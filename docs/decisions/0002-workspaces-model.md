@@ -1,6 +1,9 @@
 # ADR-0002: Workspaces model (renamed tabs, move-default, doc-only also-show)
 
-**Status:** Accepted
+**Status:** Accepted — the deferred full `Tab`→`Workspace` type rename (below) was
+later **completed** by ADR-0028 §5 (project T007): `Tab<C>`→`Workspace<C>`, the old
+container `Workspace<C>`→`Frame<C>`. The "strings-only, type stays `Tab`" stance here
+is superseded.
 **Date:** 2026-06-02
 **Related:** spec-workspaces-tagging.md, spec-tabs-and-splits.md, ADR-0005
 
@@ -39,7 +42,7 @@ an unanswerable "is the cursor shared?" — rejected; tag the *content* instead.
 
 - **Shared layout nodes** (same `Window` leaf in two trees) — graph data model, cursor ambiguity.
 - **Workspaces-of-tabs (2-level)** — muddy mental model (which level owns focus/rail).
-- **Full `Tab`→`Workspace` type rename** — large mechanical churn + name collision; deferred to strings-only.
+- **Full `Tab`→`Workspace` type rename** — large mechanical churn + name collision; deferred to strings-only. **(Superseded by ADR-0028 §5 / T007: the full rename was completed — `Tab<C>`→`Workspace<C>`, container `Workspace<C>`→`Frame<C>`, resolving the collision.)**
 
 ## Consequences
 

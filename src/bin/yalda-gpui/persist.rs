@@ -1,5 +1,5 @@
 //! Durable on-disk state: yalda-home paths, client id, preferences,
-//! workspace snapshot/restore (tabs/splits/rails), persisted ACP session
+//! workspace snapshot/restore (workspaces/splits/rails), persisted ACP session
 //! slots, and session-server launch/attach helpers. Extracted verbatim
 //! from main.rs (split-gpui-main).
 
@@ -207,7 +207,7 @@ pub(crate) fn resolve_agent_cwd_arg(arg: &str) -> Result<PathBuf, String> {
     };
 
     // 2) Canonicalize when possible, else fall back to cwd-relative with
-    //    `.`/`..` collapsed (same pattern as `Workspace::canonical_key`).
+    //    `.`/`..` collapsed (same pattern as `Frame::canonical_key`).
     let resolved = match std::fs::canonicalize(&expanded) {
         Ok(c) => c,
         Err(_) => {
@@ -281,14 +281,14 @@ pub(crate) fn shorten_cwd_for_display(cwd: &std::path::Path) -> String {
     }
 }
 
-/// Path to the JSON file that maps cwd → workspace snapshot (tabs + layout
+/// Path to the JSON file that maps cwd → workspace snapshot (workspaces + layout
 /// tree). Companion to acp_sessions.json; cleared by clearing cache_dir.
 pub(crate) fn workspace_persist_path() -> Option<PathBuf> {
     // Fail safe in test builds (same rationale as `preferences_path`): NEVER
     // touch the user's real `~/.yalda/workspace.json`. `save_workspace_state`
     // fires from ~75 action handlers (open / split / close / focus), so any
     // test that dispatches one of those actions would otherwise overwrite the
-    // user's real tab/split layout. Round-trip tests opt in via
+    // user's real workspace/split layout. Round-trip tests opt in via
     // `with_workspace_path`; everything else gets `None` → save is a no-op.
     #[cfg(test)]
     {
@@ -696,7 +696,7 @@ pub(crate) enum PersistedRailKind {
     Outline,
 }
 
-/// Persisted per-tab rail (spec-rail.md §14). Optional on `PersistedTab` so
+/// Persisted per-workspace rail (spec-rail.md §14). Optional on `PersistedWorkspace` so
 /// snapshots written before rails existed still load (serde default → `None`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PersistedRail {
@@ -710,7 +710,7 @@ pub(crate) struct PersistedRail {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) cwd: Option<PathBuf>,
     /// Leaf the rail is pinned to. Defaults to 0 for old snapshots (will be
-    /// overridden by the tab's focused_window on restore).
+    /// overridden by the workspace's focused_window on restore).
     #[serde(default)]
     pub(crate) pinned_to: workspace::WindowId,
 }
@@ -735,7 +735,7 @@ pub(crate) struct PersistedCamera {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct PersistedTab {
+pub(crate) struct PersistedWorkspace {
     pub(crate) auto_name: String,
     pub(crate) display_name: Option<String>,
     pub(crate) focused_window: workspace::WindowId,
@@ -743,7 +743,7 @@ pub(crate) struct PersistedTab {
     /// Optional rail (spec-rail.md §14). Absent in old snapshots → no rail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) rail: Option<PersistedRail>,
-    // Layout patterns: per-tab layout mode + master-stack params
+    // Layout patterns: per-workspace layout mode + master-stack params
     #[serde(default)]
     pub(crate) layout_mode: workspace::LayoutMode,
     #[serde(default = "default_master_ratio")]
@@ -796,9 +796,14 @@ pub(crate) fn default_master_count() -> usize {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct PersistedWorkspace {
-    pub(crate) tabs: Vec<PersistedTab>,
-    pub(crate) active_tab: usize,
+pub(crate) struct PersistedFrame {
+    // On-disk keys stay `tabs`/`active_tab` (pre-T007 format) so existing
+    // `workspace.json` files keep loading after the Tab→Workspace rename. The
+    // Rust field names are the new vocabulary; serde bridges to the old keys.
+    #[serde(rename = "tabs")]
+    pub(crate) workspaces: Vec<PersistedWorkspace>,
+    #[serde(rename = "active_tab")]
+    pub(crate) active_workspace: usize,
     // Layout patterns: workspace-global marks
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub(crate) marks: HashMap<char, workspace::WindowId>,
@@ -939,7 +944,7 @@ pub(crate) fn restore_rail(
 /// persisted session id (`Option<String>`) so restore rebinds each tile to its
 /// OWN session by identity (UXI-AgentTile-18), not by index.
 pub(crate) fn restore_layout(
-    ws: &mut workspace::Workspace<App>,
+    ws: &mut workspace::Frame<App>,
     theme: &Theme,
     layout: PersistedLayout,
 ) -> (
@@ -990,7 +995,7 @@ pub(crate) fn restore_layout(
 }
 
 pub(crate) fn restore_content(
-    ws: &mut workspace::Workspace<App>,
+    ws: &mut workspace::Frame<App>,
     theme: &Theme,
     kind: PersistedKind,
 ) -> App {
@@ -1049,7 +1054,7 @@ pub(crate) fn restore_content(
         PersistedKind::Agent { .. } => {
             // Claude restore is its own subsystem (acp_sessions.json +
             // open_agent_inner). Replace with a Browser stub here so the
-            // tab survives; user can re-attach via the existing Claude
+            // workspace survives; user can re-attach via the existing Claude
             // commands.
             App::Buffer(BufferApp::Picking(BrowserWindow::standalone(
                 std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -1062,21 +1067,21 @@ pub(crate) fn restore_content(
 
 /// Snapshot a live workspace into a fully serializable shape.
 pub(crate) fn snapshot_workspace(
-    ws: &workspace::Workspace<App>,
+    ws: &workspace::Frame<App>,
     projects: &Projects,
     resolve: SidResolver,
-) -> PersistedWorkspace {
+) -> PersistedFrame {
     // Ephemeral virtual workspaces (ADR-0021) are transient and never persisted;
-    // they're always the last tab, so filtering them keeps the remaining indices
-    // contiguous. `active_tab` is clamped into the surviving range so a restore
+    // they're always the last wsp, so filtering them keeps the remaining indices
+    // contiguous. `active_workspace` is clamped into the surviving range so a restore
     // never points past the saved list.
-    let non_ephemeral = ws.tabs.iter().filter(|t| !t.ephemeral).count();
-    PersistedWorkspace {
-        tabs: ws
-            .tabs
+    let non_ephemeral = ws.workspaces.iter().filter(|t| !t.ephemeral).count();
+    PersistedFrame {
+        workspaces: ws
+            .workspaces
             .iter()
             .filter(|t| !t.ephemeral)
-            .map(|t| PersistedTab {
+            .map(|t| PersistedWorkspace {
                 auto_name: t.auto_name.clone(),
                 display_name: t.display_name.clone(),
                 focused_window: t.focused,
@@ -1114,7 +1119,7 @@ pub(crate) fn snapshot_workspace(
                 legacy_kv: HashMap::new(),
             })
             .collect(),
-        active_tab: ws.active_tab.min(non_ephemeral.saturating_sub(1)),
+        active_workspace: ws.active_workspace.min(non_ephemeral.saturating_sub(1)),
         marks: ws.marks.all_marks().into_iter().collect(),
         tag_shortcuts: ws.tag_shortcuts.clone(),
         buffer_tags: {
@@ -1136,7 +1141,7 @@ pub(crate) fn snapshot_workspace(
 /// on any I/O / serialization failure (Behavior 23: best-effort + silent).
 pub(crate) fn save_persisted_workspace(
     cwd: &std::path::Path,
-    ws: &workspace::Workspace<App>,
+    ws: &workspace::Frame<App>,
     projects: &Projects,
     resolve: SidResolver,
 ) {
@@ -1169,7 +1174,7 @@ pub(crate) fn save_persisted_workspace(
 /// Read the persisted workspace for `cwd`. Returns `None` if no file, no
 /// entry, or unparseable — the caller treats these as "no saved state,
 /// bootstrap fresh" (Behavior 24).
-pub(crate) fn load_persisted_workspace(cwd: &std::path::Path) -> Option<PersistedWorkspace> {
+pub(crate) fn load_persisted_workspace(cwd: &std::path::Path) -> Option<PersistedFrame> {
     let path = workspace_persist_path()?;
     let bytes = std::fs::read(&path).ok()?;
     let map: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&bytes).ok()?;
@@ -1382,7 +1387,7 @@ pub(crate) fn forget_persisted_acp_sessions(cwd: &std::path::Path) {
 /// EVERY cwd key (the file is `{ cwd_key: [ {id, ...}, ... ] }`). Used when an
 /// attach reports a session the server no longer has: re-saving the live rings
 /// can't be relied on to drop the id (a single-slot ring that empties no longer
-/// holds an Agent ring to re-save, and a stale id in a non-active tab is never
+/// holds an Agent ring to re-save, and a stale id in a non-active workspace is never
 /// walked), so we scrub by id here. A cwd whose array becomes empty has its key
 /// removed. Best-effort.
 pub(crate) fn forget_persisted_acp_session_ids(ids: &[String]) {

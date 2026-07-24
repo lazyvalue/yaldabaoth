@@ -285,7 +285,7 @@ fn re_render_one_doc_sources_live_core_not_disk() {
     // Disk holds a single paragraph → exactly one rendered block.
     std::fs::write(&path, "disk only\n").unwrap();
 
-    let mut ws: workspace::Workspace<App> = workspace::Workspace::new(ProjectId(0));
+    let mut ws: workspace::Frame<App> = workspace::Frame::new(ProjectId(0));
     let (id, core) = ws.open_and_retain(&path).unwrap();
 
     // A pool-bound Doc, rendered at the disk content (rendered_seq stamped at
@@ -2612,7 +2612,7 @@ fn gpui_menu_has_required_entries() {
         "open-browser",
         "buffer-list",
         "split-h",
-        "new-tab",
+        "new-workspace",
         "move-tile",
         "cycle-layout",
         "tag-add",
@@ -3484,7 +3484,7 @@ fn agent_tile_persists_session_identity_not_index() {
 
     // Restore side: each leaf comes back paired with ITS OWN id — identity
     // travels with the leaf, independent of any session-list ordering.
-    let mut ws = workspace::Workspace::<App>::new(ProjectId(0));
+    let mut ws = workspace::Frame::<App>::new(ProjectId(0));
     let theme = Theme::default();
     let (_lay, _max, agents) = restore_layout(&mut ws, &theme, snap);
 
@@ -3502,12 +3502,12 @@ fn agent_tile_persists_session_identity_not_index() {
 // Infinite-plane persistence (spec-infinite-plane-workspace.md Behavior 7 / D4)
 // ---------------------------------------------------------------------------
 
-/// Minimal well-formed `PersistedTab` for the plane-persistence serde tests:
+/// Minimal well-formed `PersistedWorkspace` for the plane-persistence serde tests:
 /// one Agent leaf, no rail, default layout params. The caller sets the plane
 /// fields (`desktop_slots`, `camera`) under test.
 #[cfg(test)]
-fn plane_persist_test_tab() -> PersistedTab {
-    PersistedTab {
+fn plane_persist_test_workspace() -> PersistedWorkspace {
+    PersistedWorkspace {
         auto_name: "plane-1".into(),
         display_name: None,
         focused_window: 1,
@@ -3528,26 +3528,26 @@ fn plane_persist_test_tab() -> PersistedTab {
     }
 }
 
-/// A `PersistedTab` carrying NEGATIVE-coordinate slots and a NON-default camera
+/// A `PersistedWorkspace` carrying NEGATIVE-coordinate slots and a NON-default camera
 /// round-trips byte-faithfully through serialize → deserialize (D4: signed
 /// slots + persisted camera). Guards the `i32` slot widening and the
 /// pan/zoom camera field.
 #[test]
 fn plane_persist_round_trips_signed_slots_and_camera() {
-    let mut tab = plane_persist_test_tab();
-    tab.desktop_slots = vec![(1, -3, -7), (2, 0, 0), (3, 5, -2)];
-    tab.desktop_spans = vec![(1, 2, 1)];
-    tab.camera = Some(PersistedCamera {
+    let mut wsp = plane_persist_test_workspace();
+    wsp.desktop_slots = vec![(1, -3, -7), (2, 0, 0), (3, 5, -2)];
+    wsp.desktop_spans = vec![(1, 2, 1)];
+    wsp.camera = Some(PersistedCamera {
         pan: (-2.5, 4.0),
         zoom: workspace::Detail::Minimap,
     });
 
-    let json = serde_json::to_string(&tab).expect("serialize");
-    let back: PersistedTab = serde_json::from_str(&json).expect("deserialize");
+    let json = serde_json::to_string(&wsp).expect("serialize");
+    let back: PersistedWorkspace = serde_json::from_str(&json).expect("deserialize");
 
-    assert_eq!(back.desktop_slots, tab.desktop_slots, "signed slots survive");
-    assert_eq!(back.desktop_spans, tab.desktop_spans, "spans survive");
-    assert_eq!(back.camera, tab.camera, "camera (pan + zoom) survives");
+    assert_eq!(back.desktop_slots, wsp.desktop_slots, "signed slots survive");
+    assert_eq!(back.desktop_spans, wsp.desktop_spans, "spans survive");
+    assert_eq!(back.camera, wsp.camera, "camera (pan + zoom) survives");
     // Explicitly pin the signed slot: a naive u32 tuple would have refused to
     // parse `-3` at all, so a passing round-trip proves the widening.
     assert!(
@@ -3557,7 +3557,7 @@ fn plane_persist_round_trips_signed_slots_and_camera() {
     );
 }
 
-/// A LITERAL old-format `workspace.json` tab (unsigned `desktop_slots`, NO
+/// A LITERAL old-format `workspace.json` workspace (unsigned `desktop_slots`, NO
 /// `camera` field, a retired `"layout_mode":"master_stack"`) deserializes with
 /// its slots intact and the camera defaulting to origin+Full — NO panic, the
 /// snapshot is NOT dropped (D4 / Behavior 7: existing files load transparently).
@@ -3577,20 +3577,20 @@ fn old_workspace_json_loads_as_plane_with_origin_camera() {
         "cwd": "/tmp"
     }"#;
 
-    let tab: PersistedTab =
-        serde_json::from_str(old).expect("old-format tab must load, not drop the snapshot");
+    let wsp: PersistedWorkspace =
+        serde_json::from_str(old).expect("old-format workspace must load, not drop the snapshot");
 
     assert_eq!(
-        tab.desktop_slots,
+        wsp.desktop_slots,
         vec![(1, 0, 0), (2, 1, 3)],
         "old unsigned slots load as the same positive signed slots"
     );
     assert!(
-        tab.camera.is_none(),
+        wsp.camera.is_none(),
         "absent camera field stays None (restored as Camera::default() = origin+Full)"
     );
     // The restore path turns an absent camera into the origin at Full.
-    let restored = tab
+    let restored = wsp
         .camera
         .map(|c| workspace::Camera {
             pan: c.pan,
@@ -3606,7 +3606,51 @@ fn old_workspace_json_loads_as_plane_with_origin_camera() {
     // `"master_stack"` (or any old mode string) deserializes to the sole `Plane`
     // value rather than failing the parse and dropping the snapshot. The load
     // path ignores this field regardless — every workspace is a plane.
-    assert_eq!(tab.layout_mode, workspace::LayoutMode::Plane);
+    assert_eq!(wsp.layout_mode, workspace::LayoutMode::Plane);
+}
+
+/// T007 (Tab→Workspace rename): a pre-rename `workspace.json` frame written with
+/// the OLD on-disk keys `"tabs"` / `"active_tab"` must still load after the Rust
+/// fields were renamed to `workspaces` / `active_workspace`. The `#[serde(rename)]`
+/// bridges the old keys; without it the frame — and every saved workspace — would
+/// silently vanish. Negative control: drop the `#[serde(rename = "tabs")]` on
+/// `PersistedFrame::workspaces` and this `expect` panics on the missing field.
+#[test]
+fn old_workspace_json_frame_loads_with_pre_rename_keys() {
+    let old = r#"{
+        "tabs": [
+            {
+                "auto_name": "plane-1",
+                "display_name": null,
+                "focused_window": 1,
+                "layout": { "leaf": { "id": 1, "kind": "claude", "data": { "session_id": null } } },
+                "layout_mode": "master_stack",
+                "master_ratio": 0.6,
+                "master_count": 1,
+                "desktop_slots": [[1, 0, 0], [2, 1, 3]],
+                "cwd": "/tmp"
+            }
+        ],
+        "active_tab": 0
+    }"#;
+
+    let frame: PersistedFrame = serde_json::from_str(old)
+        .expect("pre-rename frame with `tabs`/`active_tab` keys must load, not drop the layout");
+
+    assert_eq!(
+        frame.workspaces.len(),
+        1,
+        "the `tabs` on-disk key maps to the renamed `workspaces` field"
+    );
+    assert_eq!(
+        frame.active_workspace, 0,
+        "the `active_tab` on-disk key maps to the renamed `active_workspace` field"
+    );
+    assert_eq!(
+        frame.workspaces[0].desktop_slots,
+        vec![(1, 0, 0), (2, 1, 3)],
+        "the nested workspace snapshot survives the frame rename"
+    );
 }
 
 /// A camera whose `zoom` string is unknown to this binary (a value from a NEWER

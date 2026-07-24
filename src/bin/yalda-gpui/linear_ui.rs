@@ -164,7 +164,7 @@ impl YaldaGpuiView {
     }
 
     /// Push a new body state onto the tile's cached view (mutation-site notify),
-    /// then notify the root for the tab-strip title. If the tile is in Normal
+    /// then notify the root for the workspace-strip title. If the tile is in Normal
     /// mode, re-enter browse so the cursor is on the first link of the freshly
     /// loaded body (Insert leaves it hidden — you're typing).
     fn linear_set_view(
@@ -312,8 +312,8 @@ impl YaldaGpuiView {
     }
 
     fn linear_tile_by_id_mut(&mut self, id: workspace::WindowId) -> Option<&mut LinearTile> {
-        for tab in self.workspace.tabs.iter_mut() {
-            if let Some(w) = tab.layout.find_leaf_mut(id) {
+        for wsp in self.workspace.workspaces.iter_mut() {
+            if let Some(w) = wsp.layout.find_leaf_mut(id) {
                 return match &mut w.content {
                     App::Linear(tile) => Some(tile),
                     _ => None,

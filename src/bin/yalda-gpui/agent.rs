@@ -2003,7 +2003,7 @@ pub(crate) enum InputModeKind {
 
 /// Which surface holds keyboard focus in an agent tile (Model C — `design-c.md`
 /// §4.5). Default `Compose`. `Transcript` is the read-only navigation/selection
-/// mode (the base "workspace" capability), entered via the local menu and exited
+/// mode (the base "tab" capability), entered via the local menu and exited
 /// with `Esc`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum AgentFocus {
@@ -2345,7 +2345,7 @@ impl Compose {
         let line_count = self.editor.document().line_count().max(1);
         let cursor = self.editor.cursor();
         // Length of the caret's line in the SAME representation the rows render
-        // in (tabs expanded to 4 spaces), so the horizontal clamp matches what's
+        // in (workspaces expanded to 4 spaces), so the horizontal clamp matches what's
         // painted.
         let cursor_line_len = {
             let cl = cursor.line.min(line_count.saturating_sub(1));
@@ -4559,7 +4559,7 @@ pub(crate) fn alloc_open_token() -> u64 {
 pub(crate) struct AgentSession {
     /// The session state. Contains editor, channel, tool calls, etc.
     pub(crate) state: AgentState,
-    /// User-facing label shown in tab strips / pickers.
+    /// User-facing label shown in workspace strips / pickers.
     pub(crate) label: String,
     /// Absolute working directory the agent subprocess runs in (spec-agent-
     /// cwd.md §1).
@@ -4619,7 +4619,7 @@ pub(crate) struct SessionPicker {
     /// to the FREE sessions projected from the universal roster for the active
     /// workspace's cwd (`picker_projection`, universal-agent-list). UI state
     /// ONLY — neither the rows NOR the cwd are cached here: a rendered picker is
-    /// always on the active tab, so its cwd is read live from `agent_base_cwd`
+    /// always on the active wsp, so its cwd is read live from `agent_base_cwd`
     /// at render/select time. (Caching the cwd here is what made "Set CWD, then
     /// Start a new session" create the agent in the *old* dir.)
     pub(crate) selected: usize,

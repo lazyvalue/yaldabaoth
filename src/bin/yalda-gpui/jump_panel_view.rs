@@ -1,6 +1,6 @@
 //! The jump panel (jump-panel; spec-jump-panel.md): an always-visible root-level
 //! navigator sidebar. Unlike the per-tile **rail** (`spec-rail.md`,
-//! `Tab::rail`), it is a single instance laid out outside the workspace/tab
+//! `Workspace::rail`), it is a single instance laid out outside the workspace
 //! content, so it stays put across workspace switches (INV-JP1).
 //!
 //! # Why inline, not a cached child
@@ -17,14 +17,14 @@
 //! a plain inline element built by [`YaldaGpuiView::render_jump_panel`].
 //!
 //! It is a pure navigator: a row click calls an existing encapsulated root API
-//! (`select_tab` / `jump_to_session`) and mutates nothing it reads (INV-JP2).
+//! (`select_workspace` / `jump_to_session`) and mutates nothing it reads (INV-JP2).
 //! Free agent sessions open in an ephemeral virtual workspace (ADR-0021); bound
 //! ones focus their tile in place.
 
 use super::*;
 
 /// Fixed sidebar width. Chrome-class — renders at native size, unaffected by
-/// document zoom (consistent with the tab strip / rail).
+/// document zoom (consistent with the workspace strip / rail).
 pub(crate) const JUMP_PANEL_WIDTH: f32 = 220.0;
 
 /// What a jump-panel agent row points at (universal-agent-list). A session may
@@ -283,7 +283,7 @@ impl YaldaGpuiView {
 }
 
 /// One rendered project section in the jump panel (UXI-Project-3): a project's
-/// name + cwd, the workspaces that belong to it (each carrying its GLOBAL tab
+/// name + cwd, the workspaces that belong to it (each carrying its GLOBAL workspace
 /// index so the `ctrl-<n>` badge stays sequential across projects), and the
 /// agent sessions rooted at its cwd. Pure view-model so the section structure is
 /// headlessly assertable — the render just walks it.
@@ -291,7 +291,7 @@ pub(crate) struct JumpProjectSection {
     pub(crate) id: ProjectId,
     pub(crate) name: String,
     pub(crate) cwd_display: String,
-    /// `(global tab idx, label, is-active)` — idx+1 is the `ctrl-<n>` number.
+    /// `(global workspace idx, label, is-active)` — idx+1 is the `ctrl-<n>` number.
     pub(crate) workspaces: Vec<(usize, String, bool)>,
     /// `(flat row index, row)` — the flat index is the stable listener key.
     pub(crate) sessions: Vec<(usize, AgentRow)>,
@@ -303,7 +303,7 @@ impl YaldaGpuiView {
     /// (UXI-Project-3). Every project renders (so an EMPTY project still shows
     /// its header + create rows); its sessions are the cwd-groups that resolve to
     /// it (cwd is unique per project, so each group maps to at most one project),
-    /// and its workspaces are the non-ephemeral tabs whose `tab.project()` is it.
+    /// and its workspaces are the non-ephemeral workspaces whose `wsp.project()` is it.
     /// Sections are ordered by the user's `jump_cwd_order` drag order (keyed on
     /// the project's cwd display — the same key `CwdDrag` carries), stable so
     /// undragged projects stay in id order. Pure (no listeners) so it is
@@ -334,12 +334,12 @@ impl YaldaGpuiView {
         for (id, p) in self.projects.iter() {
             let workspaces: Vec<(usize, String, bool)> = self
                 .workspace
-                .tabs
+                .workspaces
                 .iter()
                 .enumerate()
                 .filter(|(_, t)| !t.ephemeral && t.project() == id)
                 .map(|(idx, t)| {
-                    (idx, t.display_label().to_string(), idx == self.workspace.active_tab)
+                    (idx, t.display_label().to_string(), idx == self.workspace.active_workspace)
                 })
                 .collect();
             let sessions = by_project.remove(&id).unwrap_or_default();
@@ -588,7 +588,7 @@ impl YaldaGpuiView {
         );
 
         // ── Per-project sections (UXI-Project-3): one section per project, each
-        // owning its WORKSPACES sublist (workspaces whose tab.project() == this
+        // owning its WORKSPACES sublist (workspaces whose wsp.project() == this
         // project; the badge keeps the GLOBAL idx+1 = ctrl-<n> number) and its
         // AGENT SESSIONS, plus inline ＋create rows. Individual tiles are NOT
         // listed. Unfiled sessions (a cwd no project roots) trail under path
@@ -686,7 +686,7 @@ impl YaldaGpuiView {
                         sel_bg,
                         active.then_some(active_accent),
                     )
-                    .on_click(cx.listener(move |this, _ev, _window, cx| this.select_tab(idx, cx))),
+                    .on_click(cx.listener(move |this, _ev, _window, cx| this.select_workspace(idx, cx))),
                 );
             }
             col = col.child(

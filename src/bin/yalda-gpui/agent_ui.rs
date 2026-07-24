@@ -259,13 +259,13 @@ impl YaldaGpuiView {
             .expect("infinite range always yields a free label")
     }
 
-    /// The set of server sids currently BOUND to some tile (across all tabs).
+    /// The set of server sids currently BOUND to some tile (across all workspaces).
     /// Their `AgentSession`s exist in the store; everything else in the store
     /// or on the server is free.
     pub(crate) fn bound_sid_set(&self) -> std::collections::HashSet<String> {
         let mut bound: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for tab in self.workspace.tabs.iter() {
-            tab.layout.for_each_leaf(&mut |w| {
+        for wsp in self.workspace.workspaces.iter() {
+            wsp.layout.for_each_leaf(&mut |w| {
                 if let App::Agent(tile) = &w.content
                     && let Some(id) = tile.session()
                     && let Some(sid) = self.sessions.sid_of(id)
@@ -627,11 +627,11 @@ impl YaldaGpuiView {
     }
 
     /// Locate the `SessionId` of the session whose tile carries `token` in its
-    /// `pending_open_token` (across all tabs/tiles).
+    /// `pending_open_token` (across all workspaces/tiles).
     fn session_id_for_open_token(&self, token: u64) -> Option<SessionId> {
-        for tab in self.workspace.tabs.iter() {
+        for wsp in self.workspace.workspaces.iter() {
             let mut found = None;
-            tab.layout.for_each_leaf(&mut |w| {
+            wsp.layout.for_each_leaf(&mut |w| {
                 if let App::Agent(tile) = &w.content
                     && tile.pending_token() == Some(token)
                 {
@@ -646,16 +646,16 @@ impl YaldaGpuiView {
     }
 
     /// The stable `WindowId` of the agent tile currently BOUND to session
-    /// `sid` (at most one, INV-2), scanning every tab. Deliberately
+    /// `sid` (at most one, INV-2), scanning every workspace. Deliberately
     /// focus-INDEPENDENT: the async close/reconcile paths use it to address a
     /// replacement selector's list back to the bound tile (INV-PR), so it must
     /// never depend on which tile holds focus. Directly unit-tested
     /// (`session_close_shows_selector_on_bound_tile_not_focused`) so a revert to
     /// focus-based routing fails CI rather than silently passing.
     pub(crate) fn agent_tile_id_bound_to(&self, sid: SessionId) -> Option<workspace::WindowId> {
-        for tab in self.workspace.tabs.iter() {
+        for wsp in self.workspace.workspaces.iter() {
             let mut found = None;
-            tab.layout.for_each_leaf(&mut |w| {
+            wsp.layout.for_each_leaf(&mut |w| {
                 if let App::Agent(tile) = &w.content
                     && tile.session() == Some(sid)
                 {
@@ -674,7 +674,7 @@ impl YaldaGpuiView {
     /// tile — preserves the 1:1 invariant). If it is **free** (no tile binds it),
     /// open it in an **ephemeral virtual workspace** whose single tile binds it;
     /// that workspace is torn down the instant the user navigates away
-    /// (`Workspace::set_active_tab`), returning the session to free. No-op if the
+    /// (`Frame::set_active_workspace`), returning the session to free. No-op if the
     /// session id is no longer in the store.
     pub(crate) fn jump_to_session(&mut self, sid: SessionId, cx: &mut Context<Self>) {
         if !self.sessions.contains(sid) {
@@ -694,7 +694,7 @@ impl YaldaGpuiView {
                 .and_then(|c| self.projects.membership_for_cwd(&c).project())
                 .or_else(|| self.active_project(cx))
                 .unwrap_or_else(|| self.workspace.inherited_project());
-            self.workspace.open_ephemeral_tab_in(App::Agent(tile), proj);
+            self.workspace.open_ephemeral_workspace_in(App::Agent(tile), proj);
         }
         // You're now looking at this session — clear its "waiting on you" mark
         // eagerly (the pump also clears it, but this makes the dot update on the
@@ -729,7 +729,7 @@ impl YaldaGpuiView {
 
     /// Open a roster session (one not yet in this GUI's store) by its server
     /// sid. If it's already opened here, delegate to `jump_to_session` (focus
-    /// its tile, or an ephemeral tab if free). Otherwise open a fresh ephemeral
+    /// its tile, or an ephemeral workspace if free). Otherwise open a fresh ephemeral
     /// virtual workspace (ADR-0021) and attach the session into it, reusing the
     /// picker's bind+attach path (`picker_attach_existing`).
     pub(crate) fn jump_to_roster_session(&mut self, sid: String, cx: &mut Context<Self>) {
@@ -756,7 +756,7 @@ impl YaldaGpuiView {
             .or_else(|| self.active_project(cx))
             .unwrap_or_else(|| self.workspace.inherited_project());
         self.workspace
-            .open_ephemeral_tab_in(App::Agent(AgentTile::new()), proj);
+            .open_ephemeral_workspace_in(App::Agent(AgentTile::new()), proj);
         self.picker_attach_existing(
             info.cwd,
             info.session_id,
@@ -769,7 +769,7 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
-    /// Resolve an agent tile by its stable `WindowId`, scanning every tab's
+    /// Resolve an agent tile by its stable `WindowId`, scanning every workspace's
     /// layout (ids are unique workspace-wide). The canonical way for an async
     /// reducer to reach the tile that originated its work — `agent_tile_mut()`
     /// (the FOCUSED tile) must never be used from a `cx.spawn` continuation,
@@ -781,8 +781,8 @@ impl YaldaGpuiView {
     // tiles through this, never `agent_tile_mut()`.
     #[allow(dead_code)]
     fn agent_tile_by_id_mut(&mut self, id: workspace::WindowId) -> Option<&mut AgentTile> {
-        for tab in self.workspace.tabs.iter_mut() {
-            if let Some(w) = tab.layout.find_leaf_mut(id) {
+        for wsp in self.workspace.workspaces.iter_mut() {
+            if let Some(w) = wsp.layout.find_leaf_mut(id) {
                 return match &mut w.content {
                     App::Agent(tile) => Some(tile),
                     _ => None,
@@ -794,8 +794,8 @@ impl YaldaGpuiView {
 
     /// Clear the `pending_open_token` on whichever tile carries `token`.
     fn clear_open_token(&mut self, token: u64) {
-        for tab in self.workspace.tabs.iter_mut() {
-            tab.layout.for_each_leaf_content_mut(&mut |content| {
+        for wsp in self.workspace.workspaces.iter_mut() {
+            wsp.layout.for_each_leaf_content_mut(&mut |content| {
                 if let App::Agent(tile) = content
                     && tile.pending_token() == Some(token)
                 {
@@ -940,7 +940,7 @@ impl YaldaGpuiView {
             let _ = this.update(cx, |this, cx| {
                 // Sids whose attach failed with a PERMANENT "session is gone"
                 // error. These are dropped after the status pass so the dead
-                // slot neither lingers as a broken tab nor gets retried next
+                // slot neither lingers as a broken workspace nor gets retried next
                 // launch (see below). Transient failures keep today's behavior.
                 let mut dead_sids: Vec<String> = Vec::new();
                 for (sid, r) in results {
@@ -1000,8 +1000,8 @@ impl YaldaGpuiView {
                 // id (across every cwd key). `save_agent_ring` alone misses the
                 // cases that matter most here: a single-slot ring that empties
                 // (the tile no longer holds an Agent ring, so the re-save never
-                // touches that cwd) and a stale session in a non-active tab
-                // (save_agent_ring only walks the active tab). Without this the
+                // touches that cwd) and a stale session in a non-active workspace
+                // (save_agent_ring only walks the active workspace). Without this the
                 // dead id would be resumed again on the next launch — the exact
                 // churn this fix targets.
                 if !dead_sids.is_empty() {
@@ -1020,7 +1020,7 @@ impl YaldaGpuiView {
     /// command handler) is responsible for running the input through
     /// `resolve_agent_cwd_arg` first.
     /// The active workspace's working directory. `None` only when there is no
-    /// active tab at all (a transient pre-first-tab state); a workspace that
+    /// active workspace at all (a transient pre-first-workspace state); a workspace that
     /// exists always carries a cwd (the typed [`WorkspaceCwd`] makes "no cwd"
     /// unrepresentable — ADR-0023). The path is whatever `Set CWD` resolved at
     /// write time; a since-deleted dir surfaces as a spawn error
@@ -1029,7 +1029,7 @@ impl YaldaGpuiView {
         // The workspace's cwd is its project's cwd, resolved at the point of use
         // (ADR-0028 §3 — no cwd is cached on the workspace).
         self.workspace
-            .active_tab()
+            .active_workspace()
             .map(|t| t.project())
             .and_then(|pid| self.projects.cwd_of(pid).map(|p| p.to_path_buf()))
     }
@@ -1039,7 +1039,7 @@ impl YaldaGpuiView {
     /// agent-creation entry point (open / new / bootstrap) shares, so opening an
     /// agent in workspace 2 lands in workspace 2's dir, not the app's launch
     /// dir. Total — the workspace always has a cwd; the `process_cwd` fallback
-    /// only covers the degenerate no-tab state.
+    /// only covers the degenerate no-workspace state.
     pub(crate) fn agent_base_cwd(&self) -> PathBuf {
         self.active_workspace_cwd().unwrap_or_else(process_cwd)
     }
@@ -1047,13 +1047,13 @@ impl YaldaGpuiView {
     /// The id-level twin of `active_workspace_cwd`/`agent_base_cwd` (UXI-Project-7):
     /// there is NO stored "current project" — derive it. The project of the focused
     /// workspace, else the focused (bound) session's project, else the first
-    /// project. In practice the workspace branch dominates (an active tab always
+    /// project. In practice the workspace branch dominates (an active workspace always
     /// carries a project), but the session + first fallbacks keep the derivation
     /// total for spec fidelity — the NC short-circuits to `first()` so focus stops
     /// moving it.
     pub(crate) fn active_project(&self, cx: &GpuiApp) -> Option<ProjectId> {
         self.workspace
-            .active_tab()
+            .active_workspace()
             .map(|t| t.project())
             .or_else(|| {
                 let id = self.focused_bound_session()?;
@@ -1560,10 +1560,10 @@ impl YaldaGpuiView {
             .detach();
     }
 
-    /// Snapshot every bound agent session to disk. Walks ALL tabs (not just the
+    /// Snapshot every bound agent session to disk. Walks ALL workspaces (not just the
     /// active one) so it is SYMMETRIC with restore (`restore_agent_leaves`
-    /// collects agent leaves across every tab) — otherwise an agent in a
-    /// background tab would be saved-but-not-restored or vice versa. The first
+    /// collects agent leaves across every workspace) — otherwise an agent in a
+    /// background workspace would be saved-but-not-restored or vice versa. The first
     /// bound session is marked active. Free sessions (no tile) are not persisted
     /// — they only live for the running process. Best-effort.
     pub(crate) fn save_agent_ring(&mut self, cx: &GpuiApp) {
@@ -1575,8 +1575,8 @@ impl YaldaGpuiView {
         // write pass below can stamp each tile's `resume_sid` — the identity the
         // layout snapshot persists so restore rebinds each tile to ITS OWN
         // session (UXI-AgentTile-18), not by index.
-        for tab in self.workspace.tabs.iter() {
-            tab.layout.for_each_leaf(&mut |window| {
+        for wsp in self.workspace.workspaces.iter() {
+            wsp.layout.for_each_leaf(&mut |window| {
                 if let App::Agent(tile) = &window.content
                     && let Some(id) = tile.session()
                     && let Some(ent) = self.sessions.get(id)
@@ -2045,14 +2045,14 @@ impl YaldaGpuiView {
         self._server_pump = Some(task);
     }
 
-    /// Find an agent slot by its server session id across ALL tabs and tiles,
+    /// Find an agent slot by its server session id across ALL workspaces and tiles,
     /// running `f` on the first match. Returns `true` if a slot was found.
     ///
     /// A single shared `SessionServerClient` multiplexes every session's
     /// notifications onto one pump (`start_server_pump`), so routing must
-    /// search the whole workspace — not just the active tab — or a session
-    /// living in a background tab silently drops its streamed output. The
-    /// scan is cheap: a handful of tabs × tiles × slots.
+    /// search the whole workspace — not just the active workspace — or a session
+    /// living in a background workspace silently drops its streamed output. The
+    /// scan is cheap: a handful of workspaces × tiles × slots.
     /// Route to the single [`AgentSession`] bound to `sid` and run `f` on it,
     /// returning whether one was found (INV-4: 1:1, so zero or one match — the
     /// fan-out is gone). Replaces the old `with_server_session_slot` /
@@ -2102,8 +2102,8 @@ impl YaldaGpuiView {
         // misroute), so there's no longer a tile id to capture here.
         let mut tile_was_respawning = false;
         let mut tile_found = false;
-        for tab in self.workspace.tabs.iter_mut() {
-            tab.layout.for_each_leaf_content_mut(&mut |content| {
+        for wsp in self.workspace.workspaces.iter_mut() {
+            wsp.layout.for_each_leaf_content_mut(&mut |content| {
                 if let App::Agent(tile) = content
                     && tile.session() == Some(id)
                 {
@@ -2149,8 +2149,8 @@ impl YaldaGpuiView {
             .map(|e| e.read(cx).label.clone().into())
             .unwrap_or_else(|| sid.chars().take(8).collect::<String>().into());
         let mut tile_found = false;
-        for tab in self.workspace.tabs.iter_mut() {
-            tab.layout.for_each_leaf_content_mut(&mut |content| {
+        for wsp in self.workspace.workspaces.iter_mut() {
+            wsp.layout.for_each_leaf_content_mut(&mut |content| {
                 if let App::Agent(tile) = content
                     && tile.session() == Some(id)
                 {
@@ -2216,9 +2216,9 @@ impl YaldaGpuiView {
 
         // A single shared `SessionServerClient` multiplexes every session's
         // notifications onto this one pump, so each note is routed by its
-        // `session_id` across the *whole* workspace (all tabs and tiles), not
-        // just the active tab — otherwise a session living in a background
-        // tab silently drops its streamed output.
+        // `session_id` across the *whole* workspace (all workspaces and tiles), not
+        // just the active workspace — otherwise a session living in a background
+        // workspace silently drops its streamed output.
         let did_work = !batch.is_empty();
         // Sessions that received at least one ReplyEvent in this batch. The
         // follow-scroll is hoisted out of the per-event loop and applied once
@@ -2228,7 +2228,7 @@ impl YaldaGpuiView {
         // workspace) wasted work during fast streaming.
         let mut scrolled_sessions: Vec<String> = Vec::new();
         // Perf: a streaming batch is overwhelmingly a run of ReplyEvent chunks
-        // for the SAME session. Previously each chunk re-walked every tab+tile
+        // for the SAME session. Previously each chunk re-walked every workspace+tile
         // to find the slot (O(events*tiles)) and cloned the event String into a
         // throwaway `vec![event.clone()]`. Coalesce consecutive same-session
         // ReplyEvents into one slot lookup + one `apply_reply_events` call,
@@ -3940,7 +3940,7 @@ impl YaldaGpuiView {
         self.submit_compose(cx);
     }
 
-    /// Whether any agent slot (across all tabs/tiles) is mid-turn. Cheap
+    /// Whether any agent slot (across all workspaces/tiles) is mid-turn. Cheap
     /// traversal the pumps use to decide whether an idle animation tick is
     /// worth a re-render.
     pub(crate) fn any_agent_awaiting(&self, cx: &GpuiApp) -> bool {
@@ -4986,7 +4986,7 @@ impl YaldaGpuiView {
 
         // Transcript focus (Model C §4.5): keystrokes drive READ-ONLY navigation
         // and selection over the committed transcript; `Esc` returns to the
-        // compose. This is the base "workspace" capability — select history, then
+        // compose. This is the base "tab" capability — select history, then
         // `S` sends the selection. Edits are inert: the transcript is all frozen
         // (guards no-op them) and we pin the editor to Normal so `i`/`a` can't
         // enter Insert.

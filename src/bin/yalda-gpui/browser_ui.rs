@@ -142,11 +142,11 @@ impl YaldaGpuiView {
             cx.notify();
             return;
         }
-        // Standalone browser (new-tab open, persisted browser tab, split
+        // Standalone browser (new-workspace open, persisted browser wsp, split
         // fallback). Try to dismiss the tile:
         //   - one tile of a split → close just that tile.
-        //   - sole tile in tab, multiple tabs → close the tab.
-        //   - sole tile in sole tab → no-op. Esc/q is intentionally NOT a
+        //   - sole tile in wsp, multiple workspaces → close the workspace.
+        //   - sole tile in sole workspace → no-op. Esc/q is intentionally NOT a
         //     quit shortcut — too easy to lose the app by mashing keys.
         //     Quit lives on Cmd-Q.
         match self.workspace.close_focused() {
@@ -155,9 +155,9 @@ impl YaldaGpuiView {
                 cx.notify();
             }
             Ok(None) => {
-                if self.workspace.tabs.len() > 1 {
-                    let idx = self.workspace.active_tab;
-                    self.workspace.close_tab(idx);
+                if self.workspace.workspaces.len() > 1 {
+                    let idx = self.workspace.active_workspace;
+                    self.workspace.close_workspace(idx);
                     self.save_workspace_state();
                     cx.notify();
                 }
@@ -313,15 +313,15 @@ impl YaldaGpuiView {
 
     // ---- Rail (persistent side column, spec-rail.md) -----------------------
 
-    /// `&mut` to the active tab's rail state, if a rail is open.
+    /// `&mut` to the active workspace's rail state, if a rail is open.
     pub(crate) fn rail_mut(&mut self) -> Option<&mut workspace::RailState> {
-        self.workspace.active_tab_mut()?.rail.as_mut()
+        self.workspace.active_workspace_mut()?.rail.as_mut()
     }
 
-    /// True when the active tab has a rail open AND it currently holds focus.
+    /// True when the active workspace has a rail open AND it currently holds focus.
     pub(crate) fn rail_is_focused(&self) -> bool {
         self.workspace
-            .active_tab()
+            .active_workspace()
             .and_then(|t| t.rail.as_ref())
             .map(|r| r.focused)
             .unwrap_or(false)
@@ -330,13 +330,13 @@ impl YaldaGpuiView {
     /// Sync `rail.focused` after a focus-motion: the rail holds focus only
     /// when the newly focused leaf is the one the rail is pinned to.
     pub(crate) fn sync_rail_focus_after_motion(&mut self) {
-        let Some(tab) = self.workspace.active_tab_mut() else {
+        let Some(wsp) = self.workspace.active_workspace_mut() else {
             return;
         };
-        let Some(rail) = tab.rail.as_mut() else {
+        let Some(rail) = wsp.rail.as_mut() else {
             return;
         };
-        rail.focused = tab.focused == rail.pinned_to;
+        rail.focused = wsp.focused == rail.pinned_to;
     }
 
     /// Toggle the file-browser rail (Cmd-B). Two-state model (spec §5):
@@ -356,18 +356,18 @@ impl YaldaGpuiView {
     pub(crate) fn toggle_file_browser_rail_impl(&mut self, cx: &mut Context<Self>) {
         // Resolve the active workspace's (project) cwd before the mutable borrow.
         let cwd = self.active_workspace_cwd().unwrap_or_else(process_cwd);
-        let Some(tab) = self.workspace.active_tab_mut() else {
+        let Some(wsp) = self.workspace.active_workspace_mut() else {
             return;
         };
-        match &tab.rail {
+        match &wsp.rail {
             Some(r) if r.content.is_file_browser() => {
-                tab.rail = None;
+                wsp.rail = None;
             }
             existing => {
                 let side = existing.as_ref().map(|r| r.side).unwrap_or_default();
-                let pinned_to = tab.focused;
+                let pinned_to = wsp.focused;
                 let content = workspace::RailContent::FileBrowser(FileBrowser::new(cwd));
-                tab.rail = Some(workspace::RailState::new(content, side, pinned_to));
+                wsp.rail = Some(workspace::RailState::new(content, side, pinned_to));
             }
         }
         self.save_workspace_state();
@@ -388,18 +388,18 @@ impl YaldaGpuiView {
     /// Toggle-logic for the outline rail, shared by the keybinding action and
     /// the command menu (`rail-outline`).
     pub(crate) fn toggle_outline_rail_impl(&mut self, cx: &mut Context<Self>) {
-        let Some(tab) = self.workspace.active_tab_mut() else {
+        let Some(wsp) = self.workspace.active_workspace_mut() else {
             return;
         };
-        match &tab.rail {
+        match &wsp.rail {
             Some(r) if r.content.is_outline() => {
-                tab.rail = None;
+                wsp.rail = None;
             }
             existing => {
                 let side = existing.as_ref().map(|r| r.side).unwrap_or_default();
-                let pinned_to = tab.focused;
+                let pinned_to = wsp.focused;
                 let content = workspace::RailContent::Outline(workspace::OutlineState::new());
-                tab.rail = Some(workspace::RailState::new(content, side, pinned_to));
+                wsp.rail = Some(workspace::RailState::new(content, side, pinned_to));
             }
         }
         self.save_workspace_state();
@@ -431,7 +431,7 @@ impl YaldaGpuiView {
     }
 
     /// Close the rail and return focus to the previously-focused split-tree
-    /// leaf (spec §7 — `tab.focused` is the single source of truth).
+    /// leaf (spec §7 — `wsp.focused` is the single source of truth).
     pub(crate) fn rail_close(&mut self, _: &RailClose, _w: &mut Window, cx: &mut Context<Self>) {
         // If in worktree mode, Esc exits that overlay instead of closing the rail.
         if let Some(r) = self.rail_mut()
@@ -442,10 +442,10 @@ impl YaldaGpuiView {
             cx.notify();
             return;
         }
-        if let Some(tab) = self.workspace.active_tab_mut()
-            && tab.rail.is_some()
+        if let Some(wsp) = self.workspace.active_workspace_mut()
+            && wsp.rail.is_some()
         {
-            tab.rail = None;
+            wsp.rail = None;
             self.save_workspace_state();
             cx.notify();
         }
@@ -520,7 +520,7 @@ impl YaldaGpuiView {
             // Selecting a file opens it in the focused leaf; the rail stays
             // open but yields focus back to the content (spec §7, §12).
             // `open_file` replaces a transient Browser tile in place or
-            // pushes a new tab otherwise.
+            // pushes a new workspace otherwise.
             self.open_file(path);
             if let Some(r) = self.rail_mut() {
                 r.focused = false;
@@ -532,7 +532,7 @@ impl YaldaGpuiView {
         // Outline: jump the focused window to the selected heading.
         let target = self
             .workspace
-            .active_tab()
+            .active_workspace()
             .and_then(|t| t.rail.as_ref())
             .and_then(|r| match &r.content {
                 workspace::RailContent::Outline(o) => {

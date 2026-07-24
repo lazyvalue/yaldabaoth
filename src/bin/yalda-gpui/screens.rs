@@ -216,9 +216,9 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::restart))
             .on_action(cx.listener(Self::next_buffer))
             .on_action(cx.listener(Self::prev_buffer))
-            // next_tab/prev_tab now come from `.workspace_nav(cx)` (every screen).
-            .on_action(cx.listener(Self::new_tab))
-            .on_action(cx.listener(Self::close_tab))
+            // next_workspace/prev_workspace now come from `.workspace_nav(cx)` (every screen).
+            .on_action(cx.listener(Self::new_workspace))
+            .on_action(cx.listener(Self::close_workspace))
             .on_action(cx.listener(Self::split_h))
             .on_action(cx.listener(Self::split_v))
             .on_action(cx.listener(Self::close_window))
@@ -246,7 +246,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::copy_doc_selection))
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::paste_from_clipboard))
-            .on_action(cx.listener(Self::rename_tab))
+            .on_action(cx.listener(Self::rename_workspace))
             .on_action(cx.listener(Self::move_tile))
             .on_action(cx.listener(Self::also_show_tile))
             .on_action(cx.listener(Self::toggle_file_browser_rail))
@@ -378,7 +378,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::toggle_theme))
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::paste_from_clipboard))
-            .on_action(cx.listener(Self::rename_tab))
+            .on_action(cx.listener(Self::rename_workspace))
             .on_action(cx.listener(Self::move_tile))
             .on_action(cx.listener(Self::also_show_tile))
             .on_action(cx.listener(Self::close_window))
@@ -1369,7 +1369,7 @@ impl YaldaGpuiView {
             };
             let compose_bounds_sink = tb.bounds.clone();
 
-            // All logical lines, tab-expanded. UXI-AgentTile-9: each WORD-WRAPS to rows
+            // All logical lines, wsp-expanded. UXI-AgentTile-9: each WORD-WRAPS to rows
             // of ≤ `visible_cols` columns (no horizontal scroll). The small vs
             // virtualized decision is on TOTAL VISUAL rows so one long wrapped
             // line can't overflow the un-scrolled small box and hide the caret
@@ -2065,7 +2065,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::toggle_theme))
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::paste_from_clipboard))
-            .on_action(cx.listener(Self::rename_tab))
+            .on_action(cx.listener(Self::rename_workspace))
             .on_action(cx.listener(Self::move_tile))
             .on_action(cx.listener(Self::also_show_tile))
             .on_action(cx.listener(Self::close_window))
@@ -2226,7 +2226,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::toggle_theme))
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::paste_from_clipboard))
-            .on_action(cx.listener(Self::rename_tab))
+            .on_action(cx.listener(Self::rename_workspace))
             .on_action(cx.listener(Self::move_tile))
             .on_action(cx.listener(Self::also_show_tile))
             .on_action(cx.listener(Self::close_window))
@@ -2295,7 +2295,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::toggle_theme))
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::paste_from_clipboard))
-            .on_action(cx.listener(Self::rename_tab))
+            .on_action(cx.listener(Self::rename_workspace))
             .on_action(cx.listener(Self::move_tile))
             .on_action(cx.listener(Self::also_show_tile))
             .on_action(cx.listener(Self::close_window))
@@ -2587,7 +2587,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::toggle_theme))
             // Workspace navigation must reach the picker: an unbound agent tile
             // showing the selector is still a full tile, so ctrl-<n> / cmd-shift-[]
-            // (GotoWorkspace1-10 + Next/PrevTab) and the jump panel must dispatch
+            // (GotoWorkspace1-10 + Next/PrevWorkspace) and the jump panel must dispatch
             // here just like on a bound AgentView (bug-0011).
             .on_action(cx.listener(Self::toggle_jump_panel))
             .workspace_nav(cx)
@@ -2899,7 +2899,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::toggle_theme))
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::paste_from_clipboard))
-            .on_action(cx.listener(Self::rename_tab))
+            .on_action(cx.listener(Self::rename_workspace))
             .on_action(cx.listener(Self::move_tile))
             .on_action(cx.listener(Self::also_show_tile))
             .on_action(cx.listener(Self::close_window))

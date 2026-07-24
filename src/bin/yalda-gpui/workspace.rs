@@ -1,7 +1,7 @@
 //! Tabs / windows / splits data model for the GPUI workspace.
 //!
-//! This is the data substrate for `spec-tabs-and-splits.md`: a workspace
-//! contains tabs, each tab roots an n-ary split tree of windows, and each
+//! This is the data substrate for `spec-workspaces-and-splits.md`: a workspace
+//! contains workspaces, each workspace roots an n-ary split tree of windows, and each
 //! window holds one content kind (Doc / Edit / Browser / Agent). File-backed
 //! editors live in a pooled `FileBuffer` and may be referenced by multiple
 //! windows simultaneously (shared edits across splits).
@@ -46,7 +46,7 @@ pub enum FocusDir {
     Down,
 }
 
-/// One leaf of a tab's layout tree. A `Window` carries its stable id plus the
+/// One leaf of a workspace's layout tree. A `Window` carries its stable id plus the
 /// per-window content (kind- and frontend-specific state). The content kind
 /// (`DocWindow`, `EditWindow`, `BrowserWindow`, `AgentWindow`) is defined in
 /// the main binary because some fields reference GPUI-specific types
@@ -214,7 +214,7 @@ fn renormalize(children: &mut [(f32, impl Sized)]) {
     }
 }
 
-/// Which edge of the tab a rail anchors to (spec-rail.md §10). Default `Left`.
+/// Which edge of the workspace a rail anchors to (spec-rail.md §10). Default `Left`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
@@ -277,7 +277,7 @@ impl RailContent {
 /// the value is stored so a future resize handle can mutate it in place.
 pub const RAIL_DEFAULT_WIDTH: f32 = 200.0;
 
-/// Per-tab rail state (spec-rail.md "Data model"). A tab has at most one rail
+/// Per-workspace rail state (spec-rail.md "Data model"). A workspace has at most one rail
 /// open at a time; opening a different kind replaces it in place.
 pub struct RailState {
     pub content: RailContent,
@@ -310,12 +310,12 @@ impl RailState {
 // ---------------------------------------------------------------------------
 
 /// Workspace-global mark table. Maps single characters to `WindowId`s.
-/// Stored on `Workspace<C>`, not per-tab — marks span all tabs.
+/// Stored on `Frame<C>`, not per-workspace — marks span all workspaces.
 pub struct MarkTable {
     marks: HashMap<char, WindowId>,
     /// The window where the last text edit occurred (special mark `.`).
     pub last_edit: Option<WindowId>,
-    /// The window focused before the last cross-tab jump (special mark `'`).
+    /// The window focused before the last cross-workspace jump (special mark `'`).
     pub prev_jump: Option<WindowId>,
 }
 
@@ -380,14 +380,14 @@ impl MarkTable {
 // Automatic layouts (spec-layout-patterns.md Phase 2)
 // ---------------------------------------------------------------------------
 
-/// The interior of a workspace `Tab`. Post-Stage-D there is exactly ONE:
+/// The interior of a `Workspace`. Post-Stage-D there is exactly ONE:
 /// `Plane` — the infinite signed-grid + semantic-zoom camera
 /// (`spec-infinite-plane-workspace.md`). The retired multi-mode surface
 /// (Manual/MasterStack/Monocle/Columns) collapsed into this single value; the
 /// enum is retained only so the persisted `layout_mode` field still has a type
 /// and old snapshots deserialize (any value is force-mapped to `Plane`, and the
 /// field is ignored on load — Behavior 7). The `Layout<C>` tree remains the
-/// CONTENT owner; geometry + camera live in the tab's [`DesktopState`].
+/// CONTENT owner; geometry + camera live in the workspace's [`DesktopState`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LayoutMode {
@@ -606,7 +606,7 @@ pub struct DesktopPan {
     pub start_pan: (f32, f32),
 }
 
-/// Per-tab desktop-mode geometry (spec-desktop-mode.md). The layout tree
+/// Per-workspace desktop-mode geometry (spec-desktop-mode.md). The layout tree
 /// remains the content owner; this owns ONLY placement. Invariant
 /// (Behavior 2): exactly one entry per tree leaf, no two entries share a
 /// slot — maintained by [`reconcile`](Self::reconcile), which callers run on
@@ -1074,15 +1074,13 @@ pub fn slot_at(point: (f32, f32), tile: (f32, f32), gutter: f32) -> Slot {
 /// A set of user-assigned tag names.
 pub type TagSet = BTreeSet<String>;
 
-/// One tab in the workspace's tab strip.
+/// One **Workspace** in the frame's workspace strip.
 ///
-/// User-facing name: **"Workspace"**. The product presents each `Tab` as a
-/// named, swappable desktop (its own split layout, focus, and rail); the
-/// container that owns the list of these is `Workspace<C>` (an unfortunate
-/// internal name collision — a full rename is out of scope, so user-facing
-/// strings say "workspace" while the type stays `Tab`). See
+/// The product presents each `Workspace` as a named, swappable desktop (its own
+/// split layout, focus, and rail); the container that owns the list of these is
+/// `Frame<C>`. A Workspace belongs to exactly one project (ADR-0028). See
 /// `docs/specs/spec-workspaces-tagging.md` (Phase 1).
-pub struct Tab<C> {
+pub struct Workspace<C> {
     /// Monotonic auto-name set at create (e.g. "workspace-1"). Survives rename so
     /// the user can clear `display_name` and recover the auto-name.
     pub auto_name: String,
@@ -1091,25 +1089,25 @@ pub struct Tab<C> {
     pub layout: Layout<C>,
     pub focused: WindowId,
     /// Persistent side column (spec-rail.md). `None` when no rail is open.
-    /// Per-tab — switching tabs shows/hides the arriving/departing tab's rail.
+    /// Per-workspace — switching workspaces shows/hides the arriving/departing workspace's rail.
     pub rail: Option<RailState>,
     /// Ephemeral *virtual workspace* marker (jump-panel; ADR-0021). `true` for a
-    /// transient single-tile tab created to display a free agent session; such a
-    /// tab is invisible to the jump panel's Workspaces section, the `?`
+    /// transient single-tile workspace created to display a free agent session; such a
+    /// workspace is invisible to the jump panel's Workspaces section, the `?`
     /// workspace menu, and persistence, and is torn down (the session returning
     /// to free) the moment the active workspace switches away from it via
-    /// [`Workspace::set_active_tab`]. `false` for every real workspace.
+    /// [`Frame::set_active_workspace`]. `false` for every real workspace.
     pub ephemeral: bool,
     // --- Layout patterns (spec-layout-patterns.md) ---
-    /// The tab interior. Always [`LayoutMode::Plane`] (infinite-plane, Stage D);
+    /// The workspace interior. Always [`LayoutMode::Plane`] (infinite-plane, Stage D);
     /// persisted for snapshot-format stability but ignored on load (Behavior 7).
     pub layout_mode: LayoutMode,
     /// Inert persisted fields from the retired MasterStack mode. No longer read
     /// by any layout logic (the plane never re-tiles); kept only so the on-disk
-    /// snapshot shape (`PersistedTab`) stays stable and old snapshots round-trip.
+    /// snapshot shape (`PersistedWorkspace`) stays stable and old snapshots round-trip.
     pub master_ratio: f32,
     pub master_count: usize,
-    /// Tag-view filter. When non-empty, the tab shows only windows whose
+    /// Tag-view filter. When non-empty, the workspace shows only windows whose
     /// buffer carries at least one tag in this set. Empty = show all.
     pub tag_view: TagSet,
     /// Desktop-mode placement (spec-desktop-mode.md). Geometry only — the
@@ -1117,19 +1115,19 @@ pub struct Tab<C> {
     /// switching away from Desktop so the arrangement survives round-trips.
     pub desktop: DesktopState,
     /// The **project** this workspace belongs to (ADR-0028, `UXI-Project-2`).
-    /// **Private and required**: a `Tab` cannot be constructed without one (build
-    /// via [`Tab::with_layout`]), so no workspace — real or ephemeral — can exist
+    /// **Private and required**: a `Workspace` cannot be constructed without one (build
+    /// via [`Workspace::with_layout`]), so no workspace — real or ephemeral — can exist
     /// without a project. This is a **foreign key** (a `ProjectId`), NOT a cwd:
     /// the working directory is owned by the project and resolved at the point of
-    /// use (`projects.cwd_of(tab.project())`), never cached here — so a project
+    /// use (`projects.cwd_of(wsp.project())`), never cached here — so a project
     /// cwd repoint is picked up live with nothing to keep in sync. Replaced the
-    /// per-tab `WorkspaceCwd` field (ADR-0023, lifted to the project); the
+    /// per-workspace `WorkspaceCwd` field (ADR-0023, lifted to the project); the
     /// same "unrepresentable without one" typed-required-field discipline.
     project: ProjectId,
 }
 
-impl<C> Tab<C> {
-    /// THE `Tab` constructor (the project field is private, so this is the only
+impl<C> Workspace<C> {
+    /// THE `Workspace` constructor (the project field is private, so this is the only
     /// way to build one outside this module). Requires a [`ProjectId`] — that is
     /// what makes a project-less workspace unrepresentable. Non-project fields
     /// default (no rail, not ephemeral, Desktop layout, empty tags); callers set
@@ -1199,242 +1197,242 @@ pub struct FileBuffer {
     pub tags: TagSet,
 }
 
-/// Top-level container for the GPUI frontend. Owns the tab strip, the file-
-/// buffer pool, and the active-tab pointer. Replaces today's
+/// Top-level container for the GPUI frontend. Owns the workspace strip, the file-
+/// buffer pool, and the active-workspace pointer. Replaces today's
 /// `GpuiApp.screen` + `GpuiApp.open_buffers` + `GpuiApp.active_buffer_idx` triple.
-pub struct Workspace<C> {
-    pub tabs: Vec<Tab<C>>,
-    pub active_tab: usize,
+pub struct Frame<C> {
+    pub workspaces: Vec<Workspace<C>>,
+    pub active_workspace: usize,
     pub file_buffers: HashMap<FileBufferId, FileBuffer>,
     /// Canonical path → buffer id, for pool lookups during open.
     pub path_index: HashMap<PathBuf, FileBufferId>,
     pub next_buffer_id: u64,
     pub next_window_id: u64,
-    /// Monotonic counter feeding `Tab::auto_name`. Bumped on each tab create.
-    pub next_tab_index: usize,
+    /// Monotonic counter feeding `Workspace::auto_name`. Bumped on each workspace create.
+    pub next_workspace_index: usize,
     // --- Layout patterns (spec-layout-patterns.md) ---
-    /// Workspace-global mark table (Phase 1). Cross-tab bookmarks on windows.
+    /// Workspace-global mark table (Phase 1). Cross-workspace bookmarks on windows.
     pub marks: MarkTable,
     /// Shortcut keys bound to tag names (Phase 3). `Ctrl-W t {key}` views
     /// the tag mapped to `{key}`.
     pub tag_shortcuts: HashMap<char, String>,
-    /// The **project** a newly-created tab inherits when there is no active tab to
-    /// copy from (the first/root tab). Set by the binary at construction
+    /// The **project** a newly-created workspace inherits when there is no active workspace to
+    /// copy from (the first/root workspace). Set by the binary at construction
     /// (`with_initial`) / restore from the migrated `Projects` store; thereafter
-    /// new tabs inherit the *active* tab's project. A `ProjectId` FK — the
+    /// new workspaces inherit the *active* workspace's project. A `ProjectId` FK — the
     /// migration guarantees at least one project exists at boot, so a real id is
     /// always available (ADR-0028 §3).
     default_project: ProjectId,
 }
 
-impl<C> Workspace<C> {
-    /// Bare workspace with no tabs, rooted at `default_project` (the project a
-    /// tab created before any exists — or without an explicit project — inherits;
-    /// in practice the first tab comes via `with_initial` or restore, so it is
+impl<C> Frame<C> {
+    /// Bare workspace with no workspaces, rooted at `default_project` (the project a
+    /// workspace created before any exists — or without an explicit project — inherits;
+    /// in practice the first workspace comes via `with_initial` or restore, so it is
     /// rarely the live source). The caller supplies a real `ProjectId` from the
     /// (already-built) `Projects` store — ADR-0028's "projects before workspace"
     /// boot ordering.
     pub fn new(default_project: ProjectId) -> Self {
         Self {
-            tabs: Vec::new(),
-            active_tab: 0,
+            workspaces: Vec::new(),
+            active_workspace: 0,
             file_buffers: HashMap::new(),
             path_index: HashMap::new(),
             next_buffer_id: 1,
             next_window_id: 1,
-            next_tab_index: 1,
+            next_workspace_index: 1,
             marks: MarkTable::new(),
             tag_shortcuts: HashMap::new(),
             default_project,
         }
     }
 
-    /// The project a new tab should inherit: the active tab's, else
+    /// The project a new workspace should inherit: the active workspace's, else
     /// `default_project`.
     pub fn inherited_project(&self) -> ProjectId {
-        self.active_tab()
+        self.active_workspace()
             .map(|t| t.project())
             .unwrap_or(self.default_project)
     }
 
-    pub fn active_tab(&self) -> Option<&Tab<C>> {
-        self.tabs.get(self.active_tab)
+    pub fn active_workspace(&self) -> Option<&Workspace<C>> {
+        self.workspaces.get(self.active_workspace)
     }
 
-    pub fn active_tab_mut(&mut self) -> Option<&mut Tab<C>> {
-        self.tabs.get_mut(self.active_tab)
+    pub fn active_workspace_mut(&mut self) -> Option<&mut Workspace<C>> {
+        self.workspaces.get_mut(self.active_workspace)
     }
 
-    /// Borrow the focused window's content (None if no tab, or the tab's
+    /// Borrow the focused window's content (None if no wsp, or the workspace's
     /// focused id is missing from the layout — invariant violation).
     pub fn focused_content(&self) -> Option<&C> {
-        let tab = self.active_tab()?;
-        tab.layout.find_leaf(tab.focused).map(|w| &w.content)
+        let wsp = self.active_workspace()?;
+        wsp.layout.find_leaf(wsp.focused).map(|w| &w.content)
     }
 
     /// Mutably borrow the focused window's content.
     pub fn focused_content_mut(&mut self) -> Option<&mut C> {
-        let tab = self.active_tab_mut()?;
-        let focused = tab.focused;
-        tab.layout.find_leaf_mut(focused).map(|w| &mut w.content)
+        let wsp = self.active_workspace_mut()?;
+        let focused = wsp.focused;
+        wsp.layout.find_leaf_mut(focused).map(|w| &mut w.content)
     }
 
     /// Replace the focused window's content in place. Returns the old value
     /// (or None if there's no focused window).
     pub fn replace_focused_content(&mut self, content: C) -> Option<C> {
-        let tab = self.active_tab_mut()?;
-        let focused = tab.focused;
-        let win = tab.layout.find_leaf_mut(focused)?;
+        let wsp = self.active_workspace_mut()?;
+        let focused = wsp.focused;
+        let win = wsp.layout.find_leaf_mut(focused)?;
         Some(std::mem::replace(&mut win.content, content))
     }
 
-    /// The id of the focused window (or None if the workspace has no tabs).
+    /// The id of the focused window (or None if the workspace has no workspaces).
     pub fn focused_window_id(&self) -> Option<WindowId> {
-        self.active_tab().map(|t| t.focused)
+        self.active_workspace().map(|t| t.focused)
     }
 
-    /// Construct a workspace pre-populated with one tab containing one
-    /// window of `content`. Tab name is auto-assigned to `tab-1`.
+    /// Construct a workspace pre-populated with one workspace containing one
+    /// window of `content`. Workspace name is auto-assigned to `workspace-1`.
     pub fn with_initial(content: C, project: ProjectId) -> Self {
-        // This project seeds the root tab AND is the fallback every later tab
+        // This project seeds the root workspace AND is the fallback every later workspace
         // inherits from when there's nothing active to copy.
         let mut ws = Self::new(project);
-        ws.push_initial_tab(content, project);
+        ws.push_initial_workspace(content, project);
         ws
     }
 
-    /// Append a new tab containing a single window with `content`, belonging to
-    /// `project`. Becomes the active tab. Returns the new window's id. (Callers
+    /// Append a new workspace containing a single window with `content`, belonging to
+    /// `project`. Becomes the active workspace. Returns the new window's id. (Callers
     /// wanting "inherit the current workspace's project" pass
-    /// [`Workspace::inherited_project`].)
-    pub fn push_initial_tab(&mut self, content: C, project: ProjectId) -> WindowId {
+    /// [`Frame::inherited_project`].)
+    pub fn push_initial_workspace(&mut self, content: C, project: ProjectId) -> WindowId {
         let id = self.alloc_window_id();
-        let name = auto_tab_name(self.next_tab_index);
-        self.next_tab_index += 1;
-        self.tabs
-            .push(Tab::with_layout(name, Layout::Leaf(Window { id, content }), id, project));
-        self.active_tab = self.tabs.len() - 1;
+        let name = auto_workspace_name(self.next_workspace_index);
+        self.next_workspace_index += 1;
+        self.workspaces
+            .push(Workspace::with_layout(name, Layout::Leaf(Window { id, content }), id, project));
+        self.active_workspace = self.workspaces.len() - 1;
         id
     }
 
-    /// Append a tab inheriting the **active** workspace's project (else the
-    /// `default_project`). Convenience over [`push_initial_tab`] for the common
+    /// Append a workspace inheriting the **active** workspace's project (else the
+    /// `default_project`). Convenience over [`push_initial_workspace`] for the common
     /// "new workspace beside this one" case, resolving the project in one `&mut
     /// self` borrow.
-    pub fn push_tab_inheriting(&mut self, content: C) -> WindowId {
+    pub fn push_workspace_inheriting(&mut self, content: C) -> WindowId {
         let project = self.inherited_project();
-        self.push_initial_tab(content, project)
+        self.push_initial_workspace(content, project)
     }
 
-    /// Close the tab at index `idx`. The active-tab pointer adjusts to stay
-    /// in range; closing the last tab leaves the workspace with zero tabs
+    /// Close the workspace at index `idx`. The active-workspace pointer adjusts to stay
+    /// in range; closing the last workspace leaves the workspace with zero workspaces
     /// (caller is responsible for the spec Behavior 2 placeholder).
     ///
-    /// Agent tiles in the closed tab hold only a `SessionId` key — the session
-    /// STATE lives in `YaldaGpuiView::sessions`. So closing a tab/window FREES
+    /// Agent tiles in the closed workspace hold only a `SessionId` key — the session
+    /// STATE lives in `YaldaGpuiView::sessions`. So closing a workspace/window FREES
     /// (does not KILL) any agent session it showed: the session stays in the
     /// store, still running, re-bindable from another tile's selector. An
     /// explicit close (`claude-close`) is the only path that kills a session.
-    pub fn close_tab(&mut self, idx: usize) {
-        if idx >= self.tabs.len() {
+    pub fn close_workspace(&mut self, idx: usize) {
+        if idx >= self.workspaces.len() {
             return;
         }
-        self.tabs.remove(idx);
-        if self.active_tab >= self.tabs.len() {
-            self.active_tab = self.tabs.len().saturating_sub(1);
-        } else if idx < self.active_tab {
-            self.active_tab -= 1;
+        self.workspaces.remove(idx);
+        if self.active_workspace >= self.workspaces.len() {
+            self.active_workspace = self.workspaces.len().saturating_sub(1);
+        } else if idx < self.active_workspace {
+            self.active_workspace -= 1;
         }
     }
 
-    /// Is the tab at `idx` an ephemeral virtual workspace (ADR-0021)?
+    /// Is the workspace at `idx` an ephemeral virtual workspace (ADR-0021)?
     pub fn is_ephemeral(&self, idx: usize) -> bool {
-        self.tabs.get(idx).is_some_and(|t| t.ephemeral)
+        self.workspaces.get(idx).is_some_and(|t| t.ephemeral)
     }
 
-    /// Is the *active* tab an ephemeral virtual workspace? (Equivalently: does a
+    /// Is the *active* workspace an ephemeral virtual workspace? (Equivalently: does a
     /// virtual workspace currently exist — by invariant it is always the active
     /// one, created active and torn down the instant focus leaves it.)
     pub fn active_is_ephemeral(&self) -> bool {
-        self.is_ephemeral(self.active_tab)
+        self.is_ephemeral(self.active_workspace)
     }
 
-    /// THE workspace-switch chokepoint (ADR-0021). Activate the tab at `idx`,
+    /// THE workspace-switch chokepoint (ADR-0021). Activate the workspace at `idx`,
     /// first tearing down a departing **ephemeral** virtual workspace: if the
-    /// currently-active tab is ephemeral and we are leaving it, that tab is
+    /// currently-active workspace is ephemeral and we are leaving it, that workspace is
     /// removed (dropping its single agent tile, which returns the session to
     /// *free* in the store — the tile holds only a `SessionId` key). Index math
-    /// accounts for the removal so `idx` still lands on its intended tab. No-op
+    /// accounts for the removal so `idx` still lands on its intended workspace. No-op
     /// if `idx` is out of range. Does NOT notify — callers do.
-    pub fn set_active_tab(&mut self, idx: usize) {
-        if idx >= self.tabs.len() {
+    pub fn set_active_workspace(&mut self, idx: usize) {
+        if idx >= self.workspaces.len() {
             return;
         }
-        let cur = self.active_tab;
+        let cur = self.active_workspace;
         if cur != idx && self.is_ephemeral(cur) {
-            self.tabs.remove(cur);
-            // The ephemeral tab is gone; shift `idx` down if it sat after it.
+            self.workspaces.remove(cur);
+            // The ephemeral workspace is gone; shift `idx` down if it sat after it.
             let target = if idx > cur { idx - 1 } else { idx };
-            self.active_tab = target.min(self.tabs.len().saturating_sub(1));
+            self.active_workspace = target.min(self.workspaces.len().saturating_sub(1));
         } else {
-            self.active_tab = idx;
+            self.active_workspace = idx;
         }
     }
 
     /// Open an **ephemeral virtual workspace** (ADR-0021): a transient,
-    /// single-tile tab holding `content`, made active. If a virtual workspace is
+    /// single-tile workspace holding `content`, made active. If a virtual workspace is
     /// already open it is replaced (we never accumulate more than one). Returns
     /// the new tile's window id. Does NOT notify — callers do.
-    pub fn open_ephemeral_tab(&mut self, content: C) -> WindowId {
+    pub fn open_ephemeral_workspace(&mut self, content: C) -> WindowId {
         // Inherit the spawning workspace's cwd BEFORE we (possibly) drop it, so
         // an agent created in the virtual workspace lands in the same dir as the
         // workspace you jumped from — not the process dir (the regression this
         // typed cwd makes impossible; ADR-0023).
         let project = self.inherited_project();
-        self.open_ephemeral_tab_in(content, project)
+        self.open_ephemeral_workspace_in(content, project)
     }
 
-    /// Like [`Workspace::open_ephemeral_tab`] but pins the virtual workspace to an
+    /// Like [`Frame::open_ephemeral_workspace`] but pins the virtual workspace to an
     /// explicit `project` (UXI-Project-6): a free-session jump opens its ephemeral
     /// workspace under the SESSION's own project, not the spawning workspace's, so
     /// the subsequent bind is intra-project by construction.
-    pub fn open_ephemeral_tab_in(&mut self, content: C, project: ProjectId) -> WindowId {
+    pub fn open_ephemeral_workspace_in(&mut self, content: C, project: ProjectId) -> WindowId {
         // Replace any existing virtual workspace rather than stacking.
         if self.active_is_ephemeral() {
-            let cur = self.active_tab;
-            self.tabs.remove(cur);
+            let cur = self.active_workspace;
+            self.workspaces.remove(cur);
         }
         let id = self.alloc_window_id();
-        let name = auto_tab_name(self.next_tab_index);
-        self.next_tab_index += 1;
-        let mut tab = Tab::with_layout(name, Layout::Leaf(Window { id, content }), id, project);
-        tab.ephemeral = true;
-        self.tabs.push(tab);
-        self.active_tab = self.tabs.len() - 1;
+        let name = auto_workspace_name(self.next_workspace_index);
+        self.next_workspace_index += 1;
+        let mut wsp = Workspace::with_layout(name, Layout::Leaf(Window { id, content }), id, project);
+        wsp.ephemeral = true;
+        self.workspaces.push(wsp);
+        self.active_workspace = self.workspaces.len() - 1;
         id
     }
 
-    /// Cycle to the next tab (wraps). Routes through [`set_active_tab`] so a
+    /// Cycle to the next workspace (wraps). Routes through [`set_active_workspace`] so a
     /// departing virtual workspace is torn down.
-    pub fn next_tab(&mut self) {
-        if self.tabs.is_empty() {
+    pub fn next_workspace(&mut self) {
+        if self.workspaces.is_empty() {
             return;
         }
-        let next = (self.active_tab + 1) % self.tabs.len();
-        self.set_active_tab(next);
+        let next = (self.active_workspace + 1) % self.workspaces.len();
+        self.set_active_workspace(next);
     }
 
-    /// Cycle to the previous tab (wraps). Routes through [`set_active_tab`].
-    pub fn prev_tab(&mut self) {
-        if self.tabs.is_empty() {
+    /// Cycle to the previous workspace (wraps). Routes through [`set_active_workspace`].
+    pub fn prev_workspace(&mut self) {
+        if self.workspaces.is_empty() {
             return;
         }
-        let prev = if self.active_tab == 0 {
-            self.tabs.len() - 1
+        let prev = if self.active_workspace == 0 {
+            self.workspaces.len() - 1
         } else {
-            self.active_tab - 1
+            self.active_workspace - 1
         };
-        self.set_active_tab(prev);
+        self.set_active_workspace(prev);
     }
 
     /// Allocate the next stable window id.
@@ -1593,9 +1591,9 @@ impl<C> Workspace<C> {
     }
 }
 
-impl<C> Workspace<C> {
-    /// Insert a new window adjacent to the focused leaf in the active tab.
-    /// Implements Behavior 12–13 of `spec-tabs-and-splits.md`:
+impl<C> Frame<C> {
+    /// Insert a new window adjacent to the focused leaf in the active workspace.
+    /// Implements Behavior 12–13 of `spec-workspaces-and-splits.md`:
     /// - If the focused leaf's parent split has the same `dir`, append the
     ///   new leaf right after the focused leaf (no nesting).
     /// - Otherwise (root leaf, or perpendicular parent), wrap the focused
@@ -1604,21 +1602,21 @@ impl<C> Workspace<C> {
     /// The new window's weight initializes to the average of existing
     /// siblings; all weights renormalize to sum to 1.0. Focus moves to the
     /// new window. Returns the new window's id (or `None` if the workspace
-    /// has no active tab).
+    /// has no active workspace).
     pub fn split_focused(&mut self, dir: SplitDir, content: C) -> Option<WindowId> {
         let new_id = self.alloc_window_id();
         let new_window = Window {
             id: new_id,
             content,
         };
-        let tab = self.active_tab_mut()?;
-        let focused = tab.focused;
-        let path = tab.layout.path_to(focused)?;
+        let wsp = self.active_workspace_mut()?;
+        let focused = wsp.focused;
+        let path = wsp.layout.path_to(focused)?;
 
         if path.is_empty() {
             // Root is the focused leaf. Wrap it in a Split with the new leaf.
-            let old_root = std::mem::take(&mut tab.layout);
-            tab.layout = Layout::Split {
+            let old_root = std::mem::take(&mut wsp.layout);
+            wsp.layout = Layout::Split {
                 dir,
                 children: vec![(0.5, old_root), (0.5, Layout::Leaf(new_window))],
             };
@@ -1626,7 +1624,7 @@ impl<C> Workspace<C> {
             // Walk to the parent of the focused leaf.
             let (parent_path, tail) = path.split_at(path.len() - 1);
             let leaf_idx = tail[0];
-            let parent = tab.layout.node_at_path_mut(parent_path)?;
+            let parent = wsp.layout.node_at_path_mut(parent_path)?;
             let Layout::Split {
                 dir: parent_dir,
                 children,
@@ -1655,29 +1653,29 @@ impl<C> Workspace<C> {
                 children[leaf_idx] = (old_weight, nested);
             }
         }
-        tab.focused = new_id;
+        wsp.focused = new_id;
         Some(new_id)
     }
 
     /// Close the focused window. Returns:
     /// - `Ok(Some(new_focus))` — close succeeded, focus moved to a sibling.
-    /// - `Ok(None)` — the focused window was the last in the tab; the caller
-    ///   should close the tab (or replace it with a placeholder per spec
+    /// - `Ok(None)` — the focused window was the last in the workspace; the caller
+    ///   should close the workspace (or replace it with a placeholder per spec
     ///   Behavior 2).
-    /// - `Err(())` — no active tab / no focused window.
+    /// - `Err(())` — no active workspace / no focused window.
     pub fn close_focused(&mut self) -> Result<Option<WindowId>, ()> {
-        let tab = self.active_tab_mut().ok_or(())?;
-        let focused = tab.focused;
-        let path = tab.layout.path_to(focused).ok_or(())?;
+        let wsp = self.active_workspace_mut().ok_or(())?;
+        let focused = wsp.focused;
+        let path = wsp.layout.path_to(focused).ok_or(())?;
 
         if path.is_empty() {
-            // Focused leaf IS the root. The tab has nothing left.
+            // Focused leaf IS the root. The workspace has nothing left.
             return Ok(None);
         }
 
         let (parent_path, tail) = path.split_at(path.len() - 1);
         let leaf_idx = tail[0];
-        let parent = tab.layout.node_at_path_mut(parent_path).ok_or(())?;
+        let parent = wsp.layout.node_at_path_mut(parent_path).ok_or(())?;
         let Layout::Split { children, .. } = parent else {
             return Err(());
         };
@@ -1698,7 +1696,7 @@ impl<C> Workspace<C> {
         if collapse {
             // Replace this split with its sole remaining child.
             let only_child = std::mem::take(&mut children[0].1);
-            let parent_slot = tab.layout.node_at_path_mut(parent_path).ok_or(())?;
+            let parent_slot = wsp.layout.node_at_path_mut(parent_path).ok_or(())?;
             *parent_slot = only_child;
         } else {
             // Renormalize the remaining siblings.
@@ -1706,39 +1704,39 @@ impl<C> Workspace<C> {
         }
 
         if let Some(id) = new_focus {
-            tab.focused = id;
+            wsp.focused = id;
             Ok(Some(id))
         } else {
             Ok(None)
         }
     }
 
-    /// Detach the focused window from the active tab's layout, returning the
+    /// Detach the focused window from the active workspace's layout, returning the
     /// owned `Window<C>` (content travels with it — no cloning). Used by the
     /// "move tile to workspace" verb.
     ///
     /// Returns `Ok((window, source_now_empty))`:
     /// - `window` — the relocated leaf, ready to insert elsewhere.
-    /// - `source_now_empty` — true when the focused leaf was the tab's root,
-    ///   so the active tab's layout is left as `Layout::Empty` and the caller
-    ///   should remove the tab (or leave it if it's the only one).
+    /// - `source_now_empty` — true when the focused leaf was the workspace's root,
+    ///   so the active workspace's layout is left as `Layout::Empty` and the caller
+    ///   should remove the workspace (or leave it if it's the only one).
     ///
     /// On the non-root case the split is pruned exactly like `close_focused`
     /// (collapse single-child splits, renormalize, re-focus a sibling).
     ///
-    /// `Err(())` — no active tab / no focused window.
+    /// `Err(())` — no active workspace / no focused window.
     pub fn detach_focused(&mut self) -> Result<(Window<C>, bool), ()> {
-        let tab = self.active_tab_mut().ok_or(())?;
-        let focused = tab.focused;
-        let path = tab.layout.path_to(focused).ok_or(())?;
+        let wsp = self.active_workspace_mut().ok_or(())?;
+        let focused = wsp.focused;
+        let path = wsp.layout.path_to(focused).ok_or(())?;
 
         if path.is_empty() {
-            // Focused leaf is the root — take it, leave the tab empty.
-            let root = std::mem::take(&mut tab.layout);
+            // Focused leaf is the root — take it, leave the workspace empty.
+            let root = std::mem::take(&mut wsp.layout);
             let Layout::Leaf(window) = root else {
                 // path_to said empty path means root is the target leaf, so
                 // this is unreachable; restore and bail defensively.
-                tab.layout = root;
+                wsp.layout = root;
                 return Err(());
             };
             return Ok((window, true));
@@ -1746,7 +1744,7 @@ impl<C> Workspace<C> {
 
         let (parent_path, tail) = path.split_at(path.len() - 1);
         let leaf_idx = tail[0];
-        let parent = tab.layout.node_at_path_mut(parent_path).ok_or(())?;
+        let parent = wsp.layout.node_at_path_mut(parent_path).ok_or(())?;
         let Layout::Split { children, .. } = parent else {
             return Err(());
         };
@@ -1772,33 +1770,33 @@ impl<C> Workspace<C> {
         let collapse = children.len() == 1;
         if collapse {
             let only_child = std::mem::take(&mut children[0].1);
-            let parent_slot = tab.layout.node_at_path_mut(parent_path).ok_or(())?;
+            let parent_slot = wsp.layout.node_at_path_mut(parent_path).ok_or(())?;
             *parent_slot = only_child;
         } else {
             renormalize(children);
         }
 
         if let Some(id) = new_focus {
-            tab.focused = id;
+            wsp.focused = id;
         }
         Ok((window, false))
     }
 
-    /// Append `window` as a new leaf in the tab at `tab_idx`, focusing it
+    /// Append `window` as a new leaf in the workspace at `workspace_idx`, focusing it
     /// there. The window keeps its existing `id` (ids are workspace-unique).
     ///
     /// Placement mirrors `split_focused`'s root case: if the target layout is
     /// a single leaf, it is wrapped in a vertical `Split` so the arriving tile
     /// sits beside it; if it is already a `Split`, the leaf is appended as a
-    /// new child and weights renormalize; an `Empty` target (a tab whose sole
+    /// new child and weights renormalize; an `Empty` target (a workspace whose sole
     /// tile was just moved away) simply adopts the leaf as its root.
     ///
-    /// Returns `Err(())` if `tab_idx` is out of range.
-    pub fn insert_leaf_into_tab(&mut self, tab_idx: usize, window: Window<C>) -> Result<(), ()> {
+    /// Returns `Err(())` if `workspace_idx` is out of range.
+    pub fn insert_leaf_into_workspace(&mut self, workspace_idx: usize, window: Window<C>) -> Result<(), ()> {
         let id = window.id;
-        let tab = self.tabs.get_mut(tab_idx).ok_or(())?;
-        let root = std::mem::take(&mut tab.layout);
-        tab.layout = match root {
+        let wsp = self.workspaces.get_mut(workspace_idx).ok_or(())?;
+        let root = std::mem::take(&mut wsp.layout);
+        wsp.layout = match root {
             Layout::Empty => Layout::Leaf(window),
             Layout::Leaf(existing) => Layout::Split {
                 dir: SplitDir::V,
@@ -1815,17 +1813,17 @@ impl<C> Workspace<C> {
                 Layout::Split { dir, children }
             }
         };
-        tab.focused = id;
+        wsp.focused = id;
         Ok(())
     }
 
-    /// Close every window in the active tab except the focused one. The
-    /// focused leaf becomes the tab's root. Returns `Err(())` if there is no
+    /// Close every window in the active workspace except the focused one. The
+    /// focused leaf becomes the workspace's root. Returns `Err(())` if there is no
     /// focused window.
     pub fn only(&mut self) -> Result<(), ()> {
-        let tab = self.active_tab_mut().ok_or(())?;
-        let focused = tab.focused;
-        let path = tab.layout.path_to(focused).ok_or(())?;
+        let wsp = self.active_workspace_mut().ok_or(())?;
+        let focused = wsp.focused;
+        let path = wsp.layout.path_to(focused).ok_or(())?;
         if path.is_empty() {
             return Ok(()); // Already the root.
         }
@@ -1834,32 +1832,32 @@ impl<C> Workspace<C> {
         // Extract via walk: get to parent, swap leaf out with Empty.
         let (parent_path, tail) = path.split_at(path.len() - 1);
         let leaf_idx = tail[0];
-        let parent = tab.layout.node_at_path_mut(parent_path).ok_or(())?;
+        let parent = wsp.layout.node_at_path_mut(parent_path).ok_or(())?;
         if let Layout::Split { children, .. } = parent {
             let (_w, l) = children.get_mut(leaf_idx).ok_or(())?;
             focused_leaf = Some(std::mem::take(l));
         }
         let leaf = focused_leaf.ok_or(())?;
-        tab.layout = leaf;
+        wsp.layout = leaf;
         Ok(())
     }
 
     /// Cycle focus to the next tile in the plane's row-major slot order
-    /// (spec-infinite-plane-workspace.md Behavior 5). No-op if the active tab
+    /// (spec-infinite-plane-workspace.md Behavior 5). No-op if the active workspace
     /// has fewer than 2 tiles.
     pub fn focus_next(&mut self) -> Result<(), ()> {
-        let tab = self.active_tab_mut().ok_or(())?;
-        if let Some(next) = tab.desktop.sequence_neighbor(tab.focused, true) {
-            tab.focused = next;
+        let wsp = self.active_workspace_mut().ok_or(())?;
+        if let Some(next) = wsp.desktop.sequence_neighbor(wsp.focused, true) {
+            wsp.focused = next;
         }
         Ok(())
     }
 
     /// Cycle focus to the previous tile in the plane's row-major slot order.
     pub fn focus_prev(&mut self) -> Result<(), ()> {
-        let tab = self.active_tab_mut().ok_or(())?;
-        if let Some(prev) = tab.desktop.sequence_neighbor(tab.focused, false) {
-            tab.focused = prev;
+        let wsp = self.active_workspace_mut().ok_or(())?;
+        if let Some(prev) = wsp.desktop.sequence_neighbor(wsp.focused, false) {
+            wsp.focused = prev;
         }
         Ok(())
     }
@@ -1879,7 +1877,7 @@ impl<C> Workspace<C> {
     ///
     /// No-op when there's no sibling in the requested direction.
     pub fn focus_motion(&mut self, dir: FocusDir) -> Result<(), ()> {
-        let tab = self.active_tab_mut().ok_or(())?;
+        let wsp = self.active_workspace_mut().ok_or(())?;
         // Spatial navigation over plane slots (spec-infinite-plane-workspace.md
         // Behavior 5). No candidate = no-op.
         let sdir = match dir {
@@ -1888,26 +1886,26 @@ impl<C> Workspace<C> {
             FocusDir::Up => SpatialDir::Up,
             FocusDir::Down => SpatialDir::Down,
         };
-        if let Some(next) = tab.desktop.spatial_neighbor(tab.focused, sdir) {
-            tab.focused = next;
+        if let Some(next) = wsp.desktop.spatial_neighbor(wsp.focused, sdir) {
+            wsp.focused = next;
         }
         Ok(())
     }
 
     // --- Layout patterns: marks (Phase 1) ----------------------------------
 
-    /// Find which tab (by index) contains the window with the given id.
-    pub fn tab_containing(&self, id: WindowId) -> Option<usize> {
-        self.tabs
+    /// Find which workspace (by index) contains the window with the given id.
+    pub fn workspace_containing(&self, id: WindowId) -> Option<usize> {
+        self.workspaces
             .iter()
-            .position(|tab| tab.layout.find_leaf(id).is_some())
+            .position(|wsp| wsp.layout.find_leaf(id).is_some())
     }
 
-    /// Collect all window ids across all tabs (for mark GC).
+    /// Collect all window ids across all workspaces (for mark GC).
     pub fn all_window_ids(&self) -> HashSet<WindowId> {
         let mut out = HashSet::new();
-        for tab in &self.tabs {
-            tab.layout.for_each_leaf(&mut |w| {
+        for wsp in &self.workspaces {
+            wsp.layout.for_each_leaf(&mut |w| {
                 out.insert(w.id);
             });
         }
@@ -1915,14 +1913,14 @@ impl<C> Workspace<C> {
     }
 
     /// Retained no-op (infinite-plane, Stage D). The plane's `Layout<C>` tree is
-    /// the CONTENT owner only; geometry lives in `tab.desktop` and never rebuilds
+    /// the CONTENT owner only; geometry lives in `wsp.desktop` and never rebuilds
     /// the tree, so there is nothing to re-tile. Kept as a stable seam so the
     /// (many) callers that punctuated a structural mutation with a "settle the
     /// layout" call don't each need editing; on a plane it does nothing.
     pub fn retile_active(&mut self) {}
 }
 
-impl<C> Default for Workspace<C> {
+impl<C> Default for Frame<C> {
     fn default() -> Self {
         // Sentinel default project (`ProjectId(0)`); real construction passes an
         // id from the migrated `Projects` store (ADR-0028 boot ordering).
@@ -1931,8 +1929,8 @@ impl<C> Default for Workspace<C> {
 }
 
 /// Helper for new workspace auto-naming. User-facing default label for a
-/// freshly-created workspace (today's `Tab`) when the user hasn't renamed it.
-pub fn auto_tab_name(idx: usize) -> String {
+/// freshly-created workspace when the user hasn't renamed it.
+pub fn auto_workspace_name(idx: usize) -> String {
     format!("workspace-{idx}")
 }
 
@@ -2429,7 +2427,7 @@ mod tests {
         let path = dir.join("shared.md");
         std::fs::write(&path, "hello\n").unwrap();
 
-        let mut ws: Workspace<TestContent> = Workspace::new(ProjectId(0));
+        let mut ws: Frame<TestContent> = Frame::new(ProjectId(0));
         let (id1, core1) = ws.open_and_retain(&path).unwrap();
         let (id2, core2) = ws.open_and_retain(&path).unwrap();
 
@@ -2509,7 +2507,7 @@ mod tests {
 
     #[test]
     fn alloc_ids_are_monotonic() {
-        let mut ws: Workspace<TestContent> = Workspace::new(ProjectId(0));
+        let mut ws: Frame<TestContent> = Frame::new(ProjectId(0));
         assert_eq!(ws.alloc_window_id(), 1);
         assert_eq!(ws.alloc_window_id(), 2);
         assert_eq!(ws.alloc_buffer_id(), 1);
@@ -2518,14 +2516,14 @@ mod tests {
 
     #[test]
     fn canonical_key_handles_relative_paths() {
-        let key = Workspace::<TestContent>::canonical_key(Path::new("./nonexistent.md"));
+        let key = Frame::<TestContent>::canonical_key(Path::new("./nonexistent.md"));
         assert!(key.is_absolute());
         assert!(key.ends_with("nonexistent.md"));
     }
 
     #[test]
     fn open_buffer_pools_by_canonical_path() {
-        let mut ws: Workspace<TestContent> = Workspace::new(ProjectId(0));
+        let mut ws: Frame<TestContent> = Frame::new(ProjectId(0));
         // Use a path that probably doesn't exist on the FS so we exercise the
         // empty-buffer branch.
         let p = std::env::temp_dir().join("yalda-workspace-test-buffer.md");
@@ -2538,10 +2536,10 @@ mod tests {
 
     // --- Mutation methods (split / close / only / resize / equalize) ---
 
-    fn ws_with_layout(layout: Layout<TestContent>, focused: WindowId) -> Workspace<TestContent> {
-        let mut ws: Workspace<TestContent> = Workspace::new(ProjectId(0));
-        ws.tabs.push(Tab {
-            auto_name: "tab-1".into(),
+    fn ws_with_layout(layout: Layout<TestContent>, focused: WindowId) -> Frame<TestContent> {
+        let mut ws: Frame<TestContent> = Frame::new(ProjectId(0));
+        ws.workspaces.push(Workspace {
+            auto_name: "workspace-1".into(),
             display_name: None,
             layout,
             focused,
@@ -2555,7 +2553,7 @@ mod tests {
             project: ProjectId(0),
         });
         // Ensure window-id allocator skips past the ids we hand-rolled.
-        let max_id = ws.tabs[0].layout.leaf_ids().into_iter().max().unwrap_or(0);
+        let max_id = ws.workspaces[0].layout.leaf_ids().into_iter().max().unwrap_or(0);
         ws.next_window_id = max_id + 1;
         ws
     }
@@ -2564,17 +2562,17 @@ mod tests {
     fn split_focused_on_root_wraps_in_split() {
         let mut ws = ws_with_layout(leaf(1, "a"), 1);
         let new_id = ws.split_focused(SplitDir::V, TestContent("b")).unwrap();
-        let tab = ws.active_tab().unwrap();
-        match &tab.layout {
+        let wsp = ws.active_workspace().unwrap();
+        match &wsp.layout {
             Layout::Split { dir, children } => {
                 assert_eq!(*dir, SplitDir::V);
                 assert_eq!(children.len(), 2);
                 assert_eq!(children[0].1.leaf_ids(), vec![1]);
                 assert_eq!(children[1].1.leaf_ids(), vec![new_id]);
             }
-            _ => panic!("expected Split at root, got {:?}", tab.layout.leaf_ids()),
+            _ => panic!("expected Split at root, got {:?}", wsp.layout.leaf_ids()),
         }
-        assert_eq!(tab.focused, new_id);
+        assert_eq!(wsp.focused, new_id);
     }
 
     #[test]
@@ -2586,8 +2584,8 @@ mod tests {
         };
         let mut ws = ws_with_layout(layout, 2);
         let new_id = ws.split_focused(SplitDir::V, TestContent("c")).unwrap();
-        let tab = ws.active_tab().unwrap();
-        match &tab.layout {
+        let wsp = ws.active_workspace().unwrap();
+        match &wsp.layout {
             Layout::Split { dir, children } => {
                 assert_eq!(*dir, SplitDir::V);
                 assert_eq!(children.len(), 3);
@@ -2609,8 +2607,8 @@ mod tests {
         };
         let mut ws = ws_with_layout(layout, 2);
         let _new_id = ws.split_focused(SplitDir::H, TestContent("c")).unwrap();
-        let tab = ws.active_tab().unwrap();
-        match &tab.layout {
+        let wsp = ws.active_workspace().unwrap();
+        match &wsp.layout {
             Layout::Split { dir, children } => {
                 assert_eq!(*dir, SplitDir::V);
                 assert_eq!(children.len(), 2);
@@ -2636,12 +2634,12 @@ mod tests {
         let mut ws = ws_with_layout(layout, 2);
         let new_focus = ws.close_focused().unwrap();
         assert_eq!(new_focus, Some(1));
-        let tab = ws.active_tab().unwrap();
-        match &tab.layout {
+        let wsp = ws.active_workspace().unwrap();
+        match &wsp.layout {
             Layout::Leaf(w) => assert_eq!(w.id, 1),
             _ => panic!("expected collapsed root Leaf(1)"),
         }
-        assert_eq!(tab.focused, 1);
+        assert_eq!(wsp.focused, 1);
     }
 
     #[test]
@@ -2659,8 +2657,8 @@ mod tests {
         let new_focus = ws.close_focused().unwrap();
         // After close, focus moves to previous index → leaf 1.
         assert_eq!(new_focus, Some(1));
-        let tab = ws.active_tab().unwrap();
-        match &tab.layout {
+        let wsp = ws.active_workspace().unwrap();
+        match &wsp.layout {
             Layout::Split { children, .. } => {
                 assert_eq!(children.len(), 2);
                 let sum: f32 = children.iter().map(|(w, _)| *w).sum();
@@ -2671,7 +2669,7 @@ mod tests {
     }
 
     #[test]
-    fn close_focused_on_root_leaf_signals_tab_empty() {
+    fn close_focused_on_root_leaf_signals_workspace_empty() {
         let mut ws = ws_with_layout(leaf(1, "a"), 1);
         let result = ws.close_focused().unwrap();
         assert_eq!(result, None);
@@ -2695,8 +2693,8 @@ mod tests {
         };
         let mut ws = ws_with_layout(layout, 3);
         ws.only().unwrap();
-        let tab = ws.active_tab().unwrap();
-        assert_eq!(tab.layout.leaf_ids(), vec![3]);
+        let wsp = ws.active_workspace().unwrap();
+        assert_eq!(wsp.layout.leaf_ids(), vec![3]);
     }
 
     // NOTE (infinite-plane, Stage D): the retired split-tree topology tests
@@ -2714,12 +2712,12 @@ mod tests {
         // A single unseeded tile has no slot neighbor — focus_motion is a no-op.
         let mut ws = ws_with_layout(leaf(1, "only"), 1);
         ws.focus_motion(FocusDir::Right).unwrap();
-        assert_eq!(ws.active_tab().unwrap().focused, 1);
+        assert_eq!(ws.active_workspace().unwrap().focused, 1);
     }
 
     #[test]
     fn buffer_retain_release_lifecycle() {
-        let mut ws: Workspace<TestContent> = Workspace::new(ProjectId(0));
+        let mut ws: Frame<TestContent> = Frame::new(ProjectId(0));
         let p = std::env::temp_dir().join("yalda-workspace-test-refcount.md");
         let _ = std::fs::remove_file(&p);
         let id = ws.open_buffer(&p).unwrap();
@@ -2745,7 +2743,7 @@ mod tests {
         // Two windows of one file get two clones of the SAME core; an edit
         // through one is visible through the other, and the document's
         // `edit_seq` (the perf-cache key) advances for both since it's one doc.
-        let mut ws: Workspace<TestContent> = Workspace::new(ProjectId(0));
+        let mut ws: Frame<TestContent> = Frame::new(ProjectId(0));
         let p = std::env::temp_dir().join("yalda-shared-edit-test.md");
         let _ = std::fs::remove_file(&p);
 
@@ -2765,7 +2763,7 @@ mod tests {
 
     #[test]
     fn gc_reaps_unreferenced_clean_buffers_keeps_dirty() {
-        let mut ws: Workspace<TestContent> = Workspace::new(ProjectId(0));
+        let mut ws: Frame<TestContent> = Frame::new(ProjectId(0));
         let clean = std::env::temp_dir().join("yalda-gc-clean.md");
         let dirty = std::env::temp_dir().join("yalda-gc-dirty.md");
         let _ = std::fs::remove_file(&clean);
@@ -2794,7 +2792,7 @@ mod tests {
 
     #[test]
     fn gc_keeps_buffers_a_view_still_holds() {
-        let mut ws: Workspace<TestContent> = Workspace::new(ProjectId(0));
+        let mut ws: Frame<TestContent> = Frame::new(ProjectId(0));
         let p = std::env::temp_dir().join("yalda-gc-live.md");
         let _ = std::fs::remove_file(&p);
         let (id, core) = ws.open_and_retain(&p).unwrap();
@@ -2811,13 +2809,13 @@ mod tests {
     // --- Relocate (move tile to workspace) ---------------------------------
 
     #[test]
-    fn detach_focused_root_leaves_tab_empty() {
+    fn detach_focused_root_leaves_workspace_empty() {
         let mut ws = ws_with_layout(leaf(1, "a"), 1);
         let (window, empty) = ws.detach_focused().unwrap();
         assert_eq!(window.id, 1);
         assert_eq!(window.content.0, "a");
-        assert!(empty, "detaching the root leaf empties the tab");
-        assert!(matches!(ws.tabs[0].layout, Layout::Empty));
+        assert!(empty, "detaching the root leaf empties the workspace");
+        assert!(matches!(ws.workspaces[0].layout, Layout::Empty));
     }
 
     #[test]
@@ -2830,19 +2828,19 @@ mod tests {
         let mut ws = ws_with_layout(layout, 2);
         let (window, empty) = ws.detach_focused().unwrap();
         assert_eq!(window.id, 2);
-        assert!(!empty, "tab still has the sibling");
-        match &ws.tabs[0].layout {
+        assert!(!empty, "workspace still has the sibling");
+        match &ws.workspaces[0].layout {
             Layout::Leaf(w) => assert_eq!(w.id, 1),
             _ => panic!("expected collapsed Leaf(1)"),
         }
-        assert_eq!(ws.tabs[0].focused, 1);
+        assert_eq!(ws.workspaces[0].focused, 1);
     }
 
     #[test]
-    fn insert_leaf_into_empty_tab_adopts_root() {
+    fn insert_leaf_into_empty_workspace_adopts_root() {
         let mut ws = ws_with_layout(leaf(1, "a"), 1);
-        // Give it a second, empty tab.
-        ws.tabs.push(Tab {
+        // Give it a second, empty workspace.
+        ws.workspaces.push(Workspace {
             auto_name: "workspace-2".into(),
             display_name: None,
             layout: Layout::Empty,
@@ -2860,18 +2858,18 @@ mod tests {
             id: 9,
             content: TestContent("moved"),
         };
-        ws.insert_leaf_into_tab(1, w).unwrap();
-        match &ws.tabs[1].layout {
+        ws.insert_leaf_into_workspace(1, w).unwrap();
+        match &ws.workspaces[1].layout {
             Layout::Leaf(w) => assert_eq!(w.id, 9),
-            _ => panic!("empty tab should adopt the leaf as root"),
+            _ => panic!("empty workspace should adopt the leaf as root"),
         }
-        assert_eq!(ws.tabs[1].focused, 9);
+        assert_eq!(ws.workspaces[1].focused, 9);
     }
 
     #[test]
-    fn insert_leaf_into_leaf_tab_wraps_in_split() {
+    fn insert_leaf_into_leaf_workspace_wraps_in_split() {
         let mut ws = ws_with_layout(leaf(1, "a"), 1);
-        ws.tabs.push(Tab {
+        ws.workspaces.push(Workspace {
             auto_name: "workspace-2".into(),
             display_name: None,
             layout: leaf(5, "x"),
@@ -2889,8 +2887,8 @@ mod tests {
             id: 9,
             content: TestContent("moved"),
         };
-        ws.insert_leaf_into_tab(1, w).unwrap();
-        match &ws.tabs[1].layout {
+        ws.insert_leaf_into_workspace(1, w).unwrap();
+        match &ws.workspaces[1].layout {
             Layout::Split { children, .. } => {
                 assert_eq!(children.len(), 2);
                 assert_eq!(children[0].1.leaf_ids(), vec![5]);
@@ -2898,18 +2896,18 @@ mod tests {
             }
             _ => panic!("expected a 2-child split"),
         }
-        assert_eq!(ws.tabs[1].focused, 9);
+        assert_eq!(ws.workspaces[1].focused, 9);
     }
 
     #[test]
-    fn move_focused_leaf_across_tabs_roundtrip() {
-        // Source tab [a | b]; move focused b to a second (empty) tab.
+    fn move_focused_leaf_across_workspaces_roundtrip() {
+        // Source workspace [a | b]; move focused b to a second (empty) workspace.
         let layout = Layout::Split {
             dir: SplitDir::V,
             children: vec![(0.5, leaf(1, "a")), (0.5, leaf(2, "b"))],
         };
         let mut ws = ws_with_layout(layout, 2);
-        ws.tabs.push(Tab {
+        ws.workspaces.push(Workspace {
             auto_name: "workspace-2".into(),
             display_name: None,
             layout: Layout::Empty,
@@ -2925,11 +2923,11 @@ mod tests {
         });
         let (window, empty) = ws.detach_focused().unwrap();
         assert!(!empty);
-        ws.insert_leaf_into_tab(1, window).unwrap();
+        ws.insert_leaf_into_workspace(1, window).unwrap();
         // Source collapsed to a.
-        assert_eq!(ws.tabs[0].layout.leaf_ids(), vec![1]);
+        assert_eq!(ws.workspaces[0].layout.leaf_ids(), vec![1]);
         // Target now holds the moved leaf.
-        assert_eq!(ws.tabs[1].layout.leaf_ids(), vec![2]);
-        assert_eq!(ws.tabs[1].focused, 2);
+        assert_eq!(ws.workspaces[1].layout.leaf_ids(), vec![2]);
+        assert_eq!(ws.workspaces[1].focused, 2);
     }
 }
