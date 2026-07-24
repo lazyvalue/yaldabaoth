@@ -13,6 +13,20 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Closing a free session lands in the SAME project** — `NEEDS-RUNTIME` (branch
+  `free-close-same-project`, 2026-07-24; amends `UXI-Workspace-9` clause 2).
+  Reported: *"when I close a free agent session it drops me in a different project
+  sometimes."* The first cut returned to the workspace you jumped FROM, which is a
+  foreign project whenever you jumped across projects. Now the landing stays in the
+  **closed session's** project: origin-if-same-project → that project's first
+  workspace → (project has no workspace) **another session in it**, in its own bare
+  agent view → origin/last. Guard
+  `closing_a_free_session_lands_in_the_same_project` (three projects; both NCs
+  observed RED, one reproducing the reported bug exactly). Also recorded the
+  **terminology** the user asked for — "free" = a session no tile binds — in
+  `docs/components/README.md` § Terminology, cross-referenced from the jump-panel
+  and session-binding specs.
+
 - **Contextual "New Agent" + one-gesture close in the bare agent view** —
   `NEEDS-RUNTIME` (branch `contextual-new-agent`, 2026-07-24 via `/new-ux`;
   `UXI-Workspace-8`, `UXI-Workspace-9`, `UXI-AgentTile-23`). Two user

@@ -529,25 +529,45 @@ selector tile to dismiss with a second `.` `x`.
 1. **Only in the ephemeral case.** In a real workspace, closing a session is
    unchanged: the tile stays an agent tile and becomes a live unbound **selector**
    (an agent tile never vanishes and never becomes a buffer).
-2. **Return to origin.** The frame records the workspace the ephemeral was opened
-   FROM (`Frame::ephemeral_origin`, the origin workspace's focused `WindowId` — a
-   stable key, unlike an index) and reactivates exactly that workspace. If the
-   origin is gone (closed while the ephemeral was up), the last remaining workspace
-   is used. There is always ≥1 real workspace, so the fallback is total.
+2. **Land in the CLOSED SESSION'S project — never a foreign one.** The ephemeral
+   workspace is pinned to the session's project (`UXI-Project-6`), and that is the
+   project the user stays in. In preference order:
+   1. **The origin**, when it belongs to that project. The frame records the
+      workspace the ephemeral was opened FROM (`Frame::ephemeral_origin`, the origin
+      workspace's focused `WindowId` — a stable key, unlike an index).
+   2. Else **the project's first workspace** — the origin is a foreign project (you
+      jumped in from project A to a project-B session), so going "back" would drop
+      you somewhere you weren't working.
+   3. Else — the project has **no workspace at all** — **another agent session in
+      that project**, opened in its own bare agent view. Projected from the same
+      list the jump panel shows, in the order the user sees it; the session just
+      closed is excluded by both its local `SessionId` and its server sid (the
+      roster still lists that sid until the async `SessionDeleted` arrives).
+   4. Else the origin whatever its project, then the last remaining workspace. There
+      is always ≥1 real workspace, so the landing is total.
+
+   A **workspace is never auto-bound to some other session**: clause 3 only fires
+   when the project has no workspace to land on, which is exactly when a session is
+   the only in-project destination that exists.
 3. **Replacing one ephemeral with another keeps the ORIGINAL origin** — the
    ephemeral is the thing you return *from*, never the thing you return *to*.
 4. Switch-away teardown (ADR-0021, `set_active_workspace`) is unchanged; it just
    clears the recorded origin.
 
 **Applies to.** `workspace.rs`: `Frame::ephemeral_origin`,
-`Frame::dismiss_ephemeral_workspace`, `Frame::workspace_index_of_window`, the origin
+`Frame::dismiss_ephemeral_workspace`, `Frame::same_project_landing`,
+`Frame::active_ephemeral_project`, `Frame::workspace_index_of_window`, the origin
 capture in `open_ephemeral_workspace_in`, the clear in `set_active_workspace`.
-`agent_ui.rs`: the tail of `close_active_agent_session`.
+`agent_ui.rs`: the tail of `close_active_agent_session` +
+`same_project_session_target`.
 
 **Why.** The bare agent view exists *to show that one session*. Once the session is
 closed the view has nothing to show, so leaving a selector behind makes the user
 close the same thing twice (`<space> x … yes`, then `.` `x`) — the friction this
-invariant removes.
+invariant removes. Clause 2's project rule came from the first version shipping a
+plain return-to-origin: jumping to a **free** session in another project and closing
+it silently dropped the user into the project they'd jumped *from*. Closing a session
+is not a request to change projects.
 
 **Status.** `implemented` (headless, end-to-end on the real close path).
 
@@ -565,6 +585,18 @@ session on a properly-bound tile in a real workspace.
 *Negative controls (both observed RED):* skip the `dismiss_ephemeral_workspace` call
 → "the ephemeral view is gone" fires (`3` vs `2`); force the origin lookup to `None`
 → "we land back on the ORIGIN workspace" fires (`1` vs `0`).
+
+Clause 2's project rule is pinned separately by
+`verify_harness.rs::closing_a_free_session_lands_in_the_same_project` — three
+projects (A has the workspace the user sits on, B has a workspace, C has **none**),
+same REAL close path. Arm 1: a project-B session jumped to from A lands on **B's**
+workspace, not the A origin. Arm 2: closing one of project C's two sessions lands on
+**the other C session** in its own bare agent view, not a foreign workspace.
+*Negative controls (both observed RED):* drop the `same_project` preference in
+`dismiss_ephemeral_workspace` → arm 1 lands on workspace `0` (project A) — the
+reported bug, reproduced exactly; drop the `session_fallback` in
+`close_active_agent_session` → arm 2 ends with no bound session (`None` vs the
+sibling).
 
 **Deviation from plan.** The clause-1 contrast lives in the `UXI-AgentTile-23` test
 rather than this one: binding a second free session into a *real* workspace mid-test

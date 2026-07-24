@@ -54,6 +54,25 @@ holds the detail for a slice. The UXI ids stay owned by the component, not the f
 - [common/](common/README.md) — shared behaviors: `TextEditing`, `Selection`,
   `TextZoom`, `Blockquote`, `ParagraphSpacing`, `Menu` (leader command panel).
 
+## Terminology (use these words)
+
+The vocabulary component specs are written in. These are the user's words — prefer
+them in specs, code comments, and UI copy over ad-hoc synonyms.
+
+- **free** — a session that **no tile binds**: it belongs to no workspace, runs on
+  its own, and is re-bindable at any time. "Free" is the standing term for this
+  (not "unbound session", "orphan", "detached", or "loose"). A free session shows
+  in the jump panel's agent list and in any tile selector; selecting one **binds**
+  it. The 1:1 store is what makes the state well-defined — a session is bound by at
+  most one tile, so "free" is exactly "bound by zero"
+  (`spec-agent-session-ownership.md`).
+  - **bare agent view** — the **ephemeral virtual workspace** a free session opens
+    in when you jump to it from the jump panel (ADR-0021): one agent, fullscreen,
+    torn down on switch-away. Distinct from a session shown in a tile of a real
+    workspace.
+  - *Note:* **unbound** stays the right word for a **tile** with no session (it
+    renders the selector). Sessions are free; tiles are unbound.
+
 ## Format of a component spec
 
 Every component spec has three parts:

@@ -1441,28 +1441,66 @@ impl<C> Frame<C> {
             .position(|w| w.layout.find_leaf(id).is_some())
     }
 
-    /// Tear down the active **ephemeral** virtual workspace and return to the
-    /// workspace it was opened from (`UXI-Workspace-9`). Called when the session a
-    /// bare agent view exists to show is closed — the view has nothing left to show,
-    /// so it should not linger as a selector the user must dismiss again.
+    /// The workspace a dismissal should land on to STAY IN `project`
+    /// (`UXI-Workspace-9` clause 2): the recorded origin when it belongs to
+    /// `project` (you jumped from inside the project — going back is right),
+    /// otherwise that project's first non-ephemeral workspace. `None` when the
+    /// project has no workspace at all, which is the caller's signal to fall back
+    /// to another session in the project rather than a foreign project's workspace.
     ///
-    /// No-op when the active workspace is not ephemeral (a real workspace's tile
-    /// stays put and becomes a selector — clause 1). The origin is resolved BEFORE
-    /// the removal (indices shift) and falls back to the last remaining workspace if
-    /// it is gone, so the landing is total. Does NOT notify — callers do.
+    /// Pure — it does not consume the origin.
+    pub fn same_project_landing(&self, project: ProjectId) -> Option<usize> {
+        self.ephemeral_origin
+            .and_then(|w| self.workspace_index_of_window(w))
+            .filter(|&i| self.workspaces.get(i).is_some_and(|w| w.project() == project))
+            .or_else(|| {
+                self.workspaces
+                    .iter()
+                    .position(|w| !w.ephemeral && w.project() == project)
+            })
+    }
+
+    /// The project of the active ephemeral virtual workspace — i.e. the project of
+    /// the session a bare agent view is showing (`UXI-Project-6` pins the ephemeral
+    /// workspace to the SESSION's project). `None` when the active workspace isn't
+    /// ephemeral.
+    pub fn active_ephemeral_project(&self) -> Option<ProjectId> {
+        self.active_workspace()
+            .filter(|w| w.ephemeral)
+            .map(|w| w.project())
+    }
+
+    /// Tear down the active **ephemeral** virtual workspace and land somewhere in
+    /// the SAME project (`UXI-Workspace-9`). Called when the session a bare agent
+    /// view exists to show is closed — the view has nothing left to show, so it
+    /// should not linger as a selector the user must dismiss again.
+    ///
+    /// Landing order: [`Frame::same_project_landing`] (origin-if-same-project, else
+    /// the project's first workspace), then the origin whatever its project, then
+    /// the last remaining workspace — so the landing is total even for a project
+    /// with no workspace. (In that case the CALLER prefers another session in the
+    /// project and jumps to it after this returns; see
+    /// `close_active_agent_session`.) No-op when the active workspace is not
+    /// ephemeral (a real workspace's tile stays put and becomes a selector —
+    /// clause 1). Does NOT notify — callers do.
     pub fn dismiss_ephemeral_workspace(&mut self) {
         if !self.active_is_ephemeral() {
             return;
         }
         let cur = self.active_workspace;
+        // Resolve every candidate BEFORE the removal — indices shift after it.
+        let same_project = self
+            .active_ephemeral_project()
+            .and_then(|p| self.same_project_landing(p));
         let origin = self
             .ephemeral_origin
             .take()
             .and_then(|w| self.workspace_index_of_window(w));
+        let target = same_project.or(origin);
         self.workspaces.remove(cur);
         let last = self.workspaces.len().saturating_sub(1);
-        self.active_workspace = match origin {
-            // The ephemeral workspace is always pushed last, so a live origin sits
+        self.active_workspace = match target {
+            // The ephemeral workspace is always pushed last, so a live target sits
             // before it; the `>` arm is defensive, not reachable today.
             Some(i) if i > cur => (i - 1).min(last),
             Some(i) => i.min(last),

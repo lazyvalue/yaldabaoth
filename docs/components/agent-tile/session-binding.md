@@ -12,6 +12,8 @@ persisted layout leaf, so restore rebinds each tile to its OWN session.
 
 ## References
 
+- `docs/components/README.md` § Terminology — a session no tile binds is **free**
+  (the standing term); a *tile* with no session is **unbound**.
 - ADR-0025 — identity-based binding + auto-resume (the decision).
 - `spec-agent-session-ownership.md` — the live 1:1 store invariant.
 - `spec-workspaces-and-splits.md` Behavior 23–24 — workspace persistence.

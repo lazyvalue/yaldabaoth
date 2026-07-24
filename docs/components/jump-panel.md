@@ -58,6 +58,9 @@ Sections:
 
 ## References
 
+- `docs/components/README.md` § Terminology — **free** (a session no tile binds) and
+  **bare agent view** (the ephemeral workspace a free session opens in). The panel's
+  agent list is where free sessions live.
 - `docs/specs/spec-jump-panel.md` — deeper design doc.
 - ADR-0021 — the ephemeral virtual-workspace decision that shaped free-session
   jump.
