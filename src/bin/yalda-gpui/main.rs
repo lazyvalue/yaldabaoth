@@ -490,9 +490,24 @@ fn format_menu_key(seq: &[KeyPress]) -> String {
 pub(crate) const MENU_PANEL_MIN_W: f32 = 340.0;
 pub(crate) const MENU_PANEL_MAX_W: f32 = 720.0;
 pub(crate) const MENU_PANEL_TOP: f32 = 48.0;
-/// Left gutter between the jump panel and the card, so the card sits about where
-/// the first workspace tile would render rather than glued to the panel edge.
-pub(crate) const MENU_PANEL_LEFT_PAD: f32 = 16.0;
+/// Left gutter between the jump panel and the card, so the card sits just inside
+/// the tile region — offset enough that it doesn't line up flush with the first
+/// tile's edge (which read as an accidental alignment).
+pub(crate) const MENU_PANEL_LEFT_PAD: f32 = 30.0;
+
+/// Command-panel background: an **elevated** surface — a touch LIGHTER than the
+/// editor/tile background at the same hue + saturation — so the card stands out
+/// from both the workspace/tiles (which use `editor_bg`) and the recessed jump bar
+/// (`jump_panel_bg`, which goes the other way). A fixed ΔL, clamped, so it lifts on
+/// dark themes and reads as a near-white note on light ones without muddying the hue.
+pub(crate) fn menu_panel_bg(editor: Hsla) -> Hsla {
+    let l = if editor.l >= 0.5 {
+        (editor.l + 0.04).min(0.985) // light themes: a lifted near-white card
+    } else {
+        (editor.l + 0.055).min(1.0) // dark themes: a soft lift so it glows above the bg
+    };
+    Hsla { l, ..editor }
+}
 
 /// Build the keystroke trail for the current menu depth (UXI-Menu-3): the leader
 /// glyph followed by each descended submenu key, plus the name of the level you're
@@ -6412,7 +6427,9 @@ impl YaldaGpuiView {
         };
 
         let ov = &self.theme.overlay;
-        let menu_bg: Hsla = nc(ov.bg);
+        // Elevated card bg: lighter than tiles/workspace AND the recessed jump bar,
+        // derived from the live editor bg so the separation holds on every theme.
+        let menu_bg: Hsla = menu_panel_bg(self.editor_bg());
         let label_fg: Hsla = nc(ov.label);
         let key_fg: Hsla = nc(ov.key);
         let label_text_fg: Hsla = nc(ov.fg);

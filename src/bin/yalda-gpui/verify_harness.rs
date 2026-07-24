@@ -6267,6 +6267,40 @@ fn jump_panel_bg_shades_by_theme_and_preserves_hue() {
     assert!(l.l < light.l - 0.02, "light bg → darker panel, got L {}", l.l);
 }
 
+/// UXI-Menu-5: the command panel is an ELEVATED surface — lighter than the editor
+/// (tiles/workspace) at the same hue + saturation — so it stands out. It lifts on
+/// both dark and light themes, and crucially goes the OPPOSITE direction from the
+/// recessed jump bar, so the two never converge. Pure fn.
+///
+/// Negative control: make `menu_panel_bg` return `editor` unchanged → the
+/// lighter-than-editor asserts fail; make it darken (like `jump_panel_bg`) → the
+/// "opposite direction from the jump bar" assert fails.
+#[test]
+fn menu_panel_bg_is_elevated_and_distinct_from_jump_bar() {
+    use crate::{jump_panel_bg, menu_panel_bg};
+    use gpui::Hsla;
+    // Dark theme (Nightfox-ish editor_bg L≈0.17): card lifts above the bg.
+    let dark = Hsla { h: 0.62, s: 0.30, l: 0.17, a: 1.0 };
+    let d = menu_panel_bg(dark);
+    assert!(d.l > dark.l + 0.02, "dark bg → lighter card (got L {} vs {})", d.l, dark.l);
+    assert!(
+        (d.h - dark.h).abs() < 1e-6 && (d.s - dark.s).abs() < 1e-6 && d.a == dark.a,
+        "hue + saturation + alpha preserved (no muddying)"
+    );
+    // The card and the jump bar diverge from the same editor bg (elevated vs recessed).
+    assert!(
+        d.l > jump_panel_bg(dark).l + 0.05,
+        "card ({}) must be clearly lighter than the recessed jump bar ({})",
+        d.l,
+        jump_panel_bg(dark).l
+    );
+    // Light theme (paper L≈0.94): still lifts (a near-white elevated card).
+    let light = Hsla { h: 0.12, s: 0.5, l: 0.94, a: 1.0 };
+    let l = menu_panel_bg(light);
+    assert!(l.l > light.l, "light bg → lighter card, got L {}", l.l);
+    assert!(l.l <= 1.0, "clamped");
+}
+
 /// UXI-JumpPanel-8: clicking a project name opens a context menu (the REAL entry
 /// point `open_project_menu`), and choosing an item runs the project-scoped action
 /// and dismisses the menu. New workspace creates a workspace in THAT project;

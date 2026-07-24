@@ -59,9 +59,10 @@ level — a menu whose goal is its own obsolescence.
 to `[MENU_PANEL_MIN_W (340px), MENU_PANEL_MAX_W (720px)]` and is strictly less than
 the window width on any monitor wider than `MENU_PANEL_MAX_W`. It is **left-anchored**
 just past the jump panel — its left edge sits at
-`JUMP_PANEL_WIDTH + MENU_PANEL_LEFT_PAD (16px)` when the panel is visible (else
-`MENU_PANEL_LEFT_PAD`), about where the first workspace tile renders — and pinned a
-fixed `MENU_PANEL_TOP (48px)` below the top of the window. It grows down/right from
+`JUMP_PANEL_WIDTH + MENU_PANEL_LEFT_PAD (30px)` when the panel is visible (else
+`MENU_PANEL_LEFT_PAD`), just inside the tile region but offset enough not to line up
+flush with the first tile's edge — and pinned a fixed `MENU_PANEL_TOP (48px)` below
+the top of the window. It grows down/right from
 that anchor; it is not centered.
 
 **Applies to.** `render_menu_overlay` (`main.rs`); the wrapper that composites it
@@ -142,7 +143,32 @@ static-render descent read as the card breathing rather than teleporting.
 
 **Enforcement.** `verify_harness.rs::menu_panel_top_stable_across_descent` — opens
 the `.` workspace menu, probes the card top, descends into a submenu, and asserts the
-top is unchanged. The accent-bar *color* is the documented pixel gap.
+top + left edges are unchanged. The accent-bar *color* is the documented pixel gap.
+
+### UXI-Menu-5 — the card is an elevated (lighter) surface
+
+**Statement.** The card background is an **elevated surface**: derived from the live
+`editor_bg` (what tiles + the workspace paint) and lifted in lightness at the same
+hue + saturation, so it stands out from both the tiles/workspace AND the recessed
+jump bar (`jump_panel_bg`, which shifts the *opposite* way). It lifts on both dark
+and light themes and never converges with the jump bar's shade.
+
+**Applies to.** `menu_panel_bg` (pure fn, `main.rs`); `render_menu_overlay`'s
+`menu_bg` (was `overlay.bg`, now `menu_panel_bg(self.editor_bg())`); `jump_panel_bg`
+(the recessed counterpart it must not match).
+
+**Why.** With the flat `overlay.bg` the card didn't read as distinct from the
+workspace on some themes. Tying it to the live editor bg guarantees the separation on
+every theme, and elevating (vs. the jump bar recessing) gives a coherent depth model:
+jump bar sunk, tiles level, command card raised.
+
+**Status.** `implemented`
+
+**Enforcement.** `verify_harness.rs::menu_panel_bg_is_elevated_and_distinct_from_jump_bar`
+— the pure fn lifts lightness above `editor` on dark + light themes, preserves
+hue/sat/alpha, and lands clearly lighter than `jump_panel_bg` of the same editor.
+Negative control: return `editor` unchanged (or darken like the jump bar) ⇒ RED. The
+exact resulting color per theme is the documented pixel gap.
 
 ## Deviations from the design brief (Fable, "The Sigil Card")
 
