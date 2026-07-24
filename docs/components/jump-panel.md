@@ -441,13 +441,21 @@ The panel's **look** is:
 - **Weight.** Row labels render at **`SEMIBOLD`** (they read too thin at normal
   weight; still a step under the `BOLD` uppercase project headers, so the header >
   row hierarchy holds). The project-name red is softened to α 0.9.
-- **Recessed background.** The panel background is `jump_panel_bg(editor_bg())` — a
-  touch darker in **lightness** than the editor at the **same hue + saturation**
+- **Recessed background.** The panel background is `agent.jump_panel_bg` when a
+  theme art-directs one (e.g. **Nightfox** `#0d1119`), else `jump_panel_bg(editor_bg())`
+  — a touch darker in **lightness** than the editor at the **same hue + saturation**
   (dropping saturation is what muddies a tinted bg), with a **lighten-flip** on
   near-black themes so the seam never vanishes. A fixed ΔL (−0.035 dark / −0.045
   light / +0.04 near-black), not a multiply or black-composite (those vanish at
   low L and overshoot at high L). The darker shade also makes the cyan selection
   tint pop.
+
+- **Theme-owned accents.** The header red, the "Unfiled" subheader blue, and the
+  "working" star color are no longer fixed constants — they are `AgentTheme`
+  fields (`jump_header` / `jump_subheader` / `jump_working`), defaulting to the old
+  theme-neutral values for every theme, with **Nightfox** art-directed to its
+  palette (`#c94f6d` / `#719cd6` / `#f4a261`). The waiting-green (`tool_completed`),
+  neutral-dim (`dim`), and selection cyan (`frozen_bar`) were already theme-derived.
 
 The navigation/marks/status behavior (`UXI-JumpPanel-1/-2/-5/-6`, `UXI-Project-3`)
 is otherwise unchanged; the section view-model (`jump_panel_sections`) is
@@ -457,8 +465,10 @@ untouched — only `render_jump_panel` and `jump_nav_row` changed.
 without cwd/✕, per-section `jump_divider`, `⊞` workspace badge + right-edge number
 hint, `✦` session badge via `jump_session_row_el`, `jump_panel_bg` background),
 `jump_nav_row` (new `hint` param + `SEMIBOLD` label), `jump_panel_bg` +
-`jump_divider` (new free fns). `main.rs`: `global_menu` (+ "new project" entry) and
-`dispatch_menu_command` (+ `"new-project"` arm).
+`jump_divider` (new free fns). `main.rs`: `global_menu` (+ "new project" entry),
+`dispatch_menu_command` (+ `"new-project"` arm), `render_project_menu` (delete color
+from `jump_header`). `theme.rs`: `AgentTheme.{jump_panel_bg, jump_header,
+jump_subheader, jump_working}` (all 8 themes; Nightfox art-directed).
 
 **Why.** With projects, workspaces, and sessions all listed, the panel had grown a
 thicket of ＋/✕ affordances and cwd lines that competed with the navigation it
@@ -476,8 +486,11 @@ dark → darker, near-black → lighter, light → darker, hue+sat+alpha preserv
 return `editor` unchanged → the dark/near-black asserts fail) and
 `new_project_relocated_to_global_menu` (the global menu offers "new project" and
 `dispatch_menu_command("new-project")` opens the REAL New Project overlay; NC:
-drop the `"new-project"` dispatch arm → the overlay never opens). The removed rows'
-absence + the visual treatment are gap #1.
+drop the `"new-project"` dispatch arm → the overlay never opens). The theme-owned
+accents are pinned by `tests.rs::nightfox_jump_panel_colors_are_art_directed`
+(Nightfox carries its palette-native jump colors, Dracula preserves the legacy
+constants + `jump_panel_bg: None`; NC: revert Nightfox's fields to the constants →
+RED). The removed rows' absence + the literal glyphs/colors are gap #1.
 
 ### UXI-JumpPanel-8 — Clicking a project name opens a context menu of project-scoped actions
 

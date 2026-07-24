@@ -6896,7 +6896,7 @@ impl YaldaGpuiView {
         // tint at low alpha, as an inset hover pill.
         let mut hover_bg: Hsla = nc(self.theme.agent.frozen_bar);
         hover_bg.a = 0.15;
-        let err: Hsla = rgb(0xff6b6b).into();
+        let err: Hsla = nc(self.theme.agent.jump_header);
         let mono = self.code_font.clone();
 
         let item = |id: &str,

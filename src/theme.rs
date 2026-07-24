@@ -195,6 +195,22 @@ pub struct AgentTheme {
     pub sidebar_header: Color,
     /// Active/warm accent (in-flight timer, focused subagent).
     pub warm_accent: Color,
+
+    // -- jump panel (sidebar navigator; UXI-JumpPanel-7/-8) --
+    /// Jump-panel background. `None` derives a recessed shade from `editor_bg`
+    /// (a small ΔL darken, or a lighten on near-black themes — `jump_panel_bg`);
+    /// `Some` is an explicit, art-directed per-theme panel color.
+    pub jump_panel_bg: Option<Color>,
+    /// Project-name + section header color in the jump panel (PINNED / a project
+    /// name / UNFILED). Was a fixed `#ff6b6b`; now theme-owned.
+    pub jump_header: Color,
+    /// Per-cwd "Unfiled" subheader color in the jump panel. Was a fixed
+    /// electric-blue `#3b9eff`.
+    pub jump_subheader: Color,
+    /// The "working" agent-session status star (a reply in flight). Was a fixed
+    /// orange `#ff9e64`. (Waiting-on-you = `tool_completed`; neutral = `dim`;
+    /// selection/active = `frozen_bar` — those already come from the theme.)
+    pub jump_working: Color,
 }
 
 /// Colors for popup overlays: command menu, buffer list, session
@@ -1169,6 +1185,11 @@ impl AgentTheme {
             sidebar_border: Color::Rgb(0x44, 0x47, 0x5a),
             sidebar_header: Color::Rgb(0x8b, 0xe9, 0xfd),
             warm_accent: Color::Rgb(0xf1, 0xfa, 0x8c),
+
+            jump_panel_bg: None,
+            jump_header: Color::Rgb(0xff, 0x6b, 0x6b),
+            jump_subheader: Color::Rgb(0x3b, 0x9e, 0xff),
+            jump_working: Color::Rgb(0xff, 0x9e, 0x64),
         }
     }
 
@@ -1214,6 +1235,14 @@ impl AgentTheme {
             sidebar_border: Color::Rgb(0x2b, 0x3b, 0x51),
             sidebar_header: Color::Rgb(0x63, 0xcd, 0xcf),
             warm_accent: Color::Rgb(0xdb, 0xc0, 0x74),
+
+            // Jump panel, art-directed to the Nightfox palette (not the fixed
+            // theme-neutral constants): a recessed navy panel, muted-rose headers,
+            // soft blue subheaders, and a warm-orange "working" star.
+            jump_panel_bg: Some(Color::Rgb(0x0d, 0x11, 0x19)), // deeper than editor #131a24
+            jump_header: Color::Rgb(0xc9, 0x4f, 0x6d),         // nightfox red
+            jump_subheader: Color::Rgb(0x71, 0x9c, 0xd6),      // nightfox blue
+            jump_working: Color::Rgb(0xf4, 0xa2, 0x61),        // nightfox orange
         }
     }
 
@@ -1259,6 +1288,11 @@ impl AgentTheme {
             sidebar_border: Color::Rgb(0xd3, 0xcc, 0xbc),
             sidebar_header: Color::Rgb(0x26, 0x8b, 0xd2),
             warm_accent: Color::Rgb(0xb5, 0x89, 0x00),
+
+            jump_panel_bg: None,
+            jump_header: Color::Rgb(0xff, 0x6b, 0x6b),
+            jump_subheader: Color::Rgb(0x3b, 0x9e, 0xff),
+            jump_working: Color::Rgb(0xff, 0x9e, 0x64),
         }
     }
 
@@ -1304,6 +1338,11 @@ impl AgentTheme {
             sidebar_border: Color::Rgb(0x07, 0x42, 0x4e),
             sidebar_header: Color::Rgb(0x26, 0x8b, 0xd2),
             warm_accent: Color::Rgb(0xb5, 0x89, 0x00),
+
+            jump_panel_bg: None,
+            jump_header: Color::Rgb(0xff, 0x6b, 0x6b),
+            jump_subheader: Color::Rgb(0x3b, 0x9e, 0xff),
+            jump_working: Color::Rgb(0xff, 0x9e, 0x64),
         }
     }
 
@@ -1349,6 +1388,11 @@ impl AgentTheme {
             sidebar_border: Color::Rgb(0x3c, 0x38, 0x36),
             sidebar_header: Color::Rgb(0xfa, 0xbd, 0x2f),
             warm_accent: Color::Rgb(0xfa, 0xbd, 0x2f),
+
+            jump_panel_bg: None,
+            jump_header: Color::Rgb(0xff, 0x6b, 0x6b),
+            jump_subheader: Color::Rgb(0x3b, 0x9e, 0xff),
+            jump_working: Color::Rgb(0xff, 0x9e, 0x64),
         }
     }
 
@@ -1394,6 +1438,11 @@ impl AgentTheme {
             sidebar_border: Color::Rgb(0xd8, 0xd0, 0xc4),
             sidebar_header: Color::Rgb(0x99, 0x0f, 0x3d),
             warm_accent: Color::Rgb(0xff, 0x88, 0x33),
+
+            jump_panel_bg: None,
+            jump_header: Color::Rgb(0xff, 0x6b, 0x6b),
+            jump_subheader: Color::Rgb(0x3b, 0x9e, 0xff),
+            jump_working: Color::Rgb(0xff, 0x9e, 0x64),
         }
     }
 
@@ -1439,6 +1488,11 @@ impl AgentTheme {
             sidebar_border: Color::Rgb(0x36, 0x32, 0x2e),
             sidebar_header: Color::Rgb(0xd6, 0x3b, 0x6a),
             warm_accent: Color::Rgb(0xff, 0x88, 0x33),
+
+            jump_panel_bg: None,
+            jump_header: Color::Rgb(0xff, 0x6b, 0x6b),
+            jump_subheader: Color::Rgb(0x3b, 0x9e, 0xff),
+            jump_working: Color::Rgb(0xff, 0x9e, 0x64),
         }
     }
 
@@ -1484,6 +1538,11 @@ impl AgentTheme {
             sidebar_border: Color::Rgb(0xd6, 0xd2, 0xca),
             sidebar_header: Color::Rgb(0x40, 0x5d, 0x72), // steel
             warm_accent: Color::Rgb(0x8b, 0x70, 0x20),
+
+            jump_panel_bg: None,
+            jump_header: Color::Rgb(0xff, 0x6b, 0x6b),
+            jump_subheader: Color::Rgb(0x3b, 0x9e, 0xff),
+            jump_working: Color::Rgb(0xff, 0x9e, 0x64),
         }
     }
 }

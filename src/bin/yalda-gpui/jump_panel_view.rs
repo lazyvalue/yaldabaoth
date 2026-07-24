@@ -502,7 +502,7 @@ impl YaldaGpuiView {
             fg: self.editor_fg(),
             dim: nc(self.theme.agent.dim),
             accent: nc(self.theme.agent.warm_accent),
-            err: rgb(0xff6b6b).into(),
+            err: nc(self.theme.agent.jump_header),
             mono: self.code_font.clone(),
             prose: self.body_font.clone(),
             base: px(13.0),
@@ -517,11 +517,16 @@ impl YaldaGpuiView {
         let active_accent = nc(self.theme.agent.frozen_bar);
         let mut sel_bg = active_accent;
         sel_bg.a = 0.15;
-        // The panel is a recessed room: same hue + saturation as the editor, a
-        // touch darker in lightness (a lighten-flip on near-black themes so the
-        // seam never vanishes) — `jump_panel_bg`. Untouched s keeps it from
-        // muddying (dropping saturation is what browns a blue-tinted bg).
-        let panel_bg = jump_panel_bg(self.editor_bg());
+        // The panel is a recessed room. A theme may art-direct its exact shade
+        // (`agent.jump_panel_bg = Some(...)`, e.g. Nightfox); otherwise it's
+        // derived from the editor bg: same hue + saturation, a touch darker in
+        // lightness (a lighten-flip on near-black themes so the seam never
+        // vanishes) — `jump_panel_bg`. Untouched s keeps it from muddying
+        // (dropping saturation is what browns a blue-tinted bg).
+        let panel_bg = match self.theme.agent.jump_panel_bg {
+            Some(c) => nc(c),
+            None => jump_panel_bg(self.editor_bg()),
+        };
         let border = st.dim;
         // Inter-section hairline (a rule ABOVE each project header): the dim
         // border color at low alpha, so internal structure stays quieter than
@@ -535,14 +540,14 @@ impl YaldaGpuiView {
         // "Waiting for you" status-dot color (turn finished, your move). The
         // tool-completed green reads as ready/done across both themes.
         let ready = nc(self.theme.agent.tool_completed);
-        // Header palette: top-level section headers are RED (`st.err`); per-cwd
-        // subheaders are ELECTRIC BLUE (`0x3b9eff`, a vivid theme-neutral blue).
-        // Italic is reserved for the "waiting on you" session state (below), so
-        // headers carry no italic.
-        let electric: Hsla = rgb(0x3b9eff).into();
-        // Orange "working" status-dot (a reply is in flight). Fixed warm orange,
-        // distinct from the warm gold `warm_accent` and legible on every theme.
-        let working_orange: Hsla = rgb(0xff9e64).into();
+        // Header palette (theme-owned; `UXI-JumpPanel-7`): top-level section
+        // headers use `st.err` (= `agent.jump_header`); per-cwd "Unfiled"
+        // subheaders use `agent.jump_subheader`. Italic is reserved for the
+        // "waiting on you" session state (below), so headers carry no italic.
+        let electric: Hsla = nc(self.theme.agent.jump_subheader);
+        // "Working" status star (a reply in flight) — `agent.jump_working`, warm
+        // and distinct from the gold `warm_accent`.
+        let working_orange: Hsla = nc(self.theme.agent.jump_working);
 
         // The active screen element for the red "you are here" box (UXI-JumpPanel-5):
         // the session bound to the focused tile (matched against each row below).

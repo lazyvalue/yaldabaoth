@@ -9,20 +9,25 @@ The design intent: the panel reads as **one cool-blue family** (cyan active
 marks + electric-blue headers), with warm notes reserved for the status dots'
 traffic-light semantics.
 
-## Fixed constants (theme-independent)
+## Jump-panel colors are now theme-owned (`UXI-JumpPanel-7`)
 
-| Token        | Value      | Role |
-|--------------|------------|------|
-| `st.err`     | `0xff6b6b` | Top-level section headers (PINNED / WORKSPACES / AGENT SESSIONS) — red. |
-| `electric`   | `0x3b9eff` | Per-cwd subheaders — electric blue, real path casing. Vivid theme-neutral blue. |
-| `working_orange` | `0xff9e64` | The "working" status dot (reply in flight). Warm orange, distinct from `warm_accent` gold. |
+The three formerly-fixed accents were lifted into `AgentTheme` so each theme owns
+them (the AgentTheme "every hardcoded hex lifted here" pattern). The **default**
+values below preserve the old theme-neutral look for every theme; **Nightfox**
+art-directs its own palette-native set (see its `AgentTheme::nightfox`).
+
+| Token        | Source (`theme.agent.*`) | Default (most themes) | Nightfox | Role |
+|--------------|--------------------------|-----------------------|----------|------|
+| `st.err`     | `jump_header`            | `0xff6b6b`            | `0xc94f6d` | Top-level section headers (PINNED / UNFILED) + project names — red. |
+| `electric`   | `jump_subheader`         | `0x3b9eff`            | `0x719cd6` | Per-cwd "Unfiled" subheaders — real path casing. |
+| `working_orange` | `jump_working`       | `0xff9e64`            | `0xf4a261` | The "working" status star (reply in flight). |
 
 ## Theme-derived colors
 
 | Token          | Source (`theme.agent.*`) | Dracula hex | Role |
 |----------------|--------------------------|-------------|------|
 | `st.fg`        | `editor_fg()`            | —           | Default row label text. |
-| `panel_bg`     | `editor_bg()`            | —           | Panel background. |
+| `panel_bg`     | `jump_panel_bg` (`Some`) else `jump_panel_bg(editor_bg())` | `#20222c` (derived) / Nightfox `#0d1119` (explicit) | Recessed panel background — a per-theme ΔL darken of the editor bg (near-black themes lighten instead), or an explicit override. |
 | `border`       | `dim`                    | `0x6272a4`  | Panel right border. |
 | `st.dim`       | `dim`                    | `0x6272a4`  | Section-header underline, badge fallback, disconnected/off dot, disconnected row label, muted placeholder text. |
 | `active_accent`| `frozen_bar`             | `0x8be9fd`  | The "you are here" left accent bar, active row label, selection-tint base, "＋ New agent session" badge. |

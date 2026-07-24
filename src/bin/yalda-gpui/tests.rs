@@ -2,6 +2,38 @@
 
 use super::*;
 
+/// UXI-JumpPanel-7: the jump-panel accent colors are theme-owned, not fixed
+/// constants. Nightfox art-directs its own palette-native jump colors (explicit
+/// recessed panel bg + muted-rose header + soft-blue subheader + warm-orange
+/// working star); the other themes keep the legacy theme-neutral constants
+/// (`jump_panel_bg: None` ⇒ derive the shade from `editor_bg`).
+///
+/// Negative control: revert Nightfox's jump fields to the legacy constants
+/// (`jump_header = #ff6b6b`, `jump_panel_bg = None`, …) → the Nightfox asserts fail.
+#[test]
+fn nightfox_jump_panel_colors_are_art_directed() {
+    use yalda::style::Color;
+    use yalda::theme::AgentTheme;
+    let nf = AgentTheme::nightfox();
+    assert_eq!(
+        nf.jump_panel_bg,
+        Some(Color::Rgb(0x0d, 0x11, 0x19)),
+        "Nightfox art-directs an explicit recessed panel background"
+    );
+    assert_eq!(nf.jump_header, Color::Rgb(0xc9, 0x4f, 0x6d), "Nightfox red header");
+    assert_eq!(nf.jump_subheader, Color::Rgb(0x71, 0x9c, 0xd6), "Nightfox blue subheader");
+    assert_eq!(nf.jump_working, Color::Rgb(0xf4, 0xa2, 0x61), "Nightfox orange working star");
+    // Distinct from the legacy theme-neutral constants the other themes fall back to.
+    assert_ne!(nf.jump_header, Color::Rgb(0xff, 0x6b, 0x6b), "not the legacy #ff6b6b header");
+    let dr = AgentTheme::dracula();
+    assert_eq!(dr.jump_panel_bg, None, "Dracula still derives its panel shade from editor_bg");
+    assert_eq!(
+        dr.jump_header,
+        Color::Rgb(0xff, 0x6b, 0x6b),
+        "Dracula preserves the legacy jump-header red (unchanged look)"
+    );
+}
+
 /// UXI-AgentTile-21: the sentence splitter behind `[N]r` reply-with-quotation.
 /// Counts + joins the first N sentences; a decimal point and a common
 /// abbreviation do NOT split; a run with no terminator is one sentence; blank
