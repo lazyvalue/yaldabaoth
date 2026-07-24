@@ -457,6 +457,152 @@ pub(crate) fn save_preferences(prefs: &Preferences) {
     }
 }
 
+// ── Projects (ADR-0028, docs/components/project.md, UXI-Project-8) ───────────
+
+/// Path to the JSON file holding the Project registry (ADR-0028). **Global**,
+/// not cwd-keyed — projects are the top of the hierarchy, so one file holds them
+/// all. Same fail-safe seam as [`preferences_path`]: under `cfg(test)` returns
+/// `None` unless a test opts in via [`with_projects_path`], so a headless test
+/// never touches the user's real `~/.yalda/projects.json`.
+pub(crate) fn projects_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        return PROJECTS_PATH_OVERRIDE.with(|c| c.borrow().clone());
+    }
+    #[cfg(not(test))]
+    {
+        yalda::paths::yalda_home().map(|d| d.join("projects.json"))
+    }
+}
+
+/// Test-only seam mirroring [`PREFS_PATH_OVERRIDE`] for the projects file.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PROJECTS_PATH_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn with_projects_path<R>(path: PathBuf, f: impl FnOnce() -> R) -> R {
+    PROJECTS_PATH_OVERRIDE.with(|c| *c.borrow_mut() = Some(path));
+    let r = f();
+    PROJECTS_PATH_OVERRIDE.with(|c| *c.borrow_mut() = None);
+    r
+}
+
+/// On-disk shadow of one [`Project`]. `params` defaults empty so a file written
+/// before a future key existed loads cleanly; serde ignores unknown fields, so a
+/// *newer* file never resets the store (the migration discipline of
+/// `UXI-Workspace-7`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PersistedProject {
+    pub(crate) name: String,
+    pub(crate) cwd: String,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub(crate) params: std::collections::BTreeMap<String, String>,
+}
+
+/// The `projects.json` root.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PersistedProjects {
+    #[serde(default)]
+    pub(crate) projects: Vec<PersistedProject>,
+}
+
+/// Load the persisted project registry, or `None` when the file is absent — the
+/// signal that triggers a one-time cwd→project migration ([`migrate_cwds_to_projects`]).
+pub(crate) fn load_persisted_projects() -> Option<PersistedProjects> {
+    let path = projects_path()?;
+    let bytes = std::fs::read(&path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Best-effort write of the live [`Projects`] store. No-ops on any failure.
+pub(crate) fn save_persisted_projects(projects: &Projects) {
+    let Some(path) = projects_path() else {
+        return;
+    };
+    let doc = PersistedProjects {
+        projects: projects
+            .iter()
+            .map(|(_, p)| PersistedProject {
+                name: p.name.clone(),
+                cwd: p.cwd.display().to_string(),
+                params: p.params.clone(),
+            })
+            .collect(),
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(bytes) = serde_json::to_vec_pretty(&doc) {
+        let _ = std::fs::write(&path, bytes);
+    }
+}
+
+/// Rebuild a live [`Projects`] store from a persisted doc. Tolerant of a
+/// malformed/hand-edited file: a duplicate **name** folds to the existing
+/// project, a duplicate **cwd** folds to whatever roots there — the loader never
+/// panics and never drops a record's params.
+pub(crate) fn projects_from_persisted(doc: &PersistedProjects) -> Projects {
+    let mut ps = Projects::new();
+    for pp in &doc.projects {
+        let cwd = PathBuf::from(&pp.cwd);
+        let id = match ps.create(pp.name.clone(), cwd.clone()) {
+            Ok(id) => id,
+            // Fold a corrupt duplicate onto the existing project rather than fail.
+            Err(CreateError::DuplicateName) => match ps.by_name(&pp.name) {
+                Some(id) => id,
+                None => continue,
+            },
+            Err(CreateError::DuplicateCwd(id)) => id,
+        };
+        if let Some(p) = ps.get_mut(id) {
+            p.params = pp.params.clone();
+        }
+    }
+    ps
+}
+
+/// The project name a cwd migrates to (ADR-0028 §7, `UXI-Project-8`): the last
+/// path component with its first letter capitalized. Basename `yaldabaoth` →
+/// `Yaldabaoth`, `fulcrum` → `Fulcrum` — the user's two named projects fall out
+/// of this general rule, and any other cwd gets its own basename-derived name.
+/// Total: an empty/rootless path falls back to `"Project"`.
+pub(crate) fn project_name_for_cwd(cwd: &std::path::Path) -> String {
+    let base = cwd
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "Project".to_string());
+    let mut chars = base.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => "Project".to_string(),
+    }
+}
+
+/// Migrate the cwds found across persisted workspaces + sessions into a named
+/// [`Projects`] store (ADR-0028 §7). Each **distinct canonical** cwd becomes a
+/// project named by [`project_name_for_cwd`]; a name clash folds via
+/// `get_or_create` (a documented limitation — two distinct dirs sharing a
+/// basename share a project; not expected in practice, where live state is under
+/// the two known cwds). **Total + panic-proof**: every cwd yields a project and
+/// nothing is dropped, so an old snapshot with no `projects.json` never loses
+/// data.
+pub(crate) fn migrate_cwds_to_projects(cwds: impl IntoIterator<Item = PathBuf>) -> Projects {
+    let mut ps = Projects::new();
+    for cwd in cwds {
+        // `ensure_at_cwd` dedups on the canonical key (so `/tmp` vs `/private/tmp`
+        // don't split) and uniquifies the basename-derived name on a clash, so
+        // both uniqueness invariants stay total.
+        let name = project_name_for_cwd(&cwd);
+        ps.ensure_at_cwd(cwd, &name);
+    }
+    ps
+}
+
 /// Serializable shadow of `App` for spec-tiles-and-apps.md (ADR-0019).
 ///
 /// The tag set is `{buffer{mode}, agent}` (was `{doc, edit, browser, claude}`).

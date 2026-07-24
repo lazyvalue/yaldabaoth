@@ -3685,3 +3685,81 @@ fn classify_link_routes_urls_external_and_notes_wiki() {
     // arbitrary local handler) — treated as a local reference.
     assert_eq!(classify_link("file:///etc/passwd"), LinkTarget::Wiki("file:///etc/passwd".into()));
 }
+
+// ── Projects: persistence + migration (T002, UXI-Project-8) ─────────────────
+
+/// UXI-Project-8 — migration maps distinct cwds to basename-derived project
+/// names, with the two known cwds falling out of the general rule; it is total
+/// (every cwd yields a project) and dedups by canonical cwd.
+///
+/// Negative control: replace `project_name_for_cwd(&cwd)` in
+/// `migrate_cwds_to_projects` with a constant `"Yaldabaoth".to_string()` — then
+/// all three cwds resolve to one name, fold via `get_or_create`, and this fails
+/// (`len()==1`, `by_name("Fulcrum")`/`("Archon")` are `None`).
+#[test]
+fn migration_maps_known_cwds_and_basename_fallback() {
+    let cwds = vec![
+        std::path::PathBuf::from("/home/scott/ws/yaldabaoth"),
+        std::path::PathBuf::from("/home/scott/ws/fulcrum"),
+        std::path::PathBuf::from("/home/scott/ws/archon"),
+        // A duplicate of the first — must fold, not create a fourth project.
+        std::path::PathBuf::from("/home/scott/ws/yaldabaoth"),
+    ];
+    let ps = migrate_cwds_to_projects(cwds);
+
+    assert_eq!(ps.len(), 3, "three distinct cwds → three projects (dup folded)");
+    // The two user-named projects fall out of the basename rule.
+    assert!(ps.by_name("Yaldabaoth").is_some(), "ws/yaldabaoth → Yaldabaoth");
+    assert!(ps.by_name("Fulcrum").is_some(), "ws/fulcrum → Fulcrum");
+    // The fallback names any other cwd from its basename.
+    assert!(ps.by_name("Archon").is_some(), "ws/archon → Archon (basename)");
+    // Totality: every cwd resolves back to a project (nothing dropped).
+    for c in ["/home/scott/ws/yaldabaoth", "/home/scott/ws/fulcrum", "/home/scott/ws/archon"] {
+        assert!(
+            ps.by_cwd(&std::path::PathBuf::from(c)).is_some(),
+            "cwd {c} maps to a project"
+        );
+    }
+}
+
+/// `project_name_for_cwd` capitalizes the basename's first letter and is total.
+#[test]
+fn project_name_for_cwd_capitalizes_basename() {
+    use std::path::Path;
+    assert_eq!(project_name_for_cwd(Path::new("/home/scott/ws/yaldabaoth")), "Yaldabaoth");
+    assert_eq!(project_name_for_cwd(Path::new("/home/scott/ws/fulcrum")), "Fulcrum");
+    assert_eq!(project_name_for_cwd(Path::new("/x/archon")), "Archon");
+    assert_eq!(project_name_for_cwd(Path::new("/")), "Project"); // rootless fallback
+}
+
+/// The `projects.json` registry round-trips through disk via the `cfg(test)`
+/// path seam — proving persistence never touches `~/.yalda` and restores names,
+/// cwds, and params faithfully (`projects_from_persisted`).
+#[test]
+fn projects_persist_round_trips_via_disk() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("projects.json");
+
+    let mut ps = Projects::new();
+    let yalda = ps
+        .create("Yaldabaoth".into(), std::path::PathBuf::from("/ws/yaldabaoth"))
+        .unwrap();
+    ps.get_mut(yalda).unwrap().params.insert("model".into(), "opus".into());
+    ps.create("Fulcrum".into(), std::path::PathBuf::from("/ws/fulcrum")).unwrap();
+
+    crate::persist::with_projects_path(file.clone(), || save_persisted_projects(&ps));
+    let doc = crate::persist::with_projects_path(file.clone(), || {
+        load_persisted_projects().expect("file written")
+    });
+    let restored = projects_from_persisted(&doc);
+
+    assert_eq!(restored.len(), 2);
+    let ry = restored.by_name("Yaldabaoth").expect("Yaldabaoth restored");
+    assert_eq!(restored.cwd_of(ry), Some(std::path::Path::new("/ws/yaldabaoth")));
+    assert_eq!(
+        restored.get(ry).unwrap().params.get("model").map(String::as_str),
+        Some("opus"),
+        "params round-trip"
+    );
+    assert!(restored.by_name("Fulcrum").is_some());
+}
