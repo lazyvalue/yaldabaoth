@@ -32,6 +32,22 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
   `new_project_relocated_to_global_menu` (NCs noted). **Runtime check:** the
   literal glyphs / colors / popup placement are harness gap #1 (human eye).
 
+- **Subagent-pane markdown wrapping + Task-output pretty-print** — `NEEDS-RUNTIME`
+  (built 2026-07-23, autonomous; `UXI-AgentTile-26`, on `worktree-agent-a11a3fd6ea26222bc`).
+  Two live-screenshot defects in the UXI-AgentTile-25 tool-body sections: (1) a
+  markdown bullet list of long unbroken file paths rendered as a **vertical column
+  of one glyph per line** — root cause: `render_markdown_column` never gave each
+  block a definite full width, so a list item's `flex_1().min_w_0()` content column
+  got 0px and wrapped char-by-char; fixed by wrapping every block in a `w_full()`
+  row + `flex_1().min_w_0()` inner (mirroring the doc view's `block_element`), plus
+  `w_full()`/`flex_none()` on `list_item_element`. (2) A subagent's Task output — a
+  **bare** content-block array `[{type:"text",text:"…"}]` — dumped as escaped JSON;
+  fixed by extending `extract_output_text` with a `Value::Array` arm so it renders
+  as the readable markdown report. Guards: `subagent_markdown_list_wraps_at_pane_width`
+  (layout probe, NC RED) in `verify_harness.rs`; `extract_output_text_handles_bare_content_block_array`
+  + `plan_tool_sections_bare_array_output_is_markdown_not_json` (NC RED) in `tests.rs`.
+  **Runtime check:** exact painted glyphs/theme colors are gap #1 (human eye).
+
 - **Beautiful subagent / tool-call content rendering** — `NEEDS-RUNTIME` (built
   2026-07-23 via `/new-ux`, autonomous, Fable advising; `UXI-AgentTile-25`). Tool
   inputs/outputs now render as typed semantic sections instead of raw JSON: a

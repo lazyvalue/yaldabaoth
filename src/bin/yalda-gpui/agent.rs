@@ -536,21 +536,33 @@ pub(crate) fn extract_output_text(v: &serde_json::Value) -> Option<String> {
         let t = s.trim_matches(['\n', '\r']);
         (!t.trim().is_empty()).then(|| t.to_string())
     }
+    // Join an ACP content-block array (`[ {type:"text", text:"…"}, … ]`, or bare
+    // strings) into readable text — the inner `text` fields carry REAL newlines,
+    // so this also un-escapes the `\n`-riddled JSON the raw payload would show.
+    fn join_content_blocks(items: &[Value]) -> Option<String> {
+        let joined = items
+            .iter()
+            .filter_map(|it| {
+                it.get("text")
+                    .and_then(Value::as_str)
+                    .or_else(|| it.as_str())
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let t = joined.trim_matches(['\n', '\r']);
+        (!t.trim().is_empty()).then(|| t.to_string())
+    }
     match v {
         Value::String(s) => clean(s),
+        // A BARE top-level content-block array — the shape the Task/subagent tool
+        // returns as `raw_output` (`[ {type:"text", text:"…"} ]`). Without this it
+        // fell through to an ugly escaped-JSON dump instead of the readable text
+        // (UXI-AgentTile-26).
+        Value::Array(items) => join_content_blocks(items),
         Value::Object(map) => {
             // ACP content-block array: `{ content: [ {type:"text", text:"…"}, … ] }`.
             if let Some(Value::Array(items)) = map.get("content") {
-                let joined = items
-                    .iter()
-                    .filter_map(|it| {
-                        it.get("text")
-                            .and_then(Value::as_str)
-                            .or_else(|| it.as_str())
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
-                if let Some(c) = clean(&joined) {
+                if let Some(c) = join_content_blocks(items) {
                     return Some(c);
                 }
             }

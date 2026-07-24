@@ -10061,6 +10061,68 @@ fn subagent_focus_swaps_the_painted_view(cx: &mut TestAppContext) {
     );
 }
 
+/// UXI-AgentTile-26 (PAINT): a markdown bullet list inside a subagent pane wraps
+/// at the PANE width, not one glyph per line. Repro from the live screenshot: a
+/// prompt whose `Files:` list holds long unbroken paths rendered as a vertical
+/// column of single characters because the list item's inner `flex_1().min_w_0()`
+/// content column had no definite width to distribute against, collapsing to ~0.
+///
+/// The honest seam is the layout probe (a geometry bug), asserting the PAINTED
+/// width of the list block (`md-block-0`) is a large fraction of the pane — and
+/// NON-vacuously: the path is far too long to fit, so a real fit can't produce a
+/// false pass (with the bug the block collapses to the ~24px marker column).
+///
+/// Negative control (observed RED): in `render_markdown_column`, drop the
+/// per-block `w_full()` row + `flex_1().min_w_0()` inner (revert to
+/// `div().pt(gap).child(probe_bounds_dyn("md-block-{i}", block_inner(&ctx, b)))`,
+/// keeping ONLY the probe) → `md-block-0` paints ~24px wide and the
+/// `md_w > sub_w * 0.5` assert fails.
+#[gpui::test]
+fn subagent_markdown_list_wraps_at_pane_width(cx: &mut TestAppContext) {
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    // A subagent whose prompt is a bullet list of long, unbroken paths — the
+    // exact shape that collapsed to one-glyph-per-line in the screenshot. Only a
+    // prompt (no description/output) so the single Markdown section — the list —
+    // is unambiguously `md-block-0`.
+    let key = view.update(vcx, |v, cx| {
+        use yalda::acp_channel::{ToolCall, ToolCallId, ToolKind};
+        let mut c = v.agent_mut(cx).expect("agent");
+        let tid: ToolCallId = "sub-wrap".into();
+        let mut tc = ToolCall::new(tid.clone(), "Explore repo".to_string());
+        tc.kind = ToolKind::Think;
+        tc.raw_input = Some(serde_json::json!({
+            "subagent_type": "Explore",
+            "prompt": "- /Users/scott/ws/yaldabaoth/src/bin/yalda-gpui/render_blocks.rs\n\
+                       - /Users/scott/ws/yaldabaoth/src/bin/yalda-gpui/transcript_view.rs\n\
+                       - /Users/scott/ws/yaldabaoth/src/bin/yalda-gpui/agent_sessions.rs"
+        }));
+        let anchor = c.editor.anchor_for_line(0);
+        let k = crate::ToolCallKey::from_id(&tid);
+        c.tools.register(k.clone(), tc, anchor);
+        k
+    });
+    vcx.run_until_parked();
+
+    view.update(vcx, |v, cx| v.focus_subagent(key, cx));
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let sub = crate::layout_probe_get("subagent-view");
+    let block = crate::layout_probe_get("md-block-0");
+    crate::layout_probe_end();
+
+    let (_, _, sub_w, _) = sub.expect("the subagent view must paint");
+    let (_, _, md_w, _) = block.expect("the markdown list block must paint");
+    // Non-vacuous: the pane is a real width, and the path text is far wider than
+    // it, so the list MUST wrap — a fit can't fake this.
+    assert!(sub_w > 400.0, "expected a real pane width, got {sub_w}");
+    assert!(
+        md_w > sub_w * 0.5,
+        "the markdown list block must span the pane, not collapse to the marker \
+         column: md_w={md_w} sub_w={sub_w} (one-glyph-per-line regression)"
+    );
+}
+
 /// UXI-AgentTile-25 (MAIN transcript integration): a Task tool call built through
 /// the real `tools.register` path renders its prompt + report as MARKDOWN
 /// sections, not raw JSON. Drives the exact `plan_tool_sections` call the
