@@ -5678,8 +5678,19 @@ impl YaldaGpuiView {
         for i in idxs {
             self.workspace.close_workspace(i);
         }
+        // 3. Drop the project FIRST, so the survivor is derived from what REMAINS
+        // (deleting the last project must not seed a workspace under the id we're
+        // about to remove — bug caught in review).
+        self.projects.close(pid);
+        // Guarantee ≥1 workspace AND ≥1 project survive. If that was the last
+        // project, mint a fresh default rooted at the process dir — the "never
+        // zero projects" twin of "never zero workspaces", so the app can never
+        // enter a projectless / orphaned-workspace state.
         if self.workspace.workspaces.is_empty() {
-            let survivor = self.projects.ids().find(|&x| x != pid).unwrap_or(pid);
+            let survivor = self.projects.first().unwrap_or_else(|| {
+                let cwd = process_cwd();
+                self.projects.ensure_at_cwd(cwd.clone(), &project_name_for_cwd(&cwd))
+            });
             let name = workspace::auto_workspace_name(self.workspace.next_workspace_index);
             self.workspace.next_workspace_index += 1;
             self.workspace.workspaces.push(workspace::Workspace::with_layout(
@@ -5690,8 +5701,6 @@ impl YaldaGpuiView {
             ));
             self.workspace.active_workspace = 0;
         }
-        // 3. Drop the project + persist.
-        self.projects.close(pid);
         save_persisted_projects(&self.projects);
         self.save_workspace_state();
         self.clear_overlay();

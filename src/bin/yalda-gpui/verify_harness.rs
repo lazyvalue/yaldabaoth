@@ -12743,3 +12743,36 @@ fn active_project_derives_from_focus(cx: &mut TestAppContext) {
     // Distinct ids so the NC (hardcode `first()`) is non-vacuous.
     assert_ne!(a_pid, b_pid);
 }
+
+/// Deleting the LAST project must not orphan the surviving workspace (review-caught
+/// bug): `perform_delete_project` closes the project first, then mints a fresh
+/// default when none survive, and seeds the replacement workspace under THAT — so
+/// the store is never empty and no workspace points at a dead project id.
+///
+/// Negative control: restore the old `ids().find(|x| x != pid).unwrap_or(pid)`
+/// survivor (computed before `close(pid)`) → the seeded workspace points at the
+/// deleted id and `projects.contains(w.project())` fails.
+#[gpui::test]
+fn delete_last_project_mints_a_fresh_default(cx: &mut TestAppContext) {
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+    vcx.run_until_parked();
+    let only = view.read_with(vcx, |v, _| {
+        assert_eq!(v.projects.len(), 1, "boot has exactly one project");
+        v.projects.first().expect("the boot project")
+    });
+    view.update(vcx, |v, cx| v.perform_delete_project(only, cx));
+    view.read_with(vcx, |v, cx| {
+        assert!(v.projects.len() >= 1, "a fresh default project was minted");
+        assert!(!v.workspace.workspaces.is_empty(), "a workspace survives");
+        for w in &v.workspace.workspaces {
+            assert!(
+                v.projects.contains(w.project()),
+                "no surviving workspace points at a deleted project id"
+            );
+        }
+        assert!(
+            v.active_project(cx).is_some_and(|p| v.projects.contains(p)),
+            "the active project resolves to a live project"
+        );
+    });
+}
