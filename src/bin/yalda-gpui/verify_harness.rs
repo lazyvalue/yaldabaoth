@@ -3653,6 +3653,7 @@ fn install_agent_picker(
                 turns: 3,
                 connected: true,
                 permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+                busy: false,
             });
         }
         let mut tile = AgentTile::new();
@@ -3724,6 +3725,7 @@ fn selector_projection_reflects_binding_across_tiles(cx: &mut TestAppContext) {
                 turns: 0,
                 connected: true,
                 permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+                busy: false,
             });
         }
     });
@@ -5950,6 +5952,7 @@ fn roster_surfaces_unopened_session_and_tracks_rename_close(cx: &mut TestAppCont
         turns: 0,
         connected: true,
         permission_mode: yalda::acp_channel::PermissionMode::ReadOnly,
+        busy: false,
     };
 
     // A session created elsewhere on the server — never opened in this GUI.
@@ -6548,6 +6551,7 @@ fn free_agent_row_is_unbound_and_bindable(cx: &mut TestAppContext) {
         turns: 0,
         connected: true,
         permission_mode: yalda::acp_channel::PermissionMode::ReadOnly,
+        busy: false,
     };
 
     // The end state of a free create: the session appears in the roster, bound
@@ -6625,6 +6629,7 @@ fn jump_panel_orders_local_and_roster_sessions_by_label(cx: &mut TestAppContext)
                     turns: 0,
                     connected: true,
                     permission_mode: yalda::acp_channel::PermissionMode::ReadOnly,
+                    busy: false,
                 },
             }],
             cx,
@@ -6762,6 +6767,7 @@ fn jump_reorder_methods_reorder_and_gate_by_cwd(cx: &mut TestAppContext) {
         turns: 0,
         connected: true,
         permission_mode: yalda::acp_channel::PermissionMode::ReadOnly,
+        busy: false,
     };
     // alpha: {a1, a2}; beta: {b1}.
     view.update(vcx, |v, _| {
@@ -6854,6 +6860,7 @@ fn clear_keeps_the_sessions_jump_panel_slot(cx: &mut TestAppContext) {
         turns: 0,
         connected: true,
         permission_mode: yalda::acp_channel::PermissionMode::ReadOnly,
+        busy: false,
     };
     // One cwd group, two sessions. Labels are chosen so the USER's order is the
     // reverse of by-label order: any surviving slot proves the order list drove it.
@@ -12465,6 +12472,7 @@ fn opened_session_recovers_lost_label_from_roster(cx: &mut TestAppContext) {
         turns: 0,
         connected: true,
         permission_mode: yalda::acp_channel::PermissionMode::ReadOnly,
+        busy: false,
     };
 
     let (lost_id, kept_id) = view.update(vcx, |v, cx| {
@@ -13265,6 +13273,7 @@ fn bind_refused_across_projects_allowed_within(cx: &mut TestAppContext) {
             turns: 0,
             connected: true,
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+            busy: false,
         });
     });
     // The active workspace is project A, showing an unbound agent tile (selector).
@@ -14108,6 +14117,7 @@ fn autoname_summary_survives_a_gui_reload(cx: &mut TestAppContext) {
             turns: 1,
             connected: true,
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+            busy: false,
         });
         v.jump_panel_agent_rows(cx)
             .into_iter()
@@ -14119,6 +14129,226 @@ fn autoname_summary_survives_a_gui_reload(cx: &mut TestAppContext) {
         Some("Ripping out the payments adapter."),
         "the autoname summary must survive a reload, even unbound"
     );
+}
+
+/// A focused Agent tile bound to a pre-attach PLACEHOLDER session (no sid) with a
+/// pending open token — the exact state the real create/attach paths leave behind
+/// while the server round-trip is in flight, so `apply_open_agent_resolution` can
+/// be driven against it. Returns the token.
+#[cfg(test)]
+fn boot_pending_agent_tile<'a>(
+    cx: &'a mut TestAppContext,
+) -> (gpui::Entity<YaldaGpuiView>, &'a mut gpui::VisualTestContext, u64) {
+    use crate::{AgentSession, AgentState, AgentTile, App};
+    let (view, vcx) = boot_browser(cx);
+    let token = view.update(vcx, |v, cx| {
+        v.set_screen(App::Agent(AgentTile::new()));
+        v.show_local_session(
+            AgentSession {
+                state: AgentState::new_server_managed(Some("connecting…".into())),
+                label: "claude-7".into(),
+                cwd: PathBuf::from("."),
+                resume_id: None,
+            },
+            cx,
+        );
+        let token = crate::alloc_open_token();
+        if let Some(tile) = v.agent_tile_mut() {
+            tile.set_pending(Some(token));
+        }
+        token
+    });
+    vcx.run_until_parked();
+    (view, vcx, token)
+}
+
+/// bug-0022: the jump panel shows live status for a session this GUI has NEVER
+/// opened. The server's `SessionBusy` broadcast drives the row: busy ⇒ `working`,
+/// and a busy→idle flip while you are elsewhere ⇒ `your turn` (the roster-side
+/// twin of `AgentState::unread`), cleared when you jump to it.
+///
+/// This is the actual "status marks appear inconsistently" cause: `awaiting` /
+/// `unread` used to be readable ONLY off a live in-store session, so free
+/// sessions (and any session another GUI was driving) were permanently neutral.
+///
+/// Drives the REAL reducer (`apply_server_batch` with the real notification) and
+/// the REAL row builder.
+///
+/// Negative control: drop the `.or(Some(info.busy))` fallback in
+/// `jump_panel_agent_rows` → the roster row reports `Neutral` while working.
+#[gpui::test]
+fn roster_only_session_shows_live_status(cx: &mut TestAppContext) {
+    use yalda::session_proto::{Notification as ServerNotification, SessionInfo};
+    let (view, vcx) = boot_browser(cx);
+    view.update(vcx, |v, _cx| {
+        v.agent_roster.upsert(SessionInfo {
+            session_id: "S-free".into(),
+            acp_session_id: None,
+            label: "free one".into(),
+            cwd: PathBuf::from("."),
+            turns: 0,
+            connected: true,
+            permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+            busy: false,
+        });
+    });
+    let status_of = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.update(vcx, |v, cx| {
+            v.jump_panel_agent_rows(cx)
+                .into_iter()
+                .find(|r| matches!(&r.target, crate::JumpTarget::Roster(s) if s == "S-free"))
+                .map(|r| r.dot_status())
+        })
+    };
+    assert_eq!(
+        status_of(&view, vcx),
+        Some(crate::AgentDotStatus::Neutral),
+        "idle to begin with"
+    );
+
+    // The server says a turn started — through the REAL notification reducer.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![ServerNotification::SessionBusy {
+                session_id: "S-free".into(),
+                busy: true,
+            }],
+            cx,
+        );
+    });
+    assert_eq!(
+        status_of(&view, vcx),
+        Some(crate::AgentDotStatus::Working),
+        "a session we never opened still reports WORKING while its turn runs"
+    );
+
+    // …and finishing while we're elsewhere is "your turn".
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![ServerNotification::SessionBusy {
+                session_id: "S-free".into(),
+                busy: false,
+            }],
+            cx,
+        );
+    });
+    assert_eq!(
+        status_of(&view, vcx),
+        Some(crate::AgentDotStatus::WaitingForYou),
+        "a backgrounded roster session that finished a turn is waiting on you"
+    );
+
+    // Jumping to it marks it read.
+    view.update(vcx, |v, _cx| v.mark_roster_session_read("S-free"));
+    assert_eq!(
+        status_of(&view, vcx),
+        Some(crate::AgentDotStatus::Neutral),
+        "looking at it clears the mark"
+    );
+}
+
+/// bug-0021 / `UXI-AgentTile-27` property 1 (amended): the one-shot autoname is armed
+/// by SESSION IDENTITY, not by which constructor built the state. A session that
+/// arrives by ATTACH (created free from the jump panel, `/clear`ed, or restored)
+/// with a still-generated `claude-N` label and an unspent one-shot is armed at the
+/// bind, and its replayed content makes it due — that whole class could never be
+/// named before.
+///
+/// Drives the REAL resolution handler (`apply_open_agent_resolution` →
+/// `Attached`), then the REAL replay boundary (`finish_replay`) + drain.
+///
+/// Negative control: drop the `maybe_arm_autoname` call in
+/// `apply_open_agent_resolution` → the session stays `Done` and never requests.
+#[gpui::test]
+fn attached_unnamed_session_is_armed_and_named(cx: &mut TestAppContext) {
+    let (view, vcx, token) = boot_pending_agent_tile(cx);
+
+    // The REAL attach resolution binds sid S-free and installs its label.
+    view.update(vcx, |v, cx| {
+        v.apply_open_agent_resolution(
+            token,
+            crate::OpenResolution::Attached(vec![crate::AttachedSlot {
+                label: "claude-7".into(),
+                sid: "S-free".into(),
+                acp_id: None,
+                status: "attached".into(),
+                permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+            }]),
+            cx,
+        );
+    });
+    let id = view.update(vcx, |v, _cx| v.focused_bound_session().expect("bound"));
+    view.read_with(vcx, |v, cx| {
+        assert_eq!(
+            v.read_session(id, cx, |c| c.autoname),
+            Some(crate::AutonameState::Pending),
+            "an attached session still called claude-N must be armed for naming"
+        );
+    });
+
+    // Replay delivers the conversation; that boundary is what makes it nameable.
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| {
+            c.editor
+                .programmatic_insert(0, "user: fix the flaky deploy test\nagent: on it\n");
+            c.finish_replay();
+        });
+        v.drain_autoname_requests(cx);
+    });
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, cx| {
+        assert_eq!(
+            v.read_session(id, cx, |c| c.autoname),
+            Some(crate::AutonameState::Requested),
+            "replayed content makes the armed session due, and the drain requests the name"
+        );
+    });
+}
+
+/// bug-0021: the one-shot is spent per SID and that fact is durable — a session
+/// whose naming already ran (or ran and produced nothing) is NOT re-armed on the
+/// next launch, so we never re-ask Haiku about the same session forever.
+///
+/// Negative control: drop the `autoname_already_attempted` check in
+/// `maybe_arm_autoname` → the second view re-arms and RED.
+#[gpui::test]
+fn a_spent_autoname_is_never_re_armed(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("session_summaries.json");
+
+    // View 1: the call comes back empty — the one-shot is still SPENT.
+    let (view, vcx, id) = boot_armed_autoname_session(cx);
+    view.update(vcx, |v, cx| {
+        crate::persist::with_session_summaries_path(file.clone(), || {
+            v.finish_autoname(id, None, cx)
+        })
+    });
+    vcx.run_until_parked();
+
+    // View 2 ("relaunch"): the same sid attaches, still labelled claude-N.
+    let (view2, vcx2, token) =
+        crate::persist::with_session_summaries_path(file.clone(), || boot_pending_agent_tile(cx));
+    view2.update(vcx2, |v, cx| {
+        v.apply_open_agent_resolution(
+            token,
+            crate::OpenResolution::Attached(vec![crate::AttachedSlot {
+                label: "claude-3".into(),
+                sid: "S1".into(),
+                acp_id: None,
+                status: "attached".into(),
+                permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+            }]),
+            cx,
+        );
+    });
+    view2.read_with(vcx2, |v, cx| {
+        let sid_id = v.focused_bound_session().expect("bound");
+        assert_eq!(
+            v.read_session(sid_id, cx, |c| c.autoname),
+            Some(crate::AutonameState::Done),
+            "a session whose one-shot was already spent must not be re-armed"
+        );
+    });
 }
 
 /// UXI-AgentTile-27 property 3 (early half): renaming BEFORE the first turn ends

@@ -3953,6 +3953,17 @@ impl AgentState {
     /// (Finding 13, INV-4).
     pub(crate) fn finish_replay(&mut self) {
         self.replay_turns.finish_replay();
+        // bug-0021: a session armed while it was still empty (attach/restore arms
+        // at bind, before replay) now HAS its conversation — that is the moment it
+        // becomes nameable. Without this the arm would sit idle until the user
+        // happened to run another turn, which is exactly why old nameless sessions
+        // stayed `claude-N` forever. The drain (which runs after every pump batch)
+        // turns the flag into the one-shot request.
+        if self.autoname == AutonameState::Pending
+            && !self.editor.document().full_text().trim().is_empty()
+        {
+            self.autoname_due = true;
+        }
         // Reopening a session that was in Worksheet mode rebuilds the transcript
         // from the replayed event_log; land the caret on the editable tail (the
         // last line) so the user finds it where they compose, not stranded at

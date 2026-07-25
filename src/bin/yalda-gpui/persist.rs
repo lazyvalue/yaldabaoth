@@ -98,9 +98,36 @@ pub(crate) fn load_session_summaries() -> std::collections::HashMap<String, Stri
 /// concurrent yalda instances only clobber the key they touched (last-writer-
 /// wins per session, matching the ACP-slot file). Best-effort.
 pub(crate) fn save_session_summary(sid: &ServerSid, summary: &str) {
-    if summary.trim().is_empty() {
+    write_summary_entry(sid, summary.trim());
+}
+
+/// Record that the one-shot autoname has been SPENT for `sid` without producing
+/// a summary (`bug-0021`): an empty-string entry. The autoname arm is keyed by
+/// session identity now, not by which constructor built the state, so "have we
+/// already tried this session?" has to outlive the process — otherwise every
+/// launch re-asks Haiku about the same nameless session.
+///
+/// Never downgrades a real summary to empty.
+pub(crate) fn mark_autoname_attempted(sid: &ServerSid) {
+    if load_session_summaries()
+        .get(sid.as_str())
+        .is_some_and(|s| !s.is_empty())
+    {
         return;
     }
+    write_summary_entry(sid, "");
+}
+
+/// Has the one-shot autoname already been spent for `sid` (`bug-0021`)? True for
+/// both outcomes — a summary landed, or the attempt produced nothing.
+pub(crate) fn autoname_already_attempted(
+    map: &std::collections::HashMap<String, String>,
+    sid: &ServerSid,
+) -> bool {
+    map.contains_key(sid.as_str())
+}
+
+fn write_summary_entry(sid: &ServerSid, value: &str) {
     let Some(path) = session_summaries_path() else {
         return;
     };
@@ -108,7 +135,7 @@ pub(crate) fn save_session_summary(sid: &ServerSid, summary: &str) {
         let _ = std::fs::create_dir_all(parent);
     }
     let mut map = load_session_summaries();
-    map.insert(sid.to_string(), summary.to_string());
+    map.insert(sid.to_string(), value.to_string());
     if let Ok(serialized) = serde_json::to_string_pretty(&map) {
         let _ = std::fs::write(&path, serialized);
     }

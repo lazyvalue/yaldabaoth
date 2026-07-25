@@ -300,6 +300,13 @@ struct ManagedSession {
     gen_watch: watch::Sender<u64>,
     turns: usize,
     permission_mode: PermissionMode,
+    /// A turn is in flight (bug-0022). Set when a prompt is accepted by the
+    /// channel, cleared when the turn completes (`TurnCount`) or a channel is
+    /// (re)spawned — a respawn kills whatever was running, so a stale `true`
+    /// would strand a session showing "working" forever. Surfaced on
+    /// [`SessionInfo::busy`] and broadcast as `SessionBusy` so every GUI can show
+    /// live status for sessions it is not attached to.
+    busy: bool,
     /// Per-session transcript log channel. Holds the latest snapshot of
     /// `event_log` (as a cloned `Arc`); every `record`/`log_only` sends the
     /// updated snapshot via `send_replace`. The forwarder tails `[sent..]` of
@@ -378,6 +385,7 @@ impl ManagedSession {
             turns: self.turns,
             connected: self.channel.as_ref().is_some_and(|c| c.is_connected()),
             permission_mode: self.permission_mode,
+            busy: self.busy,
         }
     }
 
@@ -661,14 +669,22 @@ impl ManagedSession {
     ) -> Vec<(String, String)> {
         handle.set_permission_mode(self.permission_mode);
         let mut undelivered: Vec<(String, String)> = Vec::new();
+        // bug-0022: a (re)spawn kills whatever turn was running, so the in-flight
+        // flag starts false and is re-raised only by a queued prompt that
+        // actually flushes onto the new channel. Without the reset a session
+        // whose agent was restarted mid-turn would show "working" forever.
+        self.busy = false;
         for payload in std::mem::take(&mut self.pending_prompts) {
             let text = payload.text.clone();
-            if let Err(e) = handle.send_payload(payload) {
-                tracing::error!(error = %e, "queued prompt failed to flush — notifying submitter");
-                undelivered.push((
-                    text,
-                    format!("queued message was not delivered on reconnect: {e}"),
-                ));
+            match handle.send_payload(payload) {
+                Ok(()) => self.busy = true, // a queued turn is now really running
+                Err(e) => {
+                    tracing::error!(error = %e, "queued prompt failed to flush — notifying submitter");
+                    undelivered.push((
+                        text,
+                        format!("queued message was not delivered on reconnect: {e}"),
+                    ));
+                }
             }
         }
         let acp_session_id = handle.session_id();
@@ -762,6 +778,7 @@ fn new_managed_session(
         gen_watch,
         turns: 0,
         permission_mode,
+        busy: false,
         log_tx,
         forwarder: None,
         pending_prompts: Vec::new(),
@@ -1070,6 +1087,9 @@ fn restore_seed_from_disk(
             gen_watch,
             turns: rs.turns,
             permission_mode: rs.permission_mode,
+            // A recovered session has no live turn — whatever was running died
+            // with the previous process (bug-0022).
+            busy: false,
             log_tx,
             forwarder: None,
             pending_prompts: Vec::new(),
@@ -1255,7 +1275,7 @@ impl Manager {
                 resumed,
                 reply,
             } => {
-                let (published, undelivered) = match self.sessions.get_mut(&sid) {
+                let (published, undelivered, busy_now) = match self.sessions.get_mut(&sid) {
                     Some(s) => {
                         let undelivered = s.apply_channel_state(handle, is_respawn, resumed);
                         (
@@ -1266,10 +1286,17 @@ impl Manager {
                                 s.turns,
                             )),
                             undelivered,
+                            Some(s.busy),
                         )
                     }
-                    None => (None, Vec::new()),
+                    None => (None, Vec::new(), None),
                 };
+                // bug-0022: publish the post-spawn in-flight state to every GUI —
+                // a respawn clears it (unless a queued prompt flushed), and a GUI
+                // that isn't attached has no other way to learn that.
+                if let Some(busy) = busy_now {
+                    self.broadcast_busy(&sid, busy);
+                }
                 // Queued prompts that failed to flush onto the (re)spawned channel
                 // were optimistically echoed in the GUI — surface each as a
                 // transient `PromptRejected` (the manager broadcast reaches the
@@ -1371,6 +1398,10 @@ impl Manager {
                     turn_count: turns,
                     generation: channel_generation,
                 });
+                // bug-0022: the turn is settled — the session is idle again.
+                // Broadcast so every GUI's status mark drops out of "working",
+                // including the ones not attached to this session.
+                self.set_busy(&sid, false);
             }
             Command::ReplayDone { sid, generation } => {
                 let Some(s) = self.sessions.get_mut(&sid) else {
@@ -1594,7 +1625,12 @@ impl Manager {
             text: text.to_string(),
             images,
         };
-        match session.channel.as_ref() {
+        // bug-0022: a prompt (sent OR queued for a still-spawning agent) means a
+        // turn is now owed — the session is working from the user's point of
+        // view, which is what the status marks report.
+        let was_busy = session.busy;
+        session.busy = true;
+        let result = match session.channel.as_ref() {
             Some(channel) => channel
                 .send_payload(payload)
                 .map_err(|e| format!("send failed: {e}")),
@@ -1602,7 +1638,35 @@ impl Manager {
                 session.pending_prompts.push(payload);
                 Ok(())
             }
+        };
+        if result.is_err() {
+            // The send failed outright — nothing is running.
+            self.set_busy(session_id, false);
+        } else if !was_busy {
+            self.broadcast_busy(session_id, true);
         }
+        result
+    }
+
+    /// Set a session's in-flight flag and broadcast the change to EVERY
+    /// connection (bug-0022). No-op when the flag is already at `busy`, so the
+    /// broadcast fires on transitions only.
+    fn set_busy(&mut self, session_id: &str, busy: bool) {
+        let Some(session) = self.sessions.get_mut(session_id) else {
+            return;
+        };
+        if session.busy == busy {
+            return;
+        }
+        session.busy = busy;
+        self.broadcast_busy(session_id, busy);
+    }
+
+    fn broadcast_busy(&self, session_id: &str, busy: bool) {
+        let _ = self.events.send(Notification::SessionBusy {
+            session_id: session_id.to_string(),
+            busy,
+        });
     }
 
     fn do_cancel(&mut self, session_id: &str) -> Result<(), String> {

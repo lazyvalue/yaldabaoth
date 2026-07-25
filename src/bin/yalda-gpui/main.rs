@@ -1753,6 +1753,13 @@ struct YaldaGpuiView {
     /// of a generation. Rendered inside the agent tile, above the subagents/tasks
     /// panels (`render_agent`), NOT in the global jump panel.
     recaps: HashMap<SessionId, RecapState>,
+    /// Sessions this GUI has NO local state for that finished a turn while you
+    /// were elsewhere (`bug-0022`), keyed by server sid. Fed by the server's
+    /// `SessionBusy` busy→idle broadcast, cleared when you jump to the session.
+    /// This is the roster-side twin of `AgentState::unread`: without it, "your
+    /// turn" could only ever light up for sessions open in this GUI, which is
+    /// what made the jump panel's status marks look arbitrary.
+    roster_unread: std::collections::HashSet<String>,
     /// Durable autoname summaries, keyed by SERVER session id (`bug-0020`).
     /// Loaded once at construction from the id-keyed sidecar
     /// (`session_summaries.json`) and written at `finish_autoname`. The live
@@ -1814,6 +1821,7 @@ impl YaldaGpuiView {
             jump_session_order: Vec::new(),
             jump_order_succession: HashMap::new(),
             recaps: HashMap::new(),
+            roster_unread: std::collections::HashSet::new(),
             // bug-0020: id-keyed autoname summaries, durable across restarts.
             session_summaries: crate::persist::load_session_summaries(),
         }
@@ -1860,6 +1868,7 @@ impl YaldaGpuiView {
             jump_session_order: Vec::new(),
             jump_order_succession: HashMap::new(),
             recaps: HashMap::new(),
+            roster_unread: std::collections::HashSet::new(),
             // bug-0020: id-keyed autoname summaries, durable across restarts.
             session_summaries: crate::persist::load_session_summaries(),
         }
@@ -2119,7 +2128,10 @@ impl YaldaGpuiView {
                         // only ever held tile-bound sessions, and old files have
                         // no `summary` key at all).
                         let slot_summary = slot.summary.clone().or_else(|| {
-                            self.session_summaries.get(slot.id.as_str()).cloned()
+                            self.session_summaries
+                                .get(slot.id.as_str())
+                                .filter(|s| !s.trim().is_empty())
+                                .cloned()
                         });
                         let bind = self.sessions.open_or_focus(&slot.id, |_id| {
                             cx.new(|_| {
@@ -2155,6 +2167,10 @@ impl YaldaGpuiView {
                                     // the next save resolves it via `sid_of` — no cache.
                                     tile.bind(sid_id);
                                 }
+                                // bug-0021: a restored session that never got a
+                                // name (still `claude-N`, one-shot unspent) arms
+                                // here; replay's end is what makes it nameable.
+                                self.maybe_arm_autoname(sid_id, cx);
                                 // Wire boundary: the bound sid leaves to attach.
                                 attach_sids.push(slot.id.to_string());
                                 eprintln!(

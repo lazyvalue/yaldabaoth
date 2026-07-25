@@ -660,6 +660,48 @@ own reverted-fix mutation:
    `PaletteTarget` could be compared and printed in test failures — the only edit
    outside the palette's own files and the wiring.
 
+### UXI-JumpPanel-12 — Status is known for EVERY session, not just the ones open here
+
+**Statement.** The panel's live status (`UXI-JumpPanel-1`'s dot, `-10`'s word +
+chip, `-6`'s waiting-on-you) applies to **every listed session**, including ones
+this GUI has never opened — free sessions, jump-panel-created ones, and sessions
+another GUI instance is driving.
+
+The derivation is **local-then-server**:
+
+1. session open in this GUI ⇒ its live `turn_phase` / `unread` win (unchanged);
+2. otherwise ⇒ the server's `SessionInfo.busy` (a turn is in flight) drives
+   **working**, and a **busy→idle** `SessionBusy` broadcast that arrives while you
+   are not on that session raises a roster-side unread mark
+   (`YaldaGpuiView.roster_unread`) ⇒ **your turn**, cleared when you jump to it.
+
+The server owns `busy`: set when a prompt is accepted or queued, cleared when the
+turn settles or the channel is (re)spawned. `SessionInfo.busy` is
+`#[serde(default)]` and the broadcast is additive, so a GUI running against an
+OLDER daemon degrades to "never busy" instead of failing to parse the session list.
+
+**Applies to.** `session_proto.rs` (`SessionInfo.busy`, `Notification::SessionBusy`);
+`yalda-session-server/main.rs` (`ManagedSession.busy`, `set_busy`/`broadcast_busy`,
+`enqueue_prompt`, the `TurnCount` arm, `apply_channel_state`); `agent_roster.rs`
+(`set_busy`); `agent_ui.rs` (the `SessionBusy` arm, `note_roster_turn_finished`,
+`mark_roster_session_read`); `jump_panel_view.rs::jump_panel_agent_rows`.
+
+**Why.** Before this, `awaiting`/`unread` were readable only off a live in-store
+session, so most rows were structurally incapable of showing status — which reads
+to the user as "the marks appear inconsistently" (bug-0022). A per-session event
+subscription for every listed session is not an option (it would spawn replay for
+sessions the user isn't using), so the server — which owns every channel — publishes
+the one bit.
+
+**Status.** `implemented` — **requires a running server built from this commit**;
+an old daemon never sends `SessionBusy`.
+
+**Enforcement.** `verify_harness.rs::roster_only_session_shows_live_status` — a
+never-opened roster session goes Neutral → Working → WaitingForYou through the REAL
+`apply_server_batch` reducer + the REAL row builder, and clears on read. **NC
+observed RED**: drop the `.or(Some(info.busy))` fallback → `Some(Neutral)` while
+working. The live server→GUI loop is verification gap 2.
+
 ### UXI-JumpPanel-10 — A live session says what it is doing, in words and in shape
 
 **Statement.** In the jump panel, the two **live** session states are unmistakable

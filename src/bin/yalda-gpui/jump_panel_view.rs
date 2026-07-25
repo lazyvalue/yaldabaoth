@@ -195,15 +195,28 @@ impl YaldaGpuiView {
             let label = opened
                 .map(|e| e.read(cx).label.clone())
                 .unwrap_or_else(|| info.label.clone());
-            let awaiting = opened.map(|e| e.read(cx).state.turn_phase.is_awaiting());
-            let unread = opened.map(|e| e.read(cx).state.unread).unwrap_or(false);
+            // bug-0022: local state is authoritative when this GUI holds the
+            // session; otherwise the SERVER's in-flight flag drives it, so a
+            // free session (or one another GUI is driving) shows real status
+            // instead of a permanent neutral dot.
+            let awaiting = opened
+                .map(|e| e.read(cx).state.turn_phase.is_awaiting())
+                .or(Some(info.busy));
+            let unread = opened
+                .map(|e| e.read(cx).state.unread)
+                .unwrap_or_else(|| self.roster_unread.contains(&info.session_id));
             // bug-0020: the live session is authoritative, but a session that is
             // NOT open here (free, or freshly restored before attach) still has a
             // durable summary in the id-keyed sidecar. Without this fallback the
             // explainer line only existed for the run that generated it.
             let summary = opened
                 .and_then(|e| e.read(cx).state.summary.clone())
-                .or_else(|| self.session_summaries.get(&info.session_id).cloned());
+                .or_else(|| {
+                    self.session_summaries
+                        .get(&info.session_id)
+                        .filter(|s| !s.trim().is_empty())
+                        .cloned()
+                });
             rows.push(AgentRow {
                 target: JumpTarget::Roster(info.session_id.clone()),
                 label,
@@ -231,9 +244,12 @@ impl YaldaGpuiView {
                 // bug-0020: same sidecar fallback as the roster rows above, for a
                 // session whose sid the roster hasn't listed yet.
                 summary: ent.read(cx).state.summary.clone().or_else(|| {
-                    self.sessions
-                        .sid_of(id)
-                        .and_then(|s| self.session_summaries.get(s.as_str()).cloned())
+                    self.sessions.sid_of(id).and_then(|s| {
+                        self.session_summaries
+                            .get(s.as_str())
+                            .filter(|v| !v.trim().is_empty())
+                            .cloned()
+                    })
                 }),
                 cwd: ent.read(cx).cwd.clone(),
                 bound: self.agent_tile_id_bound_to(id).is_some(),

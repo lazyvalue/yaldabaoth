@@ -189,6 +189,18 @@ pub struct SessionInfo {
     pub turns: usize,
     pub connected: bool,
     pub permission_mode: PermissionMode,
+    /// A turn is in flight RIGHT NOW (bug-0022): set when a prompt is sent,
+    /// cleared when the turn completes or the channel is (re)spawned. This is
+    /// what lets a GUI show "working" for a session it has not attached — the
+    /// per-session `ReplyEvent` stream only reaches subscribers, so before this
+    /// existed the jump panel could only report status for sessions it happened
+    /// to have open, which is why the status marks looked inconsistent.
+    ///
+    /// `#[serde(default)]`: an OLDER server (the daemon survives GUI restarts)
+    /// sends `SessionInfo` without this key — it must load as `false`, not as a
+    /// deserialize failure that breaks the whole session list.
+    #[serde(default)]
+    pub busy: bool,
 }
 
 /// Diagnostic snapshot of the server's live session state (response to
@@ -299,6 +311,16 @@ pub enum Notification {
     /// regardless of which connection initiated the close.
     #[serde(rename = "session_closed")]
     SessionClosed { session_id: ServerSessionId },
+
+    /// A session started or finished a turn (bug-0022). Broadcast to EVERY
+    /// connection — like a rename — so each GUI can show live "working" status
+    /// for sessions it has not attached to (a free session in the jump panel, or
+    /// one another GUI instance is driving).
+    #[serde(rename = "session_busy")]
+    SessionBusy {
+        session_id: ServerSessionId,
+        busy: bool,
+    },
 
     /// A session's label changed. Broadcast to every connection so the new
     /// label propagates to every tile and every GUI instance.

@@ -74,7 +74,24 @@ without the user asking. Five hard properties:
    summary renders **only** in the jump panel, on its own line under the label,
    in a smaller italic dim style — chrome-class, so document zoom does not
    scale it.
-6. **Durability (bug-0020).** Because the call is one-shot and never re-run, the
+6. **Arming is by IDENTITY, not provenance (bug-0021 — amends property 1).** A
+   session is armed for its one-shot at the moment it becomes **bound to a sid**
+   (create resolution, attach resolution, restore) when all of: its label is still
+   an auto-generated `claude-N`, `name_origin` is not the `User` latch, no call is
+   in flight, and **the one-shot has not already been spent for that sid**
+   (recorded durably — see 7). The original "armed only at genuinely-fresh
+   creation points" rule excluded three whole classes of nameless session
+   (jump-panel-created free sessions, `/clear`, and anything restored), which
+   could therefore never be named at all. The "one shot, ever" guarantee is
+   unchanged — it is now keyed on the session's identity instead of on which
+   constructor ran, which is strictly stronger (it survives restarts).
+
+   A session that is armed while still empty becomes **due** at its replay
+   boundary (`finish_replay`, when the transcript is non-empty) — an attached or
+   restored session gets named as soon as its content arrives, without waiting for
+   another turn. An empty transcript at drain time re-arms rather than settling:
+   nothing to name from yet is not the same as unnameable.
+7. **Durability (bug-0020, bug-0021).** Because the call is one-shot and never re-run, the
    summary must survive a GUI restart **unconditionally** — including for a
    session no tile is bound to. Its durable home is the **id-keyed sidecar**
    `~/.yalda/session_summaries.json` (`{server session id → summary}`), written at
@@ -85,6 +102,11 @@ without the user asking. Five hard properties:
    round-trips for tile-bound sessions, but it CANNOT carry a free session — which
    is what made the line vanish on reload.) The NAME needs none of this: it is
    pushed to the session server, whose WAL is its durable home.
+
+   The same entry doubles as the record that the one-shot is **spent** for that
+   sid: an **empty-string** value means "the call ran, nothing usable came back".
+   That is what keeps property 6's identity-keyed arm from re-asking Haiku about
+   the same session on every launch.
 
 **Applies to.** `agent.rs` — `NameOrigin`, `AgentSession::{name_origin, summary,
 autoname_state}`; `agent_naming.rs` — the pure `build_naming_prompt` /
@@ -117,6 +139,10 @@ path — `apply_server_batch` → `ServerNotification::TurnEnded` →
 `finalize_agent_turn_idem` → `drain_autoname_requests` — and asserts the request
 is armed on turn 1 and NOT re-armed on turn 2),
 `autoname_result_renames_the_session`,
+`attached_unnamed_session_is_armed_and_named` + `a_spent_autoname_is_never_re_armed`
+(property 6 / bug-0021 — the REAL `Attached` resolution arms a still-`claude-N`
+session and replay makes it due; a spent one-shot is never re-armed after a
+relaunch; both NCs observed RED),
 `autoname_summary_survives_a_restart` + `autoname_summary_survives_a_gui_reload`
 (property 6 / bug-0020 — the settle path's write round-trips, and a SECOND view
 that knows the session only from the roster still shows its summary; NC observed

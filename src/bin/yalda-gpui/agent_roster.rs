@@ -46,6 +46,21 @@ impl AgentRoster {
         self.by_sid.remove(sid).is_some()
     }
 
+    /// Update a session's in-flight flag (from the `SessionBusy` broadcast,
+    /// bug-0022). Returns `true` when the session is known and the flag actually
+    /// flipped — the caller notifies on `true` so the jump panel repaints. A
+    /// broadcast for an unknown session is a no-op (the next `list_sessions`
+    /// carries the current state).
+    pub(crate) fn set_busy(&mut self, sid: &str, busy: bool) -> bool {
+        match self.by_sid.get_mut(sid) {
+            Some(info) if info.busy != busy => {
+                info.busy = busy;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Update a session's label (from `SessionRenamed`). Returns `true` if the
     /// session is known and the label actually changed. A rename for a session
     /// not yet in the roster is a no-op here (the eventual `list_sessions` /

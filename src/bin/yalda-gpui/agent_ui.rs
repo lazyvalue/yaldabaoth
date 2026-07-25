@@ -616,6 +616,10 @@ impl YaldaGpuiView {
                 }
             }
         }
+        // bug-0021: the session now carries its sid, which is what the one-shot
+        // autoname is keyed on. Arm here rather than at the constructor so a
+        // free/attached/`/clear`ed session is covered, not just a fresh create.
+        self.maybe_arm_autoname(id, cx);
         self.save_agent_ring(cx);
         cx.notify();
 
@@ -708,7 +712,41 @@ impl YaldaGpuiView {
 
     /// Clear a session's `unread` ("waiting on you") flag — it's being viewed.
     /// Idempotent; only touches the entity when the flag is actually set.
+    /// A session the server says just finished a turn (bug-0022). If this GUI
+    /// holds no local state for it — or holds it but isn't looking at it — it is
+    /// now "waiting on you". Local state wins when present (the pump's own turn
+    /// accounting already sets `unread`); this only covers the roster-only case.
+    pub(crate) fn note_roster_turn_finished(&mut self, sid: &str, cx: &mut Context<Self>) {
+        let server_sid = ServerSid::new(sid.to_string());
+        if let Some(local) = self.sessions.locate(&server_sid) {
+            // Open here: it is unread unless you are looking at it right now.
+            if self.jump_active_session().0 == Some(local) {
+                return;
+            }
+            if let Some(ent) = self.session_entity(local) {
+                ent.update(cx, |session, scx| {
+                    if !session.state.unread {
+                        session.state.unread = true;
+                        scx.notify();
+                    }
+                });
+            }
+            return;
+        }
+        self.roster_unread.insert(sid.to_string());
+        cx.notify();
+    }
+
+    /// Clear the roster-side unread mark for `sid` (bug-0022) — the twin of
+    /// [`mark_session_read`] for sessions with no local state.
+    pub(crate) fn mark_roster_session_read(&mut self, sid: &str) {
+        self.roster_unread.remove(sid);
+    }
+
     pub(crate) fn mark_session_read(&mut self, sid: SessionId, cx: &mut Context<Self>) {
+        if let Some(server_sid) = self.sessions.sid_of(sid).cloned() {
+            self.roster_unread.remove(server_sid.as_str());
+        }
         if let Some(ent) = self.session_entity(sid) {
             ent.update(cx, |session, scx| {
                 if session.state.unread {
@@ -726,7 +764,12 @@ impl YaldaGpuiView {
     pub(crate) fn jump_to_agent(&mut self, target: JumpTarget, cx: &mut Context<Self>) {
         match target {
             JumpTarget::Local(id) => self.jump_to_session(id, cx),
-            JumpTarget::Roster(sid) => self.jump_to_roster_session(sid, cx),
+            JumpTarget::Roster(sid) => {
+                // bug-0022: you are looking at it now — drop the roster-side
+                // "waiting on you" mark (the local one is cleared by the jump).
+                self.mark_roster_session_read(&sid);
+                self.jump_to_roster_session(sid, cx)
+            }
         }
     }
 
@@ -2588,6 +2631,29 @@ impl YaldaGpuiView {
                     self.agent_roster.rename(&session_id, &label);
                     self.reconcile_session_renamed(&session_id, &label, cx);
                 }
+                // bug-0022: live turn status for EVERY session, including ones
+                // this GUI never attached to (free sessions, or ones another GUI
+                // is driving). A busy→idle flip on a session that isn't the
+                // focused one is exactly "it finished while you were elsewhere",
+                // so it also raises the unread mark the panel reads as
+                // "your turn" (UXI-JumpPanel-6) — previously impossible for a
+                // session we hold no local state for.
+                ServerNotification::SessionBusy { session_id, busy } => {
+                    let was_busy = self
+                        .agent_roster
+                        .entries_by_label()
+                        .into_iter()
+                        .find(|i| i.session_id == session_id)
+                        .map(|i| i.busy)
+                        .unwrap_or(false);
+                    let changed = self.agent_roster.set_busy(&session_id, busy);
+                    if changed && was_busy && !busy {
+                        self.note_roster_turn_finished(&session_id, cx);
+                    }
+                    if changed {
+                        cx.notify();
+                    }
+                }
                 ServerNotification::PromptRejected {
                     session_id,
                     reason,
@@ -3369,12 +3435,16 @@ impl YaldaGpuiView {
         };
 
         // Snapshot the identity to carry across the reset BEFORE closing.
-        let Some((label, slot_cwd)) = self
+        // bug-0021: `name_origin` travels with the label — `/clear` mints a NEW
+        // server session that inherits the old name, so without carrying the
+        // latch a user-typed name would come back marked `Auto` and become
+        // autoname-eligible again.
+        let Some((label, slot_cwd, name_origin)) = self
             .sessions
             .get(id)
             .map(|ent| {
                 let s = ent.read(cx);
-                (s.label.clone(), s.cwd.clone())
+                (s.label.clone(), s.cwd.clone(), s.state.name_origin)
             })
         else {
             return;
@@ -3418,6 +3488,7 @@ impl YaldaGpuiView {
             // placeholder has no history, so finish_replay won't re-settle it.)
             let mut state =
                 AgentState::new_server_managed(Some("connecting to session server…".into()));
+            state.name_origin = name_origin;
             state.settle_input_focus();
             let new_id = self.show_local_session(
                 AgentSession {
@@ -3438,7 +3509,8 @@ impl YaldaGpuiView {
             // attaches asynchronously, so the permission mode is not forced here
             // — this path keeps the server default. The server path above is the
             // real one.
-            let state = self.create_agent_session(None, slot_cwd.clone(), cx);
+            let mut state = self.create_agent_session(None, slot_cwd.clone(), cx);
+            state.name_origin = name_origin;
             let new_id = self.show_local_session(
                 AgentSession {
                     state,
@@ -4682,6 +4754,58 @@ impl YaldaGpuiView {
     /// `Pending → Requested` here is what makes the call one-shot: a second
     /// turn finishing before the first result lands finds `Requested`, not
     /// `Pending`, and re-arms nothing.
+    /// Arm `id` for the one-shot autoname if this SESSION has never had one
+    /// (`bug-0021`, `UXI-AgentTile-27` property 1 as amended).
+    ///
+    /// The original arming rule was "the constructor that built this state was a
+    /// fresh-create path", which silently excluded three real ways a nameless
+    /// session comes into being: created **free** from the jump panel (server-side
+    /// only — there is no local state to arm), `/clear` (a brand-new server
+    /// session that inherits the old label), and a session restored from a launch
+    /// where the naming never ran. Those sessions could never be named, ever.
+    ///
+    /// So the arm is keyed on **identity + evidence**, not on provenance:
+    ///
+    /// 1. the label is still an auto-generated placeholder (`claude-N`) — an
+    ///    installed autoname or anything the user typed is left alone;
+    /// 2. `name_origin` is not the `User` latch (belt and braces with 1);
+    /// 3. the one-shot has not already been spent for this **sid** — recorded
+    ///    durably in the summary sidecar, so this cannot re-ask Haiku about the
+    ///    same session on every launch;
+    /// 4. the autoname isn't already `Requested` (a call is in flight).
+    ///
+    /// Called at every point a session becomes bound to a sid (create + attach
+    /// resolutions, restore), so it covers every arrival path by construction.
+    pub(crate) fn maybe_arm_autoname(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        let Some(sid) = self.sessions.sid_of(id).cloned() else {
+            return;
+        };
+        if crate::persist::autoname_already_attempted(&self.session_summaries, &sid) {
+            return;
+        }
+        let Some(ent) = self.sessions.get(id).cloned() else {
+            return;
+        };
+        ent.update(cx, |s, scx| {
+            if s.autoname == AutonameState::Requested
+                || s.name_origin == NameOrigin::User
+                || !is_auto_claude_label(&s.label)
+            {
+                return;
+            }
+            s.autoname = AutonameState::Pending;
+            // A session that ALREADY has content (attach + replay, `/clear`ed and
+            // used, a restored transcript) must not wait for another turn to be
+            // named — the turn-finalize arm only covers sessions that run one
+            // while we watch. Empty sessions arm and wait: there is nothing to
+            // name from yet.
+            if !s.state.editor.document().full_text().trim().is_empty() {
+                s.autoname_due = true;
+            }
+            scx.notify();
+        });
+    }
+
     pub(crate) fn drain_autoname_requests(&mut self, cx: &mut Context<Self>) {
         let due: Vec<SessionId> = self
             .sessions
@@ -4718,9 +4842,17 @@ impl YaldaGpuiView {
                 continue;
             };
             if transcript.trim().is_empty() {
-                // Nothing to name from — settle terminally rather than retrying
-                // on the next turn (property 1: one shot, ever).
-                self.finish_autoname(id, None, cx);
+                // Nothing to name from YET. bug-0021: leave the arm `Pending`
+                // (re-arm the state the drain just moved to `Requested`) instead
+                // of settling terminally — an empty transcript means the content
+                // hasn't arrived, not that this session is unnameable, and
+                // settling here is one of the ways sessions ended up stuck at
+                // `claude-N`. The one-shot is still honored: it is spent only
+                // when a call is actually made (`finish_autoname`).
+                self.with_session(id, cx, |s| {
+                    s.autoname = AutonameState::Pending;
+                    s.autoname_due = false;
+                });
                 continue;
             }
             self.spawn_autoname_worker(id, transcript, cx);
@@ -4811,12 +4943,25 @@ impl YaldaGpuiView {
         // (cwd-keyed, tile-bound sessions only) drops it for every free session —
         // so the explainer line vanished on reload. Record it id-keyed, the same
         // durability the label gets from the WAL.
-        if let Some(summary) = new_summary
-            && let Some(sid) = self.sessions.sid_of(id).cloned()
-        {
-            self.session_summaries
-                .insert(sid.to_string(), summary.clone());
-            crate::persist::save_session_summary(&sid, &summary);
+        //
+        // bug-0021: the same entry is the durable record that this session's
+        // one-shot is SPENT (empty string = tried, nothing usable came back), so
+        // the identity-keyed arm in `maybe_arm_autoname` can't re-ask on the next
+        // launch.
+        if let Some(sid) = self.sessions.sid_of(id).cloned() {
+            match new_summary {
+                Some(summary) => {
+                    self.session_summaries
+                        .insert(sid.to_string(), summary.clone());
+                    crate::persist::save_session_summary(&sid, &summary);
+                }
+                None => {
+                    self.session_summaries
+                        .entry(sid.to_string())
+                        .or_default();
+                    crate::persist::mark_autoname_attempted(&sid);
+                }
+            }
         }
         self.save_agent_ring(cx);
         cx.notify();
