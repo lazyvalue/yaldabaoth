@@ -233,6 +233,19 @@ pub(crate) struct TranscriptView {
     /// the caret is suppressed so EVERY visible line renders via the uniform
     /// (registerable) non-cursor path and the selection band shows instead.
     pub(crate) dragging: bool,
+    /// bug-0023: the element-id fingerprint FROZEN for the duration of a mouse
+    /// gesture. `render_agent` keys the transcript wrapper's `GlobalElementId` on
+    /// the render fingerprint (the dropped-self-notify backstop), so every
+    /// descendant's element state is re-keyed whenever that fingerprint moves.
+    /// A press inside the transcript moves it by itself (`transcript_mouse_down`
+    /// sets the caret + focus, both fingerprint fields), which threw away the
+    /// tool fold header's `pending_mouse_down` between down and up — gpui then
+    /// fired NO click and the fold could never be expanded. Same shape as
+    /// bug-0015's `drag_protect_line`: hold the transcript stable for the whole
+    /// gesture. `Some(fp)` from mouse-down until mouse-up; the self-notify path
+    /// still invalidates normally meanwhile, so only the rare dropped-notify
+    /// backstop is deferred (by one press).
+    pub(crate) element_fp_freeze: Option<u64>,
 }
 
 impl TranscriptView {
@@ -294,7 +307,14 @@ impl TranscriptView {
             perf_label: "transcript",
             token_hits: std::rc::Rc::new(RefCell::new(Vec::new())),
             dragging: false,
+            element_fp_freeze: None,
         }
+    }
+
+    /// The element-id fingerprint `render_agent` must use this frame: the frozen
+    /// one while a mouse gesture is in flight (bug-0023), else `live`.
+    pub(crate) fn element_fp(&self, live: u64) -> u64 {
+        self.element_fp_freeze.unwrap_or(live)
     }
 }
 
@@ -336,6 +356,13 @@ impl TranscriptView {
     /// hit and drop the selection anchor there. A click on empty space (no token
     /// hit) clears any existing selection. (UXI-Selection-1.)
     pub(crate) fn transcript_mouse_down(&mut self, ev: &gpui::MouseDownEvent, cx: &mut Context<Self>) {
+        // bug-0023: freeze the transcript wrapper's element-id fingerprint at its
+        // PRE-press value for the whole gesture. Moving the caret/focus below
+        // would otherwise re-key every descendant's element state mid-gesture,
+        // dropping gpui's `pending_mouse_down` so no `on_click` inside the
+        // transcript (the tool fold header, a wiki link) ever fires.
+        self.element_fp_freeze =
+            Some(TranscriptSeqs::of(&self.session.read(cx).state).fingerprint_hash());
         let Some((line, col)) = self.transcript_pos_at(cx, ev.position) else {
             self.session.update(cx, |sp, _| {
                 sp.state.editor.clear_selection();
@@ -386,7 +413,15 @@ impl TranscriptView {
     /// Finish the drag: X11-style, a non-empty selection auto-copies to the
     /// system clipboard; an empty one (a bare click) is dropped. (UXI-Selection-1.)
     pub(crate) fn transcript_mouse_up(&mut self, _ev: &gpui::MouseUpEvent, cx: &mut Context<Self>) {
+        // Gesture over: the element id tracks the live fingerprint again
+        // (bug-0023). Cleared unconditionally — a press that never started a drag
+        // (or whose up arrives after the pointer left the transcript) must not
+        // strand the freeze and disable the dropped-notify backstop.
+        let was_frozen = self.element_fp_freeze.take().is_some();
         if !self.dragging {
+            if was_frozen {
+                cx.notify();
+            }
             return;
         }
         self.dragging = false;
@@ -1225,6 +1260,13 @@ impl TranscriptView {
                                 },
                             );
                         }
+
+                        // bug-0023: the harness clicks this row's REAL painted rect
+                        // (a hand-called `toggle_expanded` proves nothing).
+                        let header_row = header_row.into_any_element();
+                        #[cfg(test)]
+                        let header_row =
+                            crate::probe_bounds_dyn(format!("tool-group-header-{anchor}"), header_row);
 
                         let mut block = div()
                             .flex()

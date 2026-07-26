@@ -160,6 +160,18 @@ but the fingerprint only busts the cache if its notify LANDS. Keying the element
 id on the fingerprint makes "fingerprint moved ⇒ render ran" true by construction
 of the element tree, not by a notify that a framework hole can eat.
 
+**Exception — a mouse gesture freezes the id (bug-0023).** Keying the element id on
+the fingerprint also re-keys every DESCENDANT's element state whenever the
+fingerprint moves. A press inside the transcript moves it by itself
+(`transcript_mouse_down` sets the caret + focus, both fingerprint fields), so gpui's
+`pending_mouse_down` was thrown away between down and up and NO `on_click` inside the
+transcript ever fired — the tool fold header stopped expanding. So
+`TranscriptView::element_fp_freeze` holds the fingerprint at its pre-press value from
+mouse-down until mouse-up (`element_fp(live)`), the same gesture-scoped stability
+bug-0015's `drag_protect_line` gives the flat-item count. The self-notify path keeps
+invalidating normally during the gesture; only the dropped-notify backstop is
+deferred, by one press.
+
 **Status.** `implemented` (headless — the reuse-decision path is deterministic in the
 harness).
 
@@ -169,7 +181,47 @@ WITHOUT notifying the session (deterministically reproducing a dropped notify),
 forces a root frame, and asserts the transcript render count still advances +1.
 Negative control (observed RED): revert the embed to the fingerprint-independent
 `cached_child(transcript_view)` and the count stays flat — the stale-tail bug
-reproduced.
+reproduced. The freeze exception is pinned by
+`tool_group_header_click_expands_the_fold` (below).
+
+### UXI-AgentTile-29 — A folded tool block expands on click, and `j`/`k` hop over it
+
+**Statement.** In the transcript:
+
+1. **Click expands.** Clicking a folded tool-use group's header (`▶ ● bash …`)
+   toggles it open/closed. This holds even though the press itself moves the
+   transcript's caret + focus.
+2. **Navigation hops over it.** A tool call splices a dedicated BLANK anchor line
+   into the document, which renders as the tool card (its own blank `Line` item is
+   stripped by blank-collapse). Transcript navigation therefore never RESTS on a
+   tool-anchor line: a motion that would land there continues in the direction of
+   travel to the next real content line, so one `j` (or `k`) crosses the whole tool
+   block — including a run of back-to-back anchors that render as one merged group.
+   A motion that doesn't change the line (`h`/`l`, an edge no-op) never teleports.
+
+**Why.** (1) was a shipped regression: the fold was unopenable (bug-0023). (2) is the
+matching keyboard behavior — the anchor line has no text, and stopping on it puts the
+cursor bar on an invisible row (worse: it forces the blank line to be KEPT by the
+caret-protection rule, so the block visibly grows a blank row as you pass it).
+
+**Applies to.** `transcript_view.rs` — the `FlatItem::ToolGroup` header `on_click`
+plus `element_fp_freeze` / `element_fp` (see the UXI-AgentTile-7 exception above);
+`screens.rs` `render_agent` (`transcript_view.read(cx).element_fp(live_fp)`);
+`agent.rs` — `AgentState::tool_anchor_lines` / `hop_cursor_over_tool_anchors` and the
+pure `hop_over_tool_anchors`; `agent_ui.rs` — the transcript-nav dispatch.
+
+**Status.** `implemented`.
+
+**Enforcement.** `verify_harness.rs`:
+`tool_group_header_click_expands_the_fold` — probes the header's REAL painted rect
+and drives the window's REAL mouse dispatch (`simulate_click`) at it, asserting
+`tools.expanded` flips (and, non-vacuously, that the press really does move the
+render fingerprint). **NC observed RED**: use the live fingerprint for the wrapper id
+(drop the freeze) ⇒ "clicking the folded tool-use header did NOTHING".
+`transcript_jk_hops_over_tool_blocks` — real `handle_claude_key("j"/"k")` from the
+content line above a TWO-anchor run; asserts the caret clears both in one press and
+comes back. **NC observed RED**: drop the `hop_cursor_over_tool_anchors` call ⇒ the
+caret lands on anchor line 1.
 
 ### UXI-AgentTile-8 — A tool call never splits an agent sentence
 

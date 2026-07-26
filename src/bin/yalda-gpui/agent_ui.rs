@@ -5500,6 +5500,7 @@ impl YaldaGpuiView {
             let Some(outcome) = self.with_session_silent(focused_id, cx, |claude| {
                 claude.status = None;
                 claude.mode = EditMode::Normal;
+                let from_line = claude.editor.cursor().line;
                 let out = Self::dispatch_normal_core(
                     &mut claude.editor,
                     &mut claude.mode,
@@ -5508,6 +5509,11 @@ impl YaldaGpuiView {
                 );
                 // Never leave the read-only transcript in Insert mode.
                 claude.mode = EditMode::Normal;
+                // UXI-AgentTile-29: a tool-use block's anchor line holds no text —
+                // it renders as the tool card and its blank `Line` is stripped. So
+                // navigation HOPS OVER it (and over a run of them) rather than
+                // resting on an invisible row.
+                claude.hop_cursor_over_tool_anchors(from_line);
                 out
             }) else {
                 return;

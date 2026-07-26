@@ -250,6 +250,44 @@ pub(crate) fn user_turn_item_indices(flat_items: &[FlatItem]) -> Vec<usize> {
         .collect()
 }
 
+/// PURE: where the caret lands when a transcript motion from `from` to `to` puts
+/// it on a tool-anchor line (UXI-AgentTile-29). Walks in the direction of travel
+/// until a real content line, so a run of consecutive anchors (back-to-back tool
+/// calls, which render as ONE merged group) is crossed in a single press. A
+/// motion that didn't change the line (`h`/`l`, an edge no-op) never teleports.
+/// Falls back to the opposite direction at the buffer edge, and to `to` itself
+/// when every line is an anchor.
+pub(crate) fn hop_over_tool_anchors(
+    anchors: &std::collections::HashSet<usize>,
+    from: usize,
+    to: usize,
+    last: usize,
+) -> usize {
+    if !anchors.contains(&to) || to == from {
+        return to;
+    }
+    let down = to > from;
+    let walk = |mut l: usize, down: bool| -> Option<usize> {
+        loop {
+            if down {
+                if l >= last {
+                    return None;
+                }
+                l += 1;
+            } else {
+                if l == 0 {
+                    return None;
+                }
+                l -= 1;
+            }
+            if !anchors.contains(&l) {
+                return Some(l);
+            }
+        }
+    };
+    walk(to, down).or_else(|| walk(to, !down)).unwrap_or(to)
+}
+
 /// Free-function variant of `YaldaGpuiView::build_tool_block` that
 /// works without an active `&Context<Self>`. Used inside `gpui::list`'s
 /// per-item render closure (which only gets `&mut Window, &mut GpuiApp`).
@@ -3404,6 +3442,39 @@ impl AgentState {
     pub(crate) fn armed_for_autoname(mut self) -> Self {
         self.autoname = AutonameState::Pending;
         self
+    }
+
+    /// The doc lines that exist ONLY to anchor a tool-use block. Every tool call
+    /// splices a dedicated BLANK line (`anchor_for_new_tool_call`) that the flat
+    /// build renders as the tool card; the blank `Line` itself is stripped
+    /// (blank-collapse) unless the caret happens to sit on it. So these lines
+    /// carry no text and are not navigation stops (UXI-AgentTile-29).
+    pub(crate) fn tool_anchor_lines(&self) -> std::collections::HashSet<usize> {
+        self.tools
+            .order
+            .iter()
+            .filter_map(|id| self.tools.anchor.get(id))
+            .filter_map(|&a| self.editor.line_for_anchor(a))
+            .collect()
+    }
+
+    /// UXI-AgentTile-29: after a transcript motion from `from_line`, push the
+    /// caret off any tool-anchor line so `j`/`k` HOP OVER a tool-use block in one
+    /// press instead of resting on its invisible anchor line(s).
+    pub(crate) fn hop_cursor_over_tool_anchors(&mut self, from_line: usize) {
+        let to = self.editor.cursor().line;
+        let anchors = self.tool_anchor_lines();
+        if !anchors.contains(&to) {
+            return;
+        }
+        let last = self.editor.document().line_count().saturating_sub(1);
+        let target = hop_over_tool_anchors(&anchors, from_line, to, last);
+        if target != to {
+            self.editor.cursor_mut().line = target;
+            let len = self.editor.document().line_len_chars(target);
+            let col = self.editor.cursor().col.min(len);
+            self.editor.cursor_mut().col = col;
+        }
     }
 
     /// The transcript-structure generation counter — bumped on every mutation

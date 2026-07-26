@@ -912,7 +912,13 @@ impl YaldaGpuiView {
         // render-skip preserved (typing elsewhere never moves it). The root
         // (uncached) recomputes this each frame, so the backstop can't itself be
         // parked. See `TranscriptSeqs::fingerprint_hash`.
-        let transcript_fp = TranscriptSeqs::of(&session_ent.read(cx).state).fingerprint_hash();
+        // bug-0023: while a mouse gesture is in flight the transcript view FREEZES
+        // this fingerprint at its pre-press value, so the press can't re-key its own
+        // descendants' element state and kill gpui's down→up click pairing (the tool
+        // fold header stopped expanding). The freeze lasts one gesture; the
+        // self-notify path keeps invalidating normally meanwhile.
+        let live_fp = TranscriptSeqs::of(&session_ent.read(cx).state).fingerprint_hash();
+        let transcript_fp = transcript_view.read(cx).element_fp(live_fp);
         let transcript_body: AnyElement = div()
             .id(("transcript-fp", transcript_fp))
             .size_full()

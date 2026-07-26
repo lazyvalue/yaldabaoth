@@ -1768,6 +1768,191 @@ fn tool_call_midtoken_does_not_split_agent_text_run(cx: &mut TestAppContext) {
     });
 }
 
+/// bug-0023: clicking a FOLDED tool-use block's header must expand it. The
+/// sibling `transcript_021_tool_expand_busts_cache` hand-calls `toggle_expanded`
+/// — a proxy (anti-circling rule 1) that stays green while the user's actual
+/// click is dead. This drives the window's REAL mouse dispatch
+/// (`simulate_click`) at the header's REAL painted rect, so the transcript's own
+/// select-to-clipboard gesture (`#claude-body`'s mouse down/move/up) is under
+/// test alongside the header's `on_click`.
+#[gpui::test]
+fn tool_group_header_click_expands_the_fold(cx: &mut TestAppContext) {
+    use yalda::acp_channel::{ReplyEvent, ToolCall};
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    let ev = |e: ReplyEvent| ServerNotification::ReplyEvent {
+        session_id: "S1".into(),
+        event: e,
+    };
+    view.update(vcx, |v, cx| {
+        let tc = ToolCall::new("tool-1", "Bash echo hi");
+        let batch = vec![
+            ev(ReplyEvent::Chunk("Running a command.\n".into())),
+            ev(ReplyEvent::ToolCallStarted(tc)),
+            ev(ReplyEvent::Chunk("Done.\n".into())),
+        ];
+        v.apply_server_batch(batch, cx);
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+
+    let anchor = view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        c.view_model
+            .flat_items_cache
+            .iter()
+            .find_map(|it| match it {
+                crate::FlatItem::ToolGroup { anchor_line, .. } => Some(*anchor_line),
+                _ => None,
+            })
+            .expect("a tool group is rendered")
+    });
+
+    // The header's REAL painted rect — clicking a computed guess proves nothing.
+    // The transcript is a CACHED child: dirty the session so it actually
+    // re-renders (a bare root notify is a cache hit and paints nothing).
+    for _ in 0..2 {
+        view.update(vcx, |v, cx| {
+            if let Some(mut c) = v.agent_mut(cx) {
+                c.pending_reveal_cursor = true;
+            }
+            cx.notify();
+        });
+        vcx.run_until_parked();
+    }
+    crate::layout_probe_begin();
+    view.update(vcx, |v, cx| {
+        if let Some(mut c) = v.agent_mut(cx) {
+            c.pending_reveal_cursor = true;
+        }
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    let rect = crate::layout_probe_get(&format!("tool-group-header-{anchor}"));
+    crate::layout_probe_end();
+
+    let (x, y, w, h) = rect.expect("the folded tool header never painted");
+    assert!(w > 4.0 && h > 4.0, "fold header painted with no area ({w}x{h}) — nothing to click");
+    let at = point(px(x + w / 2.0), px(y + h / 2.0));
+
+    view.read_with(vcx, |v, cx| {
+        let folded = v
+            .agent_read(cx, |c| !c.tools.expanded.contains(&anchor.to_string()))
+            .expect("agent");
+        assert!(folded, "precondition: the tool block starts FOLDED");
+    });
+
+    // The press itself moves the transcript's render fingerprint (caret + focus),
+    // which is exactly what used to re-key the header's element state between
+    // down and up. Non-vacuous: assert it really moves, so the guard can't pass
+    // because nothing happened.
+    let fp_before = view.read_with(vcx, |v, cx| {
+        v.agent_read(cx, |c| crate::TranscriptSeqs::of(c).fingerprint_hash())
+            .expect("agent")
+    });
+    vcx.simulate_mouse_move(at, None, gpui::Modifiers::default());
+    vcx.simulate_click(at, gpui::Modifiers::default());
+    vcx.run_until_parked();
+    let fp_after = view.read_with(vcx, |v, cx| {
+        v.agent_read(cx, |c| crate::TranscriptSeqs::of(c).fingerprint_hash())
+            .expect("agent")
+    });
+    assert_ne!(
+        fp_before, fp_after,
+        "the press must move the render fingerprint — otherwise this guard proves nothing"
+    );
+
+    view.read_with(vcx, |v, cx| {
+        let expanded = v
+            .agent_read(cx, |c| c.tools.expanded.contains(&anchor.to_string()))
+            .expect("agent");
+        assert!(
+            expanded,
+            "clicking the folded tool-use header did NOTHING — it never expanded (bug-0023)"
+        );
+    });
+}
+
+/// UXI-AgentTile-29: `j`/`k` in transcript navigation HOP OVER a tool-use block.
+/// Every tool call splices a dedicated BLANK anchor line that renders as the tool
+/// card (its own `Line` item is stripped by blank-collapse), so resting the caret
+/// there is a stop on an invisible row. Drives the REAL key path
+/// (`handle_claude_key` → `dispatch_normal_core` → the hop), not a hand-set cursor.
+#[gpui::test]
+fn transcript_jk_hops_over_tool_blocks(cx: &mut TestAppContext) {
+    use yalda::acp_channel::{ReplyEvent, ToolCall};
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let (view, vcx, id, _session) = boot_with_transcript(cx);
+    let ev = |e: ReplyEvent| ServerNotification::ReplyEvent {
+        session_id: "S1".into(),
+        event: e,
+    };
+    view.update(vcx, |v, cx| {
+        // Two back-to-back tool calls → two consecutive anchor lines, rendered as
+        // ONE merged group. Both must be crossed in a single press.
+        let batch = vec![
+            ev(ReplyEvent::Chunk("before the tools\n".into())),
+            ev(ReplyEvent::ToolCallStarted(ToolCall::new("t-1", "Bash one"))),
+            ev(ReplyEvent::ToolCallStarted(ToolCall::new("t-2", "Bash two"))),
+            ev(ReplyEvent::Chunk("after the tools\n".into())),
+        ];
+        v.apply_server_batch(batch, cx);
+    });
+    vcx.run_until_parked();
+
+    let (anchors, start) = view.read_with(vcx, |v, cx| {
+        v.read_session(id, cx, |c| {
+            let a: std::collections::BTreeSet<usize> = c.tool_anchor_lines().into_iter().collect();
+            let first = *a.iter().next().expect("tool anchor lines exist");
+            (a, first)
+        })
+        .expect("session")
+    });
+    assert_eq!(anchors.len(), 2, "two tool calls ⇒ two anchor lines, got {anchors:?}");
+    assert!(start > 0, "the anchor run must have a content line above it");
+    // Non-vacuous: the anchors are CONSECUTIVE, so a plain one-line `j` from just
+    // above would land on the first one (and a second `j` on the second).
+    assert!(
+        anchors.contains(&(start + 1)),
+        "expected consecutive anchor lines, got {anchors:?}"
+    );
+
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| {
+            c.focus = crate::AgentFocus::Transcript;
+            c.editor.cursor_mut().line = start - 1;
+            c.editor.cursor_mut().col = 0;
+        });
+    });
+    let line = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.read_with(vcx, |v, cx| {
+            v.read_session(id, cx, |c| c.editor.cursor().line).unwrap()
+        })
+    };
+
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("j"), w, cx));
+    let after_j = line(&view, vcx);
+    assert!(
+        !anchors.contains(&after_j),
+        "j must HOP OVER the tool block, not rest on its anchor line (landed {after_j}, anchors {anchors:?})"
+    );
+    assert!(
+        after_j > *anchors.iter().next_back().unwrap(),
+        "one press clears the WHOLE run of tool anchors (landed {after_j}, anchors {anchors:?})"
+    );
+
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("k"), w, cx));
+    let after_k = line(&view, vcx);
+    assert!(
+        !anchors.contains(&after_k),
+        "k must hop back over the block too (landed {after_k}, anchors {anchors:?})"
+    );
+    assert_eq!(after_k, start - 1, "k returns to the content line above the block");
+}
+
 /// REGRESSION (live report "undo erased the buffer"): agent content that
 /// streams while the user is mid-insert in Worksheet mode must NOT become
 /// user-undoable. The bug: `begin_insert` opens ONE undo group for the whole
