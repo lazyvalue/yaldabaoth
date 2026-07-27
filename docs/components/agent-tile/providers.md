@@ -9,7 +9,8 @@ Facet of the [Agent Tile](README.md) component. Owns `UXI-AgentTile-30`.
 selector, and a bound tile identifies it in the status strip. Each session owns
 exactly one provider for its lifetime. Create, restart, WAL recovery, clear, resume,
 and working-directory respawn all route through that provider; a mixed roster may
-run Claude and Codex concurrently.
+run Claude and Codex concurrently. Transcript agent-turn headers use that active
+provider's display name (`Claude` or `Codex`); the user header remains `You`.
 
 Codex uses the `codex-acp` adapter and the cached interactive login created by
 `codex login`. Yalda removes ambient OpenAI API-auth variables from Codex children

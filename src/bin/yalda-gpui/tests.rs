@@ -1888,6 +1888,33 @@ fn header_role_is_total_over_turn_id() {
     assert_eq!(HeaderRole::User.into_turn_role(), TurnRole::User);
 }
 
+#[test]
+fn agent_turn_header_uses_active_provider_name() {
+    use yalda::acp_channel::AgentProvider;
+
+    assert_eq!(
+        turn_header_label(TurnRole::Claude, AgentProvider::Claude),
+        "Claude"
+    );
+    assert_eq!(
+        turn_header_label(TurnRole::Claude, AgentProvider::Codex),
+        "Codex"
+    );
+    assert_eq!(
+        turn_header_label(TurnRole::User, AgentProvider::Codex),
+        "You"
+    );
+
+    let mut state = AgentState::new_for_test();
+    let claude_fp = TranscriptSeqs::of(&state).fingerprint_hash();
+    state.provider = AgentProvider::Codex;
+    let codex_fp = TranscriptSeqs::of(&state).fingerprint_hash();
+    assert_ne!(
+        claude_fp, codex_fp,
+        "changing provider must invalidate the cached transcript label"
+    );
+}
+
 /// F8 / INV-12 (count parity): `reconcile_list` is the ONLY mutator of
 /// `(list_state, list_item_count)`, updating both together so they can't
 /// drift. It returns whether the list grew. After any reconcile the

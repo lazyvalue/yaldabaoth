@@ -55,6 +55,19 @@ pub(crate) fn committed_row_bg(tag: Option<TurnId>, user_turn_bg: Hsla) -> Hsla 
     }
 }
 
+/// User-facing label for a transcript turn header. `TurnRole::Claude` is the
+/// historical internal name for an agent/LLM turn; the visible label follows
+/// the session's actual provider.
+pub(crate) fn turn_header_label(
+    role: TurnRole,
+    provider: yalda::acp_channel::AgentProvider,
+) -> &'static str {
+    match role {
+        TurnRole::Claude => provider.label(),
+        TurnRole::User => "You",
+    }
+}
+
 /// The slice-version watermark the observe filter compares across renders. Each
 /// field is a monotonic (or monotonic-equivalent) counter for one input the
 /// transcript `render()` reads; the observe callback recomputes the live values
@@ -62,6 +75,9 @@ pub(crate) fn committed_row_bg(tag: Option<TurnId>, user_turn_bg: Hsla) -> Hsla 
 /// slice moved for the `YALDA_PERF` notify-reason counter.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub(crate) struct TranscriptSeqs {
+    /// Active agent backend. It controls the visible agent-turn label, so a
+    /// provider change must invalidate the cached transcript.
+    pub(crate) provider: yalda::acp_channel::AgentProvider,
     /// Document `edit_seq` — text content (insert/delete; freezing via
     /// `freeze_as_user_turn` is an edit so it bumps this too).
     pub(crate) edit_seq: u64,
@@ -143,6 +159,7 @@ impl TranscriptSeqs {
                 (0, (0, 0), EditMode::Normal, None)
             };
         Self {
+            provider: c.provider,
             edit_seq: c.editor.document().edit_seq(),
             frozen_gen: c.frozen_gen(),
             tools_gen: c.tools_gen(),
@@ -537,6 +554,7 @@ impl TranscriptView {
             you_parked_snap,
             you_wrap_cols,
             you_block_seq,
+            provider_snap,
         } = session.update(cx, |sp, _scx| {
             let c: &mut AgentState = &mut sp.state;
 
@@ -803,6 +821,7 @@ impl TranscriptView {
                 you_parked_snap,
                 you_wrap_cols,
                 you_block_seq,
+                provider_snap: c.provider,
             }
         });
 
@@ -1404,9 +1423,10 @@ impl TranscriptView {
                         }
                     }
                     FlatItem::TurnHeader { role } => {
-                        let (label, accent): (&str, Hsla) = match role {
-                            TurnRole::Claude => ("Claude", nc(at_snap.turn_header_agent)),
-                            TurnRole::User => ("You", nc(at_snap.turn_header_user)),
+                        let label = turn_header_label(*role, provider_snap);
+                        let accent: Hsla = match role {
+                            TurnRole::Claude => nc(at_snap.turn_header_agent),
+                            TurnRole::User => nc(at_snap.turn_header_user),
                         };
                         let rule_color = nc(at_snap.turn_rule);
                         div()
@@ -1738,6 +1758,8 @@ struct TranscriptPrep {
     you_block_snap: Option<YouBlockSnap>,
     you_parked_snap: Vec<(usize, Vec<String>)>,
     you_wrap_cols: usize,
+    /// Active backend used for the agent-turn header label.
+    provider_snap: yalda::acp_channel::AgentProvider,
     /// Render-input hash of the ACTIVE You-block (compose text + caret + mode +
     /// selection), or 0 when no block is active. The You-block is one list item
     /// driven by the COMPOSE buffer, not the transcript `edit_seq`, so
