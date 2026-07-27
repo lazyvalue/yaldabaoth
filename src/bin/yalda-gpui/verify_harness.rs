@@ -3835,6 +3835,7 @@ fn install_agent_picker(
                 acp_session_id: None,
                 label: label.to_string(),
                 cwd: PathBuf::from("."),
+                provider: yalda::acp_channel::AgentProvider::Claude,
                 turns: 3,
                 connected: true,
                 permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
@@ -3863,7 +3864,7 @@ fn session_picker_renders_empty_ring(cx: &mut TestAppContext) {
     });
     vcx.run_until_parked();
 
-    // Empty roster → only the "start new" row; renders without panic.
+    // Empty roster → only the two provider creation rows; renders without panic.
     install_agent_picker(&view, &mut *vcx, &[]);
     vcx.run_until_parked();
     view.read_with(vcx, |v, cx| {
@@ -3876,7 +3877,7 @@ fn session_picker_renders_empty_ring(cx: &mut TestAppContext) {
     });
 
     // Seed two roster sessions for this cwd → the selector projects two FREE
-    // rows (plus the "start new" row = 3 total). No async reducer, no per-tile
+    // rows (plus the two provider creation rows = 4 total). No async reducer, no per-tile
     // cache — a pure view of the shared roster.
     install_agent_picker(&view, &mut *vcx, &[("S1", "claude-1"), ("S2", "claude-2")]);
     vcx.run_until_parked();
@@ -3907,6 +3908,7 @@ fn selector_projection_reflects_binding_across_tiles(cx: &mut TestAppContext) {
                 acp_session_id: None,
                 label: label.into(),
                 cwd: PathBuf::from("."),
+                provider: yalda::acp_channel::AgentProvider::Claude,
                 turns: 0,
                 connected: true,
                 permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
@@ -4019,6 +4021,35 @@ fn new_agent_uses_live_workspace_cwd_after_set_cwd(cx: &mut TestAppContext) {
         "a new agent must use the cwd set on the workspace, not the one cached \
          when the selector opened"
     );
+}
+
+/// Codex identity lives on the session itself, so it remains available even
+/// when the session server (and therefore the roster) is disabled.
+#[gpui::test]
+fn codex_picker_session_retains_provider_without_server(cx: &mut TestAppContext) {
+    use crate::{AgentTile, App};
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+    vcx.run_until_parked();
+
+    view.update(vcx, |v, _cx| {
+        v.set_screen(App::Agent(AgentTile::new()));
+    });
+    view.update(vcx, |v, cx| v.agent_picker_activate(1, cx));
+    vcx.run_until_parked();
+
+    view.read_with(vcx, |v, cx| {
+        let id = v
+            .agent_tile()
+            .expect("agent tile")
+            .session()
+            .expect("Codex session bound");
+        let session = v.sessions.get(id).expect("session").read(cx);
+        assert_eq!(
+            session.state.provider,
+            yalda::acp_channel::AgentProvider::Codex
+        );
+        assert_eq!(session.label, "codex-1");
+    });
 }
 
 /// INV-PR regression (the close path the adversarial review flagged): when a
@@ -4136,6 +4167,10 @@ fn next_agent_label_is_unique_and_fills_gaps(cx: &mut TestAppContext) {
     // Empty store → claude-1.
     view.read_with(vcx, |v, cx| {
         assert_eq!(v.next_agent_label(cx), "claude-1");
+        assert_eq!(
+            v.next_agent_label_for(yalda::acp_channel::AgentProvider::Codex, cx),
+            "codex-1"
+        );
     });
     // With claude-1 present → claude-2 (NOT another claude-1).
     add(&view, &mut *vcx, "claude-1");
@@ -4171,10 +4206,11 @@ fn session_picker_navigation_wraps(cx: &mut TestAppContext) {
         })
     };
 
-    // 3 rows (new + S1 + S2). Down from 0 → 1 → 2 → wraps to 0.
+    // 4 rows (new Claude + new Codex + S1 + S2). Navigation wraps.
     view.update(vcx, |v, cx| v.agent_picker_move(1, cx));
     view.update(vcx, |v, cx| v.agent_picker_move(1, cx));
-    assert_eq!(selected(&view, &mut *vcx), 2);
+    view.update(vcx, |v, cx| v.agent_picker_move(1, cx));
+    assert_eq!(selected(&view, &mut *vcx), 3);
     view.update(vcx, |v, cx| v.agent_picker_move(1, cx));
     assert_eq!(
         selected(&view, &mut *vcx),
@@ -4185,7 +4221,7 @@ fn session_picker_navigation_wraps(cx: &mut TestAppContext) {
     view.update(vcx, |v, cx| v.agent_picker_move(-1, cx));
     assert_eq!(
         selected(&view, &mut *vcx),
-        2,
+        3,
         "up past the top wraps to bottom"
     );
 }
@@ -4200,8 +4236,8 @@ fn session_picker_activation_binds_slot(cx: &mut TestAppContext) {
     install_agent_picker(&view, &mut *vcx, &[("S1", "claude-1"), ("S2", "claude-2")]);
     vcx.run_until_parked();
 
-    // Activate row 2 (the second listed session, sid "S2").
-    view.update(vcx, |v, cx| v.agent_picker_activate(2, cx));
+    // Activate row 3 (the second listed session, sid "S2").
+    view.update(vcx, |v, cx| v.agent_picker_activate(3, cx));
     // Park the executor: with the server off, the attach round-trip is a no-op,
     // so the bind must SURVIVE (regression guard for the orphaned-tile bug).
     vcx.run_until_parked();
@@ -4351,6 +4387,7 @@ fn duplicate_resolution_closes_orphan_and_focuses_owner(cx: &mut TestAppContext)
             OpenResolution::Created {
                 sid: "S".into(),
                 acp_id: None,
+                provider: yalda::acp_channel::AgentProvider::Claude,
                 permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             },
             cx,
@@ -4408,6 +4445,7 @@ fn clear_async_bind_leaves_worksheet_typeable(cx: &mut TestAppContext) {
             crate::OpenResolution::Created {
                 sid: "S-cleared".into(),
                 acp_id: None,
+                provider: yalda::acp_channel::AgentProvider::Claude,
                 permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             },
             cx,
@@ -6134,6 +6172,7 @@ fn roster_surfaces_unopened_session_and_tracks_rename_close(cx: &mut TestAppCont
         acp_session_id: Some("acp-1".into()),
         label: "claude-7".into(),
         cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        provider: yalda::acp_channel::AgentProvider::Claude,
         turns: 0,
         connected: true,
         permission_mode: yalda::acp_channel::PermissionMode::ReadOnly,
@@ -6733,6 +6772,7 @@ fn free_agent_row_is_unbound_and_bindable(cx: &mut TestAppContext) {
         acp_session_id: Some("acp-free-1".into()),
         label: "claude-free".into(),
         cwd: cwd.clone(),
+        provider: yalda::acp_channel::AgentProvider::Claude,
         turns: 0,
         connected: true,
         permission_mode: yalda::acp_channel::PermissionMode::ReadOnly,
@@ -6811,6 +6851,7 @@ fn jump_panel_orders_local_and_roster_sessions_by_label(cx: &mut TestAppContext)
                     acp_session_id: None,
                     label: "claude-2".into(),
                     cwd: PathBuf::from("."),
+                    provider: yalda::acp_channel::AgentProvider::Claude,
                     turns: 0,
                     connected: true,
                     permission_mode: yalda::acp_channel::PermissionMode::ReadOnly,
@@ -6949,6 +6990,7 @@ fn jump_reorder_methods_reorder_and_gate_by_cwd(cx: &mut TestAppContext) {
         acp_session_id: None,
         label: label.into(),
         cwd: std::path::PathBuf::from(cwd),
+        provider: yalda::acp_channel::AgentProvider::Claude,
         turns: 0,
         connected: true,
         permission_mode: yalda::acp_channel::PermissionMode::ReadOnly,
@@ -7042,6 +7084,7 @@ fn clear_keeps_the_sessions_jump_panel_slot(cx: &mut TestAppContext) {
         acp_session_id: None,
         label: label.into(),
         cwd: std::path::PathBuf::from("/proj/x"),
+        provider: yalda::acp_channel::AgentProvider::Claude,
         turns: 0,
         connected: true,
         permission_mode: yalda::acp_channel::PermissionMode::ReadOnly,
@@ -7105,6 +7148,7 @@ fn clear_keeps_the_sessions_jump_panel_slot(cx: &mut TestAppContext) {
             crate::OpenResolution::Created {
                 sid: "S-fresh".into(),
                 acp_id: None,
+                provider: yalda::acp_channel::AgentProvider::Claude,
                 permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             },
             cx,
@@ -8502,6 +8546,7 @@ fn real_clear_server_branch_then_type_paints(cx: &mut TestAppContext) {
             crate::OpenResolution::Created {
                 sid: "S-fresh".into(),
                 acp_id: None,
+                provider: yalda::acp_channel::AgentProvider::Claude,
                 permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             },
             cx,
@@ -12618,16 +12663,39 @@ fn acp_persist_path_never_hits_real_home_in_tests() {
 }
 
 /// Unit (bug-0016): `is_auto_claude_label` recognizes exactly the auto-generated
-/// names (`claude`, `claude-<n>`) and nothing a user would type as a real name.
+/// names (`claude`, `claude-<n>`, `codex`, `codex-<n>`) and nothing a user would
+/// type as a real name.
 /// This gate decides when the server WAL's label may be adopted, so getting it
 /// wrong either fails to recover a lost name or clobbers a real one.
 #[test]
 fn is_auto_claude_label_matches_only_generated_names() {
     use crate::agent_ui::is_auto_claude_label;
-    for auto in ["claude", "claude-1", "claude-2", "claude-10", "claude-999", "  claude-3  "] {
+    for auto in [
+        "claude",
+        "claude-1",
+        "claude-2",
+        "claude-10",
+        "claude-999",
+        "  claude-3  ",
+        "codex",
+        "codex-1",
+        "codex-42",
+    ] {
         assert!(is_auto_claude_label(auto), "{auto:?} should be auto");
     }
-    for custom in ["", "my agent", "claude-", "claude-x", "claude-2b", "reviewer", "Claude-1", "the-claude-1"] {
+    for custom in [
+        "",
+        "my agent",
+        "claude-",
+        "claude-x",
+        "claude-2b",
+        "codex-",
+        "codex-x",
+        "reviewer",
+        "Claude-1",
+        "Codex-1",
+        "the-claude-1",
+    ] {
         assert!(!is_auto_claude_label(custom), "{custom:?} should NOT be auto");
     }
 }
@@ -12654,6 +12722,7 @@ fn opened_session_recovers_lost_label_from_roster(cx: &mut TestAppContext) {
         acp_session_id: None,
         label: label.into(),
         cwd: std::path::PathBuf::from("/proj/x"),
+        provider: yalda::acp_channel::AgentProvider::Claude,
         turns: 0,
         connected: true,
         permission_mode: yalda::acp_channel::PermissionMode::ReadOnly,
@@ -13455,6 +13524,7 @@ fn bind_refused_across_projects_allowed_within(cx: &mut TestAppContext) {
             acp_session_id: None,
             label: "claude-b".into(),
             cwd: pb.clone(),
+            provider: yalda::acp_channel::AgentProvider::Claude,
             turns: 0,
             connected: true,
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
@@ -13488,6 +13558,7 @@ fn bind_refused_across_projects_allowed_within(cx: &mut TestAppContext) {
             pb.clone(),
             "SB".into(),
             None,
+            yalda::acp_channel::AgentProvider::Claude,
             "claude-b".into(),
             true,
             yalda::acp_channel::DEFAULT_PERMISSION_MODE,
@@ -13520,6 +13591,7 @@ fn bind_refused_across_projects_allowed_within(cx: &mut TestAppContext) {
             pb.clone(),
             "SB".into(),
             None,
+            yalda::acp_channel::AgentProvider::Claude,
             "claude-b".into(),
             true,
             yalda::acp_channel::DEFAULT_PERMISSION_MODE,
@@ -14299,6 +14371,7 @@ fn autoname_summary_survives_a_gui_reload(cx: &mut TestAppContext) {
             acp_session_id: None,
             label: "payments adapter".into(),
             cwd: PathBuf::from("."),
+            provider: yalda::acp_channel::AgentProvider::Claude,
             turns: 1,
             connected: true,
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
@@ -14371,6 +14444,7 @@ fn roster_only_session_shows_live_status(cx: &mut TestAppContext) {
             acp_session_id: None,
             label: "free one".into(),
             cwd: PathBuf::from("."),
+            provider: yalda::acp_channel::AgentProvider::Claude,
             turns: 0,
             connected: true,
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
@@ -14456,6 +14530,7 @@ fn attached_unnamed_session_is_armed_and_named(cx: &mut TestAppContext) {
                 label: "claude-7".into(),
                 sid: "S-free".into(),
                 acp_id: None,
+                provider: yalda::acp_channel::AgentProvider::Claude,
                 status: "attached".into(),
                 permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             }]),
@@ -14520,6 +14595,7 @@ fn a_spent_autoname_is_never_re_armed(cx: &mut TestAppContext) {
                 label: "claude-3".into(),
                 sid: "S1".into(),
                 acp_id: None,
+                provider: yalda::acp_channel::AgentProvider::Claude,
                 status: "attached".into(),
                 permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             }]),

@@ -435,9 +435,25 @@ impl SessionServerClient {
         label: String,
         resume_session_id: Option<String>,
     ) -> io::Result<SessionInfo> {
+        self.create_session_with_provider(
+            cwd,
+            label,
+            crate::acp_channel::AgentProvider::Claude,
+            resume_session_id,
+        )
+    }
+
+    pub fn create_session_with_provider(
+        &self,
+        cwd: PathBuf,
+        label: String,
+        provider: crate::acp_channel::AgentProvider,
+        resume_session_id: Option<String>,
+    ) -> io::Result<SessionInfo> {
         match self.request(Request::CreateSession {
             cwd,
             label,
+            provider,
             resume_session_id,
         })? {
             Response::Ok {
@@ -689,9 +705,25 @@ impl SessionServerHandle {
         label: String,
         resume_session_id: Option<String>,
     ) -> io::Result<SessionInfo> {
+        self.create_session_with_provider(
+            cwd,
+            label,
+            crate::acp_channel::AgentProvider::Claude,
+            resume_session_id,
+        )
+    }
+
+    pub fn create_session_with_provider(
+        &self,
+        cwd: PathBuf,
+        label: String,
+        provider: crate::acp_channel::AgentProvider,
+        resume_session_id: Option<String>,
+    ) -> io::Result<SessionInfo> {
         match self.request(Request::CreateSession {
             cwd,
             label,
+            provider,
             resume_session_id,
         })? {
             Response::Ok {

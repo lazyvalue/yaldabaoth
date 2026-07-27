@@ -39,6 +39,8 @@ strip**, the **transcript** (a cached child, `TranscriptView`), the **compose** 
 - [session-binding.md](session-binding.md) — `UXI-AgentTile-18..19`, `-22..23`: durable
   tile↔session identity + auto-resume on restart (the unresumable-session notice,
   and the typed-`yes` close confirmation + its auto-insert).
+- [providers.md](providers.md) — `UXI-AgentTile-30`: explicit Claude/Codex choice
+  with durable provider ownership and subscription-safe Codex authentication.
 
 <!-- Add facets as more of the agent tile's behavior is migrated in:
      status-strip.md, … -->
@@ -72,3 +74,4 @@ strip**, the **transcript** (a cached child, `TranscriptView`), the **compose** 
 | UXI-AgentTile-23 | session-binding | Arming the close confirm drops you into insert, unless a draft is at risk | implemented |
 | UXI-AgentTile-27 | naming | A session names + summarizes itself once; an explicit rename wins forever | implemented |
 | UXI-AgentTile-28 | transcript | The tile says whether the agent is working or waiting on you | implemented |
+| UXI-AgentTile-30 | providers | Claude and Codex sessions coexist with durable provider identity | implemented |

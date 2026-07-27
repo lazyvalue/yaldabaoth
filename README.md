@@ -4,6 +4,37 @@ A terminal markdown editor with Helix-style selections, an outline browser, and
 a Claude Code MCP channel for piping buffers and inline replies into a running
 `claude` session in another terminal.
 
+## Claude and Codex agents
+
+The GPUI app can run Claude and Codex sessions side by side through ACP. Open an
+unbound Agent tile and choose **New Claude session** or **New Codex session**;
+existing sessions show their provider in the selector and the bound tile shows it
+in the status strip. Provider ownership is durable, so clear, restart, resume, and
+working-directory changes keep using the same backend.
+
+Codex setup:
+
+```sh
+npm install -g @agentclientprotocol/codex-acp
+codex login
+codex login status
+```
+
+`codex login` uses your ChatGPT account. With that login, Codex usage is covered by
+your ChatGPT plan and its limits rather than billed to an OpenAI API key. Yalda
+removes ambient `OPENAI_API_KEY`, `CODEX_API_KEY`, and `DEFAULT_AUTH_REQUEST` from
+Codex adapter processes by default to prevent an accidental switch to metered API
+authentication. See the official [Codex authentication
+guide](https://developers.openai.com/codex/auth/) and [ChatGPT plan
+guide](https://help.openai.com/en/articles/11369540-using-codex-with-your-chatgpt-plan).
+
+Provider command overrides:
+
+- `YALDA_CLAUDE_ACP_AGENT=/path/to/claude-adapter`
+- `YALDA_CODEX_ACP_AGENT=/path/to/codex-adapter`
+- `YALDA_CODEX_ALLOW_API_KEY=1` opts Codex back into inherited API-key
+  authentication. This can incur API charges.
+
 ## Build
 
 ```sh

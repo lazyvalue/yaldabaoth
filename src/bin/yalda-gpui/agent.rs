@@ -1,4 +1,4 @@
-//! Agent (Claude) tile data layer: tool-call model + renderers, transcript
+//! Coding-agent tile data layer: tool-call model + renderers, transcript
 //! flat-item view model (S1 cache + rebuild), turn/phase state machine,
 //! chatbox, per-tile AgentState, the AgentSession payload + AgentTile view.
 //! Extracted verbatim from main.rs (split-gpui-main). Render methods on
@@ -3134,9 +3134,9 @@ pub(crate) fn rebuild_agent_view_model(
     )
 }
 
-/// State held while the user is conversing with an ACP-attached Claude
+/// State held while the user is conversing with an ACP-attached coding
 /// agent. The transcript lives in an in-memory `Editor` (no on-disk file);
-/// Claude's replies are spliced in as frozen lines via the same lock-and-
+/// agent replies are spliced in as frozen lines via the same lock-and-
 /// advance pattern the TUI uses (`app::claude::append_to_claude_buffer`),
 /// so the user can keep typing inline edits between turns.
 pub(crate) struct AgentState {
@@ -3147,6 +3147,10 @@ pub(crate) struct AgentState {
     /// Live ACP connection. `None` while attaching, after a worker crash,
     /// or when the user pre-emptively detached.
     pub(crate) channel: Option<AcpChannelClient>,
+    /// Durable identity of the ACP backend for this conversation. Keeping it
+    /// on the local state makes direct-spawn sessions just as provider-aware as
+    /// server-managed sessions.
+    pub(crate) provider: yalda::acp_channel::AgentProvider,
     /// Receiver for an in-flight ACP attach. The attach runs on a
     /// background `std::thread` because `AcpChannelClient::spawn` blocks
     /// on the worker's initialize handshake — running it on the GPUI
@@ -3686,6 +3690,7 @@ impl AgentState {
         AgentState {
             editor: Editor::new(String::new(), PathBuf::from("*claude*")),
             channel: None,
+            provider: yalda::acp_channel::AgentProvider::Claude,
             attach_pending: None,
             mode: EditMode::Insert,
             keybinds: KeybindManager::default(),
@@ -3759,9 +3764,17 @@ impl AgentState {
     /// inline in `open_agent_inner` / `create_agent_session_via_server`. The
     /// follow handler is wired up before returning.
     pub(crate) fn new_server_managed(status: Option<SharedString>) -> Self {
+        Self::new_server_managed_for(yalda::acp_channel::AgentProvider::Claude, status)
+    }
+
+    pub(crate) fn new_server_managed_for(
+        provider: yalda::acp_channel::AgentProvider,
+        status: Option<SharedString>,
+    ) -> Self {
         let state = AgentState {
             editor: Editor::new(String::new(), PathBuf::from("*claude*")),
             channel: None,
+            provider,
             attach_pending: None,
             mode: EditMode::Insert,
             keybinds: KeybindManager::default(),
@@ -4533,6 +4546,7 @@ impl AgentState {
 pub(crate) struct AttachedSlot {
     pub(crate) label: String,
     pub(crate) sid: String,
+    pub(crate) provider: yalda::acp_channel::AgentProvider,
     /// The ACP session id, used as the slot's `resume_id`.
     pub(crate) acp_id: Option<String>,
     /// Footer status string ("reconnected …").
@@ -4552,6 +4566,7 @@ pub(crate) enum OpenResolution {
     Created {
         sid: String,
         acp_id: Option<String>,
+        provider: yalda::acp_channel::AgentProvider,
         /// Server-reported permission mode for the freshly created session.
         permission_mode: yalda::acp_channel::PermissionMode,
     },
@@ -4622,6 +4637,7 @@ pub(crate) type AgentSessions = SessionStore<Entity<AgentSession>>;
 pub(crate) struct PickerSession {
     pub(crate) sid: String,
     pub(crate) acp_id: Option<String>,
+    pub(crate) provider: yalda::acp_channel::AgentProvider,
     pub(crate) label: String,
     pub(crate) turns: usize,
     pub(crate) connected: bool,
@@ -4634,7 +4650,8 @@ pub(crate) struct PickerSession {
 /// `bound == None` ⇒ the tile renders this picker; selecting a row binds the
 /// tile, after which `render_agent` renders the normal transcript.
 pub(crate) struct SessionPicker {
-    /// Highlighted row. Row 0 is always "start a new session"; rows `1..=N` map
+    /// Highlighted row. Rows 0 and 1 start Claude and Codex sessions;
+    /// rows `2..=N+1` map
     /// to the FREE sessions projected from the universal roster for the active
     /// workspace's cwd (`picker_projection`, universal-agent-list). UI state
     /// ONLY — neither the rows NOR the cwd are cached here: a rendered picker is

@@ -91,6 +91,7 @@ fn info(sid: &str, label: &str, cwd: PathBuf) -> SessionInfo {
         acp_session_id: None,
         label: label.to_string(),
         cwd,
+        provider: yalda::acp_channel::AgentProvider::Claude,
         turns: 0,
         connected: false,
         permission_mode: PermissionMode::ReadOnly,

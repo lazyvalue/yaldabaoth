@@ -21,8 +21,8 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, watch};
 
 use yalda::acp_channel::{
-    AgentSpawner, AgentTransport, ImageAttachment, PermissionMode, PromptPayload, RealAgentSpawner,
-    TransportHandle, YaldaFrontend,
+    AgentProvider, AgentSpawner, AgentTransport, ImageAttachment, PermissionMode, PromptPayload,
+    RealAgentSpawner, TransportHandle, YaldaFrontend, configured_agent_command,
 };
 use yalda::session_proto::*;
 
@@ -116,6 +116,7 @@ enum Command {
     Create {
         cwd: PathBuf,
         label: String,
+        provider: AgentProvider,
         resume_session_id: Option<String>,
         reply: tokio::sync::oneshot::Sender<SessionInfo>,
     },
@@ -285,6 +286,7 @@ struct ManagedSession {
     id: ServerSessionId,
     label: String,
     cwd: PathBuf,
+    provider: AgentProvider,
     /// The live ACP transport surface — the Send sub-handles of the
     /// `AcpChannelClient` whose `reply_rx` is owned by the pump thread. `None`
     /// while the subprocess is being spawned. The actor never holds the client
@@ -382,6 +384,7 @@ impl ManagedSession {
             acp_session_id: self.channel.as_ref().and_then(|c| c.session_id()),
             label: self.label.clone(),
             cwd: self.cwd.clone(),
+            provider: self.provider,
             turns: self.turns,
             connected: self.channel.as_ref().is_some_and(|c| c.is_connected()),
             permission_mode: self.permission_mode,
@@ -759,6 +762,7 @@ fn new_managed_session(
     id: ServerSessionId,
     label: String,
     cwd: PathBuf,
+    provider: AgentProvider,
     permission_mode: PermissionMode,
     wal: Option<yalda::session_wal::SessionWal>,
     bridge_tx: Option<BridgeTx>,
@@ -773,6 +777,7 @@ fn new_managed_session(
         id,
         label,
         cwd,
+        provider,
         channel: None,
         channel_generation: 0,
         gen_watch,
@@ -795,6 +800,7 @@ fn new_managed_session(
 struct ResumeJob {
     session_id: ServerSessionId,
     cwd: PathBuf,
+    provider: AgentProvider,
     acp_session_id: String,
 }
 
@@ -837,9 +843,17 @@ fn open_session_wal(
     label: &str,
     cwd: &std::path::Path,
     permission_mode: PermissionMode,
+    provider: AgentProvider,
 ) -> Option<yalda::session_wal::SessionWal> {
     let dir = session_wal_dir()?;
-    match yalda::session_wal::SessionWal::create(&dir, id, label, cwd, permission_mode) {
+    match yalda::session_wal::SessionWal::create_for_provider(
+        &dir,
+        id,
+        label,
+        cwd,
+        permission_mode,
+        provider,
+    ) {
         Ok(w) => Some(w),
         Err(e) => {
             tracing::error!(
@@ -872,12 +886,14 @@ impl SessionManager {
         &self,
         cwd: PathBuf,
         label: String,
+        provider: AgentProvider,
         resume_session_id: Option<String>,
     ) -> SessionInfo {
         let (reply, rx) = tokio::sync::oneshot::channel();
         let _ = self.cmd_tx.send(Command::Create {
             cwd,
             label,
+            provider,
             resume_session_id,
             reply,
         });
@@ -1082,6 +1098,7 @@ fn restore_seed_from_disk(
             id: sid.clone(),
             label: rs.label.clone(),
             cwd: rs.cwd.clone(),
+            provider: rs.provider,
             channel: None,
             channel_generation: 0,
             gen_watch,
@@ -1115,6 +1132,7 @@ fn restore_seed_from_disk(
         jobs.push(ResumeJob {
             session_id: sid,
             cwd: rs.cwd,
+            provider: rs.provider,
             acp_session_id,
         });
     }
@@ -1131,6 +1149,7 @@ fn spawn_resume_worker(
     let ResumeJob {
         session_id,
         cwd,
+        provider,
         acp_session_id,
     } = job;
     std::thread::Builder::new()
@@ -1143,8 +1162,14 @@ fn spawn_resume_worker(
             unsafe {
                 std::env::set_var("YALDA_SESSION_MANAGED", "1");
             }
-            let cmd = std::env::var("YALDA_ACP_AGENT").unwrap_or_default();
-            match spawner.spawn(&cmd, Some(cwd), Some(acp_session_id), YaldaFrontend::Gpui) {
+            let cmd = configured_agent_command(provider);
+            match spawner.spawn(
+                provider,
+                &cmd,
+                Some(cwd),
+                Some(acp_session_id),
+                YaldaFrontend::Gpui,
+            ) {
                 Ok(client) => {
                     // Resume from disk → is_respawn=false (generation stays 0).
                     //
@@ -1209,10 +1234,11 @@ impl Manager {
             Command::Create {
                 cwd,
                 label,
+                provider,
                 resume_session_id,
                 reply,
             } => {
-                let info = self.do_create(cwd, label, resume_session_id);
+                let info = self.do_create(cwd, label, provider, resume_session_id);
                 let _ = reply.send(info);
             }
             Command::Attach { sid, cursor, reply } => {
@@ -1432,17 +1458,19 @@ impl Manager {
         &mut self,
         cwd: PathBuf,
         label: String,
+        provider: AgentProvider,
         resume_session_id: Option<String>,
     ) -> SessionInfo {
         let id = uuid::Uuid::new_v4().to_string();
         let permission_mode = self.default_permission_mode;
         // Open the durable WAL up front so even a crash immediately after create
         // can recover the session's identity.
-        let wal = open_session_wal(&id, &label, &cwd, permission_mode);
+        let wal = open_session_wal(&id, &label, &cwd, permission_mode, provider);
         let session = new_managed_session(
             id.clone(),
             label,
             cwd.clone(),
+            provider,
             permission_mode,
             wal,
             self.bridge_tx.clone(),
@@ -1466,9 +1494,15 @@ impl Manager {
                 unsafe {
                     std::env::set_var("YALDA_SESSION_MANAGED", "1");
                 }
-                let cmd = std::env::var("YALDA_ACP_AGENT").unwrap_or_default();
+                let cmd = configured_agent_command(provider);
                 let resumed = resume_session_id.is_some();
-                match spawner.spawn(&cmd, Some(cwd), resume_session_id, YaldaFrontend::Gpui) {
+                match spawner.spawn(
+                    provider,
+                    &cmd,
+                    Some(cwd),
+                    resume_session_id,
+                    YaldaFrontend::Gpui,
+                ) {
                     Ok(client) => {
                         // Fresh spawn → is_respawn = false, generation stays 0.
                         // `resumed` (create-with-resume) arms nothing here —
@@ -1681,13 +1715,13 @@ impl Manager {
     }
 
     fn do_restart(&mut self, session_id: &str) -> Result<(), String> {
-        let (cwd, resume_id) = {
+        let (cwd, provider, resume_id) = {
             let session = self
                 .sessions
                 .get_mut(session_id)
                 .ok_or_else(|| format!("no such session: {session_id}"))?;
             let resume = session.channel.as_ref().and_then(|c| c.session_id());
-            (session.cwd.clone(), resume)
+            (session.cwd.clone(), session.provider, resume)
         };
 
         let cmd_tx = self.cmd_tx.clone();
@@ -1700,9 +1734,15 @@ impl Manager {
                 unsafe {
                     std::env::set_var("YALDA_SESSION_MANAGED", "1");
                 }
-                let cmd = std::env::var("YALDA_ACP_AGENT").unwrap_or_default();
+                let cmd = configured_agent_command(provider);
                 let resumed = resume_id.is_some();
-                match spawner.spawn(&cmd, Some(cwd), resume_id, YaldaFrontend::Gpui) {
+                match spawner.spawn(
+                    provider,
+                    &cmd,
+                    Some(cwd),
+                    resume_id,
+                    YaldaFrontend::Gpui,
+                ) {
                     Ok(client) => {
                         // is_respawn=true bumps generation + gen_watch so the OLD
                         // pump self-terminates and drops its client off-actor.
@@ -1792,6 +1832,7 @@ impl Manager {
             .map(|s| AdminSessionInfo {
                 session_id: s.id.clone(),
                 label: s.label.clone(),
+                provider: s.provider,
                 connected: s.channel.is_some(),
                 turns: s.turns,
                 event_log_len: s.event_log.len(),
@@ -2167,9 +2208,12 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
             Request::CreateSession {
                 cwd,
                 label,
+                provider,
                 resume_session_id,
             } => {
-                let info = manager.send_create(cwd, label, resume_session_id).await;
+                let info = manager
+                    .send_create(cwd, label, provider, resume_session_id)
+                    .await;
                 Response::Ok {
                     data: ResponseData::Session { session: info },
                 }

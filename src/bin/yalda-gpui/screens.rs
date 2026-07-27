@@ -883,9 +883,9 @@ impl YaldaGpuiView {
         let Some(session_ent) = self.session_entity(id) else {
             return self.render_agent_picker(root, tile, cx);
         };
-        let (active_slot_label, active_slot_cwd) = {
+        let (active_slot_label, active_slot_cwd, active_provider) = {
             let s = session_ent.read(cx);
-            (s.label.clone(), s.cwd.clone())
+            (s.label.clone(), s.cwd.clone(), s.state.provider)
         };
         // Weak handle to THIS view, captured by the status-strip / sidebar
         // click listeners (they re-enter via `weak.update(app, …)` at click
@@ -976,6 +976,15 @@ impl YaldaGpuiView {
             div()
                 .pr_2()
                 .child(SharedString::from(active_slot_label.clone())),
+        );
+        strip = strip.child(
+            div()
+                .mr_2()
+                .px_1()
+                .rounded_sm()
+                .bg(strip_dim.opacity(0.18))
+                .text_color(strip_dim)
+                .child(SharedString::from(active_provider.label())),
         );
 
         // Edit-surface status (moved up from the old footer): which surface +
@@ -2507,7 +2516,7 @@ impl YaldaGpuiView {
             self.picker_projection(&self.agent_base_cwd());
         // Clamp the highlight to the current row count (the projection may have
         // shrunk since the user last moved).
-        let row_count = 1 + free.len();
+        let row_count = 2 + free.len();
         let selected = tile.picker()
             .map(|p| p.selected.min(row_count.saturating_sub(1)))
             .unwrap_or(0);
@@ -2533,12 +2542,21 @@ impl YaldaGpuiView {
             .text_size(px(13.0))
             .font_family(self.body_font.clone());
 
-        // Row 0 is always "start a new session".
+        // The two creation rows make provider choice explicit; existing sessions
+        // follow and carry their provider in the subtitle.
         list = list.child(self.picker_row(
             0,
             selected == 0,
-            SharedString::new_static("＋ Start a new session"),
+            SharedString::new_static("＋ New Claude session"),
             None,
+            ov,
+            cx,
+        ));
+        list = list.child(self.picker_row(
+            1,
+            selected == 1,
+            SharedString::new_static("＋ New Codex session"),
+            Some(SharedString::new_static("uses your Codex login")),
             ov,
             cx,
         ));
@@ -2555,10 +2573,11 @@ impl YaldaGpuiView {
             );
         } else {
             for (i, s) in free.iter().enumerate() {
-                let row = i + 1;
+                let row = i + 2;
                 let liveness = if s.connected { "live" } else { "idle" };
                 let sub = format!(
-                    "{} turn{} · {}",
+                    "{} · {} turn{} · {}",
+                    s.provider.label(),
                     s.turns,
                     if s.turns == 1 { "" } else { "s" },
                     liveness,
@@ -2590,7 +2609,8 @@ impl YaldaGpuiView {
             for s in bound {
                 let liveness = if s.connected { "live" } else { "idle" };
                 let sub = format!(
-                    "{} turn{} · {}",
+                    "{} · {} turn{} · {}",
+                    s.provider.label(),
                     s.turns,
                     if s.turns == 1 { "" } else { "s" },
                     liveness,
@@ -3003,4 +3023,3 @@ impl YaldaGpuiView {
             .child(hint)
     }
 }
-

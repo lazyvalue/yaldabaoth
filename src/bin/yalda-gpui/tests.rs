@@ -2767,6 +2767,15 @@ fn agent_local_n_resolves_to_claude_new() {
 }
 
 #[test]
+fn agent_local_upper_n_resolves_to_codex_new() {
+    let mut state = MenuState::new();
+    state.open();
+    let menu = agent_local_menu();
+    let cmd = state.process_key(KeyPress::new(Key::Char('N'), KMods::NONE), &menu);
+    assert_eq!(cmd, Some("codex-new".to_string()));
+}
+
+#[test]
 fn agent_local_c_resolves_to_session_picker() {
     // The session selector (free-session picker / rebind) lives at `c` in the
     // Agent local menu (spec-agent-session-ownership.md).

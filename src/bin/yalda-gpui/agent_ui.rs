@@ -1,4 +1,4 @@
-//! Agent (Claude) tile UI + session-server wiring on YaldaGpuiView:
+//! Coding-agent tile UI + session-server wiring on YaldaGpuiView:
 //! open/attach/create/close session flows, lease heartbeat, server pump
 //! + notification reducer (apply_server_batch / apply_reply_events /
 //! apply_agent_event), submit paths, and the Claude key handler.
@@ -17,12 +17,12 @@ enum BindOutcome {
 }
 
 impl YaldaGpuiView {
-    /// Open the Claude screen and attempt to attach to an ACP agent. Bound
+    /// Open the Agent screen and attempt to attach to an ACP agent. Bound
     /// to `Ctrl-K` in the Doc and Edit views. Replaces the focused tile with an
     /// Agent tile; the prior buffer stays in the pool (reachable via Cmd+O).
     ///
-    /// Attach uses `YALDA_ACP_AGENT` if set, else the
-    /// `claude-agent-acp` default (`AcpChannelClient::DEFAULT_AGENT_COMMAND`).
+    /// Direct open remains Claude-compatible by default; explicit new-session
+    /// actions can select either provider.
     pub(crate) fn open_agent(&mut self, _: &OpenAgent, _w: &mut Window, cx: &mut Context<Self>) {
         self.open_agent_inner(cx);
     }
@@ -220,6 +220,7 @@ impl YaldaGpuiView {
             let ps = PickerSession {
                 sid: info.session_id.clone(),
                 acp_id: info.acp_session_id.clone(),
+                provider: info.provider,
                 label: info.label.clone(),
                 turns: info.turns,
                 connected: info.connected,
@@ -243,6 +244,14 @@ impl YaldaGpuiView {
     /// names distinct too. Reuses a freed number (close claude-2, create →
     /// claude-2 again).
     pub(crate) fn next_agent_label(&self, cx: &GpuiApp) -> String {
+        self.next_agent_label_for(AgentProvider::Claude, cx)
+    }
+
+    pub(crate) fn next_agent_label_for(
+        &self,
+        provider: AgentProvider,
+        cx: &GpuiApp,
+    ) -> String {
         let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (_, s) in self.sessions.iter() {
             used.insert(s.read(cx).label.clone());
@@ -253,8 +262,12 @@ impl YaldaGpuiView {
         for info in self.agent_roster.entries_by_label() {
             used.insert(info.label.clone());
         }
+        let prefix = match provider {
+            AgentProvider::Claude => "claude",
+            AgentProvider::Codex => "codex",
+        };
         (1..)
-            .map(|n| format!("claude-{n}"))
+            .map(|n| format!("{prefix}-{n}"))
             .find(|l| !used.contains(l))
             .expect("infinite range always yields a free label")
     }
@@ -282,10 +295,10 @@ impl YaldaGpuiView {
         if self.agent_tile().and_then(|t| t.picker()).is_none() {
             return;
         }
-        // Row count = "start new" + the FREE roster rows for the active
+        // Row count = Claude + Codex creation rows + the FREE roster rows for the active
         // workspace's LIVE cwd (same source the picker renders/creates from).
         let cwd = self.agent_base_cwd();
-        let n = (1 + self.picker_projection(&cwd).0.len()) as isize;
+        let n = (2 + self.picker_projection(&cwd).0.len()) as isize;
         if let Some(picker) = self.agent_tile_mut().and_then(|t| t.picker_mut()) {
             if n > 0 {
                 picker.selected = (picker.selected as isize + delta).rem_euclid(n) as usize;
@@ -294,17 +307,18 @@ impl YaldaGpuiView {
         }
     }
 
-    /// Activate picker row `row`: row 0 starts a fresh session; rows `1..=N`
+    /// Activate picker row `row`: rows 0/1 start Claude/Codex; rows `2..=N+1`
     /// attach the corresponding listed session. No-op outside picker mode or
     /// for an out-of-range / still-loading row.
     pub(crate) fn agent_picker_activate(&mut self, row: usize, cx: &mut Context<Self>) {
         // What to do, extracted before the helpers borrow `&mut self`.
         enum Choice {
-            New(PathBuf),
+            New(PathBuf, AgentProvider),
             Attach {
                 cwd: PathBuf,
                 sid: String,
                 acp_id: Option<String>,
+                provider: AgentProvider,
                 label: String,
                 connected: bool,
                 permission_mode: yalda::acp_channel::PermissionMode,
@@ -322,13 +336,16 @@ impl YaldaGpuiView {
         } else {
             let cwd = self.agent_base_cwd();
             if row == 0 {
-                Some(Choice::New(cwd))
+                Some(Choice::New(cwd, AgentProvider::Claude))
+            } else if row == 1 {
+                Some(Choice::New(cwd, AgentProvider::Codex))
             } else {
                 let free = self.picker_projection(&cwd).0;
-                free.get(row - 1).map(|s| Choice::Attach {
+                free.get(row - 2).map(|s| Choice::Attach {
                     cwd,
                     sid: s.sid.clone(),
                     acp_id: s.acp_id.clone(),
+                    provider: s.provider,
                     label: s.label.clone(),
                     connected: s.connected,
                     permission_mode: s.permission_mode,
@@ -336,16 +353,26 @@ impl YaldaGpuiView {
             }
         };
         match choice {
-            Some(Choice::New(cwd)) => self.picker_start_new(cwd, cx),
+            Some(Choice::New(cwd, provider)) => self.picker_start_new(provider, cwd, cx),
             Some(Choice::Attach {
                 cwd,
                 sid,
                 acp_id,
+                provider,
                 label,
                 connected,
                 permission_mode,
             }) => {
-                self.picker_attach_existing(cwd, sid, acp_id, label, connected, permission_mode, cx)
+                self.picker_attach_existing(
+                    cwd,
+                    sid,
+                    acp_id,
+                    provider,
+                    label,
+                    connected,
+                    permission_mode,
+                    cx,
+                )
             }
             None => {}
         }
@@ -353,8 +380,13 @@ impl YaldaGpuiView {
 
     /// Picker → "start a new session": clear the picker, bind a placeholder
     /// session to this tile, and create a fresh session via the shared path.
-    fn picker_start_new(&mut self, cwd: PathBuf, cx: &mut Context<Self>) {
-        let label = self.next_agent_label(cx);
+    fn picker_start_new(
+        &mut self,
+        provider: AgentProvider,
+        cwd: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let label = self.next_agent_label_for(provider, cx);
         let open_token = alloc_open_token();
         if self.agent_tile_mut().is_none() {
             return;
@@ -363,9 +395,10 @@ impl YaldaGpuiView {
             AgentSession {
                 // UXI-AgentTile-27: "start a new session" from the picker is a
                 // genuinely-fresh session, so arm it for one-shot autonaming.
-                state: AgentState::new_server_managed(Some(
-                    "connecting to session server…".into(),
-                ))
+                state: AgentState::new_server_managed_for(
+                    provider,
+                    Some("connecting to session server…".into()),
+                )
                 .armed_for_autoname(),
                 label: label.clone(),
                 cwd: cwd.clone(),
@@ -376,7 +409,7 @@ impl YaldaGpuiView {
         if let Some(tile) = self.agent_tile_mut() {
             tile.set_pending(Some(open_token));
         }
-        self.spawn_create_agent_session(open_token, label, cwd, None, cx);
+        self.spawn_create_agent_session(open_token, provider, label, cwd, None, cx);
         if let Some(mut c) = self.agent_mut(cx) {
             c.editor.begin_insert();
         }
@@ -394,7 +427,7 @@ impl YaldaGpuiView {
             tile.show_picker();
         }
         let cwd = self.agent_base_cwd();
-        self.picker_start_new(cwd, cx);
+        self.picker_start_new(AgentProvider::Claude, cwd, cx);
     }
 
     /// Picker → attach an existing session. The sid / acp id / permission mode
@@ -408,6 +441,7 @@ impl YaldaGpuiView {
         cwd: PathBuf,
         sid: String,
         acp_id: Option<String>,
+        provider: AgentProvider,
         label: String,
         connected: bool,
         permission_mode: yalda::acp_channel::PermissionMode,
@@ -440,7 +474,10 @@ impl YaldaGpuiView {
         }
         self.show_local_session(
             AgentSession {
-                state: AgentState::new_server_managed(Some("reconnecting…".into())),
+                state: AgentState::new_server_managed_for(
+                    provider,
+                    Some("reconnecting…".into()),
+                ),
                 label: label.clone(),
                 cwd,
                 resume_id: None,
@@ -459,6 +496,7 @@ impl YaldaGpuiView {
             label,
             sid,
             acp_id,
+            provider,
             status: status.to_string(),
             permission_mode,
         }]);
@@ -549,6 +587,7 @@ impl YaldaGpuiView {
             OpenResolution::Created {
                 sid,
                 acp_id,
+                provider,
                 permission_mode,
             } => match self.bind_session_sid(id, &sid) {
                 BindOutcome::Bound => {
@@ -556,6 +595,7 @@ impl YaldaGpuiView {
                         ent.update(cx, |session, scx| {
                             // Wire boundary: the ACP session id becomes the typed resume id.
                             session.resume_id = acp_id.map(ServerSid::new);
+                            session.state.provider = provider;
                             session.state.permission_mode = permission_mode;
                             session.state.status =
                                 Some("attaching to ACP agent via session server…".into());
@@ -596,6 +636,7 @@ impl YaldaGpuiView {
                                 label,
                                 sid,
                                 acp_id,
+                                provider,
                                 status,
                                 permission_mode,
                             } = first;
@@ -604,6 +645,7 @@ impl YaldaGpuiView {
                                     session.label = label;
                                     // Wire boundary: ACP session id → typed resume id.
                                     session.resume_id = acp_id.map(ServerSid::new);
+                                    session.state.provider = provider;
                                     session.state.permission_mode = permission_mode;
                                     session.state.status = Some(status.into());
                                     scx.notify();
@@ -807,6 +849,7 @@ impl YaldaGpuiView {
             info.cwd,
             info.session_id,
             info.acp_session_id,
+            info.provider,
             info.label,
             info.connected,
             info.permission_mode,
@@ -1116,10 +1159,19 @@ impl YaldaGpuiView {
     }
 
     pub(crate) fn new_agent_session(&mut self, cwd: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.new_agent_session_for(AgentProvider::Claude, cwd, cx);
+    }
+
+    pub(crate) fn new_agent_session_for(
+        &mut self,
+        provider: AgentProvider,
+        cwd: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
         // Not on an Agent tile yet — bootstrap one AND create a brand-new
         // session (never re-attach an existing per-cwd one).
         if self.agent_tile().is_none() {
-            self.bootstrap_fresh_agent_session(cwd, cx);
+            self.bootstrap_fresh_agent_session_for(provider, cwd, cx);
             return;
         }
         // On an Agent tile: a tile shows exactly one session (1:1), so "new
@@ -1127,7 +1179,7 @@ impl YaldaGpuiView {
         // session is freed (kept running in the store) UNLESS it is a pre-attach
         // local placeholder mid-open — that would orphan its in-flight create
         // (no tile would match its token), so close it.
-        let label = self.next_agent_label(cx);
+        let label = self.next_agent_label_for(provider, cx);
         let slot_cwd = cwd.unwrap_or_else(|| self.agent_base_cwd());
         self.release_focused_session_for_rebind();
 
@@ -1139,9 +1191,10 @@ impl YaldaGpuiView {
                 AgentSession {
                     // UXI-AgentTile-27: a brand-new session is armed for
                     // one-shot autonaming; attach/restore paths are not.
-                    state: AgentState::new_server_managed(Some(
-                        "connecting to session server…".into(),
-                    ))
+                    state: AgentState::new_server_managed_for(
+                        provider,
+                        Some("connecting to session server…".into()),
+                    )
                     .armed_for_autoname(),
                     label: label.clone(),
                     cwd: slot_cwd.clone(),
@@ -1152,10 +1205,12 @@ impl YaldaGpuiView {
             if let Some(tile) = self.agent_tile_mut() {
                 tile.set_pending(Some(open_token));
             }
-            self.spawn_create_agent_session(open_token, label, slot_cwd, None, cx);
+            self.spawn_create_agent_session(open_token, provider, label, slot_cwd, None, cx);
         } else {
             // Direct-spawn path.
-            let state = self.create_agent_session(None, slot_cwd.clone(), cx).armed_for_autoname();
+            let state = self
+                .create_agent_session_for(provider, None, slot_cwd.clone(), cx)
+                .armed_for_autoname();
             let id = self.show_local_session(
                 AgentSession {
                     state,
@@ -1215,12 +1270,21 @@ impl YaldaGpuiView {
         cwd: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) {
+        self.bootstrap_fresh_agent_session_for(AgentProvider::Claude, cwd, cx);
+    }
+
+    pub(crate) fn bootstrap_fresh_agent_session_for(
+        &mut self,
+        provider: AgentProvider,
+        cwd: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
         // Replace the focused tile with a fresh Agent tile (no buffer stash —
         // Agent and Buffer are orthogonal).
         let tile = AgentTile::new();
         self.set_screen(App::Agent(tile));
         let slot_cwd = cwd.unwrap_or_else(|| self.agent_base_cwd());
-        let label = self.next_agent_label(cx);
+        let label = self.next_agent_label_for(provider, cx);
 
         if self.session_server.is_some() {
             // Server path: placeholder + create-only round-trip (NO resolve /
@@ -1230,9 +1294,10 @@ impl YaldaGpuiView {
                 AgentSession {
                     // UXI-AgentTile-27: a brand-new session is armed for
                     // one-shot autonaming; attach/restore paths are not.
-                    state: AgentState::new_server_managed(Some(
-                        "connecting to session server…".into(),
-                    ))
+                    state: AgentState::new_server_managed_for(
+                        provider,
+                        Some("connecting to session server…".into()),
+                    )
                     .armed_for_autoname(),
                     label: label.clone(),
                     cwd: slot_cwd.clone(),
@@ -1248,10 +1313,12 @@ impl YaldaGpuiView {
                 c.editor.begin_insert();
             }
             cx.notify();
-            self.spawn_create_agent_session(open_token, label, slot_cwd, None, cx);
+            self.spawn_create_agent_session(open_token, provider, label, slot_cwd, None, cx);
         } else {
             // Direct-spawn path: a fresh session has no resume_id.
-            let state = self.create_agent_session(None, slot_cwd.clone(), cx).armed_for_autoname();
+            let state = self
+                .create_agent_session_for(provider, None, slot_cwd.clone(), cx)
+                .armed_for_autoname();
             let id = self.show_local_session(
                 AgentSession {
                     state,
@@ -1277,6 +1344,7 @@ impl YaldaGpuiView {
     pub(crate) fn spawn_create_agent_session(
         &self,
         open_token: u64,
+        provider: AgentProvider,
         label: String,
         cwd: PathBuf,
         // When `Some`, force this permission mode on the freshly-created session
@@ -1298,7 +1366,7 @@ impl YaldaGpuiView {
                     // `apply_open_agent_resolution` (after the slot binds its
                     // `server_session_id`) so the bind-before-attach ordering
                     // is uniform across the open and new-session paths.
-                    match handle.create_session(cwd, label, None) {
+                    match handle.create_session_with_provider(cwd, label, provider, None) {
                         Ok(info) => {
                             let mut permission_mode = info.permission_mode;
                             // Preserve a non-default mode across `/clear`: the
@@ -1318,6 +1386,7 @@ impl YaldaGpuiView {
                             OpenResolution::Created {
                                 sid: info.session_id,
                                 acp_id: info.acp_session_id,
+                                provider: info.provider,
                                 permission_mode,
                             }
                         }
@@ -1422,6 +1491,9 @@ impl YaldaGpuiView {
         if !self.sessions.contains(id) {
             return;
         }
+        let provider = self
+            .read_session(id, cx, |state| state.provider)
+            .unwrap_or_default();
 
         // Phase 1: tear down the existing channel + attach state.
         if let Some(ent) = self.session_entity(id) {
@@ -1476,6 +1548,7 @@ impl YaldaGpuiView {
             }
             self.spawn_create_agent_session(
                 open_token,
+                provider,
                 "respawned".to_string(),
                 new_cwd.clone(),
                 None,
@@ -1484,7 +1557,7 @@ impl YaldaGpuiView {
         } else {
             // Direct-spawn path: graft a throwaway AgentState's attach handle
             // into the existing session, then (re)start its pump.
-            let fresh = self.create_agent_session(None, new_cwd.clone(), cx);
+            let fresh = self.create_agent_session_for(provider, None, new_cwd.clone(), cx);
             if let Some(ent) = self.session_entity(id) {
                 ent.update(cx, |session, scx| {
                     session.state.attach_pending = fresh.attach_pending;
@@ -1796,18 +1869,29 @@ impl YaldaGpuiView {
         &mut self,
         resume_id: Option<ServerSid>,
         cwd: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> AgentState {
+        self.create_agent_session_for(AgentProvider::Claude, resume_id, cwd, cx)
+    }
+
+    pub(crate) fn create_agent_session_for(
+        &mut self,
+        provider: AgentProvider,
+        resume_id: Option<ServerSid>,
+        cwd: PathBuf,
         _cx: &mut Context<Self>,
     ) -> AgentState {
         let (attach_tx, attach_rx) =
             std::sync::mpsc::channel::<std::io::Result<AcpChannelClient>>();
-        let cmd = std::env::var("YALDA_ACP_AGENT").unwrap_or_default();
+        let cmd = yalda::acp_channel::configured_agent_command(provider);
         let spawn_cwd = Some(cwd);
         // Wire boundary: the resume id leaves to the ACP channel as a bare String.
         let resume_wire = resume_id.map(|s| s.to_string());
         let _ = std::thread::Builder::new()
             .name("yalda-acp-attach".into())
             .spawn(move || {
-                let _ = attach_tx.send(AcpChannelClient::spawn_with_resume_in(
+                let _ = attach_tx.send(AcpChannelClient::spawn_with_resume_in_for(
+                    provider,
                     &cmd,
                     spawn_cwd,
                     resume_wire,
@@ -1820,6 +1904,7 @@ impl YaldaGpuiView {
         let state = AgentState {
             editor,
             channel: None,
+            provider,
             attach_pending: Some(attach_rx),
             mode: EditMode::Insert,
             keybinds: KeybindManager::default(),
@@ -3450,6 +3535,9 @@ impl YaldaGpuiView {
             return;
         };
         let desired_mode = self.read_session(id, cx, |s| s.permission_mode);
+        let provider = self
+            .read_session(id, cx, |state| state.provider)
+            .unwrap_or_default();
 
         // Forget persisted slots BEFORE re-opening so the new spawn hits
         // session/new, not session/load (a load would resume the conversation
@@ -3487,7 +3575,10 @@ impl YaldaGpuiView {
             // navigation (the "/clear then can't type" bug). (The connecting
             // placeholder has no history, so finish_replay won't re-settle it.)
             let mut state =
-                AgentState::new_server_managed(Some("connecting to session server…".into()));
+                AgentState::new_server_managed_for(
+                    provider,
+                    Some("connecting to session server…".into()),
+                );
             state.name_origin = name_origin;
             state.settle_input_focus();
             let new_id = self.show_local_session(
@@ -3503,13 +3594,21 @@ impl YaldaGpuiView {
             if let Some(tile) = self.agent_tile_mut() {
                 tile.set_pending(Some(open_token));
             }
-            self.spawn_create_agent_session(open_token, label, slot_cwd, desired_mode, cx);
+            self.spawn_create_agent_session(
+                open_token,
+                provider,
+                label,
+                slot_cwd,
+                desired_mode,
+                cx,
+            );
         } else {
             // Direct-spawn fallback (legacy YALDA_SESSION_SERVER=0). The channel
             // attaches asynchronously, so the permission mode is not forced here
             // — this path keeps the server default. The server path above is the
             // real one.
-            let mut state = self.create_agent_session(None, slot_cwd.clone(), cx);
+            let mut state =
+                self.create_agent_session_for(provider, None, slot_cwd.clone(), cx);
             state.name_origin = name_origin;
             let new_id = self.show_local_session(
                 AgentSession {
@@ -5752,17 +5851,20 @@ impl YaldaGpuiView {
     }
 }
 
-/// Whether `label` is an AUTO-generated session name — `claude-<n>` for a
+/// Whether `label` is an AUTO-generated session name — `claude-<n>` or `codex-<n>` for a
 /// positive integer `n`, matching `next_agent_label` / `unique_label`. Used to
 /// decide when the server roster's (WAL-backed) name may be adopted over the
 /// local one without ever clobbering a real custom name (bug-0016). Bare
 /// `claude` (no number) counts as auto too — it's the legacy default.
 pub(crate) fn is_auto_claude_label(label: &str) -> bool {
     let l = label.trim();
-    if l == "claude" {
+    if matches!(l, "claude" | "codex") {
         return true;
     }
-    match l.strip_prefix("claude-") {
+    match l
+        .strip_prefix("claude-")
+        .or_else(|| l.strip_prefix("codex-"))
+    {
         Some(n) => !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()),
         None => false,
     }

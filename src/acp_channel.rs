@@ -92,6 +92,72 @@ macro_rules! acp_debug {
 /// [`DEFAULT_AGENT_FALLBACKS`] so users on either binary name still work.
 pub const DEFAULT_AGENT_COMMAND: &str = "claude-agent-acp";
 
+/// Which coding-agent backend owns an ACP session. This identity is persisted
+/// with the server session so a restart always resumes a thread with the same
+/// adapter that created it.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentProvider {
+    #[default]
+    Claude,
+    Codex,
+}
+
+impl AgentProvider {
+    pub const ALL: [Self; 2] = [Self::Claude, Self::Codex];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude",
+            Self::Codex => "Codex",
+        }
+    }
+
+    pub fn default_command(self) -> &'static str {
+        match self {
+            Self::Claude => "claude-agent-acp",
+            Self::Codex => "codex-acp",
+        }
+    }
+
+    pub fn install_hint(self) -> &'static str {
+        match self {
+            Self::Claude => "npm i -g @agentclientprotocol/claude-agent-acp",
+            Self::Codex => "npm i -g @agentclientprotocol/codex-acp",
+        }
+    }
+}
+
+/// Resolve the configured adapter command for one provider. The legacy
+/// `YALDA_ACP_AGENT` override remains a Claude-only fallback so existing setups
+/// keep working without accidentally routing a Codex session through Claude.
+pub fn configured_agent_command(provider: AgentProvider) -> String {
+    let provider_key = match provider {
+        AgentProvider::Claude => "YALDA_CLAUDE_ACP_AGENT",
+        AgentProvider::Codex => "YALDA_CODEX_ACP_AGENT",
+    };
+    std::env::var(provider_key)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            (provider == AgentProvider::Claude)
+                .then(|| std::env::var("YALDA_ACP_AGENT").ok())
+                .flatten()
+                .filter(|v| !v.trim().is_empty())
+        })
+        .unwrap_or_default()
+}
+
 /// Which yalda frontend is hosting this ACP session. Threaded into the
 /// system-prompt append so Claude knows which host it's running inside —
 /// affects nothing protocol-side, only the host-description sentence at the
@@ -509,10 +575,12 @@ fn allow_tool_kind(mode: PermissionMode, kind: ToolKind) -> bool {
 /// SDK prompt, so a stale install must fail loud ("no ACP agent on PATH")
 /// rather than silently launch a worse agent.
 pub const DEFAULT_AGENT_FALLBACKS: &[&str] = &["claude-agent-acp"];
+pub const DEFAULT_CODEX_AGENT_FALLBACKS: &[&str] = &["codex-acp"];
 
 /// Command-name needles identifying an ACP adapter subprocess, for the
 /// orphan reaper. Covers the current binary + the legacy one.
-pub const ADAPTER_PROCESS_NEEDLES: &[&str] = &["claude-agent-acp", "claude-code-acp"];
+pub const ADAPTER_PROCESS_NEEDLES: &[&str] =
+    &["claude-agent-acp", "claude-code-acp", "codex-acp"];
 
 /// Parse `ps -axo pid=,ppid=,command=` output and return the PIDs of ORPHANED
 /// ACP adapter processes — those whose parent is PID 1 (the spawner died and the
@@ -601,6 +669,7 @@ pub trait AgentSpawner: Send + Sync {
     /// Runs on a dedicated OS spawn thread (the handshake blocks), never the actor.
     fn spawn(
         &self,
+        provider: AgentProvider,
         command: &str,
         cwd: Option<PathBuf>,
         resume: Option<String>,
@@ -616,12 +685,13 @@ pub struct RealAgentSpawner;
 impl AgentSpawner for RealAgentSpawner {
     fn spawn(
         &self,
+        provider: AgentProvider,
         command: &str,
         cwd: Option<PathBuf>,
         resume: Option<String>,
         frontend: YaldaFrontend,
     ) -> io::Result<Box<dyn AgentTransport>> {
-        AcpChannelClient::spawn_with_resume_in(command, cwd, resume, frontend)
+        AcpChannelClient::spawn_with_resume_in_for(provider, command, cwd, resume, frontend)
             .map(|c| Box::new(c) as Box<dyn AgentTransport>)
     }
 }
@@ -844,6 +914,7 @@ mod fake {
     impl AgentSpawner for FakeAgentSpawner {
         fn spawn(
             &self,
+            _provider: AgentProvider,
             command: &str,
             cwd: Option<PathBuf>,
             resume: Option<String>,
@@ -964,8 +1035,30 @@ impl AcpChannelClient {
         resume_session_id: Option<String>,
         frontend: YaldaFrontend,
     ) -> io::Result<Self> {
+        Self::spawn_with_resume_in_for(
+            AgentProvider::Claude,
+            command_str,
+            cwd,
+            resume_session_id,
+            frontend,
+        )
+    }
+
+    /// Provider-aware spawn used by the session server. The legacy public
+    /// helpers above remain Claude defaults for direct-mode compatibility.
+    pub fn spawn_with_resume_in_for(
+        provider: AgentProvider,
+        command_str: &str,
+        cwd: Option<PathBuf>,
+        resume_session_id: Option<String>,
+        frontend: YaldaFrontend,
+    ) -> io::Result<Self> {
         let candidates: Vec<String> = if command_str.trim().is_empty() {
-            DEFAULT_AGENT_FALLBACKS
+            let fallbacks = match provider {
+                AgentProvider::Claude => DEFAULT_AGENT_FALLBACKS,
+                AgentProvider::Codex => DEFAULT_CODEX_AGENT_FALLBACKS,
+            };
+            fallbacks
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect()
@@ -979,7 +1072,13 @@ impl AcpChannelClient {
             tried.push(command.clone());
             // First try: direct PATH lookup (cheap, works for absolute
             // paths and binaries on the inherited PATH).
-            match Self::try_spawn(&command, cwd.clone(), resume_session_id.clone(), frontend) {
+            match Self::try_spawn(
+                provider,
+                &command,
+                cwd.clone(),
+                resume_session_id.clone(),
+                frontend,
+            ) {
                 Ok(client) => return Ok(client),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
                     last_err = Some(e);
@@ -994,7 +1093,13 @@ impl AcpChannelClient {
                 if resolved != command {
                     tried.push(resolved.clone());
                 }
-                match Self::try_spawn(&resolved, cwd.clone(), resume_session_id.clone(), frontend) {
+                match Self::try_spawn(
+                    provider,
+                    &resolved,
+                    cwd.clone(),
+                    resume_session_id.clone(),
+                    frontend,
+                ) {
                     Ok(client) => return Ok(client),
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {
                         last_err = Some(e);
@@ -1009,8 +1114,14 @@ impl AcpChannelClient {
         Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!(
-                "no ACP agent on PATH (tried {}). Install with `npm i -g @agentclientprotocol/claude-agent-acp`, or set YALDA_ACP_AGENT=/path/to/agent. Last error: {}",
+                "no {} ACP agent on PATH (tried {}). Install with `{}`, or set {}=/path/to/agent. Last error: {}",
+                provider.label(),
                 tried.join(", "),
+                provider.install_hint(),
+                match provider {
+                    AgentProvider::Claude => "YALDA_CLAUDE_ACP_AGENT",
+                    AgentProvider::Codex => "YALDA_CODEX_ACP_AGENT",
+                },
                 last_err
                     .as_ref()
                     .map(|e| e.to_string())
@@ -1023,6 +1134,7 @@ impl AcpChannelClient {
     /// candidate chain. Same handshake semantics as the public `spawn`,
     /// just without the fallback loop.
     fn try_spawn(
+        provider: AgentProvider,
         command: &str,
         cwd: Option<PathBuf>,
         resume_session_id: Option<String>,
@@ -1097,6 +1209,7 @@ impl AcpChannelClient {
                     wake_tx,
                     cancel_rx,
                     frontend,
+                    provider,
                 );
             })?;
 
@@ -1626,6 +1739,7 @@ fn run_worker(
     wake_tx: futures::channel::mpsc::UnboundedSender<()>,
     cancel_rx: futures::channel::mpsc::UnboundedReceiver<()>,
     frontend: YaldaFrontend,
+    provider: AgentProvider,
 ) {
     // Build a small multi-thread runtime — the ACP crate spawns several
     // tasks internally (read loop, write loop, response router) and a
@@ -1661,6 +1775,7 @@ fn run_worker(
             wake_tx,
             cancel_rx,
             frontend,
+            provider,
         )
         .await
     });
@@ -1692,6 +1807,7 @@ async fn worker_async(
     wake_tx: futures::channel::mpsc::UnboundedSender<()>,
     mut cancel_rx: futures::channel::mpsc::UnboundedReceiver<()>,
     frontend: YaldaFrontend,
+    provider: AgentProvider,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 1) Spawn the agent process.
     let mut cmd = tokio::process::Command::new(&parts[0]);
@@ -1716,6 +1832,16 @@ async fn worker_async(
     // CLAUDE_CODE_* vars (SESSION_ID, ENTRYPOINT, etc.) are passed through
     // since the agent may key behavior off them.
     cmd.env_remove("CLAUDECODE");
+    // Codex sessions use the interactive ChatGPT login cached by `codex login`.
+    // Do not let an ambient API key silently switch the adapter onto metered API
+    // billing. Advanced users can opt back into API-key auth explicitly.
+    if provider == AgentProvider::Codex
+        && std::env::var("YALDA_CODEX_ALLOW_API_KEY").as_deref() != Ok("1")
+    {
+        cmd.env_remove("OPENAI_API_KEY");
+        cmd.env_remove("CODEX_API_KEY");
+        cmd.env_remove("DEFAULT_AUTH_REQUEST");
+    }
     // Reasoning depth is intentionally NOT configured here. The adapter/SDK
     // already default to adaptive thinking at effort "high", so a raw
     // `MAX_THINKING_TOKENS` budget would only fight the adaptive system. Do
@@ -2108,7 +2234,14 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                         session_mode = session_mode,
                         body = CLAUDE_CODE_APPEND_BODY,
                     );
-                    let claude_code_meta = || {
+                    let agent_meta = || {
+                        // `_meta.claudeCode` and `_meta.systemPrompt.append` are
+                        // Claude-adapter extensions, not ACP. Codex reads its
+                        // durable guidance from AGENTS.md / Codex config, so keep
+                        // its session request provider-neutral.
+                        if provider == AgentProvider::Codex {
+                            return serde_json::Map::new();
+                        }
                         let mut m = serde_json::Map::new();
                         m.insert(
                             "systemPrompt".to_string(),
@@ -2156,7 +2289,7 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                             SessionId::new(id.clone()),
                             cwd.clone(),
                         )
-                        .meta(claude_code_meta());
+                        .meta(agent_meta());
                         // A stale / GC'd / otherwise unloadable resume id can make
                         // the agent HANG in `session/load` — it never errors and
                         // never returns, so the existing error-fallback below never
@@ -2203,7 +2336,7 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                         } else {
                             match connection
                                 .send_request(
-                                    NewSessionRequest::new(cwd.clone()).meta(claude_code_meta()),
+                                    NewSessionRequest::new(cwd.clone()).meta(agent_meta()),
                                 )
                                 .block_task()
                                 .await
@@ -2225,7 +2358,7 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                     } else {
                         match connection
                             .send_request(
-                                NewSessionRequest::new(cwd.clone()).meta(claude_code_meta()),
+                                NewSessionRequest::new(cwd.clone()).meta(agent_meta()),
                             )
                             .block_task()
                             .await

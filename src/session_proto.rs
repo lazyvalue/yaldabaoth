@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::acp_channel::{ImageAttachment, PermissionMode, ReplyEvent};
+use crate::acp_channel::{AgentProvider, ImageAttachment, PermissionMode, ReplyEvent};
 use crate::agent_event::AgentEvent;
 
 /// Server-assigned stable session handle (UUID string).
@@ -48,6 +48,10 @@ pub enum Request {
     CreateSession {
         cwd: PathBuf,
         label: String,
+        /// Backend adapter that owns this session. Missing on an older client
+        /// means Claude, preserving the pre-provider wire behavior.
+        #[serde(default)]
+        provider: AgentProvider,
         /// Resume a prior ACP session id, if available.
         resume_session_id: Option<String>,
     },
@@ -186,6 +190,9 @@ pub struct SessionInfo {
     pub acp_session_id: Option<String>,
     pub label: String,
     pub cwd: PathBuf,
+    /// Backend that owns the ACP thread. Additive for mixed-version peers.
+    #[serde(default)]
+    pub provider: AgentProvider,
     pub turns: usize,
     pub connected: bool,
     pub permission_mode: PermissionMode,
@@ -218,6 +225,8 @@ pub struct AdminSnapshot {
 pub struct AdminSessionInfo {
     pub session_id: ServerSessionId,
     pub label: String,
+    #[serde(default)]
+    pub provider: AgentProvider,
     /// Agent subprocess live (channel is Some).
     pub connected: bool,
     pub turns: usize,
@@ -399,6 +408,38 @@ pub fn session_wal_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_session_defaults_legacy_peer_to_claude() {
+        let old = r#"{"method":"create_session","cwd":"/tmp/work","label":"claude-1","resume_session_id":null}"#;
+        let req: Request = serde_json::from_str(old).expect("old create must deserialize");
+        match req {
+            Request::CreateSession { provider, .. } => {
+                assert_eq!(provider, AgentProvider::Claude);
+            }
+            other => panic!("expected CreateSession, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_session_round_trips_codex_provider() {
+        let req = Request::CreateSession {
+            cwd: PathBuf::from("/tmp/work"),
+            label: "codex-1".into(),
+            provider: AgentProvider::Codex,
+            resume_session_id: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains(r#""provider":"codex""#));
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back,
+            Request::CreateSession {
+                provider: AgentProvider::Codex,
+                ..
+            }
+        ));
+    }
 
     /// Back-compat: a `prompt` request written before image attachments existed
     /// has no `images` key. `#[serde(default)]` MUST let it deserialize (to an

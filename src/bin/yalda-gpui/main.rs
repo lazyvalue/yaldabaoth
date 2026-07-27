@@ -135,7 +135,7 @@ pub(crate) use gpui::{
     rgba, size,
 };
 
-pub(crate) use yalda::acp_channel::AcpChannelClient;
+pub(crate) use yalda::acp_channel::{AcpChannelClient, AgentProvider};
 pub(crate) use yalda::blocks::{ColumnAlignment, ListItem, RenderedBlock, StyledLine, StyledSpan};
 pub(crate) use yalda::cursor::CursorPos;
 pub(crate) use yalda::document::Document;
@@ -1556,7 +1556,8 @@ fn agent_local_menu() -> Vec<MenuNode> {
         MenuNode::entry(".", "stop", "claude-stop"),
         MenuNode::entry("w", "switch worksheet ⇄ message box", "agent-input-toggle"),
         MenuNode::separator(),
-        MenuNode::entry("n", "new session", "claude-new"),
+        MenuNode::entry("n", "new Claude session", "claude-new"),
+        MenuNode::entry("N", "new Codex session", "codex-new"),
         MenuNode::entry("x", "close session", "claude-close"),
         MenuNode::entry("C", "clear session", "claude-clear"),
         MenuNode::entry("r", "rename session", "claude-rename"),
@@ -2133,11 +2134,17 @@ impl YaldaGpuiView {
                                 .filter(|s| !s.trim().is_empty())
                                 .cloned()
                         });
+                        let provider = self
+                            .agent_roster
+                            .get(slot.id.as_str())
+                            .map(|info| info.provider)
+                            .unwrap_or_default();
                         let bind = self.sessions.open_or_focus(&slot.id, |_id| {
                             cx.new(|_| {
-                                let mut state = AgentState::new_server_managed(Some(
-                                    "reconnecting…".into(),
-                                ));
+                                let mut state = AgentState::new_server_managed_for(
+                                    provider,
+                                    Some("reconnecting…".into()),
+                                );
                                 state.summary = slot_summary;
                                 AgentSession {
                                     state,
@@ -4753,6 +4760,7 @@ impl YaldaGpuiView {
                 }
             }
             "claude-new" => self.new_agent_session(None, cx),
+            "codex-new" => self.new_agent_session_for(AgentProvider::Codex, None, cx),
             "claude-session-picker" => self.open_session_picker_rebind(cx),
             "claude-stop" => {
                 if matches!(

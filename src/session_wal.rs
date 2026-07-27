@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::acp_channel::PermissionMode;
+use crate::acp_channel::{AgentProvider, PermissionMode};
 use crate::session_proto::Notification;
 
 /// One line in a session WAL file.
@@ -57,6 +57,8 @@ enum WalRecord {
         label: String,
         cwd: PathBuf,
         permission_mode: PermissionMode,
+        #[serde(default)]
+        provider: AgentProvider,
     },
     /// One transcript event, in `event_log` order.
     Event(Notification),
@@ -104,6 +106,24 @@ impl SessionWal {
         cwd: &Path,
         permission_mode: PermissionMode,
     ) -> std::io::Result<SessionWal> {
+        Self::create_for_provider(
+            dir,
+            server_session_id,
+            label,
+            cwd,
+            permission_mode,
+            AgentProvider::Claude,
+        )
+    }
+
+    pub fn create_for_provider(
+        dir: &Path,
+        server_session_id: &str,
+        label: &str,
+        cwd: &Path,
+        permission_mode: PermissionMode,
+        provider: AgentProvider,
+    ) -> std::io::Result<SessionWal> {
         std::fs::create_dir_all(dir)?;
         let path = wal_path(dir, server_session_id);
         // Truncate: a fresh session starts a fresh log. (A reused id would be a
@@ -120,6 +140,7 @@ impl SessionWal {
             label: label.to_string(),
             cwd: cwd.to_path_buf(),
             permission_mode,
+            provider,
         };
         wal.write_record(&header)?;
         wal.file.sync_data()?;
@@ -182,6 +203,7 @@ pub struct RecoveredSession {
     pub label: String,
     pub cwd: PathBuf,
     pub permission_mode: PermissionMode,
+    pub provider: AgentProvider,
     /// The replayed transcript, in order.
     pub event_log: Vec<Notification>,
     /// Re-derived from the last `SessionAttached` event — the id needed to
@@ -229,7 +251,7 @@ pub fn recover_one(path: &Path) -> std::io::Result<Option<RecoveredSession>> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
 
-    let mut header: Option<(String, String, PathBuf, PermissionMode)> = None;
+    let mut header: Option<(String, String, PathBuf, PermissionMode, AgentProvider)> = None;
     let mut event_log: Vec<Notification> = Vec::new();
     // The most recent rename, if any. Applied over the header label so a
     // session recovered after a server restart keeps its renamed name rather
@@ -259,6 +281,7 @@ pub fn recover_one(path: &Path) -> std::io::Result<Option<RecoveredSession>> {
                 label,
                 cwd,
                 permission_mode,
+                provider,
             } => {
                 // Version gate: a header from any prior schema is discarded
                 // wholesale — the session resumes empty and re-loads from the
@@ -279,14 +302,14 @@ pub fn recover_one(path: &Path) -> std::io::Result<Option<RecoveredSession>> {
                     );
                     return Ok(None);
                 }
-                header = Some((server_session_id, label, cwd, permission_mode));
+                header = Some((server_session_id, label, cwd, permission_mode, provider));
             }
             WalRecord::Event(note) => event_log.push(note),
             WalRecord::Rename { label } => renamed_label = Some(label),
         }
     }
 
-    let Some((server_session_id, header_label, cwd, permission_mode)) = header else {
+    let Some((server_session_id, header_label, cwd, permission_mode, provider)) = header else {
         return Ok(None);
     };
     // Last rename wins over the creation-time header label.
@@ -338,6 +361,7 @@ pub fn recover_one(path: &Path) -> std::io::Result<Option<RecoveredSession>> {
         label,
         cwd,
         permission_mode,
+        provider,
         event_log,
         acp_session_id,
         turns,
@@ -411,6 +435,25 @@ mod tests {
         assert_eq!(s.turns, 1);
         // header is not an event; 4 events were appended.
         assert_eq!(s.event_log.len(), 4);
+        assert_eq!(s.provider, AgentProvider::Claude);
+    }
+
+    #[test]
+    fn codex_provider_survives_recovery() {
+        let dir = tmp_dir("codex-provider");
+        SessionWal::create_for_provider(
+            &dir,
+            "codex-s1",
+            "codex-1",
+            Path::new("/tmp/work"),
+            PermissionMode::Yolo,
+            AgentProvider::Codex,
+        )
+        .unwrap();
+
+        let recovered = recover_all(&dir);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].provider, AgentProvider::Codex);
     }
 
     #[test]

@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{broadcast, mpsc};
-use yalda::acp_channel::PermissionMode;
+use yalda::acp_channel::{AgentProvider, PermissionMode};
 use yalda::session_proto::{Notification, ServerSessionId, SessionInfo};
 
 use command::Command;
@@ -252,7 +252,8 @@ pub trait SessionDriver: Send + Sync + 'static {
 
 impl SessionDriver for Arc<crate::SessionManager> {
     async fn create(&self, label: String, cwd: PathBuf) -> SessionInfo {
-        self.send_create(cwd, label, None).await
+        self.send_create(cwd, label, AgentProvider::Claude, None)
+            .await
     }
     async fn admin_prompt(&self, sid: String, text: String) -> Result<(), String> {
         self.send_admin_prompt(&sid, &text).await
