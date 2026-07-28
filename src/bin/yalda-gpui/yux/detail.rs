@@ -93,23 +93,29 @@ pub(crate) fn section_heading(text: &str, st: &DetailStyle) -> gpui::Div {
 
 /// A compact tab/button for narrow chrome surfaces. The caller owns the tab
 /// group layout and attaches the click listener; this primitive owns the shared
-/// selected/hover typography and geometry. Selection is carried by the caller's
-/// background color; labels stay at normal foreground contrast.
+/// selected/hover typography and geometry. An optional indicator remains inside
+/// the equal-width target. Selection is carried by the caller's background
+/// color; labels stay at normal foreground contrast.
 pub(crate) fn compact_tab(
     id: impl Into<ElementId>,
     label: &str,
+    indicator: Option<gpui::AnyElement>,
     selected: bool,
     selected_bg: Hsla,
     st: &DetailStyle,
 ) -> gpui::Stateful<gpui::Div> {
     let transparent: Hsla = rgba(0x00000000).into();
-    div()
+    let mut tab = div()
         .id(id)
         .flex_1()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .gap(px(3.0))
         .py(px(3.0))
         .rounded_sm()
         .cursor_pointer()
-        .text_center()
         .font_family(st.mono.clone())
         .font_weight(if selected {
             FontWeight::BOLD
@@ -120,7 +126,39 @@ pub(crate) fn compact_tab(
         .text_color(st.fg)
         .bg(if selected { selected_bg } else { transparent })
         .hover(|s| s.bg(selected_bg))
-        .child(SharedString::from(label.to_string()))
+        .child(SharedString::from(label.to_string()));
+    if let Some(indicator) = indicator {
+        tab = tab.child(indicator);
+    }
+    tab
+}
+
+/// A small always-visible numeric indicator for compact chrome. Its tint is
+/// semantic (for example ready-green or working-orange), while the tab that
+/// contains it remains responsible for selected/hover treatment.
+pub(crate) fn compact_count_indicator(
+    id: impl Into<ElementId>,
+    count: usize,
+    tint: Hsla,
+    st: &DetailStyle,
+) -> gpui::Stateful<gpui::Div> {
+    let mut wash = tint;
+    wash.a *= 0.14;
+    div()
+        .id(id)
+        .min_w(px(16.0))
+        .h(px(16.0))
+        .px(px(4.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(8.0))
+        .bg(wash)
+        .text_color(tint)
+        .font_family(st.mono.clone())
+        .font_weight(FontWeight::BOLD)
+        .text_size(px(st.pt * 0.7))
+        .child(SharedString::from(count.to_string()))
 }
 
 /// A compact heading inside a dense list. The caller supplies the semantic

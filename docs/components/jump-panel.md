@@ -964,3 +964,47 @@ guard to green.
 projection rather than inheriting the currently visible per-project tab; this
 is the necessary expression of the requirement that the palette remain ordinary
 navigation and never expose Archived.
+
+### UXI-JumpPanel-17 — Waiting and Working tabs show their live session totals
+
+**Statement.** Every expanded project's Waiting and Working tab carries an
+always-visible number indicator, including when the total is **0**. Each number
+is derived from that project's current, deduplicated session projection:
+
+- Waiting counts non-archived rows whose activity is
+  `AgentActivity::Waiting`;
+- Working counts non-archived rows whose activity is
+  `AgentActivity::Working`.
+
+Unavailable and archived rows contribute to neither total. Archive/unarchive
+and live activity transitions update the numbers on the next projection. All
+and Archived stay unnumbered. The Waiting indicator uses the existing semantic
+green, the Working indicator uses the existing semantic orange, and the
+selected tab retains the neutral gray treatment from `UXI-JumpPanel-15`.
+
+**Applies to.** `jump_panel_view.rs` (`JumpProjectSection`,
+`jump_panel_sections_with_tab`, `render_jump_panel`) and `yux/detail.rs`
+(`compact_tab`, `compact_count_indicator`).
+
+**Why.** The filtered tabs need to communicate queue size before selection,
+without adding another row of chrome or allowing a stale independently-managed
+counter to drift from the sessions the tab actually contains.
+
+**Status.** `implemented` — the indicators derive from the same project
+projection as their tabs and their geometry is headless-guarded. Exact
+antialiasing and subjective balance in each theme remain harness gap #1.
+
+**Enforcement.**
+`verify_harness.rs::jump_waiting_working_tabs_paint_live_counts` drives the real
+project projection, proves archived and unavailable sessions are excluded,
+observes a Working→Waiting transition, and layout-probes both indicators inside
+their tab targets to ensure the zero indicator remains painted.
+
+**Negative control observed.** With the guard added before the renderer changed,
+it failed specifically because the Waiting count indicator did not paint.
+Adding the derived totals and compact indicators returned the guard to green.
+
+**Deviation from plan.** None material. The visual number shape was promoted to
+the reusable `yux::compact_count_indicator` primitive, while `compact_tab`
+learned to accept optional inline content so equal-width tab geometry remains
+centralized.

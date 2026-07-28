@@ -7367,6 +7367,111 @@ fn jump_project_agent_tabs_are_independent_and_all_appends(cx: &mut TestAppConte
     );
 }
 
+/// UXI-JumpPanel-17: Waiting and Working expose their live project totals in
+/// the painted tab strip, including when one side reaches zero.
+#[gpui::test]
+fn jump_waiting_working_tabs_paint_live_counts(cx: &mut TestAppContext) {
+    use yalda::session_proto::SessionInfo;
+
+    let (view, vcx) = boot_browser(cx);
+    let (pid, cwd) = view.update(vcx, |v, _| {
+        let pid = v.workspace.active_workspace().expect("workspace").project();
+        (pid, v.projects.cwd_of(pid).expect("project cwd").to_path_buf())
+    });
+    let info = |sid: &str, label: &str, busy: bool, connected: bool| SessionInfo {
+        session_id: sid.into(),
+        acp_session_id: None,
+        label: label.into(),
+        cwd: cwd.clone(),
+        provider: yalda::acp_channel::AgentProvider::Claude,
+        turns: 0,
+        connected,
+        permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+        busy,
+    };
+    view.update(vcx, |v, _| {
+        v.agent_roster
+            .upsert(info("count-wait-a", "count wait a", false, true));
+        v.agent_roster
+            .upsert(info("count-wait-b", "count wait b", false, true));
+        v.agent_roster
+            .upsert(info("count-work", "count work", true, true));
+        v.agent_roster
+            .upsert(info("count-offline", "count offline", false, false));
+        v.agent_roster
+            .upsert(info("count-archived", "count archived", false, true));
+        v.jump_archived_sessions.insert("count-archived".into());
+        v.jump_session_order = vec![
+            "count-wait-a".into(),
+            "count-work".into(),
+            "count-offline".into(),
+            "count-wait-b".into(),
+            "count-archived".into(),
+        ];
+    });
+
+    let counts = |view: &gpui::Entity<YaldaGpuiView>,
+                  vcx: &mut gpui::VisualTestContext| {
+        view.update(vcx, |v, cx| {
+            let section = v
+                .jump_panel_sections(cx)
+                .0
+                .into_iter()
+                .find(|section| section.id == pid)
+                .expect("project section");
+            (section.waiting_count, section.working_count)
+        })
+    };
+    assert_eq!(
+        counts(&view, vcx),
+        (2, 1),
+        "archived and unavailable sessions contribute to neither live total"
+    );
+
+    crate::layout_probe_begin();
+    for _ in 0..3 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+    for tab in ["waiting", "working"] {
+        let tab_bounds =
+            crate::layout_probe_get(&format!("jump-agent-tab-{}-{tab}", pid.0))
+                .expect("the counted tab must paint");
+        let (x, y, w, h) =
+            crate::layout_probe_get(&format!("jump-agent-tab-count-{}-{tab}", pid.0))
+                .unwrap_or_else(|| panic!("the {tab} tab's live total must paint"));
+        let (tab_x, tab_y, tab_w, tab_h) = tab_bounds;
+        assert!(
+            x >= tab_x
+                && y >= tab_y
+                && x + w <= tab_x + tab_w
+                && y + h <= tab_y + tab_h,
+            "the {tab} total must stay inside its tab target"
+        );
+    }
+    crate::layout_probe_end();
+
+    view.update(vcx, |v, _| {
+        v.agent_roster.set_busy("count-work", false);
+    });
+    assert_eq!(
+        counts(&view, vcx),
+        (3, 0),
+        "a live state change updates both derived totals"
+    );
+
+    crate::layout_probe_begin();
+    for _ in 0..3 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+    assert!(
+        crate::layout_probe_get(&format!("jump-agent-tab-count-{}-working", pid.0)).is_some(),
+        "the Working indicator must remain painted when its value is zero"
+    );
+    crate::layout_probe_end();
+}
+
 /// UXI-JumpPanel-14: All is a headed stable partition of the durable custom
 /// roster. Working leads, Waiting follows, and exceptional unavailable rows
 /// trail only when present.

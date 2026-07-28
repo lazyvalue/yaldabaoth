@@ -13,6 +13,18 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Show live totals on Waiting and Working tabs** — `NEEDS-RUNTIME` (built on branch
+  `jump-tab-counts`, 2026-07-28 via `/new-ux`; `UXI-JumpPanel-17`). Captured
+  verbatim: *"I want the Waiting and Working tabs to have a number indicator
+  showing how many sessions are in each."* Scoped per expanded project: both
+  indicators are always visible, including `0`, and count non-archived sessions
+  admitted by the corresponding live-activity tab. All and Archived remain
+  unnumbered. The indicator uses the tab's green/orange activity color while
+  selected-tab chrome remains neutral gray. Derived totals, activity changes,
+  archive/unavailable exclusion, zero-state paint, and indicator containment
+  are headless-verified; final visual balance in Folio and Nightfox remains
+  runtime gap #1.
+
 - **Group the All tab by live activity** — `NEEDS-RUNTIME` (built on branch
   `jump-all-state-groups`, 2026-07-28 via `/new-ux`; extends
   `UXI-JumpPanel-14`). Captured verbatim: *"In the 'all' tab sessions should be
