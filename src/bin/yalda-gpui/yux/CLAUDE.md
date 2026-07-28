@@ -34,8 +34,8 @@ style bundle so a caller themes once:
 - **`kv_row(label, value, &DetailStyle)`** — fixed-label / value row.
 - **`section_heading(text, &DetailStyle)`** — underlined section header.
 - **`compact_tab(id, label, selected, selected_bg, &DetailStyle)`** — equal-width
-  compact tab chrome; selected text uses `DetailStyle::accent`, unselected text
-  uses normal foreground contrast. The caller owns the enclosing tab group.
+  compact tab chrome; selection is carried by its background and every label
+  keeps normal foreground contrast. The caller owns the enclosing tab group.
 - **`note_block(author, when, body, &DetailStyle)`** — author · timestamp over a
   multiline body (comments, updates, log entries).
 - **`fmt_iso_datetime(&Option<String>)`** — ISO-8601 → `YYYY-MM-DD HH:MM`.

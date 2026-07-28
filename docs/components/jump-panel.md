@@ -15,10 +15,9 @@ O(workspaces + sessions)), not cached. Primary code home:
 **Palette.** Two header tiers, distinct hues: top-level section headers
 ("PINNED" / "WORKSPACES" / "AGENT SESSIONS") are **red** (`DetailStyle.err`,
 `0xff6b6b`, bold uppercase); per-cwd subheaders are **electric blue** (`0x3b9eff`,
-real path casing). The "you are here" active mark + selection tint are the theme's
-cyan `frozen_bar` (UXI-JumpPanel-5). **Italic carries exactly one meaning** — the
-"waiting on you" session state (UXI-JumpPanel-6); nothing else in the panel is
-italic.
+real path casing). Operational state uses two literal hues: **orange = working**
+and **green = ready for input**. The "you are here" active mark and selected tabs
+use the overlay's neutral gray selection palette (UXI-JumpPanel-5).
 
 > **Current chrome (`UXI-JumpPanel-7/-8`).** The Sections list below predates the
 > declutter: the inline **＋ create rows**, the **✕** close glyph, and the **cwd
@@ -48,10 +47,8 @@ Sections:
   - **Status dot** = what the AGENT is doing (INV-UX-10, UXI-JumpPanel-6) — the
     shape + color are one signal, not binding:
     - **● orange** — working (a reply is in flight).
-    - **● green + italic label** — idle with unread output → **waiting on you**
-      (UXI-JumpPanel-6).
-    - **○ dim** — idle and already read, or disconnected, or a roster-only
-      session whose phase we can't know. Disconnected also dims the whole row.
+    - **● green** — connected and idle → **ready for input / your turn**.
+    - **○ dim** — disconnected or connecting. The whole row is also dimmed.
   - Click → bound session focuses its tile; **free** session opens in an
     ephemeral virtual workspace (torn down on switch-away).
   - The row bound to the **focused tile** carries a left accent bar
@@ -77,36 +74,32 @@ whose **shape and color together** are one signal for what the agent is doing �
 NOT binding (binding is no longer surfaced in the panel):
 
 - **● orange** (`0xff9e64`) — **working**: a reply is in flight.
-- **● green** (`theme.agent.tool_completed`) + **italic label** — **waiting on
-  you**: the session finished a turn whose output you haven't read yet
-  (UXI-JumpPanel-6).
-- **○ dim** — **neutral**: idle and already read, OR the phase is unknown (a
-  roster-only session running on the server but never opened here), OR the agent
-  is disconnected (which also dims the whole row).
+- **● green** (`theme.agent.tool_completed`) — **ready for input / your turn**:
+  every connected session not currently producing a reply.
+- **○ dim** — **unavailable**: disconnected or connecting (which also dims the
+  whole row).
 
-The mapping is a pure function of `(connected, awaiting, unread)` —
+The mapping is a pure function of `(connected, awaiting)` —
 `AgentRow::dot_status` → `AgentDotStatus::{Working, WaitingForYou, Neutral}` — so
-the render just picks the glyph/hue. Working wins over unread; disconnected wins
-over any phase.
+the render just picks the glyph/hue. `unread` is retained as internal attention
+state but never makes one Waiting row look different from another.
 
 **Applies to.** `jump_panel_view.rs`: `jump_panel_agent_rows` (reads each opened
 session's `state.turn_phase.is_awaiting()` into `AgentRow::awaiting` and
-`state.unread` into `AgentRow::unread`; roster-only rows stay `None`/`false`) and
-`render_jump_panel` (glyph + color + italic from `dot_status`).
+`state.unread` into `AgentRow::unread`) and `render_jump_panel` (glyph + color
+from `dot_status`).
 
 **Why.** The user wants to glance at the panel and see which agents are working,
-which are waiting on them (unread), and which are done — without opening each tile.
+which are ready for them and which are unavailable — without opening each tile.
 
-**Status.** `partial` — the **mapping** is headless-guarded; the actual
-**hue** is a paint/human-eye detail (harness gap #1). Roster-only sessions can't
-show working/waiting until the server reports turn state in `SessionInfo` (today
-`Neutral`).
+**Status.** `implemented` — the mapping and palette routing are headless-guarded;
+the actual alpha/compositing is a paint/human-eye detail (harness gap #1).
 
 **Enforcement.** Headless in `verify_harness.rs`:
-`agent_status_dot_reflects_turn_phase` (idle+read→Neutral, idle+unread→
+`agent_status_dot_reflects_turn_phase` (every connected idle state→
 WaitingForYou, mid-turn→Working through the real `jump_panel_agent_rows`) and the
-pure `agent_dot_status_mapping` unit test (totality, working-wins,
-disconnected-wins). The hue itself is a runtime check.
+pure `agent_dot_status_mapping` unit test (totality and disconnected-wins).
+`jump_panel_state_palette_is_orange_green_and_gray` guards palette routing.
 
 ### UXI-JumpPanel-2 — Jump-panel items reorder by drag, at two levels, cwd-bounded
 
@@ -310,19 +303,18 @@ typed cwd needs the daemon (harness gap #2).
 ### UXI-JumpPanel-5 — The active screen element wears an accent mark in the jump panel
 
 **Statement.** The jump panel marks the row(s) representing the **active screen UX
-element** — "this is where you are" — with a **left accent bar** (2px, the theme's
-cool primary `AgentTheme.frozen_bar`) plus a matching low-alpha selection tint and
-an accent-colored label. (Superseded the original bright-red `0xff6b6b` bounding
-box, which read as an alarm and clashed with the warm selection tint — restyled to
-the cool accent scheme; the *predicate* is unchanged.) Two independent marks,
+element** — "this is where you are" — with a 2px neutral left mark plus the
+overlay's gray selected background. Label text remains normal foreground.
+Selection is intentionally neutral so orange and green are reserved for
+operational state. Two independent marks,
 0/1/2 marks total:
 
 1. **The active workspace row** — the row whose tab index equals
    `workspace.active_tab` — is always boxed **when that tab is listed** (i.e. it
    is non-ephemeral). If the active tab is an **ephemeral virtual workspace** (a
    free session opened via ADR-0021), it isn't in the Workspaces list, so **no
-   workspace row is marked**. The mark is a left accent bar + accent label over the
-   tinted selection background.
+   workspace row is marked**. The mark is a neutral left bar over the gray
+   selected background.
 2. **The focused bound-session row** — the agent-session row bound to the
    **focused tile** (`focused_bound_session()`) — is marked. When the focused tile
    is a **buffer**, or an **unbound** agent tile (selector, no session), there is
@@ -345,17 +337,16 @@ every listed row when the active tab is ephemeral.
 
 **Applies to.** `jump_panel_view.rs`: `jump_active_session` +
 `jump_target_is_active` (the pure derivation), `jump_nav_row` (`active:
-Option<Hsla>` param → left `border_l_2` accent bar + tint + accent label), and
-`render_jump_panel` (workspace rows pass `active.then_some(active_accent)`; session
-rows pass the same over `jump_target_is_active(...)`; `active_accent` =
-`AgentTheme.frozen_bar`). `focused_bound_session` (`main.rs`).
+Option<Hsla>` param → left `border_l_2` neutral bar + gray selected background),
+and `render_jump_panel` (workspace/session rows use `OverlayTheme::border` for the
+mark and `OverlayTheme::selected_bg` for selection). `focused_bound_session`
+(`main.rs`).
 
 **Why.** With several workspaces and many agent sessions listed, the user loses
 track of which one they're currently looking at. A clean accent mark on "where you
-are" — workspace and, when applicable, the specific agent session — makes the panel
-a map with a "you are here" pin. The mark uses the theme's cool primary accent (a
-left bar + low-alpha tint), not a bright red border, so it reads as "current"
-rather than "alarm" and stays harmonious with the rest of the chrome.
+are" — workspace and, when applicable, the specific agent session — makes the
+panel a map with a "you are here" pin. Neutral gray is reserved for selection so
+orange and green retain their single operational meanings.
 
 **Status.** `implemented`.
 
@@ -363,7 +354,7 @@ rather than "alarm" and stays harmonious with the rest of the chrome.
 `focused_bound_session()` (which `.expect`s a focused window) — the jump panel can
 render with no focused window (the `workspace_number_skips_ephemeral` path), so it
 matches `workspace.focused_content()` directly and returns `(None, None)` when
-absent, rather than panicking. The mark is a 2px left `border_l_2` accent bar
+absent, rather than panicking. The mark is a 2px left `border_l_2` neutral bar
 (every row reserves the same-width transparent bar when inactive) so it never
 shifts row geometry — no inset margin, which on a `w_full` row would overflow the
 panel.
@@ -377,15 +368,17 @@ switching focus to a buffer tile clears the session mark but keeps the workspace
 mark; NC: revert the predicate to `false` and observe RED). The literal accent-bar
 pixels are harness gap #1 (human eye).
 
-### UXI-JumpPanel-6 — A backgrounded session that finishes a turn is "waiting on you"
+### UXI-JumpPanel-6 — Unread is internal attention state, not a third visual state
 
 **Statement.** When an agent session finishes a turn (its phase returns to
-`Idle`) while it is **not** the focused tile's session, it is marked **unread** —
-its jump-panel row shows the ● green dot and an **italic** label ("waiting on
-you", UXI-JumpPanel-1). The mark **clears** the moment the session becomes the
-focused/viewed session. A turn that finishes while you ARE focused on the session
-never marks unread (you're reading it live). Italic in the panel means this and
-only this.
+`Idle`) while it is **not** the focused tile's session, it is marked **unread**.
+The mark clears when the session becomes focused/viewed. A turn that finishes
+while you ARE focused never marks unread (you're reading it live).
+
+Unread does not change jump-panel styling. Both read and unread idle sessions are
+Waiting, wear the same green ready-for-input wash, and say `your turn`. This keeps
+the operational model honest: a row cannot appear in Waiting while looking
+neutral or unavailable.
 
 State lives on `AgentState.unread`. It is **set** in the one idempotent turn-end
 chokepoint `finalize_agent_turn_idem` (so every turn-end path — the pump
@@ -399,27 +392,22 @@ the same tick for the focused session, no flicker), and the tail of
 **Applies to.** `agent.rs` (`AgentState.unread`, set in `finalize_agent_turn_idem`);
 `agent_ui.rs` (`pump_session` focused-clear, `apply_server_batch` focused-clear,
 `jump_to_session` + `mark_session_read`); `jump_panel_view.rs`
-(`AgentRow::unread`, `dot_status`, the italic row + ● green in `render_jump_panel`).
+(`AgentRow::unread`, with `dot_status` deliberately independent of it).
 
-**Why.** With many sessions, the user needs to see at a glance which agents have
-produced output that's waiting for them — distinct from ones still working and
-ones they've already read. Clearing on focus makes the mark mean "you haven't
-looked," not merely "a turn ended."
+**Why.** Unread remains useful for attention/accounting, but exposing it as a
+separate visual treatment contradicted the Waiting tab and made the list noisy.
 
-**Status.** `implemented`. Roster-only sessions (never opened here) have no local
-`unread` and stay neutral until opened.
+**Status.** `implemented`.
 
 **Enforcement.** `verify_harness.rs`:
 `jump_dot_unread_on_background_turn_end_read_on_focused` (drives the REAL
 `apply_server_batch` → `ServerNotification::TurnEnded` on a backgrounded vs a
-focused session; asserts through REAL `jump_panel_agent_rows` + `dot_status` that
-the backgrounded one is `WaitingForYou` and the focused one is `Neutral`; NC:
-remove `self.unread = true` in `finalize_agent_turn_idem` → the backgrounded row
-reads `Neutral`, observed RED). The green/italic pixels are harness gap #1.
+focused session; asserts their distinct unread booleans while both project to
+`WaitingForYou`. `jump_project_agent_tabs_are_independent_and_all_appends`
+asserts every row admitted to Waiting carries the `your turn` hint.
 
-_Note (UXI-JumpPanel-7): the status glyph is now a **`✦`** whose COLOR carries the
-state (orange working / green waiting / dim neutral), not a separate ●/○ dot. The
-`dot_status` mapping and its enforcement are unchanged — only the rendered glyph._
+_Note (UXI-JumpPanel-7): the status glyph is a **`✦`** whose color carries the
+state (orange working / green ready / dim unavailable), not a separate ●/○ dot._
 
 ### UXI-JumpPanel-7 — The jump panel is a decluttered navigator; create/delete live in menus, and it wears a recessed shade
 
@@ -464,7 +452,7 @@ The panel's **look** is:
   fields (`jump_header` / `jump_subheader` / `jump_working`), defaulting to the old
   theme-neutral values for every theme, with **Nightfox** art-directed to its
   palette (`#c94f6d` / `#719cd6` / `#f4a261`). The waiting-green (`tool_completed`),
-  neutral-dim (`dim`), and selection cyan (`frozen_bar`) were already theme-derived.
+  neutral-dim (`dim`), and neutral overlay selection remain theme-derived.
 
 The navigation/marks/status behavior (`UXI-JumpPanel-1/-2/-5/-6`, `UXI-Project-3`)
 is otherwise unchanged; the section view-model (`jump_panel_sections`) is
@@ -666,18 +654,18 @@ own reverted-fix mutation:
 
 ### UXI-JumpPanel-12 — Status is known for EVERY session, not just the ones open here
 
-**Statement.** The panel's live status (`UXI-JumpPanel-1`'s dot, `-10`'s word +
-chip, `-6`'s waiting-on-you) applies to **every listed session**, including ones
+**Statement.** The panel's live status (`UXI-JumpPanel-1`'s dot and `-10`'s word +
+wash) applies to **every listed session**, including ones
 this GUI has never opened — free sessions, jump-panel-created ones, and sessions
 another GUI instance is driving.
 
 The derivation is **local-then-server**:
 
-1. session open in this GUI ⇒ its live `turn_phase` / `unread` win (unchanged);
+1. session open in this GUI ⇒ its live `turn_phase` wins;
 2. otherwise ⇒ the server's `SessionInfo.busy` (a turn is in flight) drives
-   **working**, and a **busy→idle** `SessionBusy` broadcast that arrives while you
-   are not on that session raises a roster-side unread mark
-   (`YaldaGpuiView.roster_unread`) ⇒ **your turn**, cleared when you jump to it.
+   **working**; connected + not busy is **ready for input**. A **busy→idle**
+   broadcast may also raise the internal roster-side unread mark, cleared when
+   you jump to it, without changing the visible ready state.
 
 The server owns `busy`: set when a prompt is accepted or queued, cleared when the
 turn settles or the channel is (re)spawned. `SessionInfo.busy` is
@@ -701,52 +689,49 @@ the one bit.
 an old daemon never sends `SessionBusy`.
 
 **Enforcement.** `verify_harness.rs::roster_only_session_shows_live_status` — a
-never-opened roster session goes Neutral → Working → WaitingForYou through the REAL
-`apply_server_batch` reducer + the REAL row builder, and clears on read. **NC
-observed RED**: drop the `.or(Some(info.busy))` fallback → `Some(Neutral)` while
-working. The live server→GUI loop is verification gap 2.
+never-opened connected roster session goes WaitingForYou → Working →
+WaitingForYou through the REAL `apply_server_batch` reducer + row builder.
+Reading clears its internal unread mark without changing its visible readiness.
+The live server→GUI loop is verification gap 2.
 
 ### UXI-JumpPanel-10 — A live session says what it is doing, in words and in shape
 
-**Statement.** In the jump panel, the two **live** session states are unmistakable
-while scanning — each one carries a **status word**, its own **glyph shape**, and a
-**tinted, outlined chip** around the row, not a hue on a single tiny glyph:
+**Statement.** In the jump panel, the two connected session states are
+unmistakable while scanning, but visually quiet: each carries a status word, its
+own glyph shape, and a low-alpha background wash with no bounding box:
 
 | State (`AgentDotStatus`) | Glyph | Right-edge word | Row |
 |---|---|---|---|
-| **Working** — a reply is in flight | `◆` (filled) | `working`, in the working hue | tint α 0.12 + hairline outline α 0.55, both in `agent.jump_working` |
-| **Waiting for you** — a backgrounded turn finished, unread (`UXI-JumpPanel-6`) | `✦` | `your turn`, in the ready hue | tint + outline in `agent.tool_completed`, label **italic** |
-| **Neutral** — idle+read, disconnected, or roster-only | `✦` (dim) | *(nothing)* | plain row |
+| **Working** — a reply is in flight | `◆` (filled) | `working`, orange | orange wash α 0.07 |
+| **Ready for input** — connected and not working | `✦` | `your turn`, green | green wash α 0.08 |
+| **Unavailable** — disconnected/connecting | `✦` (dim) | *(nothing)* | plain dim row |
 
-Both live tints/outlines are **alpha-derived from the existing theme colors** — no
-new theme fields, so a re-themed palette carries through. The **active row**
-(`UXI-JumpPanel-5`, "you are here") keeps its own accent background — the you-are-
-here mark wins over the status tint; the status outline still draws.
+Both state washes are alpha-derived from existing theme colors; there are no
+outlines or rounded chips. The active row (`UXI-JumpPanel-5`, "you are here")
+uses the overlay's gray selected background, which wins over the status wash.
 
 The **glyph shapes differ** so working vs waiting is legible with no color
-perception at all, and italic still carries exactly one meaning
-(`UXI-JumpPanel-6`): waiting on you.
+perception at all.
 
 The `(glyph, word)` mapping is the pure `agent_row_marks(status)`, and the **agent
 tile reuses it** (`UXI-AgentTile-28`) so both surfaces speak one vocabulary.
 
 **Applies to.** `jump_panel_view.rs`: `agent_row_marks` (new pure fn),
-`jump_session_row_el` (chip + hinted row), `jump_nav_row_hinted` (`jump_nav_row`
+`jump_session_row_el` (wash + hinted row), `jump_nav_row_hinted` (`jump_nav_row`
 plus a hint color, so a workspace's `ctrl-<n>` digit stays dim while a session's
 status word takes the status hue).
 
 **Why.** A colored `✦` was the *only* signal, at ~10px, in a list of otherwise
-identical rows — too quiet to catch out of the corner of the eye, and useless if
-you don't remember which hue means which. Words plus shapes plus a chip make "this
-one is running" and "this one needs me" readable at a glance.
+identical rows — too quiet to catch out of the corner of the eye. Words, shapes,
+and a restrained wash make state readable without turning every row into a card.
 
-**Status.** `implemented` — the mapping is headless-guarded; the tint/outline/
-italic as *pixels* are harness gap #1 (human eye).
+**Status.** `implemented` — the mapping and palette routing are headless-guarded;
+the alpha/compositing as pixels is harness gap #1 (human eye).
 
 **Enforcement.** `verify_harness.rs::agent_row_marks_name_the_live_states` (each
 status' glyph + word, and that the two live glyphs differ; NC: return `("✦", None)`
 for every status → RED). `dot_status` itself stays pinned by
-`agent_dot_status_mapping` + `jump_panel_agent_dot_reflects_turn_phase`.
+`agent_dot_status_mapping` + `agent_status_dot_reflects_turn_phase`.
 
 ### UXI-JumpPanel-11 — The panel wears the command-menu surface (reverses -7's recessed shade)
 
@@ -815,9 +800,8 @@ is covered by `tests.rs::preferences_round_trip_with_text_scale`.
 panel renders three independently selectable agent tabs:
 
 1. **Waiting** contains every connected session that is not currently producing
-   a reply (`AgentActivity::Waiting`). Reading its latest output removes the
-   green/italic **your turn** attention treatment but does not remove the agent
-   from Waiting.
+   a reply (`AgentActivity::Waiting`). Every row is consistently green and says
+   **your turn**, whether its latest output is read or unread.
 2. **Working** contains connected sessions with a reply in flight
    (`AgentDotStatus::Working`).
 3. **All** contains every session in the project and is the default.
@@ -826,8 +810,8 @@ Waiting and Working are chronological live queues: rows sort by when they
 entered that state, oldest first and **most recent last**. Their order is not
 draggable. State-entry time is owned beside the operational state itself: local
 sessions use `TurnPhase::turn_started` / `AgentState::waiting_since`;
-roster-only sessions use `AgentRoster::state_since`. Unread is an attention
-marker inside Waiting, not an activity state.
+roster-only sessions use `AgentRoster::state_since`. Unread remains internal
+attention state, not an activity or visual state.
 
 A connected agent therefore always belongs to exactly one of Waiting or
 Working. Disconnected/connecting sessions are `AgentActivity::Unavailable` and
@@ -854,18 +838,20 @@ presence are headless-guarded. Exact colors remain harness gap #1.
 `verify_harness.rs::jump_agent_state_tabs_filter_and_sort_without_moving_all`
 guards state filtering, oldest→newest order, and All identity.
 `jump_project_agent_tabs_are_independent_and_all_appends` drives the real
-per-project section projection and append method, probes all three painted tab
-controls, and includes a state flip that must not move All rows.
+per-project section projection and append method, proves every Waiting row says
+`your turn`, probes all three painted tab controls, and includes a state flip
+that must not move All rows.
 
-### UXI-JumpPanel-15 — Agent tabs are one cool-accent segmented control
+### UXI-JumpPanel-15 — Agent tabs are a separated neutral segmented control
 
 **Statement.** Waiting / Working / All render as a single bounded segmented
 control, not three floating words:
 
-- one rounded cool-accent hairline encloses the group;
+- one rounded neutral hairline encloses the group;
 - internal hairlines separate its three equal-width targets;
-- the selected segment carries a low-alpha cool tint and cool accent text;
-- unselected labels use normal foreground contrast;
+- the selected segment uses the overlay's gray selected background;
+- every label uses normal foreground contrast;
+- 10px of breathing room separates the workspace rows from the control;
 - agent summaries use `AgentTheme::agent_tint`, never `warm_accent` or the
   structural low-contrast `dim` color.
 
@@ -885,3 +871,4 @@ remain harness gap #1.
 probes the enclosing control and proves each painted tab is inside it.
 `tests.rs::jump_supporting_text_is_cool_and_readable_in_everyday_themes`
 locks the Folio/Nightfox supporting colors and rejects their warm accents.
+`jump_panel_state_palette_is_orange_green_and_gray` guards neutral selection.
