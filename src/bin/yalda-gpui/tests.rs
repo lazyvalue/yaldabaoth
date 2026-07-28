@@ -4304,6 +4304,45 @@ fn jump_supporting_text_is_cool_and_readable_in_everyday_themes() {
 }
 
 #[test]
+fn jump_panel_state_palette_is_orange_green_and_gray() {
+    use yalda::style::Color;
+    use yalda::theme::{AgentTheme, OverlayTheme};
+
+    let agent = AgentTheme::nightfox();
+    assert_eq!(
+        crate::jump_agent_status_color(&agent, crate::AgentDotStatus::Working),
+        agent.jump_working,
+        "working uses the theme's orange"
+    );
+    assert_eq!(
+        crate::jump_agent_status_color(&agent, crate::AgentDotStatus::WaitingForYou),
+        agent.tool_completed,
+        "ready for input uses the theme's green"
+    );
+
+    let nightfox = OverlayTheme::nightfox();
+    let folio = OverlayTheme::folio();
+    assert_eq!(
+        crate::jump_selection_color(&nightfox),
+        Color::Rgb(0x2b, 0x3b, 0x51),
+        "Nightfox selection uses its neutral slate"
+    );
+    assert_eq!(
+        crate::jump_selection_color(&folio),
+        Color::Rgb(0xd6, 0xdc, 0xe4),
+        "Folio selection uses its neutral blue-gray"
+    );
+    assert_ne!(
+        crate::jump_selection_color(&nightfox),
+        crate::jump_agent_status_color(&agent, crate::AgentDotStatus::Working)
+    );
+    assert_ne!(
+        crate::jump_selection_color(&nightfox),
+        crate::jump_agent_status_color(&agent, crate::AgentDotStatus::WaitingForYou)
+    );
+}
+
+#[test]
 fn parse_naming_reply_tolerates_real_model_output() {
     use crate::agent_naming::parse_naming_reply;
 

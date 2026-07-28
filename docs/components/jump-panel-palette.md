@@ -1,13 +1,12 @@
 # Jump panel — color scheme
 
 The full palette of the jump-panel sidebar (`jump_panel_view.rs`,
-`render_jump_panel`). Almost every color is **derived from the active theme**
-(`AgentTheme`) so the panel re-tints per theme; only two are fixed constants.
-Concrete hexes below are for the default **Dracula** theme (`AgentTheme::dracula`).
+`render_jump_panel`). Colors derive from the active `AgentTheme` and
+`OverlayTheme`, so the panel re-tints per theme.
 
-The design intent: the panel reads as **one cool-blue family** (cyan active
-marks + electric-blue headers), with warm notes reserved for the status dots'
-traffic-light semantics.
+The operational language is literal: **orange = working**, **green = ready for
+input**, and **neutral gray = selected**. Cool blues remain supporting prose and
+subheader colors, never status or selection.
 
 ## Jump-panel colors are now theme-owned (`UXI-JumpPanel-7`)
 
@@ -20,20 +19,20 @@ art-directs its own palette-native set (see its `AgentTheme::nightfox`).
 |--------------|--------------------------|-----------------------|----------|------|
 | `st.err`     | `jump_header`            | `0xff6b6b`            | `0xc94f6d` | Top-level section headers (PINNED / UNFILED) + project names — red. |
 | `electric`   | `jump_subheader`         | `0x3b9eff`            | `0x719cd6` | Per-cwd "Unfiled" subheaders — real path casing. |
-| `working_orange` | `jump_working`       | `0xff9e64`            | `0xf4a261` | The "working" status star (reply in flight). |
+| `working_orange` | `jump_working`       | `0xff9e64`            | `0xf4a261` | Working glyph, word, and row wash. |
 
 ## Theme-derived colors
 
-| Token          | Source (`theme.agent.*`) | Dracula hex | Role |
-|----------------|--------------------------|-------------|------|
-| `st.fg`        | `editor_fg()`            | —           | Default row label text. |
-| `panel_bg`     | `jump_panel_bg` (`Some`) else `jump_panel_bg(editor_bg())` | `#20222c` (derived) / Nightfox `#0d1119` (explicit) | Recessed panel background — a per-theme ΔL darken of the editor bg (near-black themes lighten instead), or an explicit override. |
-| `border`       | `dim`                    | `0x6272a4`  | Panel right border. |
-| `st.dim`       | `dim`                    | `0x6272a4`  | Section-header underline, badge fallback, disconnected/off dot, disconnected row label, muted placeholder text. |
-| `active_accent`| `frozen_bar`             | `0x8be9fd`  | The "you are here" left accent bar, active row label, selection-tint base, "＋ New agent session" badge. |
-| `sel_bg`       | `frozen_bar` @ α 0.15    | `0x8be9fd`… | Selection / hover row tint; floating drag-chip background. |
-| `st.accent`    | `warm_accent`            | `0xf1fa8c`  | "Working" status dot (reply in flight). The one warm note. |
-| `ready`        | `tool_completed`         | `0x50fa7b`  | "Waiting for you" status dot (turn finished, your move). |
+| Token | Source | Role |
+|-------|--------|------|
+| `st.fg` | `editor_fg()` | Default row and tab label text. |
+| `panel_bg` | menu/overlay surface | Same elevated material as command menus. |
+| `border` / `selection_mark` | `overlay.border` | Panel/control boundaries and the selected-row left mark. |
+| `sel_bg` | `overlay.selected_bg` | Neutral selected/hover background for rows and tabs. |
+| `st.dim` | `agent.dim` | Disconnected glyph/row and muted placeholders. |
+| `supporting_text` | `agent.agent_tint` | Session summaries and supporting copy. |
+| `ready` | `agent.tool_completed` | Ready glyph/word and green wash. |
+| `working_orange` | `agent.jump_working` | Working glyph/word and orange wash. |
 
 ## Where each color lands
 
@@ -44,22 +43,19 @@ art-directs its own palette-native set (see its `AgentTheme::nightfox`).
   no italic. Reads as a secondary tier.
 
 ### Rows
-- **Label text** — `active_accent` when this is the focused/active row, else
-  `st.fg`; overridden to `st.dim` when the session is disconnected.
-- **Italic** — carries exactly one meaning: the **"waiting on you"** session state
-  (idle + unread, `dot_status == WaitingForYou`). Nothing else in the panel is
-  italic.
-- **Active mark (UXI-JumpPanel-5)** — 2px left border in `active_accent` +
-  `sel_bg` background tint. Every row reserves a transparent 2px bar so the mark
-  never shifts geometry.
-- **Hover** — `sel_bg` tint.
+- **Label text** — `st.fg`, overridden to `st.dim` when disconnected.
+- **Ready** — green background wash at α 0.08, with no outline or italic.
+- **Working** — orange background wash at α 0.07, with no outline.
+- **Selected (UXI-JumpPanel-5)** — `sel_bg` neutral background plus a 2px
+  `overlay.border` left mark. It wins over the status wash.
+- **Hover** — the same neutral `sel_bg`.
 
 ### Status dots — shape + color together = what the agent is doing (UXI-JumpPanel-1/6)
 | State | Glyph | Color | Token |
 |-------|-------|-------|-------|
-| Working (reply in flight)                | ● | orange | `working_orange` |
-| Waiting on you (idle + unread output)    | ● | green + italic label | `ready` |
-| Idle+read / disconnected / unknown phase | ○ | dim    | `st.dim` |
+| Working (reply in flight) | ◆ | orange | `working_orange` |
+| Ready for input (every connected non-working agent) | ✦ | green | `ready` |
+| Disconnected / connecting | ✦ | dim | `st.dim` |
 
 Binding (in-use vs free) is no longer shown by the dot — the dot is purely an
 activity signal.
@@ -70,12 +66,10 @@ activity signal.
 ## History
 - Selection tint & active mark were originally built from `warm_accent`
   (muddied to brown/olive at low α) and a bright-red `0xff6b6b` bounding box.
-  Restyled to the cool `frozen_bar` accent (tint + left bar) — see
-  UXI-JumpPanel-5 in `jump-panel.md`. `0xff6b6b` was then repurposed as the
-  red section-header color.
+  They moved through a cool `frozen_bar` treatment and now use neutral overlay
+  gray so state colors keep one meaning.
 - Headers were briefly all-electric-blue; settled on **red top-level headers +
   electric-blue cwd subheaders** for a two-tier hierarchy.
-- The status dots were redefined around **agent activity** (not binding): orange
-  working / green-italic waiting-on-you / dim read, backed by the new
-  `AgentState.unread` flag (UXI-JumpPanel-6). Italic was reassigned from
-  "free session" to "waiting on you".
+- Status was simplified from outlined chips and unread-dependent italic to quiet
+  washes: orange Working, green ready-for-input, and dim unavailable. Unread is
+  internal state and no longer fragments the Waiting presentation.

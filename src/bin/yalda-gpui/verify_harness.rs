@@ -1153,10 +1153,10 @@ fn workspace_number_skips_ephemeral(cx: &mut TestAppContext) {
     });
 }
 
-/// UXI-JumpPanel-1: the jump-panel agent status dot reflects the session's turn
-/// phase + unread state. `dot_status` is the headless-verifiable mapping (the
-/// actual hue is a paint detail — gap 1). Idle-and-read is neutral; idle-with-
-/// unread-output waits for you; a reply in flight is working.
+/// UXI-JumpPanel-1: the jump-panel agent status reflects its operational state.
+/// `dot_status` is the headless-verifiable mapping (the actual hue is a paint
+/// detail — gap 1). Every connected idle agent is ready for input; a reply in
+/// flight is working.
 #[gpui::test]
 fn agent_status_dot_reflects_turn_phase(cx: &mut TestAppContext) {
     use crate::AgentDotStatus;
@@ -1171,19 +1171,19 @@ fn agent_status_dot_reflects_turn_phase(cx: &mut TestAppContext) {
         })
     };
 
-    // Idle with nothing unread → neutral (not waiting on you).
+    // Every connected idle session is ready for input, even when already read.
     assert_eq!(
         status(&view, vcx),
-        AgentDotStatus::Neutral,
-        "a fresh idle session with nothing unread is neutral"
+        AgentDotStatus::WaitingForYou,
+        "a fresh idle session is ready for input"
     );
 
-    // Mark unread (a turn finished while you were elsewhere) → waiting on you.
+    // Unread remains internal attention state; it does not alter readiness.
     view.update(vcx, |v, cx| v.with_session(id, cx, |c| c.unread = true));
     assert_eq!(
         status(&view, vcx),
         AgentDotStatus::WaitingForYou,
-        "an idle session with unread output waits for you"
+        "an unread idle session is also ready for input"
     );
 
     // A reply in flight → working (regardless of unread).
@@ -1219,31 +1219,32 @@ fn agent_dot_status_mapping() {
     };
     // Reply in flight → working (unread irrelevant while working).
     assert_eq!(row(true, Some(true), false).dot_status(), AgentDotStatus::Working);
-    // Idle + unread output → waiting on you.
+    // Every connected idle row is ready for input, regardless of unread state.
     assert_eq!(
         row(true, Some(false), true).dot_status(),
         AgentDotStatus::WaitingForYou
     );
-    // Idle + already read → neutral (not waiting).
-    assert_eq!(row(true, Some(false), false).dot_status(), AgentDotStatus::Neutral);
-    // Unknown phase (roster-only) → neutral.
-    assert_eq!(row(true, None, false).dot_status(), AgentDotStatus::Neutral);
+    assert_eq!(
+        row(true, Some(false), false).dot_status(),
+        AgentDotStatus::WaitingForYou
+    );
+    // A connected roster-only row with an unknown phase is also admitted to Waiting.
+    assert_eq!(row(true, None, false).dot_status(), AgentDotStatus::WaitingForYou);
     // Disconnected wins even if it was mid-turn / had unread.
     assert_eq!(row(false, Some(true), true).dot_status(), AgentDotStatus::Neutral);
 }
 
-/// UXI-JumpPanel-6 (unread "waiting on you" dot): a turn that finalizes on a
-/// session you are NOT focused on marks it unread → its jump-panel row reads
-/// `WaitingForYou` (● green + italic). A turn that finalizes on the session you
-/// ARE focused on stays read → `Neutral`. Drives the REAL turn-end path
+/// UXI-JumpPanel-6: a turn that finalizes on a session you are NOT focused on
+/// marks it unread; a focused session stays read. Both rows remain visibly ready
+/// for input because unread no longer fragments the Waiting state. Drives the
+/// REAL turn-end path
 /// (`apply_server_batch` → `ServerNotification::TurnEnded` →
 /// `finalize_agent_turn_idem`, which sets `unread`; the batch's focused-clear
-/// keeps the focused session read), then asserts through the REAL
-/// `jump_panel_agent_rows` + `dot_status` derivation the render uses.
+/// keeps the focused session read), then asserts through the REAL row projection.
 ///
 /// Negative control (observed RED): remove `self.unread = true` in
-/// `finalize_agent_turn_idem` → S1 reads `Neutral` (assert fails). Remove the
-/// focused-clear in `apply_server_batch` → S2 reads `WaitingForYou` (assert fails).
+/// `finalize_agent_turn_idem` → S1's unread assertion fails. Remove the
+/// focused-clear in `apply_server_batch` → S2's read assertion fails.
 #[gpui::test]
 fn jump_dot_unread_on_background_turn_end_read_on_focused(cx: &mut TestAppContext) {
     use crate::{AgentDotStatus, AgentSession, AgentState, AgentTile, App};
@@ -1308,8 +1309,20 @@ fn jump_dot_unread_on_background_turn_end_read_on_focused(cx: &mut TestAppContex
         );
         assert_eq!(
             dot("S2"),
-            AgentDotStatus::Neutral,
-            "the focused session's finished turn stays read → neutral"
+            AgentDotStatus::WaitingForYou,
+            "the focused session is also visibly ready for input"
+        );
+        assert!(
+            rows.iter()
+                .find(|r| r.order_sid.as_deref() == Some("S1"))
+                .is_some_and(|r| r.unread),
+            "the background session retains its unread attention state"
+        );
+        assert!(
+            rows.iter()
+                .find(|r| r.order_sid.as_deref() == Some("S2"))
+                .is_some_and(|r| !r.unread),
+            "the focused session stays read"
         );
         assert!(
             rows.iter()
@@ -6647,8 +6660,8 @@ fn delete_nonempty_project_confirms_then_cascades(cx: &mut TestAppContext) {
 /// UXI-JumpPanel-10: a live session names its state in WORDS and in a distinct
 /// GLYPH SHAPE, not by hue alone — `◆ working` while a reply is in flight,
 /// `✦ your turn` when a backgrounded turn finished, and nothing at all for a
-/// quiet session. Pure mapping (the tint/outline/italic that carry it are paint,
-/// harness gap #1).
+/// unavailable session. Pure mapping (the restrained washes are paint, harness
+/// gap #1).
 ///
 /// Negative control: return `("✦", None)` for every status → the working and
 /// waiting asserts both fail.
@@ -7209,16 +7222,21 @@ fn jump_agent_state_tabs_filter_and_sort_without_moving_all() {
 /// changes, and appends a newly discovered sid.
 #[gpui::test]
 fn jump_project_agent_tabs_are_independent_and_all_appends(cx: &mut TestAppContext) {
-    use crate::JumpAgentTab;
+    use crate::{agent_row_marks, JumpAgentTab};
     use yalda::session_proto::SessionInfo;
     let (view, vcx) = boot_browser(cx);
-    let (pid, other_pid, cwd) = view.update(vcx, |v, _| {
+    let (pid, other_pid, workspace_idx, cwd) = view.update(vcx, |v, _| {
         let pid = v.workspace.active_workspace().expect("workspace").project();
         let other = v
             .projects
             .create("Other tab project".into(), PathBuf::from("/tmp/yalda-tab-other"))
             .expect("other project");
-        (pid, other, v.projects.cwd_of(pid).expect("project cwd").to_path_buf())
+        (
+            pid,
+            other,
+            v.workspace.active_workspace,
+            v.projects.cwd_of(pid).expect("project cwd").to_path_buf(),
+        )
     });
     let info = |sid: &str, label: &str, busy: bool| SessionInfo {
         session_id: sid.into(),
@@ -7248,6 +7266,13 @@ fn jump_project_agent_tabs_are_independent_and_all_appends(cx: &mut TestAppConte
     let outer_label = format!("jump-agent-tabs-{}", pid.0);
     let (outer_x, outer_y, outer_w, outer_h) = crate::layout_probe_get(&outer_label)
         .expect("the tabs must paint inside one enclosing segmented-control box");
+    let (_, workspace_y, _, workspace_h) =
+        crate::layout_probe_get(&format!("jump-workspace-row-{workspace_idx}"))
+            .expect("the project's workspace row must paint above its tabs");
+    assert!(
+        outer_y - (workspace_y + workspace_h) >= 8.0,
+        "tabs need visible breathing room after workspaces"
+    );
     for tab in ["waiting", "working", "all"] {
         let label = format!("jump-agent-tab-{}-{tab}", pid.0);
         let (x, y, w, h) = crate::layout_probe_get(&label)
@@ -7281,6 +7306,22 @@ fn jump_project_agent_tabs_are_independent_and_all_appends(cx: &mut TestAppConte
         labels(&view, vcx),
         vec!["wait", "quiet"],
         "read and unread idle agents both belong to Waiting"
+    );
+    let waiting_hints = view.update(vcx, |v, cx| {
+        v.jump_panel_sections(cx)
+            .0
+            .into_iter()
+            .find(|s| s.id == pid)
+            .expect("project section")
+            .sessions
+            .into_iter()
+            .map(|(_, row)| agent_row_marks(row.dot_status()).1)
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        waiting_hints,
+        vec![Some("your turn"), Some("your turn")],
+        "every row admitted to Waiting is visibly ready for input"
     );
     let other_tab = view.update(vcx, |v, cx| {
         v.jump_panel_sections(cx)
@@ -14924,8 +14965,8 @@ fn roster_only_session_shows_live_status(cx: &mut TestAppContext) {
     };
     assert_eq!(
         status_of(&view, vcx),
-        Some(crate::AgentDotStatus::Neutral),
-        "idle to begin with"
+        Some(crate::AgentDotStatus::WaitingForYou),
+        "idle begins ready for input"
     );
 
     // The server says a turn started — through the REAL notification reducer.
@@ -14964,8 +15005,8 @@ fn roster_only_session_shows_live_status(cx: &mut TestAppContext) {
     view.update(vcx, |v, _cx| v.mark_roster_session_read("S-free"));
     assert_eq!(
         status_of(&view, vcx),
-        Some(crate::AgentDotStatus::Neutral),
-        "looking at it clears the mark"
+        Some(crate::AgentDotStatus::WaitingForYou),
+        "looking at it clears unread state without changing readiness"
     );
 }
 
