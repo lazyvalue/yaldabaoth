@@ -137,6 +137,16 @@ impl YaldaGpuiView {
             let _ = this.update(cx, |this, cx| {
                 if let Ok(sessions) = result {
                     let changed = this.agent_roster.replace_all(sessions);
+                    let order_changed = this.append_new_jump_sessions(
+                        this.agent_roster
+                            .entries_by_label()
+                            .into_iter()
+                            .map(|s| s.session_id.clone())
+                            .collect::<Vec<_>>(),
+                    );
+                    if order_changed {
+                        this.save_settings();
+                    }
                     // bug-0016: the server WAL is authoritative for a session's
                     // LABEL (renames are persisted there). If a locally-opened
                     // session is carrying an AUTO-generated name (`claude-N` or
@@ -147,7 +157,7 @@ impl YaldaGpuiView {
                     // momentarily-stale roster.
                     let recovered_labels = this.recover_labels_from_roster(cx);
                     let recovered_providers = this.recover_providers_from_roster(cx);
-                    if changed || recovered_labels || recovered_providers {
+                    if changed || recovered_labels || recovered_providers || order_changed {
                         cx.notify();
                     }
                 }
@@ -806,15 +816,16 @@ impl YaldaGpuiView {
             }
             if let Some(ent) = self.session_entity(local) {
                 ent.update(cx, |session, scx| {
-                    if !session.state.unread {
-                        session.state.unread = true;
-                        scx.notify();
-                    }
+                    session.state.unread = true;
+                    session.state.unread_since = Some(std::time::Instant::now());
+                    scx.notify();
                 });
             }
             return;
         }
-        self.roster_unread.insert(sid.to_string());
+        self.roster_unread
+            .entry(sid.to_string())
+            .or_insert_with(std::time::Instant::now);
         cx.notify();
     }
 
@@ -832,6 +843,7 @@ impl YaldaGpuiView {
             ent.update(cx, |session, scx| {
                 if session.state.unread {
                     session.state.unread = false;
+                    session.state.unread_since = None;
                     scx.notify();
                 }
             });
@@ -1991,6 +2003,7 @@ impl YaldaGpuiView {
             replay_prefix_finalized: false,
             agent_stream_authoritative: false,
             unread: false,
+            unread_since: None,
             follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
             name_origin: NameOrigin::Auto,
             summary: None,
@@ -2743,14 +2756,19 @@ impl YaldaGpuiView {
                     // cron, another window). Fold it into the universal roster
                     // (universal-agent-list) so the jump panel + every selector
                     // surface it immediately — even though no tile here binds it.
+                    let sid = session.session_id.clone();
                     let changed = self.agent_roster.upsert(session);
+                    let order_changed = self.append_new_jump_sessions([sid]);
+                    if order_changed {
+                        self.save_settings();
+                    }
                     // A startup restore may already have bound this sid before
                     // the async roster arrived. Reconcile both pieces of
                     // identity now so neither the tile nor transcript remains
                     // stuck on its legacy Claude fallback (bug-0024).
                     let recovered_labels = self.recover_labels_from_roster(cx);
                     let recovered_providers = self.recover_providers_from_roster(cx);
-                    if changed || recovered_labels || recovered_providers {
+                    if changed || recovered_labels || recovered_providers || order_changed {
                         cx.notify();
                     }
                 }
@@ -2759,6 +2777,7 @@ impl YaldaGpuiView {
                     // another GUI instance). Drop it from the roster, then from
                     // the store + land its tile (if any) in a live selector.
                     self.agent_roster.remove(&session_id);
+                    self.roster_unread.remove(&session_id);
                     self.reconcile_session_closed(&session_id, cx);
                 }
                 ServerNotification::SessionRenamed { session_id, label } => {
@@ -2997,6 +3016,7 @@ impl YaldaGpuiView {
             // after the drain, overrides that set on the SAME tick (no flicker).
             if is_focused && claude.unread {
                 claude.unread = false;
+                claude.unread_since = None;
             }
 
             // Mutation-site notify on the session entity (load-bearing after

@@ -91,6 +91,37 @@ pub(crate) fn section_heading(text: &str, st: &DetailStyle) -> gpui::Div {
         .child(SharedString::from(text.to_uppercase()))
 }
 
+/// A compact tab/button for narrow chrome surfaces. The caller owns the tab
+/// group layout and attaches the click listener; this primitive owns the shared
+/// selected/hover typography and geometry.
+pub(crate) fn compact_tab(
+    id: impl Into<ElementId>,
+    label: &str,
+    selected: bool,
+    selected_bg: Hsla,
+    st: &DetailStyle,
+) -> gpui::Stateful<gpui::Div> {
+    let transparent: Hsla = rgba(0x00000000).into();
+    div()
+        .id(id)
+        .flex_1()
+        .py(px(3.0))
+        .rounded_sm()
+        .cursor_pointer()
+        .text_center()
+        .font_family(st.mono.clone())
+        .font_weight(if selected {
+            FontWeight::BOLD
+        } else {
+            FontWeight::SEMIBOLD
+        })
+        .text_size(px(st.pt * 0.82))
+        .text_color(if selected { st.fg } else { st.dim })
+        .bg(if selected { selected_bg } else { transparent })
+        .hover(|s| s.bg(selected_bg))
+        .child(SharedString::from(label.to_string()))
+}
+
 /// An author · timestamp header over a multiline body (comments, updates).
 pub(crate) fn note_block(author: String, when: String, body: &str, st: &DetailStyle) -> gpui::Div {
     let hdr = if when.is_empty() {

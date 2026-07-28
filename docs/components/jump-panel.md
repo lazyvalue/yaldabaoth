@@ -132,9 +132,12 @@ drags. Items not yet in an order list sort after the listed ones, keeping their
 default position. Only roster-backed sessions (stable sid) drag; local mid-create
 placeholders don't.
 
-4. **A row NEVER moves except by a user drag.** Nothing else — an async roster
-   refresh, a `SessionCreated`/`SessionDeleted` broadcast, a reconnect, or a
-   `/clear` — may change a session's slot. `/clear` is the load-bearing case: it
+4. **In the All tab, a row NEVER moves except by a user drag.** Nothing else —
+   an agent-state transition, async roster refresh, a
+   `SessionCreated`/`SessionDeleted` broadcast, a reconnect, or a `/clear` — may
+   change an existing session's slot. (Waiting and Working intentionally use
+   chronological state-entry order per `UXI-JumpPanel-14`.) `/clear` is the
+   load-bearing All-tab case: it
    kills the server session and creates a new one with a NEW sid, so the row is
    the *same session* to the user but a different key to the order list. Its
    continuity is carried by an explicit **order succession**
@@ -805,3 +808,43 @@ gate), `main.rs` (`jump_folded_projects`), and `persist.rs`
 an expanded workspace row, folds its project through the real toggle, proves
 the row is absent, then unfolds and proves it returns. Preference serialization
 is covered by `tests.rs::preferences_round_trip_with_text_scale`.
+
+### UXI-JumpPanel-14 — Every project has Waiting / Working / All agent tabs
+
+**Statement.** Directly below each expanded project's workspace rows, the jump
+panel renders three independently selectable agent tabs:
+
+1. **Waiting** contains connected sessions whose last completed output is unread
+   (`AgentDotStatus::WaitingForYou`).
+2. **Working** contains connected sessions with a reply in flight
+   (`AgentDotStatus::Working`).
+3. **All** contains every session in the project and is the default.
+
+Waiting and Working are chronological live queues: rows sort by when they
+entered that state, oldest first and **most recent last**. Their order is not
+draggable. State-entry time is owned beside the state itself: local sessions use
+`TurnPhase::turn_started` / `AgentState::unread_since`; roster-only sessions use
+`AgentRoster::state_since` / `roster_unread`.
+
+All is the durable curated roster. It follows `jump_session_order`, exposes the
+existing within-project drag reorder, and a newly discovered server sid is
+appended to the order's bottom. A state transition never changes an All slot.
+The first roster seed freezes the previous by-label default into the order; later
+`SessionCreated` events only append.
+
+**Applies to.** `jump_panel_view.rs` (`JumpAgentTab`,
+`agent_rows_for_tab`, `jump_panel_sections`, `render_jump_panel`,
+`append_new_jump_sessions`), `agent.rs` (`AgentState::unread_since`),
+`agent_roster.rs` (`state_since`), `agent_ui.rs` (state-transition timestamp and
+new-session append sites), and `yux/detail.rs` (`compact_tab`).
+
+**Status.** `implemented` — filtering, chronology, independent project
+selection, stable All order, append semantics, and the three tabs' painted
+presence are headless-guarded. Exact colors remain harness gap #1.
+
+**Enforcement.**
+`verify_harness.rs::jump_agent_state_tabs_filter_and_sort_without_moving_all`
+guards state filtering, oldest→newest order, and All identity.
+`jump_project_agent_tabs_are_independent_and_all_appends` drives the real
+per-project section projection and append method, probes all three painted tab
+controls, and includes a state flip that must not move All rows.

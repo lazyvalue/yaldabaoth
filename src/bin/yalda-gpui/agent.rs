@@ -3410,6 +3410,9 @@ pub(crate) struct AgentState {
     /// jump panel's ● green + italic "waiting on you" row; a turn that ends while
     /// you're watching it stays read (`false`).
     pub(crate) unread: bool,
+    /// When this session most recently entered the unread / "waiting on you"
+    /// state. The jump panel's Waiting tab sorts oldest→newest by this instant.
+    pub(crate) unread_since: Option<std::time::Instant>,
     /// Where this session's `label` came from (`UXI-AgentTile-27`). `User` is a
     /// latch set by the rename command: once set, autonaming can never fire and
     /// a late autoname result is dropped. Lives here (not on `AgentSession`)
@@ -3742,6 +3745,7 @@ impl AgentState {
             replay_prefix_finalized: false,
             agent_stream_authoritative: false,
             unread: false,
+            unread_since: None,
             follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
             name_origin: NameOrigin::Auto,
             summary: None,
@@ -3823,6 +3827,7 @@ impl AgentState {
             replay_prefix_finalized: false,
             agent_stream_authoritative: false,
             unread: false,
+            unread_since: None,
             follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
             name_origin: NameOrigin::Auto,
             summary: None,
@@ -4152,6 +4157,9 @@ impl AgentState {
         // this again for the session the user is currently focused on, so a turn
         // that ends while you're watching it stays read. Central here because
         // this idempotent ledger is the one place every turn-end path converges.
+        // Even if an older result was still unread, the row was Working during
+        // this turn and is entering Waiting anew now.
+        self.unread_since = Some(std::time::Instant::now());
         self.unread = true;
         true
     }

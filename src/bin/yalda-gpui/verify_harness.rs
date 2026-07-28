@@ -1206,6 +1206,7 @@ fn agent_dot_status_mapping() {
     use crate::{AgentDotStatus, AgentRow, JumpTarget};
     let row = |connected, awaiting, unread| AgentRow {
         order_sid: None,
+        state_entered_at: None,
         target: JumpTarget::Roster("s".into()),
         label: "x".into(),
         summary: None,
@@ -1308,6 +1309,12 @@ fn jump_dot_unread_on_background_turn_end_read_on_focused(cx: &mut TestAppContex
             dot("S2"),
             AgentDotStatus::Neutral,
             "the focused session's finished turn stays read → neutral"
+        );
+        assert!(
+            rows.iter()
+                .find(|r| r.order_sid.as_deref() == Some("S1"))
+                .is_some_and(|r| r.state_entered_at.is_some()),
+            "the background turn records when it entered Waiting"
         );
     });
 }
@@ -7104,6 +7111,7 @@ fn jump_reorder_ordering_applies_and_defaults_to_alpha() {
         awaiting: None,
         unread: false,
         order_sid: Some(sid.into()),
+        state_entered_at: None,
     };
     // Two projects; alpha has two sessions (incoming by-label a,b), beta one.
     let mk = || {
@@ -7136,6 +7144,160 @@ fn jump_reorder_ordering_applies_and_defaults_to_alpha() {
     let g = order_grouped_rows(group_agent_rows_by_cwd(mk()), &[], &sess_order);
     let alpha_idx = keys(&g).iter().position(|k| k == "/work/alpha").unwrap();
     assert_eq!(sess(&g, alpha_idx), vec!["b", "a"], "session order reorders within group");
+}
+
+/// UXI-JumpPanel-14: Waiting and Working are chronological live queues
+/// (oldest state entry first, newest last), while All preserves its incoming
+/// custom order exactly.
+#[test]
+fn jump_agent_state_tabs_filter_and_sort_without_moving_all() {
+    use crate::{agent_rows_for_tab, AgentRow, JumpAgentTab, JumpTarget};
+    let base = std::time::Instant::now();
+    let row = |sid: &str,
+               label: &str,
+               awaiting: Option<bool>,
+               unread: bool,
+               age_secs: u64| AgentRow {
+        target: JumpTarget::Roster(sid.into()),
+        label: label.into(),
+        summary: None,
+        cwd: std::path::PathBuf::from("/work"),
+        bound: false,
+        connected: true,
+        awaiting,
+        unread,
+        order_sid: Some(sid.into()),
+        state_entered_at: Some(base - std::time::Duration::from_secs(age_secs)),
+    };
+    // Incoming order represents the user's custom All order, deliberately
+    // unrelated to either state's chronology.
+    let make = || {
+        vec![
+            (0, row("w-new", "wait-new", Some(false), true, 1)),
+            (1, row("quiet", "quiet", Some(false), false, 50)),
+            (2, row("k-new", "work-new", Some(true), false, 2)),
+            (3, row("w-old", "wait-old", Some(false), true, 20)),
+            (4, row("k-old", "work-old", Some(true), false, 30)),
+        ]
+    };
+    let labels = |rows: Vec<(usize, AgentRow)>| {
+        rows.into_iter().map(|(_, r)| r.label).collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        labels(agent_rows_for_tab(make(), JumpAgentTab::Waiting)),
+        vec!["wait-old", "wait-new"],
+        "Waiting is oldest→newest by waiting-state entry"
+    );
+    assert_eq!(
+        labels(agent_rows_for_tab(make(), JumpAgentTab::Working)),
+        vec!["work-old", "work-new"],
+        "Working is oldest→newest by working-state entry"
+    );
+    assert_eq!(
+        labels(agent_rows_for_tab(make(), JumpAgentTab::All)),
+        vec!["wait-new", "quiet", "work-new", "wait-old", "work-old"],
+        "All never reorders when state-derived tabs do"
+    );
+}
+
+/// UXI-JumpPanel-14, real per-project projection: each project defaults to All,
+/// selects its own state slice, preserves custom All order through state
+/// changes, and appends a newly discovered sid.
+#[gpui::test]
+fn jump_project_agent_tabs_are_independent_and_all_appends(cx: &mut TestAppContext) {
+    use crate::JumpAgentTab;
+    use yalda::session_proto::SessionInfo;
+    let (view, vcx) = boot_browser(cx);
+    let (pid, other_pid, cwd) = view.update(vcx, |v, _| {
+        let pid = v.workspace.active_workspace().expect("workspace").project();
+        let other = v
+            .projects
+            .create("Other tab project".into(), PathBuf::from("/tmp/yalda-tab-other"))
+            .expect("other project");
+        (pid, other, v.projects.cwd_of(pid).expect("project cwd").to_path_buf())
+    });
+    let info = |sid: &str, label: &str, busy: bool| SessionInfo {
+        session_id: sid.into(),
+        acp_session_id: None,
+        label: label.into(),
+        cwd: cwd.clone(),
+        provider: yalda::acp_channel::AgentProvider::Claude,
+        turns: 0,
+        connected: true,
+        permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+        busy,
+    };
+    view.update(vcx, |v, _| {
+        v.agent_roster.upsert(info("S-wait", "wait", false));
+        v.agent_roster.upsert(info("S-work", "work", true));
+        v.agent_roster.upsert(info("S-quiet", "quiet", false));
+        v.roster_unread.insert("S-wait".into(), std::time::Instant::now());
+        v.jump_session_order =
+            vec!["S-quiet".into(), "S-work".into(), "S-wait".into()];
+    });
+
+    crate::layout_probe_begin();
+    for _ in 0..3 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+    for tab in ["waiting", "working", "all"] {
+        let label = format!("jump-agent-tab-{}-{tab}", pid.0);
+        assert!(
+            crate::layout_probe_get(&label).is_some(),
+            "the per-project {tab} tab must paint below the workspace list"
+        );
+    }
+    crate::layout_probe_end();
+
+    let labels = |view: &gpui::Entity<YaldaGpuiView>,
+                  vcx: &mut gpui::VisualTestContext| {
+        view.update(vcx, |v, cx| {
+            v.jump_panel_sections(cx)
+                .0
+                .into_iter()
+                .find(|s| s.id == pid)
+                .expect("project section")
+                .sessions
+                .into_iter()
+                .map(|(_, r)| r.label)
+                .collect::<Vec<_>>()
+        })
+    };
+    view.update(vcx, |v, cx| v.select_jump_agent_tab(pid, JumpAgentTab::Waiting, cx));
+    assert_eq!(labels(&view, vcx), vec!["wait"]);
+    let other_tab = view.update(vcx, |v, cx| {
+        v.jump_panel_sections(cx)
+            .0
+            .into_iter()
+            .find(|s| s.id == other_pid)
+            .expect("other section")
+            .agent_tab
+    });
+    assert_eq!(other_tab, JumpAgentTab::All, "one project's tab does not affect another");
+
+    view.update(vcx, |v, cx| v.select_jump_agent_tab(pid, JumpAgentTab::Working, cx));
+    assert_eq!(labels(&view, vcx), vec!["work"]);
+    view.update(vcx, |v, cx| v.select_jump_agent_tab(pid, JumpAgentTab::All, cx));
+    assert_eq!(
+        labels(&view, vcx),
+        vec!["quiet", "work", "wait"],
+        "All follows custom order"
+    );
+
+    view.update(vcx, |v, _| {
+        // A state flip may change the live tabs, never All's positions.
+        v.agent_roster.set_busy("S-work", false);
+        v.agent_roster.set_busy("S-quiet", true);
+        assert!(v.append_new_jump_sessions(["S-new".into()]));
+        v.agent_roster.upsert(info("S-new", "aaa-new", false));
+    });
+    assert_eq!(
+        labels(&view, vcx),
+        vec!["quiet", "work", "wait", "aaa-new"],
+        "state changes preserve slots and a new agent appends at the bottom"
+    );
 }
 
 /// Unit (jump-reorder): `reorder_move` drops the dragged item into the target's
@@ -7374,6 +7536,7 @@ fn jump_panel_groups_agent_rows_by_cwd() {
     use crate::{group_agent_rows_by_cwd, AgentRow, JumpTarget};
     let row = |label: &str, cwd: &str| AgentRow {
         order_sid: Some(label.into()),
+        state_entered_at: None,
         target: JumpTarget::Roster(label.into()),
         label: label.into(),
         summary: None,
