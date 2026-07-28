@@ -1439,12 +1439,16 @@ impl TranscriptView {
                             .px_4()
                             .gap_3()
                             .child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .text_color(accent)
-                                    .font_weight(FontWeight::BOLD)
-                                    .font_family(body_font_snap.clone())
-                                    .child(SharedString::from(label)),
+                                crate::probe_bounds_dyn(
+                                    format!("agent-turn-header-{label}"),
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(accent)
+                                        .font_weight(FontWeight::BOLD)
+                                        .font_family(body_font_snap.clone())
+                                        .child(SharedString::from(label))
+                                        .into_any_element(),
+                                ),
                             )
                             .child(div().flex_1().h(px(1.0)).bg(rule_color))
                             .into_any_element()

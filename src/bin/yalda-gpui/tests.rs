@@ -3381,6 +3381,7 @@ fn compose_draft_persist_roundtrip() {
             persist::SessionSnapshot {
                 id: "S-with-draft".into(),
                 label: "claude-1".into(),
+                provider: AgentProvider::Claude,
                 active: true,
                 mode: InputModeKind::Worksheet,
                 tasklist_open: false,
@@ -3393,6 +3394,7 @@ fn compose_draft_persist_roundtrip() {
             persist::SessionSnapshot {
                 id: "S-empty".into(),
                 label: "claude-2".into(),
+                provider: AgentProvider::Claude,
                 active: false,
                 mode: InputModeKind::Chatbox,
                 tasklist_open: false,
@@ -3451,6 +3453,10 @@ fn restore_dedupes_duplicate_claude_labels() {
     let loaded =
         persist::with_acp_persist_path(path.clone(), || persist::load_persisted_acp_sessions(cwd));
     assert_eq!(loaded.len(), 3, "all three slots load");
+    assert!(
+        loaded.iter().all(|slot| slot.provider.is_none()),
+        "pre-provider snapshots stay unknown until the authoritative roster arrives"
+    );
     let labels: Vec<String> = loaded.iter().map(|s| s.label.clone()).collect();
     assert!(
         labels.iter().all(|l| !l.trim().is_empty()),

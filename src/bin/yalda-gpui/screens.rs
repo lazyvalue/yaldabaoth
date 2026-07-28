@@ -980,15 +980,17 @@ impl YaldaGpuiView {
                 .pr_2()
                 .child(SharedString::from(active_slot_label.clone())),
         );
-        strip = strip.child(
+        strip = strip.child(probe_bounds_dyn(
+            format!("agent-provider-{}", active_provider.label()),
             div()
                 .mr_2()
                 .px_1()
                 .rounded_sm()
                 .bg(strip_dim.opacity(0.18))
                 .text_color(strip_dim)
-                .child(SharedString::from(active_provider.label())),
-        );
+                .child(SharedString::from(active_provider.label()))
+                .into_any_element(),
+        ));
 
         // Edit-surface status (moved up from the old footer): which surface +
         // mode is active, the cursor position, and any transient status/awaiting

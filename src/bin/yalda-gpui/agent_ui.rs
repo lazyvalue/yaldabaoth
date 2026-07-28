@@ -84,8 +84,12 @@ impl YaldaGpuiView {
             }
             Some(slot) => {
                 let slot_cwd = slot.cwd.clone().unwrap_or_else(|| base_cwd.clone());
-                let mut state =
-                    self.create_agent_session(Some(slot.id.clone()), slot_cwd.clone(), cx);
+                let mut state = self.create_agent_session_for(
+                    slot.provider.unwrap_or_default(),
+                    Some(slot.id.clone()),
+                    slot_cwd.clone(),
+                    cx,
+                );
                 // Restore placement + seed the persisted compose draft (Model C).
                 state.input_surface =
                     InputSurface::with_draft(slot.mode, slot.compose_draft.as_deref().unwrap_or(""));
@@ -141,8 +145,9 @@ impl YaldaGpuiView {
                     // adopt the roster's (WAL-backed) name. Gated to auto names
                     // so a real custom name set here is NEVER overridden by a
                     // momentarily-stale roster.
-                    let recovered = this.recover_labels_from_roster(cx);
-                    if changed || recovered {
+                    let recovered_labels = this.recover_labels_from_roster(cx);
+                    let recovered_providers = this.recover_providers_from_roster(cx);
+                    if changed || recovered_labels || recovered_providers {
                         cx.notify();
                     }
                 }
@@ -189,6 +194,40 @@ impl YaldaGpuiView {
         }
         // Persist the recovered names so the next launch reads them from
         // `acp_sessions.json` directly (belt-and-suspenders alongside the WAL).
+        self.save_agent_ring(cx);
+        true
+    }
+
+    /// Adopt the server roster's provider for every locally-opened session with
+    /// the same sid (bug-0024). The roster is the authoritative WAL-backed
+    /// identity; unlike labels, provider is not user-editable, so a mismatch is
+    /// always repaired. Entity notification is required because TranscriptView
+    /// caches the provider in its render fingerprint.
+    pub(crate) fn recover_providers_from_roster(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut updates: Vec<(SessionId, AgentProvider)> = Vec::new();
+        for (id, ent) in self.sessions.iter() {
+            let Some(sid) = self.sessions.sid_of(id) else {
+                continue;
+            };
+            let Some(info) = self.agent_roster.get(sid.as_str()) else {
+                continue;
+            };
+            if ent.read(cx).state.provider != info.provider {
+                updates.push((id, info.provider));
+            }
+        }
+        if updates.is_empty() {
+            return false;
+        }
+        for (id, provider) in updates {
+            if let Some(ent) = self.session_entity(id) {
+                ent.update(cx, |session, scx| {
+                    session.state.provider = provider;
+                    scx.notify();
+                });
+            }
+        }
+        // Future restores no longer need to wait for the async roster seed.
         self.save_agent_ring(cx);
         true
     }
@@ -1836,6 +1875,7 @@ impl YaldaGpuiView {
                         snaps.push(SessionSnapshot {
                             id: rid,
                             label: session.label.clone(),
+                            provider: session.state.provider,
                             active: snaps.is_empty(),
                             mode: session.state.input_surface.mode(),
                             tasklist_open: session.state.tasklist_open,
@@ -2703,7 +2743,16 @@ impl YaldaGpuiView {
                     // cron, another window). Fold it into the universal roster
                     // (universal-agent-list) so the jump panel + every selector
                     // surface it immediately — even though no tile here binds it.
-                    self.agent_roster.upsert(session);
+                    let changed = self.agent_roster.upsert(session);
+                    // A startup restore may already have bound this sid before
+                    // the async roster arrived. Reconcile both pieces of
+                    // identity now so neither the tile nor transcript remains
+                    // stuck on its legacy Claude fallback (bug-0024).
+                    let recovered_labels = self.recover_labels_from_roster(cx);
+                    let recovered_providers = self.recover_providers_from_roster(cx);
+                    if changed || recovered_labels || recovered_providers {
+                        cx.notify();
+                    }
                 }
                 ServerNotification::SessionClosed { session_id } => {
                     // A session closed somewhere (this GUI, another tile, or

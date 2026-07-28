@@ -4482,7 +4482,8 @@ fn multi_session_persistence_round_trips_distinct_sids() {
     let snaps = vec![
         SessionSnapshot {
             id: "SID-A".into(),
-            label: "claude-A".into(),
+            label: "codex-A".into(),
+            provider: yalda::acp_channel::AgentProvider::Codex,
             active: true,
             mode: InputModeKind::Chatbox,
             tasklist_open: false,
@@ -4495,6 +4496,7 @@ fn multi_session_persistence_round_trips_distinct_sids() {
         SessionSnapshot {
             id: "SID-B".into(),
             label: "claude-B".into(),
+            provider: yalda::acp_channel::AgentProvider::Claude,
             active: false,
             mode: InputModeKind::Worksheet,
             tasklist_open: true,
@@ -4515,7 +4517,12 @@ fn multi_session_persistence_round_trips_distinct_sids() {
     assert_eq!(loaded.len(), 2, "both sessions round-trip");
     // Each slot kept its OWN sid + label (no cross-binding).
     assert_eq!(loaded[0].id.as_str(), "SID-A");
-    assert_eq!(loaded[0].label, "claude-A");
+    assert_eq!(loaded[0].label, "codex-A");
+    assert_eq!(
+        loaded[0].provider,
+        Some(yalda::acp_channel::AgentProvider::Codex),
+        "the Codex provider survives synchronous restore before roster seed"
+    );
     assert!(loaded[0].active, "first session is the active one");
     assert_eq!(loaded[1].id.as_str(), "SID-B");
     assert_eq!(loaded[1].label, "claude-B");
@@ -4830,6 +4837,110 @@ fn boot_with_transcript<'a>(
         (id, ent)
     });
     (view, vcx, id, session)
+}
+
+/// REGRESSION (bug-0024): restore binds a tile before the async roster seed, so
+/// its temporary provider fallback can be Claude even when the WAL-backed
+/// session is Codex. A later `SessionCreated` roster event for that bound sid
+/// must repair the live AgentState and repaint BOTH visible identity surfaces:
+/// the tile status strip and the cached conversation turn header.
+///
+/// Negative control: remove `recover_providers_from_roster` from the
+/// `SessionCreated` reducer. The state stays Claude, the Claude probes paint,
+/// and all Codex assertions below fail RED.
+#[gpui::test]
+fn codex_roster_identity_repairs_restored_tile_and_turn_header(cx: &mut TestAppContext) {
+    use yalda::acp_channel::{AgentProvider, PermissionMode, ReplyEvent};
+    use yalda::session_proto::{Notification as ServerNotification, SessionInfo};
+
+    let (view, vcx) = boot_browser(cx);
+    install_agent_slot(&view, &mut *vcx, Some("S1"));
+    let session_entity = view.update(vcx, |v, cx| {
+        let id = v.focused_bound_session().expect("bound session");
+        let entity = v.session_entity(id).expect("session entity");
+        cx.notify();
+        entity
+    });
+    vcx.run_until_parked();
+    view.read_with(vcx, |_v, cx| {
+        let provider = session_entity.read(cx).state.provider;
+        assert_eq!(
+            provider,
+            AgentProvider::Claude,
+            "fixture reproduces the pre-roster Claude fallback"
+        );
+    });
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                ServerNotification::SessionCreated {
+                    session: SessionInfo {
+                        session_id: "S1".into(),
+                        acp_session_id: Some("codex-acp-1".into()),
+                        label: "codex-1".into(),
+                        cwd,
+                        provider: AgentProvider::Codex,
+                        turns: 1,
+                        connected: true,
+                        permission_mode: PermissionMode::ReadOnly,
+                        busy: false,
+                    },
+                },
+                ServerNotification::ReplyEvent {
+                    session_id: "S1".into(),
+                    event: ReplyEvent::Chunk("reply from Codex\n".into()),
+                },
+                ServerNotification::ReplyEvent {
+                    session_id: "S1".into(),
+                    event: ReplyEvent::ReplayComplete,
+                },
+            ],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    view.read_with(vcx, |_v, cx| {
+        let session = session_entity.read(cx);
+        let (provider, label) = (session.state.provider, session.label.clone());
+        assert_eq!(
+            provider,
+            AgentProvider::Codex,
+            "authoritative roster identity repairs the already-open session"
+        );
+        assert_eq!(
+            label, "codex-1",
+            "the restored auto-name follows the Codex roster"
+        );
+    });
+
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let tile_codex = crate::layout_probe_get("agent-provider-Codex");
+    let tile_claude = crate::layout_probe_get("agent-provider-Claude");
+    let turn_codex = crate::layout_probe_get("agent-turn-header-Codex");
+    let turn_claude = crate::layout_probe_get("agent-turn-header-Claude");
+    crate::layout_probe_end();
+
+    let (_, _, tile_w, tile_h) =
+        tile_codex.expect("the real agent tile must paint the Codex provider");
+    assert!(
+        tile_w > 4.0 && tile_h > 4.0,
+        "Codex tile badge has no painted area"
+    );
+    let (_, _, turn_w, turn_h) =
+        turn_codex.expect("the real transcript must paint a Codex turn header");
+    assert!(
+        turn_w > 4.0 && turn_h > 4.0,
+        "Codex transcript header has no painted area"
+    );
+    assert!(
+        tile_claude.is_none() && turn_claude.is_none(),
+        "no visible identity surface may still call this Codex session Claude"
+    );
 }
 
 /// REGRESSION (bug-0006): on a FROZEN line that renders markdown-stripped, a drag
@@ -12887,6 +12998,7 @@ fn renamed_session_label_round_trips_unchanged() {
         SessionSnapshot {
             id: "sid-alpha".into(),
             label: "my important agent".into(),
+            provider: yalda::acp_channel::AgentProvider::Claude,
             active: true,
             mode: InputModeKind::Worksheet,
             tasklist_open: false,
@@ -12899,6 +13011,7 @@ fn renamed_session_label_round_trips_unchanged() {
         SessionSnapshot {
             id: "sid-beta".into(),
             label: "reviewer".into(),
+            provider: yalda::acp_channel::AgentProvider::Claude,
             active: false,
             mode: InputModeKind::Worksheet,
             tasklist_open: false,

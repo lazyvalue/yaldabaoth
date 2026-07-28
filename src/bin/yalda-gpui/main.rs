@@ -2120,6 +2120,7 @@ impl YaldaGpuiView {
                                 // Empty → the dedupe below assigns a unique claude-N
                                 // instead of a bare "claude" (bug-0005).
                                 label: String::new(),
+                                provider: None,
                                 active: false,
                                 mode: InputModeKind::Worksheet,
                                 tasklist_open: false,
@@ -2163,10 +2164,13 @@ impl YaldaGpuiView {
                                 .filter(|s| !s.trim().is_empty())
                                 .cloned()
                         });
-                        let provider = self
-                            .agent_roster
-                            .get(slot.id.as_str())
-                            .map(|info| info.provider)
+                        let provider = slot
+                            .provider
+                            .or_else(|| {
+                                self.agent_roster
+                                    .get(slot.id.as_str())
+                                    .map(|info| info.provider)
+                            })
                             .unwrap_or_default();
                         let bind = self.sessions.open_or_focus(&slot.id, |_id| {
                             cx.new(|_| {
@@ -2274,8 +2278,12 @@ impl YaldaGpuiView {
                     }
                     Some(slot) => {
                         let slot_cwd = slot.cwd.clone().unwrap_or_else(|| proc_cwd.clone());
-                        let mut state =
-                            self.create_agent_session(Some(slot.id.clone()), slot_cwd.clone(), cx);
+                        let mut state = self.create_agent_session_for(
+                            slot.provider.unwrap_or_default(),
+                            Some(slot.id.clone()),
+                            slot_cwd.clone(),
+                            cx,
+                        );
                         state.input_surface = InputSurface::with_draft(
                             slot.mode,
                             slot.compose_draft.as_deref().unwrap_or(""),

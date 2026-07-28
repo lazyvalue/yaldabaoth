@@ -1319,6 +1319,10 @@ pub(crate) fn load_persisted_workspace(cwd: &std::path::Path) -> Option<Persiste
 pub(crate) struct PersistedSlot {
     pub(crate) id: ServerSid,
     pub(crate) label: String,
+    /// Backend identity for the restored tile (bug-0024). `None` means this is
+    /// an older snapshot; restore may consult the authoritative server roster
+    /// and the live roster reconciliation will fill it once startup completes.
+    pub(crate) provider: Option<yalda::acp_channel::AgentProvider>,
     pub(crate) active: bool,
     pub(crate) mode: InputModeKind,
     pub(crate) tasklist_open: bool,
@@ -1369,6 +1373,7 @@ pub(crate) fn load_persisted_acp_sessions(cwd: &std::path::Path) -> Vec<Persiste
             // Wire boundary: the legacy single-string id becomes a `ServerSid`.
             id: ServerSid::new(id),
             label: "claude-1".into(),
+            provider: None,
             active: true,
             mode: InputModeKind::Chatbox,
             tasklist_open: false,
@@ -1396,6 +1401,10 @@ pub(crate) fn load_persisted_acp_sessions(cwd: &std::path::Path) -> Vec<Persiste
                 .and_then(|s| s.as_str())
                 .unwrap_or("")
                 .to_string();
+            let provider = obj
+                .get("provider")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
             let active = obj.get("active").and_then(|b| b.as_bool()).unwrap_or(false);
             // Spec §35 additions. Missing keys default per the same
             // table (chatbox, false, false). Unknown mode strings fall
@@ -1438,6 +1447,7 @@ pub(crate) fn load_persisted_acp_sessions(cwd: &std::path::Path) -> Vec<Persiste
             Some(PersistedSlot {
                 id,
                 label,
+                provider,
                 active,
                 mode,
                 tasklist_open,
@@ -1575,6 +1585,9 @@ pub(crate) fn forget_persisted_acp_session_ids(ids: &[String]) {
 pub(crate) struct SessionSnapshot {
     pub(crate) id: ServerSid,
     pub(crate) label: String,
+    /// Backend identity is tile-visible state, so it must survive the interval
+    /// between synchronous restore and the async roster seed (bug-0024).
+    pub(crate) provider: yalda::acp_channel::AgentProvider,
     pub(crate) active: bool,
     pub(crate) mode: InputModeKind,
     pub(crate) tasklist_open: bool,
@@ -1609,6 +1622,16 @@ pub(crate) fn save_persisted_acp_sessions(cwd: &std::path::Path, snaps: &[Sessio
             obj.insert(
                 "label".into(),
                 serde_json::Value::String(snap.label.clone()),
+            );
+            obj.insert(
+                "provider".into(),
+                serde_json::Value::String(
+                    match snap.provider {
+                        yalda::acp_channel::AgentProvider::Claude => "claude",
+                        yalda::acp_channel::AgentProvider::Codex => "codex",
+                    }
+                    .to_string(),
+                ),
             );
             if snap.active {
                 obj.insert("active".into(), serde_json::Value::Bool(true));
