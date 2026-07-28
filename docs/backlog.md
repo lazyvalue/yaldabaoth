@@ -13,6 +13,16 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Group the All tab by live activity** — `NEEDS-RUNTIME` (built on branch
+  `jump-all-state-groups`, 2026-07-28 via `/new-ux`; extends
+  `UXI-JumpPanel-14`). Captured verbatim: *"In the 'all' tab sessions should be
+  organized by 'working' and 'waiting'. Working is first. Each has an
+  appropriate header."* Resolved with the user: All renders Working first,
+  Waiting second, then a subdued Unavailable group only when disconnected or
+  connecting rows exist. The durable custom order remains stable within each
+  group. Real rendered ordering, headings, row order, and empty-section removal
+  are headless-verified; final visual density/contrast remains runtime gap #1.
+
 - **Archive agent sessions from the jump panel** — `NEEDS-RUNTIME` (built on branch
   `jump-session-archive`, 2026-07-28 via `/new-ux`; `UXI-JumpPanel-16`).
   Captured verbatim: *"I also want to add an 'archived' state for sessions.

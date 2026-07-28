@@ -36,6 +36,8 @@ style bundle so a caller themes once:
 - **`compact_tab(id, label, selected, selected_bg, &DetailStyle)`** — equal-width
   compact tab chrome; selection is carried by its background and every label
   keeps normal foreground contrast. The caller owns the enclosing tab group.
+- **`compact_list_group_heading(id, glyph, label, count, tint, &DetailStyle)`**
+  — small uppercase label + count + trailing hairline for headed dense lists.
 - **`context_menu_item(id, glyph, colors, label, font)`** — shared compact
   popup-row chrome for cursor context menus. The caller owns dispatch and the
   popup shell.

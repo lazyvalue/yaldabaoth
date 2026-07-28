@@ -7367,6 +7367,138 @@ fn jump_project_agent_tabs_are_independent_and_all_appends(cx: &mut TestAppConte
     );
 }
 
+/// UXI-JumpPanel-14: All is a headed stable partition of the durable custom
+/// roster. Working leads, Waiting follows, and exceptional unavailable rows
+/// trail only when present.
+#[gpui::test]
+fn jump_all_tab_groups_activity_with_headers(cx: &mut TestAppContext) {
+    use std::collections::HashMap;
+    use yalda::session_proto::SessionInfo;
+
+    let (view, vcx) = boot_browser(cx);
+    let (pid, cwd) = view.update(vcx, |v, _| {
+        let pid = v.workspace.active_workspace().expect("workspace").project();
+        (pid, v.projects.cwd_of(pid).expect("project cwd").to_path_buf())
+    });
+    let info = |sid: &str, label: &str, busy: bool, connected: bool| SessionInfo {
+        session_id: sid.into(),
+        acp_session_id: None,
+        label: label.into(),
+        cwd: cwd.clone(),
+        provider: yalda::acp_channel::AgentProvider::Claude,
+        turns: 0,
+        connected,
+        permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+        busy,
+    };
+    view.update(vcx, |v, _| {
+        v.agent_roster
+            .upsert(info("S-wait-2", "wait-two", false, true));
+        v.agent_roster
+            .upsert(info("S-work-2", "work-two", true, true));
+        v.agent_roster
+            .upsert(info("S-off", "offline", false, false));
+        v.agent_roster
+            .upsert(info("S-work-1", "work-one", true, true));
+        v.agent_roster
+            .upsert(info("S-wait-1", "wait-one", false, true));
+        // Deliberately interleave activities. The rendered partition must group
+        // them without disturbing this durable relative rank inside each group.
+        v.jump_session_order = vec![
+            "S-wait-2".into(),
+            "S-work-2".into(),
+            "S-off".into(),
+            "S-work-1".into(),
+            "S-wait-1".into(),
+        ];
+    });
+
+    let row_ids: HashMap<String, usize> = view.update(vcx, |v, cx| {
+        v.jump_panel_sections(cx)
+            .0
+            .into_iter()
+            .find(|section| section.id == pid)
+            .expect("project section")
+            .sessions
+            .into_iter()
+            .map(|(i, row)| (row.label, i))
+            .collect()
+    });
+
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let heading_y = |name: &str| {
+        crate::layout_probe_get(&format!("jump-agent-group-{}-{name}", pid.0))
+            .unwrap_or_else(|| panic!("All must paint the nonempty {name} heading"))
+            .1
+    };
+    let working_y = heading_y("working");
+    let waiting_y = heading_y("waiting");
+    let unavailable_y = heading_y("unavailable");
+    assert!(
+        working_y < waiting_y && waiting_y < unavailable_y,
+        "All headings must paint Working, Waiting, Unavailable"
+    );
+
+    let row_y = |label: &str| {
+        let i = row_ids[label];
+        crate::layout_probe_get(&format!("jump-session-row-{i}"))
+            .unwrap_or_else(|| panic!("{label} row must paint"))
+            .1
+    };
+    let painted = ["work-two", "work-one", "wait-two", "wait-one", "offline"]
+        .map(row_y);
+    assert!(
+        painted.windows(2).all(|pair| pair[0] < pair[1]),
+        "groups reorder activities but preserve durable relative rank inside each"
+    );
+    crate::layout_probe_end();
+
+    let palette_agents = view.update(vcx, |v, cx| {
+        v.jump_palette_items(cx)
+            .into_iter()
+            .filter(|item| item.is_agent)
+            .map(|item| item.label)
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        palette_agents,
+        vec!["work-two", "work-one", "wait-two", "wait-one", "offline"],
+        "empty Cmd-P mirrors the All tab's activity-grouped presentation order"
+    );
+
+    // Empty exceptional/working sections disappear rather than leaving chrome
+    // between the tab strip and the only populated group.
+    view.update(vcx, |v, _| {
+        for (sid, label) in [
+            ("S-wait-2", "wait-two"),
+            ("S-work-2", "work-two"),
+            ("S-off", "offline"),
+            ("S-work-1", "work-one"),
+            ("S-wait-1", "wait-one"),
+        ] {
+            v.agent_roster.upsert(info(sid, label, false, true));
+        }
+    });
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    assert!(
+        crate::layout_probe_get(&format!("jump-agent-group-{}-working", pid.0)).is_none(),
+        "an empty Working group has no header"
+    );
+    assert!(
+        crate::layout_probe_get(&format!("jump-agent-group-{}-waiting", pid.0)).is_some(),
+        "the populated Waiting group keeps its header"
+    );
+    assert!(
+        crate::layout_probe_get(&format!("jump-agent-group-{}-unavailable", pid.0)).is_none(),
+        "an empty Unavailable group has no header"
+    );
+    crate::layout_probe_end();
+}
+
 /// UXI-JumpPanel-16: archive is a visibility flag complementary to the ordinary
 /// tabs. Even when the sidebar itself is on Archived, Cmd-P must project the
 /// unarchived All roster rather than leaking archived sessions or inheriting the
