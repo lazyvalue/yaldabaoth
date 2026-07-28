@@ -814,17 +814,25 @@ is covered by `tests.rs::preferences_round_trip_with_text_scale`.
 **Statement.** Directly below each expanded project's workspace rows, the jump
 panel renders three independently selectable agent tabs:
 
-1. **Waiting** contains connected sessions whose last completed output is unread
-   (`AgentDotStatus::WaitingForYou`).
+1. **Waiting** contains every connected session that is not currently producing
+   a reply (`AgentActivity::Waiting`). Reading its latest output removes the
+   green/italic **your turn** attention treatment but does not remove the agent
+   from Waiting.
 2. **Working** contains connected sessions with a reply in flight
    (`AgentDotStatus::Working`).
 3. **All** contains every session in the project and is the default.
 
 Waiting and Working are chronological live queues: rows sort by when they
 entered that state, oldest first and **most recent last**. Their order is not
-draggable. State-entry time is owned beside the state itself: local sessions use
-`TurnPhase::turn_started` / `AgentState::unread_since`; roster-only sessions use
-`AgentRoster::state_since` / `roster_unread`.
+draggable. State-entry time is owned beside the operational state itself: local
+sessions use `TurnPhase::turn_started` / `AgentState::waiting_since`;
+roster-only sessions use `AgentRoster::state_since`. Unread is an attention
+marker inside Waiting, not an activity state.
+
+A connected agent therefore always belongs to exactly one of Waiting or
+Working. Disconnected/connecting sessions are `AgentActivity::Unavailable` and
+remain visible in All; availability is exceptional and is not presented as a
+third normal activity queue.
 
 All is the durable curated roster. It follows `jump_session_order`, exposes the
 existing within-project drag reorder, and a newly discovered server sid is
@@ -834,7 +842,7 @@ The first roster seed freezes the previous by-label default into the order; late
 
 **Applies to.** `jump_panel_view.rs` (`JumpAgentTab`,
 `agent_rows_for_tab`, `jump_panel_sections`, `render_jump_panel`,
-`append_new_jump_sessions`), `agent.rs` (`AgentState::unread_since`),
+`append_new_jump_sessions`), `agent.rs` (`AgentState::waiting_since`),
 `agent_roster.rs` (`state_since`), `agent_ui.rs` (state-transition timestamp and
 new-session append sites), and `yux/detail.rs` (`compact_tab`).
 
@@ -848,3 +856,32 @@ guards state filtering, oldest→newest order, and All identity.
 `jump_project_agent_tabs_are_independent_and_all_appends` drives the real
 per-project section projection and append method, probes all three painted tab
 controls, and includes a state flip that must not move All rows.
+
+### UXI-JumpPanel-15 — Agent tabs are one cool-accent segmented control
+
+**Statement.** Waiting / Working / All render as a single bounded segmented
+control, not three floating words:
+
+- one rounded cool-accent hairline encloses the group;
+- internal hairlines separate its three equal-width targets;
+- the selected segment carries a low-alpha cool tint and cool accent text;
+- unselected labels use normal foreground contrast;
+- agent summaries use `AgentTheme::agent_tint`, never `warm_accent` or the
+  structural low-contrast `dim` color.
+
+The everyday themes are explicitly art-directed: Folio supporting text is deep
+steel (`#2d3d4e`), never gold/tan; Nightfox is pale blue (`#9abed0`), never its
+nearly-background `dim` blue.
+
+**Applies to.** `jump_panel_view.rs` (`render_jump_panel`,
+`jump_supporting_text_color`, `jump_session_row_el`), and `yux/detail.rs`
+(`compact_tab`).
+
+**Status.** `implemented` — the segmented-control containment and palette
+selection are headless-guarded. Exact antialiasing and subjective visual balance
+remain harness gap #1.
+
+**Enforcement.** `jump_project_agent_tabs_are_independent_and_all_appends`
+probes the enclosing control and proves each painted tab is inside it.
+`tests.rs::jump_supporting_text_is_cool_and_readable_in_everyday_themes`
+locks the Folio/Nightfox supporting colors and rejects their warm accents.

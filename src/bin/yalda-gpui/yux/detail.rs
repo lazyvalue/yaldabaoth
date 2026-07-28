@@ -93,7 +93,8 @@ pub(crate) fn section_heading(text: &str, st: &DetailStyle) -> gpui::Div {
 
 /// A compact tab/button for narrow chrome surfaces. The caller owns the tab
 /// group layout and attaches the click listener; this primitive owns the shared
-/// selected/hover typography and geometry.
+/// selected/hover typography and geometry. Selected text uses the style's
+/// accent; unselected text stays at normal foreground contrast.
 pub(crate) fn compact_tab(
     id: impl Into<ElementId>,
     label: &str,
@@ -116,7 +117,7 @@ pub(crate) fn compact_tab(
             FontWeight::SEMIBOLD
         })
         .text_size(px(st.pt * 0.82))
-        .text_color(if selected { st.fg } else { st.dim })
+        .text_color(if selected { st.accent } else { st.fg })
         .bg(if selected { selected_bg } else { transparent })
         .hover(|s| s.bg(selected_bg))
         .child(SharedString::from(label.to_string()))

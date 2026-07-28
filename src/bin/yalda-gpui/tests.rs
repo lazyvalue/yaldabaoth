@@ -4256,6 +4256,54 @@ fn sanitize_summary_keeps_two_sentences_and_flattens() {
 }
 
 #[test]
+fn naming_summary_is_topic_only_short_and_has_a_user_turn_fallback() {
+    use crate::agent_naming::{
+        fallback_topic_summary, naming_system_prompt, MAX_SUMMARY_CHARS,
+    };
+
+    assert_eq!(MAX_SUMMARY_CHARS, 140, "jump summaries stay glanceable");
+    let prompt = naming_system_prompt();
+    assert!(
+        prompt.contains("enduring topic or goal")
+            && prompt.contains("Do NOT mention progress")
+            && prompt.contains("Maximum 140 characters"),
+        "the model is asked for durable topic, not a progress report"
+    );
+    assert_eq!(
+        fallback_topic_summary(
+            "user: redesign the jump panel agent tabs\n\
+             with a clearer segmented control\n\
+             agent: I have started editing several files\n\
+             status: implementation is half done"
+        )
+        .as_deref(),
+        Some("redesign the jump panel agent tabs with a clearer segmented control"),
+        "fallback uses only the opening user topic and excludes agent progress"
+    );
+}
+
+#[test]
+fn jump_supporting_text_is_cool_and_readable_in_everyday_themes() {
+    use yalda::style::Color;
+    use yalda::theme::AgentTheme;
+
+    let nightfox = AgentTheme::nightfox();
+    let folio = AgentTheme::folio();
+    assert_eq!(
+        crate::jump_supporting_text_color(&nightfox),
+        Color::Rgb(0x9a, 0xbe, 0xd0),
+        "Nightfox uses its pale blue prose tint, not low-contrast dim blue"
+    );
+    assert_eq!(
+        crate::jump_supporting_text_color(&folio),
+        Color::Rgb(0x2d, 0x3d, 0x4e),
+        "Folio uses deep steel, not gold/tan"
+    );
+    assert_ne!(crate::jump_supporting_text_color(&nightfox), nightfox.warm_accent);
+    assert_ne!(crate::jump_supporting_text_color(&folio), folio.warm_accent);
+}
+
+#[test]
 fn parse_naming_reply_tolerates_real_model_output() {
     use crate::agent_naming::parse_naming_reply;
 

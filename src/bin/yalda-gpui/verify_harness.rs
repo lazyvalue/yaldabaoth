@@ -1207,6 +1207,7 @@ fn agent_dot_status_mapping() {
     let row = |connected, awaiting, unread| AgentRow {
         order_sid: None,
         state_entered_at: None,
+        summary_pending: false,
         target: JumpTarget::Roster("s".into()),
         label: "x".into(),
         summary: None,
@@ -7105,6 +7106,7 @@ fn jump_reorder_ordering_applies_and_defaults_to_alpha() {
         target: JumpTarget::Roster(sid.into()),
         label: label.into(),
         summary: None,
+        summary_pending: false,
         cwd: std::path::PathBuf::from(cwd),
         bound: false,
         connected: true,
@@ -7161,6 +7163,7 @@ fn jump_agent_state_tabs_filter_and_sort_without_moving_all() {
         target: JumpTarget::Roster(sid.into()),
         label: label.into(),
         summary: None,
+        summary_pending: false,
         cwd: std::path::PathBuf::from("/work"),
         bound: false,
         connected: true,
@@ -7186,8 +7189,8 @@ fn jump_agent_state_tabs_filter_and_sort_without_moving_all() {
 
     assert_eq!(
         labels(agent_rows_for_tab(make(), JumpAgentTab::Waiting)),
-        vec!["wait-old", "wait-new"],
-        "Waiting is oldest→newest by waiting-state entry"
+        vec!["quiet", "wait-old", "wait-new"],
+        "Waiting includes every connected non-working agent and is oldest→newest"
     );
     assert_eq!(
         labels(agent_rows_for_tab(make(), JumpAgentTab::Working)),
@@ -7242,11 +7245,19 @@ fn jump_project_agent_tabs_are_independent_and_all_appends(cx: &mut TestAppConte
         view.update(vcx, |_, cx| cx.notify());
         vcx.run_until_parked();
     }
+    let outer_label = format!("jump-agent-tabs-{}", pid.0);
+    let (outer_x, outer_y, outer_w, outer_h) = crate::layout_probe_get(&outer_label)
+        .expect("the tabs must paint inside one enclosing segmented-control box");
     for tab in ["waiting", "working", "all"] {
         let label = format!("jump-agent-tab-{}-{tab}", pid.0);
+        let (x, y, w, h) = crate::layout_probe_get(&label)
+            .unwrap_or_else(|| panic!("the per-project {tab} tab must paint"));
         assert!(
-            crate::layout_probe_get(&label).is_some(),
-            "the per-project {tab} tab must paint below the workspace list"
+            x >= outer_x
+                && y >= outer_y
+                && x + w <= outer_x + outer_w
+                && y + h <= outer_y + outer_h,
+            "the {tab} tab must sit inside the shared segmented-control boundary"
         );
     }
     crate::layout_probe_end();
@@ -7266,7 +7277,11 @@ fn jump_project_agent_tabs_are_independent_and_all_appends(cx: &mut TestAppConte
         })
     };
     view.update(vcx, |v, cx| v.select_jump_agent_tab(pid, JumpAgentTab::Waiting, cx));
-    assert_eq!(labels(&view, vcx), vec!["wait"]);
+    assert_eq!(
+        labels(&view, vcx),
+        vec!["wait", "quiet"],
+        "read and unread idle agents both belong to Waiting"
+    );
     let other_tab = view.update(vcx, |v, cx| {
         v.jump_panel_sections(cx)
             .0
@@ -7537,6 +7552,7 @@ fn jump_panel_groups_agent_rows_by_cwd() {
     let row = |label: &str, cwd: &str| AgentRow {
         order_sid: Some(label.into()),
         state_entered_at: None,
+        summary_pending: false,
         target: JumpTarget::Roster(label.into()),
         label: label.into(),
         summary: None,
@@ -14588,6 +14604,16 @@ fn autoname_fires_once_on_first_turn_completion(cx: &mut TestAppContext) {
         Some(crate::AutonameState::Requested),
         "the first completed turn must arm exactly one naming request"
     );
+    let pending_summary = view.update(vcx, |v, cx| {
+        v.jump_panel_agent_rows(cx)
+            .into_iter()
+            .find(|row| row.order_sid.as_deref() == Some("S1"))
+            .is_some_and(|row| row.summary_pending)
+    });
+    assert!(
+        pending_summary,
+        "the jump row exposes summary progress while the model request is in flight"
+    );
 
     // A second turn must NOT re-arm: settle the first request as the worker
     // would (no name came back), then end another turn.
@@ -14600,6 +14626,82 @@ fn autoname_fires_once_on_first_turn_completion(cx: &mut TestAppContext) {
         after_second,
         Some((crate::AutonameState::Done, false)),
         "a later turn must never re-arm autonaming (one shot, ever)"
+    );
+}
+
+/// Topic summaries are useful before the first agent reply finishes. The shared
+/// accepted-user-turn chokepoint installs an immediate compact excerpt, while
+/// leaving the AI naming one-shot Pending to refine it asynchronously later.
+#[gpui::test]
+fn autoname_topic_appears_on_first_user_turn(cx: &mut TestAppContext) {
+    use yalda::agent_transcript::UserTurnOrigin;
+    let (view, vcx, id) = boot_armed_autoname_session(cx);
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |session| {
+            session.insert_user_turn(
+                "redesign the jump tabs without low contrast gold text",
+                UserTurnOrigin::LocalSubmit,
+                false,
+            );
+        });
+    });
+    view.read_with(vcx, |v, cx| {
+        let session = v.sessions.get(id).expect("session").read(cx);
+        assert_eq!(
+            session.state.summary.as_deref(),
+            Some("redesign the jump tabs without low contrast gold text"),
+            "the topic is visible immediately after submit"
+        );
+        assert_eq!(
+            session.state.autoname,
+            crate::AutonameState::Pending,
+            "the AI refinement is still owed after the immediate excerpt"
+        );
+    });
+}
+
+/// Summary reliability: a missing API key is a normal installation state, not a
+/// reason for the one-shot to remain `Requested` forever. The exact credential
+/// branch settles with a deterministic opening-topic fallback and persists it.
+///
+/// Negative control: remove the `finish_autoname` call from the `None` key arm
+/// of `spawn_autoname_worker_with_key`; state remains Requested, summary stays
+/// absent, and both assertions fail RED.
+#[gpui::test]
+fn autoname_without_api_key_settles_with_persisted_topic(cx: &mut TestAppContext) {
+    let (view, vcx, id) = boot_armed_autoname_session(cx);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("session_summaries.json");
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |session| {
+            session.autoname = crate::AutonameState::Requested;
+        });
+        crate::persist::with_session_summaries_path(file.clone(), || {
+            v.test_autoname_without_api_key(
+                id,
+                "user: improve jump panel state tabs\nagent: working on it".into(),
+                cx,
+            )
+        });
+    });
+    vcx.run_until_parked();
+
+    view.read_with(vcx, |v, cx| {
+        let session = v.sessions.get(id).expect("session").read(cx);
+        assert_eq!(session.state.autoname, crate::AutonameState::Done);
+        assert_eq!(
+            session.state.summary.as_deref(),
+            Some("improve jump panel state tabs"),
+            "no-key fallback is visible instead of a permanently blank summary"
+        );
+    });
+    let saved = crate::persist::with_session_summaries_path(file, || {
+        crate::persist::load_session_summaries()
+    });
+    assert_eq!(
+        saved.get("S1").map(String::as_str),
+        Some("improve jump panel state tabs"),
+        "the fallback survives restart like an AI-produced summary"
     );
 }
 
