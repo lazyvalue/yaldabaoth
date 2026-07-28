@@ -260,6 +260,34 @@ pub(crate) fn with_server_clear_branch<R>(f: impl FnOnce() -> R) -> R {
     r
 }
 
+/// Test seam: allow the real roster-row jump path to construct and bind its
+/// local attachment placeholder while the hermetic harness has no live session
+/// server. The eventual attach task still bails on `session_server == None`;
+/// this only reaches the synchronous `jump_to_roster_session` →
+/// `picker_attach_existing` identity handoff that production runs before it.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FORCE_SERVER_ROSTER_JUMP_BRANCH: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn force_server_roster_jump_branch() -> bool {
+    #[cfg(test)]
+    {
+        return FORCE_SERVER_ROSTER_JUMP_BRANCH.with(|c| c.get());
+    }
+    #[cfg(not(test))]
+    false
+}
+
+#[cfg(test)]
+pub(crate) fn with_server_roster_jump_branch<R>(f: impl FnOnce() -> R) -> R {
+    FORCE_SERVER_ROSTER_JUMP_BRANCH.with(|c| c.set(true));
+    let r = f();
+    FORCE_SERVER_ROSTER_JUMP_BRANCH.with(|c| c.set(false));
+    r
+}
+
 pub(crate) fn connect_session_server() -> Option<SessionServerClient> {
     // NOTE (clear-worksheet-invisible critique R4): under `cfg(test)` this still
     // falls through to a LIVE `SessionServerClient::connect()` unless a test wraps

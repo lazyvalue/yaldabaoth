@@ -880,7 +880,7 @@ impl YaldaGpuiView {
         let Some(info) = self.agent_roster.get(&sid).cloned() else {
             return;
         };
-        if self.session_server.is_none() {
+        if self.session_server.is_none() && !crate::force_server_roster_jump_branch() {
             return;
         }
         // Fresh ephemeral workspace holding one unbound agent tile, now focused;

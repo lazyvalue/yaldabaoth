@@ -273,26 +273,43 @@ impl YaldaGpuiView {
             let label = opened
                 .map(|e| e.read(cx).label.clone())
                 .unwrap_or_else(|| info.label.clone());
+            // Local activity can lead the roster briefly while the server's
+            // SessionBusy broadcast is in flight. Capture its phase and entry
+            // time together so status and chronology are one coherent read.
+            let local_activity = opened.map(|e| {
+                let state = &e.read(cx).state;
+                let awaiting = state.turn_phase.is_awaiting();
+                let entered_at = if awaiting {
+                    state.turn_phase.turn_started()
+                } else {
+                    state.waiting_since
+                };
+                (awaiting, entered_at)
+            });
             // bug-0022: local state is authoritative when this GUI holds the
             // session; otherwise the SERVER's in-flight flag drives it, so a
             // free session (or one another GUI is driving) shows real status
             // instead of a permanent neutral dot.
-            let awaiting = opened
-                .map(|e| e.read(cx).state.turn_phase.is_awaiting())
-                .or(Some(info.busy));
+            let awaiting = local_activity.map(|(awaiting, _)| awaiting).or(Some(info.busy));
             let unread = opened
                 .map(|e| e.read(cx).state.unread)
                 .unwrap_or_else(|| self.roster_unread.contains_key(&info.session_id));
-            let state_entered_at = opened
-                .and_then(|e| {
-                    let state = &e.read(cx).state;
-                    if state.turn_phase.is_awaiting() {
-                        state.turn_phase.turn_started()
-                    } else {
-                        state.waiting_since
-                    }
-                })
-                .or_else(|| self.agent_roster.state_since(&info.session_id));
+            let roster_entered_at = self.agent_roster.state_since(&info.session_id);
+            // UXI-JumpPanel-14: attaching/viewing a roster session constructs a
+            // fresh local AgentState whose default waiting_since is "now". That
+            // construction is NOT an operational transition and must not send
+            // the row to the bottom of Waiting. While local + roster activity
+            // agree, retain the roster's identity-stable entry time. If they
+            // disagree, local state has begun a real transition ahead of the
+            // corresponding server broadcast, so its timestamp leads until the
+            // roster catches up.
+            let state_entered_at = match local_activity {
+                Some((local_busy, local_entered_at)) if local_busy == info.busy => {
+                    roster_entered_at.or(local_entered_at)
+                }
+                Some((_, local_entered_at)) => local_entered_at.or(roster_entered_at),
+                None => roster_entered_at,
+            };
             // bug-0020: the live session is authoritative, but a session that is
             // NOT open here (free, or freshly restored before attach) still has a
             // durable summary in the id-keyed sidecar. Without this fallback the
