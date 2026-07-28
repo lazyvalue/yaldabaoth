@@ -27,6 +27,15 @@ use super::*;
 /// document zoom (consistent with the workspace strip / rail).
 pub(crate) const JUMP_PANEL_WIDTH: f32 = 320.0;
 
+/// Theme-owned cool supporting copy for tab labels and session summaries. This
+/// explicit seam guards against accidentally routing either through the warm
+/// gold accent or the intentionally low-contrast structural `dim` color.
+pub(crate) fn jump_supporting_text_color(
+    theme: &yalda::theme::AgentTheme,
+) -> yalda::style::Color {
+    theme.agent_tint
+}
+
 /// The per-project agent list selected under that project's workspace rows.
 /// `All` is the default so the new control preserves the panel's existing
 /// visibility until the user asks for a live-state slice.
@@ -82,12 +91,14 @@ pub(crate) struct AgentRow {
     /// ("waiting on you") — `AgentState.unread`. `false` for roster-only sessions
     /// not opened in this GUI (unknown). Drives the ● green + italic row.
     pub(crate) unread: bool,
-    /// The autonamer's two-sentence summary of the session (`UXI-AgentTile-27`),
-    /// when this GUI has the session open. Rendered as a small italic second
-    /// line under the label. `None` for roster-only sessions (never opened here,
-    /// so we have no local state to read it from) and for sessions that were
-    /// never named.
+    /// The autonamer's compact topic summary of the session (`UXI-AgentTile-27`),
+    /// Rendered as a small italic second line under the label. Live local state
+    /// is authoritative; roster-only sessions fall back to the durable
+    /// id-keyed summary sidecar. `None` means no usable topic exists yet.
     pub(crate) summary: Option<String>,
+    /// The one-shot topic summary is currently being derived. Used to render a
+    /// quiet progress line instead of making the summary appear broken.
+    pub(crate) summary_pending: bool,
     /// The sid this row occupies in the user's drag order (`jump_session_order`).
     /// For a roster row that is its own sid. For a local-only placeholder it is
     /// its PREDECESSOR's sid when the placeholder continues a killed session
@@ -161,6 +172,17 @@ pub(crate) enum AgentDotStatus {
     Neutral,
 }
 
+/// The operational state used by the Waiting / Working tabs. Attention
+/// (`unread`) is deliberately separate: reading a finished turn removes the
+/// stronger "your turn" treatment but the connected idle agent is still
+/// waiting. Disconnected/connecting sessions remain available in All.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AgentActivity {
+    Waiting,
+    Working,
+    Unavailable,
+}
+
 /// The row marks a live session wears (`UXI-JumpPanel-10`): `(badge glyph,
 /// right-edge status word)`. Color alone was too quiet to catch while scanning a
 /// list of sessions, so each live state also gets a WORD and its own glyph SHAPE
@@ -179,6 +201,16 @@ pub(crate) fn agent_row_marks(status: AgentDotStatus) -> (&'static str, Option<&
 }
 
 impl AgentRow {
+    pub(crate) fn activity(&self) -> AgentActivity {
+        if !self.connected {
+            AgentActivity::Unavailable
+        } else if self.awaiting == Some(true) {
+            AgentActivity::Working
+        } else {
+            AgentActivity::Waiting
+        }
+    }
+
     /// Map this row to its status-dot meaning (UXI-JumpPanel-1). Disconnected wins
     /// (nothing is happening); otherwise a reply in flight is **working**, an idle
     /// turn with unread output is **waiting on you**, and anything else (idle +
@@ -235,21 +267,11 @@ impl YaldaGpuiView {
                     let state = &e.read(cx).state;
                     if state.turn_phase.is_awaiting() {
                         state.turn_phase.turn_started()
-                    } else if state.unread {
-                        state.unread_since
                     } else {
-                        None
+                        state.waiting_since
                     }
                 })
-                .or_else(|| {
-                    if info.busy {
-                        self.agent_roster.state_since(&info.session_id)
-                    } else if unread {
-                        self.roster_unread.get(&info.session_id).copied()
-                    } else {
-                        None
-                    }
-                });
+                .or_else(|| self.agent_roster.state_since(&info.session_id));
             // bug-0020: the live session is authoritative, but a session that is
             // NOT open here (free, or freshly restored before attach) still has a
             // durable summary in the id-keyed sidecar. Without this fallback the
@@ -261,11 +283,19 @@ impl YaldaGpuiView {
                         .get(&info.session_id)
                         .filter(|s| !s.trim().is_empty())
                         .cloned()
-                });
+                })
+                // Enforce the current compact display contract for summaries
+                // written by older builds with the former 240-character cap.
+                .and_then(|summary| sanitize_summary(&summary));
+            let summary_pending = opened.is_some_and(|e| {
+                let state = &e.read(cx).state;
+                state.summary.is_none() && state.autoname == AutonameState::Requested
+            });
             rows.push(AgentRow {
                 target: JumpTarget::Roster(info.session_id.clone()),
                 label,
                 summary,
+                summary_pending,
                 cwd: info.cwd.clone(),
                 bound,
                 connected: info.connected,
@@ -289,14 +319,24 @@ impl YaldaGpuiView {
                 label: ent.read(cx).label.clone(),
                 // bug-0020: same sidecar fallback as the roster rows above, for a
                 // session whose sid the roster hasn't listed yet.
-                summary: ent.read(cx).state.summary.clone().or_else(|| {
-                    self.sessions.sid_of(id).and_then(|s| {
-                        self.session_summaries
-                            .get(s.as_str())
-                            .filter(|v| !v.trim().is_empty())
-                            .cloned()
+                summary: ent
+                    .read(cx)
+                    .state
+                    .summary
+                    .clone()
+                    .or_else(|| {
+                        self.sessions.sid_of(id).and_then(|s| {
+                            self.session_summaries
+                                .get(s.as_str())
+                                .filter(|v| !v.trim().is_empty())
+                                .cloned()
+                        })
                     })
-                }),
+                    .and_then(|summary| sanitize_summary(&summary)),
+                summary_pending: {
+                    let state = &ent.read(cx).state;
+                    state.summary.is_none() && state.autoname == AutonameState::Requested
+                },
                 cwd: ent.read(cx).cwd.clone(),
                 bound: self.agent_tile_id_bound_to(id).is_some(),
                 connected: true,
@@ -314,10 +354,8 @@ impl YaldaGpuiView {
                     let state = &ent.read(cx).state;
                     if state.turn_phase.is_awaiting() {
                         state.turn_phase.turn_started()
-                    } else if state.unread {
-                        state.unread_since
                     } else {
-                        None
+                        state.waiting_since
                     }
                 },
             });
@@ -473,14 +511,14 @@ pub(crate) fn agent_rows_for_tab(
     tab: JumpAgentTab,
 ) -> Vec<(usize, AgentRow)> {
     let wanted = match tab {
-        JumpAgentTab::Waiting => Some(AgentDotStatus::WaitingForYou),
-        JumpAgentTab::Working => Some(AgentDotStatus::Working),
+        JumpAgentTab::Waiting => Some(AgentActivity::Waiting),
+        JumpAgentTab::Working => Some(AgentActivity::Working),
         JumpAgentTab::All => None,
     };
     let Some(wanted) = wanted else {
         return rows;
     };
-    rows.retain(|(_, row)| row.dot_status() == wanted);
+    rows.retain(|(_, row)| row.activity() == wanted);
     rows.sort_by_key(|(_, row)| row.state_entered_at);
     rows
 }
@@ -682,10 +720,15 @@ impl YaldaGpuiView {
     /// handler (never closed over from a prior build).
     pub(crate) fn render_jump_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
         record_render("jump_panel");
+        // Supporting copy in the panel stays on the theme's cool prose palette.
+        // Never inherit `warm_accent`: Folio's gold and Nightfox's very dark
+        // `dim` both failed as readable navigation text.
+        let active_accent = nc(self.theme.agent.frozen_bar);
+        let supporting_text = nc(jump_supporting_text_color(&self.theme.agent));
         let st = DetailStyle {
             fg: self.editor_fg(),
             dim: nc(self.theme.agent.dim),
-            accent: nc(self.theme.agent.warm_accent),
+            accent: active_accent,
             err: nc(self.theme.agent.jump_header),
             mono: self.code_font.clone(),
             prose: self.body_font.clone(),
@@ -698,7 +741,6 @@ impl YaldaGpuiView {
         // warm_accent tint muddied to brown/olive over the background, and the
         // "you are here" mark is now this same accent as a left bar rather than a
         // bright red bounding box (UXI-JumpPanel-5).
-        let active_accent = nc(self.theme.agent.frozen_bar);
         let mut sel_bg = active_accent;
         sel_bg.a = 0.15;
         // UXI-JumpPanel-11 (reverses UXI-JumpPanel-7's recessed shade): the panel
@@ -881,10 +923,27 @@ impl YaldaGpuiView {
 
             // Per-project state tabs sit directly under the workspace list.
             // Their selection is independent across projects.
-            let mut tabs = div().flex().flex_row().gap_1().w_full().px_3().py_1();
-            for tab in
+            let mut tab_edge = active_accent;
+            tab_edge.a = 0.48;
+            let mut tab_surface = active_accent;
+            tab_surface.a = 0.035;
+            let mut tabs = div()
+                .flex()
+                .flex_row()
+                .w_full()
+                .p(px(2.0))
+                .border_1()
+                .border_color(tab_edge)
+                .rounded_md()
+                .bg(tab_surface);
+            for (tab_idx, tab) in
                 [JumpAgentTab::Waiting, JumpAgentTab::Working, JumpAgentTab::All]
+                    .into_iter()
+                    .enumerate()
             {
+                if tab_idx > 0 {
+                    tabs = tabs.child(div().w(px(1.0)).my_1().bg(tab_edge));
+                }
                 let tab_probe = format!(
                     "jump-agent-tab-{}-{}",
                     pid.0,
@@ -902,7 +961,16 @@ impl YaldaGpuiView {
                 }));
                 tabs = tabs.child(probe_bounds_dyn(tab_probe, button.into_any_element()));
             }
-            col = col.child(tabs);
+            col = col.child(
+                div()
+                    .w_full()
+                    .px_3()
+                    .py_1()
+                    .child(probe_bounds_dyn(
+                        format!("jump-agent-tabs-{}", pid.0),
+                        tabs.into_any_element(),
+                    )),
+            );
 
             // AGENT SESSIONS sublist (status-colored `✦` + accent marks preserved).
             // Drag order belongs only to All; state tabs own their chronological
@@ -922,6 +990,7 @@ impl YaldaGpuiView {
                     drag_fg,
                     drag_font.clone(),
                     agent_tab == JumpAgentTab::All,
+                    supporting_text,
                     cx,
                 ));
             }
@@ -957,6 +1026,7 @@ impl YaldaGpuiView {
                         drag_fg,
                         drag_font.clone(),
                         true,
+                        supporting_text,
                         cx,
                     ));
                 }
@@ -987,6 +1057,7 @@ fn jump_session_row_el(
     drag_fg: Hsla,
     drag_font: SharedString,
     allow_drag: bool,
+    supporting_text: Hsla,
     cx: &mut Context<YaldaGpuiView>,
 ) -> gpui::AnyElement {
     // The agent-session icon is a `✦` whose COLOR carries the status (one glyph =
@@ -1078,13 +1149,22 @@ fn jump_session_row_el(
             }));
     }
     // UXI-AgentTile-27: the autoname summary sits UNDER the label as a small
-    // italic dim line. Chrome-class (fixed size, unaffected by document zoom),
-    // single-line-height text indented to the label's x so it reads as a
-    // subtitle of the row rather than a row of its own. A session with no
-    // summary renders exactly as before — no reserved space, no layout shift.
-    let Some(summary) = row.summary.as_ref().filter(|s| !s.trim().is_empty()) else {
-        return r.into_any_element();
-    };
+    // italic cool-prose line. Chrome-class (fixed size, unaffected by document
+    // zoom), single-line-height text indented to the label's x so it reads as a
+    // subtitle of the row rather than a row of its own. A settled session with
+    // no summary reserves no space; an in-flight one gets explicit feedback.
+    let (summary, pending) =
+        if let Some(summary) = row.summary.as_ref().filter(|s| !s.trim().is_empty()) {
+            (summary.clone(), false)
+        } else if row.summary_pending {
+            ("summarizing topic…".to_string(), true)
+        } else {
+            return r.into_any_element();
+        };
+    let mut summary_color = supporting_text;
+    if pending {
+        summary_color.a = 0.72;
+    }
     div()
         .flex()
         .flex_col()
@@ -1101,8 +1181,8 @@ fn jump_session_row_el(
                 .min_w_0()
                 .italic()
                 .text_size(px(st.pt * 0.8))
-                .text_color(st.dim)
-                .child(SharedString::from(summary.clone())),
+                .text_color(summary_color)
+                .child(SharedString::from(summary)),
         )
         .into_any_element()
 }

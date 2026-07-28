@@ -3410,16 +3410,17 @@ pub(crate) struct AgentState {
     /// jump panel's ● green + italic "waiting on you" row; a turn that ends while
     /// you're watching it stays read (`false`).
     pub(crate) unread: bool,
-    /// When this session most recently entered the unread / "waiting on you"
-    /// state. The jump panel's Waiting tab sorts oldest→newest by this instant.
-    pub(crate) unread_since: Option<std::time::Instant>,
+    /// When this session most recently entered the connected, non-working
+    /// state. Reading its output clears `unread` but does not change this
+    /// operational Waiting state or its chronological position.
+    pub(crate) waiting_since: Option<std::time::Instant>,
     /// Where this session's `label` came from (`UXI-AgentTile-27`). `User` is a
     /// latch set by the rename command: once set, autonaming can never fire and
     /// a late autoname result is dropped. Lives here (not on `AgentSession`)
     /// only because `AgentSession` derefs to `AgentState` and this is the one
     /// place every construction path funnels through.
     pub(crate) name_origin: NameOrigin,
-    /// The autonamer's two-sentence summary of what this session is about, or
+    /// The autonamer's compact topic summary of what this session is about, or
     /// `None` until one lands. Rendered under the label in the jump panel.
     pub(crate) summary: Option<String>,
     /// One-shot autoname lifecycle. Defaults to `Done` — a session must be
@@ -3745,7 +3746,7 @@ impl AgentState {
             replay_prefix_finalized: false,
             agent_stream_authoritative: false,
             unread: false,
-            unread_since: None,
+            waiting_since: Some(std::time::Instant::now()),
             follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
             name_origin: NameOrigin::Auto,
             summary: None,
@@ -3827,7 +3828,7 @@ impl AgentState {
             replay_prefix_finalized: false,
             agent_stream_authoritative: false,
             unread: false,
-            unread_since: None,
+            waiting_since: Some(std::time::Instant::now()),
             follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
             name_origin: NameOrigin::Auto,
             summary: None,
@@ -3933,6 +3934,17 @@ impl AgentState {
                          dropping duplicate user turn (text={text:?})"
                     );
                     return None;
+                }
+                // A topic-only summary does not need to wait for the agent's
+                // first reply. Install a compact excerpt from the first accepted
+                // user turn immediately; the asynchronous naming result may
+                // refine it later. This is intentionally local-only here —
+                // `finish_autoname` owns durable settlement.
+                if self.summary.is_none()
+                    && self.autoname == AutonameState::Pending
+                    && self.name_origin != NameOrigin::User
+                {
+                    self.summary = fallback_topic_summary(text);
                 }
                 Some(k)
             }
@@ -4159,7 +4171,7 @@ impl AgentState {
         // this idempotent ledger is the one place every turn-end path converges.
         // Even if an older result was still unread, the row was Working during
         // this turn and is entering Waiting anew now.
-        self.unread_since = Some(std::time::Instant::now());
+        self.waiting_since = Some(std::time::Instant::now());
         self.unread = true;
         true
     }

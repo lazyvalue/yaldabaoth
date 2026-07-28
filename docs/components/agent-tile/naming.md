@@ -12,7 +12,7 @@ meaningful name has been to run the rename command by hand on each one.
 **Autonaming** closes that gap. When a session's **first** agent turn completes,
 the opening exchange (the user's first message + the agent's first reply) is sent
 to a cheap model — Haiku, over a single plain-HTTP `/v1/messages` call — which
-returns a two-to-three-word label and a two-sentence summary of what the session
+returns a two-to-three-word label and a compact topic summary of what the session
 is about. The label replaces `claude-N` everywhere the session is listed; the
 summary renders under it in tiny italics in the jump panel.
 
@@ -24,7 +24,8 @@ autoname result is dropped on the floor.
 
 The naming call is deliberately **not** the recap facet's throwaway ACP
 subprocess ([`UXI-AgentTile-15`](recap.md)). A recap is a multi-paragraph
-summary that earns a full agent subprocess; two words and two sentences do not.
+summary that earns a full agent subprocess; two words and a compact topic line
+do not.
 The direct Haiku call is ~1s instead of several, and the request is
 `ANTHROPIC_API_KEY`-authenticated from the environment (or a gitignored `.env`
 loaded at startup) rather than riding the Claude Code login.
@@ -53,8 +54,10 @@ without the user asking. Five hard properties:
    continues, and a session restored from a previous launch — which has already
    had turns — is never retro-named.
 2. **Shape.** The name is 2–3 lowercase space-separated words, hard-capped at 28
-   characters (`payments refactor`, `flaky test hunt`); the summary is at most
-   two sentences, capped at 240 characters. Both are sanitized client-side, so a
+  characters (`payments refactor`, `flaky test hunt`); the summary describes only
+  the session's enduring topic or goal, never progress, actions, outcomes, or
+  blockers. It prefers one sentence, permits two when needed, and is capped at
+  140 characters. Both are sanitized client-side, so a
    model that ignores the instruction and returns a preamble, quotes, a code
    fence, or a paragraph still yields a well-formed label or nothing at all.
    Names are **not** deduplicated — two sessions may legitimately be about the
@@ -65,15 +68,21 @@ without the user asking. Five hard properties:
    result that lands after a rename is **dropped**, not applied. This replaces
    the string-sniffing `is_auto_claude_label` heuristic, which cannot tell an
    autoname (`payments refactor`) from a name the user typed.
-4. **Silent failure.** No API key, no network, a non-2xx response, a refusal, or
-   an unusable reply leaves the session as `claude-N` with no summary and no
-   error banner. Autonaming is a convenience; it never interrupts the user, and
-   it never blocks or delays the turn it rides on.
+4. **Fast, visible, reliable fallback.** The first accepted user turn installs a
+   deterministic compact topic excerpt immediately; the model result may refine
+   it after the first reply. If no useful excerpt exists while the request is in
+   flight, the jump row says `summarizing topic…`. The direct request is bounded
+   to eight seconds. No API key, timeout/network/non-2xx failure, refusal, or an
+   omitted summary settles with the opening-topic fallback and persists it
+   through the normal summary sidecar. The session may retain its placeholder
+   name when naming fails, but its summary never remains permanently blank or
+   stuck in `Requested`. No error banner interrupts the user.
 5. **Placement.** The name is the session's `label` and therefore appears
    everywhere a session is listed (jump panel, tile selector, tab strip). The
    summary renders **only** in the jump panel, on its own line under the label,
-   in a smaller italic dim style — chrome-class, so document zoom does not
-   scale it.
+   in a smaller italic cool-prose style (`AgentTheme::agent_tint`, never the warm
+   gold accent or low-contrast structural dim) — chrome-class, so document zoom
+   does not scale it.
 6. **Arming is by IDENTITY, not provenance (bug-0021 — amends property 1).** A
    session is armed for its one-shot at the moment it becomes **bound to a sid**
    (create resolution, attach resolution, restore) when all of: its label is still
@@ -110,7 +119,8 @@ without the user asking. Five hard properties:
 
 **Applies to.** `agent.rs` — `NameOrigin`, `AgentSession::{name_origin, summary,
 autoname_state}`; `agent_naming.rs` — the pure `build_naming_prompt` /
-`parse_naming_reply` / `sanitize_name` / `sanitize_summary` and the blocking
+`parse_naming_reply` / `sanitize_name` / `sanitize_summary` /
+`fallback_topic_summary` and the blocking
 `request_session_name` HTTP call (`claude-haiku-4-5`, `POST
 https://api.anthropic.com/v1/messages`, `anthropic-version: 2023-06-01`);
 `agent_ui.rs` — `maybe_autoname_session` (fired from the turn-finalize
@@ -152,6 +162,9 @@ RED: drop `save_session_summary` → the reloaded row's summary is `None`),
 `late_autoname_result_never_clobbers_a_user_rename`. `tests.rs`:
 `sanitize_name_enforces_shape_and_cap`,
 `sanitize_summary_keeps_two_sentences_and_flattens`,
+`naming_summary_is_topic_only_short_and_has_a_user_turn_fallback`,
+`autoname_topic_appears_on_first_user_turn`,
+`autoname_without_api_key_settles_with_persisted_topic`,
 `parse_naming_reply_tolerates_real_model_output`,
 `parse_dotenv_reads_keys_and_ignores_noise`. Four negative controls observed RED
 (finalize arm removed → `Pending` not `Requested`; rename latch removed → origin

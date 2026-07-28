@@ -817,7 +817,7 @@ impl YaldaGpuiView {
             if let Some(ent) = self.session_entity(local) {
                 ent.update(cx, |session, scx| {
                     session.state.unread = true;
-                    session.state.unread_since = Some(std::time::Instant::now());
+                    session.state.waiting_since = Some(std::time::Instant::now());
                     scx.notify();
                 });
             }
@@ -843,7 +843,6 @@ impl YaldaGpuiView {
             ent.update(cx, |session, scx| {
                 if session.state.unread {
                     session.state.unread = false;
-                    session.state.unread_since = None;
                     scx.notify();
                 }
             });
@@ -2003,7 +2002,7 @@ impl YaldaGpuiView {
             replay_prefix_finalized: false,
             agent_stream_authoritative: false,
             unread: false,
-            unread_since: None,
+            waiting_since: Some(std::time::Instant::now()),
             follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
             name_origin: NameOrigin::Auto,
             summary: None,
@@ -3016,7 +3015,6 @@ impl YaldaGpuiView {
             // after the drain, overrides that set on the SAME tick (no flicker).
             if is_focused && claude.unread {
                 claude.unread = false;
-                claude.unread_since = None;
             }
 
             // Mutation-site notify on the session entity (load-bearing after
@@ -5033,14 +5031,41 @@ impl YaldaGpuiView {
     /// call is dev-system verification gap 2, so headless tests never make a
     /// network request — they leave the session `Requested` and drive
     /// `apply_autoname_result` directly, exactly as the worker would.
-    fn spawn_autoname_worker(&self, id: SessionId, transcript: String, cx: &mut Context<Self>) {
+    fn spawn_autoname_worker(
+        &mut self,
+        id: SessionId,
+        transcript: String,
+        cx: &mut Context<Self>,
+    ) {
         if cfg!(test) {
             return;
         }
-        let Some(key) = naming_api_key() else {
-            // No key configured: fail silently (property 4) and settle so we
-            // never retry on a later turn.
+        self.spawn_autoname_worker_with_key(id, transcript, naming_api_key(), cx);
+    }
+
+    /// Shared live/test seam for the request's credential decision. Tests drive
+    /// `None` through this exact branch; `Some` is live-only because it performs
+    /// the real network request.
+    fn spawn_autoname_worker_with_key(
+        &mut self,
+        id: SessionId,
+        transcript: String,
+        key: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let fallback = fallback_topic_summary(&transcript);
+        let Some(key) = key else {
+            // No key configured: settle immediately with the opening user's
+            // topic instead of leaving the request stuck at `Requested` forever.
             eprintln!("[yalda-gpui] autoname skipped: ANTHROPIC_API_KEY not set");
+            self.finish_autoname(
+                id,
+                Some(SessionNaming {
+                    name: None,
+                    summary: fallback,
+                }),
+                cx,
+            );
             return;
         };
         cx.spawn(async move |this, cx| {
@@ -5048,16 +5073,32 @@ impl YaldaGpuiView {
                 .background_executor()
                 .spawn(async move { request_session_name(&key, &transcript) })
                 .await;
-            let naming = match result {
-                Ok(naming) => Some(naming),
+            let mut naming = match result {
+                Ok(naming) => naming,
                 Err(e) => {
                     eprintln!("[yalda-gpui] autoname failed: {e}");
-                    None
+                    SessionNaming {
+                        name: None,
+                        summary: fallback.clone(),
+                    }
                 }
             };
-            let _ = this.update(cx, |this, cx| this.finish_autoname(id, naming, cx));
+            if naming.summary.is_none() {
+                naming.summary = fallback;
+            }
+            let _ = this.update(cx, |this, cx| this.finish_autoname(id, Some(naming), cx));
         })
         .detach();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_autoname_without_api_key(
+        &mut self,
+        id: SessionId,
+        transcript: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.spawn_autoname_worker_with_key(id, transcript, None, cx);
     }
 
     /// Settle a session's autoname: install the name/summary if one came back
@@ -5095,6 +5136,12 @@ impl YaldaGpuiView {
                     s.summary = naming.summary.clone();
                     summary = naming.summary;
                 }
+            }
+            // The first user turn may already have installed an immediate local
+            // topic excerpt. Preserve and persist it when credentials/network
+            // fail or a user rename causes the late model result to be dropped.
+            if summary.is_none() {
+                summary = s.summary.clone();
             }
             scx.notify();
             (installed, summary)

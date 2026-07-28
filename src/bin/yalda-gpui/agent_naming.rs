@@ -2,7 +2,7 @@
 //!
 //! When a session's FIRST agent turn completes, the opening exchange is sent to
 //! a cheap model (Haiku) which returns a two-to-three-word name and a
-//! two-sentence summary. The name replaces the placeholder `claude-N` label
+//! compact topic summary. The name replaces the placeholder `claude-N` label
 //! everywhere the session is listed; the summary renders under it in the jump
 //! panel.
 //!
@@ -13,7 +13,7 @@
 //!
 //! This deliberately does NOT reuse the recap facet's throwaway ACP subprocess
 //! (`UXI-AgentTile-15`): a multi-paragraph recap earns a whole agent
-//! subprocess, two words and two sentences do not.
+//! subprocess, two words and a compact topic line do not.
 
 /// The model that derives the name. Haiku is the cheapest current model and the
 /// task is trivial — see `docs/components/agent-tile/naming.md`.
@@ -28,7 +28,7 @@ const NAMING_TRANSCRIPT_BUDGET: usize = 4000;
 
 /// Hard caps on what we will install, whatever the model returns.
 pub(crate) const MAX_NAME_CHARS: usize = 28;
-pub(crate) const MAX_SUMMARY_CHARS: usize = 240;
+pub(crate) const MAX_SUMMARY_CHARS: usize = 140;
 
 /// Where a session's `label` came from.
 ///
@@ -99,7 +99,10 @@ pub(crate) fn naming_system_prompt() -> String {
      - \"name\": 2-3 lowercase words, space separated, at most 28 characters, \
      naming the concrete thing being worked on (e.g. \"payments refactor\", \
      \"flaky test hunt\"). No punctuation, no quotes, no file extensions.\n\
-     - \"summary\": at most two short sentences on what this session is about.\n\
+     - \"summary\": one compact sentence, or two only when needed, describing \
+     the session's enduring topic or goal. Maximum 140 characters. Do NOT \
+     mention progress, current status, actions already taken, results, blockers, \
+     or implementation details.\n\
      Output the JSON object and nothing else — no preamble, no code fence."
         .to_string()
 }
@@ -111,6 +114,47 @@ pub(crate) fn build_naming_prompt(transcript: &str) -> String {
         "<conversation>\n{}\n</conversation>",
         trim_opening(transcript)
     )
+}
+
+/// A deterministic topic-only fallback for when the naming request is missing,
+/// slow, fails, or omits its summary. Prefer the opening user turn and stop when
+/// the first agent turn begins; then apply the same hard summary shape as model
+/// output. This keeps the jump panel informative without pretending a network
+/// convenience is a reliable storage system.
+pub(crate) fn fallback_topic_summary(transcript: &str) -> Option<String> {
+    let mut topic = String::new();
+    for raw in transcript.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        let is_agent = ["agent:", "assistant:", "claude:", "codex:"]
+            .iter()
+            .any(|prefix| lower.starts_with(prefix));
+        if is_agent {
+            if !topic.is_empty() {
+                break;
+            }
+            continue;
+        }
+        let user_line = ["user:", "you:"]
+            .iter()
+            .find_map(|prefix| lower.starts_with(prefix).then(|| line[prefix.len()..].trim()))
+            .unwrap_or(line)
+            .trim_start_matches(['#', '-', '*', '>', ' ']);
+        if user_line.is_empty() {
+            continue;
+        }
+        if !topic.is_empty() {
+            topic.push(' ');
+        }
+        topic.push_str(user_line);
+        if topic.chars().count() >= MAX_SUMMARY_CHARS {
+            break;
+        }
+    }
+    sanitize_summary(&topic)
 }
 
 /// Strip one layer of markdown code fence, if the model wrapped its JSON.
@@ -164,7 +208,7 @@ pub(crate) fn sanitize_name(raw: &str) -> Option<String> {
     if name.is_empty() { None } else { Some(name) }
 }
 
-/// Reduce the model's summary to at most two sentences and
+/// Reduce the model's summary to at most two compact sentences and
 /// [`MAX_SUMMARY_CHARS`] characters. Newlines are collapsed — the jump panel
 /// renders this as a single small italic line.
 pub(crate) fn sanitize_summary(raw: &str) -> Option<String> {
@@ -252,11 +296,12 @@ pub(crate) fn naming_api_key() -> Option<String> {
 pub(crate) fn request_session_name(api_key: &str, transcript: &str) -> Result<SessionNaming, String> {
     let body = serde_json::json!({
         "model": NAMING_MODEL,
-        "max_tokens": 200,
+        "max_tokens": 120,
         "system": naming_system_prompt(),
         "messages": [{ "role": "user", "content": build_naming_prompt(transcript) }],
     });
     let value: serde_json::Value = match ureq::post(MESSAGES_URL)
+        .timeout(std::time::Duration::from_secs(8))
         .set("content-type", "application/json")
         .set("x-api-key", api_key)
         .set("anthropic-version", ANTHROPIC_VERSION)
