@@ -23,9 +23,21 @@ use yalda::session_proto::SessionInfo;
 
 /// Cache of all server-known sessions, keyed by server sid. Stable iteration is
 /// by sid; display order is by label (`entries_by_label`).
-#[derive(Default)]
 pub(crate) struct AgentRoster {
     by_sid: BTreeMap<String, SessionInfo>,
+    /// Runtime entry time for the roster's current busy/idle state. Local-open
+    /// sessions carry richer timing in `AgentState`; this covers sessions the
+    /// GUI has never attached to.
+    state_since: BTreeMap<String, std::time::Instant>,
+}
+
+impl Default for AgentRoster {
+    fn default() -> Self {
+        Self {
+            by_sid: BTreeMap::new(),
+            state_since: BTreeMap::new(),
+        }
+    }
 }
 
 impl AgentRoster {
@@ -35,6 +47,14 @@ impl AgentRoster {
         match self.by_sid.get(&info.session_id) {
             Some(existing) if *existing == info => false,
             _ => {
+                let reset_state_time = self
+                    .by_sid
+                    .get(&info.session_id)
+                    .is_none_or(|existing| existing.busy != info.busy);
+                if reset_state_time {
+                    self.state_since
+                        .insert(info.session_id.clone(), std::time::Instant::now());
+                }
                 self.by_sid.insert(info.session_id.clone(), info);
                 true
             }
@@ -43,6 +63,7 @@ impl AgentRoster {
 
     /// Drop a session (from `SessionClosed`). Returns `true` if it was present.
     pub(crate) fn remove(&mut self, sid: &str) -> bool {
+        self.state_since.remove(sid);
         self.by_sid.remove(sid).is_some()
     }
 
@@ -55,6 +76,8 @@ impl AgentRoster {
         match self.by_sid.get_mut(sid) {
             Some(info) if info.busy != busy => {
                 info.busy = busy;
+                self.state_since
+                    .insert(sid.to_string(), std::time::Instant::now());
                 true
             }
             _ => false,
@@ -79,16 +102,31 @@ impl AgentRoster {
     /// `true` if the contents changed (so the caller can decide to notify).
     pub(crate) fn replace_all(&mut self, sessions: Vec<SessionInfo>) -> bool {
         let mut next = BTreeMap::new();
+        let now = std::time::Instant::now();
+        let mut next_state_since = BTreeMap::new();
         for s in sessions {
+            let since = self
+                .by_sid
+                .get(&s.session_id)
+                .filter(|old| old.busy == s.busy)
+                .and_then(|_| self.state_since.get(&s.session_id))
+                .copied()
+                .unwrap_or(now);
+            next_state_since.insert(s.session_id.clone(), since);
             next.insert(s.session_id.clone(), s);
         }
         let changed = next != self.by_sid;
         self.by_sid = next;
+        self.state_since = next_state_since;
         changed
     }
 
     pub(crate) fn get(&self, sid: &str) -> Option<&SessionInfo> {
         self.by_sid.get(sid)
+    }
+
+    pub(crate) fn state_since(&self, sid: &str) -> Option<std::time::Instant> {
+        self.state_since.get(sid).copied()
     }
 
     #[allow(dead_code)] // used by the Phase-2 selector projection

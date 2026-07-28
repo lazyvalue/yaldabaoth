@@ -1760,8 +1760,12 @@ struct YaldaGpuiView {
     jump_cwd_order: Vec<String>,
     /// User's drag-reordered order of jump-panel sessions within their cwd group
     /// (jump-reorder; `Preferences::jump_session_order`). Ordered server sids;
-    /// empty = by-label. A session never crosses cwd groups (drop is cwd-gated).
+    /// empty = by-label until the first roster refresh freezes that order. A
+    /// session never crosses cwd groups (drop is cwd-gated).
     jump_session_order: Vec<String>,
+    /// Per-project live-state slice selected in the jump panel. Missing means
+    /// `All`; runtime-only because ProjectId is not durable across restarts.
+    jump_agent_tabs: HashMap<ProjectId, JumpAgentTab>,
     /// Project names whose jump-panel children are hidden. Names, rather than
     /// runtime-local ProjectIds, make the preference durable across restart.
     jump_folded_projects: std::collections::HashSet<String>,
@@ -1782,12 +1786,13 @@ struct YaldaGpuiView {
     /// panels (`render_agent`), NOT in the global jump panel.
     recaps: HashMap<SessionId, RecapState>,
     /// Sessions this GUI has NO local state for that finished a turn while you
-    /// were elsewhere (`bug-0022`), keyed by server sid. Fed by the server's
-    /// `SessionBusy` busy→idle broadcast, cleared when you jump to the session.
+    /// were elsewhere (`bug-0022`), keyed by server sid with the instant they
+    /// entered that unread state. Fed by the server's `SessionBusy` busy→idle
+    /// broadcast, cleared when you jump to the session.
     /// This is the roster-side twin of `AgentState::unread`: without it, "your
     /// turn" could only ever light up for sessions open in this GUI, which is
     /// what made the jump panel's status marks look arbitrary.
-    roster_unread: std::collections::HashSet<String>,
+    roster_unread: HashMap<String, std::time::Instant>,
     /// Durable autoname summaries, keyed by SERVER session id (`bug-0020`).
     /// Loaded once at construction from the id-keyed sidecar
     /// (`session_summaries.json`) and written at `finish_autoname`. The live
@@ -1847,10 +1852,11 @@ impl YaldaGpuiView {
             jump_panel_visible: true,
             jump_cwd_order: Vec::new(),
             jump_session_order: Vec::new(),
+            jump_agent_tabs: HashMap::new(),
             jump_folded_projects: std::collections::HashSet::new(),
             jump_order_succession: HashMap::new(),
             recaps: HashMap::new(),
-            roster_unread: std::collections::HashSet::new(),
+            roster_unread: HashMap::new(),
             // bug-0020: id-keyed autoname summaries, durable across restarts.
             session_summaries: crate::persist::load_session_summaries(),
         }
@@ -1895,10 +1901,11 @@ impl YaldaGpuiView {
             jump_panel_visible: true,
             jump_cwd_order: Vec::new(),
             jump_session_order: Vec::new(),
+            jump_agent_tabs: HashMap::new(),
             jump_folded_projects: std::collections::HashSet::new(),
             jump_order_succession: HashMap::new(),
             recaps: HashMap::new(),
-            roster_unread: std::collections::HashSet::new(),
+            roster_unread: HashMap::new(),
             // bug-0020: id-keyed autoname summaries, durable across restarts.
             session_summaries: crate::persist::load_session_summaries(),
         }

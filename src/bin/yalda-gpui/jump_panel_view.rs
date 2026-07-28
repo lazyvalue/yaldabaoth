@@ -27,6 +27,27 @@ use super::*;
 /// document zoom (consistent with the workspace strip / rail).
 pub(crate) const JUMP_PANEL_WIDTH: f32 = 320.0;
 
+/// The per-project agent list selected under that project's workspace rows.
+/// `All` is the default so the new control preserves the panel's existing
+/// visibility until the user asks for a live-state slice.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum JumpAgentTab {
+    Waiting,
+    Working,
+    #[default]
+    All,
+}
+
+impl JumpAgentTab {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Waiting => "Waiting",
+            Self::Working => "Working",
+            Self::All => "All",
+        }
+    }
+}
+
 /// What a jump-panel agent row points at (universal-agent-list). A session may
 /// be opened here (`Local`, keyed by store `SessionId`) or known only to the
 /// server via the roster (`Roster`, keyed by server sid) — running but never
@@ -52,10 +73,10 @@ pub(crate) struct AgentRow {
     pub(crate) connected: bool,
     /// Per-session turn activity, when this GUI has the session open (in
     /// `self.sessions`): `Some(true)` = a reply is in flight (**working**),
-    /// `Some(false)` = the turn finished and it's the user's move (**waiting for
-    /// you**). `None` = roster-only (running on the server but never opened
-    /// here), so the phase is unknown and the dot stays neutral. Drives the
-    /// status-dot color in `render_jump_panel`.
+    /// `Some(false)` = no reply is in flight. Roster-backed rows also receive
+    /// `Some(info.busy)` from the server; `None` is reserved for genuinely
+    /// unknown local state. Unread decides whether idle means waiting on you.
+    /// Drives the status-dot color in `render_jump_panel`.
     pub(crate) awaiting: Option<bool>,
     /// The session finished a turn whose output the user hasn't looked at
     /// ("waiting on you") — `AgentState.unread`. `false` for roster-only sessions
@@ -74,6 +95,10 @@ pub(crate) struct AgentRow {
     /// through the whole close→create→bind window instead of falling to the
     /// bottom (bug-0007). `None` = genuinely new, unranked, sorts after.
     pub(crate) order_sid: Option<String>,
+    /// When the row entered its CURRENT live state. Working rows source this
+    /// from the turn start; waiting rows source it from the unread transition.
+    /// State tabs sort ascending, making the most recent transition last.
+    pub(crate) state_entered_at: Option<std::time::Instant>,
 }
 
 /// Drag payload for a session row being reordered (jump-reorder). Carries the
@@ -204,7 +229,27 @@ impl YaldaGpuiView {
                 .or(Some(info.busy));
             let unread = opened
                 .map(|e| e.read(cx).state.unread)
-                .unwrap_or_else(|| self.roster_unread.contains(&info.session_id));
+                .unwrap_or_else(|| self.roster_unread.contains_key(&info.session_id));
+            let state_entered_at = opened
+                .and_then(|e| {
+                    let state = &e.read(cx).state;
+                    if state.turn_phase.is_awaiting() {
+                        state.turn_phase.turn_started()
+                    } else if state.unread {
+                        state.unread_since
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| {
+                    if info.busy {
+                        self.agent_roster.state_since(&info.session_id)
+                    } else if unread {
+                        self.roster_unread.get(&info.session_id).copied()
+                    } else {
+                        None
+                    }
+                });
             // bug-0020: the live session is authoritative, but a session that is
             // NOT open here (free, or freshly restored before attach) still has a
             // durable summary in the id-keyed sidecar. Without this fallback the
@@ -227,6 +272,7 @@ impl YaldaGpuiView {
                 awaiting,
                 unread,
                 order_sid: Some(info.session_id.clone()),
+                state_entered_at,
             });
         }
 
@@ -264,6 +310,16 @@ impl YaldaGpuiView {
                     .sid_of(id)
                     .map(|s| s.as_str().to_string())
                     .or_else(|| self.jump_order_succession.get(&id).cloned()),
+                state_entered_at: {
+                    let state = &ent.read(cx).state;
+                    if state.turn_phase.is_awaiting() {
+                        state.turn_phase.turn_started()
+                    } else if state.unread {
+                        state.unread_since
+                    } else {
+                        None
+                    }
+                },
             });
         }
         // Order the COMBINED list (roster + local-only) by label, so a session sits
@@ -333,6 +389,7 @@ pub(crate) struct JumpProjectSection {
     pub(crate) id: ProjectId,
     pub(crate) name: String,
     pub(crate) cwd_display: String,
+    pub(crate) agent_tab: JumpAgentTab,
     /// `(global workspace idx, label, is-active)` — idx+1 is the `ctrl-<n>` number.
     pub(crate) workspaces: Vec<(usize, String, bool)>,
     /// `(flat row index, row)` — the flat index is the stable listener key.
@@ -384,11 +441,14 @@ impl YaldaGpuiView {
                     (idx, t.display_label().to_string(), idx == self.workspace.active_workspace)
                 })
                 .collect();
-            let sessions = by_project.remove(&id).unwrap_or_default();
+            let agent_tab = self.jump_agent_tabs.get(&id).copied().unwrap_or_default();
+            let sessions =
+                agent_rows_for_tab(by_project.remove(&id).unwrap_or_default(), agent_tab);
             sections.push(JumpProjectSection {
                 id,
                 name: p.name.clone(),
                 cwd_display: shorten_cwd_for_display(&p.cwd),
+                agent_tab,
                 workspaces,
                 sessions,
             });
@@ -402,6 +462,27 @@ impl YaldaGpuiView {
         sections.sort_by_key(|s| cwd_rank(&s.cwd_display));
         (sections, unfiled)
     }
+}
+
+/// Apply one project's selected agent-state tab. Waiting and Working are live
+/// queues sorted by when each row entered that state (oldest first, newest
+/// last). All preserves the incoming custom order exactly; a state transition
+/// therefore never moves an All row.
+pub(crate) fn agent_rows_for_tab(
+    mut rows: Vec<(usize, AgentRow)>,
+    tab: JumpAgentTab,
+) -> Vec<(usize, AgentRow)> {
+    let wanted = match tab {
+        JumpAgentTab::Waiting => Some(AgentDotStatus::WaitingForYou),
+        JumpAgentTab::Working => Some(AgentDotStatus::Working),
+        JumpAgentTab::All => None,
+    };
+    let Some(wanted) = wanted else {
+        return rows;
+    };
+    rows.retain(|(_, row)| row.dot_status() == wanted);
+    rows.sort_by_key(|(_, row)| row.state_entered_at);
+    rows
 }
 
 /// Group agent rows by their cwd for the jump panel's per-cwd subheaders
@@ -476,6 +557,24 @@ pub(crate) fn reorder_move(v: &mut Vec<String>, dragged: &str, target: &str) {
 }
 
 impl YaldaGpuiView {
+    /// Append newly discovered server sessions to the durable All order without
+    /// disturbing any existing slot. On the first roster seed this freezes the
+    /// historical by-label default; every later Created event appends exactly
+    /// one sid at the bottom.
+    pub(crate) fn append_new_jump_sessions(
+        &mut self,
+        sids: impl IntoIterator<Item = String>,
+    ) -> bool {
+        let mut changed = false;
+        for sid in sids {
+            if !self.jump_session_order.contains(&sid) {
+                self.jump_session_order.push(sid);
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Reorder the jump-panel cwd group `dragged` to `target`'s header position
     /// (jump-reorder, cwd-level drag). Rebuilds `jump_cwd_order` over the CURRENT
     /// set of group keys (in their present display order) so it stays a total
@@ -546,6 +645,26 @@ impl YaldaGpuiView {
 }
 
 impl YaldaGpuiView {
+    /// Select the agent-state slice for one project. `All` is represented by an
+    /// absent entry, keeping the runtime map sparse.
+    pub(crate) fn select_jump_agent_tab(
+        &mut self,
+        project: ProjectId,
+        tab: JumpAgentTab,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self.jump_agent_tabs.get(&project).copied().unwrap_or_default();
+        if current == tab {
+            return;
+        }
+        if tab == JumpAgentTab::All {
+            self.jump_agent_tabs.remove(&project);
+        } else {
+            self.jump_agent_tabs.insert(project, tab);
+        }
+        cx.notify();
+    }
+
     /// Fold or unfold one project's children. Project names are the durable
     /// human key (project ids are runtime-local), so folded state is keyed and
     /// persisted by name.
@@ -656,6 +775,7 @@ impl YaldaGpuiView {
 
         for section in sections {
             let pid = section.id;
+            let agent_tab = section.agent_tab;
             let cwd_key = section.cwd_display.clone();
             let project_name = section.name.clone();
             let folded = self.jump_folded_projects.contains(&project_name);
@@ -759,7 +879,34 @@ impl YaldaGpuiView {
                 ));
             }
 
+            // Per-project state tabs sit directly under the workspace list.
+            // Their selection is independent across projects.
+            let mut tabs = div().flex().flex_row().gap_1().w_full().px_3().py_1();
+            for tab in
+                [JumpAgentTab::Waiting, JumpAgentTab::Working, JumpAgentTab::All]
+            {
+                let tab_probe = format!(
+                    "jump-agent-tab-{}-{}",
+                    pid.0,
+                    tab.label().to_lowercase()
+                );
+                let button = compact_tab(
+                    SharedString::from(tab_probe.clone()),
+                    tab.label(),
+                    tab == agent_tab,
+                    sel_bg,
+                    &st,
+                )
+                .on_click(cx.listener(move |this, _ev, _window, cx| {
+                    this.select_jump_agent_tab(pid, tab, cx)
+                }));
+                tabs = tabs.child(probe_bounds_dyn(tab_probe, button.into_any_element()));
+            }
+            col = col.child(tabs);
+
             // AGENT SESSIONS sublist (status-colored `✦` + accent marks preserved).
+            // Drag order belongs only to All; state tabs own their chronological
+            // order and therefore do not expose drag affordances.
             for (i, row) in section.sessions {
                 let active =
                     jump_target_is_active(&row.target, active_local, active_sid.as_deref());
@@ -774,6 +921,7 @@ impl YaldaGpuiView {
                     active,
                     drag_fg,
                     drag_font.clone(),
+                    agent_tab == JumpAgentTab::All,
                     cx,
                 ));
             }
@@ -808,6 +956,7 @@ impl YaldaGpuiView {
                         active,
                         drag_fg,
                         drag_font.clone(),
+                        true,
                         cx,
                     ));
                 }
@@ -837,6 +986,7 @@ fn jump_session_row_el(
     active: bool,
     drag_fg: Hsla,
     drag_font: SharedString,
+    allow_drag: bool,
     cx: &mut Context<YaldaGpuiView>,
 ) -> gpui::AnyElement {
     // The agent-session icon is a `✦` whose COLOR carries the status (one glyph =
@@ -893,7 +1043,9 @@ fn jump_session_row_el(
         let target = target.clone();
         move |this, _ev, _window, cx| this.jump_to_agent(target.clone(), cx)
     }));
-    if let JumpTarget::Roster(sid) = &row.target {
+    if allow_drag
+        && let JumpTarget::Roster(sid) = &row.target
+    {
         let sid = sid.clone();
         let cwd_key = shorten_cwd_for_display(&row.cwd);
         let label: SharedString = row.label.clone().into();
