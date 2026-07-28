@@ -1208,6 +1208,7 @@ fn agent_dot_status_mapping() {
         order_sid: None,
         state_entered_at: None,
         summary_pending: false,
+        archived: false,
         target: JumpTarget::Roster("s".into()),
         label: "x".into(),
         summary: None,
@@ -7120,6 +7121,7 @@ fn jump_reorder_ordering_applies_and_defaults_to_alpha() {
         label: label.into(),
         summary: None,
         summary_pending: false,
+        archived: false,
         cwd: std::path::PathBuf::from(cwd),
         bound: false,
         connected: true,
@@ -7177,6 +7179,7 @@ fn jump_agent_state_tabs_filter_and_sort_without_moving_all() {
         label: label.into(),
         summary: None,
         summary_pending: false,
+        archived: false,
         cwd: std::path::PathBuf::from("/work"),
         bound: false,
         connected: true,
@@ -7188,12 +7191,15 @@ fn jump_agent_state_tabs_filter_and_sort_without_moving_all() {
     // Incoming order represents the user's custom All order, deliberately
     // unrelated to either state's chronology.
     let make = || {
+        let mut archived = row("arch", "archived", Some(true), false, 3);
+        archived.archived = true;
         vec![
             (0, row("w-new", "wait-new", Some(false), true, 1)),
             (1, row("quiet", "quiet", Some(false), false, 50)),
             (2, row("k-new", "work-new", Some(true), false, 2)),
             (3, row("w-old", "wait-old", Some(false), true, 20)),
             (4, row("k-old", "work-old", Some(true), false, 30)),
+            (5, archived),
         ]
     };
     let labels = |rows: Vec<(usize, AgentRow)>| {
@@ -7213,7 +7219,12 @@ fn jump_agent_state_tabs_filter_and_sort_without_moving_all() {
     assert_eq!(
         labels(agent_rows_for_tab(make(), JumpAgentTab::All)),
         vec!["wait-new", "quiet", "work-new", "wait-old", "work-old"],
-        "All never reorders when state-derived tabs do"
+        "All never reorders when state-derived tabs do and excludes archived rows"
+    );
+    assert_eq!(
+        labels(agent_rows_for_tab(make(), JumpAgentTab::Archived)),
+        vec!["archived"],
+        "Archived is the complementary durable-order slice"
     );
 }
 
@@ -7273,7 +7284,7 @@ fn jump_project_agent_tabs_are_independent_and_all_appends(cx: &mut TestAppConte
         outer_y - (workspace_y + workspace_h) >= 8.0,
         "tabs need visible breathing room after workspaces"
     );
-    for tab in ["waiting", "working", "all"] {
+    for tab in ["waiting", "working", "all", "archived"] {
         let label = format!("jump-agent-tab-{}-{tab}", pid.0);
         let (x, y, w, h) = crate::layout_probe_get(&label)
             .unwrap_or_else(|| panic!("the per-project {tab} tab must paint"));
@@ -7354,6 +7365,199 @@ fn jump_project_agent_tabs_are_independent_and_all_appends(cx: &mut TestAppConte
         vec!["quiet", "work", "wait", "aaa-new"],
         "state changes preserve slots and a new agent appends at the bottom"
     );
+}
+
+/// UXI-JumpPanel-16: archive is a visibility flag complementary to the ordinary
+/// tabs. Even when the sidebar itself is on Archived, Cmd-P must project the
+/// unarchived All roster rather than leaking archived sessions or inheriting the
+/// current tab filter.
+#[gpui::test]
+fn jump_session_archive_filters_tabs_palette_and_persists(cx: &mut TestAppContext) {
+    use crate::JumpAgentTab;
+    use yalda::session_proto::SessionInfo;
+    let (view, vcx) = boot_browser(cx);
+    let (pid, cwd) = view.update(vcx, |v, _| {
+        let pid = v.workspace.active_workspace().expect("workspace").project();
+        (pid, v.projects.cwd_of(pid).expect("project cwd").to_path_buf())
+    });
+    let info = |sid: &str, label: &str, busy: bool| SessionInfo {
+        session_id: sid.into(),
+        acp_session_id: None,
+        label: label.into(),
+        cwd: cwd.clone(),
+        provider: yalda::acp_channel::AgentProvider::Claude,
+        turns: 0,
+        connected: true,
+        permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+        busy,
+    };
+    view.update(vcx, |v, _| {
+        v.agent_roster.upsert(info("S-live", "live-session", false));
+        v.agent_roster.upsert(info("S-arch", "archived-session", true));
+        v.jump_session_order = vec!["S-arch".into(), "S-live".into()];
+    });
+    let temp = tempfile::tempdir().expect("temp preferences dir");
+    let prefs_path = temp.path().join("preferences.json");
+    crate::persist::with_preferences_path(prefs_path.clone(), || {
+        view.update(vcx, |v, cx| v.set_session_archived("S-arch", true, cx));
+    });
+    let persisted = crate::persist::with_preferences_path(prefs_path, crate::persist::load_preferences);
+    assert_eq!(
+        persisted.jump_archived_sessions.as_deref(),
+        Some(&["S-arch".to_string()][..]),
+        "archive identity persists by stable server sid"
+    );
+
+    let labels = |view: &gpui::Entity<YaldaGpuiView>,
+                  vcx: &mut gpui::VisualTestContext,
+                  tab: JumpAgentTab| {
+        view.update(vcx, |v, cx| {
+            v.select_jump_agent_tab(pid, tab, cx);
+            v.jump_panel_sections(cx)
+                .0
+                .into_iter()
+                .find(|section| section.id == pid)
+                .expect("project section")
+                .sessions
+                .into_iter()
+                .map(|(_, row)| row.label)
+                .collect::<Vec<_>>()
+        })
+    };
+    assert_eq!(labels(&view, vcx, JumpAgentTab::All), vec!["live-session"]);
+    assert_eq!(labels(&view, vcx, JumpAgentTab::Waiting), vec!["live-session"]);
+    assert!(labels(&view, vcx, JumpAgentTab::Working).is_empty());
+    assert_eq!(
+        labels(&view, vcx, JumpAgentTab::Archived),
+        vec!["archived-session"],
+        "Archived preserves the durable order slice"
+    );
+
+    let palette_labels = view.update(vcx, |v, cx| {
+        v.jump_palette_items(cx)
+            .into_iter()
+            .filter(|item| item.is_agent)
+            .map(|item| item.label)
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        palette_labels,
+        vec!["live-session"],
+        "Cmd-P excludes archived sessions and ignores the sidebar's Archived selection"
+    );
+}
+
+/// UXI-JumpPanel-16 controls: a real right-click on a painted session row opens
+/// the cursor menu, whose real painted item toggles the durable flag in both
+/// directions. The active agent's dynamic Space menu exposes the same toggle and
+/// flips its copy after each action.
+#[gpui::test]
+fn jump_session_archive_controls_toggle_the_same_durable_flag(cx: &mut TestAppContext) {
+    use crate::{JumpAgentTab, JumpTarget};
+    use gpui::{Modifiers, MouseButton};
+    use yalda::session_proto::SessionInfo;
+    let (view, vcx) = boot_browser(cx);
+    install_agent_slot(&view, vcx, Some("S-menu"));
+    let pid = view.update(vcx, |v, _| {
+        let pid = v.workspace.active_workspace().expect("workspace").project();
+        let cwd = v.projects.cwd_of(pid).expect("project cwd").to_path_buf();
+        v.agent_roster.upsert(SessionInfo {
+            session_id: "S-menu".into(),
+            acp_session_id: None,
+            label: "menu-session".into(),
+            cwd,
+            provider: yalda::acp_channel::AgentProvider::Claude,
+            turns: 0,
+            connected: true,
+            permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+            busy: false,
+        });
+        pid
+    });
+    vcx.run_until_parked();
+
+    let row_center = |view: &gpui::Entity<YaldaGpuiView>,
+                      vcx: &mut gpui::VisualTestContext| {
+        crate::layout_probe_begin();
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+        let (x, y, w, h) =
+            crate::layout_probe_get("jump-session-row-0").expect("session row painted");
+        crate::layout_probe_end();
+        point(px(x + w / 2.0), px(y + h / 2.0))
+    };
+    let click_context_toggle = |view: &gpui::Entity<YaldaGpuiView>,
+                                vcx: &mut gpui::VisualTestContext| {
+        crate::layout_probe_begin();
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+        let (x, y, w, h) =
+            crate::layout_probe_get("session-menu-toggle").expect("context action painted");
+        crate::layout_probe_end();
+        let at = point(px(x + w / 2.0), px(y + h / 2.0));
+        vcx.simulate_mouse_move(at, None, Modifiers::default());
+        vcx.simulate_click(at, Modifiers::default());
+        vcx.run_until_parked();
+    };
+
+    // Ordinary row → right click → Archive.
+    let at = row_center(&view, vcx);
+    vcx.simulate_mouse_move(at, None, Modifiers::default());
+    vcx.simulate_mouse_down(at, MouseButton::Right, Modifiers::default());
+    vcx.simulate_mouse_up(at, MouseButton::Right, Modifiers::default());
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert!(
+            matches!(v.session_menu_ref(), Some(("S-menu", _, _))),
+            "right-click targets the row's stable sid"
+        );
+    });
+    click_context_toggle(&view, vcx);
+    assert!(view.read_with(vcx, |v, _| v.jump_archived_sessions.contains("S-menu")));
+
+    // Archived row → right click → Unarchive.
+    view.update(vcx, |v, cx| v.select_jump_agent_tab(pid, JumpAgentTab::Archived, cx));
+    let at = row_center(&view, vcx);
+    vcx.simulate_mouse_move(at, None, Modifiers::default());
+    vcx.simulate_mouse_down(at, MouseButton::Right, Modifiers::default());
+    vcx.simulate_mouse_up(at, MouseButton::Right, Modifiers::default());
+    vcx.run_until_parked();
+    click_context_toggle(&view, vcx);
+    assert!(!view.read_with(vcx, |v, _| v.jump_archived_sessions.contains("S-menu")));
+
+    // Space menu copy is contextual in both directions and dispatches the same
+    // set_session_archived seam as the right-click menu.
+    view.update(vcx, |v, cx| v.open_local_menu_inner(cx));
+    view.read_with(vcx, |v, _| {
+        assert!(v.menu_ref().expect("space menu").menu.iter().any(|node| {
+            node.label == "archive session"
+                && matches!(&node.action, crate::MenuAction::Command(command) if command == "archive-session")
+        }));
+    });
+    view.update(vcx, |v, cx| {
+        v.clear_overlay();
+        v.dispatch_menu_command("archive-session", cx);
+    });
+    assert!(view.read_with(vcx, |v, _| v.jump_archived_sessions.contains("S-menu")));
+
+    view.update(vcx, |v, cx| v.open_local_menu_inner(cx));
+    view.read_with(vcx, |v, _| {
+        assert!(v.menu_ref().expect("space menu").menu.iter().any(|node| {
+            node.label == "unarchive session"
+                && matches!(&node.action, crate::MenuAction::Command(command) if command == "unarchive-session")
+        }));
+    });
+    view.update(vcx, |v, cx| {
+        v.clear_overlay();
+        v.dispatch_menu_command("unarchive-session", cx);
+    });
+    assert!(!view.read_with(vcx, |v, _| v.jump_archived_sessions.contains("S-menu")));
+
+    // The direct context entry point refuses sid-less local placeholders.
+    view.update(vcx, |v, cx| {
+        v.open_session_menu(JumpTarget::Local(crate::SessionId(u64::MAX)), (20.0, 20.0), cx);
+        assert!(!v.overlay_is_session_menu());
+    });
 }
 
 /// Unit (jump-reorder): `reorder_move` drops the dragged item into the target's
@@ -7517,6 +7721,7 @@ fn clear_keeps_the_sessions_jump_panel_slot(cx: &mut TestAppContext) {
             });
         }
         v.jump_session_order = vec!["S1".into(), "S2".into()];
+        v.jump_archived_sessions.insert("S1".into());
     });
     vcx.run_until_parked();
 
@@ -7551,6 +7756,10 @@ fn clear_keeps_the_sessions_jump_panel_slot(cx: &mut TestAppContext) {
         vec!["z-one", "a-two"],
         "MID-OPEN: the /clear placeholder must hold the killed session's slot, not sink"
     );
+    assert!(
+        view.update(vcx, |v, _| v.jump_archived_sessions.contains("S1")),
+        "MID-OPEN: the placeholder retains its predecessor's archive identity"
+    );
 
     // REAL async completion: the fresh sid binds.
     let token = view
@@ -7580,6 +7789,13 @@ fn clear_keeps_the_sessions_jump_panel_slot(cx: &mut TestAppContext) {
         vec!["S-fresh".to_string(), "S2".to_string()],
         "the persisted order inherits the slot in place (no append, no duplicate)"
     );
+    view.update(vcx, |v, _| {
+        assert!(v.jump_archived_sessions.contains("S-fresh"));
+        assert!(
+            !v.jump_archived_sessions.contains("S1"),
+            "the durable archive flag migrates instead of leaving a stale sid"
+        );
+    });
 }
 
 /// Unit: the jump panel groups agent-session rows under per-cwd subheaders
@@ -7594,6 +7810,7 @@ fn jump_panel_groups_agent_rows_by_cwd() {
         order_sid: Some(label.into()),
         state_entered_at: None,
         summary_pending: false,
+        archived: false,
         target: JumpTarget::Roster(label.into()),
         label: label.into(),
         summary: None,

@@ -1001,15 +1001,26 @@ impl YaldaGpuiView {
         if old == sid {
             return;
         }
-        let Some(pos) = self.jump_session_order.iter().position(|s| *s == old) else {
-            return;
+        let archived_migrated = if self.jump_archived_sessions.remove(&old) {
+            self.jump_archived_sessions.insert(sid.to_string());
+            true
+        } else {
+            false
         };
-        // Drop any pre-existing entry for the new sid first so the list stays a
-        // set; then take the predecessor's exact index.
-        self.jump_session_order[pos] = sid.to_string();
-        let mut seen = std::collections::HashSet::new();
-        self.jump_session_order.retain(|s| seen.insert(s.clone()));
-        self.save_settings();
+        let order_migrated =
+            if let Some(pos) = self.jump_session_order.iter().position(|s| *s == old) {
+                // Drop any pre-existing entry for the new sid first so the list
+                // stays a set; then take the predecessor's exact index.
+                self.jump_session_order[pos] = sid.to_string();
+                let mut seen = std::collections::HashSet::new();
+                self.jump_session_order.retain(|s| seen.insert(s.clone()));
+                true
+            } else {
+                false
+            };
+        if archived_migrated || order_migrated {
+            self.save_settings();
+        }
     }
 
     /// Resolve an AlreadyBound conflict: the sid we tried to bind is already

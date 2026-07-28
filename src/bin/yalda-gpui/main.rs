@@ -1401,11 +1401,11 @@ struct NewProjectOverlay {
 
 /// The single, mutually-exclusive overlay layered over the screen body — at
 /// most one is open at a time (the spec's "make illegal states unrepresentable":
-/// the five sibling `Option<…>` fields this replaces could, in principle, all be
+/// the former sibling `Option<…>` fields this replaces could, in principle, all be
 /// `Some` at once, and one path did strand a `menu` behind a `rename`). `open()`
 /// **replaces** whatever was active rather than stacking; `clear()` returns to
 /// `None`. The render if-chain and key dispatch resolve the active variant in a
-/// fixed precedence (rename > buffer > session > workspace > menu).
+/// fixed precedence in `render()`.
 ///
 /// NB: the `Menu` variant's inner `MenuOverlay` has its OWN field named `menu`
 /// (`Vec<MenuNode>`) — distinct from this variant; `menu_mut()` hands back the
@@ -1421,6 +1421,13 @@ enum ProjectMenuAction {
     NewWorkspace,
     NewAgentSession,
     DeleteProject,
+}
+
+/// The jump-panel session context menu has one contextual operation. Keeping
+/// the intended value in the action makes a stale double dispatch idempotent.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SessionMenuAction {
+    SetArchived(bool),
 }
 
 #[derive(Default)]
@@ -1446,6 +1453,10 @@ enum ActiveOverlay {
     /// the target project + the window-space anchor point (already clamped to the
     /// viewport at open time).
     ProjectMenu { pid: ProjectId, x: f32, y: f32 },
+    /// Session context menu opened by right-clicking a jump-panel row. The
+    /// stable server sid is the archive identity; local sid-less placeholders
+    /// cannot open this menu.
+    SessionMenu { sid: String, x: f32, y: f32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1763,6 +1774,9 @@ struct YaldaGpuiView {
     /// empty = by-label until the first roster refresh freezes that order. A
     /// session never crosses cwd groups (drop is cwd-gated).
     jump_session_order: Vec<String>,
+    /// Durable server sids hidden from Waiting / Working / All and Cmd-P.
+    /// Archived sessions continue running and retain their All-order slot.
+    jump_archived_sessions: std::collections::HashSet<String>,
     /// Per-project live-state slice selected in the jump panel. Missing means
     /// `All`; runtime-only because ProjectId is not durable across restarts.
     jump_agent_tabs: HashMap<ProjectId, JumpAgentTab>,
@@ -1852,6 +1866,7 @@ impl YaldaGpuiView {
             jump_panel_visible: true,
             jump_cwd_order: Vec::new(),
             jump_session_order: Vec::new(),
+            jump_archived_sessions: std::collections::HashSet::new(),
             jump_agent_tabs: HashMap::new(),
             jump_folded_projects: std::collections::HashSet::new(),
             jump_order_succession: HashMap::new(),
@@ -1901,6 +1916,7 @@ impl YaldaGpuiView {
             jump_panel_visible: true,
             jump_cwd_order: Vec::new(),
             jump_session_order: Vec::new(),
+            jump_archived_sessions: std::collections::HashSet::new(),
             jump_agent_tabs: HashMap::new(),
             jump_folded_projects: std::collections::HashSet::new(),
             jump_order_succession: HashMap::new(),
@@ -3235,6 +3251,11 @@ impl YaldaGpuiView {
             jump_cwd_order: (!self.jump_cwd_order.is_empty()).then(|| self.jump_cwd_order.clone()),
             jump_session_order: (!self.jump_session_order.is_empty())
                 .then(|| self.jump_session_order.clone()),
+            jump_archived_sessions: (!self.jump_archived_sessions.is_empty()).then(|| {
+                let mut sids: Vec<_> = self.jump_archived_sessions.iter().cloned().collect();
+                sids.sort();
+                sids
+            }),
             jump_folded_projects: (!self.jump_folded_projects.is_empty()).then(|| {
                 let mut names: Vec<_> = self.jump_folded_projects.iter().cloned().collect();
                 names.sort();
@@ -4356,6 +4377,17 @@ impl YaldaGpuiView {
             None
         }
     }
+    fn overlay_is_session_menu(&self) -> bool {
+        matches!(self.active_overlay, ActiveOverlay::SessionMenu { .. })
+    }
+    /// The open session context menu's `(server sid, anchor x, anchor y)`.
+    fn session_menu_ref(&self) -> Option<(&str, f32, f32)> {
+        if let ActiveOverlay::SessionMenu { sid, x, y } = &self.active_overlay {
+            Some((sid.as_str(), *x, *y))
+        } else {
+            None
+        }
+    }
 
     fn menu_ref(&self) -> Option<&MenuOverlay> {
         if let ActiveOverlay::Menu(m) = &self.active_overlay {
@@ -4481,16 +4513,26 @@ impl YaldaGpuiView {
     /// <space> — open the content-kind-specific local menu (spec-menu-scopes.md
     /// Behavior 2). Same overlay machinery as the global menu; only the tree
     /// and header differ.
-    /// The agent tile's local menu with a live "switch model" submenu grafted
-    /// on. The base entries are static (`agent_local_menu`); the submenu's
-    /// children are built from the focused session's advertised model list so
-    /// the picker reflects exactly what the agent offers (UXI-AgentTile-16). Each
-    /// child dispatches `set-model:<id>`; the active model is marked `✓`. The
+    /// The agent tile's local menu with contextual archive/unarchive and a live
+    /// "switch model" submenu grafted on. The base entries are static
+    /// (`agent_local_menu`); model children are built from the focused session's
+    /// advertised list so the picker reflects exactly what the agent offers
+    /// (UXI-AgentTile-16). Each child dispatches `set-model:<id>`; the active
+    /// model is marked `✓`. The
     /// "switch model" entry is ALWAYS present for discoverability — when the
     /// agent hasn't advertised a picklist yet it drills into a single disabled
     /// "(models not available yet)" label rather than vanishing.
     fn agent_local_menu_dynamic(&self, cx: &mut Context<Self>) -> Vec<MenuNode> {
         let mut menu = agent_local_menu();
+        let archived = self
+            .active_server_session_id()
+            .is_some_and(|sid| self.jump_archived_sessions.contains(&sid));
+        menu.push(MenuNode::separator());
+        menu.push(if archived {
+            MenuNode::entry("a", "unarchive session", "unarchive-session")
+        } else {
+            MenuNode::entry("a", "archive session", "archive-session")
+        });
         let (models, current) = self
             .focused_bound_session()
             .and_then(|id| {
@@ -4531,13 +4573,25 @@ impl YaldaGpuiView {
         let Some(opened_from) = self.workspace.focused_window_id() else {
             return;
         };
-        let (menu, header) = match self.workspace.focused_content() {
-            Some(App::Buffer(BufferApp::Viewing(_))) => (doc_local_menu(), "DOC"),
-            Some(App::Buffer(BufferApp::Editing(_))) => (edit_local_menu(), "EDIT"),
-            Some(App::Agent(_)) => (self.agent_local_menu_dynamic(cx), "AGENT"),
-            Some(App::Buffer(BufferApp::Picking(_))) => (browser_local_menu(), "BROWSE"),
-            Some(App::Linear(_)) => (linear_local_menu(), "LINEAR"),
-            Some(App::Keymap(_)) => (keymap_local_menu(), "KEYBINDINGS"),
+        let (menu, header, disabled) = match self.workspace.focused_content() {
+            Some(App::Buffer(BufferApp::Viewing(_))) => {
+                (doc_local_menu(), "DOC", HashSet::new())
+            }
+            Some(App::Buffer(BufferApp::Editing(_))) => {
+                (edit_local_menu(), "EDIT", HashSet::new())
+            }
+            Some(App::Agent(_)) => {
+                let mut disabled = HashSet::new();
+                if self.active_server_session_id().is_none() {
+                    disabled.insert("archive-session".to_string());
+                }
+                (self.agent_local_menu_dynamic(cx), "AGENT", disabled)
+            }
+            Some(App::Buffer(BufferApp::Picking(_))) => {
+                (browser_local_menu(), "BROWSE", HashSet::new())
+            }
+            Some(App::Linear(_)) => (linear_local_menu(), "LINEAR", HashSet::new()),
+            Some(App::Keymap(_)) => (keymap_local_menu(), "KEYBINDINGS", HashSet::new()),
             None => return,
         };
         self.transient_status = None;
@@ -4549,7 +4603,7 @@ impl YaldaGpuiView {
             header,
             leader: ' ',
             opened_from,
-            disabled: HashSet::new(),
+            disabled,
         }));
         cx.notify();
     }
@@ -4826,6 +4880,8 @@ impl YaldaGpuiView {
             "claude-mode-cycle" => self.cycle_claude_permission_mode(cx),
             "claude-clear" => self.clear_agent_session(cx),
             "claude-rename" => self.open_rename_overlay(cx),
+            "archive-session" => self.set_focused_session_archived(true, cx),
+            "unarchive-session" => self.set_focused_session_archived(false, cx),
             "claude-cd" => self.open_change_agent_cwd_overlay(cx),
             "dev-restart-gui" => self.dev_rebuild_restart_gui(cx),
             "dev-restart-all" => self.dev_rebuild_restart_all(cx),
@@ -5764,6 +5820,80 @@ impl YaldaGpuiView {
             Key::Char('w') => self.project_menu_action(pid, ProjectMenuAction::NewWorkspace, cx),
             Key::Char('a') => self.project_menu_action(pid, ProjectMenuAction::NewAgentSession, cx),
             Key::Char('d') => self.project_menu_action(pid, ProjectMenuAction::DeleteProject, cx),
+            _ => {}
+        }
+    }
+
+    /// Open the jump-panel session context menu at the pointer. Roster rows
+    /// already carry a sid; a local row is eligible once its store entry has
+    /// bound one. Sid-less create placeholders intentionally do nothing.
+    pub(crate) fn open_session_menu(
+        &mut self,
+        target: JumpTarget,
+        pos: (f32, f32),
+        cx: &mut Context<Self>,
+    ) {
+        if self.has_overlay() {
+            return;
+        }
+        let sid = match target {
+            JumpTarget::Roster(sid) => Some(sid),
+            JumpTarget::Local(id) => self.sessions.sid_of(id).map(|sid| sid.to_string()),
+        };
+        let Some(sid) = sid else {
+            return;
+        };
+        const MENU_W: f32 = 210.0;
+        const MENU_H: f32 = 44.0;
+        let (vw, vh) = (self.viewport_width_px, self.viewport_height_px);
+        let mut x = pos.0 + 2.0;
+        let mut y = pos.1 + 4.0;
+        if vw > 0.0 && x + MENU_W > vw {
+            x = (vw - MENU_W).max(0.0);
+        }
+        if vh > 0.0 && y + MENU_H > vh {
+            y = (pos.1 - MENU_H).max(0.0);
+        }
+        self.open_overlay(ActiveOverlay::SessionMenu { sid, x, y });
+        cx.notify();
+    }
+
+    fn session_menu_action(
+        &mut self,
+        sid: &str,
+        action: SessionMenuAction,
+        cx: &mut Context<Self>,
+    ) {
+        self.clear_overlay();
+        match action {
+            SessionMenuAction::SetArchived(archived) => {
+                self.set_session_archived(sid, archived, cx)
+            }
+        }
+    }
+
+    fn handle_session_menu_key(
+        &mut self,
+        ev: &KeyDownEvent,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((sid, _, _)) = self.session_menu_ref() else {
+            return;
+        };
+        let sid = sid.to_string();
+        let archived = self.jump_archived_sessions.contains(&sid);
+        let press = keystroke_to_keypress(&ev.keystroke);
+        match press.key {
+            Key::Esc => {
+                self.clear_overlay();
+                cx.notify();
+            }
+            Key::Char('a') | Key::Char('u') => self.session_menu_action(
+                &sid,
+                SessionMenuAction::SetArchived(!archived),
+                cx,
+            ),
             _ => {}
         }
     }
@@ -7216,32 +7346,18 @@ impl YaldaGpuiView {
                     label: &str,
                     label_color: Hsla,
                     action: ProjectMenuAction| {
-            div()
-                .id(SharedString::from(id.to_string()))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .mx(px(4.0))
-                .px_3()
-                .py(px(6.0))
-                .rounded(px(4.0))
-                .cursor_pointer()
-                .font_family(mono.clone())
-                .text_size(px(13.0))
-                .font_weight(FontWeight::MEDIUM)
-                .hover(|s| s.bg(hover_bg))
-                .child(
-                    div()
-                        .w(px(16.0))
-                        .flex_none()
-                        .text_color(glyph_color)
-                        .child(SharedString::from(glyph.to_string())),
-                )
-                .child(div().flex_1().text_color(label_color).child(SharedString::from(label.to_string())))
-                .on_click(cx.listener(move |this, _ev, _w, cx| {
-                    this.project_menu_action(pid, action, cx)
-                }))
+            context_menu_item(
+                SharedString::from(id.to_string()),
+                glyph,
+                glyph_color,
+                label,
+                label_color,
+                hover_bg,
+                &mono,
+            )
+            .on_click(cx.listener(move |this, _ev, _w, cx| {
+                this.project_menu_action(pid, action, cx)
+            }))
         };
         // Tag each item with its painted bounds so the harness can click the REAL
         // rect (bug-0019) instead of a computed guess.
@@ -7305,6 +7421,73 @@ impl YaldaGpuiView {
                 }),
             );
 
+        div().absolute().inset_0().child(backdrop).child(popup)
+    }
+
+    /// One-item context menu for a jump-panel session row. The action is
+    /// contextual at render time so an archived row always offers restoration.
+    fn render_session_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (sid, x, y) = self.session_menu_ref().expect("session menu open");
+        let sid = sid.to_string();
+        let archived = self.jump_archived_sessions.contains(&sid);
+        let ov = &self.theme.overlay;
+        let menu_bg: Hsla = nc(ov.bg);
+        let popup_border: Hsla = nc(ov.border);
+        let item_fg: Hsla = nc(ov.fg);
+        let glyph_color = if archived {
+            nc(self.theme.agent.tool_completed)
+        } else {
+            nc(self.theme.agent.dim)
+        };
+        let mut hover_bg: Hsla = nc(self.theme.agent.frozen_bar);
+        hover_bg.a = 0.15;
+        let mono = self.code_font.clone();
+        let (glyph, label) = if archived {
+            ("↩", "Unarchive session")
+        } else {
+            ("◇", "Archive session")
+        };
+        let action = SessionMenuAction::SetArchived(!archived);
+        let item = context_menu_item(
+            "session-menu-toggle",
+            glyph,
+            glyph_color,
+            label,
+            item_fg,
+            hover_bg,
+            &mono,
+        )
+        .on_click(cx.listener({
+            let sid = sid.clone();
+            move |this, _ev, _w, cx| this.session_menu_action(&sid, action, cx)
+        }));
+        let popup = div()
+            .absolute()
+            .occlude()
+            .left(px(x))
+            .top(px(y))
+            .min_w(px(196.0))
+            .bg(menu_bg)
+            .border_1()
+            .border_color(popup_border)
+            .rounded(px(6.0))
+            .shadow_md()
+            .py(px(4.0))
+            .child(probe_bounds_dyn(
+                "session-menu-toggle".to_string(),
+                item.into_any_element(),
+            ));
+        let backdrop = div()
+            .id("session-menu-backdrop")
+            .absolute()
+            .inset_0()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _ev: &MouseDownEvent, _w, cx| {
+                    this.clear_overlay();
+                    cx.notify();
+                }),
+            );
         div().absolute().inset_0().child(backdrop).child(popup)
     }
 
@@ -7628,6 +7811,20 @@ impl Render for YaldaGpuiView {
                 }))
                 .child(screen_view)
                 .child(self.render_project_menu(cx))
+                .into_any_element();
+        }
+
+        if self.overlay_is_session_menu() {
+            return div()
+                .track_focus(&self.focus_handle)
+                .key_context("SessionMenuView")
+                .size_full()
+                .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
+                    this.handle_session_menu_key(ev, w, cx);
+                    cx.stop_propagation();
+                }))
+                .child(screen_view)
+                .child(self.render_session_menu(cx))
                 .into_any_element();
         }
 
@@ -8263,6 +8460,9 @@ fn main() {
                         }
                         if let Some(o) = prefs.jump_session_order {
                             view.jump_session_order = o;
+                        }
+                        if let Some(sids) = prefs.jump_archived_sessions {
+                            view.jump_archived_sessions = sids.into_iter().collect();
                         }
                         if let Some(names) = prefs.jump_folded_projects {
                             view.jump_folded_projects = names.into_iter().collect();

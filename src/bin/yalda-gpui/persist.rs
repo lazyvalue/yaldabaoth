@@ -548,6 +548,10 @@ pub(crate) struct Preferences {
     /// list suffices. `None`/absent = by-label (the default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) jump_session_order: Option<Vec<String>>,
+    /// Server session ids hidden from everyday jump navigation. Archive is a
+    /// durable visibility flag, independent of the session's live activity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) jump_archived_sessions: Option<Vec<String>>,
     /// Folded jump-panel projects, keyed by durable project name (ProjectId is
     /// runtime-local). Absent means every project starts expanded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
