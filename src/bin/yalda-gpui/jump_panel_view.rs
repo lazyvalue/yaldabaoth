@@ -460,6 +460,9 @@ pub(crate) struct JumpProjectSection {
     pub(crate) name: String,
     pub(crate) cwd_display: String,
     pub(crate) agent_tab: JumpAgentTab,
+    /// Live non-archived totals for the two operational tabs.
+    pub(crate) waiting_count: usize,
+    pub(crate) working_count: usize,
     /// `(global workspace idx, label, is-active)` — idx+1 is the `ctrl-<n>` number.
     pub(crate) workspaces: Vec<(usize, String, bool)>,
     /// `(flat row index, row)` — the flat index is the stable listener key.
@@ -530,13 +533,27 @@ impl YaldaGpuiView {
                 .collect();
             let selected_tab = self.jump_agent_tabs.get(&id).copied().unwrap_or_default();
             let agent_tab = forced_tab.unwrap_or(selected_tab);
-            let sessions =
-                agent_rows_for_tab(by_project.remove(&id).unwrap_or_default(), agent_tab);
+            let project_rows = by_project.remove(&id).unwrap_or_default();
+            let waiting_count = project_rows
+                .iter()
+                .filter(|(_, row)| {
+                    !row.archived && row.activity() == AgentActivity::Waiting
+                })
+                .count();
+            let working_count = project_rows
+                .iter()
+                .filter(|(_, row)| {
+                    !row.archived && row.activity() == AgentActivity::Working
+                })
+                .count();
+            let sessions = agent_rows_for_tab(project_rows, agent_tab);
             sections.push(JumpProjectSection {
                 id,
                 name: p.name.clone(),
                 cwd_display: shorten_cwd_for_display(&p.cwd),
                 agent_tab: selected_tab,
+                waiting_count,
+                working_count,
                 workspaces,
                 sessions,
             });
@@ -931,6 +948,8 @@ impl YaldaGpuiView {
         for section in sections {
             let pid = section.id;
             let agent_tab = section.agent_tab;
+            let waiting_count = section.waiting_count;
+            let working_count = section.working_count;
             let cwd_key = section.cwd_display.clone();
             let project_name = section.name.clone();
             let folded = self.jump_folded_projects.contains(&project_name);
@@ -1063,9 +1082,25 @@ impl YaldaGpuiView {
                     pid.0,
                     tab.label().to_lowercase()
                 );
+                let indicator = match tab {
+                    JumpAgentTab::Waiting => Some(("waiting", waiting_count, ready)),
+                    JumpAgentTab::Working => Some(("working", working_count, working_orange)),
+                    JumpAgentTab::All | JumpAgentTab::Archived => None,
+                }
+                .map(|(slug, count, tint)| {
+                    let probe = format!("jump-agent-tab-count-{}-{slug}", pid.0);
+                    let indicator = compact_count_indicator(
+                        SharedString::from(probe.clone()),
+                        count,
+                        tint,
+                        &st,
+                    );
+                    probe_bounds_dyn(probe, indicator.into_any_element())
+                });
                 let button = compact_tab(
                     SharedString::from(tab_probe.clone()),
                     tab.label(),
+                    indicator,
                     tab == agent_tab,
                     sel_bg,
                     &st,

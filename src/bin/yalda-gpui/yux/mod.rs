@@ -7,7 +7,8 @@
 //!    the one lever that keeps typing latency O(changed), not O(whole tree).
 //! 2. **Reusable view primitives** (`detail`) — `DetailStyle` + the
 //!    domain-free building blocks (`multiline_text`, `kv_row`,
-//!    `section_heading`, `compact_tab`, `compact_list_group_heading`,
+//!    `section_heading`, `compact_tab`, `compact_count_indicator`,
+//!    `compact_list_group_heading`,
 //!    `context_menu_item`, `note_block`, `fmt_iso_datetime`) that any surface
 //!    composes from.
 //! 3. **Virtualized scroll surfaces** (`list`) — `ScrollAnchoredList`, the one

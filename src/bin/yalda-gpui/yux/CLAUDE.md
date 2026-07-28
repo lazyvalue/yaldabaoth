@@ -33,9 +33,12 @@ style bundle so a caller themes once:
   one child per line (a bare `SharedString` collapses newlines). Empty → `—`.
 - **`kv_row(label, value, &DetailStyle)`** — fixed-label / value row.
 - **`section_heading(text, &DetailStyle)`** — underlined section header.
-- **`compact_tab(id, label, selected, selected_bg, &DetailStyle)`** — equal-width
-  compact tab chrome; selection is carried by its background and every label
-  keeps normal foreground contrast. The caller owns the enclosing tab group.
+- **`compact_tab(id, label, indicator, selected, selected_bg, &DetailStyle)`** —
+  equal-width compact tab chrome with an optional inline indicator; selection
+  is carried by its background and every label keeps normal foreground
+  contrast. The caller owns the enclosing tab group.
+- **`compact_count_indicator(id, count, tint, &DetailStyle)`** — compact semantic
+  number pill for tabs and other narrow chrome.
 - **`compact_list_group_heading(id, glyph, label, count, tint, &DetailStyle)`**
   — small uppercase label + count + trailing hairline for headed dense lists.
 - **`context_menu_item(id, glyph, colors, label, font)`** — shared compact
