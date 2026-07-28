@@ -168,40 +168,45 @@ construction. (The earlier stand-alone `jump_group_header` helper + its
 `jump_panel_groups_sessions_by_project` test were removed once T005's
 `jump_panel_sections` became the sole render path — single-sourced.)
 
-### UXI-Project-4 — Creating a project asks for a name + cwd and starts empty
+### UXI-Project-4 — Creating a project asks for its cwd and starts empty
 
-**Statement.** The top-level **＋ New project** opens an overlay prompting for a
-**name** and a **cwd** (resolved by `resolve_agent_cwd_arg`). On commit a new,
-**empty** project (zero workspaces, zero sessions) is created and persisted; a
-**duplicate name** is refused with a transient error and creates nothing; an
-empty name cancels. The per-project **＋ New workspace / ＋ New agent session**
+> **Simplified entry.** `?` → `p` now asks only for the cwd. The project name
+> is derived from the directory basename using `project_name_for_cwd`; a name
+> collision is uniquified with ` (2)`, ` (3)`, and so on. The two-field
+> name/cwd overlay described in the historical notes is superseded.
+
+**Statement.** The global **new project** command (`?` → `p`) opens an overlay
+prompting for a **cwd** (resolved by `resolve_agent_cwd_arg`). On commit a new,
+**empty** project (zero workspaces, zero sessions) is created and persisted with
+a basename-derived unique name; a **duplicate cwd** is refused with a transient
+error and creates nothing; an empty cwd cancels. The per-project **＋ New
+workspace / ＋ New agent session**
 create into *that* project (no cwd prompt — the cwd is the project's).
 
-> **Entry points moved (`UXI-JumpPanel-7/-8`).** The `Projects::create` +
-> `new_workspace_in` / `new_agent_session_in` methods below are unchanged; only
-> where they're invoked moved — **New project** to the global menu, **New
-> workspace / New agent session** to the project name's context menu.
+> **Entry points moved (`UXI-JumpPanel-7/-8`).** **New project** lives in the
+> global menu; **New workspace / New agent session** live in the project name's
+> context menu.
 
-**Applies to.** `main.rs`: a new `RenameTarget::NewProject`-style overlay (name +
-cwd), its open + commit routing → `Projects::create`; `jump_panel_view.rs` the
-＋ rows. The per-project create rows call `new_workspace_in(project)` /
-`new_agent_session_in(project)`.
+**Applies to.** `main.rs`: `ActiveOverlay::NewProject` with one cwd field, its
+open + commit routing → `Projects::ensure_at_cwd`; `jump_panel_view.rs` the
+per-project context-menu entry point. The project-scoped creates call
+`new_workspace_in(project)` / `new_agent_session_in(project)`.
 
-**Why.** A project is the create scope; making name+cwd explicit at birth is what
-lets everything below inherit the cwd.
+**Why.** A project is the create scope; making the cwd explicit at birth is what
+lets everything below inherit it, while deriving the name keeps creation quick.
 
-**Status.** `implemented` (T005). `ActiveOverlay::NewProject` (a two-field
-name+cwd overlay, Tab toggles the field) → `commit_new_project_overlay` →
-`Projects::create`; a duplicate name/cwd or a bad cwd surfaces a transient error
-and creates nothing; an empty name cancels. The jump panel's per-project ＋New
+**Status.** `implemented` (simplified from the original T005 flow).
+`ActiveOverlay::NewProject` (one cwd field) → `commit_new_project_overlay` →
+`Projects::ensure_at_cwd`; a duplicate cwd or bad cwd surfaces a transient error
+and creates nothing; an empty cwd cancels. The jump panel's per-project ＋New
 workspace / ＋New agent session rows call `new_workspace_in(pid)` /
 `new_agent_session_in(pid)` (cwd = the project's, no prompt).
 
-**Enforcement.** `verify_harness.rs::new_project_overlay_creates_empty_project_and_rejects_dup`
-(drives `open_new_project_overlay` → edit fields → `commit_new_project_overlay`:
-the store gains ONE empty project; a second commit with the same name adds nothing
-and sets an "already exists" note; NC: remove the `by_name` guard in
-`Projects::create` → the dup is accepted and `len` grows, observed RED).
+**Enforcement.**
+`verify_harness.rs::new_project_overlay_creates_from_cwd_and_rejects_duplicate_cwd`
+drives the real overlay/commit path, proves basename derivation, uniquification
+for two distinct directories with the same basename, empty-project creation,
+and duplicate-cwd refusal.
 
 ### UXI-Project-5 — Deleting a project confirms when non-empty, then cascades
 

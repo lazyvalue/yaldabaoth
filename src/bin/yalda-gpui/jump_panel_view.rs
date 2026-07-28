@@ -25,7 +25,7 @@ use super::*;
 
 /// Fixed sidebar width. Chrome-class — renders at native size, unaffected by
 /// document zoom (consistent with the workspace strip / rail).
-pub(crate) const JUMP_PANEL_WIDTH: f32 = 220.0;
+pub(crate) const JUMP_PANEL_WIDTH: f32 = 320.0;
 
 /// What a jump-panel agent row points at (universal-agent-list). A session may
 /// be opened here (`Local`, keyed by store `SessionId`) or known only to the
@@ -546,6 +546,17 @@ impl YaldaGpuiView {
 }
 
 impl YaldaGpuiView {
+    /// Fold or unfold one project's children. Project names are the durable
+    /// human key (project ids are runtime-local), so folded state is keyed and
+    /// persisted by name.
+    pub(crate) fn toggle_project_fold(&mut self, name: &str, cx: &mut Context<Self>) {
+        if !self.jump_folded_projects.remove(name) {
+            self.jump_folded_projects.insert(name.to_string());
+        }
+        self.save_settings();
+        cx.notify();
+    }
+
     /// Build the jump-panel sidebar element (inline; see the module note).
     /// Reads workspaces + agent sessions + theme directly off `self`; row clicks
     /// re-enter through `cx.listener` and resolve their target id/index in the
@@ -646,13 +657,18 @@ impl YaldaGpuiView {
         for section in sections {
             let pid = section.id;
             let cwd_key = section.cwd_display.clone();
+            let project_name = section.name.clone();
+            let folded = self.jump_folded_projects.contains(&project_name);
             // Inter-section rule, above the header (Pinned always precedes the
             // first project, so every project section gets a top rule).
             col = col.child(jump_divider(divider_color));
-            // Project header: NAME only. Clicking it opens the project context
-            // menu at the cursor. The header is still a CwdDrag source / target so
-            // sections reorder (keyed on the cwd display, the same key the session
-            // drag rejects across) — a click opens the menu, a drag reorders.
+            // Project header: disclosure chevron + NAME. The chevron owns folding;
+            // clicking the name still opens the project menu. Keeping those targets
+            // distinct preserves the existing menu gesture. The name remains the
+            // drag source and the whole header remains the drop target.
+            let fold_name = project_name.clone();
+            let name_label: SharedString = project_name.to_uppercase().into();
+            let drag_label: SharedString = project_name.into();
             let header = div()
                 .id(SharedString::from(format!("jump-proj-{}", pid.0)))
                 .flex()
@@ -661,33 +677,51 @@ impl YaldaGpuiView {
                 .w_full()
                 .px_3()
                 .pb(px(4.0))
-                .cursor_pointer()
                 .child(
                     div()
+                        .id(SharedString::from(format!("jump-proj-fold-{}", pid.0)))
+                        .w(px(18.0))
+                        .flex_none()
+                        .cursor_pointer()
+                        .text_color(st.dim)
+                        .child(SharedString::new_static(if folded { "▸" } else { "▾" }))
+                        .on_click(cx.listener(move |this, _ev, _window, cx| {
+                            this.toggle_project_fold(&fold_name, cx);
+                        })),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!("jump-proj-name-{}", pid.0)))
                         .flex_1()
                         .min_w_0()
+                        .cursor_pointer()
                         .text_color(header_red)
                         .font_family(st.mono.clone())
                         .font_weight(FontWeight::BOLD)
                         .text_size(px(st.pt * 0.95))
-                        .child(SharedString::from(section.name.to_uppercase())),
+                        .child(name_label)
+                        .on_click(cx.listener(
+                            move |this, ev: &gpui::ClickEvent, _window, cx| {
+                                let p = ev.position();
+                                this.open_project_menu(
+                                    pid,
+                                    (f32::from(p.x), f32::from(p.y)),
+                                    cx,
+                                );
+                            },
+                        ))
+                        .on_drag(CwdDrag { cwd_key: cwd_key.clone() }, {
+                            let (fg, bg, font) = (drag_fg, sel_bg, drag_font.clone());
+                            move |_payload, _pos, _window, cx| {
+                                cx.new(|_| JumpDragPreview {
+                                    label: drag_label.clone(),
+                                    fg,
+                                    bg,
+                                    font: font.clone(),
+                                })
+                            }
+                        }),
                 )
-                .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, _window, cx| {
-                    let p = ev.position();
-                    this.open_project_menu(pid, (f32::from(p.x), f32::from(p.y)), cx);
-                }))
-                .on_drag(CwdDrag { cwd_key: cwd_key.clone() }, {
-                    let label: SharedString = section.name.clone().into();
-                    let (fg, bg, font) = (drag_fg, sel_bg, drag_font.clone());
-                    move |_payload, _pos, _window, cx| {
-                        cx.new(|_| JumpDragPreview {
-                            label: label.clone(),
-                            fg,
-                            bg,
-                            font: font.clone(),
-                        })
-                    }
-                })
                 .drag_over::<CwdDrag>(move |s, _, _, _| s.bg(sel_bg))
                 .on_drop(cx.listener({
                     let target_key = cwd_key.clone();
@@ -697,13 +731,16 @@ impl YaldaGpuiView {
                 }));
             col = col.child(header);
 
+            if folded {
+                continue;
+            }
+
             // WORKSPACES sublist — a `⊞` icon leads; the GLOBAL idx+1 (ctrl-<n>)
             // becomes a dim right-edge shortcut hint.
             for (idx, label, active) in section.workspaces {
                 let row_id = SharedString::from(format!("jump-ws-{idx}"));
                 let num = format!("{}", idx + 1);
-                col = col.child(
-                    jump_nav_row(
+                let row = jump_nav_row(
                         row_id,
                         &label,
                         Some("⊞"),
@@ -713,8 +750,13 @@ impl YaldaGpuiView {
                         sel_bg,
                         active.then_some(active_accent),
                     )
-                    .on_click(cx.listener(move |this, _ev, _window, cx| this.select_workspace(idx, cx))),
-                );
+                    .on_click(cx.listener(move |this, _ev, _window, cx| {
+                        this.select_workspace(idx, cx)
+                    }));
+                col = col.child(probe_bounds_dyn(
+                    format!("jump-workspace-row-{idx}"),
+                    row.into_any_element(),
+                ));
             }
 
             // AGENT SESSIONS sublist (status-colored `✦` + accent marks preserved).

@@ -481,3 +481,18 @@ session, painted with real size (`w > 20`, `h > 6`) once a turn is in flight.
 **NC observed RED**: drop the pill child → "the working pill must paint while a reply
 is in flight". The word/glyph mapping is pinned by
 `agent_row_marks_name_the_live_states`.
+
+### UXI-AgentTile-31 — Narrow tiles wrap header chrome; usage owns a line
+
+**Statement.** The primary agent status row wraps and grows vertically instead
+of clipping when a desktop tile is narrow. Context-window usage is never packed
+into that row: when present, it renders on a dedicated second line with the
+`USAGE` label, progress bar, and compact token count. Both lines remain
+chrome-sized and unaffected by document zoom.
+
+**Applies to.** `screens.rs::render_agent` (`strip`, `usage_line`, and `header`).
+
+**Status.** `implemented`.
+
+**Enforcement.** `verify_harness.rs::agent_usage_paints_on_its_own_header_line`
+paints real usage state and proves its bounds start below the primary status row.

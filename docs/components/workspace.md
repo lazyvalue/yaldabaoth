@@ -602,3 +602,17 @@ sibling).
 rather than this one: binding a second free session into a *real* workspace mid-test
 needs a bound-tile boot (`boot_worksheet_channel`), which that test already has —
 `focus_existing_session` on a free session opens another ephemeral view instead.
+
+### UXI-Workspace-10 — The default desktop density fits a 4×4 viewport
+
+**Statement.** A fresh desktop divides the visible canvas into four columns by
+four rows, with the jump panel visible. The existing desktop-grid command remains
+authoritative for explicit user choices. Legacy preferences carrying the former
+built-in `2×2` default migrate once to `4×4`; a `2×2` value explicitly saved
+after the migration remains `2×2`.
+
+**Applies to.** `main.rs` (constructor defaults and versioned preference load)
+and `persist.rs` (`desktop_grid_defaults_version`).
+
+**Status.** `implemented`; exact fit still respects the existing 160×120px
+minimum tile size.

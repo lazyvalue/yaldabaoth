@@ -6346,33 +6346,79 @@ fn jump_panel_renders_per_project_sections(cx: &mut TestAppContext) {
     assert!(sec_b.sessions.is_empty(), "B (no sessions) still renders an empty section");
 }
 
-/// UXI-Project-4: the "New project" overlay creates an EMPTY project via the REAL
-/// path (`open_new_project_overlay` → edit fields → `commit_new_project_overlay`),
-/// and a duplicate NAME is refused with a transient error, creating nothing.
-///
-/// Negative control: remove the `by_name` duplicate guard in `Projects::create`
-/// (`project.rs`) → the dup name is accepted, `projects.len()` grows, and the
-/// "creates nothing" assert fails.
+/// A project disclosure hides every workspace/session row beneath that header,
+/// while a second toggle restores them. The folded key is the durable project
+/// name rather than its runtime-local id.
 #[gpui::test]
-fn new_project_overlay_creates_empty_project_and_rejects_dup(cx: &mut TestAppContext) {
+fn jump_panel_project_fold_hides_and_restores_children(cx: &mut TestAppContext) {
     let (view, vcx) = boot_browser(cx);
-    // Two distinct REAL directories (resolve_agent_cwd_arg validates existence).
-    let dir1 = std::env::temp_dir();
-    let dir2 = std::env::temp_dir().join(format!("yalda-np-{}", std::process::id()));
+    let (project, project_name, workspace_idx) = view.read_with(vcx, |v, _| {
+        let idx = v.workspace.active_workspace;
+        let pid = v.workspace.workspaces[idx].project();
+        (pid, v.projects.name_of(pid).to_string(), idx)
+    });
+    let probe = format!("jump-workspace-row-{workspace_idx}");
+
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    assert!(
+        crate::layout_probe_get(&probe).is_some(),
+        "expanded project paints its workspace row"
+    );
+    crate::layout_probe_end();
+
+    view.update(vcx, |v, cx| v.toggle_project_fold(&project_name, cx));
+    view.read_with(vcx, |v, _| {
+        assert!(v.projects.contains(project));
+        assert!(v.jump_folded_projects.contains(&project_name));
+    });
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    assert!(
+        crate::layout_probe_get(&probe).is_none(),
+        "folded project must not paint workspace children"
+    );
+    crate::layout_probe_end();
+
+    view.update(vcx, |v, cx| v.toggle_project_fold(&project_name, cx));
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    assert!(
+        crate::layout_probe_get(&probe).is_some(),
+        "unfolding restores workspace children"
+    );
+    crate::layout_probe_end();
+}
+
+/// UXI-Project-4: the "New project" overlay creates an EMPTY project via the REAL
+/// path (`open_new_project_overlay` → edit cwd → `commit_new_project_overlay`).
+/// Its name is derived from the directory basename; equal basenames uniquify,
+/// while a duplicate CWD is refused and creates nothing.
+#[gpui::test]
+fn new_project_overlay_creates_from_cwd_and_rejects_duplicate_cwd(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_browser(cx);
+    // Two distinct REAL directories with the same basename.
+    let basename = format!("yalda-np-{}", std::process::id());
+    let root1 = std::env::temp_dir().join("yalda-np-a");
+    let root2 = std::env::temp_dir().join("yalda-np-b");
+    let dir1 = root1.join(&basename);
+    let dir2 = root2.join(&basename);
+    std::fs::create_dir_all(&dir1).expect("mk dir1");
     std::fs::create_dir_all(&dir2).expect("mk dir2");
+    let derived = crate::project_name_for_cwd(&dir1);
 
     let before = view.read_with(vcx, |v, _| v.projects.len());
     view.update(vcx, |v, cx| {
         v.open_new_project_overlay(cx);
-        {
-            let o = v.new_project_mut().expect("new-project overlay open");
-            o.name = "Zephyr".into();
-            o.cwd = dir1.display().to_string();
-        }
+        v.new_project_mut().expect("new-project overlay open").cwd =
+            dir1.display().to_string();
         v.commit_new_project_overlay(cx);
     });
     let zid = view.read_with(vcx, |v, _| {
-        let zid = v.projects.by_name("Zephyr").expect("project created");
+        let zid = v.projects.by_name(&derived).expect("derived-name project created");
         assert_eq!(v.projects.len(), before + 1, "exactly one new project");
         zid
     });
@@ -6385,22 +6431,32 @@ fn new_project_overlay_creates_empty_project_and_rejects_dup(cx: &mut TestAppCon
         );
     });
 
-    // A second create with the SAME name is refused; nothing added.
+    // A distinct cwd with the same basename is accepted under a unique name.
     let after = view.read_with(vcx, |v, _| v.projects.len());
     view.update(vcx, |v, cx| {
         v.open_new_project_overlay(cx);
-        {
-            let o = v.new_project_mut().expect("overlay open");
-            o.name = "Zephyr".into();
-            o.cwd = dir2.display().to_string();
-        }
+        v.new_project_mut().expect("overlay open").cwd = dir2.display().to_string();
         v.commit_new_project_overlay(cx);
     });
     view.read_with(vcx, |v, _| {
-        assert_eq!(v.projects.len(), after, "a duplicate name creates NOTHING");
-        let note = v.transient_status.as_ref().map(|s| s.to_string()).unwrap_or_default();
-        assert!(note.contains("already exists"), "dup name surfaces an error, got: {note:?}");
+        assert_eq!(v.projects.len(), after + 1, "same basename is uniquified");
+        assert!(v.projects.by_name(&format!("{derived} (2)")).is_some());
     });
+
+    // Reusing the exact cwd is refused.
+    let after_unique = view.read_with(vcx, |v, _| v.projects.len());
+    view.update(vcx, |v, cx| {
+        v.open_new_project_overlay(cx);
+        v.new_project_mut().expect("overlay open").cwd = dir1.display().to_string();
+        v.commit_new_project_overlay(cx);
+    });
+    view.read_with(vcx, |v, _| {
+        assert_eq!(v.projects.len(), after_unique, "duplicate cwd creates NOTHING");
+        let note = v.transient_status.as_ref().map(|s| s.to_string()).unwrap_or_default();
+        assert!(note.contains("already roots"), "duplicate cwd surfaces an error: {note:?}");
+    });
+    let _ = std::fs::remove_dir_all(root1);
+    let _ = std::fs::remove_dir_all(root2);
 }
 
 /// UXI-Project-5: deleting a NON-empty project first confirms, then cascades. The
@@ -6540,6 +6596,35 @@ fn agent_tile_paints_a_status_pill_while_working(cx: &mut TestAppContext) {
         w > 20.0 && h > 6.0,
         "the pill must have real painted size, got {w}x{h}"
     );
+}
+
+/// The context-window usage meter occupies its own header line. This protects
+/// the identity/model/permission row from being clipped in narrow 4×4 tiles.
+#[gpui::test]
+fn agent_usage_paints_on_its_own_header_line(cx: &mut TestAppContext) {
+    let (view, vcx, id, _session) = boot_with_transcript(cx);
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| {
+            c.usage = Some(yalda::acp_channel::UsageSnapshot {
+                tokens_used: 32_000,
+                tokens_total: 200_000,
+                cost_usd: None,
+            });
+        });
+    });
+
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let status = crate::layout_probe_get("agent-status-row").expect("primary status row paints");
+    let usage = crate::layout_probe_get("agent-usage-row").expect("usage row paints");
+    crate::layout_probe_end();
+
+    assert!(
+        usage.1 >= status.1 + status.3 - 0.5,
+        "usage must start below the primary row: status={status:?}, usage={usage:?}"
+    );
+    assert!(usage.2 > 100.0 && usage.3 > 6.0, "usage line has real size: {usage:?}");
 }
 
 /// UXI-JumpPanel-11: the jump panel is painted on the SAME surface as the

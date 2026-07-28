@@ -525,6 +525,11 @@ pub(crate) struct Preferences {
     pub(crate) desktop_grid_cols: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) desktop_grid_rows: Option<u32>,
+    /// Version of the built-in desktop-density default. Version 2 changes the
+    /// original 2×2 default to 4×4 without overriding a 2×2 choice explicitly
+    /// saved after the migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) desktop_grid_defaults_version: Option<u8>,
     /// Jump-panel visibility (jump-panel; `cmd-j` / `?` menu). `None` means
     /// "no saved preference; show it" (the default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -543,6 +548,10 @@ pub(crate) struct Preferences {
     /// list suffices. `None`/absent = by-label (the default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) jump_session_order: Option<Vec<String>>,
+    /// Folded jump-panel projects, keyed by durable project name (ProjectId is
+    /// runtime-local). Absent means every project starts expanded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) jump_folded_projects: Option<Vec<String>>,
 }
 
 pub(crate) fn load_preferences() -> Preferences {

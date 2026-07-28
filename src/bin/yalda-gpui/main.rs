@@ -497,6 +497,21 @@ fn format_menu_key(seq: &[KeyPress]) -> String {
 pub(crate) const MENU_PANEL_MIN_W: f32 = 340.0;
 pub(crate) const MENU_PANEL_MAX_W: f32 = 720.0;
 pub(crate) const MENU_PANEL_TOP: f32 = 48.0;
+const DEFAULT_DESKTOP_GRID_COLS: u32 = 4;
+const DEFAULT_DESKTOP_GRID_ROWS: u32 = 4;
+const DESKTOP_GRID_DEFAULTS_VERSION: u8 = 2;
+
+/// Restore one desktop-grid axis, including the one-time migration from the
+/// original 2×2 built-in default. Once version 2 has been saved, `2` is an
+/// explicit user choice and remains untouched.
+fn restore_desktop_grid_axis(saved: Option<u32>, version: Option<u8>, default: u32) -> u32 {
+    match saved {
+        Some(2) if version.unwrap_or(1) < DESKTOP_GRID_DEFAULTS_VERSION => default,
+        Some(value) => value.clamp(1, 12),
+        None => default,
+    }
+}
+
 /// Left gutter between the jump panel and the card, so the card sits just inside
 /// the tile region — offset enough that it doesn't line up flush with the first
 /// tile's edge (which read as an accidental alignment).
@@ -1357,22 +1372,10 @@ enum RenameTarget {
     DesktopTileSize,
 }
 
-/// Which field the [`NewProjectOverlay`] edits (Tab toggles). A new project
-/// needs BOTH a name and a cwd at birth (UXI-Project-4), so this is a two-field
-/// input rather than the single-field [`RenameOverlay`].
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum NpField {
-    Name,
-    Cwd,
-}
-
-/// "New project" overlay (UXI-Project-4): prompts for a unique name + a cwd,
-/// then `Projects::create`. A duplicate name/cwd is refused with a transient
-/// error (nothing created); an empty name cancels.
+/// "New project" overlay (UXI-Project-4): asks only for the cwd. Its display
+/// name is derived from the directory basename and uniquified by `Projects`.
 struct NewProjectOverlay {
-    name: String,
     cwd: String,
-    field: NpField,
 }
 
 /// The single, mutually-exclusive overlay layered over the screen body — at
@@ -1408,7 +1411,7 @@ enum ActiveOverlay {
     WorkspacePicker(WorkspacePicker),
     Rename(RenameOverlay),
     TagInput(TagInputOverlay),
-    /// "New project" name+cwd input (UXI-Project-4).
+    /// "New project" cwd input (UXI-Project-4).
     NewProject(NewProjectOverlay),
     /// "Delete project?" confirmation for a non-empty project (UXI-Project-5);
     /// carries the target so confirm cascades exactly it.
@@ -1738,6 +1741,9 @@ struct YaldaGpuiView {
     /// (jump-reorder; `Preferences::jump_session_order`). Ordered server sids;
     /// empty = by-label. A session never crosses cwd groups (drop is cwd-gated).
     jump_session_order: Vec<String>,
+    /// Project names whose jump-panel children are hidden. Names, rather than
+    /// runtime-local ProjectIds, make the preference durable across restart.
+    jump_folded_projects: std::collections::HashSet<String>,
     /// Jump-panel **order succession**: a placeholder session that is the
     /// continuation of a killed one (today: `/clear`, which closes the server
     /// session and creates a fresh one) maps to its PREDECESSOR's sid, so it
@@ -1794,8 +1800,8 @@ impl YaldaGpuiView {
             text_scale: 1.0,
             show_agent_heading_markers: true,
             keymap_registry: KeymapRegistry::load(),
-            desktop_grid_cols: 2,
-            desktop_grid_rows: 2,
+            desktop_grid_cols: DEFAULT_DESKTOP_GRID_COLS,
+            desktop_grid_rows: DEFAULT_DESKTOP_GRID_ROWS,
             browser_sort: HashMap::new(),
             desktop_canvas_bounds: std::rc::Rc::new(std::cell::Cell::new((0.0, 0.0, 0.0, 0.0))),
             viewport_height_px: 0.0,
@@ -1820,6 +1826,7 @@ impl YaldaGpuiView {
             jump_panel_visible: true,
             jump_cwd_order: Vec::new(),
             jump_session_order: Vec::new(),
+            jump_folded_projects: std::collections::HashSet::new(),
             jump_order_succession: HashMap::new(),
             recaps: HashMap::new(),
             roster_unread: std::collections::HashSet::new(),
@@ -1841,8 +1848,8 @@ impl YaldaGpuiView {
             text_scale: 1.0,
             show_agent_heading_markers: true,
             keymap_registry: KeymapRegistry::load(),
-            desktop_grid_cols: 2,
-            desktop_grid_rows: 2,
+            desktop_grid_cols: DEFAULT_DESKTOP_GRID_COLS,
+            desktop_grid_rows: DEFAULT_DESKTOP_GRID_ROWS,
             browser_sort: HashMap::new(),
             desktop_canvas_bounds: std::rc::Rc::new(std::cell::Cell::new((0.0, 0.0, 0.0, 0.0))),
             viewport_height_px: 0.0,
@@ -1867,6 +1874,7 @@ impl YaldaGpuiView {
             jump_panel_visible: true,
             jump_cwd_order: Vec::new(),
             jump_session_order: Vec::new(),
+            jump_folded_projects: std::collections::HashSet::new(),
             jump_order_succession: HashMap::new(),
             recaps: HashMap::new(),
             roster_unread: std::collections::HashSet::new(),
@@ -3186,10 +3194,16 @@ impl YaldaGpuiView {
             text_scale: Some(self.text_scale),
             desktop_grid_cols: Some(self.desktop_grid_cols),
             desktop_grid_rows: Some(self.desktop_grid_rows),
+            desktop_grid_defaults_version: Some(DESKTOP_GRID_DEFAULTS_VERSION),
             jump_panel_visible: Some(self.jump_panel_visible),
             jump_cwd_order: (!self.jump_cwd_order.is_empty()).then(|| self.jump_cwd_order.clone()),
             jump_session_order: (!self.jump_session_order.is_empty())
                 .then(|| self.jump_session_order.clone()),
+            jump_folded_projects: (!self.jump_folded_projects.is_empty()).then(|| {
+                let mut names: Vec<_> = self.jump_folded_projects.iter().cloned().collect();
+                names.sort();
+                names
+            }),
         });
     }
 
@@ -5718,53 +5732,44 @@ impl YaldaGpuiView {
         }
     }
 
-    /// Open the "New project" overlay (UXI-Project-4): a name + cwd input. The
-    /// cwd pre-fills with the active project's cwd so the common "a project near
-    /// this one" case is one keystroke. No-op if any overlay is already open.
+    /// Open the `? p` "New project" overlay (UXI-Project-4). It asks for one
+    /// thing—the cwd—and derives the project name from that directory.
     pub(crate) fn open_new_project_overlay(&mut self, cx: &mut Context<Self>) {
         if self.has_overlay() {
             return;
         }
         let cwd = self.agent_base_cwd().display().to_string();
-        self.open_overlay(ActiveOverlay::NewProject(NewProjectOverlay {
-            name: String::new(),
-            cwd,
-            field: NpField::Name,
-        }));
+        self.open_overlay(ActiveOverlay::NewProject(NewProjectOverlay { cwd }));
         cx.notify();
     }
 
-    /// Commit the "New project" overlay (UXI-Project-4): create an EMPTY project
-    /// and persist it. An empty name cancels; a bad cwd, a duplicate name, or a
-    /// duplicate cwd each surface a transient error and create NOTHING.
+    /// Commit the cwd-only project overlay: resolve the directory, derive and
+    /// uniquify its basename display name, create an EMPTY project, and persist.
     fn commit_new_project_overlay(&mut self, cx: &mut Context<Self>) {
-        let (name, cwd) = match self.new_project_ref() {
-            Some(o) => (o.name.trim().to_string(), o.cwd.trim().to_string()),
+        let cwd = match self.new_project_ref() {
+            Some(o) => o.cwd.trim().to_string(),
             None => return,
         };
-        if name.is_empty() {
+        if cwd.is_empty() {
             self.clear_overlay();
             cx.notify();
             return;
         }
         match resolve_agent_cwd_arg(&cwd) {
-            Ok(resolved) => match self.projects.create(name.clone(), resolved) {
-                Ok(_) => {
+            Ok(resolved) => {
+                if self.projects.by_cwd(&resolved).is_some() {
+                    self.clear_overlay();
+                    self.transient_status =
+                        Some("another project already roots that directory".into());
+                } else {
+                    let hint = project_name_for_cwd(&resolved);
+                    let pid = self.projects.ensure_at_cwd(resolved, &hint);
+                    let name = self.projects.name_of(pid).to_string();
                     save_persisted_projects(&self.projects);
                     self.clear_overlay();
                     self.transient_status = Some(format!("project {name} created").into());
                 }
-                Err(CreateError::DuplicateName) => {
-                    self.clear_overlay();
-                    self.transient_status =
-                        Some(format!("a project named {name} already exists").into());
-                }
-                Err(CreateError::DuplicateCwd(_)) => {
-                    self.clear_overlay();
-                    self.transient_status =
-                        Some("another project already roots that directory".into());
-                }
-            },
+            }
             Err(msg) => {
                 self.clear_overlay();
                 self.transient_status = Some(msg.into());
@@ -5786,34 +5791,15 @@ impl YaldaGpuiView {
                 cx.notify();
             }
             Key::Enter => self.commit_new_project_overlay(cx),
-            Key::Tab | Key::BackTab | Key::Down | Key::Up => {
-                if let Some(o) = self.new_project_mut() {
-                    o.field = match o.field {
-                        NpField::Name => NpField::Cwd,
-                        NpField::Cwd => NpField::Name,
-                    };
-                }
-                cx.notify();
-            }
             Key::Backspace => {
                 if let Some(o) = self.new_project_mut() {
-                    match o.field {
-                        NpField::Name => {
-                            o.name.pop();
-                        }
-                        NpField::Cwd => {
-                            o.cwd.pop();
-                        }
-                    }
+                    o.cwd.pop();
                 }
                 cx.notify();
             }
             Key::Char(c) => {
                 if let Some(o) = self.new_project_mut() {
-                    match o.field {
-                        NpField::Name => o.name.push(c),
-                        NpField::Cwd => o.cwd.push(c),
-                    }
+                    o.cwd.push(c);
                 }
                 cx.notify();
             }
@@ -7045,8 +7031,8 @@ impl YaldaGpuiView {
             )
     }
 
-    /// The "New project" overlay (UXI-Project-4): two input rows (name / cwd)
-    /// with a block cursor on the focused field, modeled on `render_rename_overlay`.
+    /// The `? p` "New project" overlay (UXI-Project-4): one cwd input. The
+    /// project name is derived from the final directory component.
     fn render_new_project_overlay(&self, _cx: &mut Context<Self>) -> impl IntoElement {
         let o = match self.new_project_ref() {
             Some(o) => o,
@@ -7057,42 +7043,32 @@ impl YaldaGpuiView {
         let popup_border: Hsla = nc(ov.border);
         let label_fg: Hsla = nc(ov.label);
         let input_fg: Hsla = nc(ov.input);
-        let cursor = |on: bool| if on { "\u{2588}" } else { "" };
-
         let header = div()
             .px_4()
             .py_1()
             .text_color(label_fg)
             .font_weight(FontWeight::BOLD)
             .child(SharedString::new_static("NEW PROJECT"));
-        let name_row = div()
-            .px_4()
-            .pt_2()
-            .text_color(input_fg)
-            .text_size(px(14.0))
-            .font_family(self.code_font.clone())
-            .child(SharedString::from(format!(
-                "name: {}{}",
-                o.name,
-                cursor(o.field == NpField::Name)
-            )));
         let cwd_row = div()
             .px_4()
+            .pt_2()
             .pb_2()
             .text_color(input_fg)
             .text_size(px(14.0))
             .font_family(self.code_font.clone())
             .child(SharedString::from(format!(
-                "cwd:  {}{}",
+                "cwd: {}{}",
                 o.cwd,
-                cursor(o.field == NpField::Cwd)
+                "\u{2588}"
             )));
         let footer = div()
             .px_4()
             .py_1()
             .text_color(label_fg)
             .text_size(px(11.0))
-            .child(SharedString::new_static("workspace:switch field  enter:create  esc:cancel"));
+            .child(SharedString::new_static(
+                "name comes from directory  enter:create  esc:cancel",
+            ));
 
         div()
             .absolute()
@@ -7111,7 +7087,6 @@ impl YaldaGpuiView {
                     .flex()
                     .flex_col()
                     .child(header)
-                    .child(name_row)
                     .child(cwd_row)
                     .child(footer),
             )
@@ -8233,13 +8208,19 @@ fn main() {
                         if let Some(scale) = prefs.text_scale {
                             view.text_scale = scale.clamp(MIN_TEXT_SCALE, MAX_TEXT_SCALE);
                         }
-                        // Desktop tile size (clamped per spec Behavior 6).
-                        if let Some(c) = prefs.desktop_grid_cols {
-                            view.desktop_grid_cols = c.clamp(1, 12);
-                        }
-                        if let Some(r) = prefs.desktop_grid_rows {
-                            view.desktop_grid_rows = r.clamp(1, 12);
-                        }
+                        // Desktop density v2: migrate the original persisted 2×2
+                        // default to 4×4 once. A 2×2 value saved by v2 remains an
+                        // explicit user choice because the version marker is set.
+                        view.desktop_grid_cols = restore_desktop_grid_axis(
+                            prefs.desktop_grid_cols,
+                            prefs.desktop_grid_defaults_version,
+                            DEFAULT_DESKTOP_GRID_COLS,
+                        );
+                        view.desktop_grid_rows = restore_desktop_grid_axis(
+                            prefs.desktop_grid_rows,
+                            prefs.desktop_grid_defaults_version,
+                            DEFAULT_DESKTOP_GRID_ROWS,
+                        );
                         if let Some(v) = prefs.jump_panel_visible {
                             view.jump_panel_visible = v;
                         }
@@ -8249,6 +8230,9 @@ fn main() {
                         }
                         if let Some(o) = prefs.jump_session_order {
                             view.jump_session_order = o;
+                        }
+                        if let Some(names) = prefs.jump_folded_projects {
+                            view.jump_folded_projects = names.into_iter().collect();
                         }
                         // Universal agent roster (universal-agent-list): start
                         // the server pump + seed the roster at boot (not only

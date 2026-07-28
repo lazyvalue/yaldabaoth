@@ -949,9 +949,10 @@ impl YaldaGpuiView {
         let top = self.theme.top_bar;
 
         // ---- Status Strip (spec §30) ----
-        // Single-row header showing agent label, sub-agent breadcrumb
-        // (when focused), model id, permission mode, context-window
-        // usage, and turn / elapsed. Any field
+        // Wrapping header showing agent label, sub-agent breadcrumb (when
+        // focused), model id, permission mode, and turn / elapsed. Context-window
+        // usage gets a dedicated second line so narrow desktop tiles don't clip
+        // the rest of their chrome. Any field
         // whose underlying signal is absent renders nothing — no
         // placeholder, no `?`. The strip is at most as wide as the
         // data it has.
@@ -962,14 +963,16 @@ impl YaldaGpuiView {
         let mut strip = div()
             .flex()
             .flex_row()
+            .flex_wrap()
             .items_center()
             .px_4()
             .py_1()
-            .h(px(28.0))
+            .min_h(px(28.0))
             .bg(bg_or(top, STATUS_BG))
             .text_color(strip_fg)
             .font_weight(FontWeight::BOLD)
             .text_size(px(12.0));
+        let mut usage_line: Option<AnyElement> = None;
 
         // Agent label (slot label).
         strip = strip.child(
@@ -1178,21 +1181,37 @@ impl YaldaGpuiView {
                 .bg(track_bg)
                 .child(div().w(px(fill_w)).h_full().rounded_full().bg(fill_color));
             let label = format!("{:.0}k/{:.0}k ({:.0}%)", used_k, total_k, pct);
-            strip = strip.child(
+            let usage = div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .px_4()
+                .py_1()
+                .bg(bg_or(top, STATUS_BG))
+                .text_size(px(11.0))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(strip_dim)
+                        .font_weight(FontWeight::BOLD)
+                        .child(SharedString::new_static("USAGE")),
+                )
+                .child(track)
+                .child(
+                    div()
+                        .text_color(strip_dim)
+                        .font_weight(FontWeight::NORMAL)
+                        .child(SharedString::from(label)),
+                );
+            usage_line = Some(probe_bounds(
+                "agent-usage-row",
                 div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .pr_2()
-                    .child(track)
-                    .child(
-                        div()
-                            .text_color(strip_dim)
-                            .font_weight(FontWeight::NORMAL)
-                            .child(SharedString::from(label)),
-                    ),
-            );
+                    .w_full()
+                    .child(usage)
+                    .into_any_element(),
+            ));
         }
 
         // Active sub-agents — the one readout that used to live only in the
@@ -1351,7 +1370,16 @@ impl YaldaGpuiView {
             strip = strip.child(div().flex_1()).child(header_right);
         }
 
-        let header = strip;
+        let mut header = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .bg(bg_or(top, STATUS_BG))
+            .child(probe_bounds("agent-status-row", strip.into_any_element()));
+        if let Some(line) = usage_line {
+            header = header.child(line);
+        }
 
         // Status (mode, cursor, awaiting) and the Stop button now live in the
         // header strip at the top; keyboard hints were removed. No footer.

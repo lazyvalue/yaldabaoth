@@ -5,7 +5,8 @@
 
 ## Description
 
-An always-visible root-level **navigator sidebar** (fixed `JUMP_PANEL_WIDTH`),
+An always-visible root-level **navigator sidebar** (fixed `JUMP_PANEL_WIDTH`,
+currently 320px),
 laid out outside the workspace content so it stays put across workspace switches
 (INV-JP1). Toggle: `toggle_jump_panel` (`cmd-j`). Rendered inline (cheap,
 O(workspaces + sessions)), not cached. Primary code home:
@@ -781,3 +782,26 @@ as *pixels* is harness gap #1.
 editor, hue+saturation preserved; **NC observed RED**: restore the old
 `editor.l - 0.035` recessed derivation → `left: L 0.905` vs `right: L 0.98`).
 `menu_panel_bg_is_elevated_above_the_editor` keeps the menu card's own contract.
+
+### UXI-JumpPanel-13 — Projects fold without losing their project menu
+
+**Statement.** Every project header has a disclosure chevron. Folding hides all
+workspace and agent-session rows belonging to that project; unfolding restores
+them in the same order. The chevron is a distinct click target: clicking the
+project name still opens its context menu, and dragging the name still reorders
+the project section. Folded state persists by project name, because `ProjectId`
+is runtime-local. The panel is 320px wide (100px wider than the former 220px
+surface) so project/session labels and status words have room to breathe.
+
+**Applies to.** `jump_panel_view.rs` (`JUMP_PANEL_WIDTH`,
+`toggle_project_fold`, the split chevron/name header, and the folded render
+gate), `main.rs` (`jump_folded_projects`), and `persist.rs`
+(`Preferences::jump_folded_projects`).
+
+**Status.** `implemented`.
+
+**Enforcement.**
+`verify_harness.rs::jump_panel_project_fold_hides_and_restores_children` paints
+an expanded workspace row, folds its project through the real toggle, proves
+the row is absent, then unfolds and proves it returns. Preference serialization
+is covered by `tests.rs::preferences_round_trip_with_text_scale`.

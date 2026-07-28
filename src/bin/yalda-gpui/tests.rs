@@ -398,9 +398,11 @@ fn preferences_round_trip_with_text_scale() {
         text_scale: Some(1.21),
         desktop_grid_cols: Some(100),
         desktop_grid_rows: Some(30),
+        desktop_grid_defaults_version: Some(2),
         jump_panel_visible: Some(false),
         jump_cwd_order: Some(vec!["/work/beta".into(), "/work/alpha".into()]),
         jump_session_order: Some(vec!["sid-2".into(), "sid-1".into()]),
+        jump_folded_projects: Some(vec!["Fulcrum".into(), "Yaldabaoth".into()]),
     };
     let json = serde_json::to_string(&prefs).unwrap();
     let back: Preferences = serde_json::from_str(&json).unwrap();
@@ -411,6 +413,11 @@ fn preferences_round_trip_with_text_scale() {
     assert_eq!(back.jump_session_order.as_deref(), Some(&["sid-2".into(), "sid-1".into()][..]));
     assert_eq!(back.desktop_grid_cols, Some(100));
     assert_eq!(back.desktop_grid_rows, Some(30));
+    assert_eq!(back.desktop_grid_defaults_version, Some(2));
+    assert_eq!(
+        back.jump_folded_projects.as_deref(),
+        Some(&["Fulcrum".into(), "Yaldabaoth".into()][..])
+    );
 
     // Default (no zoom) is omitted from the serialized form.
     let bare = Preferences::default();
@@ -421,6 +428,33 @@ fn preferences_round_trip_with_text_scale() {
     let parsed: Preferences = serde_json::from_str(legacy).unwrap();
     assert_eq!(parsed.text_scale, None);
     assert_eq!(parsed.theme.as_deref(), Some("folio"));
+}
+
+#[test]
+fn desktop_density_defaults_and_legacy_two_by_two_migrate_to_four_by_four() {
+    assert_eq!(
+        restore_desktop_grid_axis(None, None, DEFAULT_DESKTOP_GRID_COLS),
+        4
+    );
+    assert_eq!(
+        restore_desktop_grid_axis(Some(2), None, DEFAULT_DESKTOP_GRID_COLS),
+        4,
+        "the old persisted default migrates"
+    );
+    assert_eq!(
+        restore_desktop_grid_axis(
+            Some(2),
+            Some(DESKTOP_GRID_DEFAULTS_VERSION),
+            DEFAULT_DESKTOP_GRID_COLS,
+        ),
+        2,
+        "a post-migration explicit 2-column choice stays intact"
+    );
+    assert_eq!(
+        restore_desktop_grid_axis(Some(6), None, DEFAULT_DESKTOP_GRID_COLS),
+        6,
+        "non-default legacy choices stay intact"
+    );
 }
 
 fn s(text: &str) -> Segment {
