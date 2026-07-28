@@ -125,12 +125,14 @@ drags. Items not yet in an order list sort after the listed ones, keeping their
 default position. Only roster-backed sessions (stable sid) drag; local mid-create
 placeholders don't.
 
-4. **In the All tab, a row NEVER moves except by a user drag.** Nothing else —
-   an agent-state transition, async roster refresh, a
-   `SessionCreated`/`SessionDeleted` broadcast, a reconnect, or a `/clear` — may
-   change an existing session's slot. (Waiting and Working intentionally use
-   chronological state-entry order per `UXI-JumpPanel-14`.) `/clear` is the
-   load-bearing All-tab case: it
+4. **The durable custom slot NEVER moves except by a user drag.** The All tab
+   presents those slots through Working / Waiting / Unavailable activity
+   sections (`UXI-JumpPanel-14`), so a live state transition can move a row
+   between sections, but never changes its relative custom rank within a
+   section. Async roster refresh, `SessionCreated`/`SessionDeleted`, reconnect,
+   and `/clear` likewise never rewrite an existing slot. (The dedicated Waiting
+   and Working tabs intentionally use chronological state-entry order.)
+   `/clear` is the load-bearing identity case: it
    kills the server session and creates a new one with a NEW sid, so the row is
    the *same session* to the user but a different key to the order list. Its
    continuity is carried by an explicit **order succession**
@@ -569,8 +571,9 @@ navigate-away, so it is never a thing you name and type.
 Behavior:
 
 1. **Empty query** ⇒ the **full list in panel order** (each project section's
-   workspaces then its sessions, then the unfiled session groups), so
-   `Cmd-P` → arrows → `Enter` is a keyboard navigator with no typing.
+   workspaces, then its All-tab Working / Waiting / Unavailable session
+   partition, then the unfiled session groups), so `Cmd-P` → arrows → `Enter`
+   is a keyboard navigator with no typing.
 2. **Typing** ⇒ candidates are **filtered by subsequence match and ordered by
    match score**, best first. Score rewards contiguous runs, word-start hits, a
    whole-prefix hit and an exact hit, and prefers shorter labels on a tie; panel
@@ -622,6 +625,8 @@ own reverted-fix mutation:
   (NC: drop the modifier guard in the `Key::Char` arm → query becomes `"p"`.)
 - `jump_palette_lists_workspaces_and_sessions_in_panel_order` — both kinds present,
   workspaces before sessions within a section.
+- `jump_all_tab_groups_activity_with_headers` — empty-query agent candidates
+  mirror the All tab's Working / Waiting / Unavailable presentation order.
 - `jump_palette_ranks_best_match_first` — exact > prefix > scattered, non-matches
   dropped, empty query = panel order, word-start beats mid-word.
   (NC: remove the `sort_by` → order stays as listed.)
@@ -805,7 +810,11 @@ orthogonal fourth Archived tab is specified by `UXI-JumpPanel-16`):
    **your turn**, whether its latest output is read or unread.
 2. **Working** contains connected sessions with a reply in flight
    (`AgentDotStatus::Working`).
-3. **All** contains every session in the project and is the default.
+3. **All** contains every non-archived session in the project and is the
+   default. It is visually partitioned into headed activity sections:
+   **Working** first, **Waiting** second, then a subdued **Unavailable** section
+   only when disconnected or connecting sessions exist. Empty sections are
+   omitted.
 
 Waiting and Working are chronological live queues: rows sort by when they
 entered that state, oldest first and **most recent last**. Their order is not
@@ -816,24 +825,29 @@ attention state, not an activity or visual state.
 
 A connected agent therefore always belongs to exactly one of Waiting or
 Working. Disconnected/connecting sessions are `AgentActivity::Unavailable` and
-remain visible in All; availability is exceptional and is not presented as a
-third normal activity queue.
+remain visible in All under the conditional exceptional section; Unavailable is
+not a selectable tab.
 
-All is the durable curated roster. It follows `jump_session_order`, exposes the
-existing within-project drag reorder, and a newly discovered server sid is
-appended to the order's bottom. A state transition never changes an All slot.
-The first roster seed freezes the previous by-label default into the order; later
-`SessionCreated` events only append.
+All is the durable curated roster. Its sections are a stable partition of
+`jump_session_order`: custom order is preserved within each section, while
+Working always precedes Waiting and Unavailable. It exposes the existing
+within-project drag reorder, and a newly discovered server sid is appended to
+the order's bottom. A state transition can move a row to another section but
+never changes its durable slot. The first roster seed freezes the previous
+by-label default into the order; later `SessionCreated` events only append.
 
 **Applies to.** `jump_panel_view.rs` (`JumpAgentTab`,
-`agent_rows_for_tab`, `jump_panel_sections`, `render_jump_panel`,
+`agent_rows_for_tab`, `agent_row_groups_for_tab`, `jump_panel_sections`,
+`render_jump_panel`,
 `append_new_jump_sessions`), `agent.rs` (`AgentState::waiting_since`),
 `agent_roster.rs` (`state_since`), `agent_ui.rs` (state-transition timestamp and
-new-session append sites), and `yux/detail.rs` (`compact_tab`).
+new-session append sites), and `yux/detail.rs` (`compact_tab`,
+`compact_list_group_heading`).
 
 **Status.** `implemented` — filtering, chronology, independent project
-selection, stable All order, append semantics, and the tabs' painted presence
-are headless-guarded. Exact colors remain harness gap #1.
+selection, stable durable order, append semantics, painted tabs, and the headed
+All partition are headless-guarded. Exact heading density and contrast remain
+harness gap #1.
 
 **Enforcement.**
 `verify_harness.rs::jump_agent_state_tabs_filter_and_sort_without_moving_all`
@@ -841,7 +855,22 @@ guards state filtering, oldest→newest order, and All identity.
 `jump_project_agent_tabs_are_independent_and_all_appends` drives the real
 per-project section projection and append method, proves every Waiting row says
 `your turn`, probes all four painted tab controls, and includes a state flip
-that must not move All rows.
+that must not rewrite the All projection's durable order.
+`jump_all_tab_groups_activity_with_headers` drives the real All render and
+proves nonempty headings and rows paint in Working → Waiting → Unavailable
+order, rows retain their durable relative order within each group, and empty
+groups paint no heading.
+
+**Negative control observed.** With the guard added before the renderer changed,
+`jump_all_tab_groups_activity_with_headers` failed specifically because the
+nonempty Working heading was absent. Adding the stable partition and its real
+heading render returned it to green.
+
+**Deviation from plan.** None material. The repeated glyph / label / count /
+hairline shape was promoted to `yux::compact_list_group_heading`. The underlying
+All projection remains in durable custom order for persistence; its headed
+presentation order is also applied to empty-query `Cmd-P`, preserving
+`UXI-JumpPanel-9`'s existing panel-order promise.
 
 ### UXI-JumpPanel-15 — Agent tabs are a separated neutral segmented control
 

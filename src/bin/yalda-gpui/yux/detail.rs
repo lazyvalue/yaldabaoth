@@ -123,6 +123,56 @@ pub(crate) fn compact_tab(
         .child(SharedString::from(label.to_string()))
 }
 
+/// A compact heading inside a dense list. The caller supplies the semantic
+/// glyph and tint; this primitive owns the shared uppercase label, count,
+/// trailing hairline, and spacing so repeated list groups read as one system.
+pub(crate) fn compact_list_group_heading(
+    id: impl Into<ElementId>,
+    glyph: &str,
+    label: &str,
+    count: usize,
+    tint: Hsla,
+    st: &DetailStyle,
+) -> gpui::Stateful<gpui::Div> {
+    let mut quiet_tint = tint;
+    quiet_tint.a *= 0.72;
+    let mut hairline = tint;
+    hairline.a *= 0.24;
+    div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .items_center()
+        .w_full()
+        .gap_2()
+        .px_3()
+        .pt(px(8.0))
+        .pb(px(3.0))
+        .font_family(st.mono.clone())
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_size(px(st.pt * 0.74))
+        .text_color(tint)
+        .child(
+            div()
+                .w(px(16.0))
+                .flex_none()
+                .text_center()
+                .child(SharedString::from(glyph.to_string())),
+        )
+        .child(SharedString::from(label.to_uppercase()))
+        .child(
+            div()
+                .flex_1()
+                .h(px(1.0))
+                .bg(hairline),
+        )
+        .child(
+            div()
+                .text_color(quiet_tint)
+                .child(SharedString::from(count.to_string())),
+        )
+}
+
 /// One row in a small cursor-anchored context menu. Callers own the popup shell
 /// and attach the domain action; this primitive keeps glyph alignment,
 /// typography, spacing, and hover treatment consistent across menus.

@@ -131,10 +131,10 @@ pub(crate) fn rank_palette_items(items: &[PaletteItem], query: &str) -> Vec<usiz
 }
 
 impl YaldaGpuiView {
-    /// Every ordinary-navigation candidate, in **All order**: each project section's
-    /// workspaces then its agent sessions, then the trailing unfiled session
-    /// groups. Built from the sidebar's forced All projection so a selected
-    /// Waiting, Working, or Archived tab never changes `Cmd-P` candidates.
+    /// Every ordinary-navigation candidate, in the **All tab's presentation
+    /// order**: each project section's workspaces, then Working / Waiting /
+    /// Unavailable sessions, then the trailing unfiled groups. A selected
+    /// filtered tab never changes `Cmd-P` candidates.
     pub(crate) fn jump_palette_items(&self, cx: &gpui::App) -> Vec<PaletteItem> {
         // Cmd-P is always the ordinary navigation roster, independent of which
         // filtered tab happens to be visible in each project. Archived rows are
@@ -153,19 +153,21 @@ impl YaldaGpuiView {
                 active: jump_target_is_active(&row.target, active_local, active_sid.as_deref()),
             });
         };
-        for s in &sections {
-            for (idx, label, is_active) in &s.workspaces {
+        for s in sections {
+            for (idx, label, is_active) in s.workspaces {
                 items.push(PaletteItem {
-                    target: PaletteTarget::Workspace(*idx),
-                    label: label.clone(),
+                    target: PaletteTarget::Workspace(idx),
+                    label,
                     detail: s.name.clone(),
                     is_agent: false,
                     status: None,
-                    active: *is_active,
+                    active: is_active,
                 });
             }
-            for (_, row) in &s.sessions {
-                push_session(&mut items, row, &s.name);
+            for (_, rows) in agent_row_groups_for_tab(s.sessions, JumpAgentTab::All) {
+                for (_, row) in rows {
+                    push_session(&mut items, &row, &s.name);
+                }
             }
         }
         for (cwd_label, group) in &unfiled {

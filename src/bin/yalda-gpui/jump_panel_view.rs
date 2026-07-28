@@ -574,6 +574,36 @@ pub(crate) fn agent_rows_for_tab(
     rows
 }
 
+/// Prepare a tab's rows for paint. All is a stable activity partition over the
+/// durable custom order: Working first, Waiting second, then exceptional
+/// Unavailable. Other tabs remain one unheaded list.
+pub(crate) fn agent_row_groups_for_tab(
+    rows: Vec<(usize, AgentRow)>,
+    tab: JumpAgentTab,
+) -> Vec<(Option<AgentActivity>, Vec<(usize, AgentRow)>)> {
+    if tab != JumpAgentTab::All {
+        return (!rows.is_empty()).then_some((None, rows)).into_iter().collect();
+    }
+    let mut working = Vec::new();
+    let mut waiting = Vec::new();
+    let mut unavailable = Vec::new();
+    for row in rows {
+        match row.1.activity() {
+            AgentActivity::Working => working.push(row),
+            AgentActivity::Waiting => waiting.push(row),
+            AgentActivity::Unavailable => unavailable.push(row),
+        }
+    }
+    [
+        (AgentActivity::Working, working),
+        (AgentActivity::Waiting, waiting),
+        (AgentActivity::Unavailable, unavailable),
+    ]
+    .into_iter()
+    .filter_map(|(activity, rows)| (!rows.is_empty()).then_some((Some(activity), rows)))
+    .collect()
+}
+
 /// Group agent rows by their cwd for the jump panel's per-cwd subheaders
 /// (agent-sessions-by-cwd). Returns groups keyed by the display path
 /// (`shorten_cwd_for_display`), sorted by that label for stable headers; within
@@ -1057,27 +1087,50 @@ impl YaldaGpuiView {
                     )),
             );
 
-            // AGENT SESSIONS sublist (status-colored `✦` + accent marks preserved).
-            // Drag order belongs only to All; state tabs own their chronological
-            // order and therefore do not expose drag affordances.
-            for (i, row) in section.sessions {
-                let active =
-                    jump_target_is_active(&row.target, active_local, active_sid.as_deref());
-                col = col.child(jump_session_row_el(
-                    i,
-                    &row,
-                    &st,
-                    sel_bg,
-                    selection_mark,
-                    ready,
-                    working_orange,
-                    active,
-                    drag_fg,
-                    drag_font.clone(),
-                    agent_tab == JumpAgentTab::All,
-                    supporting_text,
-                    cx,
-                ));
+            // AGENT SESSIONS sublist (status-colored `✦` + accent marks
+            // preserved). All is a headed stable activity partition; the other
+            // tabs remain one unheaded list. Drag order belongs only to All.
+            for (activity, rows) in agent_row_groups_for_tab(section.sessions, agent_tab) {
+                if let Some(activity) = activity {
+                    let (slug, glyph, label, tint) = match activity {
+                        AgentActivity::Working => {
+                            ("working", "◆", "Working", working_orange)
+                        }
+                        AgentActivity::Waiting => ("waiting", "✦", "Waiting", ready),
+                        AgentActivity::Unavailable => {
+                            ("unavailable", "○", "Unavailable", supporting_text)
+                        }
+                    };
+                    let probe = format!("jump-agent-group-{}-{slug}", pid.0);
+                    let heading = compact_list_group_heading(
+                        SharedString::from(probe.clone()),
+                        glyph,
+                        label,
+                        rows.len(),
+                        tint,
+                        &st,
+                    );
+                    col = col.child(probe_bounds_dyn(probe, heading.into_any_element()));
+                }
+                for (i, row) in rows {
+                    let active =
+                        jump_target_is_active(&row.target, active_local, active_sid.as_deref());
+                    col = col.child(jump_session_row_el(
+                        i,
+                        &row,
+                        &st,
+                        sel_bg,
+                        selection_mark,
+                        ready,
+                        working_orange,
+                        active,
+                        drag_fg,
+                        drag_font.clone(),
+                        agent_tab == JumpAgentTab::All,
+                        supporting_text,
+                        cx,
+                    ));
+                }
             }
         }
 
