@@ -7797,6 +7797,113 @@ fn jump_session_archive_controls_toggle_the_same_durable_flag(cx: &mut TestAppCo
     });
 }
 
+/// bug-0026 / UXI-JumpPanel-16: archiving an idle session through the real
+/// jump-row context menu removes it from the currently selected Waiting tab.
+///
+/// Negative control (mandatory, observed RED): removing `!row.archived` from
+/// the production Waiting predicate leaves the archived row in the real
+/// section projection and fails at "archived Waiting rows must leave the
+/// Waiting projection". Restoring the predicate passes through paint and proves
+/// the session remains reachable only from Archived.
+#[gpui::test]
+fn archived_waiting_session_is_removed_from_the_painted_waiting_tab(
+    cx: &mut TestAppContext,
+) {
+    use crate::JumpAgentTab;
+    use gpui::{Modifiers, MouseButton};
+    use yalda::session_proto::SessionInfo;
+
+    let (view, vcx) = boot_browser(cx);
+    install_agent_slot(&view, vcx, Some("S-archived-waiting"));
+    let pid = view.update(vcx, |v, cx| {
+        let pid = v.workspace.active_workspace().expect("workspace").project();
+        let cwd = v.projects.cwd_of(pid).expect("project cwd").to_path_buf();
+        v.agent_roster.upsert(SessionInfo {
+            session_id: "S-archived-waiting".into(),
+            acp_session_id: None,
+            label: "archived waiting session".into(),
+            cwd,
+            provider: yalda::acp_channel::AgentProvider::Claude,
+            turns: 0,
+            connected: true,
+            permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+            busy: false,
+        });
+        v.select_jump_agent_tab(pid, JumpAgentTab::Waiting, cx);
+        pid
+    });
+    vcx.run_until_parked();
+
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let (x, y, w, h) =
+        crate::layout_probe_get("jump-session-row-0").expect("waiting row paints before archive");
+    crate::layout_probe_end();
+    let row_at = point(px(x + w / 2.0), px(y + h / 2.0));
+    vcx.simulate_mouse_move(row_at, None, Modifiers::default());
+    vcx.simulate_mouse_down(row_at, MouseButton::Right, Modifiers::default());
+    vcx.simulate_mouse_up(row_at, MouseButton::Right, Modifiers::default());
+    vcx.run_until_parked();
+
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let (x, y, w, h) =
+        crate::layout_probe_get("session-menu-toggle").expect("archive action paints");
+    crate::layout_probe_end();
+    let archive_at = point(px(x + w / 2.0), px(y + h / 2.0));
+    vcx.simulate_mouse_move(archive_at, None, Modifiers::default());
+    vcx.simulate_click(archive_at, Modifiers::default());
+    vcx.run_until_parked();
+
+    assert!(
+        view.read_with(vcx, |v, _| {
+            v.jump_archived_sessions.contains("S-archived-waiting")
+        }),
+        "the real context-menu action sets the durable archive flag"
+    );
+    let waiting_labels = view.update(vcx, |v, cx| {
+        let section = v
+            .jump_panel_sections(cx)
+            .0
+            .into_iter()
+            .find(|section| section.id == pid)
+            .expect("project section");
+        assert_eq!(section.agent_tab, JumpAgentTab::Waiting);
+        section
+            .sessions
+            .into_iter()
+            .map(|(_, row)| row.label)
+            .collect::<Vec<_>>()
+    });
+    assert!(
+        waiting_labels.is_empty(),
+        "archived Waiting rows must leave the Waiting projection"
+    );
+
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    assert!(
+        crate::layout_probe_get("jump-session-row-0").is_none(),
+        "archived Waiting rows must leave the painted Waiting tab"
+    );
+    crate::layout_probe_end();
+
+    view.update(vcx, |v, cx| {
+        v.select_jump_agent_tab(pid, JumpAgentTab::Archived, cx)
+    });
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    assert!(
+        crate::layout_probe_get("jump-session-row-0").is_some(),
+        "the archived row remains available in Archived"
+    );
+    crate::layout_probe_end();
+}
+
 /// Unit (jump-reorder): `reorder_move` drops the dragged item into the target's
 /// slot (target shifts down); a no-op when dragged == target or absent.
 #[test]
