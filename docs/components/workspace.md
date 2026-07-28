@@ -607,12 +607,20 @@ needs a bound-tile boot (`boot_worksheet_channel`), which that test already has 
 
 **Statement.** A fresh desktop divides the visible canvas into four columns by
 four rows, with the jump panel visible. The existing desktop-grid command remains
-authoritative for explicit user choices. Legacy preferences carrying the former
-built-in `2×2` default migrate once to `4×4`; a `2×2` value explicitly saved
-after the migration remains `2×2`.
+authoritative for explicit user choices. Legacy preferences carrying the original
+built-in `2×2` default or the subsequently shipped `3×3` density migrate once to
+`4×4`. Versioned choices made after those migrations remain unchanged; asymmetric
+custom grids are never mistaken for a shipped square default.
 
 **Applies to.** `main.rs` (constructor defaults and versioned preference load)
 and `persist.rs` (`desktop_grid_defaults_version`).
 
-**Status.** `implemented`; exact fit still respects the existing 160×120px
-minimum tile size.
+**Status.** `implemented`; exact fit still respects the 160×120px minimum live-tile
+size. Below the canvas size needed for that floor, the infinite plane reveals fewer
+complete slots instead of shrinking tiles into unusability.
+
+**Enforcement.** `tests.rs`:
+`desktop_density_migrations_reach_four_by_four_without_overriding_later_choices`
+pins the v2 `3×3` → v3 `4×4` migration plus explicit/custom-choice preservation;
+`four_by_four_slot_geometry_fits_when_readable_and_floors_tiny_canvases` pins exact
+four-slot pitch on a normal canvas and the live-tile floor on a small one.

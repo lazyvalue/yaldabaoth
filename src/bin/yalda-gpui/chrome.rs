@@ -5,13 +5,32 @@
 use super::*;
 
 /// Desktop-mode chrome constants (spec-desktop-mode.md Behavior 3/4).
-const DESKTOP_GUTTER: f32 = 12.0;
+pub(crate) const DESKTOP_GUTTER: f32 = 12.0;
+pub(crate) const DESKTOP_MIN_TILE_W: f32 = 160.0;
+pub(crate) const DESKTOP_MIN_TILE_H: f32 = 120.0;
 const DESKTOP_TITLE_H: f32 = 20.0;
 const DESKTOP_DRAG_THRESHOLD: f32 = 4.0;
 const DESKTOP_EDGE_PAN_BAND: f32 = 30.0;
 const DESKTOP_EDGE_PAN_STEP: f32 = 12.0;
 /// Width of the east/south edge bands that arm a tile resize (spec 4b).
 const DESKTOP_RESIZE_BAND: f32 = 6.0;
+
+/// Full-detail tile size for a measured canvas. The requested grid density
+/// determines slot pitch until the live-tile readability floor is reached.
+/// Below that point the infinite plane simply shows fewer complete slots.
+pub(crate) fn desktop_tile_size_for_canvas(
+    canvas_w: f32,
+    canvas_h: f32,
+    cols: u32,
+    rows: u32,
+) -> (f32, f32) {
+    let cols = cols.max(1) as f32;
+    let rows = rows.max(1) as f32;
+    (
+        ((canvas_w - (cols + 1.0) * DESKTOP_GUTTER) / cols).max(DESKTOP_MIN_TILE_W),
+        ((canvas_h - (rows + 1.0) * DESKTOP_GUTTER) / rows).max(DESKTOP_MIN_TILE_H),
+    )
+}
 
 impl YaldaGpuiView {
     /// Build the menu popup as an absolutely-positioned overlay anchored
@@ -611,12 +630,7 @@ impl YaldaGpuiView {
         if h <= 0.0 {
             h = self.viewport_height_px.max(1.0);
         }
-        let cols = self.desktop_grid_cols.max(1) as f32;
-        let rows = self.desktop_grid_rows.max(1) as f32;
-        (
-            ((w - (cols + 1.0) * DESKTOP_GUTTER) / cols).max(160.0),
-            ((h - (rows + 1.0) * DESKTOP_GUTTER) / rows).max(120.0),
-        )
+        desktop_tile_size_for_canvas(w, h, self.desktop_grid_cols, self.desktop_grid_rows)
     }
 
     /// Title-bar label for a tile. Agent labels live in the session store, so

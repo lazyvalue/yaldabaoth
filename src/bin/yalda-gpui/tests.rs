@@ -1,6 +1,9 @@
 //! Unit tests for the GPUI app (moved out of main.rs, split-gpui-main).
 
 use super::*;
+use crate::chrome::{
+    DESKTOP_GUTTER, DESKTOP_MIN_TILE_H, DESKTOP_MIN_TILE_W, desktop_tile_size_for_canvas,
+};
 
 /// UXI-JumpPanel-7: the jump-panel accent colors are theme-owned, not fixed
 /// constants. Nightfox art-directs its own palette-native jump colors (explicit
@@ -431,29 +434,63 @@ fn preferences_round_trip_with_text_scale() {
 }
 
 #[test]
-fn desktop_density_defaults_and_legacy_two_by_two_migrate_to_four_by_four() {
+fn desktop_density_migrations_reach_four_by_four_without_overriding_later_choices() {
     assert_eq!(
-        restore_desktop_grid_axis(None, None, DEFAULT_DESKTOP_GRID_COLS),
-        4
+        restore_desktop_grid(None, None, None),
+        (4, 4),
+        "a fresh install uses the dense desktop"
     );
     assert_eq!(
-        restore_desktop_grid_axis(Some(2), None, DEFAULT_DESKTOP_GRID_COLS),
-        4,
-        "the old persisted default migrates"
+        restore_desktop_grid(Some(2), Some(2), None),
+        (4, 4),
+        "the original persisted default still migrates"
     );
     assert_eq!(
-        restore_desktop_grid_axis(
+        restore_desktop_grid(
+            Some(2),
             Some(2),
             Some(DESKTOP_GRID_DEFAULTS_VERSION),
-            DEFAULT_DESKTOP_GRID_COLS,
         ),
-        2,
-        "a post-migration explicit 2-column choice stays intact"
+        (2, 2),
+        "a post-migration explicit 2×2 choice stays intact"
     );
     assert_eq!(
-        restore_desktop_grid_axis(Some(6), None, DEFAULT_DESKTOP_GRID_COLS),
-        6,
-        "non-default legacy choices stay intact"
+        restore_desktop_grid(Some(3), Some(3), Some(2)),
+        (4, 4),
+        "the shipped v2 3×3 density migrates once"
+    );
+    assert_eq!(
+        restore_desktop_grid(Some(3), Some(3), Some(DESKTOP_GRID_DEFAULTS_VERSION)),
+        (3, 3),
+        "a 3×3 choice made after this migration remains authoritative"
+    );
+    assert_eq!(
+        restore_desktop_grid(Some(5), Some(3), Some(2)),
+        (5, 3),
+        "an asymmetric custom grid is not mistaken for the shipped 3×3 density"
+    );
+}
+
+#[test]
+fn four_by_four_slot_geometry_fits_when_readable_and_floors_tiny_canvases() {
+    let (tile_w, tile_h) = desktop_tile_size_for_canvas(1200.0, 900.0, 4, 4);
+    assert_eq!(tile_w, 285.0);
+    assert_eq!(tile_h, 210.0);
+    assert_eq!(
+        4.0 * tile_w + 5.0 * DESKTOP_GUTTER,
+        1200.0,
+        "four complete columns plus their gutters fit exactly"
+    );
+    assert_eq!(
+        4.0 * tile_h + 5.0 * DESKTOP_GUTTER,
+        900.0,
+        "four complete rows plus their gutters fit exactly"
+    );
+
+    assert_eq!(
+        desktop_tile_size_for_canvas(600.0, 400.0, 4, 4),
+        (DESKTOP_MIN_TILE_W, DESKTOP_MIN_TILE_H),
+        "a tiny canvas must reveal less plane rather than crush live tiles"
     );
 }
 

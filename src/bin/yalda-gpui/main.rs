@@ -499,17 +499,38 @@ pub(crate) const MENU_PANEL_MAX_W: f32 = 720.0;
 pub(crate) const MENU_PANEL_TOP: f32 = 48.0;
 const DEFAULT_DESKTOP_GRID_COLS: u32 = 4;
 const DEFAULT_DESKTOP_GRID_ROWS: u32 = 4;
-const DESKTOP_GRID_DEFAULTS_VERSION: u8 = 2;
+const DESKTOP_GRID_DEFAULTS_VERSION: u8 = 3;
+const TWO_BY_TWO_MIGRATION_VERSION: u8 = 2;
 
 /// Restore one desktop-grid axis, including the one-time migration from the
 /// original 2×2 built-in default. Once version 2 has been saved, `2` is an
 /// explicit user choice and remains untouched.
 fn restore_desktop_grid_axis(saved: Option<u32>, version: Option<u8>, default: u32) -> u32 {
     match saved {
-        Some(2) if version.unwrap_or(1) < DESKTOP_GRID_DEFAULTS_VERSION => default,
+        Some(2) if version.unwrap_or(1) < TWO_BY_TWO_MIGRATION_VERSION => default,
         Some(value) => value.clamp(1, 12),
         None => default,
     }
+}
+
+/// Restore both axes together so the shipped 3×3 density can migrate to 4×4
+/// without rewriting a deliberate asymmetric choice such as 5×3. Version 3 is
+/// written on the next settings save; after that, an explicit 3×3 remains 3×3.
+fn restore_desktop_grid(
+    saved_cols: Option<u32>,
+    saved_rows: Option<u32>,
+    version: Option<u8>,
+) -> (u32, u32) {
+    if version.unwrap_or(1) < DESKTOP_GRID_DEFAULTS_VERSION
+        && saved_cols == Some(3)
+        && saved_rows == Some(3)
+    {
+        return (DEFAULT_DESKTOP_GRID_COLS, DEFAULT_DESKTOP_GRID_ROWS);
+    }
+    (
+        restore_desktop_grid_axis(saved_cols, version, DEFAULT_DESKTOP_GRID_COLS),
+        restore_desktop_grid_axis(saved_rows, version, DEFAULT_DESKTOP_GRID_ROWS),
+    )
 }
 
 /// Left gutter between the jump panel and the card, so the card sits just inside
@@ -8208,19 +8229,16 @@ fn main() {
                         if let Some(scale) = prefs.text_scale {
                             view.text_scale = scale.clamp(MIN_TEXT_SCALE, MAX_TEXT_SCALE);
                         }
-                        // Desktop density v2: migrate the original persisted 2×2
-                        // default to 4×4 once. A 2×2 value saved by v2 remains an
-                        // explicit user choice because the version marker is set.
-                        view.desktop_grid_cols = restore_desktop_grid_axis(
+                        // Desktop density v3: migrate the previously shipped 3×3
+                        // density to 4×4 once, while preserving asymmetric custom
+                        // grids and post-migration explicit choices.
+                        let (grid_cols, grid_rows) = restore_desktop_grid(
                             prefs.desktop_grid_cols,
-                            prefs.desktop_grid_defaults_version,
-                            DEFAULT_DESKTOP_GRID_COLS,
-                        );
-                        view.desktop_grid_rows = restore_desktop_grid_axis(
                             prefs.desktop_grid_rows,
                             prefs.desktop_grid_defaults_version,
-                            DEFAULT_DESKTOP_GRID_ROWS,
                         );
+                        view.desktop_grid_cols = grid_cols;
+                        view.desktop_grid_rows = grid_rows;
                         if let Some(v) = prefs.jump_panel_visible {
                             view.jump_panel_visible = v;
                         }

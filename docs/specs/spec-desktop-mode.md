@@ -1,7 +1,7 @@
 # Desktop Mode — Uniform Tiles on a Pannable Slot Grid
 
 **Status:** DRAFT
-**Last updated:** 2026-06-10
+**Last updated:** 2026-07-28
 
 ## Builds On
 
@@ -20,7 +20,7 @@
 Desktop mode is an alternative to tiling: every window becomes a **tile**,
 placed on an unbounded **desktop** of grid **slots**. Tile size derives from
 a globally-configured **grid** — how many tiles fit the viewport per axis
-(default **2 × 2**) — so all tiles are uniform and resize with the window
+(default **4 × 4**) — so all tiles are uniform and resize with the window
 while their slots never change. The window is a viewport over the desktop:
 growing the window reveals more desktop and grows each tile proportionally;
 it never moves or reflows tiles (slot addresses are immutable under resize). Tiles are arranged by
@@ -199,7 +199,7 @@ they are.
 ### 6 · Desktop grid configuration [DRAFT]
 
 `desktop_grid_cols` / `desktop_grid_rows` live in `Preferences` (persisted,
-default 2 × 2): how many tiles fit the viewport per axis, one global
+default 4 × 4): how many tiles fit the viewport per axis, one global
 setting for all tabs. Tile size derives from it (Behavior 3) — a 3×2 grid
 shows six full tiles per screen. Runtime configuration uses a small text
 overlay in the existing `ActiveOverlay` family (the `TagInput`/`Rename`
