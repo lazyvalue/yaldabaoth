@@ -794,10 +794,11 @@ an expanded workspace row, folds its project through the real toggle, proves
 the row is absent, then unfolds and proves it returns. Preference serialization
 is covered by `tests.rs::preferences_round_trip_with_text_scale`.
 
-### UXI-JumpPanel-14 — Every project has Waiting / Working / All agent tabs
+### UXI-JumpPanel-14 — Every project has Waiting / Working / All ordinary agent tabs
 
 **Statement.** Directly below each expanded project's workspace rows, the jump
-panel renders three independently selectable agent tabs:
+panel renders three independently selectable ordinary agent tabs (the
+orthogonal fourth Archived tab is specified by `UXI-JumpPanel-16`):
 
 1. **Waiting** contains every connected session that is not currently producing
    a reply (`AgentActivity::Waiting`). Every row is consistently green and says
@@ -831,24 +832,24 @@ The first roster seed freezes the previous by-label default into the order; late
 new-session append sites), and `yux/detail.rs` (`compact_tab`).
 
 **Status.** `implemented` — filtering, chronology, independent project
-selection, stable All order, append semantics, and the three tabs' painted
-presence are headless-guarded. Exact colors remain harness gap #1.
+selection, stable All order, append semantics, and the tabs' painted presence
+are headless-guarded. Exact colors remain harness gap #1.
 
 **Enforcement.**
 `verify_harness.rs::jump_agent_state_tabs_filter_and_sort_without_moving_all`
 guards state filtering, oldest→newest order, and All identity.
 `jump_project_agent_tabs_are_independent_and_all_appends` drives the real
 per-project section projection and append method, proves every Waiting row says
-`your turn`, probes all three painted tab controls, and includes a state flip
+`your turn`, probes all four painted tab controls, and includes a state flip
 that must not move All rows.
 
 ### UXI-JumpPanel-15 — Agent tabs are a separated neutral segmented control
 
-**Statement.** Waiting / Working / All render as a single bounded segmented
-control, not three floating words:
+**Statement.** Waiting / Working / All / Archived render as a single bounded
+segmented control, not four floating words:
 
 - one rounded neutral hairline encloses the group;
-- internal hairlines separate its three equal-width targets;
+- internal hairlines separate its four equal-width targets;
 - the selected segment uses the overlay's gray selected background;
 - every label uses normal foreground contrast;
 - 10px of breathing room separates the workspace rows from the control;
@@ -872,3 +873,65 @@ probes the enclosing control and proves each painted tab is inside it.
 `tests.rs::jump_supporting_text_is_cool_and_readable_in_everyday_themes`
 locks the Folio/Nightfox supporting colors and rejects their warm accents.
 `jump_panel_state_palette_is_orange_green_and_gray` guards neutral selection.
+
+### UXI-JumpPanel-16 — Sessions can be archived without changing live activity
+
+**Statement.** Archiving is a durable visibility flag on a server-backed agent
+session, not a third operational activity:
+
+- an archived session is absent from Waiting, Working, All, and the `Cmd-P`
+  jump palette;
+- it appears only in the project's fourth **Archived** tab;
+- the Archived tab preserves the same durable `jump_session_order` used by All;
+- archiving, unarchiving, and live activity changes never move that durable
+  slot, so unarchiving restores the row to All and to whichever one of Waiting
+  or Working currently applies;
+- an active archived session remains open and usable even though ordinary
+  navigation lists hide it;
+- the active agent's `<space>` menu offers exactly one contextual action:
+  **archive session** or **unarchive session**;
+- right-clicking a jump-panel session row opens a cursor-anchored context menu
+  with that same contextual action. `Esc` or click-away dismisses it.
+
+The flag is keyed by stable server sid and persisted with preferences. A
+session that does not yet have a sid cannot be archived; its local menu action
+is disabled and it has no archivable jump-row identity. `/clear` succession
+migrates the flag from the predecessor sid to the replacement sid alongside the
+existing durable order-slot migration.
+
+**Applies to.** `jump_panel_view.rs` (`JumpAgentTab`, session projections,
+session-row right click), `jump_palette.rs` (candidate projection), `main.rs`
+(durable archive set, local-menu command, session context-menu overlay),
+`agent_ui.rs` (`/clear` identity succession), and `persist.rs`
+(`Preferences::jump_archived_sessions`).
+
+**Why.** Long-lived session histories need to leave everyday navigation without
+being killed or losing their curated position. Keeping archive orthogonal to
+activity prevents it from becoming a misleading replacement for Waiting or
+Working.
+
+**Status.** `implemented` — archive state, filtering, persistence, both command
+surfaces, and painted-row interaction are headless-guarded. Exact visual balance
+of the four-tab strip and cursor-anchored popup remains harness gap #1.
+
+**Enforcement.**
+`verify_harness.rs::jump_session_archive_filters_tabs_palette_and_persists`
+drives all four real projections, proves `Cmd-P` remains the non-archived All
+projection even while Archived is selected, and round-trips the preference
+snapshot.
+`verify_harness.rs::jump_session_archive_controls_toggle_the_same_durable_flag`
+drives the dynamic `<space>` menu command plus actual right-click and click
+events against the painted session row and context-menu item. It also proves a
+sid-less local session cannot be archived.
+`clear_keeps_the_sessions_jump_panel_slot` proves `/clear` migrates both the
+durable order slot and archive identity.
+
+**Negative control observed.** Temporarily removing the All projection's archive
+filter made `jump_session_archive_filters_tabs_palette_and_persists` fail with
+the archived sid present beside the live sid. Restoring the filter returned the
+guard to green.
+
+**Deviation from plan.** None material. `Cmd-P` explicitly requests the All
+projection rather than inheriting the currently visible per-project tab; this
+is the necessary expression of the requirement that the palette remain ordinary
+navigation and never expose Archived.

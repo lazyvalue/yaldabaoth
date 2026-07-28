@@ -123,6 +123,48 @@ pub(crate) fn compact_tab(
         .child(SharedString::from(label.to_string()))
 }
 
+/// One row in a small cursor-anchored context menu. Callers own the popup shell
+/// and attach the domain action; this primitive keeps glyph alignment,
+/// typography, spacing, and hover treatment consistent across menus.
+pub(crate) fn context_menu_item(
+    id: impl Into<ElementId>,
+    glyph: &str,
+    glyph_color: Hsla,
+    label: &str,
+    label_color: Hsla,
+    hover_bg: Hsla,
+    mono: &SharedString,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .mx(px(4.0))
+        .px_3()
+        .py(px(6.0))
+        .rounded(px(4.0))
+        .cursor_pointer()
+        .font_family(mono.clone())
+        .text_size(px(13.0))
+        .font_weight(FontWeight::MEDIUM)
+        .hover(|s| s.bg(hover_bg))
+        .child(
+            div()
+                .w(px(16.0))
+                .flex_none()
+                .text_color(glyph_color)
+                .child(SharedString::from(glyph.to_string())),
+        )
+        .child(
+            div()
+                .flex_1()
+                .text_color(label_color)
+                .child(SharedString::from(label.to_string())),
+        )
+}
+
 /// An author · timestamp header over a multiline body (comments, updates).
 pub(crate) fn note_block(author: String, when: String, body: &str, st: &DetailStyle) -> gpui::Div {
     let hdr = if when.is_empty() {

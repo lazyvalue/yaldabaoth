@@ -36,6 +36,9 @@ style bundle so a caller themes once:
 - **`compact_tab(id, label, selected, selected_bg, &DetailStyle)`** — equal-width
   compact tab chrome; selection is carried by its background and every label
   keeps normal foreground contrast. The caller owns the enclosing tab group.
+- **`context_menu_item(id, glyph, colors, label, font)`** — shared compact
+  popup-row chrome for cursor context menus. The caller owns dispatch and the
+  popup shell.
 - **`note_block(author, when, body, &DetailStyle)`** — author · timestamp over a
   multiline body (comments, updates, log entries).
 - **`fmt_iso_datetime(&Option<String>)`** — ISO-8601 → `YYYY-MM-DD HH:MM`.

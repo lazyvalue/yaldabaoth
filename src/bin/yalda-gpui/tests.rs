@@ -405,6 +405,7 @@ fn preferences_round_trip_with_text_scale() {
         jump_panel_visible: Some(false),
         jump_cwd_order: Some(vec!["/work/beta".into(), "/work/alpha".into()]),
         jump_session_order: Some(vec!["sid-2".into(), "sid-1".into()]),
+        jump_archived_sessions: Some(vec!["sid-old".into()]),
         jump_folded_projects: Some(vec!["Fulcrum".into(), "Yaldabaoth".into()]),
     };
     let json = serde_json::to_string(&prefs).unwrap();
@@ -414,6 +415,7 @@ fn preferences_round_trip_with_text_scale() {
     assert_eq!(back.jump_panel_visible, Some(false));
     assert_eq!(back.jump_cwd_order.as_deref(), Some(&["/work/beta".into(), "/work/alpha".into()][..]));
     assert_eq!(back.jump_session_order.as_deref(), Some(&["sid-2".into(), "sid-1".into()][..]));
+    assert_eq!(back.jump_archived_sessions.as_deref(), Some(&["sid-old".into()][..]));
     assert_eq!(back.desktop_grid_cols, Some(100));
     assert_eq!(back.desktop_grid_rows, Some(30));
     assert_eq!(back.desktop_grid_defaults_version, Some(2));

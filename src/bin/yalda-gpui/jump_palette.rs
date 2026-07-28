@@ -1,10 +1,10 @@
 //! The **jump palette** (`UXI-JumpPanel-9`) — `Cmd-P`'s type-to-filter dialog
-//! over the same navigable set the jump-panel sidebar shows: every non-ephemeral
-//! workspace and every agent session (`Local` ∪ `Roster`).
+//! over the jump panel's ordinary navigable set: every non-ephemeral workspace
+//! and every non-archived agent session (`Local` ∪ `Roster`).
 //!
 //! The palette is a pure alternate *input* onto that list. It builds its
-//! candidates by walking `jump_panel_sections` — the very view-model the sidebar
-//! paints — so the two can never drift, and it activates through the sidebar's
+//! candidates by walking the sidebar's `All` projection, independent of which
+//! filtered tab is currently visible, and activates through the sidebar's
 //! existing dispatchers (`select_workspace` / `jump_to_agent`), so 1:1 binding,
 //! ephemeral-workspace teardown (ADR-0021) and read-marking stay owned where
 //! they already are. No new jump semantics live here.
@@ -131,12 +131,16 @@ pub(crate) fn rank_palette_items(items: &[PaletteItem], query: &str) -> Vec<usiz
 }
 
 impl YaldaGpuiView {
-    /// Every palette candidate, in **panel order**: each project section's
+    /// Every ordinary-navigation candidate, in **All order**: each project section's
     /// workspaces then its agent sessions, then the trailing unfiled session
-    /// groups. Built from `jump_panel_sections` — the sidebar's own view-model —
-    /// so the palette lists exactly what the panel lists.
+    /// groups. Built from the sidebar's forced All projection so a selected
+    /// Waiting, Working, or Archived tab never changes `Cmd-P` candidates.
     pub(crate) fn jump_palette_items(&self, cx: &gpui::App) -> Vec<PaletteItem> {
-        let (sections, unfiled) = self.jump_panel_sections(cx);
+        // Cmd-P is always the ordinary navigation roster, independent of which
+        // filtered tab happens to be visible in each project. Archived rows are
+        // excluded by the forced All projection.
+        let (sections, unfiled) =
+            self.jump_panel_sections_with_tab(cx, Some(crate::JumpAgentTab::All));
         let (active_local, active_sid) = self.jump_active_session();
         let mut items = Vec::new();
         let push_session = |items: &mut Vec<PaletteItem>, row: &AgentRow, detail: &str| {

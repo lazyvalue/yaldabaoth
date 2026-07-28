@@ -45,6 +45,7 @@ pub(crate) enum JumpAgentTab {
     Working,
     #[default]
     All,
+    Archived,
 }
 
 impl JumpAgentTab {
@@ -53,6 +54,7 @@ impl JumpAgentTab {
             Self::Waiting => "Waiting",
             Self::Working => "Working",
             Self::All => "All",
+            Self::Archived => "Archived",
         }
     }
 }
@@ -99,6 +101,8 @@ pub(crate) struct AgentRow {
     /// The one-shot topic summary is currently being derived. Used to render a
     /// quiet progress line instead of making the summary appear broken.
     pub(crate) summary_pending: bool,
+    /// Durable visibility flag, orthogonal to Waiting / Working activity.
+    pub(crate) archived: bool,
     /// The sid this row occupies in the user's drag order (`jump_session_order`).
     /// For a roster row that is its own sid. For a local-only placeholder it is
     /// its PREDECESSOR's sid when the placeholder continues a killed session
@@ -313,6 +317,7 @@ impl YaldaGpuiView {
                 label,
                 summary,
                 summary_pending,
+                archived: self.jump_archived_sessions.contains(&info.session_id),
                 cwd: info.cwd.clone(),
                 bound,
                 connected: info.connected,
@@ -354,6 +359,16 @@ impl YaldaGpuiView {
                     let state = &ent.read(cx).state;
                     state.summary.is_none() && state.autoname == AutonameState::Requested
                 },
+                archived: self
+                    .sessions
+                    .sid_of(id)
+                    .map(|sid| self.jump_archived_sessions.contains(sid.as_str()))
+                    .or_else(|| {
+                        self.jump_order_succession
+                            .get(&id)
+                            .map(|sid| self.jump_archived_sessions.contains(sid))
+                    })
+                    .unwrap_or(false),
                 cwd: ent.read(cx).cwd.clone(),
                 bound: self.agent_tile_id_bound_to(id).is_some(),
                 connected: true,
@@ -466,6 +481,17 @@ impl YaldaGpuiView {
         &self,
         cx: &gpui::App,
     ) -> (Vec<JumpProjectSection>, Vec<(String, Vec<(usize, AgentRow)>)>) {
+        self.jump_panel_sections_with_tab(cx, None)
+    }
+
+    /// Alternate projection used by Cmd-P: force each project's tab without
+    /// mutating the per-project UI selection. This keeps the palette's
+    /// candidate set stable even while the visible panel is on a filtered tab.
+    pub(crate) fn jump_panel_sections_with_tab(
+        &self,
+        cx: &gpui::App,
+        forced_tab: Option<JumpAgentTab>,
+    ) -> (Vec<JumpProjectSection>, Vec<(String, Vec<(usize, AgentRow)>)>) {
         let rows = self.jump_panel_agent_rows(cx);
         let grouped = order_grouped_rows(
             group_agent_rows_by_cwd(rows),
@@ -481,7 +507,13 @@ impl YaldaGpuiView {
             let pid = group.first().and_then(|(_, r)| self.projects.by_cwd(&r.cwd));
             match pid {
                 Some(id) => by_project.entry(id).or_default().extend(group),
-                None => unfiled.push((cwd_label, group)),
+                None => {
+                    let visible: Vec<_> =
+                        group.into_iter().filter(|(_, row)| !row.archived).collect();
+                    if !visible.is_empty() {
+                        unfiled.push((cwd_label, visible));
+                    }
+                }
             }
         }
         let mut sections: Vec<JumpProjectSection> = Vec::new();
@@ -496,14 +528,15 @@ impl YaldaGpuiView {
                     (idx, t.display_label().to_string(), idx == self.workspace.active_workspace)
                 })
                 .collect();
-            let agent_tab = self.jump_agent_tabs.get(&id).copied().unwrap_or_default();
+            let selected_tab = self.jump_agent_tabs.get(&id).copied().unwrap_or_default();
+            let agent_tab = forced_tab.unwrap_or(selected_tab);
             let sessions =
                 agent_rows_for_tab(by_project.remove(&id).unwrap_or_default(), agent_tab);
             sections.push(JumpProjectSection {
                 id,
                 name: p.name.clone(),
                 cwd_display: shorten_cwd_for_display(&p.cwd),
-                agent_tab,
+                agent_tab: selected_tab,
                 workspaces,
                 sessions,
             });
@@ -521,22 +554,23 @@ impl YaldaGpuiView {
 
 /// Apply one project's selected agent-state tab. Waiting and Working are live
 /// queues sorted by when each row entered that state (oldest first, newest
-/// last). All preserves the incoming custom order exactly; a state transition
-/// therefore never moves an All row.
+/// last). All and Archived preserve the incoming custom order exactly.
 pub(crate) fn agent_rows_for_tab(
     mut rows: Vec<(usize, AgentRow)>,
     tab: JumpAgentTab,
 ) -> Vec<(usize, AgentRow)> {
-    let wanted = match tab {
-        JumpAgentTab::Waiting => Some(AgentActivity::Waiting),
-        JumpAgentTab::Working => Some(AgentActivity::Working),
-        JumpAgentTab::All => None,
-    };
-    let Some(wanted) = wanted else {
-        return rows;
-    };
-    rows.retain(|(_, row)| row.activity() == wanted);
-    rows.sort_by_key(|(_, row)| row.state_entered_at);
+    match tab {
+        JumpAgentTab::Waiting => {
+            rows.retain(|(_, row)| !row.archived && row.activity() == AgentActivity::Waiting);
+            rows.sort_by_key(|(_, row)| row.state_entered_at);
+        }
+        JumpAgentTab::Working => {
+            rows.retain(|(_, row)| !row.archived && row.activity() == AgentActivity::Working);
+            rows.sort_by_key(|(_, row)| row.state_entered_at);
+        }
+        JumpAgentTab::All => rows.retain(|(_, row)| !row.archived),
+        JumpAgentTab::Archived => rows.retain(|(_, row)| row.archived),
+    }
     rows
 }
 
@@ -700,6 +734,39 @@ impl YaldaGpuiView {
 }
 
 impl YaldaGpuiView {
+    /// Set the durable archive visibility flag for one server-backed session.
+    /// Activity and custom All ordering are deliberately untouched.
+    pub(crate) fn set_session_archived(
+        &mut self,
+        sid: &str,
+        archived: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = if archived {
+            self.jump_archived_sessions.insert(sid.to_string())
+        } else {
+            self.jump_archived_sessions.remove(sid)
+        };
+        if !changed {
+            return;
+        }
+        self.save_settings();
+        cx.notify();
+    }
+
+    /// Contextual `<space>` action for the focused agent tile. Sid-less
+    /// placeholders are intentionally a no-op; the menu disables this command.
+    pub(crate) fn set_focused_session_archived(
+        &mut self,
+        archived: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(sid) = self.active_server_session_id() else {
+            return;
+        };
+        self.set_session_archived(&sid, archived, cx);
+    }
+
     /// Select the agent-state slice for one project. `All` is represented by an
     /// absent entry, keeping the runtime map sparse.
     pub(crate) fn select_jump_agent_tab(
@@ -949,7 +1016,12 @@ impl YaldaGpuiView {
                 .border_color(tab_edge)
                 .rounded_md();
             for (tab_idx, tab) in
-                [JumpAgentTab::Waiting, JumpAgentTab::Working, JumpAgentTab::All]
+                [
+                    JumpAgentTab::Waiting,
+                    JumpAgentTab::Working,
+                    JumpAgentTab::All,
+                    JumpAgentTab::Archived,
+                ]
                     .into_iter()
                     .enumerate()
             {
@@ -1164,24 +1236,39 @@ fn jump_session_row_el(
     // zoom), single-line-height text indented to the label's x so it reads as a
     // subtitle of the row rather than a row of its own. A settled session with
     // no summary reserves no space; an in-flight one gets explicit feedback.
-    let (summary, pending) =
-        if let Some(summary) = row.summary.as_ref().filter(|s| !s.trim().is_empty()) {
-            (summary.clone(), false)
-        } else if row.summary_pending {
-            ("summarizing topic…".to_string(), true)
-        } else {
-            return r.into_any_element();
-        };
-    let mut summary_color = supporting_text;
-    if pending {
-        summary_color.a = 0.72;
-    }
-    div()
+    let mut content = div()
+        .id(SharedString::from(format!("jump-session-wrap-{i}")))
         .flex()
         .flex_col()
         .w_full()
         .child(r)
-        .child(
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener({
+                let target = target.clone();
+                move |this, ev: &MouseDownEvent, _window, cx| {
+                    this.open_session_menu(
+                        target.clone(),
+                        (f32::from(ev.position.x), f32::from(ev.position.y)),
+                        cx,
+                    );
+                }
+            }),
+        );
+    if let Some((summary, pending)) =
+        if let Some(summary) = row.summary.as_ref().filter(|s| !s.trim().is_empty()) {
+            Some((summary.clone(), false))
+        } else if row.summary_pending {
+            Some(("summarizing topic…".to_string(), true))
+        } else {
+            None
+        }
+    {
+        let mut summary_color = supporting_text;
+        if pending {
+            summary_color.a = 0.72;
+        }
+        content = content.child(
             div()
                 // 2px accent gutter + px_3 padding + 16px badge + gap_2 — line the
                 // summary up with the label above it.
@@ -1194,8 +1281,9 @@ fn jump_session_row_el(
                 .text_size(px(st.pt * 0.8))
                 .text_color(summary_color)
                 .child(SharedString::from(summary)),
-        )
-        .into_any_element()
+        );
+    }
+    probe_bounds_dyn(format!("jump-session-row-{i}"), content.into_any_element())
 }
 
 /// One selectable row: optional leading badge glyph + label + optional trailing
