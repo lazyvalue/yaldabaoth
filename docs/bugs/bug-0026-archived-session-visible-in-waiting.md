@@ -60,3 +60,10 @@ ship the guard and restart from the merged release build.
 non-live integration suite. Live network/auth tests remained intentionally
 ignored. Ready to merge, rebuild release, restart the GUI, and re-query the
 preserved session server.
+
+### 2026-07-28 16:09 PDT — merged release running
+
+Merged to `main`, built the release GUI, and replaced the mismatched process.
+The new PID started after the release artifact's modification time and maps
+that artifact's inode. It reconnected successfully to the unchanged session
+server; the read-only roster query still reported all 17 live sessions.
