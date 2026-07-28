@@ -823,6 +823,13 @@ sessions use `TurnPhase::turn_started` / `AgentState::waiting_since`;
 roster-only sessions use `AgentRoster::state_since`. Unread remains internal
 attention state, not an activity or visual state.
 
+Selecting, focusing, attaching, or otherwise **viewing** a session is not a
+state transition and cannot change this timestamp or its queue position. When a
+roster-backed row becomes locally attached, its roster activity timestamp
+remains authoritative; the act of constructing a local view must not replace it
+with the new `AgentState` construction time. A Waiting row moves to the bottom
+only after it actually enters Working and later re-enters Waiting.
+
 A connected agent therefore always belongs to exactly one of Waiting or
 Working. Disconnected/connecting sessions are `AgentActivity::Unavailable` and
 remain visible in All under the conditional exceptional section; Unavailable is
@@ -844,14 +851,17 @@ by-label default into the order; later `SessionCreated` events only append.
 new-session append sites), and `yux/detail.rs` (`compact_tab`,
 `compact_list_group_heading`).
 
-**Status.** `implemented` — filtering, chronology, independent project
-selection, stable durable order, append semantics, painted tabs, and the headed
-All partition are headless-guarded. Exact heading density and contrast remain
-harness gap #1.
+**Status.** `implemented` — filtering, chronology, view/attach timestamp
+continuity, independent project selection, stable durable order, append
+semantics, painted tabs, and the headed All partition are headless-guarded.
+Exact heading density and contrast remain harness gap #1.
 
 **Enforcement.**
 `verify_harness.rs::jump_agent_state_tabs_filter_and_sort_without_moving_all`
 guards state filtering, oldest→newest order, and All identity.
+The view/attach continuity clause is guarded through the real
+`jump_to_agent` roster attach path by
+`viewing_a_waiting_agent_does_not_change_waiting_order`.
 `jump_project_agent_tabs_are_independent_and_all_appends` drives the real
 per-project section projection and append method, proves every Waiting row says
 `your turn`, probes all four painted tab controls, and includes a state flip
@@ -860,6 +870,14 @@ that must not rewrite the All projection's durable order.
 proves nonempty headings and rows paint in Working → Waiting → Unavailable
 order, rows retain their durable relative order within each group, and empty
 groups paint no heading.
+
+**View/attach reconciliation (2026-07-28).** The initial wording suggested a
+binary local-versus-roster timestamp owner. The shipped projection is
+phase-aware: while local and roster activity agree, the roster timestamp is
+authoritative and survives view attachment; while they disagree because the
+local reducer has started a real transition ahead of `SessionBusy`, the local
+transition timestamp leads until the roster catches up. This preserves queue
+identity without making status chronology lag behind real local activity.
 
 **Negative control observed.** With the guard added before the renderer changed,
 `jump_all_tab_groups_activity_with_headers` failed specifically because the

@@ -7228,6 +7228,142 @@ fn jump_agent_state_tabs_filter_and_sort_without_moving_all() {
     );
 }
 
+/// UXI-JumpPanel-14: viewing a Waiting roster session must not make it the
+/// newest Waiting session. Before selection the row is roster-only and ranked
+/// by `AgentRoster::state_since`; the real roster-row jump attaches it into a
+/// freshly constructed local `AgentState`. That identity handoff must preserve
+/// the operational timestamp and therefore the exact Waiting order.
+///
+/// Drives the real `jump_to_agent` → `jump_to_roster_session` →
+/// `picker_attach_existing` path. The test seam bypasses only the absent live
+/// daemon in the hermetic harness; the synchronous view/attach state changes are
+/// production.
+///
+/// Negative control (mandatory, observed RED): prefer the newly attached local
+/// state's `waiting_since` over `AgentRoster::state_since` in
+/// `jump_panel_agent_rows` and the final order becomes `a-new, z-old` — the
+/// selected row moves to the bottom exactly as reported.
+#[gpui::test]
+fn viewing_a_waiting_agent_does_not_change_waiting_order(cx: &mut TestAppContext) {
+    use crate::{JumpAgentTab, JumpTarget};
+    use yalda::session_proto::SessionInfo;
+
+    let (view, vcx) = boot_browser(cx);
+    let (pid, cwd) = view.update(vcx, |v, _| {
+        let pid = v.workspace.active_workspace().expect("workspace").project();
+        (pid, v.projects.cwd_of(pid).expect("project cwd").to_path_buf())
+    });
+    let info = |sid: &str, label: &str| SessionInfo {
+        session_id: sid.into(),
+        acp_session_id: None,
+        label: label.into(),
+        cwd: cwd.clone(),
+        provider: yalda::acp_channel::AgentProvider::Claude,
+        turns: 0,
+        connected: true,
+        permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+        busy: false,
+    };
+    view.update(vcx, |v, cx| {
+        // Reverse label order makes chronology observable rather than getting
+        // the same answer accidentally from the roster's alphabetical input.
+        v.agent_roster.upsert(info("S-old", "z-old"));
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        v.agent_roster.upsert(info("S-new", "a-new"));
+        v.select_jump_agent_tab(pid, JumpAgentTab::Waiting, cx);
+    });
+
+    let waiting_labels =
+        |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+            view.update(vcx, |v, cx| {
+                v.jump_panel_sections(cx)
+                    .0
+                    .into_iter()
+                    .find(|section| section.id == pid)
+                    .expect("project section")
+                    .sessions
+                    .into_iter()
+                    .map(|(_, row)| row.label)
+                    .collect::<Vec<_>>()
+            })
+        };
+    assert_eq!(
+        waiting_labels(&view, vcx),
+        vec!["z-old", "a-new"],
+        "precondition: Waiting is oldest first, not alphabetical"
+    );
+
+    view.update(vcx, |v, cx| {
+        crate::with_server_roster_jump_branch(|| {
+            v.jump_to_agent(JumpTarget::Roster("S-old".into()), cx)
+        });
+    });
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(vcx, |v, _| {
+            v.sessions
+                .locate(&ServerSid::new("S-old"))
+                .is_some()
+        }),
+        "the real roster jump attached a fresh local view for S-old"
+    );
+    assert_eq!(
+        waiting_labels(&view, vcx),
+        vec!["z-old", "a-new"],
+        "viewing S-old is not a state transition and must not move it to the bottom"
+    );
+
+    // A REAL operational cycle is different: S-old leaves Waiting for Working,
+    // then re-enters Waiting and therefore becomes the newest row.
+    use yalda::session_proto::Notification as ServerNotification;
+    let local = view.read_with(vcx, |v, _| {
+        v.sessions
+            .locate(&ServerSid::new("S-old"))
+            .expect("attached local identity")
+    });
+    view.update(vcx, |v, cx| {
+        let now = std::time::Instant::now();
+        v.session_entity(local)
+            .expect("local session")
+            .update(cx, |session, _| {
+                session.state.turn_phase =
+                    crate::TurnPhase::Awaiting { started: now, last_event: now };
+            });
+        v.apply_server_batch(
+            vec![ServerNotification::SessionBusy {
+                session_id: "S-old".into(),
+                busy: true,
+            }],
+            cx,
+        );
+    });
+    assert_eq!(
+        waiting_labels(&view, vcx),
+        vec!["a-new"],
+        "Working removes S-old from Waiting"
+    );
+    view.update(vcx, |v, cx| {
+        v.session_entity(local)
+            .expect("local session")
+            .update(cx, |session, _| {
+                session.state.turn_phase = crate::TurnPhase::Idle;
+                session.state.waiting_since = Some(std::time::Instant::now());
+            });
+        v.apply_server_batch(
+            vec![ServerNotification::SessionBusy {
+                session_id: "S-old".into(),
+                busy: false,
+            }],
+            cx,
+        );
+    });
+    assert_eq!(
+        waiting_labels(&view, vcx),
+        vec!["a-new", "z-old"],
+        "only re-entering Waiting moves S-old to the bottom"
+    );
+}
+
 /// UXI-JumpPanel-14, real per-project projection: each project defaults to All,
 /// selects its own state slice, preserves custom All order through state
 /// changes, and appends a newly discovered sid.

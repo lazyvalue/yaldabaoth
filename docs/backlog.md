@@ -13,6 +13,23 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Keep Waiting order stable when viewing an agent** — `DONE` (2026-07-28 via
+  `/new-ux`; extends `UXI-JumpPanel-14`). Captured verbatim: *"The ordering of
+  the waiting tab shouldn't change ON VIEW. The ordering should be based on when
+  the agent ENTERED the waiting state. Selecting an agent current moves it to
+  the bottom of the list, which is NOT correct behavior."* Selecting or viewing
+  a session is not an operational state transition and must preserve its
+  Waiting entry timestamp and list position. Only a real
+  Waiting→Working→Waiting cycle can move it to the newest (bottom) position.
+  Shipped by keeping the roster's identity-stable state-entry time when local
+  and server activity agree; if local activity is ahead of the server
+  broadcast, its real transition time leads temporarily. Guard
+  `viewing_a_waiting_agent_does_not_change_waiting_order` drives the real
+  roster-row `jump_to_agent` attach path, observed the reported `z-old,a-new` →
+  `a-new,z-old` RED, proves selection preserves order after the fix, and proves
+  a real Working→Waiting cycle does move the row to the bottom. Full suite
+  green.
+
 - **Show live totals on Waiting and Working tabs** — `NEEDS-RUNTIME` (built on branch
   `jump-tab-counts`, 2026-07-28 via `/new-ux`; `UXI-JumpPanel-17`). Captured
   verbatim: *"I want the Waiting and Working tabs to have a number indicator
