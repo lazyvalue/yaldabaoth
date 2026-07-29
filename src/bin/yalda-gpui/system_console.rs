@@ -1,4 +1,4 @@
-//! Yalda's drop-down system console (`UXI-SystemConsole-1..4`).
+//! Yalda's drop-down system console (`UXI-SystemConsole-1..5`).
 //!
 //! The component owns a bounded log and scroll state, persists recent lifecycle
 //! messages across the process replacement performed by self-rebuild, and
@@ -12,11 +12,28 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::Stdio;
 #[cfg(not(test))]
 use std::sync::mpsc;
+use std::sync::{Arc, OnceLock};
 
 pub(crate) const SYSTEM_CONSOLE_MAX_LINES: usize = 1_000;
 pub(crate) const SYSTEM_CONSOLE_HEIGHT_RATIO: f32 = 1.0 / 3.0;
+pub(crate) const SYSTEM_CONSOLE_WIDTH_RATIO: f32 = 2.0 / 3.0;
+pub(crate) const SYSTEM_CONSOLE_LEFT_RATIO: f32 = 1.0 / 6.0;
+pub(crate) const SYSTEM_CONSOLE_TOP_RATIO: f32 = 1.0 / 3.0;
+const SYSTEM_CONSOLE_LINE_SCROLL_PX: f32 = 20.0;
+const YALDABAOTH_LOGO_BYTES: &[u8] = include_bytes!("../../../yaldabaoth-logo.png");
 #[cfg(not(test))]
 const SYSTEM_CONSOLE_FILE: &str = "system-console.log";
+
+pub(crate) fn yaldabaoth_logo_image() -> Arc<gpui::Image> {
+    static LOGO: OnceLock<Arc<gpui::Image>> = OnceLock::new();
+    LOGO.get_or_init(|| {
+        Arc::new(gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            YALDABAOTH_LOGO_BYTES.to_vec(),
+        ))
+    })
+    .clone()
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConsoleLevel {
@@ -348,6 +365,34 @@ impl SystemConsoleView {
             cx.notify();
         }
     }
+
+    pub(crate) fn scroll_by(&mut self, down: f32, cx: &mut Context<Self>) {
+        let current = self.scroll.offset();
+        let y = (current.y - px(down)).min(px(0.0));
+        self.scroll.set_offset(gpui::point(current.x, y));
+        record_notify("system_console", MissReason::Dirtied);
+        cx.notify();
+    }
+}
+
+fn system_console_scroll_delta(press: &KeyPress, viewport_height: f32) -> Option<f32> {
+    let control = press.modifiers.contains(KMods::CONTROL);
+    if control {
+        let half_page = (viewport_height * SYSTEM_CONSOLE_HEIGHT_RATIO * 0.5).max(48.0);
+        return match press.key {
+            Key::Char('u') => Some(-half_page),
+            Key::Char('d') => Some(half_page),
+            _ => None,
+        };
+    }
+    if !press.modifiers.is_empty() {
+        return None;
+    }
+    match press.key {
+        Key::Char('k') | Key::Up => Some(-SYSTEM_CONSOLE_LINE_SCROLL_PX),
+        Key::Char('j') | Key::Down => Some(SYSTEM_CONSOLE_LINE_SCROLL_PX),
+        _ => None,
+    }
 }
 
 impl YaldaGpuiView {
@@ -403,6 +448,12 @@ impl YaldaGpuiView {
         cx: &mut Context<Self>,
     ) {
         let press = keystroke_to_keypress(&ev.keystroke);
+        if let Some(delta) = system_console_scroll_delta(&press, self.viewport_height_px) {
+            if let Some(view) = &self.system_console_view {
+                view.update(cx, |view, cx| view.scroll_by(delta, cx));
+            }
+            return;
+        }
         match press.key {
             Key::Esc | Key::Char('q') => {
                 self.clear_overlay();
@@ -428,13 +479,15 @@ impl YaldaGpuiView {
         // most of the desktop visible.
         div()
             .absolute()
-            .top_0()
-            .left_0()
-            .right_0()
+            .top(gpui::relative(SYSTEM_CONSOLE_TOP_RATIO))
+            .left(gpui::relative(SYSTEM_CONSOLE_LEFT_RATIO))
+            .w(gpui::relative(SYSTEM_CONSOLE_WIDTH_RATIO))
             .h(gpui::relative(SYSTEM_CONSOLE_HEIGHT_RATIO))
             .bg(panel_bg)
-            .border_b_1()
+            .border_1()
             .border_color(border)
+            .rounded_md()
+            .overflow_hidden()
             .shadow_lg()
             .child(cached_child(view))
             .into_any_element()
@@ -517,12 +570,31 @@ impl Render for SystemConsoleView {
 
         div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(panel_bg)
             .text_color(fg)
             .font_family(mono)
             .text_size(px(11.0))
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        img(yaldabaoth_logo_image())
+                            .size_full()
+                            .object_fit(ObjectFit::Contain)
+                            .grayscale(true)
+                            .opacity(0.07),
+                    ),
+            )
             .child(
                 div()
                     .id("system-console-header")
@@ -556,7 +628,7 @@ impl Render for SystemConsoleView {
                     .child(
                         div()
                             .text_color(dim)
-                            .child("[r] rebuild · [R] gui + server · [c] clear · esc close"),
+                            .child("[j/k ↑/↓] scroll · [^u/^d] page · [r/R] rebuild · esc close"),
                     ),
             )
             .child(
@@ -574,9 +646,36 @@ impl Render for SystemConsoleView {
 
 #[cfg(test)]
 #[test]
-fn system_console_height_stays_near_one_third() {
+fn system_console_geometry_stays_centered_and_compact() {
     assert!(
         (0.30..=0.36).contains(&SYSTEM_CONSOLE_HEIGHT_RATIO),
         "console should preserve roughly two thirds of the desktop"
     );
+    assert_eq!(SYSTEM_CONSOLE_WIDTH_RATIO, 2.0 / 3.0);
+    assert_eq!(SYSTEM_CONSOLE_TOP_RATIO, 1.0 / 3.0);
+    assert_eq!(SYSTEM_CONSOLE_LEFT_RATIO, 1.0 / 6.0);
+}
+
+#[cfg(test)]
+#[test]
+fn system_console_navigation_uses_standard_scroll_keys() {
+    let plain = KMods::NONE;
+    let control = KMods::CONTROL;
+    assert_eq!(
+        system_console_scroll_delta(&KeyPress::new(Key::Char('j'), plain), 900.0),
+        Some(SYSTEM_CONSOLE_LINE_SCROLL_PX)
+    );
+    assert_eq!(
+        system_console_scroll_delta(&KeyPress::new(Key::Up, plain), 900.0),
+        Some(-SYSTEM_CONSOLE_LINE_SCROLL_PX)
+    );
+    assert_eq!(
+        system_console_scroll_delta(&KeyPress::new(Key::Char('d'), control), 900.0),
+        Some(150.0)
+    );
+    assert_eq!(
+        system_console_scroll_delta(&KeyPress::new(Key::Char('u'), control), 900.0),
+        Some(-150.0)
+    );
+    assert!(YALDABAOTH_LOGO_BYTES.starts_with(b"\x89PNG\r\n\x1a\n"));
 }

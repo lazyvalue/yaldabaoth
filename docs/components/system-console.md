@@ -90,13 +90,15 @@ is understood.
 
 ### UXI-SystemConsole-4 — The console is compact, native Yalda chrome
 
-**Statement.** The console occupies roughly the upper third of the desktop,
-leaving the workspace legible beneath it. Its surface, border, foreground,
-muted text, accents, warnings, and errors come from the active Yalda theme; the
-console does not impose a separate hardcoded palette. Header and log spacing
-remain as compact as the rest of Yalda's operational chrome.
+**Statement.** The console is a centered floating panel two-thirds of the
+desktop wide and one-third tall, with its top edge one-third of the way down the
+screen. Its surface, border, foreground, muted text, accents, warnings, and
+errors come from the active Yalda theme; the console does not impose a separate
+hardcoded palette. Header and log spacing remain as compact as the rest of
+Yalda's operational chrome.
 
-**Applies to.** `SYSTEM_CONSOLE_HEIGHT_RATIO`,
+**Applies to.** `SYSTEM_CONSOLE_HEIGHT_RATIO`, `SYSTEM_CONSOLE_WIDTH_RATIO`,
+`SYSTEM_CONSOLE_LEFT_RATIO`, `SYSTEM_CONSOLE_TOP_RATIO`,
 `render_system_console_overlay`, and `SystemConsoleView::render`.
 
 **Why.** The console is part of Yalda, not a themed application embedded inside
@@ -105,6 +107,28 @@ dominating the desktop.
 
 **Status.** `implemented`
 
-**Enforcement.** `system_console.rs::system_console_height_stays_near_one_third`
+**Enforcement.** `system_console.rs::system_console_geometry_stays_centered_and_compact`
 guards the footprint; the existing cached-view harness verifies that theme
 changes invalidate the console body.
+
+### UXI-SystemConsole-5 — Navigation and branding match the rest of Yalda
+
+**Statement.** Mouse-wheel scrolling works over the log, while `j`/`k` and the
+arrow keys scroll by a line and `Ctrl-D`/`Ctrl-U` scroll by half a console page.
+The supplied `yaldabaoth-logo.png` is embedded in the app and appears as a dim,
+transparent watermark behind console output. The startup splash presents the
+same image prominently.
+
+**Applies to.** `SystemConsoleView::scroll_by`,
+`system_console_scroll_delta`, `yaldabaoth_logo_image`,
+`SystemConsoleView::render`, and `render_splash`.
+
+**Why.** Operational output should use Yalda's established navigation muscle
+memory, and the console and boot experience should share one recognizable
+identity without reducing log readability.
+
+**Status.** `implemented`
+
+**Enforcement.** `system_console.rs::system_console_navigation_uses_standard_scroll_keys`
+guards the keyboard map and embedded PNG; the scroll container's
+`overflow_y_scroll`/`track_scroll` wiring provides native mouse-wheel behavior.

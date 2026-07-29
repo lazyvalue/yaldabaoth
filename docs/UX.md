@@ -182,8 +182,8 @@ Single-keypress command surfaces and transient inputs:
 - **Rename overlay** (`RenameOverlayView`) — single-line tab rename.
 - **Tag input / mark & tag chords** — capture-phase next-key chords (`m`/`'`,
   tag).
-- **Splash** (`SplashView`) — startup overlay, dismissed on any key/click (auto
-  after ~1.5s).
+- **Splash** (`SplashView`) — branded with `yaldabaoth-logo.png`; startup
+  overlay, dismissed on any key/click (auto after ~1.5s).
 - **Toasts** — transient bottom-right status notifications.
 
 Overlays dispatch keys in **capture phase** with `stop_propagation` so they

@@ -133,8 +133,8 @@ pub(crate) use gpui::{
     LayoutId, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     ParentElement, Pixels, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
     StrikethroughStyle, Styled, StyledText, Task, TextLayout, TextRun, TitlebarOptions,
-    UnderlineStyle, WeakEntity, Window, WindowBounds, WindowOptions, actions, div, point, px, rgb,
-    rgba, size,
+    ObjectFit, StyledImage, UnderlineStyle, WeakEntity, Window, WindowBounds, WindowOptions,
+    actions, div, img, point, px, rgb, rgba, size,
 };
 
 pub(crate) use yalda::acp_channel::{AcpChannelClient, AgentProvider};
@@ -7580,7 +7580,6 @@ impl YaldaGpuiView {
 impl YaldaGpuiView {
     fn render_splash(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let bg = self.editor_bg();
-        let fg = self.editor_fg();
 
         div()
             .track_focus(&self.focus_handle)
@@ -7617,14 +7616,13 @@ impl YaldaGpuiView {
                     .flex()
                     .flex_col()
                     .items_center()
-                    .gap_3()
+                    .gap_1()
                     .child(
-                        div()
-                            .font_family(self.body_font.clone())
-                            .text_size(px(48.0))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(fg)
-                            .child("yalda"),
+                        img(yaldabaoth_logo_image())
+                            .w(px(344.0))
+                            .h(px(376.0))
+                            .object_fit(ObjectFit::Contain)
+                            .opacity(0.92),
                     )
                     .child(
                         div()
