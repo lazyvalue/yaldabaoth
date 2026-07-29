@@ -8441,6 +8441,7 @@ fn main() {
     };
 
     Application::new().run(move |app: &mut GpuiApp| {
+        install_yaldabaoth_app_icon();
         register_keymap(app);
 
         // Quit when the last window closes. macOS apps typically stay

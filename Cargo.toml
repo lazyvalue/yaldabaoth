@@ -34,6 +34,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 gpui = "0.2"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+cocoa = "=0.26.0"
+
 [features]
 # ON by default: without it `ReplyEvent::UsageUpdated` never fires, so the
 # context-window usage bar in the agent view has no data and never renders.

@@ -117,11 +117,12 @@ changes invalidate the console body.
 arrow keys scroll by a line and `Ctrl-D`/`Ctrl-U` scroll by half a console page.
 The supplied `yaldabaoth-logo.png` is embedded in the app and appears as a dim,
 transparent watermark behind console output. The startup splash presents the
-same image prominently.
+same image prominently, and the running macOS app uses it for its Dock and
+app-switcher icon.
 
 **Applies to.** `SystemConsoleView::scroll_by`,
 `system_console_scroll_delta`, `yaldabaoth_logo_image`,
-`SystemConsoleView::render`, and `render_splash`.
+`install_yaldabaoth_app_icon`, `SystemConsoleView::render`, and `render_splash`.
 
 **Why.** Operational output should use Yalda's established navigation muscle
 memory, and the console and boot experience should share one recognizable

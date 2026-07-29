@@ -24,6 +24,38 @@ const YALDABAOTH_LOGO_BYTES: &[u8] = include_bytes!("../../../yaldabaoth-logo.pn
 #[cfg(not(test))]
 const SYSTEM_CONSOLE_FILE: &str = "system-console.log";
 
+/// Install the embedded artwork as the running macOS application's Dock icon.
+///
+/// Yalda currently launches as a bare executable rather than an `.app` bundle,
+/// so there is no bundle `Info.plist` from which AppKit can load an icon.
+#[cfg(target_os = "macos")]
+pub(crate) fn install_yaldabaoth_app_icon() {
+    use cocoa::appkit::{NSApp, NSApplication, NSImage};
+    use cocoa::base::{id, nil};
+    use cocoa::foundation::{NSAutoreleasePool, NSData, NSUInteger};
+
+    // SAFETY: GPUI has initialized AppKit before its `Application::run`
+    // callback. NSData copies the embedded bytes, NSImage accepts PNG data,
+    // and the allocated image intentionally lives for the process lifetime
+    // because NSApplication uses it as global application state.
+    unsafe {
+        let pool = NSAutoreleasePool::new(nil);
+        let data: id = NSData::dataWithBytes_length_(
+            nil,
+            YALDABAOTH_LOGO_BYTES.as_ptr().cast(),
+            YALDABAOTH_LOGO_BYTES.len() as NSUInteger,
+        );
+        let image = NSImage::initWithData_(NSImage::alloc(nil), data);
+        if image != nil {
+            NSApp().setApplicationIconImage_(image);
+        }
+        pool.drain();
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn install_yaldabaoth_app_icon() {}
+
 pub(crate) fn yaldabaoth_logo_image() -> Arc<gpui::Image> {
     static LOGO: OnceLock<Arc<gpui::Image>> = OnceLock::new();
     LOGO.get_or_init(|| {
