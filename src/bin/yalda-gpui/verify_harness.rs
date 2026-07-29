@@ -6658,11 +6658,9 @@ fn delete_nonempty_project_confirms_then_cascades(cx: &mut TestAppContext) {
     });
 }
 
-/// UXI-JumpPanel-10: a live session names its state in WORDS and in a distinct
-/// GLYPH SHAPE, not by hue alone — `◆ working` while a reply is in flight,
-/// `✦ your turn` when a backgrounded turn finished, and nothing at all for a
-/// unavailable session. Pure mapping (the restrained washes are paint, harness
-/// gap #1).
+/// Shared Agent Tile / Jump Panel status vocabulary: live states have distinct
+/// GLYPH SHAPES and words. The Agent Tile uses both in its pill; the Jump Panel
+/// consumes only the glyph because its tabs and headers already name activity.
 ///
 /// Negative control: return `("✦", None)` for every status → the working and
 /// waiting asserts both fail.
@@ -7369,7 +7367,7 @@ fn viewing_a_waiting_agent_does_not_change_waiting_order(cx: &mut TestAppContext
 /// changes, and appends a newly discovered sid.
 #[gpui::test]
 fn jump_project_agent_tabs_are_independent_and_all_appends(cx: &mut TestAppContext) {
-    use crate::{agent_row_marks, JumpAgentTab};
+    use crate::JumpAgentTab;
     use yalda::session_proto::SessionInfo;
     let (view, vcx) = boot_browser(cx);
     let (pid, other_pid, workspace_idx, cwd) = view.update(vcx, |v, _| {
@@ -7454,22 +7452,6 @@ fn jump_project_agent_tabs_are_independent_and_all_appends(cx: &mut TestAppConte
         vec!["wait", "quiet"],
         "read and unread idle agents both belong to Waiting"
     );
-    let waiting_hints = view.update(vcx, |v, cx| {
-        v.jump_panel_sections(cx)
-            .0
-            .into_iter()
-            .find(|s| s.id == pid)
-            .expect("project section")
-            .sessions
-            .into_iter()
-            .map(|(_, row)| agent_row_marks(row.dot_status()).1)
-            .collect::<Vec<_>>()
-    });
-    assert_eq!(
-        waiting_hints,
-        vec![Some("your turn"), Some("your turn")],
-        "every row admitted to Waiting is visibly ready for input"
-    );
     let other_tab = view.update(vcx, |v, cx| {
         v.jump_panel_sections(cx)
             .0
@@ -7501,6 +7483,67 @@ fn jump_project_agent_tabs_are_independent_and_all_appends(cx: &mut TestAppConte
         vec!["quiet", "work", "wait", "aaa-new"],
         "state changes preserve slots and a new agent appends at the bottom"
     );
+}
+
+/// UXI-JumpPanel-10: tabs and All-group headers name the live states, so
+/// individual Waiting and Working rows do not paint redundant right-edge words.
+#[gpui::test]
+fn jump_session_rows_do_not_paint_redundant_status_words(cx: &mut TestAppContext) {
+    use std::collections::HashMap;
+    use yalda::session_proto::SessionInfo;
+
+    let (view, vcx) = boot_browser(cx);
+    let (pid, cwd) = view.update(vcx, |v, _| {
+        let pid = v.workspace.active_workspace().expect("workspace").project();
+        (pid, v.projects.cwd_of(pid).expect("project cwd").to_path_buf())
+    });
+    let info = |sid: &str, label: &str, busy: bool| SessionInfo {
+        session_id: sid.into(),
+        acp_session_id: None,
+        label: label.into(),
+        cwd: cwd.clone(),
+        provider: yalda::acp_channel::AgentProvider::Claude,
+        turns: 0,
+        connected: true,
+        permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+        busy,
+    };
+    view.update(vcx, |v, _| {
+        v.agent_roster
+            .upsert(info("no-word-wait", "waiting row", false));
+        v.agent_roster
+            .upsert(info("no-word-work", "working row", true));
+        v.jump_session_order = vec!["no-word-wait".into(), "no-word-work".into()];
+    });
+    let row_ids: HashMap<String, usize> = view.update(vcx, |v, cx| {
+        v.jump_panel_sections(cx)
+            .0
+            .into_iter()
+            .find(|section| section.id == pid)
+            .expect("project section")
+            .sessions
+            .into_iter()
+            .map(|(i, row)| (row.label, i))
+            .collect()
+    });
+
+    crate::layout_probe_begin();
+    for _ in 0..3 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+    for label in ["working row", "waiting row"] {
+        let i = row_ids[label];
+        assert!(
+            crate::layout_probe_get(&format!("jump-session-row-{i}")).is_some(),
+            "{label} must paint, making the word-absence assertion non-vacuous"
+        );
+        assert!(
+            crate::layout_probe_get(&format!("jump-session-status-word-{i}")).is_none(),
+            "{label} must not repeat its state as right-edge text"
+        );
+    }
+    crate::layout_probe_end();
 }
 
 /// UXI-JumpPanel-15: the four agent tabs paint as a bounded 2×2 control,
@@ -15687,8 +15730,8 @@ fn boot_pending_agent_tile<'a>(
 }
 
 /// bug-0022: the jump panel shows live status for a session this GUI has NEVER
-/// opened. The server's `SessionBusy` broadcast drives the row: busy ⇒ `working`,
-/// and a busy→idle flip while you are elsewhere ⇒ `your turn` (the roster-side
+/// opened. The server's `SessionBusy` broadcast drives the row: busy ⇒ working,
+/// and a busy→idle flip while you are elsewhere ⇒ ready (the roster-side
 /// twin of `AgentState::unread`), cleared when you jump to it.
 ///
 /// This is the actual "status marks appear inconsistently" cause: `awaiting` /
@@ -15747,7 +15790,7 @@ fn roster_only_session_shows_live_status(cx: &mut TestAppContext) {
         "a session we never opened still reports WORKING while its turn runs"
     );
 
-    // …and finishing while we're elsewhere is "your turn".
+    // …and finishing while we're elsewhere is ready for input.
     view.update(vcx, |v, cx| {
         v.apply_server_batch(
             vec![ServerNotification::SessionBusy {

@@ -378,9 +378,9 @@ The mark clears when the session becomes focused/viewed. A turn that finishes
 while you ARE focused never marks unread (you're reading it live).
 
 Unread does not change jump-panel styling. Both read and unread idle sessions are
-Waiting, wear the same green ready-for-input wash, and say `your turn`. This keeps
-the operational model honest: a row cannot appear in Waiting while looking
-neutral or unavailable.
+Waiting and wear the same green ready-for-input wash without a repeated status
+word. This keeps the operational model honest: a row cannot appear in Waiting
+while looking neutral or unavailable.
 
 State lives on `AgentState.unread`. It is **set** in the one idempotent turn-end
 chokepoint `finalize_agent_turn_idem` (so every turn-end path — the pump
@@ -405,8 +405,8 @@ separate visual treatment contradicted the Waiting tab and made the list noisy.
 `jump_dot_unread_on_background_turn_end_read_on_focused` (drives the REAL
 `apply_server_batch` → `ServerNotification::TurnEnded` on a backgrounded vs a
 focused session; asserts their distinct unread booleans while both project to
-`WaitingForYou`. `jump_project_agent_tabs_are_independent_and_all_appends`
-asserts every row admitted to Waiting carries the `your turn` hint.
+`WaitingForYou`. `jump_session_rows_do_not_paint_redundant_status_words`
+proves Waiting rows carry no redundant status hint.
 
 _Note (UXI-JumpPanel-7): the status glyph is a **`✦`** whose color carries the
 state (orange working / green ready / dim unavailable), not a separate ●/○ dot._
@@ -659,7 +659,7 @@ own reverted-fix mutation:
 
 ### UXI-JumpPanel-12 — Status is known for EVERY session, not just the ones open here
 
-**Statement.** The panel's live status (`UXI-JumpPanel-1`'s dot and `-10`'s word +
+**Statement.** The panel's live status (`UXI-JumpPanel-1`'s glyph and `-10`'s
 wash) applies to **every listed session**, including ones
 this GUI has never opened — free sessions, jump-panel-created ones, and sessions
 another GUI instance is driving.
@@ -699,17 +699,19 @@ WaitingForYou through the REAL `apply_server_batch` reducer + row builder.
 Reading clears its internal unread mark without changing its visible readiness.
 The live server→GUI loop is verification gap 2.
 
-### UXI-JumpPanel-10 — A live session says what it is doing, in words and in shape
+### UXI-JumpPanel-10 — A live session shows state without redundant row text
 
 **Statement.** In the jump panel, the two connected session states are
-unmistakable while scanning, but visually quiet: each carries a status word, its
-own glyph shape, and a low-alpha background wash with no bounding box:
+unmistakable while scanning, but visually quiet: each carries its own glyph
+shape and a low-alpha background wash with no bounding box. The tabs and All-tab
+section headers already name the state, so individual session rows never repeat
+the words `working` or `your turn`:
 
-| State (`AgentDotStatus`) | Glyph | Right-edge word | Row |
-|---|---|---|---|
-| **Working** — a reply is in flight | `◆` (filled) | `working`, orange | orange wash α 0.07 |
-| **Ready for input** — connected and not working | `✦` | `your turn`, green | green wash α 0.08 |
-| **Unavailable** — disconnected/connecting | `✦` (dim) | *(nothing)* | plain dim row |
+| State (`AgentDotStatus`) | Glyph | Row |
+|---|---|---|
+| **Working** — a reply is in flight | `◆` (filled, orange) | orange wash α 0.07 |
+| **Ready for input** — connected and not working | `✦` (green) | green wash α 0.08 |
+| **Unavailable** — disconnected/connecting | `✦` (dim) | plain dim row |
 
 Both state washes are alpha-derived from existing theme colors; there are no
 outlines or rounded chips. The active row (`UXI-JumpPanel-5`, "you are here")
@@ -718,25 +720,37 @@ uses the overlay's gray selected background, which wins over the status wash.
 The **glyph shapes differ** so working vs waiting is legible with no color
 perception at all.
 
-The `(glyph, word)` mapping is the pure `agent_row_marks(status)`, and the **agent
-tile reuses it** (`UXI-AgentTile-28`) so both surfaces speak one vocabulary.
+`agent_row_marks(status)` remains the shared glyph/word vocabulary used by the
+agent tile (`UXI-AgentTile-28`), but the Jump Panel consumes only its glyph. The
+tile's own status pill is outside this invariant and remains unchanged.
 
 **Applies to.** `jump_panel_view.rs`: `agent_row_marks` (new pure fn),
-`jump_session_row_el` (wash + hinted row), `jump_nav_row_hinted` (`jump_nav_row`
-plus a hint color, so a workspace's `ctrl-<n>` digit stays dim while a session's
-status word takes the status hue).
+`jump_session_row_el` (glyph + wash, no status hint), and `jump_nav_row`
+(workspace accelerator hints remain supported).
 
-**Why.** A colored `✦` was the *only* signal, at ~10px, in a list of otherwise
-identical rows — too quiet to catch out of the corner of the eye. Words, shapes,
-and a restrained wash make state readable without turning every row into a card.
+**Why.** A colored `✦` alone was too quiet to catch out of the corner of the eye.
+Distinct shapes and a restrained wash keep state scannable, while the surrounding
+tabs and headers supply the words once instead of repeating them on every row.
 
-**Status.** `implemented` — the mapping and palette routing are headless-guarded;
-the alpha/compositing as pixels is harness gap #1 (human eye).
+**Status.** `implemented` — both live-state rows are paint-guarded against
+redundant status words while glyph distinction and palette routing remain
+guarded. The alpha/compositing as pixels remains harness gap #1 (human eye).
 
-**Enforcement.** `verify_harness.rs::agent_row_marks_name_the_live_states` (each
-status' glyph + word, and that the two live glyphs differ; NC: return `("✦", None)`
-for every status → RED). `dot_status` itself stays pinned by
+**Enforcement.**
+`verify_harness.rs::jump_session_rows_do_not_paint_redundant_status_words`
+drives real Waiting and Working rows and proves neither paints a right-edge
+status-word element. Glyph distinction stays pinned by
+`agent_row_marks_name_the_live_states`; `dot_status` itself stays pinned by
 `agent_dot_status_mapping` + `agent_status_dot_reflects_turn_phase`.
+
+**Negative control observed.** With the paint probe added before removing the
+row hints, `jump_session_rows_do_not_paint_redundant_status_words` failed on the
+real Working row because its `working` element painted. Passing no session hint
+returned the guard to green.
+
+**Deviation from plan.** None material. `agent_row_marks` still supplies the
+Agent Tile's status-pill word, while `jump_session_row_el` intentionally consumes
+only its glyph. This keeps the request scoped to the Jump Panel.
 
 ### UXI-JumpPanel-11 — The panel wears the command-menu surface (reverses -7's recessed shade)
 
@@ -784,7 +798,8 @@ them in the same order. The chevron is a distinct click target: clicking the
 project name still opens its context menu, and dragging the name still reorders
 the project section. Folded state persists by project name, because `ProjectId`
 is runtime-local. The panel is 320px wide (100px wider than the former 220px
-surface) so project/session labels and status words have room to breathe.
+surface) so project/session labels, tab counts, and summaries have room to
+breathe.
 
 **Applies to.** `jump_panel_view.rs` (`JUMP_PANEL_WIDTH`,
 `toggle_project_fold`, the split chevron/name header, and the folded render
@@ -806,8 +821,8 @@ panel renders three independently selectable ordinary agent tabs (the
 orthogonal fourth Archived tab is specified by `UXI-JumpPanel-16`):
 
 1. **Waiting** contains every connected session that is not currently producing
-   a reply (`AgentActivity::Waiting`). Every row is consistently green and says
-   **your turn**, whether its latest output is read or unread.
+   a reply (`AgentActivity::Waiting`). Every row is consistently green, with no
+   repeated status word, whether its latest output is read or unread.
 2. **Working** contains connected sessions with a reply in flight
    (`AgentDotStatus::Working`).
 3. **All** contains every non-archived session in the project and is the
@@ -863,9 +878,10 @@ The view/attach continuity clause is guarded through the real
 `jump_to_agent` roster attach path by
 `viewing_a_waiting_agent_does_not_change_waiting_order`.
 `jump_project_agent_tabs_are_independent_and_all_appends` drives the real
-per-project section projection and append method, proves every Waiting row says
-`your turn`, probes all four painted tab controls, and includes a state flip
-that must not rewrite the All projection's durable order.
+per-project section projection and append method, probes all four painted tab
+controls, and includes a state flip that must not rewrite the All projection's
+durable order. `jump_session_rows_do_not_paint_redundant_status_words` proves
+Waiting and Working rows do not repeat the surrounding state labels.
 `jump_all_tab_groups_activity_with_headers` drives the real All render and
 proves nonempty headings and rows paint in Working → Waiting → Unavailable
 order, rows retain their durable relative order within each group, and empty

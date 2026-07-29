@@ -169,7 +169,7 @@ pub(crate) enum AgentDotStatus {
     /// Rendered **orange** with a filled `◆`.
     Working,
     /// The connected agent is not producing a reply and is ready for input.
-    /// Rendered **green** with a quiet "your turn" hint.
+    /// Rendered **green** with no redundant status word.
     WaitingForYou,
     /// Disconnected or connecting. Rendered **dim**.
     Neutral,
@@ -186,11 +186,10 @@ pub(crate) enum AgentActivity {
     Unavailable,
 }
 
-/// The row marks a live session wears (`UXI-JumpPanel-10`): `(badge glyph,
-/// right-edge status word)`. Color alone was too quiet to catch while scanning a
-/// list of sessions, so each live state also gets a WORD and its own glyph SHAPE
-/// — legible without relying on hue at all. A disconnected session keeps the
-/// plain `✦` and says nothing.
+/// The shared status marks used by the Agent Tile and Jump Panel
+/// (`UXI-AgentTile-28`, `UXI-JumpPanel-10`): `(badge glyph, status word)`.
+/// The tile uses both values in its status pill. The Jump Panel uses only the
+/// glyph because its tabs and All-group headers already name the state.
 ///
 /// Pure so the mapping is headlessly guarded; the tint that goes with it is
 /// paint (harness gap #1).
@@ -263,7 +262,7 @@ impl YaldaGpuiView {
             let bound = bound_sids.contains(&info.session_id);
             // Prefer the live store label if this session is opened here (kept in
             // sync by SessionRenamed either way, but the entity is authoritative).
-            // The same lookup tells us the turn phase (working vs your-turn) when
+            // The same lookup tells us the turn phase (working vs ready) when
             // it's open; roster-only sessions have no local phase (`None`).
             let opened = self
                 .sessions
@@ -1266,9 +1265,7 @@ fn jump_session_row_el(
         AgentDotStatus::WaitingForYou => ready,
         AgentDotStatus::Neutral => st.dim,
     };
-    let mut hint_color = badge_color;
-    hint_color.a = 0.72;
-    let (badge_glyph, hint) = agent_row_marks(status);
+    let (badge_glyph, _) = agent_row_marks(status);
     let row_id = SharedString::from(format!("jump-sess-{i}"));
     let target = row.target.clone();
     let mut r = jump_nav_row_hinted(
@@ -1276,10 +1273,11 @@ fn jump_session_row_el(
         &row.label,
         Some(badge_glyph),
         Some(badge_color),
-        hint,
-        // The hint IS the status, so it wears the status hue (the workspace
-        // rows' `ctrl-<n>` digits stay dim).
-        Some(hint_color),
+        // UXI-JumpPanel-10: tabs + All-group headers already name activity.
+        // Repeating "working" / "your turn" on every row is redundant noise.
+        None,
+        None,
+        Some(format!("jump-session-status-word-{i}")),
         st,
         sel_bg,
         active.then_some(selection_mark),
@@ -1421,12 +1419,12 @@ fn jump_nav_row(
     sel_bg: Hsla,
     active: Option<Hsla>,
 ) -> gpui::Stateful<gpui::Div> {
-    jump_nav_row_hinted(id, label, badge, badge_color, hint, None, st, sel_bg, active)
+    jump_nav_row_hinted(id, label, badge, badge_color, hint, None, None, st, sel_bg, active)
 }
 
-/// [`jump_nav_row`] with an explicit color for the right-edge hint: agent rows
-/// put their status word there in the status hue (`UXI-JumpPanel-10`), while a
-/// workspace's `ctrl-<n>` digit stays dim (`None`).
+/// [`jump_nav_row`] with an explicit color and optional paint probe for the
+/// right-edge hint. Workspace `ctrl-<n>` digits stay dim; Jump Panel session
+/// rows deliberately pass no hint (`UXI-JumpPanel-10`).
 #[allow(clippy::too_many_arguments)]
 fn jump_nav_row_hinted(
     id: impl Into<ElementId>,
@@ -1435,6 +1433,7 @@ fn jump_nav_row_hinted(
     badge_color: Option<Hsla>,
     hint: Option<&str>,
     hint_color: Option<Hsla>,
+    hint_probe: Option<String>,
     st: &DetailStyle,
     sel_bg: Hsla,
     active: Option<Hsla>,
@@ -1479,13 +1478,17 @@ fn jump_nav_row_hinted(
                 .child(SharedString::from(label)),
         );
     if let Some(hint) = hint {
-        row = row.child(
-            div()
-                .flex_none()
-                .text_color(hint_color.unwrap_or(st.dim))
-                .text_size(px(st.pt * 0.85))
-                .child(SharedString::from(hint.to_string())),
-        );
+        let hint_el = div()
+            .flex_none()
+            .text_color(hint_color.unwrap_or(st.dim))
+            .text_size(px(st.pt * 0.85))
+            .child(SharedString::from(hint.to_string()));
+        let hint_el = if let Some(probe) = hint_probe {
+            probe_bounds_dyn(probe, hint_el.into_any_element())
+        } else {
+            hint_el.into_any_element()
+        };
+        row = row.child(hint_el);
     }
     row
 }

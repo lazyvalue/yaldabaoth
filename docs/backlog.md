@@ -13,6 +13,17 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Remove redundant status words from Jump Panel session rows** — `DONE`
+  (2026-07-28 via `/new-ux`; revises `UXI-JumpPanel-10`). Captured verbatim:
+  *"with the different tabs and headers we no longer need the words 'your turn'
+  or 'working' in the jump pane."* This removes only the right-edge per-session
+  status words; the Waiting / Working tab labels and All-tab section headers
+  remain. Glyph shape, semantic color, row wash, summaries, ordering, counts,
+  and selection behavior stay unchanged. A real paint guard proves both live
+  rows paint while neither paints a status-word element; the unchanged renderer
+  produced the expected RED on the Working row. The full suite and all-bin build
+  are green.
+
 - **Lay out Jump Panel agent tabs in two rows** — `DONE` (2026-07-28 via
   `/new-ux`; extends `UXI-JumpPanel-15`). Captured verbatim: *"Tabs look
   crowded. Let's put Waiting and Working on one line, All and Archived on
