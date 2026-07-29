@@ -6,9 +6,9 @@
 ## Description
 
 The system console is Yalda's drop-down operational surface: a bounded,
-monospaced stream of lifecycle messages with a dark, high-contrast
-"Doom console" treatment. It is an overlay rather than a tile, so summoning it
-does not replace or rearrange the current workspace.
+monospaced stream of lifecycle messages presented in the same theme-aware
+chrome as the jump panel and command menus. It is an overlay rather than a tile,
+so summoning it does not replace or rearrange the current workspace.
 
 The first deliberately narrow log policy is **Yalda lifecycle plus build output**:
 startup, rebuild/relaunch state, Cargo stdout/stderr, warnings, and failures.
@@ -87,3 +87,24 @@ is understood.
 **Status.** `implemented`
 
 **Enforcement.** `tests.rs::system_console_log_is_bounded_and_classifies_build_output`.
+
+### UXI-SystemConsole-4 — The console is compact, native Yalda chrome
+
+**Statement.** The console occupies roughly the upper third of the desktop,
+leaving the workspace legible beneath it. Its surface, border, foreground,
+muted text, accents, warnings, and errors come from the active Yalda theme; the
+console does not impose a separate hardcoded palette. Header and log spacing
+remain as compact as the rest of Yalda's operational chrome.
+
+**Applies to.** `SYSTEM_CONSOLE_HEIGHT_RATIO`,
+`render_system_console_overlay`, and `SystemConsoleView::render`.
+
+**Why.** The console is part of Yalda, not a themed application embedded inside
+it. A compact, shared visual vocabulary makes the surface useful without
+dominating the desktop.
+
+**Status.** `implemented`
+
+**Enforcement.** `system_console.rs::system_console_height_stays_near_one_third`
+guards the footprint; the existing cached-view harness verifies that theme
+changes invalidate the console body.

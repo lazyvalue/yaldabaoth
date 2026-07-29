@@ -1,4 +1,4 @@
-//! Yalda's drop-down system console (`UXI-SystemConsole-1..3`).
+//! Yalda's drop-down system console (`UXI-SystemConsole-1..4`).
 //!
 //! The component owns a bounded log and scroll state, persists recent lifecycle
 //! messages across the process replacement performed by self-rebuild, and
@@ -14,6 +14,7 @@ use std::process::Stdio;
 use std::sync::mpsc;
 
 pub(crate) const SYSTEM_CONSOLE_MAX_LINES: usize = 1_000;
+pub(crate) const SYSTEM_CONSOLE_HEIGHT_RATIO: f32 = 1.0 / 3.0;
 #[cfg(not(test))]
 const SYSTEM_CONSOLE_FILE: &str = "system-console.log";
 
@@ -420,17 +421,20 @@ impl YaldaGpuiView {
 
     pub(crate) fn render_system_console_overlay(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let view = self.system_console_view(cx);
-        // Classic source-port console: a heavy panel drops over the upper 62%
-        // of the current screen, leaving the workspace visibly present below.
+        let panel_bg = menu_panel_bg(self.editor_bg());
+        let border = nc(self.theme.overlay.border);
+        // Compact operational chrome: the console uses the same themed surface
+        // and border vocabulary as Yalda's menus and jump panel, while leaving
+        // most of the desktop visible.
         div()
             .absolute()
             .top_0()
             .left_0()
             .right_0()
-            .h(gpui::relative(0.62))
-            .bg(rgb(0x070806))
-            .border_b_2()
-            .border_color(rgb(0x8d241f))
+            .h(gpui::relative(SYSTEM_CONSOLE_HEIGHT_RATIO))
+            .bg(panel_bg)
+            .border_b_1()
+            .border_color(border)
             .shadow_lg()
             .child(cached_child(view))
             .into_any_element()
@@ -443,14 +447,20 @@ impl Render for SystemConsoleView {
         let Some(root) = self.root.upgrade() else {
             return div().size_full().into_any_element();
         };
-        let (mono, fg, dim, error, warning) = {
+        let (mono, panel_bg, header_bg, fg, dim, border, accent, key, error, warning) = {
             let r = root.read(cx);
+            let overlay = &r.theme.overlay;
             (
                 r.code_font.clone(),
-                nc(r.theme.agent.tool_completed),
-                nc(r.theme.agent.dim),
-                rgb(0xff4b4b).into(),
-                rgb(0xffb347).into(),
+                menu_panel_bg(r.editor_bg()),
+                nc(overlay.selected_bg),
+                nc(overlay.fg),
+                nc(overlay.label),
+                nc(overlay.border),
+                nc(overlay.accent),
+                nc(overlay.key),
+                nc(r.theme.agent.tool_failed),
+                nc(overlay.modified),
             )
         };
 
@@ -460,8 +470,8 @@ impl Render for SystemConsoleView {
             .flex_col()
             .min_h_full()
             .px_3()
-            .py_2()
-            .gap(px(2.0));
+            .py_1()
+            .gap(px(1.0));
         if self.log.lines().is_empty() {
             rows = rows.child(
                 div()
@@ -472,7 +482,8 @@ impl Render for SystemConsoleView {
             for (idx, line) in self.log.lines().iter().enumerate() {
                 let level_color = match line.level {
                     ConsoleLevel::Error => error,
-                    ConsoleLevel::Warn | ConsoleLevel::Command => warning,
+                    ConsoleLevel::Warn => warning,
+                    ConsoleLevel::Command => key,
                     ConsoleLevel::Info => dim,
                 };
                 rows = rows.child(
@@ -508,38 +519,44 @@ impl Render for SystemConsoleView {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(0x070806))
+            .bg(panel_bg)
             .text_color(fg)
             .font_family(mono)
-            .text_size(px(12.0))
+            .text_size(px(11.0))
             .child(
                 div()
                     .id("system-console-header")
-                    .h(px(34.0))
+                    .h(px(28.0))
                     .flex_none()
                     .flex()
                     .flex_row()
                     .items_center()
                     .px_3()
-                    .gap_3()
-                    .bg(rgb(0x15100b))
+                    .gap_2()
+                    .bg(header_bg)
                     .border_b_1()
-                    .border_color(rgb(0x8d241f))
+                    .border_color(border)
                     .child(
                         div()
-                            .text_color(rgb(0xd13b2f))
+                            .text_color(accent)
                             .font_weight(FontWeight::BOLD)
-                            .child("▾ YALDA SYSTEM CONSOLE"),
+                            .child("▾"),
                     )
-                    .child(div().flex_1().text_color(dim).child(if self.building {
-                        "BUILDING…"
-                    } else {
-                        "READY"
-                    }))
+                    .child(div().font_weight(FontWeight::BOLD).child("system console"))
                     .child(
                         div()
-                            .text_color(warning)
-                            .child("[r] rebuild gui   [R] gui + server   [c] clear   [esc] close"),
+                            .text_color(if self.building { warning } else { dim })
+                            .child(if self.building {
+                                "building…"
+                            } else {
+                                "ready"
+                            }),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .text_color(dim)
+                            .child("[r] rebuild · [R] gui + server · [c] clear · esc close"),
                     ),
             )
             .child(
@@ -553,4 +570,13 @@ impl Render for SystemConsoleView {
             )
             .into_any_element()
     }
+}
+
+#[cfg(test)]
+#[test]
+fn system_console_height_stays_near_one_third() {
+    assert!(
+        (0.30..=0.36).contains(&SYSTEM_CONSOLE_HEIGHT_RATIO),
+        "console should preserve roughly two thirds of the desktop"
+    );
 }
