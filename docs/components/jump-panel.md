@@ -13,7 +13,7 @@ O(workspaces + sessions)), not cached. Primary code home:
 `jump_panel_view.rs`.
 
 **Palette.** Two header tiers, distinct hues: top-level section headers
-("PINNED" / "WORKSPACES" / "AGENT SESSIONS") are **red** (`DetailStyle.err`,
+("SYSTEM CONSOLE" / "WORKSPACES" / "AGENT SESSIONS") are **red** (`DetailStyle.err`,
 `0xff6b6b`, bold uppercase); per-cwd subheaders are **electric blue** (`0x3b9eff`,
 real path casing). Operational state uses two literal hues: **orange = working**
 and **green = ready for input**. The "you are here" active mark and selected tabs
@@ -31,7 +31,9 @@ use the overlay's neutral gray selection palette (UXI-JumpPanel-5).
 
 Sections:
 
-- **Pinned** — *placeholder* (pinning mechanics land later).
+- **System console** — a single global row that summons the system-console
+  overlay (`UXI-SystemConsole-1`). It replaces the former empty Pinned
+  placeholder.
 - **Workspaces** — one row per non-ephemeral tab, active marked (accent label +
   left accent bar, `UXI-JumpPanel-5`).
   - Each row's badge shows the **1-based workspace number** (`idx + 1`) — the
@@ -325,8 +327,8 @@ operational state. Two independent marks,
    its mark (it means "active," orthogonal to the status-dot color / row dim).
 
 There is a single focused tile, so at most one session mark and one workspace mark.
-The Pinned section, the "＋ New agent session" affordance, and section headings
-never get a mark. The panel renders inline every frame, so the marks track focus
+The System Console row, the "＋ New agent session" affordance, and section
+headings never get a mark. The panel renders inline every frame, so the marks track focus
 changes, workspace switches, and tile close/rebind with no extra plumbing.
 
 Row-activeness is a pure predicate: `jump_target_is_active(target, active_local,

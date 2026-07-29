@@ -977,6 +977,108 @@ fn jump_panel_renders_with_sessions(cx: &mut TestAppContext) {
     );
 }
 
+/// UXI-SystemConsole-1/-2 plus the yux render-count contract: both requested
+/// entry points summon the SAME overlay without moving focus; its `r` / `R`
+/// keys reach the real rebuild dispatcher; and an unrelated root repaint reuses
+/// the cached console body.
+///
+/// Guard sensitivity:
+/// - without the global-menu command the presence assertion fails;
+/// - without the jump-row listener the real painted click leaves the overlay
+///   closed;
+/// - embedding the view without `cached_child` increments the render count on
+///   the final root-only notify.
+#[gpui::test]
+fn system_console_opens_from_global_menu_and_jump_panel(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_browser(cx);
+    let focused_before = view.read_with(vcx, |v, _| v.workspace.focused_window_id());
+
+    let has_menu_entry = view.read_with(vcx, |v, _| {
+        v.global_menu().iter().any(|node| {
+            node.label == "system console"
+                && matches!(
+                    &node.action,
+                    crate::MenuAction::Command(command) if command == "open-system-console"
+                )
+        })
+    });
+    assert!(
+        has_menu_entry,
+        "the ? global menu must offer system console"
+    );
+
+    view.update(vcx, |v, cx| {
+        v.dispatch_menu_command("open-system-console", cx)
+    });
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(vcx, |v, _| v.overlay_is_system_console()),
+        "global menu dispatch summons the console"
+    );
+    assert_eq!(
+        view.read_with(vcx, |v, _| v.workspace.focused_window_id()),
+        focused_before,
+        "summoning operational chrome does not replace or refocus a tile"
+    );
+
+    // These keys run the exact dispatcher production uses. Under cfg(test) the
+    // dispatcher records the request immediately before the subprocess seam.
+    vcx.simulate_keystrokes("r");
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("shift-r");
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(vcx, |v, _| v.dev_rebuild_requests.clone()),
+        vec![false, true],
+        "r rebuilds the GUI; R rebuilds GUI + server"
+    );
+
+    // A cached console should stay flat when only the root is dirtied.
+    crate::perf_reset("system_console");
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let cached = crate::perf_render_count("system_console");
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    assert_eq!(
+        crate::perf_render_count("system_console"),
+        cached,
+        "root-only repaint must reuse the cached console body"
+    );
+    view.update(vcx, |v, cx| v.set_theme(crate::ThemeName::Folio, cx));
+    vcx.run_until_parked();
+    assert!(
+        crate::perf_render_count("system_console") > cached,
+        "theme is a global console input, so its push path must bust the cache"
+    );
+
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(!view.read_with(vcx, |v, _| v.has_overlay()));
+
+    // Click the actual painted jump-panel row, not a model-level proxy.
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let (x, y, w, h) =
+        crate::layout_probe_get("jump-system-console").expect("console jump row painted");
+    crate::layout_probe_end();
+    let at = point(px(x + w / 2.0), px(y + h / 2.0));
+    vcx.simulate_mouse_move(at, None, gpui::Modifiers::default());
+    vcx.simulate_click(at, gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(vcx, |v, _| v.overlay_is_system_console()),
+        "clicking the former PINNED slot summons the console"
+    );
+    assert_eq!(
+        view.read_with(vcx, |v, _| v.workspace.focused_window_id()),
+        focused_before
+    );
+}
+
 /// UXI-Workspace-1: `ctrl-<n>` jumps straight to the n-th workspace — the digit the
 /// jump panel shows. Exercises the FULL dispatch chain: `register_keymap`
 /// installed `ctrl-3 → GotoWorkspace3`, and the focused screen root wired

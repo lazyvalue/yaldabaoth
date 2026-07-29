@@ -4393,3 +4393,45 @@ fn parse_dotenv_reads_keys_and_ignores_noise() {
         ]
     );
 }
+
+#[test]
+fn system_console_log_is_bounded_and_classifies_build_output() {
+    use crate::{
+        ConsoleLevel, ConsoleLog, SYSTEM_CONSOLE_MAX_LINES, classify_build_line,
+        record_system_message, with_system_console_path,
+    };
+
+    assert_eq!(
+        classify_build_line("warning: unused import"),
+        ConsoleLevel::Warn
+    );
+    assert_eq!(
+        classify_build_line("error[E0308]: mismatched types"),
+        ConsoleLevel::Error
+    );
+    assert_eq!(
+        classify_build_line("   Compiling yalda v0.1.0"),
+        ConsoleLevel::Info
+    );
+
+    let mut log = ConsoleLog::default();
+    for i in 0..SYSTEM_CONSOLE_MAX_LINES + 7 {
+        log.push(ConsoleLevel::Info, format!("line-{i}"));
+    }
+    assert_eq!(log.lines().len(), SYSTEM_CONSOLE_MAX_LINES);
+    assert_eq!(
+        log.lines().front().map(|line| line.text.as_str()),
+        Some("line-7"),
+        "the bounded store retains the newest rows"
+    );
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("console.log");
+    with_system_console_path(path.clone(), || {
+        record_system_message(ConsoleLevel::Command, "cargo build --release");
+        record_system_message(ConsoleLevel::Error, "build failed");
+    });
+    let persisted = std::fs::read_to_string(path).expect("persisted log");
+    assert!(persisted.contains("CMD\tcargo build --release"));
+    assert!(persisted.contains("ERROR\tbuild failed"));
+}

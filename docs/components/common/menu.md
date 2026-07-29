@@ -13,7 +13,7 @@ existing keymap; see `spec-menu-scopes.md`). Three leaders open it:
 - **`space`** — tile/app-local menu (entries depend on the focused content kind:
   Doc / Edit / Agent / Browser / Linear / Keys).
 - **`.`** — workspace menu (new tile, theme, plane view, marks, restart, …).
-- **`?`** — global menu (workspace list + workspace/project ops).
+- **`?`** — global menu (workspace list + workspace/project ops + system console).
 
 All three share one mechanism: `ActiveOverlay::Menu(MenuOverlay)` on
 `YaldaGpuiView`, a `MenuState` (descent `path: Vec<usize>` over a static

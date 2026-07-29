@@ -130,8 +130,9 @@ sublist plus inline **＋ New workspace** / **＋ New agent session** rows. Dept
 stops there — **individual tiles are not listed**. Workspace numbering
 (`ctrl-<n>`) stays **global and sequential across all projects** (the badge digit
 under any project equals the flat position; "for now" — revisit for per-project).
-The `PINNED` placeholder stays. The active-workspace and focused-session accent
-marks (`UXI-JumpPanel-5`) and the per-session status dot (`UXI-JumpPanel-1`,
+The former `PINNED` placeholder is replaced by the global `SYSTEM CONSOLE` row
+(`UXI-SystemConsole-1`). The active-workspace and focused-session accent marks
+(`UXI-JumpPanel-5`) and the per-session status dot (`UXI-JumpPanel-1`,
 `-6`) render within their project's section.
 
 **Applies to.** `jump_panel_view.rs`: `group_agent_rows_by_cwd` becomes
