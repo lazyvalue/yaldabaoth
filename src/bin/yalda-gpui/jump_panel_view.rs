@@ -1075,57 +1075,63 @@ impl YaldaGpuiView {
             let tab_edge = border;
             let mut tabs = div()
                 .flex()
-                .flex_row()
+                .flex_col()
                 .w_full()
                 .p(px(2.0))
                 .border_1()
                 .border_color(tab_edge)
                 .rounded_md();
-            for (tab_idx, tab) in
-                [
-                    JumpAgentTab::Waiting,
-                    JumpAgentTab::Working,
-                    JumpAgentTab::All,
-                    JumpAgentTab::Archived,
-                ]
-                    .into_iter()
-                    .enumerate()
+            for (row_idx, row_tabs) in [
+                [JumpAgentTab::Waiting, JumpAgentTab::Working],
+                [JumpAgentTab::All, JumpAgentTab::Archived],
+            ]
+            .into_iter()
+            .enumerate()
             {
-                if tab_idx > 0 {
-                    tabs = tabs.child(div().w(px(1.0)).my_1().bg(tab_edge));
+                if row_idx > 0 {
+                    tabs = tabs.child(div().h(px(1.0)).mx_1().bg(tab_edge));
                 }
-                let tab_probe = format!(
-                    "jump-agent-tab-{}-{}",
-                    pid.0,
-                    tab.label().to_lowercase()
-                );
-                let indicator = match tab {
-                    JumpAgentTab::Waiting => Some(("waiting", waiting_count, ready)),
-                    JumpAgentTab::Working => Some(("working", working_count, working_orange)),
-                    JumpAgentTab::All | JumpAgentTab::Archived => None,
-                }
-                .map(|(slug, count, tint)| {
-                    let probe = format!("jump-agent-tab-count-{}-{slug}", pid.0);
-                    let indicator = compact_count_indicator(
-                        SharedString::from(probe.clone()),
-                        count,
-                        tint,
-                        &st,
+                let mut row = div().flex().flex_row().w_full();
+                for (tab_idx, tab) in row_tabs.into_iter().enumerate() {
+                    if tab_idx > 0 {
+                        row = row.child(div().w(px(1.0)).my_1().bg(tab_edge));
+                    }
+                    let tab_probe = format!(
+                        "jump-agent-tab-{}-{}",
+                        pid.0,
+                        tab.label().to_lowercase()
                     );
-                    probe_bounds_dyn(probe, indicator.into_any_element())
-                });
-                let button = compact_tab(
-                    SharedString::from(tab_probe.clone()),
-                    tab.label(),
-                    indicator,
-                    tab == agent_tab,
-                    sel_bg,
-                    &st,
-                )
-                .on_click(cx.listener(move |this, _ev, _window, cx| {
-                    this.select_jump_agent_tab(pid, tab, cx)
-                }));
-                tabs = tabs.child(probe_bounds_dyn(tab_probe, button.into_any_element()));
+                    let indicator = match tab {
+                        JumpAgentTab::Waiting => Some(("waiting", waiting_count, ready)),
+                        JumpAgentTab::Working => {
+                            Some(("working", working_count, working_orange))
+                        }
+                        JumpAgentTab::All | JumpAgentTab::Archived => None,
+                    }
+                    .map(|(slug, count, tint)| {
+                        let probe = format!("jump-agent-tab-count-{}-{slug}", pid.0);
+                        let indicator = compact_count_indicator(
+                            SharedString::from(probe.clone()),
+                            count,
+                            tint,
+                            &st,
+                        );
+                        probe_bounds_dyn(probe, indicator.into_any_element())
+                    });
+                    let button = compact_tab(
+                        SharedString::from(tab_probe.clone()),
+                        tab.label(),
+                        indicator,
+                        tab == agent_tab,
+                        sel_bg,
+                        &st,
+                    )
+                    .on_click(cx.listener(move |this, _ev, _window, cx| {
+                        this.select_jump_agent_tab(pid, tab, cx)
+                    }));
+                    row = row.child(probe_bounds_dyn(tab_probe, button.into_any_element()));
+                }
+                tabs = tabs.child(row);
             }
             col = col.child(
                 div()

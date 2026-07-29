@@ -890,12 +890,14 @@ All projection remains in durable custom order for persistence; its headed
 presentation order is also applied to empty-query `Cmd-P`, preserving
 `UXI-JumpPanel-9`'s existing panel-order promise.
 
-### UXI-JumpPanel-15 — Agent tabs are a separated neutral segmented control
+### UXI-JumpPanel-15 — Agent tabs are a separated neutral two-row control
 
 **Statement.** Waiting / Working / All / Archived render as a single bounded
-segmented control, not four floating words:
+2×2 segmented control, not four floating words or one crowded strip:
 
 - one rounded neutral hairline encloses the group;
+- **Waiting / Working** occupy the first row and **All / Archived** occupy the
+  second row;
 - internal hairlines separate its four equal-width targets;
 - the selected segment uses the overlay's gray selected background;
 - every label uses normal foreground contrast;
@@ -911,15 +913,26 @@ nearly-background `dim` blue.
 `jump_supporting_text_color`, `jump_session_row_el`), and `yux/detail.rs`
 (`compact_tab`).
 
-**Status.** `implemented` — the segmented-control containment and palette
-selection are headless-guarded. Exact antialiasing and subjective visual balance
-remain harness gap #1.
+**Status.** `implemented` — the two-row geometry, aligned columns, containment,
+and palette selection are headless-guarded. Exact antialiasing and subjective
+visual balance remain harness gap #1.
 
-**Enforcement.** `jump_project_agent_tabs_are_independent_and_all_appends`
-probes the enclosing control and proves each painted tab is inside it.
+**Enforcement.** `jump_agent_tabs_paint_as_two_by_two_grid` probes the
+enclosing control and all four painted tab targets, proving Waiting / Working
+share the first row, All / Archived share a lower second row, and every target
+is inside the control.
 `tests.rs::jump_supporting_text_is_cool_and_readable_in_everyday_themes`
 locks the Folio/Nightfox supporting colors and rejects their warm accents.
 `jump_panel_state_palette_is_orange_green_and_gray` guards neutral selection.
+
+**Negative control observed.** Against the unchanged one-row renderer,
+`jump_agent_tabs_paint_as_two_by_two_grid` failed specifically because
+All / Archived did not paint below Waiting / Working. Reflowing the enclosing
+control into two aligned rows returned it to green.
+
+**Deviation from plan.** None material. The existing `compact_tab` primitive
+remains the tab target; the Jump Panel owns the requested 2×2 group layout and
+its internal vertical and horizontal hairlines.
 
 ### UXI-JumpPanel-16 — Sessions can be archived without changing live activity
 

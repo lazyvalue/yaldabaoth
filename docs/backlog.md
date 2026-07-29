@@ -13,6 +13,18 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Lay out Jump Panel agent tabs in two rows** — `DONE` (2026-07-28 via
+  `/new-ux`; extends `UXI-JumpPanel-15`). Captured verbatim: *"Tabs look
+  crowded. Let's put Waiting and Working on one line, All and Archived on
+  another line."* Every expanded project renders one bounded 2×2 tab control:
+  Waiting / Working on the first row and All / Archived on the second. Tab
+  behavior, counts, per-project selection, colors, and spacing from workspaces
+  remain unchanged. Shipped with vertical separators inside each row and a
+  horizontal hairline between them. Painted geometry proves the requested row
+  pairing, aligned equal columns, and that all four targets remain inside the
+  control. The unchanged one-row renderer produced the expected RED; full suite
+  and all-bin build are green.
+
 - **Keep Waiting order stable when viewing an agent** — `DONE` (2026-07-28 via
   `/new-ux`; extends `UXI-JumpPanel-14`). Captured verbatim: *"The ordering of
   the waiting tab shouldn't change ON VIEW. The ordering should be based on when
