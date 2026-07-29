@@ -7503,6 +7503,71 @@ fn jump_project_agent_tabs_are_independent_and_all_appends(cx: &mut TestAppConte
     );
 }
 
+/// UXI-JumpPanel-15: the four agent tabs paint as a bounded 2×2 control,
+/// Waiting / Working above All / Archived.
+#[gpui::test]
+fn jump_agent_tabs_paint_as_two_by_two_grid(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_browser(cx);
+    let pid = view.update(vcx, |v, _| {
+        v.workspace.active_workspace().expect("workspace").project()
+    });
+
+    crate::layout_probe_begin();
+    for _ in 0..3 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+
+    let bounds = |tab: &str| {
+        crate::layout_probe_get(&format!("jump-agent-tab-{}-{tab}", pid.0))
+            .unwrap_or_else(|| panic!("the {tab} tab must paint"))
+    };
+    let waiting = bounds("waiting");
+    let working = bounds("working");
+    let all = bounds("all");
+    let archived = bounds("archived");
+    let outer = crate::layout_probe_get(&format!("jump-agent-tabs-{}", pid.0))
+        .expect("the shared tab control must paint");
+    crate::layout_probe_end();
+
+    let same_row = |a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)| {
+        (a.1 - b.1).abs() < 1.0 && (a.3 - b.3).abs() < 1.0
+    };
+    assert!(
+        same_row(waiting, working),
+        "Waiting and Working must share the first row"
+    );
+    assert!(
+        same_row(all, archived),
+        "All and Archived must share the second row"
+    );
+    assert!(
+        all.1 >= waiting.1 + waiting.3,
+        "All / Archived must paint below Waiting / Working"
+    );
+    assert!(
+        (waiting.0 - all.0).abs() < 1.0
+            && (working.0 - archived.0).abs() < 1.0
+            && (waiting.2 - all.2).abs() < 1.0
+            && (working.2 - archived.2).abs() < 1.0,
+        "the two rows must align into two equal columns"
+    );
+    for (label, (x, y, w, h)) in [
+        ("Waiting", waiting),
+        ("Working", working),
+        ("All", all),
+        ("Archived", archived),
+    ] {
+        assert!(
+            x >= outer.0
+                && y >= outer.1
+                && x + w <= outer.0 + outer.2
+                && y + h <= outer.1 + outer.3,
+            "{label} must stay inside the shared tab-control boundary"
+        );
+    }
+}
+
 /// UXI-JumpPanel-17: Waiting and Working expose their live project totals in
 /// the painted tab strip, including when one side reaches zero.
 #[gpui::test]
