@@ -17,7 +17,7 @@ art-directs its own palette-native set (see its `AgentTheme::nightfox`).
 
 | Token        | Source (`theme.agent.*`) | Default (most themes) | Nightfox | Role |
 |--------------|--------------------------|-----------------------|----------|------|
-| `st.err`     | `jump_header`            | `0xff6b6b`            | `0xc94f6d` | Top-level section headers (PINNED / UNFILED) + project names — red. |
+| `st.err`     | `jump_header`            | `0xff6b6b`            | `0xc94f6d` | Top-level SYSTEM header + project names — red. |
 | `electric`   | `jump_subheader`         | `0x3b9eff`            | `0x719cd6` | Per-cwd "Unfiled" subheaders — real path casing. |
 | `working_orange` | `jump_working`       | `0xff9e64`            | `0xf4a261` | Working glyph, word, and row wash. |
 
@@ -37,7 +37,7 @@ art-directs its own palette-native set (see its `AgentTheme::nightfox`).
 ## Where each color lands
 
 ### Section headers
-- **Top-level** (`PINNED` / `WORKSPACES` / `AGENT SESSIONS`) — `st.err` (**red**),
+- **Top-level** (`SYSTEM` / `WORKSPACES` / `AGENT SESSIONS`) — `st.err` (**red**),
   bold, uppercase, underlined (`section_heading` + `.text_color(st.err)`).
 - **Per-cwd subheaders** — `electric` (**blue**), path's real casing, no underline,
   no italic. Reads as a secondary tier.
@@ -61,7 +61,7 @@ Binding (in-use vs free) is no longer shown by the dot — the dot is purely an
 activity signal.
 
 ### Placeholders
-- "Nothing pinned yet." / "No sessions." — `st.dim`, mono (not italic).
+- "No sessions." — `st.dim`, mono (not italic).
 
 ## History
 - Selection tint & active mark were originally built from `warm_accent`

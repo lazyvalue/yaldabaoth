@@ -935,17 +935,37 @@ impl YaldaGpuiView {
             .border_color(border)
             .py_2();
 
-        // ── Pinned (placeholder; pinning mechanics land later) ───────────────
-        col = col.child(section_heading("Pinned", &st).px_3().text_color(st.err));
-        col = col.child(
+        // ── System console (UXI-SystemConsole-1) ─────────────────────────────
+        // This occupies the former empty PINNED slot. It is global operational
+        // chrome, so it never carries the active-workspace selection mark.
+        col = col.child(section_heading("System", &st).px_3().text_color(st.err));
+        col = col.child(probe_bounds(
+            "jump-system-console",
             div()
+                .id("jump-system-console")
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
                 .px_3()
                 .py_1()
-                .text_color(st.dim)
+                .cursor_pointer()
+                .hover(|s| s.bg(sel_bg))
+                .text_color(st.fg)
                 .font_family(st.mono.clone())
-                .text_size(px(st.pt * 0.9))
-                .child(SharedString::from("Nothing pinned yet.")),
-        );
+                .text_size(px(st.pt))
+                .child(
+                    div()
+                        .text_color(st.err)
+                        .font_weight(FontWeight::BOLD)
+                        .child(SharedString::new_static("▾")),
+                )
+                .child(SharedString::new_static("System console"))
+                .on_click(cx.listener(|this, _ev, _window, cx| {
+                    this.open_system_console(cx);
+                }))
+                .into_any_element(),
+        ));
 
         // ── Per-project sections (UXI-Project-3, UXI-JumpPanel-7): one section
         // per project. A **hairline rule** separates sections (drawn ABOVE each
@@ -969,7 +989,7 @@ impl YaldaGpuiView {
             let cwd_key = section.cwd_display.clone();
             let project_name = section.name.clone();
             let folded = self.jump_folded_projects.contains(&project_name);
-            // Inter-section rule, above the header (Pinned always precedes the
+            // Inter-section rule, above the header (System always precedes the
             // first project, so every project section gets a top rule).
             col = col.child(jump_divider(divider_color));
             // Project header: disclosure chevron + NAME. The chevron owns folding;

@@ -89,6 +89,7 @@ mod persist;
 mod project;
 mod render_blocks;
 mod screens;
+mod system_console;
 mod tool_body;
 mod transcript_view;
 #[cfg(test)]
@@ -110,6 +111,7 @@ pub(crate) use linear_view::*;
 pub(crate) use persist::*;
 pub(crate) use project::*;
 pub(crate) use render_blocks::*;
+pub(crate) use system_console::*;
 pub(crate) use tool_body::*;
 pub(crate) use transcript_view::*;
 pub(crate) use yux::*;
@@ -1452,11 +1454,21 @@ enum ActiveOverlay {
     /// click position, offering the project-scoped create/delete actions. Carries
     /// the target project + the window-space anchor point (already clamped to the
     /// viewport at open time).
-    ProjectMenu { pid: ProjectId, x: f32, y: f32 },
+    ProjectMenu {
+        pid: ProjectId,
+        x: f32,
+        y: f32,
+    },
     /// Session context menu opened by right-clicking a jump-panel row. The
     /// stable server sid is the archive identity; local sid-less placeholders
     /// cannot open this menu.
-    SessionMenu { sid: String, x: f32, y: f32 },
+    SessionMenu {
+        sid: String,
+        x: f32,
+        y: f32,
+    },
+    /// The Doom-style lifecycle/build console (`UXI-SystemConsole-1`).
+    SystemConsole,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1684,6 +1696,9 @@ struct YaldaGpuiView {
     /// workspace picker / rename input). At most one open at a time — see
     /// [`ActiveOverlay`]. Was five sibling `Option<…>` fields.
     active_overlay: ActiveOverlay,
+    /// Lazily-created cached body for the global system console. It survives
+    /// overlay dismissal so build output keeps accumulating while hidden.
+    system_console_view: Option<Entity<SystemConsoleView>>,
     /// One-shot footer message (e.g. "Only documents can be shown in multiple
     /// workspaces (yet)"). Rendered as a small toast in the bottom-right;
     /// cleared on the next overlay dismissal. Display-only. NOT part of
@@ -1815,6 +1830,10 @@ struct YaldaGpuiView {
     /// restart, including for sessions no tile is bound to (which
     /// `acp_sessions.json` — cwd-keyed, tile-bound-only — never persisted).
     session_summaries: HashMap<String, String>,
+    /// Test-only proof that console `r` / `R` reach the real rebuild dispatcher
+    /// without compiling and replacing the harness process.
+    #[cfg(test)]
+    dev_rebuild_requests: Vec<bool>,
 }
 
 impl YaldaGpuiView {
@@ -1848,6 +1867,7 @@ impl YaldaGpuiView {
             viewport_width_px: 800.0,
             focus_handle,
             active_overlay: ActiveOverlay::None,
+            system_console_view: None,
             transient_status: None,
             workspace: workspace::Frame::with_initial(initial, seed_project),
             projects,
@@ -1874,13 +1894,18 @@ impl YaldaGpuiView {
             roster_unread: HashMap::new(),
             // bug-0020: id-keyed autoname summaries, durable across restarts.
             session_summaries: crate::persist::load_session_summaries(),
+            #[cfg(test)]
+            dev_rebuild_requests: Vec::new(),
         }
     }
 
     fn new_browser(start_dir: PathBuf, theme: Theme, focus_handle: FocusHandle) -> Self {
-        let syntect_hl =
-            Rc::new(yalda::highlight::Highlighter::with_syntect_theme(theme.name.syntect_theme()));
-        let initial = App::Buffer(BufferApp::Picking(BrowserWindow::standalone(start_dir.clone())));
+        let syntect_hl = Rc::new(yalda::highlight::Highlighter::with_syntect_theme(
+            theme.name.syntect_theme(),
+        ));
+        let initial = App::Buffer(BufferApp::Picking(BrowserWindow::standalone(
+            start_dir.clone(),
+        )));
         // ADR-0028: projects before workspace.
         let (projects, seed_project) = boot_projects(&start_dir, [start_dir.clone()]);
         Self {
@@ -1898,6 +1923,7 @@ impl YaldaGpuiView {
             viewport_width_px: 800.0,
             focus_handle,
             active_overlay: ActiveOverlay::None,
+            system_console_view: None,
             transient_status: None,
             workspace: workspace::Frame::with_initial(initial, seed_project),
             projects,
@@ -1924,6 +1950,8 @@ impl YaldaGpuiView {
             roster_unread: HashMap::new(),
             // bug-0020: id-keyed autoname summaries, durable across restarts.
             session_summaries: crate::persist::load_session_summaries(),
+            #[cfg(test)]
+            dev_rebuild_requests: Vec::new(),
         }
     }
 
@@ -2902,17 +2930,6 @@ impl YaldaGpuiView {
         }
     }
 
-    /// Set the focused agent slot's status line (build-loop feedback). No-op
-    /// if the focused window isn't an agent screen, but always logs so the
-    /// message isn't lost when triggered from a doc/edit view.
-    fn set_agent_status(&mut self, msg: &str, cx: &mut Context<Self>) {
-        eprintln!("[yalda-gpui] {msg}");
-        if let Some(mut c) = self.agent_mut(cx) {
-            c.status = Some(msg.to_string().into());
-        }
-        cx.notify();
-    }
-
     /// Dev hot-restart: rebuild `yalda-gpui` and replace THIS instance with a
     /// fresh one. A full self-restart — build, spawn a fresh instance, then
     /// quit so the new process re-attaches to every server-managed session. The
@@ -2950,85 +2967,120 @@ impl YaldaGpuiView {
     /// running process was started. With `restart_server`, it also rebuilds
     /// `yalda-session-server` and tears the old one down.
     fn dev_rebuild_restart(&mut self, restart_server: bool, cx: &mut Context<Self>) {
-        let what = if restart_server { "gui + server" } else { "gui" };
-        self.set_agent_status(&format!("rebuilding {what} (release): cargo build…"), cx);
+        let what = if restart_server {
+            "gui + server"
+        } else {
+            "gui"
+        };
+        // The console is the canonical feedback surface for self-rebuild. Open
+        // it even when this command came from the legacy workspace menu.
+        self.open_system_console(cx);
+        let console = self.system_console_view(cx);
+        if console.read(cx).building() {
+            self.append_system_console(
+                ConsoleLevel::Warn,
+                "a rebuild is already running; request ignored",
+                cx,
+            );
+            return;
+        }
+        console.update(cx, |view, cx| view.set_building(true, cx));
+        self.append_system_console(
+            ConsoleLevel::Command,
+            format!("cargo build --release ({what})"),
+            cx,
+        );
 
+        // The harness verifies the real dispatcher but must not recursively
+        // compile and replace its own process.
+        #[cfg(test)]
+        {
+            self.dev_rebuild_requests.push(restart_server);
+            console.update(cx, |view, cx| view.set_building(false, cx));
+            return;
+        }
+
+        #[cfg(not(test))]
         let manifest_dir = env!("CARGO_MANIFEST_DIR").to_string();
+        #[cfg(not(test))]
         let gui_bin = PathBuf::from(&manifest_dir).join("target/release/yalda-gpui");
+        #[cfg(not(test))]
         let args: Vec<String> = std::env::args().skip(1).collect();
 
+        #[cfg(not(test))]
         cx.spawn(async move |this, cx| {
-            // Run the (slow, blocking) build on a background thread, then — for
-            // the "all" path — tear the old server down so the relaunched GUI
-            // brings up the newly-built one (mirrors `dev-server.sh`).
-            let built = cx
-                .background_executor()
-                .spawn(async move {
-                    let mut build_args: Vec<&str> =
-                        vec!["build", "--release", "--bin", "yalda-gpui"];
-                    if restart_server {
-                        build_args.extend_from_slice(&["--bin", "yalda-session-server"]);
-                    }
-                    let out = std::process::Command::new("cargo")
-                        .args(&build_args)
-                        .current_dir(&manifest_dir)
-                        .output();
-
-                    if restart_server
-                        && let Ok(o) = &out
-                        && o.status.success()
-                    {
-                        // Kill any running server (both profiles) and clear the
-                        // stale socket/pid so the fresh GUI launches the server
-                        // it just built instead of reconnecting to the old one.
-                        for pat in [
-                            "target/debug/yalda-session-server",
-                            "target/release/yalda-session-server",
-                        ] {
-                            let _ = std::process::Command::new("pkill")
-                                .args(["-f", pat])
-                                .status();
+            let events = spawn_self_build(manifest_dir, restart_server);
+            let timer = cx.background_executor().clone();
+            loop {
+                let mut finished = None;
+                loop {
+                    match events.try_recv() {
+                        Ok(BuildEvent::Line(level, line)) => {
+                            let _ = this.update(cx, |this, cx| {
+                                this.append_system_console(level, line, cx);
+                            });
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(300));
-                        let _ = std::fs::remove_file(yalda::session_proto::socket_path());
-                        let _ = std::fs::remove_file(yalda::session_proto::pid_file_path());
+                        Ok(BuildEvent::Finished(result)) => {
+                            finished = Some(result);
+                            break;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            finished = Some(Err("build worker disconnected".to_string()));
+                            break;
+                        }
                     }
-                    out
-                })
-                .await;
+                }
 
-            let _ = this.update(cx, |this, cx| match built {
-                Ok(out) if out.status.success() => {
-                    // Relaunch the freshly-built RELEASE binary. stderr is
-                    // inherited so post-restart logs reach the dev terminal
-                    // (unlike reboot_into_claude's fully-detached stdio).
+                if let Some(result) = finished {
+                    let _ = this.update(cx, |this, cx| {
+                        let console = this.system_console_view(cx);
+                        console.update(cx, |view, cx| view.set_building(false, cx));
+                        match result {
+                            Ok(()) => {
+                                this.append_system_console(
+                                    ConsoleLevel::Info,
+                                    "build succeeded; launching the new Yalda",
+                                    cx,
+                                );
                     let mut cmd = std::process::Command::new(&gui_bin);
                     cmd.args(&args);
+                                cmd.env("YALDA_OPEN_SYSTEM_CONSOLE", "1");
                     cmd.stdin(std::process::Stdio::null());
                     cmd.stdout(std::process::Stdio::null());
                     cmd.stderr(std::process::Stdio::inherit());
                     match cmd.spawn() {
-                        Ok(_) => {
-                            this.set_agent_status(
-                                "rebuilt — relaunching, this window will close",
+                                    Ok(child) => {
+                                        this.append_system_console(
+                                            ConsoleLevel::Info,
+                                            format!(
+                                                "relaunch started (pid {}); closing this window",
+                                                child.id()
+                                            ),
                                 cx,
                             );
-                            // Quit promptly: the new instance re-attaches to
-                            // every server session on startup (strict 1:1).
+                                        // The new process re-attaches to every
+                                        // server session on startup (strict 1:1).
                             cx.quit();
                         }
-                        Err(e) => this.set_agent_status(&format!("relaunch spawn failed: {e}"), cx),
+                                    Err(error) => this.append_system_console(
+                                        ConsoleLevel::Error,
+                                        format!("relaunch spawn failed: {error}"),
+                                        cx,
+                                    ),
                     }
                 }
-                Ok(out) => {
-                    // Surface the tail of stderr so the failure is actionable.
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    let tail: Vec<&str> = stderr.lines().rev().take(3).collect();
-                    let tail: String = tail.into_iter().rev().collect::<Vec<_>>().join(" | ");
-                    this.set_agent_status(&format!("build failed: {tail}"), cx);
+                            Err(error) => this.append_system_console(
+                                ConsoleLevel::Error,
+                                format!("build failed: {error}"),
+                                cx,
+                            ),
                 }
-                Err(e) => this.set_agent_status(&format!("build error: {e}"), cx),
             });
+                    break;
+                }
+                timer.timer(Duration::from_millis(40)).await;
+            }
         })
         .detach();
     }
@@ -3341,6 +3393,7 @@ impl YaldaGpuiView {
         self.notify_transcript_views(MissReason::Refresh, cx);
         self.notify_linear_views(MissReason::Refresh, cx);
         self.notify_keymap_views(MissReason::Refresh, cx);
+        self.notify_system_console(MissReason::Refresh, cx);
         self.save_settings();
         cx.notify();
     }
@@ -4648,6 +4701,11 @@ impl YaldaGpuiView {
         items.push(MenuNode::entry("p", "new project", "new-project"));
         // (Agent sessions are now created only inside a project — the jump panel's
         // per-project context menu, not a global cwd overlay; UXI-Project-7.)
+        items.push(MenuNode::entry(
+            "`",
+            "system console",
+            "open-system-console",
+        ));
         let jp_label = if self.jump_panel_visible {
             "hide jump panel"
         } else {
@@ -4885,6 +4943,7 @@ impl YaldaGpuiView {
             "claude-cd" => self.open_change_agent_cwd_overlay(cx),
             "dev-restart-gui" => self.dev_rebuild_restart_gui(cx),
             "dev-restart-all" => self.dev_rebuild_restart_all(cx),
+            "open-system-console" => self.open_system_console(cx),
             "rail-files" => self.toggle_file_browser_rail_impl(cx),
             "rail-outline" => self.toggle_outline_rail_impl(cx),
             "rail-flip" => self.flip_rail_side_impl(cx),
@@ -7786,6 +7845,23 @@ impl Render for YaldaGpuiView {
             return screen_view;
         }
 
+        // System console (`UXI-SystemConsole-1`): a source-port-style drop-down
+        // over the current screen. It owns every plain key while open so `r` /
+        // `R` run the rebuild commands and Esc reliably dismisses.
+        if self.overlay_is_system_console() {
+            return div()
+                .track_focus(&self.focus_handle)
+                .key_context("SystemConsoleView")
+                .size_full()
+                .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
+                    this.handle_system_console_key(ev, w, cx);
+                    cx.stop_propagation();
+                }))
+                .child(screen_view)
+                .child(self.render_system_console_overlay(cx))
+                .into_any_element();
+        }
+
         // Rename overlay takes priority — it's a transient single-line
         // input opened from the menu, so nothing else should steal keys.
         //
@@ -8322,6 +8398,10 @@ fn main() {
     // durable `~/.yalda` home (ADR-0018), BEFORE any persisted state (prefs,
     // workspace, client_id, acp_sessions) is read. One-time, idempotent.
     yalda::paths::migrate_legacy_cache_dir();
+    record_system_message(
+        ConsoleLevel::Info,
+        format!("Yalda starting (pid {})", std::process::id()),
+    );
     let config = yalda::config::Config::load().unwrap_or_default();
     // GpuiApp-managed preferences override config.kdl's theme — that's where
     // the menu-driven "View → Theme" picks land. Falls back to the kdl
@@ -8491,6 +8571,13 @@ fn main() {
                         // session/load fires once per persisted slot.
                         if std::env::var("YALDA_OPEN_CLAUDE").is_ok() {
                             view.open_agent_inner(cx);
+                        }
+                        // Self-rebuild handoff: keep the operational surface
+                        // visible in the new process so the user can see the
+                        // compiler output and relaunch boundary that just
+                        // crossed process identity (`UXI-SystemConsole-2`).
+                        if std::env::var("YALDA_OPEN_SYSTEM_CONSOLE").is_ok() {
+                            view.open_system_console(cx);
                         }
                         // Set splash deadline AFTER all init (workspace
                         // restoration, agent attach) so the countdown starts

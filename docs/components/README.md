@@ -52,6 +52,8 @@ holds the detail for a slice. The UXI ids stay owned by the component, not the f
   Window`). `UXI-Project-1..8` — all implemented (ADR-0028).
 - [rail.md](rail.md) — `Rail`.
 - [keybindings.md](keybindings.md) — `Keybindings`. `UXI-Keybindings-1`.
+- [system-console.md](system-console.md) — `SystemConsole`. A drop-down,
+  persistent operational log and self-rebuild/relaunch surface.
 - [common/](common/README.md) — shared behaviors: `TextEditing`, `Selection`,
   `TextZoom`, `Blockquote`, `ParagraphSpacing`, `Menu` (leader command panel).
 

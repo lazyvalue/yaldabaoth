@@ -986,6 +986,10 @@ user**; the rest is `NEEDS-RUNTIME`. Follow-ups below are off `integration`,
 
 ## Needs runtime verification
 
+- **System console self-relaunch (`feature/system-console`)** — run `r` and `R`
+  from the console; confirm live Cargo streaming, process replacement with the
+  console reopened, and agent-session reattachment.
+
 All 2026-06-02 branches: `rail-fixes` (placement/contrast/chords), `perf` /
 `perf-tachyon` (feels-fast + tokens/tool-expand/thinking-indicator correct),
 `workspaces` (Ctrl-W m/M chords, dot, focus after move), `integration` (all of
