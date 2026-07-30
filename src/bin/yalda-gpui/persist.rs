@@ -547,15 +547,15 @@ pub(crate) struct Preferences {
     /// on load so a hand-edited file can't push the body off-screen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) text_scale: Option<f32>,
-    /// Desktop-mode tile size in mono cells (spec-desktop-mode.md
-    /// Behavior 6). One global setting; clamped on use, not on load.
+    /// Default span assigned to new desktop tiles, in fixed cells
+    /// (spec-desktop-mode.md Behavior 6). Existing tile spans are unaffected.
+    /// One global setting; clamped on use, not on load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) desktop_grid_cols: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) desktop_grid_rows: Option<u32>,
-    /// Version of the built-in desktop-density default. Version 2 changes the
-    /// original 2×2 default to 4×4 without overriding a 2×2 choice explicitly
-    /// saved after the migration.
+    /// Version of the built-in default tile span. Migrations update shipped
+    /// defaults without overriding choices explicitly saved afterward.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) desktop_grid_defaults_version: Option<u8>,
     /// Jump-panel visibility (jump-panel; `cmd-j` / `?` menu). `None` means

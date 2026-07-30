@@ -4,33 +4,19 @@
 
 use super::*;
 
-/// Desktop-mode chrome constants (spec-desktop-mode.md Behavior 3/4).
+/// Desktop-mode geometry calibrated from the 1350×1344px @2× reference
+/// screenshot: a 160×160 logical-pixel cell is 320×320 physical Retina pixels.
+/// A default 4×4 tile with the established 12px gutters is 676×676 logical px
+/// (1352×1352 physical px), matching the reference within its border/crop.
+pub(crate) const DESKTOP_CELL_W: f32 = 160.0;
+pub(crate) const DESKTOP_CELL_H: f32 = 160.0;
 pub(crate) const DESKTOP_GUTTER: f32 = 12.0;
-pub(crate) const DESKTOP_MIN_TILE_W: f32 = 160.0;
-pub(crate) const DESKTOP_MIN_TILE_H: f32 = 120.0;
 const DESKTOP_TITLE_H: f32 = 20.0;
 const DESKTOP_DRAG_THRESHOLD: f32 = 4.0;
 const DESKTOP_EDGE_PAN_BAND: f32 = 30.0;
 const DESKTOP_EDGE_PAN_STEP: f32 = 12.0;
 /// Width of the east/south edge bands that arm a tile resize (spec 4b).
 const DESKTOP_RESIZE_BAND: f32 = 6.0;
-
-/// Full-detail tile size for a measured canvas. The requested grid density
-/// determines slot pitch until the live-tile readability floor is reached.
-/// Below that point the infinite plane simply shows fewer complete slots.
-pub(crate) fn desktop_tile_size_for_canvas(
-    canvas_w: f32,
-    canvas_h: f32,
-    cols: u32,
-    rows: u32,
-) -> (f32, f32) {
-    let cols = cols.max(1) as f32;
-    let rows = rows.max(1) as f32;
-    (
-        ((canvas_w - (cols + 1.0) * DESKTOP_GUTTER) / cols).max(DESKTOP_MIN_TILE_W),
-        ((canvas_h - (rows + 1.0) * DESKTOP_GUTTER) / rows).max(DESKTOP_MIN_TILE_H),
-    )
-}
 
 impl YaldaGpuiView {
     /// Build the menu popup as an absolutely-positioned overlay anchored
@@ -123,12 +109,15 @@ impl YaldaGpuiView {
         // is UNCLAMPED now — the plane is infinite in all directions
         // (Behavior 5). ──
         {
+            let new_tile_span =
+                workspace::Span::new(self.desktop_grid_rows, self.desktop_grid_cols);
             let wsp = &mut self.workspace.workspaces[workspace_idx];
             let leaves = wsp.layout.leaf_ids();
             // Seed beside the tile the user is on (bug-0012): a brand-new leaf
             // IS the focused one and has no slot yet, so `reconcile_near` falls
             // back to `last_reveal` — still the tile focus came from.
-            wsp.desktop.reconcile_near(&leaves, Some(focused_id));
+            wsp.desktop
+                .reconcile_near_with_span(&leaves, Some(focused_id), new_tile_span);
             if wsp.desktop.last_reveal != Some(focused_id) {
                 if let Some(slot) = wsp.desktop.slot_of(focused_id) {
                     let (x, y) = workspace::slot_origin(slot, tile, g);
@@ -464,7 +453,6 @@ impl YaldaGpuiView {
                 title_bar =
                     title_bar.child(div().px_1().text_color(accent).child(format!("[{m}]")));
             }
-
             // East / south resize bands (spec Behavior 4b): thin overlays at
             // the grow edges; the title bar (move) and content keep theirs.
             let east_band = div()
@@ -616,39 +604,12 @@ impl YaldaGpuiView {
         self.wrap_leaf_with_rail(canvas_el, rail_focusable, cx)
     }
 
-    /// Fixed tile pixel size chosen from the first measured canvas and the
-    /// desktop GRID config (spec Behavior 6). Window, sidebar, and rail resizes
-    /// change the viewport only: the cached slot pitch stays stable and the
-    /// view reveals more or fewer cells. An explicit grid-config change has
-    /// different cache keys, so it chooses and freezes a new size from the
-    /// current canvas. Floors keep tiles usable when that canvas is tiny.
+    /// One fixed Full-detail grid-cell size. Window, sidebar, and rail resizes
+    /// change the viewport only, revealing more or fewer cells. Tile usefulness
+    /// comes from its span (new tiles default to 4×4 cells), not by stretching
+    /// the underlying snap grid.
     pub(crate) fn desktop_tile_px(&self) -> (f32, f32) {
-        let cols = self.desktop_grid_cols;
-        let rows = self.desktop_grid_rows;
-        if let Some((cached_cols, cached_rows, width, height)) = self.desktop_tile_size_px.get()
-            && cached_cols == cols
-            && cached_rows == rows
-        {
-            return (width, height);
-        }
-
-        let (_, _, w, h) = self.desktop_canvas_bounds.get();
-        if w > 0.0 && h > 0.0 {
-            let (width, height) = desktop_tile_size_for_canvas(w, h, cols, rows);
-            self.desktop_tile_size_px
-                .set(Some((cols, rows, width, height)));
-            return (width, height);
-        }
-
-        // First frame: paint has not captured the canvas yet. Use the viewport
-        // as a temporary approximation but do not freeze it; the first real
-        // canvas measurement replaces this on the following frame.
-        desktop_tile_size_for_canvas(
-            self.viewport_width_px.max(1.0),
-            self.viewport_height_px.max(1.0),
-            cols,
-            rows,
-        )
+        (DESKTOP_CELL_W, DESKTOP_CELL_H)
     }
 
     /// Title-bar label for a tile. Agent labels live in the session store, so

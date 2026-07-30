@@ -153,9 +153,10 @@ Placement on the plane is:
   tile the user is on** — the focused tile if it already has a slot, else the
   last-revealed one, else the origin (that centering was bug-0012). Each ring is
   scanned in **preference order**: nearest row first, then below before above and
-  right before left, so ring 1 leads with `(row, col+1)` — same height, directly
-  to the right — and a new tile is never placed diagonally when a side slot is
-  free. Skips any slot inside an existing tile's rectangle. Deterministic;
+  right before left. The candidate's entire configured span must be free, so a
+  default 4×4 tile beside another 4×4 tile lands at `(row, col+4)` — same height,
+  directly to the right — and a new tile is never placed diagonally when a
+  side-by-side rectangle is free. Deterministic;
   independent of camera. This keeps new work clustered beside the work it came
   from rather than scattered. Cost: the spiral tests O(ring²) slots, each an
   O(tiles) `occupant` check, so seeding is worst-case super-linear on a sparse
@@ -326,18 +327,17 @@ data, *module-internal* — called by the GPUI view layer):
 - **`pan_by(dx, dy)`** — unclamped viewport translation (Behavior 5). [DRAFT]
 - **`detail_scale(detail) -> f32`** — the multiplier applied to the **Full**
   pitch for a Detail level (`Full`→1.0, `Card`→smaller, `Minimap`→smallest); the
-  one place the three levels' relative sizes are defined. Pitch itself is
-  **per-axis and viewport-derived** (`desktop_tile_px()` in `chrome.rs` computes
-  `(w, h)` from the viewport ÷ `desktop_grid_{cols,rows}`), so the effective
-  pitch is `(f32, f32) = full_pitch ⊗ detail_scale(zoom)`. A scalar
-  `slot_pitch(detail) -> f32` is **infeasible** — pitch is anisotropic and
-  changes on window resize; keep `Preferences`' grid config as the single sizing
-  source and scale off it. [DRAFT]
-- **`seed_slot_near(&self, center: Slot) -> Slot`** — first free slot on the
-  preference-ordered ring-spiral around `center` (Behavior 4);
+  one place the three levels' relative sizes are defined. Full cells are fixed
+  at 160×160px with a 12px gutter; the effective pitch is
+  `(cell + gutter) ⊗ detail_scale(zoom)` and never depends on viewport size.
+  [DRAFT]
+- **`seed_span_near(&self, center: Slot, span: Span) -> Slot`** — first free
+  rectangle on the preference-ordered ring-spiral around `center` (Behavior 4);
+  **`seed_slot_near`** is its 1×1 compatibility wrapper;
   **`seed_slot(&self)`** is the origin-centered wrapper. The center is resolved by
-  **`reconcile_near(leaves, near)`** (focused → `last_reveal` → origin). Replaces
-  desktop-mode's `first_free_slot` shelf variant. [DRAFT]
+  **`reconcile_near_with_span(leaves, near, new_span)`** (focused →
+  `last_reveal` → origin). Replaces desktop-mode's `first_free_slot` shelf
+  variant. [DRAFT]
 - Reused **type-only** from desktop mode (logic identical, `Slot` now `i32`):
   `rect_of`, `set_anchor`, `spatial_neighbor`, `span_of`, `sequence_neighbor`
   (still drives `focus_next/prev`, Behavior 5). Reused with **semantic edits**

@@ -504,9 +504,9 @@ const DEFAULT_DESKTOP_GRID_ROWS: u32 = 4;
 const DESKTOP_GRID_DEFAULTS_VERSION: u8 = 3;
 const TWO_BY_TWO_MIGRATION_VERSION: u8 = 2;
 
-/// Restore one desktop-grid axis, including the one-time migration from the
-/// original 2×2 built-in default. Once version 2 has been saved, `2` is an
-/// explicit user choice and remains untouched.
+/// Restore one default new-tile-span axis, including the one-time migration
+/// from the original 2×2 built-in default. Once version 2 has been saved, `2`
+/// is an explicit user choice and remains untouched.
 fn restore_desktop_grid_axis(saved: Option<u32>, version: Option<u8>, default: u32) -> u32 {
     match saved {
         Some(2) if version.unwrap_or(1) < TWO_BY_TWO_MIGRATION_VERSION => default,
@@ -515,7 +515,7 @@ fn restore_desktop_grid_axis(saved: Option<u32>, version: Option<u8>, default: u
     }
 }
 
-/// Restore both axes together so the shipped 3×3 density can migrate to 4×4
+/// Restore both axes together so the shipped 3×3 default span can migrate to 4×4
 /// without rewriting a deliberate asymmetric choice such as 5×3. Version 3 is
 /// written on the next settings save; after that, an explicit 3×3 remains 3×3.
 fn restore_desktop_grid(
@@ -1666,16 +1666,10 @@ struct YaldaGpuiView {
     /// display bindings and mutates it (then re-applies to the app + persists)
     /// when the user rebinds a key.
     keymap_registry: KeymapRegistry,
-    /// Desktop density used to choose the fixed tile size from the first
-    /// measured canvas (spec-desktop-mode.md Behavior 6). One global setting
-    /// for all tiles in all workspaces, persisted in `Preferences`.
+    /// Default new-tile span in fixed desktop cells (columns × rows), persisted
+    /// in `Preferences`. Existing tiles keep their own saved spans.
     desktop_grid_cols: u32,
     desktop_grid_rows: u32,
-    /// `(grid cols, grid rows, tile width, tile height)` after the first real
-    /// canvas measurement. The grid keys make an explicit density change
-    /// invalidate the value; ordinary window/chrome resize deliberately does
-    /// not, so it changes only how much of the plane is visible.
-    desktop_tile_size_px: std::cell::Cell<Option<(u32, u32, f32, f32)>>,
     /// Per-tile remembered file-explorer sort order, keyed by the tile's
     /// `WindowId`. A picker is short-lived (it's replaced by the picked file /
     /// the restored underlying buffer when closed), so its `SortOrder` would
@@ -1866,7 +1860,6 @@ impl YaldaGpuiView {
             keymap_registry: KeymapRegistry::load(),
             desktop_grid_cols: DEFAULT_DESKTOP_GRID_COLS,
             desktop_grid_rows: DEFAULT_DESKTOP_GRID_ROWS,
-            desktop_tile_size_px: std::cell::Cell::new(None),
             browser_sort: HashMap::new(),
             desktop_canvas_bounds: std::rc::Rc::new(std::cell::Cell::new((0.0, 0.0, 0.0, 0.0))),
             viewport_height_px: 0.0,
@@ -1923,7 +1916,6 @@ impl YaldaGpuiView {
             keymap_registry: KeymapRegistry::load(),
             desktop_grid_cols: DEFAULT_DESKTOP_GRID_COLS,
             desktop_grid_rows: DEFAULT_DESKTOP_GRID_ROWS,
-            desktop_tile_size_px: std::cell::Cell::new(None),
             browser_sort: HashMap::new(),
             desktop_canvas_bounds: std::rc::Rc::new(std::cell::Cell::new((0.0, 0.0, 0.0, 0.0))),
             viewport_height_px: 0.0,
@@ -3975,7 +3967,7 @@ impl YaldaGpuiView {
         let cam = self.workspace.workspaces[workspace_idx].desktop.camera;
         let scale = workspace::detail_scale(cam.zoom);
         let tile = (full_tile.0 * scale, full_tile.1 * scale);
-        let g = 12.0 * scale; // DESKTOP_GUTTER (chrome.rs); pitch-independent.
+        let g = chrome::DESKTOP_GUTTER * scale;
         let pitch = (tile.0 + g, tile.1 + g);
         let pan = (cam.pan.0 * pitch.0, cam.pan.1 * pitch.1);
         let focused_id = self.workspace.workspaces[workspace_idx].focused;
@@ -5792,10 +5784,8 @@ impl YaldaGpuiView {
         self.open_desktop_grid_overlay(cx);
     }
 
-    /// `Ctrl-W p` / menu `l g`: open the `{cols}x{rows}` input for the
-    /// desktop GRID — how many tiles fit the viewport per axis; tile size
-    /// derives from it (spec-desktop-mode.md Behavior 6, grid revision).
-    /// Pre-filled with the current value so Enter is a no-op confirm.
+    /// `Ctrl-W p` / menu `l g`: open the `{cols}x{rows}` input for the default
+    /// new-tile span in fixed desktop cells. Existing tiles are unchanged.
     fn open_desktop_grid_overlay(&mut self, cx: &mut Context<Self>) {
         if self.overlay_is_rename() {
             return;
@@ -6368,9 +6358,9 @@ impl YaldaGpuiView {
             },
             RenameTarget::DesktopTileSize => {
                 self.close_rename_overlay();
-                // Accept "120x40" / "120X40" with optional spaces. Slot
-                // addresses are size-independent (spec Behavior 6), so this
-                // re-renders in place — no migration, no slot mutation.
+                // Accept "4x4" / "4X4" with optional spaces. This controls only
+                // the span assigned to future tiles; existing placement and
+                // spans stay untouched.
                 let parsed = new_label.to_lowercase().split_once('x').and_then(|(c, r)| {
                     Some((c.trim().parse::<u32>().ok()?, r.trim().parse::<u32>().ok()?))
                 });
@@ -6380,7 +6370,7 @@ impl YaldaGpuiView {
                         self.desktop_grid_rows = rows.clamp(1, 12);
                         self.transient_status = Some(
                             format!(
-                                "desktop grid: {}x{} tiles per screen",
+                                "new tiles: {}x{} cells",
                                 self.desktop_grid_cols, self.desktop_grid_rows
                             )
                             .into(),
@@ -6388,7 +6378,8 @@ impl YaldaGpuiView {
                         self.save_settings();
                     }
                     None => {
-                        self.transient_status = Some("desktop grid: expected {cols}x{rows}".into());
+                        self.transient_status =
+                            Some("new tile span: expected {cols}x{rows}".into());
                     }
                 }
                 cx.notify();
@@ -7215,7 +7206,7 @@ impl YaldaGpuiView {
             RenameTarget::Workspace { .. } => "RENAME WORKSPACE",
             RenameTarget::AgentChangeCwd { .. } => "CHANGE SESSION CWD",
             RenameTarget::WorkspaceCwd { .. } => "SET WORKSPACE CWD",
-            RenameTarget::DesktopTileSize => "DESKTOP GRID (COLSxROWS OF TILES)",
+            RenameTarget::DesktopTileSize => "NEW TILE SIZE (COLSxROWS OF CELLS)",
         };
         let header = div()
             .px_4()
@@ -8527,9 +8518,9 @@ fn main() {
                         if let Some(scale) = prefs.text_scale {
                             view.text_scale = scale.clamp(MIN_TEXT_SCALE, MAX_TEXT_SCALE);
                         }
-                        // Desktop density v3: migrate the previously shipped 3×3
-                        // density to 4×4 once, while preserving asymmetric custom
-                        // grids and post-migration explicit choices.
+                        // Default tile-span v3: migrate the previously shipped
+                        // 3×3 value to 4×4 once, while preserving asymmetric
+                        // custom spans and post-migration explicit choices.
                         let (grid_cols, grid_rows) = restore_desktop_grid(
                             prefs.desktop_grid_cols,
                             prefs.desktop_grid_rows,
