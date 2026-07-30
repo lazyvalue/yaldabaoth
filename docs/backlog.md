@@ -13,6 +13,19 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Hide archived sessions from the Agent Tile picker** — `DONE`
+  (2026-07-29 via `/new-ux`; `UXI-AgentTile-32`). Captured verbatim:
+  *"The agent tile picker should not show archived sessions."* Scoped to the
+  unbound Agent Tile's existing-session projection: archived sessions are absent
+  whether free or bound/in use. The New Claude and New Codex rows, project
+  scoping, 1:1 binding, and the Jump Panel's Archived tab remain unchanged.
+  Shipped at the shared `picker_projection` seam, so render, navigation, row
+  count, and activation consume the same filtered list. Guard
+  `agent_tile_picker_excludes_free_and_bound_archived_sessions` proves both free
+  and bound archived sessions are excluded while equivalent unarchived sessions
+  remain; the unchanged projection produced the expected RED. The full GPUI
+  harness, library suite, and all-bin check are green.
+
 - **Remove redundant status words from Jump Panel session rows** — `DONE`
   (2026-07-28 via `/new-ux`; revises `UXI-JumpPanel-10`). Captured verbatim:
   *"with the different tabs and headers we no longer need the words 'your turn'

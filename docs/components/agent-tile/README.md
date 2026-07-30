@@ -41,6 +41,8 @@ strip**, the **transcript** (a cached child, `TranscriptView`), the **compose** 
   and the typed-`yes` close confirmation + its auto-insert).
 - [providers.md](providers.md) — `UXI-AgentTile-30`: explicit Claude/Codex choice
   with durable provider ownership and subscription-safe Codex authentication.
+- [picker.md](picker.md) — `UXI-AgentTile-32`: existing archived sessions are
+  absent from both selectable and in-use picker rows.
 
 <!-- Add facets as more of the agent tile's behavior is migrated in:
      status-strip.md, … -->
@@ -76,3 +78,4 @@ strip**, the **transcript** (a cached child, `TranscriptView`), the **compose** 
 | UXI-AgentTile-28 | transcript | The tile says whether the agent is working or waiting on you | implemented |
 | UXI-AgentTile-30 | providers | Claude and Codex sessions coexist with durable provider identity | implemented |
 | UXI-AgentTile-31 | transcript | Narrow tiles wrap header chrome; usage owns a line | implemented |
+| UXI-AgentTile-32 | picker | Archived sessions never appear in the session picker | implemented |

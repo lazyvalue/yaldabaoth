@@ -38,7 +38,7 @@ holds the detail for a slice. The UXI ids stay owned by the component, not the f
 ## Index of components
 
 - [agent-tile/](agent-tile/README.md) — `AgentTile` (decomposed): sidepanel,
-  transcript, compose, recap, model. `UXI-AgentTile-1..23`.
+  transcript, compose, recap, model, picker. `UXI-AgentTile-1..32`.
 - [buffer.md](buffer.md) — `Buffer` (Picking / Viewing / Editing).
 - [linear.md](linear.md) — `Linear`.
 - [jump-panel.md](jump-panel.md) — `JumpPanel`. `UXI-JumpPanel-1..17` (the

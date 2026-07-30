@@ -263,6 +263,14 @@ impl YaldaGpuiView {
         let tile_project = self.projects.by_cwd(cwd);
         let (mut free, mut bound) = (Vec::new(), Vec::new());
         for info in self.agent_roster.entries_by_label() {
+            // UXI-AgentTile-32: archive hides an existing session from the
+            // selector entirely, whether it would otherwise be FREE or IN USE.
+            if self
+                .jump_archived_sessions
+                .contains(info.session_id.as_str())
+            {
+                continue;
+            }
             if self.projects.by_cwd(&info.cwd) != tile_project {
                 continue;
             }

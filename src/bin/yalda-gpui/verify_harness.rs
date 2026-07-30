@@ -4069,6 +4069,89 @@ fn selector_projection_reflects_binding_across_tiles(cx: &mut TestAppContext) {
     });
 }
 
+/// UXI-AgentTile-32: archive is a visibility boundary for the Agent Tile
+/// picker, not only for the Jump Panel and Cmd-P. Both selectable FREE rows and
+/// read-only IN USE rows exclude archived sids while preserving equivalent
+/// unarchived sessions.
+///
+/// Negative control: remove the archive guard in `picker_projection` and the
+/// archived free/bound identities reappear in these lists.
+#[gpui::test]
+fn agent_tile_picker_excludes_free_and_bound_archived_sessions(cx: &mut TestAppContext) {
+    use crate::{AgentSession, AgentState, AgentTile, App};
+    use yalda::session_proto::SessionInfo;
+
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+    vcx.run_until_parked();
+
+    view.update(vcx, |v, cx| {
+        let mk_session = |label: &str| AgentSession {
+            state: AgentState::new_server_managed(None),
+            label: label.into(),
+            cwd: PathBuf::from("."),
+            resume_id: None,
+        };
+        let mk_info = |sid: &str, label: &str| SessionInfo {
+            session_id: sid.into(),
+            acp_session_id: None,
+            label: label.into(),
+            cwd: PathBuf::from("."),
+            provider: yalda::acp_channel::AgentProvider::Claude,
+            turns: 0,
+            connected: true,
+            permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+            busy: false,
+        };
+
+        // Two bound sessions occupy distinct tiles.
+        v.set_screen(App::Agent(AgentTile::new()));
+        let bound_live = v.show_local_session(mk_session("bound-live"), cx);
+        v.sessions
+            .bind_sid(bound_live, "S-bound-live".into())
+            .expect("bind live session");
+        v.workspace
+            .split_focused(crate::workspace::SplitDir::H, App::Agent(AgentTile::new()));
+        let bound_archived = v.show_local_session(mk_session("bound-archived"), cx);
+        v.sessions
+            .bind_sid(bound_archived, "S-bound-archived".into())
+            .expect("bind archived session");
+
+        // A third, focused Agent Tile is the unbound picker consuming the
+        // projection under test.
+        v.workspace
+            .split_focused(crate::workspace::SplitDir::H, App::Agent(AgentTile::new()));
+
+        for (sid, label) in [
+            ("S-bound-live", "bound-live"),
+            ("S-bound-archived", "bound-archived"),
+            ("S-free-live", "free-live"),
+            ("S-free-archived", "free-archived"),
+        ] {
+            v.agent_roster.upsert(mk_info(sid, label));
+        }
+        v.jump_archived_sessions
+            .extend(["S-bound-archived".into(), "S-free-archived".into()]);
+    });
+
+    view.read_with(vcx, |v, _| {
+        assert!(
+            v.agent_tile().is_some_and(|tile| tile.picker().is_some()),
+            "the focused Agent Tile is the real unbound picker"
+        );
+        let (free, bound) = v.picker_projection(&v.agent_base_cwd());
+        assert_eq!(
+            free.iter().map(|s| s.sid.as_str()).collect::<Vec<_>>(),
+            vec!["S-free-live"],
+            "the selectable list excludes its archived free session"
+        );
+        assert_eq!(
+            bound.iter().map(|s| s.sid.as_str()).collect::<Vec<_>>(),
+            vec!["S-bound-live"],
+            "the IN USE list excludes its archived bound session"
+        );
+    });
+}
+
 /// The workspace cwd (`Set CWD`) is PERSISTED: it survives a save→restore
 /// (process restart). Hermetic — the workspace file is redirected to a tempdir
 /// (no touch to `~/.yalda`). Save writes `PersistedWorkspace.cwd`; restore reads it
