@@ -5150,6 +5150,91 @@ fn codex_roster_identity_repairs_restored_tile_and_turn_header(cx: &mut TestAppC
     );
 }
 
+/// Agent replies use a stripped-Markdown line renderer, so the visible link
+/// label must retain its hidden destination and dispatch a real mouse click
+/// against the agent session's cwd.
+#[gpui::test]
+fn agent_markdown_link_opens_local_file_in_buffer_tile(cx: &mut TestAppContext) {
+    use crate::{App, BufferApp};
+    use gpui::{Modifiers, point, px};
+
+    let dir = std::env::temp_dir().join(format!(
+        "yalda-agent-markdown-link-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("create agent link fixture dir");
+    let target = dir.join("target.md");
+    std::fs::write(&target, "# Agent target\n").expect("write agent target");
+
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+    install_agent_slot(&view, vcx, None);
+    view.update(vcx, |v, cx| {
+        v.splash_until = None;
+        let id = v.agent_tile().unwrap().session().unwrap();
+        let session = v.session_entity(id).unwrap();
+        session.update(cx, |session, cx| {
+            session.cwd = dir.clone();
+            session
+                .state
+                .editor
+                .programmatic_insert(0, "Open [target](target.md) now\n");
+            session.state.editor.add_frozen_lines(0, 1);
+            session.state.focus = crate::AgentFocus::Compose;
+            cx.notify();
+        });
+        cx.notify();
+    });
+    for _ in 0..2 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+
+    let session = view
+        .update(vcx, |v, _| {
+            let id = v.agent_tile().unwrap().session().unwrap();
+            v.session_entity(id)
+        })
+        .expect("agent session");
+    crate::layout_probe_begin();
+    session.update(vcx, |session, cx| {
+        session.state.pending_reveal_cursor = true;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    let (x, y, w, h) =
+        crate::layout_probe_get("transcript-link-0-5").expect("inline agent link did not paint");
+    assert!(
+        crate::layout_probe_get("transcript-link-0-0").is_none(),
+        "ordinary prose before an agent link must not become clickable"
+    );
+    crate::layout_probe_end();
+    assert!(w > 0.0 && h > 0.0, "agent link painted no clickable area");
+
+    let at = point(px(x + 2.0), px(y + h / 2.0));
+    vcx.simulate_mouse_move(at, None, Modifiers::default());
+    vcx.simulate_click(at, Modifiers::default());
+    vcx.run_until_parked();
+
+    view.read_with(vcx, |v, _| {
+        let workspace = v.workspace.active_workspace().expect("active workspace");
+        let opened = &workspace
+            .layout
+            .find_leaf(workspace.focused)
+            .expect("focused linked buffer")
+            .content;
+        match opened {
+            App::Buffer(BufferApp::Viewing(doc)) => assert_eq!(
+                doc.file_label.as_ref(),
+                target.canonicalize().unwrap().display().to_string()
+            ),
+            _ => panic!("agent link target did not open in a viewed buffer"),
+        }
+    });
+
+    let _ = std::fs::remove_file(&target);
+    let _ = std::fs::remove_dir(&dir);
+}
+
 /// REGRESSION (bug-0006): on a FROZEN line that renders markdown-stripped, a drag
 /// selection must copy the VISUALLY-selected text, not a shifted raw-document slice.
 /// Repro: freeze a line `**Email:** <email>` (renders `Email: <email>`), drag across

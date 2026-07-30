@@ -524,6 +524,7 @@ impl TranscriptView {
         // Weak handle for the interactive rows' click listeners. Captured here
         // and resolved (with event-time ids) on click — stale-capture-safe.
         let weak_self = self.root.clone();
+        let link_base_dir = self.session.read(cx).cwd.clone();
 
         // ── Heavy prep inside the session update (cache mutation only; NO
         // notify — timing law). Returns the snapshots the render closure needs
@@ -940,6 +941,7 @@ impl TranscriptView {
         let render_fn = {
             let flat_items = flat_items_arc.clone();
             let weak_self = weak_self.clone();
+            let link_base_dir = link_base_dir.clone();
             let you_block_snap = you_block_snap.clone();
             let you_parked_snap = you_parked_snap.clone();
             let you_wrap_cols = you_wrap_cols;
@@ -1019,6 +1021,10 @@ impl TranscriptView {
                         } else {
                             editor_fg_u32
                         };
+                        let link_ctx = is_frozen.then(|| TranscriptLinkCtx {
+                            weak_view: weak_self.clone(),
+                            base_dir: link_base_dir.clone(),
+                        });
                         let content = build_wrapped_line(
                             &segs,
                             &line_str,
@@ -1040,6 +1046,7 @@ impl TranscriptView {
                             Some(at_snap.selection_bg),
                             Some(&token_sink_snap),
                             line_idx,
+                            link_ctx.as_ref(),
                         );
 
                         let line_has_content = !line_str.trim().is_empty();

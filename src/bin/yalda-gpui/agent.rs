@@ -1042,6 +1042,110 @@ pub(crate) fn raw_to_stripped_col(map: &[usize], raw_col: usize) -> usize {
     map[..n].partition_point(|&r| r < raw_col)
 }
 
+/// Link-dispatch state supplied only by the committed agent transcript.
+/// Edit/WP surfaces pass `None` because their Markdown source is editable text.
+#[derive(Clone)]
+pub(crate) struct TranscriptLinkCtx {
+    pub(crate) weak_view: WeakEntity<YaldaGpuiView>,
+    pub(crate) base_dir: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RenderedMarkdownLink {
+    pub(crate) range: std::ops::Range<usize>,
+    pub(crate) target: String,
+}
+
+/// Recover `[label](target)` destinations after the transcript highlighter has
+/// stripped the Markdown syntax. The highlighter deliberately keeps only the
+/// label, so this maps its rendered character range back through the existing
+/// stripped→raw alignment table.
+pub(crate) fn rendered_markdown_links(raw: &str, rendered: &str) -> Vec<RenderedMarkdownLink> {
+    let bytes = raw.as_bytes();
+    let raw_cols = stripped_to_raw_cols(raw, rendered);
+    let mut links = Vec::new();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if bytes[i] != b'[' || (i > 0 && bytes[i - 1] == b'\\') {
+            i += 1;
+            continue;
+        }
+        let Some(label_end) = bytes[i + 1..]
+            .iter()
+            .position(|b| *b == b']')
+            .map(|offset| i + 1 + offset)
+        else {
+            break;
+        };
+        if bytes.get(label_end + 1) != Some(&b'(') {
+            i = label_end + 1;
+            continue;
+        }
+        let target_start = label_end + 2;
+        let Some(target_end) = bytes[target_start..]
+            .iter()
+            .position(|b| *b == b')')
+            .map(|offset| target_start + offset)
+        else {
+            break;
+        };
+
+        let raw_label_start = raw[..i + 1].chars().count();
+        let raw_label_end = raw[..label_end].chars().count();
+        let rendered_start = raw_to_stripped_col(&raw_cols, raw_label_start);
+        let rendered_end = raw_to_stripped_col(&raw_cols, raw_label_end);
+        let target = raw[target_start..target_end].trim();
+        if rendered_end > rendered_start && !target.is_empty() {
+            links.push(RenderedMarkdownLink {
+                range: rendered_start..rendered_end,
+                target: target.to_string(),
+            });
+        }
+        i = target_end + 1;
+    }
+    links
+}
+
+fn transcript_link_element(
+    inner: AnyElement,
+    target: &str,
+    line_idx: usize,
+    start_char: usize,
+    ctx: &TranscriptLinkCtx,
+) -> AnyElement {
+    let weak = ctx.weak_view.clone();
+    let base_dir = ctx.base_dir.clone();
+    let target = target.to_string();
+    let el = div()
+        .id(SharedString::from(format!(
+            "transcript-link-{line_idx}-{start_char}"
+        )))
+        .cursor_pointer()
+        // The transcript body normally turns a press into caret placement and
+        // drag-selection. A link press must not mutate/re-key the row before
+        // GPUI delivers its click on mouse-up.
+        .on_mouse_down(MouseButton::Left, |_ev, _w, app| {
+            app.stop_propagation();
+        })
+        .on_click(move |_ev, _w, app| {
+            app.stop_propagation();
+            let _ = weak.update(app, |view, cx| {
+                match classify_link(&target) {
+                    LinkTarget::External(url) => view.open_external_link(&url, cx),
+                    LinkTarget::Wiki(path) => {
+                        view.open_wiki_link(&path, Some(&base_dir), cx);
+                    }
+                }
+            });
+        })
+        .child(inner)
+        .into_any_element();
+    #[cfg(test)]
+    let el = probe_bounds_dyn(format!("transcript-link-{line_idx}-{start_char}"), el);
+    el
+}
+
 pub(crate) fn build_wrapped_line(
     segs: &[Segment],
     line_str: &str,
@@ -1063,6 +1167,7 @@ pub(crate) fn build_wrapped_line(
     // surfaces that aren't the selectable transcript (e.g. the inline You-block).
     token_sink: Option<&std::rc::Rc<RefCell<Vec<TokenHit>>>>,
     line_idx: usize,
+    link_ctx: Option<&TranscriptLinkCtx>,
 ) -> AnyElement {
     let mut row = div().flex().flex_row().flex_wrap().flex_1().min_w_0();
 
@@ -1081,7 +1186,25 @@ pub(crate) fn build_wrapped_line(
     let stripped_render: String = segs.iter().map(|(t, _)| t.as_str()).collect();
     let raw_cols: Option<Vec<usize>> = (stripped_render != line_str)
         .then(|| stripped_to_raw_cols(line_str, &stripped_render));
+    let markdown_links = link_ctx
+        .map(|_| rendered_markdown_links(line_str, &stripped_render))
+        .unwrap_or_default();
     let reg = |el: AnyElement, start_char: usize, char_count: usize| -> AnyElement {
+        let el = match link_ctx.and_then(|ctx| {
+            markdown_links
+                .iter()
+                .find(|link| {
+                    char_count > 0
+                        && start_char >= link.range.start
+                        && start_char + char_count <= link.range.end
+                })
+                .map(|link| (ctx, link))
+        }) {
+            Some((ctx, link)) => {
+                transcript_link_element(el, &link.target, line_idx, start_char, ctx)
+            }
+            None => el,
+        };
         let raw_start = match &raw_cols {
             Some(map) => map.get(start_char).copied().unwrap_or(start_char),
             None => start_char,

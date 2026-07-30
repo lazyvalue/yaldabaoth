@@ -482,6 +482,7 @@ impl YaldaGpuiView {
                 None,
                 None,
                 line_idx,
+                None,
             );
 
             div()
@@ -620,6 +621,7 @@ impl YaldaGpuiView {
                 None,
                 None,
                 line_idx,
+                None,
             );
 
             // Block-level decoration per kind.
