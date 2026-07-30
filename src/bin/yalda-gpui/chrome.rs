@@ -616,21 +616,39 @@ impl YaldaGpuiView {
         self.wrap_leaf_with_rail(canvas_el, rail_focusable, cx)
     }
 
-    /// Tile pixel size derived from the desktop GRID config (spec
-    /// Behavior 6, grid revision): the viewport is divided into
-    /// `desktop_grid_cols × desktop_grid_rows` tiles (gutters between and
-    /// around), so changing the grid — or the window — resizes tiles while
-    /// slots stay untouched (slots, not pixels, remain the stored unit).
-    /// Floors keep tiles usable when the window gets tiny.
+    /// Fixed tile pixel size chosen from the first measured canvas and the
+    /// desktop GRID config (spec Behavior 6). Window, sidebar, and rail resizes
+    /// change the viewport only: the cached slot pitch stays stable and the
+    /// view reveals more or fewer cells. An explicit grid-config change has
+    /// different cache keys, so it chooses and freezes a new size from the
+    /// current canvas. Floors keep tiles usable when that canvas is tiny.
     pub(crate) fn desktop_tile_px(&self) -> (f32, f32) {
-        let (_, _, mut w, mut h) = self.desktop_canvas_bounds.get();
-        if w <= 0.0 {
-            w = self.viewport_width_px.max(1.0);
+        let cols = self.desktop_grid_cols;
+        let rows = self.desktop_grid_rows;
+        if let Some((cached_cols, cached_rows, width, height)) = self.desktop_tile_size_px.get()
+            && cached_cols == cols
+            && cached_rows == rows
+        {
+            return (width, height);
         }
-        if h <= 0.0 {
-            h = self.viewport_height_px.max(1.0);
+
+        let (_, _, w, h) = self.desktop_canvas_bounds.get();
+        if w > 0.0 && h > 0.0 {
+            let (width, height) = desktop_tile_size_for_canvas(w, h, cols, rows);
+            self.desktop_tile_size_px
+                .set(Some((cols, rows, width, height)));
+            return (width, height);
         }
-        desktop_tile_size_for_canvas(w, h, self.desktop_grid_cols, self.desktop_grid_rows)
+
+        // First frame: paint has not captured the canvas yet. Use the viewport
+        // as a temporary approximation but do not freeze it; the first real
+        // canvas measurement replaces this on the following frame.
+        desktop_tile_size_for_canvas(
+            self.viewport_width_px.max(1.0),
+            self.viewport_height_px.max(1.0),
+            cols,
+            rows,
+        )
     }
 
     /// Title-bar label for a tile. Agent labels live in the session store, so

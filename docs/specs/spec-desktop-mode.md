@@ -18,13 +18,13 @@
 ## Overview
 
 Desktop mode is an alternative to tiling: every window becomes a **tile**,
-placed on an unbounded **desktop** of grid **slots**. Tile size derives from
-a globally-configured **grid** — how many tiles fit the viewport per axis
-(default **4 × 4**) — so all tiles are uniform and resize with the window
-while their slots never change. The window is a viewport over the desktop:
-growing the window reveals more desktop and grows each tile proportionally;
-it never moves or reflows tiles (slot addresses are immutable under resize). Tiles are arranged by
-mouse drag-and-drop with **insert-and-shift** sequence semantics.
+placed on an unbounded **desktop** of grid **slots**. The first measured canvas
+and a globally-configured **grid** — the startup density per axis (default
+**4 × 4**) — choose one uniform fixed tile size. The window is a viewport over
+the desktop: growing it reveals more cells and shrinking it reveals fewer; it
+never resizes, moves, or reflows tiles (slot addresses are immutable under
+resize). Tiles are arranged by mouse drag-and-drop with **insert-and-shift**
+sequence semantics.
 
 Named entities introduced here:
 
@@ -80,10 +80,12 @@ simply inserts the new tile after the focused one.
 
 ### 3 · Geometry, panning, and rendering [DRAFT]
 
-Tile pixel size derives at render time from the canvas and the grid:
+Tile pixel size is chosen once from the first measured canvas and the grid:
 `tile_px = (canvas − (grid + 1) × gutter) / grid` per axis, with a fixed
 gutter (`DESKTOP_GUTTER`, ~12px) between slots and around the origin, and a
-minimum tile size so a tiny window stays usable. Slot origin:
+minimum tile size so a tiny initial canvas stays usable. That result is cached
+as the fixed slot size; later window, sidebar, or rail resize does not
+recalculate it. Slot origin:
 `gutter + slot ⊗ (tile_px + gutter) − pan`.
 
 The canvas pans on both axes (trackpad/wheel); `pan` is clamped to the
@@ -199,17 +201,17 @@ they are.
 ### 6 · Desktop grid configuration [DRAFT]
 
 `desktop_grid_cols` / `desktop_grid_rows` live in `Preferences` (persisted,
-default 4 × 4): how many tiles fit the viewport per axis, one global
-setting for all tabs. Tile size derives from it (Behavior 3) — a 3×2 grid
-shows six full tiles per screen. Runtime configuration uses a small text
+default 4 × 4): the density used to choose the fixed tile dimensions from
+the first measured canvas, one global setting for all tabs. Runtime
+configuration uses a small text
 overlay in the existing `ActiveOverlay` family (the `TagInput`/`Rename`
 pattern — yalda-gpui has no `:` command line), accepting `{cols}x{rows}`,
 clamped to `[1, 12]` per axis, reachable via `Ctrl-W p` and the layout
 menu (which also offers direct mode selection without cycling). The grid
 column count is also the effective width W. Changing it re-renders
-immediately; slot addresses are grid-independent, so no migration occurs —
-tiles keep their slots and simply resize in place (which can change what
-overlaps the viewport, never what neighbors what).
+immediately and chooses a new fixed tile size from the current measured
+canvas; slot addresses are grid-independent, so no migration occurs. Later
+viewport resize still reveals more or fewer cells without changing that size.
 
 ### 7 · Persistence [DRAFT]
 
@@ -292,8 +294,8 @@ content; `Preferences` owns tile size.
 
 - Window resize, text zoom, and grid changes MUST NOT mutate stored
   slots. The only slot mutations are seeding, reconciliation, and drops.
-  (Pixel size is viewport-derived by design — grid revision; the original
-  fixed-pixel sizing was superseded by user feedback after runtime use.)
+  Window/chrome resize also MUST NOT change the fixed tile pixel size; an
+  explicit grid-density change is the only operation that chooses a new size.
 - The slot map is geometry only. Any code that needs "which windows exist"
   keeps reading tree leaves; the Behavior-2 invariant is maintained at the
   engine boundary, not assumed by callers.
@@ -347,3 +349,7 @@ content; `Preferences` owns tile size.
   tile renders where it will land. Engine unit-tested (2 new cases: anchor move
   + wall/neighbour clamp + free shrink); GUI bands runtime-unverified (human
   check pending — GPUI can't be driven headlessly).
+- 2026-07-30 — Fixed-cell viewport revision (user feedback after runtime use):
+  grid density chooses the tile size once from the first measured canvas (and
+  again after an explicit density change). Ordinary app/chrome resize now
+  reveals more or fewer cells without stretching or squeezing them.

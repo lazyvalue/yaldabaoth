@@ -624,3 +624,27 @@ complete slots instead of shrinking tiles into unusability.
 pins the v2 `3×3` → v3 `4×4` migration plus explicit/custom-choice preservation;
 `four_by_four_slot_geometry_fits_when_readable_and_floors_tiny_canvases` pins exact
 four-slot pitch on a normal canvas and the live-tile floor on a small one.
+
+### UXI-Workspace-11 — App resize changes the viewport, not cell size
+
+**Statement.** Once the first measured desktop canvas has chosen a tile's pixel
+dimensions from the configured grid density, those dimensions are fixed. Resizing
+the app window, toggling the jump panel, or opening a rail changes only the viewport:
+a smaller canvas covers fewer cells and a larger canvas covers more. It never
+squeezes or stretches the grid cells or the tiles anchored to them.
+
+The explicit desktop-grid command remains authoritative. Changing its configured
+columns or rows chooses a new tile size from the then-current measured canvas and
+freezes that new size; it does not move stored slots.
+
+**Applies to.** `main.rs` (`desktop_tile_size_px`) and `chrome.rs`
+(`desktop_tile_px`).
+
+**Status.** `implemented`; a pre-paint frame may use the window viewport as a
+temporary estimate, but only a real captured canvas size is cached.
+
+**Enforcement.** `verify_harness.rs`:
+`workspace_cells_keep_fixed_size_when_the_window_resizes` drives the production
+size path on a real view, shrinks a 1200×900 canvas to 600×400, and asserts the
+285×210 cell remains unchanged. Its 4×4 → 3×3 contrast proves an explicit density
+change still selects a new fixed size.

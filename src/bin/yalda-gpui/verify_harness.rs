@@ -13384,6 +13384,57 @@ fn pan_drag_endpoints(
     (point(px(start.0), px(start.1)), point(px(end.0), px(end.1)))
 }
 
+/// UXI-Workspace-11: once the real canvas chooses a cell size, resizing the
+/// app window changes only the viewport. The slot pitch must stay fixed so a
+/// narrower window covers fewer cells instead of squeezing them.
+///
+/// Drives the production `desktop_tile_px` cache on a real view. The explicit
+/// density-change contrast is non-vacuous: changing 4×4 → 3×3 must still
+/// choose a new size from the current canvas.
+///
+/// NEGATIVE CONTROL (observed RED): bypass the matching cache entry in
+/// `desktop_tile_px` and recompute from `desktop_canvas_bounds` on every call;
+/// the resize equality fails with `(285, 210)` vs `(160, 120)`.
+#[gpui::test]
+fn workspace_cells_keep_fixed_size_when_the_window_resizes(cx: &mut TestAppContext) {
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+
+    let (initial, resized, reconfigured) = view.update(vcx, |v, _| {
+        v.desktop_grid_cols = 4;
+        v.desktop_grid_rows = 4;
+        v.desktop_tile_size_px.set(None);
+
+        v.desktop_canvas_bounds.set((0.0, 0.0, 1200.0, 900.0));
+        let initial = v.desktop_tile_px();
+
+        // Simulate narrowing/shortening the app. Only the viewport changes.
+        v.desktop_canvas_bounds.set((0.0, 0.0, 600.0, 400.0));
+        let resized = v.desktop_tile_px();
+
+        // The existing density command remains authoritative and intentionally
+        // invalidates the cache by changing its grid keys.
+        v.desktop_grid_cols = 3;
+        v.desktop_grid_rows = 3;
+        let reconfigured = v.desktop_tile_px();
+        (initial, resized, reconfigured)
+    });
+
+    assert_eq!(
+        initial,
+        (285.0, 210.0),
+        "fixture must start above the readability floor"
+    );
+    assert_eq!(
+        resized, initial,
+        "window resize must keep cell dimensions fixed; the view should simply cover fewer cells"
+    );
+    assert_eq!(
+        reconfigured,
+        crate::chrome::desktop_tile_size_for_canvas(600.0, 400.0, 3, 3),
+        "an explicit grid-density change must still choose a new fixed cell size"
+    );
+}
+
 fn boot_desktop_two_tiles<'a>(
     cx: &'a mut TestAppContext,
 ) -> (

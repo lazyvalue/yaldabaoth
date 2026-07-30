@@ -1666,11 +1666,16 @@ struct YaldaGpuiView {
     /// display bindings and mutates it (then re-applies to the app + persists)
     /// when the user rebinds a key.
     keymap_registry: KeymapRegistry,
-    /// Desktop-mode tile size in mono cells (spec-desktop-mode.md
-    /// Behavior 6) — one global setting for all tiles in all workspaces,
-    /// persisted in `Preferences`, clamped to [20, 400] × [5, 200].
+    /// Desktop density used to choose the fixed tile size from the first
+    /// measured canvas (spec-desktop-mode.md Behavior 6). One global setting
+    /// for all tiles in all workspaces, persisted in `Preferences`.
     desktop_grid_cols: u32,
     desktop_grid_rows: u32,
+    /// `(grid cols, grid rows, tile width, tile height)` after the first real
+    /// canvas measurement. The grid keys make an explicit density change
+    /// invalidate the value; ordinary window/chrome resize deliberately does
+    /// not, so it changes only how much of the plane is visible.
+    desktop_tile_size_px: std::cell::Cell<Option<(u32, u32, f32, f32)>>,
     /// Per-tile remembered file-explorer sort order, keyed by the tile's
     /// `WindowId`. A picker is short-lived (it's replaced by the picked file /
     /// the restored underlying buffer when closed), so its `SortOrder` would
@@ -1861,6 +1866,7 @@ impl YaldaGpuiView {
             keymap_registry: KeymapRegistry::load(),
             desktop_grid_cols: DEFAULT_DESKTOP_GRID_COLS,
             desktop_grid_rows: DEFAULT_DESKTOP_GRID_ROWS,
+            desktop_tile_size_px: std::cell::Cell::new(None),
             browser_sort: HashMap::new(),
             desktop_canvas_bounds: std::rc::Rc::new(std::cell::Cell::new((0.0, 0.0, 0.0, 0.0))),
             viewport_height_px: 0.0,
@@ -1917,6 +1923,7 @@ impl YaldaGpuiView {
             keymap_registry: KeymapRegistry::load(),
             desktop_grid_cols: DEFAULT_DESKTOP_GRID_COLS,
             desktop_grid_rows: DEFAULT_DESKTOP_GRID_ROWS,
+            desktop_tile_size_px: std::cell::Cell::new(None),
             browser_sort: HashMap::new(),
             desktop_canvas_bounds: std::rc::Rc::new(std::cell::Cell::new((0.0, 0.0, 0.0, 0.0))),
             viewport_height_px: 0.0,
