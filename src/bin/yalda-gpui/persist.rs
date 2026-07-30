@@ -547,6 +547,13 @@ pub(crate) struct Preferences {
     /// on load so a hand-edited file can't push the body off-screen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) text_scale: Option<f32>,
+    /// Last outer-window size in logical pixels. Position and maximized/fullscreen
+    /// state are intentionally not persisted; the OS remains responsible for
+    /// placing the restored window on an available display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) window_width_px: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) window_height_px: Option<f32>,
     /// Default span assigned to new desktop tiles, in fixed cells
     /// (spec-desktop-mode.md Behavior 6). Existing tile spans are unaffected.
     /// One global setting; clamped on use, not on load.

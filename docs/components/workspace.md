@@ -652,3 +652,23 @@ to its border/crop tolerance.
 `workspace_cells_keep_fixed_size_when_the_window_resizes` drives the production
 size path on a real view, shrinks a 1200×900 canvas to 600×400, changes the default
 new-tile span from 4×4 to 3×3, and asserts the 160×160 cell remains unchanged.
+
+### UXI-Workspace-12 — The outer window remembers its size
+
+**Statement.** Resizing Yalda updates its persisted outer-window width and height.
+The next launch opens at that saved size. Window position and maximized/fullscreen
+state are not persisted; the operating system remains responsible for placing
+the window on an available display.
+
+**Applies to.** `main.rs` (`observe_window_size`, `restore_window_size`, and
+startup `WindowOptions`) and `persist.rs` (`window_width_px`,
+`window_height_px`).
+
+**Status.** `implemented`. A legacy, missing, partial, or invalid saved pair
+falls back atomically to the 900×700 default.
+
+**Enforcement.** `tests.rs` pins preference compatibility and saved-size
+validation. `verify_harness.rs`:
+`window_resize_observer_persists_the_size_for_next_launch` drives GPUI's real
+window-resize observer, reads the written preferences, and feeds them through
+the production startup-size helper.

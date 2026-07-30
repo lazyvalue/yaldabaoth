@@ -399,6 +399,8 @@ fn preferences_round_trip_with_text_scale() {
     let prefs = Preferences {
         theme: Some("dracula".into()),
         text_scale: Some(1.21),
+        window_width_px: Some(1110.0),
+        window_height_px: Some(770.0),
         desktop_grid_cols: Some(100),
         desktop_grid_rows: Some(30),
         desktop_grid_defaults_version: Some(2),
@@ -412,6 +414,8 @@ fn preferences_round_trip_with_text_scale() {
     let back: Preferences = serde_json::from_str(&json).unwrap();
     assert_eq!(back.theme.as_deref(), Some("dracula"));
     assert_eq!(back.text_scale, Some(1.21));
+    assert_eq!(back.window_width_px, Some(1110.0));
+    assert_eq!(back.window_height_px, Some(770.0));
     assert_eq!(back.jump_panel_visible, Some(false));
     assert_eq!(back.jump_cwd_order.as_deref(), Some(&["/work/beta".into(), "/work/alpha".into()][..]));
     assert_eq!(back.jump_session_order.as_deref(), Some(&["sid-2".into(), "sid-1".into()][..]));
@@ -432,7 +436,27 @@ fn preferences_round_trip_with_text_scale() {
     let legacy = r#"{"theme":"folio","agent_status_position":"bottom"}"#;
     let parsed: Preferences = serde_json::from_str(legacy).unwrap();
     assert_eq!(parsed.text_scale, None);
+    assert_eq!(parsed.window_width_px, None);
+    assert_eq!(parsed.window_height_px, None);
     assert_eq!(parsed.theme.as_deref(), Some("folio"));
+}
+
+#[test]
+fn restored_window_size_uses_saved_pair_and_rejects_partial_or_invalid_values() {
+    assert_eq!(
+        restore_window_size(Some(1110.0), Some(770.0)),
+        (1110.0, 770.0)
+    );
+    assert_eq!(
+        restore_window_size(Some(1110.0), None),
+        (DEFAULT_WINDOW_WIDTH_PX, DEFAULT_WINDOW_HEIGHT_PX),
+        "a partial saved size falls back atomically"
+    );
+    assert_eq!(
+        restore_window_size(Some(-1.0), Some(770.0)),
+        (DEFAULT_WINDOW_WIDTH_PX, DEFAULT_WINDOW_HEIGHT_PX),
+        "a hand-edited invalid size cannot poison window startup"
+    );
 }
 
 #[test]

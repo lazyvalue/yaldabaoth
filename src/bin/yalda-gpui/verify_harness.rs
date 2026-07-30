@@ -13430,6 +13430,40 @@ fn workspace_cells_keep_fixed_size_when_the_window_resizes(cx: &mut TestAppConte
     );
 }
 
+/// UXI-Workspace-12: the production bounds observer records the latest outer
+/// window dimensions so the next process can use them for `WindowOptions`.
+#[gpui::test]
+fn window_resize_observer_persists_the_size_for_next_launch(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("temp preferences dir");
+    let prefs_path = temp.path().join("preferences.json");
+
+    crate::persist::with_preferences_path(prefs_path.clone(), || {
+        let (_view, vcx) = cx.add_window_view(|window, cx| {
+            let focus_handle = cx.focus_handle();
+            focus_handle.focus(window);
+            YaldaGpuiView::observe_window_size(window, cx);
+            YaldaGpuiView::new_browser(
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                Theme::default(),
+                focus_handle,
+            )
+        });
+
+        vcx.simulate_resize(gpui::size(px(1110.0), px(770.0)));
+        vcx.run_until_parked();
+    });
+
+    let persisted =
+        crate::persist::with_preferences_path(prefs_path, crate::persist::load_preferences);
+    assert_eq!(persisted.window_width_px, Some(1110.0));
+    assert_eq!(persisted.window_height_px, Some(770.0));
+    assert_eq!(
+        crate::restore_window_size(persisted.window_width_px, persisted.window_height_px),
+        (1110.0, 770.0),
+        "the startup path consumes the exact size written by the resize observer"
+    );
+}
+
 fn boot_desktop_two_tiles<'a>(
     cx: &'a mut TestAppContext,
 ) -> (

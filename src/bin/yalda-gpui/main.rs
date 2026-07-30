@@ -503,6 +503,26 @@ const DEFAULT_DESKTOP_GRID_COLS: u32 = 4;
 const DEFAULT_DESKTOP_GRID_ROWS: u32 = 4;
 const DESKTOP_GRID_DEFAULTS_VERSION: u8 = 3;
 const TWO_BY_TWO_MIGRATION_VERSION: u8 = 2;
+const DEFAULT_WINDOW_WIDTH_PX: f32 = 900.0;
+const DEFAULT_WINDOW_HEIGHT_PX: f32 = 700.0;
+
+fn valid_window_dimension(value: f32) -> bool {
+    value.is_finite() && value > 0.0
+}
+
+/// Restore the saved outer-window size as an atomic pair. A missing or
+/// hand-edited invalid axis falls back to the known-good launch size rather
+/// than combining half a saved size with half a default.
+fn restore_window_size(saved_width: Option<f32>, saved_height: Option<f32>) -> (f32, f32) {
+    match (saved_width, saved_height) {
+        (Some(width), Some(height))
+            if valid_window_dimension(width) && valid_window_dimension(height) =>
+        {
+            (width, height)
+        }
+        _ => (DEFAULT_WINDOW_WIDTH_PX, DEFAULT_WINDOW_HEIGHT_PX),
+    }
+}
 
 /// Restore one default new-tile-span axis, including the one-time migration
 /// from the original 2×2 built-in default. Once version 2 has been saved, `2`
@@ -1654,6 +1674,11 @@ struct YaldaGpuiView {
     /// the unzoomed default; clamped to [MIN_TEXT_SCALE, MAX_TEXT_SCALE] on
     /// every adjustment.
     text_scale: f32,
+    /// Last observed outer-window restore size. Kept in the view so every
+    /// settings save preserves it, and updated only by the window-bounds
+    /// observer (never as a render side effect).
+    window_width_px: f32,
+    window_height_px: f32,
     /// Agent-chat-only: when true, headings in the transcript render with their
     /// literal markdown markers (`## `, `### `) shown before the rendered text.
     /// Default on; toggled via the agent `.` menu ("heading markers"). A global
@@ -1856,6 +1881,8 @@ impl YaldaGpuiView {
             body_font: SharedString::new_static(".SystemUIFont"),
             code_font: SharedString::new_static("SF Mono"),
             text_scale: 1.0,
+            window_width_px: DEFAULT_WINDOW_WIDTH_PX,
+            window_height_px: DEFAULT_WINDOW_HEIGHT_PX,
             show_agent_heading_markers: true,
             keymap_registry: KeymapRegistry::load(),
             desktop_grid_cols: DEFAULT_DESKTOP_GRID_COLS,
@@ -1912,6 +1939,8 @@ impl YaldaGpuiView {
             body_font: SharedString::new_static(".SystemUIFont"),
             code_font: SharedString::new_static("SF Mono"),
             text_scale: 1.0,
+            window_width_px: DEFAULT_WINDOW_WIDTH_PX,
+            window_height_px: DEFAULT_WINDOW_HEIGHT_PX,
             show_agent_heading_markers: true,
             keymap_registry: KeymapRegistry::load(),
             desktop_grid_cols: DEFAULT_DESKTOP_GRID_COLS,
@@ -3286,15 +3315,18 @@ impl YaldaGpuiView {
         ticked
     }
 
-    /// Snapshot the persistable UI settings (theme, agent info-bar placement,
-    /// text zoom) and write them in ONE place. Each settings mutation just calls
-    /// this instead of re-listing every field at its own `save_preferences(...)`
+    /// Snapshot the persistable UI settings (theme, text zoom, window size,
+    /// desktop defaults, and jump-panel state) and write them in ONE place.
+    /// Each settings mutation just calls this instead of re-listing every field
+    /// at its own `save_preferences(...)`
     /// site — the structural cause of "added a setting, forgot to persist it at
     /// one of N sites" drift. Fonts are not yet user-settable, so not persisted.
     fn save_settings(&self) {
         save_preferences(&Preferences {
             theme: Some(self.theme.name.as_kebab().to_string()),
             text_scale: Some(self.text_scale),
+            window_width_px: Some(self.window_width_px),
+            window_height_px: Some(self.window_height_px),
             desktop_grid_cols: Some(self.desktop_grid_cols),
             desktop_grid_rows: Some(self.desktop_grid_rows),
             desktop_grid_defaults_version: Some(DESKTOP_GRID_DEFAULTS_VERSION),
@@ -3313,6 +3345,32 @@ impl YaldaGpuiView {
                 names
             }),
         });
+    }
+
+    /// Persist the window's normal (restore) size whenever GPUI reports a
+    /// bounds change. For maximized/fullscreen windows `window_bounds()` keeps
+    /// the normal restore bounds, so a restart does not reopen as a
+    /// screen-sized-but-unmaximized window.
+    fn remember_window_size(&mut self, window: &Window) {
+        let size = window.window_bounds().get_bounds().size;
+        let width = f32::from(size.width);
+        let height = f32::from(size.height);
+        if !valid_window_dimension(width) || !valid_window_dimension(height) {
+            return;
+        }
+        if self.window_width_px == width && self.window_height_px == height {
+            return;
+        }
+        self.window_width_px = width;
+        self.window_height_px = height;
+        self.save_settings();
+    }
+
+    fn observe_window_size(window: &mut Window, cx: &mut Context<Self>) {
+        cx.observe_window_bounds(window, |view, window, _cx| {
+            view.remember_window_size(window);
+        })
+        .detach();
     }
 
     /// Toggle the jump panel's visibility (`cmd-j` / `?` menu). Global action —
@@ -8404,6 +8462,8 @@ fn main() {
     // theme (or built-in default) when the user hasn't switched themes via
     // the UI yet.
     let prefs = load_preferences();
+    let initial_window_size =
+        restore_window_size(prefs.window_width_px, prefs.window_height_px);
     let theme_name = prefs
         .theme
         .as_deref()
@@ -8455,7 +8515,10 @@ fn main() {
         })
         .detach();
 
-        let bounds = Bounds::new(point(px(120.0), px(80.0)), size(px(900.0), px(700.0)));
+        let bounds = Bounds::new(
+            point(px(120.0), px(80.0)),
+            size(px(initial_window_size.0), px(initial_window_size.1)),
+        );
         let window_handle = app
             .open_window(
                 WindowOptions {
@@ -8518,6 +8581,8 @@ fn main() {
                         if let Some(scale) = prefs.text_scale {
                             view.text_scale = scale.clamp(MIN_TEXT_SCALE, MAX_TEXT_SCALE);
                         }
+                        view.window_width_px = initial_window_size.0;
+                        view.window_height_px = initial_window_size.1;
                         // Default tile-span v3: migrate the previously shipped
                         // 3×3 value to 4×4 once, while preserving asymmetric
                         // custom spans and post-migration explicit choices.
@@ -8592,6 +8657,7 @@ fn main() {
                             });
                         })
                         .detach();
+                        YaldaGpuiView::observe_window_size(window, cx);
                         view
                     })
                 },
