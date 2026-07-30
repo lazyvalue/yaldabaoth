@@ -157,10 +157,10 @@ destructive re-layout.
 verified (no-op'd `reset_view` → camera stuck; observed RED).
 
 **Deviation from plan.** `pan` is in slot units as specced, but the Statement's
-`pixels = pan · slot_pitch(zoom)` is realized as `pan ⊗ (desktop_tile_px ⊗
-detail_scale(zoom))` — pitch is **per-axis and viewport-derived**, not a scalar
-`slot_pitch` (see UXI-Workspace-4). `zoom_in`/`zoom_out` take an explicit `anchor:
-Slot` (focused tile or viewport center, resolved by the caller).
+`pixels = pan · slot_pitch(zoom)` is realized as `pan ⊗ ((160, 160) ⊗
+detail_scale(zoom) + gutter)` — pitch is per-axis in the implementation even
+though the Full cells are square and fixed. `zoom_in`/`zoom_out` take an explicit
+`anchor: Slot` (focused tile or viewport center, resolved by the caller).
 
 ### UXI-Workspace-4 — Zoom is semantic: discrete detail levels, not a scale transform
 
@@ -175,7 +175,7 @@ distinct from the `Cmd+=/-/0` document-text zoom (`UXI-TextZoom-1`).
 
 **Applies to.** `chrome.rs` (the `render_desktop` path — NOT `screens.rs`) +
 `workspace.rs`: per-`Detail` render representations + `detail_scale(detail)` off
-the per-axis viewport-derived Full pitch (`desktop_tile_px`); `zoom_in`/`zoom_out`;
+the fixed 160×160px Full cell (`desktop_tile_px`); `zoom_in`/`zoom_out`;
 frame-level culling renders cheap placeholders at Card/Minimap (per-frame cost
 O(visible tiles), *lower* than Full); maximize is Full-only. Bindings live in
 `keymap_registry.rs`, reflowed in one pass (`Ctrl-W =`/`Ctrl-W -` reclaimed from
@@ -195,9 +195,9 @@ probe paints while the live `plane-tile-content-{id}` probe is absent),
 `plane_pan_at_card_leaves_transcript_render_flat` (Card render is O(visible), not
 live). All negative-control-verified RED.
 
-**Deviation from plan.** `slot_pitch(detail)->f32` was **infeasible** (pitch is
-anisotropic + viewport-derived); realized as `detail_scale(Detail)->f32` (Full 1.0 /
-Card 0.5 / Minimap 0.2) multiplied against the per-axis `desktop_tile_px` Full pitch.
+**Deviation from plan.** `slot_pitch(detail)->f32` was realized as
+`detail_scale(Detail)->f32` (Full 1.0 / Card 0.5 / Minimap 0.2) multiplied
+against the fixed per-axis `desktop_tile_px` Full cell and gutter.
 Input routing (refined after runtime use — see below): `Cmd`/`Ctrl`+scroll steps
 zoom at every level; **panning is `Cmd+Shift`+left-drag** (bare scroll no longer
 pans — it bubbles so tile content still scrolls). Probe tags added:
@@ -250,18 +250,20 @@ centered on the tile the user is on** (the focused tile if placed, else the
 last-revealed one, else the origin), skipping occupied rectangles — new work
 appears beside the work it came from. Within a ring the scan is in **preference
 order, not reading order**: nearest row first, and at equal distance below before
-above and right before left. So a new tile opened beside a lone tile lands at
-`(row, col + 1)` — **same height, directly to the right** — never diagonally
-(bug-0012).
+above and right before left. The entire candidate rectangle must be free. So a
+new tile opened beside a lone tile lands at `(row, col + existing_span.cols)` —
+**same height, directly to the right** — never diagonally (bug-0012). With the
+default 4×4 span, that is four columns to the right.
 Dragging a tile moves it to the dropped slot iff its whole rectangle lands on
 free slots; an overlapping drop is **rejected** (returns home). There is **no**
 row-major insert-and-shift ripple. Closing a tile leaves a gap; neighbors never
 move. `focus_next`/`focus_prev` traverse `slots` in signed row-major **reading
 order** (top→bottom, left→right); spatial directional focus is unchanged.
 
-**Applies to.** `workspace.rs`: `seed_slot_near` / `seed_slot` (ring-spiral,
-replaces the shelf `first_free_slot`) and `reconcile_near` (resolves the spiral
-center), called from the per-frame plane upkeep in `chrome.rs`; free-placement drop (desktop-mode Behavior 4 gesture, ripple
+**Applies to.** `workspace.rs`: `seed_span_near` / `seed_slot_near` / `seed_slot`
+(rectangle-aware ring-spiral, replacing the shelf `first_free_slot`) and
+`reconcile_near_with_span` (resolves the spiral center and assigns the configured
+span), called from the per-frame plane upkeep in `chrome.rs`; free-placement drop (desktop-mode Behavior 4 gesture, ripple
 removed); edge-resize `clamp_resize` unchanged in spirit (Block rule);
 `sequence_neighbor` retained for traversal only (decoupled from placement).
 
@@ -274,13 +276,15 @@ model for a boundless canvas.
 **Enforcement.** `workspace.rs` desktop_tests: `seed_slot_spiral_deterministic`
 (origin-first, occupied origin ⇒ next lands same-row-right, deterministic),
 `seed_slot_near_prefers_same_row_right` (spiral centered on a non-origin tile)
-and `free_drop_rejects_overlap_without_moving_neighbors` (overlapping
-drop leaves every tile's slot unchanged — no ripple). Both negative-control-verified
-RED. On the REAL path: `verify_harness.rs`
+`reconcile_near_places_four_by_four_tiles_side_by_side` (4×4 rectangles seed
+four columns apart without overlap), and
+`free_drop_rejects_overlap_without_moving_neighbors` (overlapping drop leaves
+every tile's slot unchanged — no ripple). Negative-control-verified RED. On the
+REAL path: `verify_harness.rs`
 `new_tile_lands_same_row_right_of_the_only_tile` — the sole tile parked off-origin,
-the user's `Ctrl-W v` handler, slot assigned by the real `chrome.rs` reconcile;
-negative-controlled RED twice (origin-centered ⇒ `(0,0)`; row-major ring ⇒
-`(0,-2)`). Existing signed-adapted desktop_tests cover the type-only reuses.
+the user's `Ctrl-W v` handler, slot and 4×4 span assigned by the real `chrome.rs`
+reconcile; it lands at `(1,3)` beside the existing `(1,-1)` 4×4 tile.
+Existing signed-adapted desktop_tests cover the type-only reuses.
 
 **Deviation from plan.** The dead shelf code was deleted (`Slot::succ`, `first_free`,
 `seed(leaves,w)`, `insert_shift`, `absorbable_run`, `effective_width`); `reconcile`
@@ -603,48 +607,48 @@ rather than this one: binding a second free session into a *real* workspace mid-
 needs a bound-tile boot (`boot_worksheet_channel`), which that test already has —
 `focus_existing_session` on a free session opens another ephemeral view instead.
 
-### UXI-Workspace-10 — The default desktop density fits a 4×4 viewport
+### UXI-Workspace-10 — New desktop tiles default to 4×4 fixed cells
 
-**Statement.** A fresh desktop divides the visible canvas into four columns by
-four rows, with the jump panel visible. The existing desktop-grid command remains
-authoritative for explicit user choices. Legacy preferences carrying the original
-built-in `2×2` default or the subsequently shipped `3×3` density migrate once to
+**Statement.** A fresh tile occupies four columns by four rows, making a new
+whole-window tile useful immediately while retaining the snap-to-grid quality.
+The existing desktop-grid command now chooses the span assigned to future tiles;
+existing tiles keep their saved spans. Legacy preferences carrying the original
+built-in `2×2` default or the subsequently shipped `3×3` value migrate once to
 `4×4`. Versioned choices made after those migrations remain unchanged; asymmetric
-custom grids are never mistaken for a shipped square default.
+custom spans are never mistaken for a shipped square default.
 
 **Applies to.** `main.rs` (constructor defaults and versioned preference load)
 and `persist.rs` (`desktop_grid_defaults_version`).
 
-**Status.** `implemented`; exact fit still respects the 160×120px minimum live-tile
-size. Below the canvas size needed for that floor, the infinite plane reveals fewer
-complete slots instead of shrinking tiles into unusability.
+**Status.** `implemented`. An absent persisted span still reads as 1×1 for
+backward compatibility; the render-time reconcile explicitly assigns the
+configured 4×4 default only to genuinely new, slotless leaves.
 
 **Enforcement.** `tests.rs`:
-`desktop_density_migrations_reach_four_by_four_without_overriding_later_choices`
+`default_tile_span_migrations_reach_four_by_four_without_overriding_later_choices`
 pins the v2 `3×3` → v3 `4×4` migration plus explicit/custom-choice preservation;
-`four_by_four_slot_geometry_fits_when_readable_and_floors_tiny_canvases` pins exact
-four-slot pitch on a normal canvas and the live-tile floor on a small one.
+`fixed_cells_and_four_by_four_tiles_match_the_retina_reference` pins the exact
+4×4 footprint. `workspace.rs`:
+`reconcile_near_places_four_by_four_tiles_side_by_side` pins rectangle-aware
+placement without overlap.
 
 ### UXI-Workspace-11 — App resize changes the viewport, not cell size
 
-**Statement.** Once the first measured desktop canvas has chosen a tile's pixel
-dimensions from the configured grid density, those dimensions are fixed. Resizing
-the app window, toggling the jump panel, or opening a rail changes only the viewport:
-a smaller canvas covers fewer cells and a larger canvas covers more. It never
-squeezes or stretches the grid cells or the tiles anchored to them.
+**Statement.** Every Full-detail desktop cell is fixed at 160×160 logical pixels
+with a 12px gutter. Resizing the app window, toggling the jump panel, or opening a
+rail changes only the viewport: a smaller canvas covers fewer cells and a larger
+canvas covers more. It never squeezes or stretches the cells or the tiles anchored
+to them. Changing the desktop-grid command changes only the span of future tiles.
 
-The explicit desktop-grid command remains authoritative. Changing its configured
-columns or rows chooses a new tile size from the then-current measured canvas and
-freezes that new size; it does not move stored slots.
+**Applies to.** `chrome.rs` (`DESKTOP_CELL_W`, `DESKTOP_CELL_H`,
+`DESKTOP_GUTTER`, and `desktop_tile_px`).
 
-**Applies to.** `main.rs` (`desktop_tile_size_px`) and `chrome.rs`
-(`desktop_tile_px`).
-
-**Status.** `implemented`; a pre-paint frame may use the window viewport as a
-temporary estimate, but only a real captured canvas size is cached.
+**Status.** `implemented`. The July 30 reference screenshot is 1350×1344 physical
+pixels at 2× Retina (675×672 logical). Four 160px cells plus three 12px internal
+gutters produce a 676×676 logical tile (1352×1352 physical), matching the reference
+to its border/crop tolerance.
 
 **Enforcement.** `verify_harness.rs`:
 `workspace_cells_keep_fixed_size_when_the_window_resizes` drives the production
-size path on a real view, shrinks a 1200×900 canvas to 600×400, and asserts the
-285×210 cell remains unchanged. Its 4×4 → 3×3 contrast proves an explicit density
-change still selects a new fixed size.
+size path on a real view, shrinks a 1200×900 canvas to 600×400, changes the default
+new-tile span from 4×4 to 3×3, and asserts the 160×160 cell remains unchanged.

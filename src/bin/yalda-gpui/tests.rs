@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::chrome::{
-    DESKTOP_GUTTER, DESKTOP_MIN_TILE_H, DESKTOP_MIN_TILE_W, desktop_tile_size_for_canvas,
+    DESKTOP_CELL_H, DESKTOP_CELL_W, DESKTOP_GUTTER,
 };
 
 /// UXI-JumpPanel-7: the jump-panel accent colors are theme-owned, not fixed
@@ -436,11 +436,11 @@ fn preferences_round_trip_with_text_scale() {
 }
 
 #[test]
-fn desktop_density_migrations_reach_four_by_four_without_overriding_later_choices() {
+fn default_tile_span_migrations_reach_four_by_four_without_overriding_later_choices() {
     assert_eq!(
         restore_desktop_grid(None, None, None),
         (4, 4),
-        "a fresh install uses the dense desktop"
+        "a fresh install gives new tiles a useful 4×4 span"
     );
     assert_eq!(
         restore_desktop_grid(Some(2), Some(2), None),
@@ -459,7 +459,7 @@ fn desktop_density_migrations_reach_four_by_four_without_overriding_later_choice
     assert_eq!(
         restore_desktop_grid(Some(3), Some(3), Some(2)),
         (4, 4),
-        "the shipped v2 3×3 density migrates once"
+        "the shipped v2 3×3 default span migrates once"
     );
     assert_eq!(
         restore_desktop_grid(Some(3), Some(3), Some(DESKTOP_GRID_DEFAULTS_VERSION)),
@@ -469,30 +469,24 @@ fn desktop_density_migrations_reach_four_by_four_without_overriding_later_choice
     assert_eq!(
         restore_desktop_grid(Some(5), Some(3), Some(2)),
         (5, 3),
-        "an asymmetric custom grid is not mistaken for the shipped 3×3 density"
+        "an asymmetric custom span is not mistaken for the shipped 3×3 default"
     );
 }
 
 #[test]
-fn four_by_four_slot_geometry_fits_when_readable_and_floors_tiny_canvases() {
-    let (tile_w, tile_h) = desktop_tile_size_for_canvas(1200.0, 900.0, 4, 4);
-    assert_eq!(tile_w, 285.0);
-    assert_eq!(tile_h, 210.0);
-    assert_eq!(
-        4.0 * tile_w + 5.0 * DESKTOP_GUTTER,
-        1200.0,
-        "four complete columns plus their gutters fit exactly"
+fn fixed_cells_and_four_by_four_tiles_match_the_retina_reference() {
+    assert_eq!((DESKTOP_CELL_W, DESKTOP_CELL_H), (160.0, 160.0));
+    assert_eq!(DESKTOP_GUTTER, 12.0);
+    let (_, _, width, height) = workspace::tile_rect(
+        workspace::Slot::new(0, 0),
+        workspace::Span::new(4, 4),
+        (DESKTOP_CELL_W, DESKTOP_CELL_H),
+        DESKTOP_GUTTER,
     );
     assert_eq!(
-        4.0 * tile_h + 5.0 * DESKTOP_GUTTER,
-        900.0,
-        "four complete rows plus their gutters fit exactly"
-    );
-
-    assert_eq!(
-        desktop_tile_size_for_canvas(600.0, 400.0, 4, 4),
-        (DESKTOP_MIN_TILE_W, DESKTOP_MIN_TILE_H),
-        "a tiny canvas must reveal less plane rather than crush live tiles"
+        (width, height),
+        (676.0, 676.0),
+        "a default 4×4 tile should match the 675×672 logical-pixel reference"
     );
 }
 

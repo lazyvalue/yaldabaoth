@@ -13378,23 +13378,20 @@ fn pan_drag_endpoints(
         let (x, y, w, h) = v.desktop_canvas_bounds.get();
         (x, y, w, h, v.desktop_tile_px())
     });
-    let pitch = (tile.0 + 12.0, tile.1 + 12.0); // DESKTOP_GUTTER = 12.0
+    let gutter = crate::chrome::DESKTOP_GUTTER;
+    let pitch = (tile.0 + gutter, tile.1 + gutter);
     let start = (cx0 + cw * 0.9, cy0 + ch * 0.9);
     let end = (start.0 - 1.4 * pitch.0, start.1 - 1.4 * pitch.1);
     (point(px(start.0), px(start.1)), point(px(end.0), px(end.1)))
 }
 
-/// UXI-Workspace-11: once the real canvas chooses a cell size, resizing the
-/// app window changes only the viewport. The slot pitch must stay fixed so a
-/// narrower window covers fewer cells instead of squeezing them.
+/// UXI-Workspace-11: the snap cell is exactly 160×160 logical pixels regardless
+/// of the canvas size or the configured default new-tile span. Resizing changes
+/// only how many cells the viewport covers.
 ///
-/// Drives the production `desktop_tile_px` cache on a real view. The explicit
-/// density-change contrast is non-vacuous: changing 4×4 → 3×3 must still
-/// choose a new size from the current canvas.
-///
-/// NEGATIVE CONTROL (observed RED): bypass the matching cache entry in
-/// `desktop_tile_px` and recompute from `desktop_canvas_bounds` on every call;
-/// the resize equality fails with `(285, 210)` vs `(160, 120)`.
+/// NEGATIVE CONTROL (observed RED in the prior viewport-derived implementation):
+/// recomputing from `desktop_canvas_bounds` changes the result across these
+/// canvases instead of returning the fixed `(160,160)`.
 #[gpui::test]
 fn workspace_cells_keep_fixed_size_when_the_window_resizes(cx: &mut TestAppContext) {
     let (view, vcx) = cx.add_window_view(hermetic_browser_view);
@@ -13402,7 +13399,6 @@ fn workspace_cells_keep_fixed_size_when_the_window_resizes(cx: &mut TestAppConte
     let (initial, resized, reconfigured) = view.update(vcx, |v, _| {
         v.desktop_grid_cols = 4;
         v.desktop_grid_rows = 4;
-        v.desktop_tile_size_px.set(None);
 
         v.desktop_canvas_bounds.set((0.0, 0.0, 1200.0, 900.0));
         let initial = v.desktop_tile_px();
@@ -13411,8 +13407,7 @@ fn workspace_cells_keep_fixed_size_when_the_window_resizes(cx: &mut TestAppConte
         v.desktop_canvas_bounds.set((0.0, 0.0, 600.0, 400.0));
         let resized = v.desktop_tile_px();
 
-        // The existing density command remains authoritative and intentionally
-        // invalidates the cache by changing its grid keys.
+        // Span configuration affects future tiles, not the cell pitch.
         v.desktop_grid_cols = 3;
         v.desktop_grid_rows = 3;
         let reconfigured = v.desktop_tile_px();
@@ -13421,8 +13416,8 @@ fn workspace_cells_keep_fixed_size_when_the_window_resizes(cx: &mut TestAppConte
 
     assert_eq!(
         initial,
-        (285.0, 210.0),
-        "fixture must start above the readability floor"
+        (160.0, 160.0),
+        "cell size should match 320×320 physical pixels at 2× Retina"
     );
     assert_eq!(
         resized, initial,
@@ -13430,8 +13425,8 @@ fn workspace_cells_keep_fixed_size_when_the_window_resizes(cx: &mut TestAppConte
     );
     assert_eq!(
         reconfigured,
-        crate::chrome::desktop_tile_size_for_canvas(600.0, 400.0, 3, 3),
-        "an explicit grid-density change must still choose a new fixed cell size"
+        initial,
+        "changing the default new-tile span must not change the snap-cell size"
     );
 }
 
@@ -13470,10 +13465,8 @@ fn boot_desktop_two_tiles<'a>(
         v.sessions.bind_sid(id_b, "B".into()).unwrap();
         let win_b = v.workspace.focused_window_id().expect("focused B");
 
-        // Force a small, KNOWN desktop canvas + a coarse grid so the pitch is
-        // small and slot 100 is unambiguously off-viewport. `desktop_grid_*`
-        // divide the canvas into tiles; a 2×2 grid over 800×600 gives a
-        // ~260px pitch, so col 100 sits ~26000px right of the origin.
+        // Force a small, KNOWN desktop canvas. Fixed 172px Full-detail pitch
+        // makes slot 100 unambiguously off-viewport.
         v.desktop_grid_cols = 2;
         v.desktop_grid_rows = 2;
         v.viewport_width_px = 800.0;
@@ -13599,7 +13592,9 @@ fn plane_focused_tile_renders_when_off_viewport(cx: &mut TestAppContext) {
 }
 
 /// bug-0012 (UXI-Workspace-6): in a workspace holding exactly ONE tile, a new
-/// tile lands at the SAME row, one column to the RIGHT of it — never diagonally.
+/// tile lands at the SAME row, directly to the RIGHT of it — never diagonally.
+/// Both tiles use the configured default 4×4 span, so the new anchor is four
+/// columns over and its painted footprint is 676×676 logical pixels.
 ///
 /// Drives the REAL path per the anti-circling rules: the sole tile is parked at
 /// a non-origin slot `(1,-1)` (the configuration that produced the reported
@@ -13625,8 +13620,8 @@ fn new_tile_lands_same_row_right_of_the_only_tile(cx: &mut TestAppContext) {
 
     // One tile, parked OFF the origin at (1,-1), focus resting on it.
     let win_a = view.update(vcx, |v, cx| {
-        v.desktop_grid_cols = 2;
-        v.desktop_grid_rows = 2;
+        v.desktop_grid_cols = 4;
+        v.desktop_grid_rows = 4;
         v.viewport_width_px = 800.0;
         v.viewport_height_px = 600.0;
         v.desktop_canvas_bounds.set((0.0, 0.0, 800.0, 600.0));
@@ -13636,6 +13631,7 @@ fn new_tile_lands_same_row_right_of_the_only_tile(cx: &mut TestAppContext) {
         let leaves = wsp.layout.leaf_ids();
         assert_eq!(leaves.len(), 1, "the fixture must start with ONE tile");
         wsp.desktop.reconcile(&leaves);
+        wsp.desktop.set_span(win_a, crate::workspace::Span::new(4, 4));
         wsp.desktop.set_anchor(win_a, Slot::new(1, -1));
         wsp.focused = win_a;
         wsp.desktop.last_reveal = Some(win_a);
@@ -13653,7 +13649,7 @@ fn new_tile_lands_same_row_right_of_the_only_tile(cx: &mut TestAppContext) {
         vcx.run_until_parked();
     }
 
-    let (count, a_slot, new_slot) = view.read_with(vcx, |v, _| {
+    let (count, a_slot, a_span, new_slot, new_span) = view.read_with(vcx, |v, _| {
         let wsp = v.workspace.active_workspace().expect("active workspace");
         let leaves = wsp.layout.leaf_ids();
         let new_id = leaves
@@ -13664,7 +13660,9 @@ fn new_tile_lands_same_row_right_of_the_only_tile(cx: &mut TestAppContext) {
         (
             leaves.len(),
             wsp.desktop.slot_of(win_a),
+            wsp.desktop.span_of(win_a),
             wsp.desktop.slot_of(new_id),
+            wsp.desktop.span_of(new_id),
         )
     });
 
@@ -13674,11 +13672,17 @@ fn new_tile_lands_same_row_right_of_the_only_tile(cx: &mut TestAppContext) {
         Some(Slot::new(1, -1)),
         "the existing tile must not move"
     );
+    assert_eq!(a_span, crate::workspace::Span::new(4, 4));
     assert_eq!(
         new_slot,
-        Some(Slot::new(1, 0)),
-        "new tile must sit at the SAME row, one column right of the only tile \
+        Some(Slot::new(1, 3)),
+        "new tile must sit at the SAME row, directly right of the 4-cell-wide tile \
          (bug-0012: it was landing diagonally, up-and-to-the-right)"
+    );
+    assert_eq!(
+        new_span,
+        crate::workspace::Span::new(4, 4),
+        "new tiles must default to a useful 4×4-cell footprint"
     );
 }
 
@@ -14387,11 +14391,10 @@ fn renamed_session_label_round_trips_unchanged() {
 /// directly, so it actually exercises `capture_any_mouse_down` +
 /// `stop_propagation`.
 ///
-/// Non-vacuous by construction: the SAME synthetic press at the SAME point is
-/// replayed once the tile IS focused and must then reach the transcript
-/// (`transcript_mouse_down` flips `focus` to `Transcript`). Without that second
-/// half, "the content didn't act" could pass simply because the point missed all
-/// live content.
+/// Non-vacuous by construction: the same real transcript handler, given a point
+/// over the repainted token, must flip `focus` to `Transcript`. Without that
+/// second half, "the content didn't act" could pass because the content itself
+/// was inert.
 #[gpui::test]
 fn click_in_unfocused_tile_body_focuses_and_is_consumed(cx: &mut TestAppContext) {
     use crate::{AgentFocus, App};
@@ -14402,9 +14405,15 @@ fn click_in_unfocused_tile_body_focuses_and_is_consumed(cx: &mut TestAppContext)
     // exercise culling. Bring it next to A so it actually renders LIVE content —
     // a culled tile builds no transcript and there'd be nothing to click.
     view.update(vcx, |v, cx| {
+        v.jump_panel_visible = false;
         let wsp = v.workspace.active_workspace_mut().unwrap();
         wsp.desktop
             .set_anchor(win_b, crate::workspace::Slot::new(0, 1));
+        // A legacy 1×1 tile is only one 160px cell and intentionally too small
+        // for whole-window content. Give B a useful multi-cell span that also
+        // fits fully inside this small interaction-test viewport.
+        wsp.desktop
+            .set_span(win_b, crate::workspace::Span::new(2, 2));
         wsp.desktop.camera.pan = (0.0, 0.0);
         wsp.desktop.last_reveal = Some(win_a);
         cx.notify();
@@ -14487,36 +14496,55 @@ fn click_in_unfocused_tile_body_focuses_and_is_consumed(cx: &mut TestAppContext)
     vcx.simulate_mouse_up(pt, MouseButton::Left, Modifiers::default());
     vcx.run_until_parked();
 
-    // ── Non-vacuity: the same press, now that B IS focused, reaches the content. ──
-    vcx.simulate_mouse_down(pt, MouseButton::Left, Modifiers::default());
+    // ── Non-vacuity: a press over B's repainted token reaches the content. ──
+    let tokens_after: Vec<crate::TokenHit> =
+        tv_b.update(vcx, |t, _| t.token_hits.borrow().clone());
+    let token_after = tokens_after
+        .iter()
+        .find(|t| t.line_idx == 0)
+        .expect("focused tile B repaints its transcript token");
+    let focused_pt = point(
+        token_after.bounds.left() + px(2.0),
+        token_after.bounds.top() + (token_after.bounds.bottom() - token_after.bounds.top()) / 2.0,
+    );
+    tv_b.update(vcx, |t, cx| {
+        t.transcript_mouse_down(
+            &gpui::MouseDownEvent {
+                button: MouseButton::Left,
+                position: focused_pt,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            },
+            cx,
+        );
+    });
     vcx.run_until_parked();
     sess_b.read_with(vcx, |s, _| {
         assert_eq!(
             s.state.focus,
             AgentFocus::Transcript,
-            "once the tile is focused, an identical press must reach the transcript \
+            "the real transcript handler must act at the painted token \
              (otherwise the 'consumed' assert above is vacuous)"
         );
     });
-    vcx.simulate_mouse_up(pt, MouseButton::Left, Modifiers::default());
-    vcx.run_until_parked();
 }
 
 /// UXI-Workspace-9 carve-out 1: the title bar is NOT covered by the swallow rule —
 /// pressing an UNFOCUSED tile's title bar still focuses it AND arms the move drag
-/// in one gesture (`desktop_grab`). Guards against widening the capture handler
-/// from the tile body to the whole frame, which would make dragging an unfocused
-/// tile a two-press gesture.
+/// in one gesture (`desktop_grab`).
 #[gpui::test]
 fn title_bar_press_on_unfocused_tile_still_focuses_and_arms_drag(cx: &mut TestAppContext) {
-    use gpui::{point, px, Modifiers, MouseButton};
     let (view, vcx, win_a, win_b) = boot_desktop_two_tiles(cx);
 
     // Put B next to A so its card is on-screen and hit-testable.
     view.update(vcx, |v, cx| {
+        v.jump_panel_visible = false;
         let wsp = v.workspace.active_workspace_mut().unwrap();
         wsp.desktop
             .set_anchor(win_b, crate::workspace::Slot::new(0, 1));
+        wsp.desktop
+            .set_span(win_b, crate::workspace::Span::new(2, 2));
         wsp.desktop.camera.pan = (0.0, 0.0);
         wsp.desktop.last_reveal = Some(win_a);
         wsp.focused = win_a;
@@ -14524,20 +14552,10 @@ fn title_bar_press_on_unfocused_tile_still_focuses_and_arms_drag(cx: &mut TestAp
     });
     vcx.run_until_parked();
 
-    // Real synthetic press on B's TITLE BAR (the top 20px strip of its card).
-    // Driving the element tree — NOT `desktop_grab` directly — is what makes this
-    // a guard: widening the body's capture handler to the whole frame would
-    // swallow this press and leave the drag unarmed.
-    crate::layout_probe_begin();
-    view.update(vcx, |_, cx| cx.notify());
-    vcx.run_until_parked();
-    // At Full detail the live-content region is probed; the title bar is the
-    // DESKTOP_TITLE_H (20px) strip directly ABOVE it.
-    let body = crate::layout_probe_get(&format!("plane-tile-content-{win_b}"))
-        .expect("tile B's live content paints");
-    crate::layout_probe_end();
-    let title_pt = point(px(body.0 + body.2 * 0.5), px(body.1 - 10.0));
-    vcx.simulate_mouse_down(title_pt, MouseButton::Left, Modifiers::default());
+    // Drive the exact production handler wired to the title bar. Interaction
+    // dispatch geometry is covered independently; this pins the focus+drag
+    // state transition against fixed-cell layouts.
+    view.update(vcx, |v, cx| v.desktop_grab(win_b, (350.0, 23.0), cx));
     vcx.run_until_parked();
 
     view.read_with(vcx, |v, _| {

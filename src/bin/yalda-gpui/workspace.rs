@@ -675,12 +675,12 @@ impl DesktopState {
     }
 
     /// True if every slot in the rectangle at `anchor` of `span` is free of
-    /// any tile other than `exclude`.
-    fn rect_free(&self, anchor: Slot, span: Span, exclude: WindowId) -> bool {
+    /// any tile other than optional `exclude`.
+    fn rect_free(&self, anchor: Slot, span: Span, exclude: Option<WindowId>) -> bool {
         for dr in 0..span.rows as i32 {
             for dc in 0..span.cols as i32 {
                 let cell = Slot::new(anchor.row + dr, anchor.col + dc);
-                if matches!(self.occupant(cell), Some(id) if id != exclude) {
+                if matches!(self.occupant(cell), Some(id) if Some(id) != exclude) {
                     return false;
                 }
             }
@@ -710,7 +710,7 @@ impl DesktopState {
                         ResizeEdge::East => Span::new(cur.rows, ext + 1),
                         _ => Span::new(ext + 1, cur.cols),
                     };
-                    if self.rect_free(anchor, cand, id) {
+                    if self.rect_free(anchor, cand, Some(id)) {
                         ext += 1;
                     } else {
                         break;
@@ -739,7 +739,7 @@ impl DesktopState {
                         && self.rect_free(
                             Slot::new(anchor.row, left - 1),
                             Span::new(cur.rows, (right - (left - 1)) as u32),
-                            id,
+                            Some(id),
                         )
                     {
                         left -= 1;
@@ -761,7 +761,7 @@ impl DesktopState {
                         && self.rect_free(
                             Slot::new(top - 1, anchor.col),
                             Span::new((bottom - (top - 1)) as u32, cur.cols),
-                            id,
+                            Some(id),
                         )
                     {
                         top -= 1;
@@ -790,10 +790,10 @@ impl DesktopState {
         self.slots.sort_by_key(|&(_, s)| s);
     }
 
-    /// The first free slot on an outward ring-spiral centered on `center`
+    /// The first free rectangle on an outward ring-spiral centered on `center`
     /// (`spec-infinite-plane-workspace.md` Behavior 4): ring radius `r = 0, 1,
     /// 2, …`, skipping the already-scanned interior (`|dr| < r && |dc| < r`) and
-    /// any slot inside an existing tile's rectangle (`occupant`).
+    /// any candidate whose requested `span` overlaps an existing tile.
     ///
     /// Within a ring, candidates are scanned in **preference order, not reading
     /// order** (bug-0012): nearest row first, and within that, below before
@@ -801,7 +801,7 @@ impl DesktopState {
     /// `(row, col+1)`, i.e. same height, directly to the right, never a
     /// diagonal. Deterministic; independent of camera. Runs once per new tile,
     /// never per frame.
-    pub fn seed_slot_near(&self, center: Slot) -> Slot {
+    pub fn seed_span_near(&self, center: Slot, span: Span) -> Slot {
         // Sort key: closest row wins, positive (below / right) before negative
         // (above / left) at equal distance. `(0,+1)` therefore always leads
         // ring 1.
@@ -824,12 +824,18 @@ impl DesktopState {
             ring.sort_by_key(|&(dr, dc)| pref(dr, dc));
             for (dr, dc) in ring {
                 let cand = Slot::new(center.row + dr, center.col + dc);
-                if self.occupant(cand).is_none() {
+                if self.rect_free(cand, span, None) {
                     return cand;
                 }
             }
             r += 1;
         }
+    }
+
+    /// Compatibility helper for callers that are placing one cell rather than
+    /// a whole new app tile.
+    pub fn seed_slot_near(&self, center: Slot) -> Slot {
+        self.seed_span_near(center, Span::ONE)
     }
 
     /// [`seed_slot_near`](Self::seed_slot_near) centered on the origin — the
@@ -857,6 +863,18 @@ impl DesktopState {
     /// slot yet, so an unplaced `near` falls back to `last_reveal` (the tile the
     /// user was on before the new one appeared), then to the origin.
     pub fn reconcile_near(&mut self, leaves: &[WindowId], near: Option<WindowId>) -> bool {
+        self.reconcile_near_with_span(leaves, near, Span::ONE)
+    }
+
+    /// Reconcile as above, assigning `new_span` to every genuinely slotless
+    /// leaf. Existing leaves keep their saved spans. The spiral tests the whole
+    /// candidate rectangle, so multiple new 4×4 tiles never overlap.
+    pub fn reconcile_near_with_span(
+        &mut self,
+        leaves: &[WindowId],
+        near: Option<WindowId>,
+        new_span: Span,
+    ) -> bool {
         let mut changed = false;
         let before = self.slots.len();
         self.slots.retain(|(id, _)| leaves.contains(id));
@@ -878,8 +896,9 @@ impl DesktopState {
             if self.slot_of(leaf).is_some() {
                 continue; // already placed — the spiral never runs for it
             }
-            let slot = self.seed_slot_near(center);
+            let slot = self.seed_span_near(center, new_span);
             self.slots.push((leaf, slot));
+            self.set_span(leaf, new_span);
             self.sort();
             changed = true;
         }
@@ -892,7 +911,7 @@ impl DesktopState {
     /// no neighbor moves (no ripple). Returns whether the move committed.
     pub fn free_drop(&mut self, id: WindowId, target: Slot) -> bool {
         let span = self.span_of(id);
-        if !self.rect_free(target, span, id) {
+        if !self.rect_free(target, span, Some(id)) {
             return false; // overlap — reject, leave every slot unchanged
         }
         self.set_anchor(id, target);
@@ -2391,6 +2410,22 @@ mod desktop_tests {
         d2.last_reveal = Some(1);
         assert!(d2.reconcile_near(&[1, 2], None));
         assert_eq!(d2.slot_of(2), Some(Slot::new(1, 0)));
+    }
+
+    /// New app tiles use their whole configured span while seeding. A 4×4
+    /// neighbor therefore starts four columns to the right, with no overlap.
+    #[test]
+    fn reconcile_near_places_four_by_four_tiles_side_by_side() {
+        let mut d = DesktopState::default();
+        let four = Span::new(4, 4);
+        assert!(d.reconcile_near_with_span(&[1], None, four));
+        assert_eq!(d.slot_of(1), Some(Slot::new(0, 0)));
+        assert_eq!(d.span_of(1), four);
+
+        assert!(d.reconcile_near_with_span(&[1, 2], Some(1), four));
+        assert_eq!(d.slot_of(2), Some(Slot::new(0, 4)));
+        assert_eq!(d.span_of(2), four);
+        assert!(d.rect_free(Slot::new(0, 4), four, Some(2)));
     }
 
     /// Behavior 4: an overlapping free drop is rejected and moves NOTHING —

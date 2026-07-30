@@ -1,7 +1,7 @@
 # Desktop Mode — Uniform Tiles on a Pannable Slot Grid
 
 **Status:** DRAFT
-**Last updated:** 2026-07-28
+**Last updated:** 2026-07-30
 
 ## Builds On
 
@@ -18,20 +18,20 @@
 ## Overview
 
 Desktop mode is an alternative to tiling: every window becomes a **tile**,
-placed on an unbounded **desktop** of grid **slots**. The first measured canvas
-and a globally-configured **grid** — the startup density per axis (default
-**4 × 4**) — choose one uniform fixed tile size. The window is a viewport over
-the desktop: growing it reveals more cells and shrinking it reveals fewer; it
-never resizes, moves, or reflows tiles (slot addresses are immutable under
-resize). Tiles are arranged by mouse drag-and-drop with **insert-and-shift**
-sequence semantics.
+placed on an unbounded **desktop** of grid **slots**. Every Full-detail cell is
+a fixed **160 × 160 logical pixels** with a **12px gutter**. New tiles default
+to a **4 × 4-cell span** (676 × 676 logical pixels); the configured span can be
+changed for future tiles. The window is a viewport over the desktop: growing it
+reveals more cells and shrinking it reveals fewer; it never resizes, moves, or
+reflows tiles (slot addresses are immutable under resize).
 
 Named entities introduced here:
 
 - **Slot** — a cell address `(row, col)` on the unbounded grid (origin
   top-left, growth rightward/downward). The **anchor** (top-left) of a tile.
 - **Span** — a tile's extent in cells, `(rows, cols)`, each ≥ 1 (default
-  1 × 1). A tile at anchor `(r, c)` with span `(rows, cols)` **occupies the
+  for a new tile: 4 × 4). Persisted legacy tiles with no span remain 1 × 1.
+  A tile at anchor `(r, c)` with span `(rows, cols)` **occupies the
   rectangle** `[r, r+rows) × [c, c+cols)`. East/south resize grows the far
   edge (anchor fixed); west/north resize moves the anchor toward the origin
   (Behavior 4b). Window/zoom/grid changes never move an anchor.
@@ -75,17 +75,14 @@ window no longer exists is dropped, leaving a gap. Gaps are intentional
 structure — closing a tile never moves its neighbors.
 
 New windows created while in Desktop mode (split actions, `Cmd+O`, agent
-open) are tiles like any other; "split" loses its directional meaning and
-simply inserts the new tile after the focused one.
+open) are tiles like any other; they receive the configured default span and
+seed into the first free rectangle beside the focused/last-revealed tile.
 
 ### 3 · Geometry, panning, and rendering [DRAFT]
 
-Tile pixel size is chosen once from the first measured canvas and the grid:
-`tile_px = (canvas − (grid + 1) × gutter) / grid` per axis, with a fixed
-gutter (`DESKTOP_GUTTER`, ~12px) between slots and around the origin, and a
-minimum tile size so a tiny initial canvas stays usable. That result is cached
-as the fixed slot size; later window, sidebar, or rail resize does not
-recalculate it. Slot origin:
+Full-detail cell size is constant:
+`tile_px = (160px, 160px)`, with a fixed 12px `DESKTOP_GUTTER` between
+slots. It is independent of the first frame and the viewport. Slot origin:
 `gutter + slot ⊗ (tile_px + gutter) − pan`.
 
 The canvas pans on both axes (trackpad/wheel); `pan` is clamped to the
@@ -185,8 +182,9 @@ preview shows the candidate rectangle (the live tile renders at its clamped
 anchor + span); `Esc` cancels (placement returns to its prior value); mouse-up
 commits the clamped anchor + span. A spanned tile that loses its
 backing leaf (closed) drops its anchor and span together, leaving the whole
-rectangle as gaps (Behavior 2). New tiles (seed, reconcile, split, open) are
-always 1 × 1.
+rectangle as gaps (Behavior 2). New tiles (seed, reconcile, split, open) receive
+the configured default span (4 × 4 on a fresh install); existing tiles keep
+their saved spans.
 
 ### 5 · Focus and keyboard navigation [DRAFT]
 
@@ -201,17 +199,15 @@ they are.
 ### 6 · Desktop grid configuration [DRAFT]
 
 `desktop_grid_cols` / `desktop_grid_rows` live in `Preferences` (persisted,
-default 4 × 4): the density used to choose the fixed tile dimensions from
-the first measured canvas, one global setting for all tabs. Runtime
+default 4 × 4): the span assigned to future tiles, one global setting for all
+tabs. Runtime
 configuration uses a small text
 overlay in the existing `ActiveOverlay` family (the `TagInput`/`Rename`
 pattern — yalda-gpui has no `:` command line), accepting `{cols}x{rows}`,
 clamped to `[1, 12]` per axis, reachable via `Ctrl-W p` and the layout
-menu (which also offers direct mode selection without cycling). The grid
-column count is also the effective width W. Changing it re-renders
-immediately and chooses a new fixed tile size from the current measured
-canvas; slot addresses are grid-independent, so no migration occurs. Later
-viewport resize still reveals more or fewer cells without changing that size.
+menu (which also offers direct mode selection without cycling). Changing it
+does not alter any existing slot or span; it applies when the next slotless leaf
+is reconciled. Viewport resize reveals more or fewer fixed cells.
 
 ### 7 · Persistence [DRAFT]
 
@@ -287,15 +283,15 @@ called by the GPUI view layer):
   tile_px, gutter) -> Slot` — geometry, *external* to the render path.
 
 Events / messages: none (all interactions are direct view mutations).
-Data ownership: `DesktopState` owns placement; the `Layout<C>` tree owns
-content; `Preferences` owns tile size.
+Data ownership: `DesktopState` owns placement and per-tile spans; the
+`Layout<C>` tree owns content; `Preferences` owns the default new-tile span.
 
 ## Constraints
 
-- Window resize, text zoom, and grid changes MUST NOT mutate stored
-  slots. The only slot mutations are seeding, reconciliation, and drops.
-  Window/chrome resize also MUST NOT change the fixed tile pixel size; an
-  explicit grid-density change is the only operation that chooses a new size.
+- Window resize, text zoom, and default-span changes MUST NOT mutate stored
+  slots or existing spans. The only slot mutations are seeding,
+  reconciliation, and drops. Window/chrome resize MUST NOT change the fixed
+  160×160px Full-detail cell size.
 - The slot map is geometry only. Any code that needs "which windows exist"
   keeps reading tree leaves; the Behavior-2 invariant is maintained at the
   engine boundary, not assumed by callers.
@@ -350,6 +346,9 @@ content; `Preferences` owns tile size.
   + wall/neighbour clamp + free shrink); GUI bands runtime-unverified (human
   check pending — GPUI can't be driven headlessly).
 - 2026-07-30 — Fixed-cell viewport revision (user feedback after runtime use):
-  grid density chooses the tile size once from the first measured canvas (and
-  again after an explicit density change). Ordinary app/chrome resize now
-  reveals more or fewer cells without stretching or squeezing them.
+  calibrated to the supplied 1350×1344 physical-pixel @2× screenshot:
+  160×160 logical cells + 12px gutters; a default 4×4 tile is 676×676 logical
+  (1352×1352 physical), matching the reference within its border/crop.
+  Ordinary app/chrome resize reveals more or fewer cells without stretching or
+  squeezing them. The former grid-density preference now controls only the
+  default span assigned to future tiles.
