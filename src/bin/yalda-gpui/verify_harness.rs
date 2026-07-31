@@ -16717,3 +16717,118 @@ fn jump_palette_paints_over_the_screen(cx: &mut TestAppContext) {
         "the palette painted a collapsed box ({w}x{h}) — the rows/input never reached the screen"
     );
 }
+
+/// UXI-JumpPanel-18: a real archive-flag toggle announces itself — one `Info`
+/// system-console line naming the agent, plus a `TurnId::System` transcript
+/// notice when this GUI has the session open. Drives the REAL mutator both
+/// command surfaces route through (`set_session_archived`), for an open session
+/// AND a roster-only one, and proves the no-op toggle stays silent.
+///
+/// Negative control: delete the `announce_session_archived` call from
+/// `set_session_archived`. The console file has no `archived agent session`
+/// line and the transcript tail has no `session archived` notice.
+#[gpui::test]
+fn archive_toggle_announces_in_console_and_transcript(cx: &mut TestAppContext) {
+    use crate::TurnId;
+    use yalda::session_proto::SessionInfo;
+    let (view, vcx, id, _session) = boot_with_transcript(cx);
+
+    // A second session that exists only in the roster — never opened here, so
+    // it has no in-memory transcript to write into.
+    view.update(vcx, |v, _| {
+        v.agent_roster.upsert(SessionInfo {
+            session_id: "S2".into(),
+            acp_session_id: None,
+            label: "roster-only-agent".into(),
+            cwd: PathBuf::from("."),
+            provider: yalda::acp_channel::AgentProvider::Claude,
+            turns: 0,
+            connected: true,
+            permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+            busy: false,
+        });
+    });
+
+    // The transcript tail: (text, turn tag) of the last non-empty line.
+    let tail = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.update(vcx, |v, cx| {
+            v.read_session(id, cx, |c| {
+                let turn_meta = c.editor.metadata::<TurnId>();
+                (0..c.editor.document().line_count())
+                    .rev()
+                    .map(|i| {
+                        (
+                            c.editor.document().line_text(i),
+                            c.editor.anchor_for_line_opt(i).and_then(|a| turn_meta.get(a).copied()),
+                        )
+                    })
+                    .find(|(text, _)| !text.trim().is_empty())
+                    .expect("a non-empty transcript line")
+            })
+            .expect("open session")
+        })
+    };
+
+    let temp = tempfile::tempdir().expect("temp console dir");
+    let console = temp.path().join("system-console.log");
+    let read_console = || std::fs::read_to_string(&console).unwrap_or_default();
+
+    crate::with_system_console_path(console.clone(), || {
+        // ── Archive the OPEN session: console line + transcript notice ──────
+        view.update(vcx, |v, cx| v.set_session_archived("S1", true, cx));
+        let log = read_console();
+        assert!(
+            log.contains("INFO\tarchived agent session \"claude-1\""),
+            "the console must log the archive naming the agent; got: {log:?}"
+        );
+        let (text, tag) = tail(&view, vcx);
+        assert!(
+            text.contains("session archived"),
+            "the open session's transcript must carry the notice; tail: {text:?}"
+        );
+        assert_eq!(
+            tag,
+            Some(TurnId::System),
+            "a lifecycle notice is System-tagged — never an agent turn"
+        );
+
+        // ── Re-archiving is a no-op: it must announce NOTHING ───────────────
+        let before = read_console();
+        let lines_before = view
+            .update(vcx, |v, cx| v.read_session(id, cx, |c| c.editor.document().line_count()))
+            .expect("open session");
+        view.update(vcx, |v, cx| v.set_session_archived("S1", true, cx));
+        assert_eq!(read_console(), before, "a no-op archive writes no console line");
+        assert_eq!(
+            view.update(vcx, |v, cx| v.read_session(id, cx, |c| c.editor.document().line_count())),
+            Some(lines_before),
+            "a no-op archive appends no transcript notice"
+        );
+
+        // ── A ROSTER-ONLY session gets the console line and nothing else ────
+        view.update(vcx, |v, cx| v.set_session_archived("S2", true, cx));
+        let log = read_console();
+        assert!(
+            log.contains("INFO\tarchived agent session \"roster-only-agent\""),
+            "the console names the roster session even though we never opened it; got: {log:?}"
+        );
+        assert_eq!(
+            tail(&view, vcx).0,
+            text,
+            "archiving another session must not touch this session's transcript"
+        );
+
+        // ── Unarchive announces symmetrically ───────────────────────────────
+        view.update(vcx, |v, cx| v.set_session_archived("S1", false, cx));
+        assert!(
+            read_console().contains("INFO\tunarchived agent session \"claude-1\""),
+            "unarchive logs its own console line"
+        );
+        let (text, tag) = tail(&view, vcx);
+        assert!(
+            text.contains("session unarchived"),
+            "unarchive appends its own transcript notice; tail: {text:?}"
+        );
+        assert_eq!(tag, Some(TurnId::System));
+    });
+}

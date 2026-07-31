@@ -1057,3 +1057,72 @@ Adding the derived totals and compact indicators returned the guard to green.
 the reusable `yux::compact_count_indicator` primitive, while `compact_tab`
 learned to accept optional inline content so equal-width tab geometry remains
 centralized.
+
+### UXI-JumpPanel-18 — Archiving a session announces itself
+
+**Statement.** Toggling a session's durable archive flag is an observable event,
+not a silent state edit:
+
+- **System console.** Every archive and every unarchive writes one
+  `ConsoleLevel::Info` line naming the agent — `archived agent session "<label>"`
+  / `unarchived agent session "<label>"`. The label is the session's live store
+  name when this GUI has it open, otherwise the roster's name for that sid.
+- **Agent transcript.** When the session is open in this GUI, the same event
+  appends a yalda-local `TurnId::System` notice — `session archived` /
+  `session unarchived` — to that session's transcript. It carries no turn
+  number, emits no `TurnHeader`, and is excluded from agent-turn numbering
+  exactly like every other lifecycle notice.
+- **Roster-only sessions.** A session this GUI has not opened has no in-memory
+  transcript, so it gets the console line only. This is a deliberate scope
+  boundary: the notice is a local view event, not durable server transcript.
+- **No-op toggles are silent.** Archiving an already-archived session (or
+  unarchiving an unarchived one) changes nothing and therefore announces
+  nothing. A sid-less local session still cannot be archived at all
+  (`UXI-JumpPanel-16`).
+
+Both command surfaces from `UXI-JumpPanel-16` — the agent tile's `<space>`
+**archive session** / **unarchive session** command and the jump-panel session
+row's right-click context menu — announce identically, because both already
+route through the single durable-flag mutator.
+
+**Applies to.** `jump_panel_view.rs::set_session_archived` (the one choke point)
+and its `announce_session_archived` helper, `agent_ui.rs::append_system_notice`
+(the `TurnId::System` transcript lane), and
+`system_console.rs::append_system_console`.
+
+**Why.** Archive is the one session command whose entire visible effect is a row
+disappearing from the lists you were looking at. Without an announcement it is
+indistinguishable from a session vanishing for some other reason, and there is
+no record of who left when. Naming the agent in the console line makes the
+console a usable audit trail; the transcript notice puts the event where the
+session's own history lives.
+
+**Status.** `implemented` — both announcements, the roster-only console-only
+case, and the silent no-op toggle are headless-guarded. Nothing here is a
+runtime gap: the console line is asserted from its persisted file and the
+transcript notice from real editor metadata.
+
+**Enforcement.**
+`verify_harness.rs::archive_toggle_announces_in_console_and_transcript` drives
+the real `set_session_archived` — the single mutator both the `<space>` command
+and the row context menu route through — against an open session (`S1`, bound
+via `install_agent_slot`) and a roster-only session (`S2`). It asserts the
+`INFO\tarchived agent session "<label>"` line in the console log under a
+tempdir override, the `session archived` transcript tail with an actual
+`TurnId::System` tag read from `editor.metadata::<TurnId>()`, that a repeated
+archive writes neither a console line nor a transcript line, that archiving
+`S2` leaves `S1`'s transcript untouched, and that unarchive announces
+symmetrically.
+
+**Negative control observed.** Commenting out the `announce_session_archived`
+call in `set_session_archived` failed the guard at the first assertion with an
+empty console log. Restoring the call returned it to green.
+
+**Deviation from plan.** One: the console line is written through
+`YaldaGpuiView::append_system_console` rather than the free
+`record_system_message`. The free function only appends to the persisted file —
+it exists for lifecycle messages recorded *before* GPUI builds the console view
+— so using it would have left an already-open console overlay showing nothing
+until the next launch. `append_system_console` pushes into the live
+`SystemConsoleView` and persists, which is what "write a log message to the
+system console" actually requires.

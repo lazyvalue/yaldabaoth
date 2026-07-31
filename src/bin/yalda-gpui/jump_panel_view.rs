@@ -799,6 +799,11 @@ impl YaldaGpuiView {
 impl YaldaGpuiView {
     /// Set the durable archive visibility flag for one server-backed session.
     /// Activity and custom All ordering are deliberately untouched.
+    ///
+    /// UXI-JumpPanel-18: a real toggle announces itself — one `Info` console
+    /// line naming the agent, plus a `TurnId::System` transcript notice when
+    /// this GUI has the session open. A no-op toggle is silent (the early
+    /// return below is what makes that true for both command surfaces at once).
     pub(crate) fn set_session_archived(
         &mut self,
         sid: &str,
@@ -813,8 +818,37 @@ impl YaldaGpuiView {
         if !changed {
             return;
         }
+        self.announce_session_archived(sid, archived, cx);
         self.save_settings();
         cx.notify();
+    }
+
+    /// The UXI-JumpPanel-18 announcement for one real archive-flag change.
+    /// Split out so the mutator above stays a plain durable-flag edit.
+    fn announce_session_archived(&mut self, sid: &str, archived: bool, cx: &mut Context<Self>) {
+        let verb = if archived { "archived" } else { "unarchived" };
+        // The live store name is authoritative when this GUI holds the session
+        // (a rename lands there first); the roster is the fallback that covers
+        // every session we have never opened.
+        let opened = self.sessions.locate(&ServerSid::new(sid.to_string()));
+        let label = opened
+            .and_then(|id| self.sessions.get(id))
+            .map(|e| e.read(cx).label.clone())
+            .or_else(|| self.agent_roster.get(sid).map(|info| info.label.clone()))
+            .unwrap_or_else(|| sid.to_string());
+        self.append_system_console(
+            ConsoleLevel::Info,
+            format!("{verb} agent session \"{label}\""),
+            cx,
+        );
+        // A roster-only session has no in-memory transcript to write into; the
+        // console line above is its whole announcement (deliberate scope
+        // boundary — this notice is a local view event, not server transcript).
+        if let Some(id) = opened {
+            self.with_session(id, cx, |state| {
+                Self::append_system_notice(state, &format!("session {verb}"));
+            });
+        }
     }
 
     /// Contextual `<space>` action for the focused agent tile. Sid-less

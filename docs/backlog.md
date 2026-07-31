@@ -13,6 +13,23 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Archive action announces itself in the transcript and system console** —
+  `DONE` (2026-07-31 via `/new-ux`; `UXI-JumpPanel-18`). Captured verbatim:
+  *"The archive agent action should write a system message to the agent
+  transcript. It should also write a log message to the system console with the
+  name of the agent."* Shipped at the single durable-flag mutator
+  `jump_panel_view.rs::set_session_archived`, so the `<space>` command and the
+  row context menu announce identically. Decisions taken (user delegated):
+  unarchive announces symmetrically; a roster-only session gets the console line
+  only, since it has no in-memory transcript; a no-op toggle stays silent.
+  Console line is `archived/unarchived agent session "<label>"` at
+  `ConsoleLevel::Info` via `append_system_console` (the live view path, not the
+  pre-GPUI `record_system_message`); transcript notice is `session
+  archived`/`session unarchived` on the `TurnId::System` lane. Guard
+  `archive_toggle_announces_in_console_and_transcript` covers all four cases;
+  removing the announcement call produced the expected RED. GPUI harness (513),
+  library suite (161), and all-targets check are green.
+
 - **Hide archived sessions from the Agent Tile picker** — `DONE`
   (2026-07-29 via `/new-ux`; `UXI-AgentTile-32`). Captured verbatim:
   *"The agent tile picker should not show archived sessions."* Scoped to the
@@ -160,7 +177,8 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
   client-side (28-char name cap, 2-sentence summary cap, tolerant JSON/fence/
   bare-text parser), and every failure mode is silent — no key, no network, a
   refusal, or junk leaves the session as `claude-N`. `.env` is now gitignored and
-  loaded at startup for `ANTHROPIC_API_KEY` (real env vars win). Guards:
+  loaded privately at startup for `ANTHROPIC_API_KEY` (real env vars win; the
+  key is not forwarded to ACP/MCP children). Guards:
   `autoname_fires_once_on_first_turn_completion`,
   `autoname_result_renames_the_session`,
   `rename_latches_origin_and_blocks_autoname`,
