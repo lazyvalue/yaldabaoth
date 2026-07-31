@@ -13,6 +13,21 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Sessions stuck showing "Unavailable"** — `NEEDS-RUNTIME` (2026-07-31 via
+  `/bug`; `bug-0027`). Reported as *"frequently sessions are listed
+  (temporarily) as 'unavailable'"*, then sharpened to *"this session is listed
+  as 'unavailable' even though you are very clearly available"*. Root cause: the
+  exact residue of bug-0022 — that fix made `busy` roster-wide via a broadcast
+  but left `connected` with **no live source at all**, so the flag froze at
+  whatever the last full `list_sessions` seed said. Fixed server-side with
+  `Notification::SessionConnected` + `broadcast_connected` (PublishChannel /
+  AgentDisconnected / SpawnFailed), `AgentRoster::set_connected`, and a reducer
+  arm; guard `agent_coming_online_clears_the_unavailable_row` observed RED
+  without it. **Runtime-pending for one specific reason (not a test gap): the
+  session server outlives the GUI, so the running daemon is still the old binary
+  that never broadcasts. Restart `yalda-session-server` to pick this up** —
+  same caveat bug-0022 carried.
+
 - **Archive action announces itself in the transcript and system console** —
   `DONE` (2026-07-31 via `/new-ux`; `UXI-JumpPanel-18`). Captured verbatim:
   *"The archive agent action should write a system message to the agent

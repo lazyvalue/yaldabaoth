@@ -1323,6 +1323,14 @@ impl Manager {
                 if let Some(busy) = busy_now {
                     self.broadcast_busy(&sid, busy);
                 }
+                // bug-0027: this is the moment the agent subprocess becomes
+                // live. `SessionCreated` was necessarily sent with
+                // `connected: false` (it precedes the blocking handshake), so
+                // this is the ONLY thing that can move a GUI's roster off
+                // "Unavailable" without a full reseed.
+                if published.is_some() {
+                    self.broadcast_connected(&sid, true);
+                }
                 // Queued prompts that failed to flush onto the (re)spawned channel
                 // were optimistically echoed in the GUI — surface each as a
                 // transient `PromptRejected` (the manager broadcast reaches the
@@ -1344,6 +1352,11 @@ impl Manager {
                         session_id: sid.clone(),
                         reason,
                     });
+                    // bug-0027: the spawn that `SessionCreated` promised never
+                    // arrived. Confirm the still-false state explicitly so a
+                    // GUI is not left guessing whether the handshake is simply
+                    // slow.
+                    self.broadcast_connected(&sid, false);
                 }
             }
             Command::Record {
@@ -1450,6 +1463,10 @@ impl Manager {
                     reason: "agent disconnected".into(),
                 });
                 s.channel = None;
+                // bug-0027: `SessionDetached` is a per-session RECORDED event —
+                // it only reaches subscribers. Connectivity has to reach every
+                // GUI, including ones that never attached.
+                self.broadcast_connected(&sid, false);
             }
         }
     }
@@ -1700,6 +1717,18 @@ impl Manager {
         let _ = self.events.send(Notification::SessionBusy {
             session_id: session_id.to_string(),
             busy,
+        });
+    }
+
+    /// bug-0027: publish agent-subprocess liveness to every GUI. `SessionInfo`
+    /// carries `connected`, but it is only ever delivered by `list_sessions`,
+    /// which clients treat as a seed — so without this broadcast every
+    /// connectivity transition (spawn completing, agent exiting, respawn) was
+    /// invisible until an unrelated reseed. Same shape as `broadcast_busy`.
+    fn broadcast_connected(&self, session_id: &str, connected: bool) {
+        let _ = self.events.send(Notification::SessionConnected {
+            session_id: session_id.to_string(),
+            connected,
         });
     }
 

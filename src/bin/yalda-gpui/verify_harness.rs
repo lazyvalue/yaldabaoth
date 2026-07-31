@@ -16832,3 +16832,108 @@ fn archive_toggle_announces_in_console_and_transcript(cx: &mut TestAppContext) {
         assert_eq!(tag, Some(TurnId::System));
     });
 }
+
+/// REGRESSION (bug-0027): a session's agent subprocess coming up must reach the
+/// roster. `SessionCreated` is necessarily broadcast BEFORE the blocking
+/// spawn handshake, so it always carries `connected: false`; if nothing
+/// publishes the transition to true, the row stays `Unavailable` for the rest
+/// of the session's life — mid-turn included — until an unrelated
+/// `list_sessions` reseed. This drives the REAL reducer (`apply_server_batch`),
+/// exactly as the live server pump does.
+///
+/// Negative control: delete the `SessionConnected` arm from
+/// `apply_server_batch`. The row remains `AgentActivity::Unavailable` after the
+/// agent comes up, and stays Unavailable even while it reports a turn in
+/// flight — the reported symptom verbatim.
+#[gpui::test]
+fn agent_coming_online_clears_the_unavailable_row(cx: &mut TestAppContext) {
+    use crate::{AgentActivity, ServerNotification};
+    use yalda::session_proto::SessionInfo;
+    let (view, vcx) = boot_browser(cx);
+    let cwd = view.update(vcx, |v, _| {
+        let pid = v.workspace.active_workspace().expect("workspace").project();
+        v.projects.cwd_of(pid).expect("project cwd").to_path_buf()
+    });
+
+    // The create broadcast as the server actually sends it: the session exists,
+    // the subprocess does not yet.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![ServerNotification::SessionCreated {
+                session: SessionInfo {
+                    session_id: "srv-1".into(),
+                    acp_session_id: None,
+                    label: "claude-9".into(),
+                    cwd,
+                    provider: yalda::acp_channel::AgentProvider::Claude,
+                    turns: 0,
+                    connected: false,
+                    permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+                    busy: false,
+                },
+            }],
+            cx,
+        );
+    });
+    let activity = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.update(vcx, |v, cx| {
+            let rows = v.jump_panel_agent_rows(cx);
+            assert_eq!(rows.len(), 1, "exactly the one roster session");
+            rows[0].activity()
+        })
+    };
+    assert_eq!(
+        activity(&view, vcx),
+        AgentActivity::Unavailable,
+        "pre-handshake the row is honestly unavailable"
+    );
+
+    // The subprocess finishes its handshake. THIS is the event that was missing.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![ServerNotification::SessionConnected {
+                session_id: "srv-1".into(),
+                connected: true,
+            }],
+            cx,
+        );
+    });
+    assert_eq!(
+        activity(&view, vcx),
+        AgentActivity::Waiting,
+        "a live agent with no turn in flight is ready for input, not unavailable"
+    );
+
+    // And it must survive a turn: the reported symptom was a session showing
+    // Unavailable while it was demonstrably mid-reply.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![ServerNotification::SessionBusy {
+                session_id: "srv-1".into(),
+                busy: true,
+            }],
+            cx,
+        );
+    });
+    assert_eq!(
+        activity(&view, vcx),
+        AgentActivity::Working,
+        "a session mid-turn must read as working, never unavailable"
+    );
+
+    // The agent exiting puts it back — connectivity is live in both directions.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![ServerNotification::SessionConnected {
+                session_id: "srv-1".into(),
+                connected: false,
+            }],
+            cx,
+        );
+    });
+    assert_eq!(
+        activity(&view, vcx),
+        AgentActivity::Unavailable,
+        "a departed agent returns to unavailable"
+    );
+}

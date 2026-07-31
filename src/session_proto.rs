@@ -331,6 +331,20 @@ pub enum Notification {
         busy: bool,
     },
 
+    /// A session's agent subprocess came up or went away (bug-0027). Broadcast
+    /// to EVERY connection, exactly like [`Self::SessionBusy`], and for the same
+    /// reason: `SessionInfo.connected` is otherwise only ever learned from a
+    /// full `list_sessions`, which is a seed rather than a poll. Without this a
+    /// session announced by `SessionCreated` (necessarily `connected: false` —
+    /// the subprocess handshake happens after the broadcast) stays stuck at
+    /// "Unavailable" in every GUI until some unrelated action reseeds the
+    /// roster.
+    #[serde(rename = "session_connected")]
+    SessionConnected {
+        session_id: ServerSessionId,
+        connected: bool,
+    },
+
     /// A session's label changed. Broadcast to every connection so the new
     /// label propagates to every tile and every GUI instance.
     #[serde(rename = "session_renamed")]

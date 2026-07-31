@@ -2825,6 +2825,19 @@ impl YaldaGpuiView {
                         cx.notify();
                     }
                 }
+                ServerNotification::SessionConnected {
+                    session_id,
+                    connected,
+                } => {
+                    // bug-0027: the only live source of `connected`. Without it
+                    // the roster keeps whatever the last full `list_sessions`
+                    // seed said — which for any session created since that seed
+                    // is `false`, pinning a perfectly healthy agent at
+                    // "Unavailable".
+                    if self.agent_roster.set_connected(&session_id, connected) {
+                        cx.notify();
+                    }
+                }
                 ServerNotification::PromptRejected {
                     session_id,
                     reason,

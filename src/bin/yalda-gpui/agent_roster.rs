@@ -84,6 +84,21 @@ impl AgentRoster {
         }
     }
 
+    /// Update a session's agent-subprocess liveness (from the `SessionConnected`
+    /// broadcast, bug-0027). Returns `true` when the session is known and the
+    /// flag actually flipped — the caller notifies on `true` so the jump panel
+    /// repaints. Deliberately does NOT touch `state_since`: coming back online
+    /// is not a Waiting/Working transition and must not reorder the state tabs.
+    pub(crate) fn set_connected(&mut self, sid: &str, connected: bool) -> bool {
+        match self.by_sid.get_mut(sid) {
+            Some(info) if info.connected != connected => {
+                info.connected = connected;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Update a session's label (from `SessionRenamed`). Returns `true` if the
     /// session is known and the label actually changed. A rename for a session
     /// not yet in the roster is a no-op here (the eventual `list_sessions` /
