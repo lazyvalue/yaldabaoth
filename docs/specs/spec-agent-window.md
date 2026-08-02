@@ -188,23 +188,29 @@ The spec introduces eight named artifacts:
 
 ### Status Strip
 
-30. **Layout and sourcing. [DRAFT]** A single row above the main transcript area:
+30. **Layout and sourcing. [IMPLEMENTED]** Three semantic rows above the main transcript area:
 
     ```
-     claude-1  ⏵ refactor-pass ◂   sonnet-4-7   auto-edit   12.3k / 200k (6%)   $0.18   turn 4 · 0:14
+     session-label   [model-id]   [permission]   • EXT
+     [+ ready]       turn 4       USAGE ━━━━━━━ 12k/200k (6%)
+     WORKTREE branch-name
     ```
 
     | Field | Source | Notes |
     |---|---|---|
     | agent label | `AgentSlot.label` | clickable → rename overlay |
-    | sub-agent breadcrumb | `AgentState.focused_subagent` | only shown when focused; `◂` chip returns |
-    | model id | `CurrentModeUpdate` / `ConfigOptionUpdate`, fallback `AcpChannelClient::description()` | new ACP forwarding |
-    | permission mode | `AcpChannelClient::permission_mode()` | clickable → cycle |
+    | model id | `CurrentModeUpdate` / `ConfigOptionUpdate`, fallback `AcpChannelClient::description()` | badge; clickable when choices exist |
+    | permission mode | session permission state | badge with normal header text |
+    | compose status | compose editor | unsaved/unsent dirty mark and optional `EXT`; omitted when neither applies |
+    | activity | `AgentState.turn_phase` | fixed-width `* working` orange / `+ ready` green; always shown |
     | context-window usage | `UsageUpdate` (Cargo feature `unstable_session_usage`) | hidden if absent |
-    | cumulative cost | `UsageUpdate.cost_usd` | hidden if absent |
     | turn / elapsed | `AgentState.last_seen_turns` + `turn_started` | existing |
+    | worktree / cwd | session cwd | linked worktree directory name, otherwise shortened cwd |
 
-    Any field whose underlying signal is absent renders **nothing** — no placeholder, no `?`. The strip is at most as wide as the data it has.
+    Usage and model are omitted when their signals are absent. Activity, turn,
+    permission, and location are always present. The header does
+    not show provider, server-management, transient status messages, input-surface
+    placement, or duplicate awaiting text.
 
 ### Open ACP signals (parking lot)
 

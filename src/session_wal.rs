@@ -70,6 +70,10 @@ enum WalRecord {
     /// skip it on the `serde` error path and fall back to the header label
     /// (graceful downgrade), so no version bump is needed.
     Rename { label: String },
+    /// Durable cold-storage lifecycle flag. Last record wins. Separate from
+    /// the transcript event stream so archive bookkeeping never paints as an
+    /// agent turn and survives event-log compaction.
+    Archive { archived: bool },
 }
 
 /// On-disk WAL format version.
@@ -177,6 +181,18 @@ impl SessionWal {
         self.file.sync_data()
     }
 
+    /// Persist a lifecycle transition before the caller drops (archive) or
+    /// retains (unarchive) this handle. Always fsynced: recovery must never
+    /// accidentally respawn a session the user archived.
+    pub fn append_archived(&mut self, archived: bool) -> std::io::Result<()> {
+        self.write_record(&WalRecord::Archive { archived })?;
+        self.file.sync_data()
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Delete the WAL file — the session was explicitly closed, so its
     /// transcript should not be recovered on the next start.
     pub fn remove(self) {
@@ -212,6 +228,8 @@ pub struct RecoveredSession {
     pub acp_session_id: Option<String>,
     /// Completed-turn count, from `TurnEnded` events — the `replay_fence`.
     pub turns: usize,
+    /// Last durable archive marker; false for pre-archive WALs.
+    pub archived: bool,
 }
 
 /// Recover every session WAL in `dir`. Missing dir → empty (first run). A file
@@ -257,6 +275,7 @@ pub fn recover_one(path: &Path) -> std::io::Result<Option<RecoveredSession>> {
     // session recovered after a server restart keeps its renamed name rather
     // than reverting to the creation-time label.
     let mut renamed_label: Option<String> = None;
+    let mut archived = false;
 
     for line in reader.lines() {
         let line = match line {
@@ -306,6 +325,7 @@ pub fn recover_one(path: &Path) -> std::io::Result<Option<RecoveredSession>> {
             }
             WalRecord::Event(note) => event_log.push(note),
             WalRecord::Rename { label } => renamed_label = Some(label),
+            WalRecord::Archive { archived: value } => archived = value,
         }
     }
 
@@ -365,6 +385,7 @@ pub fn recover_one(path: &Path) -> std::io::Result<Option<RecoveredSession>> {
         event_log,
         acp_session_id,
         turns,
+        archived,
     }))
 }
 
@@ -544,6 +565,32 @@ mod tests {
         }
         let recovered = recover_all(&dir);
         assert_eq!(recovered[0].event_log.len(), 2);
+    }
+
+    #[test]
+    fn archive_marker_is_durable_and_last_transition_wins() {
+        let dir = tmp_dir("archive-state");
+        let path = {
+            let mut wal =
+                SessionWal::create(&dir, "cold-1", "l", Path::new("/tmp"), PermissionMode::Yolo)
+                    .unwrap();
+            wal.append(&attached("acp-cold"), true).unwrap();
+            wal.append_archived(true).unwrap();
+            wal.path().to_path_buf()
+        };
+
+        let cold = recover_one(&path).unwrap().unwrap();
+        assert!(cold.archived);
+        assert_eq!(cold.acp_session_id.as_deref(), Some("acp-cold"));
+        assert_eq!(cold.event_log.len(), 1, "archive is metadata, not a turn");
+
+        {
+            let mut wal = SessionWal::reopen(path.clone()).unwrap();
+            wal.append_archived(false).unwrap();
+        }
+        let live = recover_one(&path).unwrap().unwrap();
+        assert!(!live.archived, "the last lifecycle marker is authoritative");
+        assert_eq!(live.event_log.len(), 1);
     }
 
     #[test]

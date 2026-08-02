@@ -26,9 +26,9 @@ The naming call is deliberately **not** the recap facet's throwaway ACP
 subprocess ([`UXI-AgentTile-15`](recap.md)). A recap is a multi-paragraph
 summary that earns a full agent subprocess; two words and a compact topic line
 do not.
-The direct Haiku call is ~1s instead of several, and the request is
-`ANTHROPIC_API_KEY`-authenticated from the environment (or a gitignored `.env`
-loaded at startup) rather than riding the Claude Code login.
+The direct Haiku call is ~1s instead of several. Yalda reads
+`ANTHROPIC_API_KEY` from its launch environment or a gitignored `.env`, retains
+the credential privately, and removes it from ACP/MCP child environments.
 
 ## References
 
@@ -126,7 +126,8 @@ https://api.anthropic.com/v1/messages`, `anthropic-version: 2023-06-01`);
 `agent_ui.rs` — `maybe_autoname_session` (fired from the turn-finalize
 chokepoint) / `spawn_autoname_worker` / `apply_autoname_result`;
 `main.rs::commit_rename_overlay` (`RenameTarget::AgentSession`) — the latch;
-`persist.rs` — `dotenv` load at startup, the `acp_sessions.json` `summary` key, and
+`persist.rs` — private (non-exported) `ANTHROPIC_API_KEY` load from `.env` at
+startup, the `acp_sessions.json` `summary` key, and
 the id-keyed summary sidecar (`session_summaries_path` / `load_session_summaries` /
 `save_session_summary` / `forget_session_summaries`, bug-0020);
 `jump_panel_view.rs` — the italic summary line (+ its sidecar fallback).

@@ -797,14 +797,63 @@ impl YaldaGpuiView {
 }
 
 impl YaldaGpuiView {
-    /// Set the durable archive visibility flag for one server-backed session.
-    /// Activity and custom All ordering are deliberately untouched.
+    /// Request a durable cold-storage transition for one server-backed session.
+    /// The server persists the state and releases/recreates its runtime
+    /// resources; `apply_session_archived_local` mirrors the acknowledged state
+    /// into this GUI's navigation projections.
     ///
     /// UXI-JumpPanel-18: a real toggle announces itself — one `Info` console
     /// line naming the agent, plus a `TurnId::System` transcript notice when
     /// this GUI has the session open. A no-op toggle is silent (the early
     /// return below is what makes that true for both command surfaces at once).
     pub(crate) fn set_session_archived(
+        &mut self,
+        sid: &str,
+        archived: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.jump_archived_sessions.contains(sid) == archived {
+            return;
+        }
+        let Some(handle) = self.session_server.as_ref().map(|server| server.handle()) else {
+            // Hermetic/legacy fallback: there is no daemon authority to ask.
+            self.apply_session_archived_local(sid, archived, cx);
+            return;
+        };
+        let sid = sid.to_string();
+        cx.spawn(async move |this, cx| {
+            let request_sid = sid.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    handle
+                        .set_archived(&request_sid, archived)
+                        .map_err(|error| error.to_string())
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(()) => {
+                    // The broadcast normally arrives first, but applying here
+                    // also covers a reconnect between ACK and notification.
+                    this.apply_session_archived_local(&sid, archived, cx);
+                }
+                Err(error) => this.append_system_console(
+                    ConsoleLevel::Error,
+                    format!(
+                        "could not {} agent session: {error}",
+                        if archived { "archive" } else { "unarchive" }
+                    ),
+                    cx,
+                ),
+            });
+        })
+        .detach();
+    }
+
+    /// Apply server-authoritative lifecycle state without issuing another wire
+    /// request. Shared by the request completion and broadcast paths; idempotent
+    /// so their normal race produces exactly one announcement.
+    pub(crate) fn apply_session_archived_local(
         &mut self,
         sid: &str,
         archived: bool,
@@ -819,6 +868,19 @@ impl YaldaGpuiView {
             return;
         }
         self.announce_session_archived(sid, archived, cx);
+        // Archiving is also a viewport transition: every workspace tile that
+        // was showing this session becomes an ordinary live picker. Keep the
+        // AgentSession itself in the store; selecting its Archived jump-panel
+        // row can therefore open the preserved transcript directly in an
+        // ephemeral workspace via `jump_to_session`.
+        if archived
+            && let Some(local) = self.sessions.locate(&ServerSid::new(sid.to_string()))
+            && self.show_pickers_for_session(local)
+        {
+            // Persist the now-unbound layout immediately so restart cannot
+            // restore the archived session into those tiles.
+            self.save_agent_ring(cx);
+        }
         self.save_settings();
         cx.notify();
     }

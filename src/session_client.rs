@@ -594,6 +594,16 @@ impl SessionServerClient {
         })
     }
 
+    pub fn set_archived(&self, session_id: &str, archived: bool) -> io::Result<()> {
+        match self.request(Request::SetArchived {
+            session_id: session_id.to_string(),
+            archived,
+        })? {
+            Response::Ok { .. } => Ok(()),
+            Response::Error { message } => Err(io::Error::other(message)),
+        }
+    }
+
     pub fn close_session(&self, session_id: &str) -> io::Result<()> {
         match self.request(Request::CloseSession {
             session_id: session_id.to_string(),
@@ -696,6 +706,16 @@ impl SessionServerHandle {
                 io::ErrorKind::InvalidData,
                 "unexpected response",
             )),
+        }
+    }
+
+    pub fn set_archived(&self, session_id: &str, archived: bool) -> io::Result<()> {
+        match self.request(Request::SetArchived {
+            session_id: session_id.to_string(),
+            archived,
+        })? {
+            Response::Ok { .. } => Ok(()),
+            Response::Error { message } => Err(io::Error::other(message)),
         }
     }
 

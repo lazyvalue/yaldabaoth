@@ -91,8 +91,12 @@ the test fails.
 by clicking its row, or highlighting it in the Subagents panel per INV-UX-12), the
 agent tile's **main area is replaced** by that subagent's **context**: a `← Back`
 header (label of the subagent) over a scrollable view of its prompt + content +
-output (`append_tool_body_rich`, the same beautiful sections the expanded tool card
-shows — markdown/code/diff/chips, UXI-AgentTile-25). The cached
+output. A Claude child renders its rich parent Task call (`append_tool_body_rich`,
+the same markdown/code/diff/chips sections the expanded tool card shows,
+UXI-AgentTile-25). A Codex child is a separate durable thread, so focusing it lazily
+loads that exact thread with ACP `session/load` and renders its user/agent/tool
+timeline read-only. The loader is resume-only: failure or a stale child id is shown
+as unavailable and can never fall back to creating a replacement session. The cached
 main `TranscriptView` is **not rendered** while swapped. Returning to the main agent
 is easy and always available: click **`← Back`**, or press **`Esc`** (`Esc` with a
 focused subagent calls `unfocus_subagent`, ahead of its per-mode meaning). Switching
@@ -104,15 +108,16 @@ transcript state is touched, so Back is lossless.
 the `subagent-view` (Back header + `append_tool_body_rich`) OR the transcript body.
 `agent_ui.rs`: `focus_subagent` / `unfocus_subagent` (set/clear), the `Esc`-returns
 branch in `handle_claude_key`, and `reveal_panel_selection` (panel highlight → swap).
-`agent.rs`: `focused_subagent: Option<ToolCallKey>`, `classify_subagent` (label).
+`agent.rs`: `focused_subagent: Option<SubAgentKey>`, `classify_subagent`, and the
+Codex replay cache/reducer. `acp_channel.rs`: the resume-only load path.
 
 **Why.** A subagent's work is a self-contained sub-conversation; reading it should
 feel like *entering* it — a full view you can scroll — not squinting at an inline
 expanded card. A single obvious Back (button + `Esc`) keeps it non-trapping.
 
-**Bounds.** A subagent's "context" is whatever the Task tool call carries (prompt +
-accumulated content/output blocks), not a separate live nested transcript with its
-own tool cards — that's all the agent surfaces over ACP today.
+**Bounds.** Claude context is whatever its Task tool call carries. Codex context is
+the replayable child thread exposed by the adapter; this surface is an inspector,
+not a second driver for that thread.
 
 **Status.** `implemented` (headless — the swap is proven by the layout probe; exact
 pixels/colors are gap-1).
@@ -122,6 +127,9 @@ a subagent focused, the `subagent-view` PAINTS and `transcript-viewport` does NO
 after Back the `subagent-view` is gone (negative control: render the transcript
 unconditionally ⇒ `subagent-view` never paints ⇒ RED). Plus
 `panel_highlight_swaps_to_subagent` for the panel-driven entry.
+The provider-specific data paths are pinned by
+`codex_child_replay_reducer_preserves_roles_and_tools` and the Codex classifier/fold
+tests named in the sidepanel facet.
 
 ### UXI-AgentTile-7 — A moved transcript fingerprint is ALWAYS rendered (no stale tail)
 
@@ -441,58 +449,48 @@ marker column). `tests.rs::extract_output_text_handles_bare_content_block_array`
 extraction + its Markdown (not Json) planning — NC observed RED by deleting the
 `Value::Array(items) =>` arm (bare array → `None` → raw JSON dump).
 
-### UXI-AgentTile-28 — The tile says whether the agent is working or waiting on you
+### UXI-AgentTile-28 — The tile always says whether the agent is working or ready
 
-**Statement.** The agent tile's header strip carries a **status pill** stating the
-session's live state in the **same vocabulary the jump panel uses**
-(`UXI-JumpPanel-10` — same glyph, same word, from the same pure
-`agent_row_marks`):
+**Statement.** The agent tile's activity row always carries a fixed-width status
+pill. It uses compact header-specific vocabulary:
 
 | Condition | Pill |
 |---|---|
-| A reply is in flight (`turn_phase.is_awaiting()`) | **`◆ working`** — text, tint α 0.15 and hairline outline α 0.55, all in `agent.jump_working` |
-| Idle, at least one turn has run (`display_turn > 0`) | **`✦ your turn`** — same treatment in `agent.tool_completed` |
-| Idle, no turn has ever run | *(no pill)* — a virgin session says nothing |
+| A reply is in flight (`turn_phase.is_awaiting()`) | **`* working`** in `agent.jump_working` orange |
+| Idle, including a brand-new session | **`+ ready`** in `agent.tool_completed` green |
 
-The pill sits in the header's right group, before the `turn N · M:SS` counter and
-the `■ Stop ⌘.` button (which is unchanged and still only appears while awaiting).
-The old dim `· …awaiting reply` tail in the left status strip stays — the pill is
-the loud signal; that line remains for the details-oriented read.
+The pill is 88px wide in both states, followed by `turn N · M:SS` and the
+conditional `■ Stop ⌘.` button. The editing readout does not duplicate activity
+with an `awaiting reply` suffix.
 
-Note the tile's "your turn" is **not** gated on `unread` the way the jump panel's is
-(`UXI-JumpPanel-6`): unread means "finished while you weren't looking", which is
-meaningless for the tile you are looking at.
-
-**Applies to.** `screens.rs`: `render_agent`'s `header_right` (the pill, wrapped in
-`probe_bounds("agent-status-pill", …)`); `jump_panel_view.rs::agent_row_marks` (the
-shared mapping).
+**Applies to.** `screens.rs`: `agent_header_activity` and `render_agent`'s
+`agent-status-pill`.
 
 **Why.** With a wall of transcript above it, the only "the agent is running" signals
 were a dim status-strip suffix and an elapsed clock — easy to miss, and there was no
 positive "it's finished, it's on you" signal at all. One loud, colored, worded pill
 in a fixed place answers both questions without reading the transcript.
 
-**Status.** `implemented` — presence/absence is PAINT-guarded; the hue and the pill
-as pixels are harness gap #1.
+**Status.** `implemented`.
 
 **Enforcement.** `verify_harness.rs::agent_tile_paints_a_status_pill_while_working`
-— layout probe `"agent-status-pill"` on the REAL `render_agent`: absent on a virgin
-session, painted with real size (`w > 20`, `h > 6`) once a turn is in flight.
-**NC observed RED**: drop the pill child → "the working pill must paint while a reply
-is in flight". The word/glyph mapping is pinned by
-`agent_row_marks_name_the_live_states`.
+— layout probe `"agent-status-pill"` on the real `render_agent`: present on a
+virgin session and exactly the same width after entering the working state. The
+word/glyph mapping is pinned by
+`agent_header_uses_compact_activity_and_transient_editor_vocabulary`.
 
-### UXI-AgentTile-31 — Narrow tiles wrap header chrome; usage owns a line
+### UXI-AgentTile-31 — Header information has stable semantic rows
 
-**Statement.** The primary agent status row wraps and grows vertically instead
-of clipping when a desktop tile is narrow. Context-window usage is never packed
-into that row: when present, it renders on a dedicated second line with the
-`USAGE` label, progress bar, and compact token count. Both lines remain
-chrome-sized and unaffected by document zoom.
+**Statement.** Header information renders in this order: identity/model/
+permission/transient compose state; activity/turn/stop with optional context
+usage; linked worktree name or working directory. Each group owns a row. Rows
+may wrap their own contents on narrow tiles and remain unaffected by document
+zoom.
 
-**Applies to.** `screens.rs::render_agent` (`strip`, `usage_line`, and `header`).
+**Applies to.** `screens.rs::render_agent` (`identity_row`, `activity_row`,
+usage meter, `location_row`, and `header`).
 
 **Status.** `implemented`.
 
-**Enforcement.** `verify_harness.rs::agent_usage_paints_on_its_own_header_line`
-paints real usage state and proves its bounds start below the primary status row.
+**Enforcement.** `verify_harness.rs::agent_usage_paints_on_the_activity_header_line`
+paints real usage state and proves identity → activity+usage → location order.

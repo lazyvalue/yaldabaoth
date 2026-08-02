@@ -2275,6 +2275,88 @@ fn subagents_surfaces_registered_task_with_prompt() {
 }
 
 #[test]
+fn codex_subagent_activity_is_classified_by_child_thread() {
+    use yalda::acp_channel::{ToolCall, ToolCallId, ToolCallStatus};
+    let id: ToolCallId = "codex-start".into();
+    let mut tc = ToolCall::new(id, "Start subagent review_maintainability".to_string());
+    tc.raw_input = Some(serde_json::json!({
+        "agentThreadId": "019c-child",
+        "agentPath": "review/review_maintainability",
+        "activityKind": "started"
+    }));
+    tc.meta = serde_json::json!({
+        "codex": {
+            "subagent": {
+                "threadId": "019c-child",
+                "path": "review/review_maintainability",
+                "activity": "started"
+            }
+        }
+    })
+    .as_object()
+    .cloned();
+
+    let subagent = classify_subagent(&tc).expect("Codex activity is a subagent");
+    assert_eq!(
+        subagent.key,
+        SubAgentKey::CodexThread("019c-child".into())
+    );
+    assert_eq!(subagent.label, "review_maintainability");
+    assert_eq!(subagent.status, ToolCallStatus::InProgress);
+}
+
+#[test]
+fn codex_subagent_lifecycle_folds_to_one_row() {
+    use yalda::acp_channel::{ToolCall, ToolCallId, ToolCallStatus};
+    let mut state = AgentState::new_for_test();
+    for (id, activity) in [("start", "started"), ("interact", "interacted"), ("stop", "interrupted")] {
+        let tool_id: ToolCallId = id.into();
+        let mut tc = ToolCall::new(tool_id.clone(), format!("{activity} subagent review"));
+        tc.raw_input = Some(serde_json::json!({
+            "agentThreadId": "019c-child",
+            "agentPath": "review/review_maintainability",
+            "activityKind": activity
+        }));
+        state.tools.register(
+            ToolCallKey::from_id(&tool_id),
+            tc,
+            state.editor.anchor_for_line(0),
+        );
+    }
+
+    let rows = state.subagents();
+    assert_eq!(rows.len(), 1, "one child thread must produce one row");
+    assert_eq!(rows[0].status, ToolCallStatus::Failed);
+    assert_eq!(rows[0].activity.as_deref(), Some("interrupted"));
+}
+
+#[test]
+fn codex_child_replay_reducer_preserves_roles_and_tools() {
+    use yalda::acp_channel::{ReplyEvent, ToolCall, ToolCallId};
+    let tool_id: ToolCallId = "read-1".into();
+    let transcript = SubAgentTranscript::from_reply_events([
+        ReplyEvent::UserMessage("inspect it".into()),
+        ReplyEvent::Chunk("first ".into()),
+        ReplyEvent::Chunk("answer".into()),
+        ReplyEvent::ToolCallStarted(ToolCall::new(tool_id.clone(), "Read file".to_string())),
+        ReplyEvent::ReplayComplete,
+    ]);
+
+    assert_eq!(transcript.items.len(), 3);
+    assert!(matches!(
+        &transcript.items[0],
+        SubAgentTranscriptItem::User(text) if text == "inspect it"
+    ));
+    assert!(matches!(
+        &transcript.items[1],
+        SubAgentTranscriptItem::Agent(text) if text == "first answer"
+    ));
+    assert!(transcript
+        .tools
+        .contains_key(&ToolCallKey::from_id(&tool_id)));
+}
+
+#[test]
 fn fingerprint_tracks_resolved_tool_anchor_line() {
     let mut st = AgentState::new_for_test();
     // Seed a few frozen lines so an anchor can resolve to a real line.
@@ -3878,16 +3960,20 @@ fn unknown_detail_zoom_falls_back_to_full() {
 
 /// bug-0018: a clicked link routes by `classify_link`. External URLs
 /// (http/https/mailto) → `External` (opened in the default browser); `wiki:`
-/// note links and relative/scheme-less links → `Wiki` (opened in-app). This is
-/// the exact routing decision the doc-view `on_click` runs; before the fix, URL
-/// links were never collected/classified and were inert.
+/// note links and relative/scheme-less links → `Wiki` (opened in a new in-app
+/// buffer tile). This is the exact routing decision the doc-view `on_click`
+/// runs; before the fix, URL links were never collected/classified and were
+/// inert.
 ///
 /// Negative control: remove the http/https/mailto branch in `classify_link`
 /// (so it falls through to `Wiki`) → the URL asserts fail RED (a URL would be
 /// mis-routed to `open_wiki_link`, which only resolves LOCAL files — the bug).
 #[test]
 fn classify_link_routes_urls_external_and_notes_wiki() {
-    use crate::{classify_link, LinkTarget};
+    use crate::{
+        LinkTarget, RenderedMarkdownLink, classify_link, normalize_local_link_target,
+        rendered_markdown_links,
+    };
 
     // External URLs → open in the browser.
     assert_eq!(
@@ -3914,12 +4000,48 @@ fn classify_link_routes_urls_external_and_notes_wiki() {
     );
 
     // Wiki / local references → open in-app (prefix stripped for wiki:).
-    assert_eq!(classify_link("wiki:my-note"), LinkTarget::Wiki("my-note".into()));
-    assert_eq!(classify_link("./relative.md"), LinkTarget::Wiki("./relative.md".into()));
-    assert_eq!(classify_link("other-note"), LinkTarget::Wiki("other-note".into()));
+    assert_eq!(
+        classify_link("wiki:my-note"),
+        LinkTarget::Wiki("my-note".into())
+    );
+    assert_eq!(
+        classify_link("./relative.md"),
+        LinkTarget::Wiki("./relative.md".into())
+    );
+    assert_eq!(
+        classify_link("other-note"),
+        LinkTarget::Wiki("other-note".into())
+    );
     // A non-browser scheme is NOT opened externally (open must not launch an
     // arbitrary local handler) — treated as a local reference.
-    assert_eq!(classify_link("file:///etc/passwd"), LinkTarget::Wiki("file:///etc/passwd".into()));
+    assert_eq!(
+        classify_link("file:///etc/passwd"),
+        LinkTarget::Wiki("file:///etc/passwd".into())
+    );
+
+    assert_eq!(
+        normalize_local_link_target("file:///tmp/My%20Note.md#heading"),
+        "/tmp/My Note.md"
+    );
+    assert_eq!(
+        normalize_local_link_target("/tmp/My%20Note.md:42:7"),
+        "/tmp/My Note.md"
+    );
+    assert_eq!(
+        normalize_local_link_target("<./notes/topic.md#details>"),
+        "./notes/topic.md"
+    );
+
+    assert_eq!(
+        rendered_markdown_links(
+            "Open [the note](notes/My%20Note.md:42) now",
+            "Open the note now"
+        ),
+        vec![RenderedMarkdownLink {
+            range: 5..13,
+            target: "notes/My%20Note.md:42".into(),
+        }]
+    );
 }
 
 // ── UXI-AgentTile-25: beautiful tool-body section planning (pure) ──────────
@@ -4390,7 +4512,7 @@ fn parse_naming_reply_tolerates_real_model_output() {
 
 #[test]
 fn parse_dotenv_reads_keys_and_ignores_noise() {
-    use crate::persist::parse_dotenv;
+    use crate::persist::{is_private_dotenv_key, parse_dotenv};
 
     let parsed = parse_dotenv(
         "# a comment\n\
@@ -4410,6 +4532,11 @@ fn parse_dotenv_reads_keys_and_ignores_noise() {
             ("EMPTY".to_string(), String::new()),
         ]
     );
+    assert!(
+        is_private_dotenv_key("ANTHROPIC_API_KEY"),
+        "the autonaming credential must stay in Yalda's private store"
+    );
+    assert!(!is_private_dotenv_key("LINEAR_API_KEY"));
 }
 
 #[test]

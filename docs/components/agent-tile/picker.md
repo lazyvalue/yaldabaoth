@@ -30,6 +30,13 @@ visibility boundary for the entire existing-session portion of the picker. The
 two create-new rows remain present, and unarchived sessions retain the existing
 project scoping, free/selectable, and bound/read-only behavior.
 
+Archiving a bound session also moves its workspace tile to this picker
+immediately (`UXI-JumpPanel-16`). The archived session is still intentionally
+reachable by selecting it from the jump panel's Archived tab; that explicit
+direct visit opens its transcript read-only in a bare ephemeral view and does
+not route through or add the session to this picker. Unarchive is the explicit
+transition that recreates its ACP transport.
+
 **Applies to.** The shared picker projection in
 `agent_ui.rs::picker_projection`; its consumers
 `screens.rs::render_agent_picker`,

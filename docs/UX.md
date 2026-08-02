@@ -107,8 +107,8 @@ sessions)), not cached. Sections:
   - **Dot color** = per-session status light (INV-UX-10): **working** (reply in
     flight) = warm accent, **waiting for you** (turn finished) = green,
     **neutral/disconnected** = dim. Disconnected also dims the whole row.
-  - Click → bound session focuses its tile; **free** session opens in an
-    ephemeral virtual workspace (torn down on switch-away).
+  - Click → every session opens in a detached ephemeral view (torn down on
+    switch-away); an existing workspace tile remains in place.
 
 ### Rail (`spec-rail.md`, `chrome.rs`)
 

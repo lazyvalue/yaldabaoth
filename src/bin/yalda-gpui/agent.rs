@@ -2069,7 +2069,7 @@ pub(crate) enum PanelItem {
     /// The i-th entry of `current_plan` (no activation target today).
     Plan(usize),
     /// A subagent row; activating it focuses that subagent's output.
-    Subagent(ToolCallKey),
+    Subagent(SubAgentKey),
 }
 
 /// Which bottom-panel COLUMN holds the selection while `focus == Panel`
@@ -2157,20 +2157,110 @@ impl InputSurface {
 /// supporting a renamed vendor tool — is a one-slice change (§25).
 pub(crate) const SUBAGENT_TOOL_NAMES: &[&str] = &["Task", "Subagent", "Spawn"];
 
+/// Provider-neutral identity for a subagent row. Claude exposes a Task as one
+/// rich tool call; Codex exposes a durable child thread plus several separate
+/// lifecycle tool calls. Keeping those domains distinct prevents Codex's
+/// Start/Interact/Interrupt events from becoming duplicate rows.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum SubAgentKey {
+    ToolCall(ToolCallKey),
+    CodexThread(String),
+}
+
+/// A replayed, read-only child-thread transcript. Codex keeps the child work in
+/// its own thread rather than in the parent collaboration tool call.
+#[derive(Clone, Default)]
+pub(crate) struct SubAgentTranscript {
+    pub(crate) items: Vec<SubAgentTranscriptItem>,
+    pub(crate) tools: std::collections::HashMap<ToolCallKey, yalda::acp_channel::ToolCall>,
+}
+
+#[derive(Clone)]
+pub(crate) enum SubAgentTranscriptItem {
+    User(String),
+    Agent(String),
+    Tool(ToolCallKey),
+}
+
+#[derive(Clone)]
+pub(crate) enum SubAgentTranscriptLoad {
+    Loading,
+    Loaded(SubAgentTranscript),
+    Failed(String),
+}
+
+impl SubAgentTranscript {
+    /// Fold the ACP `session/load` replay of a child thread into a compact,
+    /// renderable read-only timeline. Chunk coalescing preserves message
+    /// boundaries while tool updates merge into their originating call.
+    pub(crate) fn from_reply_events(events: impl IntoIterator<Item = ReplyEvent>) -> Self {
+        let mut transcript = Self::default();
+        for event in events {
+            match event {
+                ReplyEvent::UserMessage(text) => {
+                    transcript.items.push(SubAgentTranscriptItem::User(text));
+                }
+                ReplyEvent::Chunk(text) => {
+                    if let Some(SubAgentTranscriptItem::Agent(existing)) =
+                        transcript.items.last_mut()
+                    {
+                        existing.push_str(&text);
+                    } else {
+                        transcript.items.push(SubAgentTranscriptItem::Agent(text));
+                    }
+                }
+                ReplyEvent::ToolCallStarted(tc) => {
+                    let key = ToolCallKey::from_id(&tc.tool_call_id);
+                    if !transcript.tools.contains_key(&key) {
+                        transcript
+                            .items
+                            .push(SubAgentTranscriptItem::Tool(key.clone()));
+                    }
+                    transcript.tools.insert(key, tc);
+                }
+                ReplyEvent::ToolCallUpdated(update) => {
+                    let key = ToolCallKey::from_id(&update.tool_call_id);
+                    if let Some(call) = transcript.tools.get_mut(&key) {
+                        call.update(update.fields);
+                    } else {
+                        let mut call = yalda::acp_channel::ToolCall::new(
+                            update.tool_call_id.clone(),
+                            String::new(),
+                        );
+                        call.update(update.fields);
+                        transcript
+                            .items
+                            .push(SubAgentTranscriptItem::Tool(key.clone()));
+                        transcript.tools.insert(key, call);
+                    }
+                }
+                ReplyEvent::PlanUpdated(_)
+                | ReplyEvent::ModeChanged(_)
+                | ReplyEvent::ModelChanged(_)
+                | ReplyEvent::ModelsAvailable { .. }
+                | ReplyEvent::UsageUpdated(_)
+                | ReplyEvent::Notice(_)
+                | ReplyEvent::ReplayComplete
+                | ReplyEvent::TurnEnded { .. } => {}
+            }
+        }
+        transcript
+    }
+}
+
 /// Yalda-side classification of a `ToolCall` that represents a sub-agent
 /// transcript (§26). Produced by the heuristic in `classify_subagent`; the
 /// `Subagents` sidebar lists these, and `focused_subagent` keys into the
-/// derived list (by `tool_call_id`) to swap the main transcript view.
+/// derived list by provider-neutral identity to swap the main transcript view.
 ///
 /// Not stored: `AgentState::subagents()` derives this list on demand by
 /// folding over `tool_call_order` + `tool_calls`, so it can never drift
 /// from the underlying tool-call state (ADR-0006 quick win #1).
 #[derive(Clone)]
 pub(crate) struct SubAgent {
-    /// Originating tool-call id. The tool call itself stays in
-    /// `tool_calls`; the sub-agent entry is an extra view over the same
-    /// content.
-    pub(crate) tool_call_id: ToolCallKey,
+    /// Stable identity of the logical child, independent of how many activity
+    /// tool calls the provider emits for it.
+    pub(crate) key: SubAgentKey,
     /// Best-effort display label: the tool call's `title` if set,
     /// otherwise its `name`, with `subagent-N` as the ultimate fallback.
     pub(crate) label: String,
@@ -2180,6 +2270,8 @@ pub(crate) struct SubAgent {
     /// `description` raw-input), shown in the subagent pane. `None` when the
     /// adapter didn't carry it.
     pub(crate) prompt: Option<String>,
+    /// Most recent Codex activity (`started`, `interacted`, `interrupted`).
+    pub(crate) activity: Option<String>,
 }
 
 /// Classify a tool call as a sub-agent (Task) spawn, as the HARNESS actually
@@ -2199,6 +2291,54 @@ pub(crate) struct SubAgent {
 pub(crate) fn classify_subagent(tc: &yalda::acp_channel::ToolCall) -> Option<SubAgent> {
     use yalda::acp_channel::ToolKind;
     let raw = tc.raw_input.as_ref();
+    let codex = tc
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.get("codex"))
+        .and_then(|value| value.as_object())
+        .and_then(|value| value.get("subagent"))
+        .and_then(|value| value.as_object());
+    let codex_thread = codex
+        .and_then(|value| value.get("threadId"))
+        .and_then(|value| value.as_str())
+        .or_else(|| raw.and_then(|value| value.get("agentThreadId")?.as_str()));
+    if let Some(thread_id) = codex_thread {
+        let path = codex
+            .and_then(|value| value.get("path"))
+            .and_then(|value| value.as_str())
+            .or_else(|| raw.and_then(|value| value.get("agentPath")?.as_str()));
+        let activity = codex
+            .and_then(|value| value.get("activity"))
+            .and_then(|value| value.as_str())
+            .or_else(|| raw.and_then(|value| value.get("activityKind")?.as_str()));
+        let label = path
+            .and_then(|value| value.rsplit('/').find(|part| !part.is_empty()))
+            .map(str::to_owned)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| {
+                tc.title
+                    .split_once("subagent ")
+                    .map(|(_, value)| value.to_owned())
+                    .unwrap_or_else(|| "subagent".to_string())
+            });
+        let status = match activity {
+            Some("started" | "interacted") => {
+                yalda::acp_channel::ToolCallStatus::InProgress
+            }
+            Some("interrupted") => yalda::acp_channel::ToolCallStatus::Failed,
+            _ => tc.status,
+        };
+        return Some(SubAgent {
+            key: SubAgentKey::CodexThread(thread_id.to_owned()),
+            label,
+            status,
+            prompt: raw
+                .and_then(|value| value.get("prompt"))
+                .and_then(|value| value.as_str())
+                .map(str::to_owned),
+            activity: activity.map(str::to_owned),
+        });
+    }
     // TodoWrite is also `Think`; its body is the running todo list, not a
     // subagent. Exclude it by the distinctive `todos` array (mirrors
     // `tool_render_policy`).
@@ -2231,10 +2371,11 @@ pub(crate) fn classify_subagent(tc: &yalda::acp_channel::ToolCall) -> Option<Sub
         "subagent".to_string()
     };
     Some(SubAgent {
-        tool_call_id: ToolCallKey::from_id(&tc.tool_call_id),
+        key: SubAgentKey::ToolCall(ToolCallKey::from_id(&tc.tool_call_id)),
         label,
         status: tc.status,
         prompt,
+        activity: None,
     })
 }
 
@@ -3427,7 +3568,7 @@ pub(crate) struct AgentState {
     /// when the upstream `unstable_session_usage` feature is on; otherwise
     /// stays `None` and the Status Strip omits these fields per §30.
     pub(crate) usage: Option<yalda::acp_channel::UsageSnapshot>,
-    /// `tool_call_id` of the currently focused sub-agent. When `Some`, the
+    /// Provider-neutral identity of the currently focused sub-agent. When `Some`, the
     /// main transcript area swaps to show that sub-agent's content instead
     /// of the root agent's (§27). Keyed by a stable `ToolCallKey` rather
     /// than a positional index so it survives any reordering of the derived
@@ -3435,7 +3576,10 @@ pub(crate) struct AgentState {
     ///
     /// The sub-agent list itself is NOT stored — see `subagents()`, which
     /// derives it from `tool_call_order` + `tool_calls`.
-    pub(crate) focused_subagent: Option<ToolCallKey>,
+    pub(crate) focused_subagent: Option<SubAgentKey>,
+    /// Read-only replay cache for Codex child threads. Claude Task subagents
+    /// remain self-contained tool calls and never enter this map.
+    pub(crate) subagent_transcripts: std::collections::HashMap<String, SubAgentTranscriptLoad>,
     /// Whether auto-scroll should follow new output. Defaults to `true`
     /// (pinned to bottom). Set to `false` when the user scrolls up in the
     /// transcript, re-enabled when they scroll back to the bottom or send
@@ -3645,12 +3789,35 @@ impl AgentState {
     /// carries the originating tool-call id, label, and status, all read
     /// live from the underlying `ToolCall`.
     pub(crate) fn subagents(&self) -> Vec<SubAgent> {
-        self.tools
+        let mut rows: Vec<SubAgent> = Vec::new();
+        let mut by_key: std::collections::HashMap<SubAgentKey, usize> =
+            std::collections::HashMap::new();
+        for call in self
+            .tools
             .order
             .iter()
             .filter_map(|id| self.tools.calls.get(id))
-            .filter_map(classify_subagent)
-            .collect()
+        {
+            let Some(candidate) = classify_subagent(call) else {
+                continue;
+            };
+            if let Some(index) = by_key.get(&candidate.key).copied() {
+                let row = &mut rows[index];
+                if row.prompt.is_none() {
+                    row.prompt = candidate.prompt;
+                }
+                if candidate.activity.as_deref() == Some("interrupted") {
+                    row.status = yalda::acp_channel::ToolCallStatus::Failed;
+                } else if row.status != yalda::acp_channel::ToolCallStatus::Failed {
+                    row.status = candidate.status;
+                }
+                row.activity = candidate.activity;
+            } else {
+                by_key.insert(candidate.key.clone(), rows.len());
+                rows.push(candidate);
+            }
+        }
+        rows
     }
 
     /// The selectable rows of one bottom-panel COLUMN, in render order. A column
@@ -3673,7 +3840,7 @@ impl AgentState {
                 if self.subagents_open {
                     self.subagents()
                         .into_iter()
-                        .map(|sa| PanelItem::Subagent(sa.tool_call_id))
+                        .map(|sa| PanelItem::Subagent(sa.key))
                         .collect()
                 } else {
                     Vec::new()
@@ -3851,6 +4018,7 @@ impl AgentState {
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             usage: None,
             focused_subagent: None,
+            subagent_transcripts: std::collections::HashMap::new(),
             tasklist_open: false,
             // Subagent panes auto-appear at the tile bottom when subagents exist;
             // Cmd-2 (ToggleSubagents) collapses them.
@@ -3933,6 +4101,7 @@ impl AgentState {
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             usage: None,
             focused_subagent: None,
+            subagent_transcripts: std::collections::HashMap::new(),
             tasklist_open: false,
             // Subagent panes auto-appear at the tile bottom when subagents exist;
             // Cmd-2 (ToggleSubagents) collapses them.
@@ -4727,9 +4896,10 @@ pub(crate) fn alloc_open_token() -> u64 {
     NEXT_OPEN_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// One agent conversation, owned centrally by [`AgentSessions`] (spec-agent-
-/// session-ownership.md). State that used to live in `AgentSlot.state` + the
-/// slot's binding fields now lives here, keyed by a stable [`SessionId`]; the
+/// One agent conversation in the project/session domain (spec-agent-session-
+/// ownership.md). [`AgentSessions`] is its normalized runtime store; workspace
+/// tiles are view references, not owners. State that used to live in
+/// `AgentSlot.state` + the slot's binding fields now lives here once, keyed by a stable [`SessionId`]; the
 /// `server_session_id` is owned by the store (not this struct), so there is one
 /// source of truth for the binding. Derefs to its inner [`AgentState`] so the
 /// many `slot.state.foo` bodies become `session.foo` with minimal churn.
@@ -4760,8 +4930,9 @@ impl std::ops::DerefMut for AgentSession {
     }
 }
 
-/// THE owner of agent-session state (spec-agent-session-ownership.md). Strict
-/// 1:1 session↔sid enforced by [`SessionStore`].
+/// The normalized owner of agent-session runtime state
+/// (spec-agent-session-ownership.md). Strict 1:1 session↔sid identity is
+/// enforced by [`SessionStore`]; project membership is resolved separately.
 ///
 /// The payload is an `Entity<AgentSession>` (not a bare `AgentSession`): per-
 /// session state lives in a GPUI entity so the framework's invalidation
@@ -4788,7 +4959,7 @@ pub(crate) struct PickerSession {
 }
 
 /// In-tile session chooser shown when an Agent tile has no `bound` session:
-/// it lists the FREE sessions (those no tile binds) plus a "start a new
+/// it lists the FREE sessions (those with no durable workspace reference) plus a "start a new
 /// session" row, so the user picks/rebinds instead of silently resuming.
 /// `bound == None` ⇒ the tile renders this picker; selecting a row binds the
 /// tile, after which `render_agent` renders the normal transcript.
@@ -4828,9 +4999,9 @@ impl SessionPicker {
 /// Option-soup let illegal combinations (bound-AND-picker, all-none,
 /// unavailable-while-bound) be constructed — the drift class of bug behind
 /// bug-0001. As an enum the compiler forces every consumer to handle each state
-/// and rejects the illegal ones. Strict 1:1 (a given `SessionId` is bound by at
-/// most one tile, INV-2) still holds; the session STATE lives in
-/// `YaldaGpuiView::sessions`, the tile holds only the key.
+/// and rejects the illegal ones. Session STATE lives in
+/// `YaldaGpuiView::sessions`; every workspace or direct viewport holds only the
+/// same lightweight key (UXI-JumpPanel-19).
 pub(crate) enum AgentTile {
     /// No session bound — the tile renders the free-session selector. The
     /// `SessionPicker` is the selector's transient cursor (row highlight) only.

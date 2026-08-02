@@ -44,11 +44,13 @@ panes' left edge at/right-of the compose right edge) +
 
 ### UXI-AgentTile-2 — A subagent is detected structurally and shown one-per-line
 
-**Statement.** Subagents are derived from the tool-call stream structurally (a
-`Task`/Think tool call carrying a spawn prompt; `TodoWrite`/`Read` excluded), not
-from a label heuristic, and rendered one row per subagent (status glyph + label +
-prompt snippet). Clicking a subagent row focuses its output (swaps the main view —
-see the transcript facet / INV-UX-15).
+**Statement.** Subagents are derived from provider structure, not labels, and
+rendered one row per logical child (status glyph + label + prompt snippet). Claude
+uses a `Task`/Think tool call carrying a spawn prompt (`TodoWrite`/`Read` excluded).
+Codex uses `_meta.codex.subagent`: its separate start/interact/interrupt activity
+calls are folded by child `threadId`, so one child never becomes duplicate rows.
+Clicking a subagent row focuses its output (swaps the main view — see the transcript
+facet / INV-UX-15).
 
 **Applies to.** `agent.rs::classify_subagent` / `AgentState::subagents`; the
 `subagent-panes` rows in `screens.rs::render_agent`.
@@ -59,7 +61,9 @@ regardless of tool naming.
 **Status.** `implemented`.
 
 **Enforcement.** `tests.rs::classify_subagent_detects_the_harness_task_shape`,
-`tests.rs::subagents_surfaces_registered_task_with_prompt`, and the PAINT proof in
+`tests.rs::subagents_surfaces_registered_task_with_prompt`,
+`tests.rs::codex_subagent_activity_is_classified_by_child_thread`,
+`tests.rs::codex_subagent_lifecycle_folds_to_one_row`, and the PAINT proof in
 UXI-AgentTile-1.
 
 ### UXI-AgentTile-3 — `Cmd-0` focuses the sidepanel; vim selects (2-D), Esc restores

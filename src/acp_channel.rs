@@ -579,8 +579,22 @@ pub const DEFAULT_CODEX_AGENT_FALLBACKS: &[&str] = &["codex-acp"];
 
 /// Command-name needles identifying an ACP adapter subprocess, for the
 /// orphan reaper. Covers the current binary + the legacy one.
-pub const ADAPTER_PROCESS_NEEDLES: &[&str] =
-    &["claude-agent-acp", "claude-code-acp", "codex-acp"];
+pub const ADAPTER_PROCESS_NEEDLES: &[&str] = &["claude-agent-acp", "claude-code-acp", "codex-acp"];
+
+/// Authentication variables Yalda must remove from an ACP adapter's inherited
+/// environment. `ANTHROPIC_API_KEY` is always private to Yalda's autonaming
+/// request: forwarding it can switch Claude/MCP integrations away from their
+/// interactive OAuth credentials. Codex keys retain their existing opt-in.
+pub fn agent_auth_env_vars_to_remove(
+    provider: AgentProvider,
+    allow_codex_api_key: bool,
+) -> Vec<&'static str> {
+    let mut vars = vec!["ANTHROPIC_API_KEY"];
+    if provider == AgentProvider::Codex && !allow_codex_api_key {
+        vars.extend(["OPENAI_API_KEY", "CODEX_API_KEY", "DEFAULT_AUTH_REQUEST"]);
+    }
+    vars
+}
 
 /// Parse `ps -axo pid=,ppid=,command=` output and return the PIDs of ORPHANED
 /// ACP adapter processes — those whose parent is PID 1 (the spawner died and the
@@ -652,6 +666,10 @@ pub fn reap_orphaned_adapters() -> usize {
 /// tighter, but the load future is opaque here; a generous total bound is the
 /// safe, simple choice that never falsely discards a recoverable session.)
 const SESSION_LOAD_TIMEOUT_SECS: u64 = 300;
+/// Child-thread inspection is user-initiated and read-only. It must fail fast
+/// enough to leave the UI usable; unlike durable session recovery it never
+/// falls back to creating a new session.
+const INSPECT_SESSION_LOAD_TIMEOUT_SECS: u64 = 30;
 
 /// Constructor seam for an [`AgentTransport`] (Phase 6, spec-session-server-actor
 /// §Rollout). The pump thread never builds the client — the session-server's
@@ -1053,6 +1071,45 @@ impl AcpChannelClient {
         resume_session_id: Option<String>,
         frontend: YaldaFrontend,
     ) -> io::Result<Self> {
+        Self::spawn_with_resume_policy_in_for(
+            provider,
+            command_str,
+            cwd,
+            resume_session_id,
+            frontend,
+            false,
+        )
+    }
+
+    /// Open an existing ACP session for read-only replay without ever falling
+    /// back to `session/new`. This is used for Codex child-agent threads: a
+    /// stale child id should show "unavailable", not silently create an empty
+    /// replacement thread merely because the inspector tried to open it.
+    pub fn spawn_resume_only_in_for(
+        provider: AgentProvider,
+        command_str: &str,
+        cwd: Option<PathBuf>,
+        resume_session_id: String,
+        frontend: YaldaFrontend,
+    ) -> io::Result<Self> {
+        Self::spawn_with_resume_policy_in_for(
+            provider,
+            command_str,
+            cwd,
+            Some(resume_session_id),
+            frontend,
+            true,
+        )
+    }
+
+    fn spawn_with_resume_policy_in_for(
+        provider: AgentProvider,
+        command_str: &str,
+        cwd: Option<PathBuf>,
+        resume_session_id: Option<String>,
+        frontend: YaldaFrontend,
+        resume_only: bool,
+    ) -> io::Result<Self> {
         let candidates: Vec<String> = if command_str.trim().is_empty() {
             let fallbacks = match provider {
                 AgentProvider::Claude => DEFAULT_AGENT_FALLBACKS,
@@ -1078,6 +1135,7 @@ impl AcpChannelClient {
                 cwd.clone(),
                 resume_session_id.clone(),
                 frontend,
+                resume_only,
             ) {
                 Ok(client) => return Ok(client),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -1099,6 +1157,7 @@ impl AcpChannelClient {
                     cwd.clone(),
                     resume_session_id.clone(),
                     frontend,
+                    resume_only,
                 ) {
                     Ok(client) => return Ok(client),
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -1139,6 +1198,7 @@ impl AcpChannelClient {
         cwd: Option<PathBuf>,
         resume_session_id: Option<String>,
         frontend: YaldaFrontend,
+        resume_only: bool,
     ) -> io::Result<Self> {
         let cwd =
             cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
@@ -1210,6 +1270,7 @@ impl AcpChannelClient {
                     cancel_rx,
                     frontend,
                     provider,
+                    resume_only,
                 );
             })?;
 
@@ -1740,6 +1801,7 @@ fn run_worker(
     cancel_rx: futures::channel::mpsc::UnboundedReceiver<()>,
     frontend: YaldaFrontend,
     provider: AgentProvider,
+    resume_only: bool,
 ) {
     // Build a small multi-thread runtime — the ACP crate spawns several
     // tasks internally (read loop, write loop, response router) and a
@@ -1776,6 +1838,7 @@ fn run_worker(
             cancel_rx,
             frontend,
             provider,
+            resume_only,
         )
         .await
     });
@@ -1808,6 +1871,7 @@ async fn worker_async(
     mut cancel_rx: futures::channel::mpsc::UnboundedReceiver<()>,
     frontend: YaldaFrontend,
     provider: AgentProvider,
+    resume_only: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 1) Spawn the agent process.
     let mut cmd = tokio::process::Command::new(&parts[0]);
@@ -1832,15 +1896,12 @@ async fn worker_async(
     // CLAUDE_CODE_* vars (SESSION_ID, ENTRYPOINT, etc.) are passed through
     // since the agent may key behavior off them.
     cmd.env_remove("CLAUDECODE");
-    // Codex sessions use the interactive ChatGPT login cached by `codex login`.
-    // Do not let an ambient API key silently switch the adapter onto metered API
-    // billing. Advanced users can opt back into API-key auth explicitly.
-    if provider == AgentProvider::Codex
-        && std::env::var("YALDA_CODEX_ALLOW_API_KEY").as_deref() != Ok("1")
-    {
-        cmd.env_remove("OPENAI_API_KEY");
-        cmd.env_remove("CODEX_API_KEY");
-        cmd.env_remove("DEFAULT_AUTH_REQUEST");
+    // Keep Yalda-only credentials out of the adapter and every MCP process it
+    // launches. Codex sessions also default to interactive ChatGPT login rather
+    // than ambient metered API keys; advanced users can opt back into those.
+    let allow_codex_api_key = std::env::var("YALDA_CODEX_ALLOW_API_KEY").as_deref() == Ok("1");
+    for key in agent_auth_env_vars_to_remove(provider, allow_codex_api_key) {
+        cmd.env_remove(key);
     }
     // Reasoning depth is intentionally NOT configured here. The adapter/SDK
     // already default to adaptive thinking at effort "high", so a raw
@@ -1863,8 +1924,9 @@ async fn worker_async(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
+            let kind = e.kind();
             let _ = ready_tx.send(Err(io::Error::new(
-                io::ErrorKind::NotFound,
+                kind,
                 format!("failed to spawn '{}': {}", parts[0], e),
             )));
             return Ok(());
@@ -2282,6 +2344,13 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                     // resumed sessions). We emit it AFTER the marker below so it
                     // is always a live, post-fence event.
                     let mut model_events: Vec<ReplyEvent> = Vec::new();
+                    if resume_only && resume_session_id.is_some() && !supports_load {
+                        let _ = ready_tx.send(Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "ACP agent does not support loading an existing session",
+                        )));
+                        return Ok(());
+                    }
                     let session_id: SessionId = if let (true, Some(id)) =
                         (supports_load, resume_session_id.as_ref())
                     {
@@ -2302,8 +2371,13 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                         // transcript is preserved (durable WAL); only the agent's
                         // resumed context is lost — identical to the error path.
                         let load_fut = connection.send_request(load_req).block_task();
-                        let loaded = match tokio::time::timeout(
-                            std::time::Duration::from_secs(SESSION_LOAD_TIMEOUT_SECS),
+                        let load_timeout_secs = if resume_only {
+                            INSPECT_SESSION_LOAD_TIMEOUT_SECS
+                        } else {
+                            SESSION_LOAD_TIMEOUT_SECS
+                        };
+                        let (loaded, load_failure) = match tokio::time::timeout(
+                            std::time::Duration::from_secs(load_timeout_secs),
                             load_fut,
                         )
                         .await
@@ -2316,23 +2390,35 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                                 if let Some(opts) = &resp.config_options {
                                     model_events = model_reply_events(opts);
                                 }
-                                true
+                                (true, None)
                             }
                             Ok(Err(e)) => {
                                 acp_debug!(
                                     "session/load failed ({e}); falling back to session/new"
                                 );
-                                false
+                                (false, Some(short_err(&e)))
                             }
                             Err(_elapsed) => {
                                 acp_debug!(
-                                    "session/load timed out after {SESSION_LOAD_TIMEOUT_SECS}s; falling back to session/new"
+                                    "session/load timed out after {load_timeout_secs}s; falling back to session/new"
                                 );
-                                false
+                                (
+                                    false,
+                                    Some(format!(
+                                        "timed out after {load_timeout_secs}s"
+                                    )),
+                                )
                             }
                         };
                         if loaded {
                             SessionId::new(id.clone())
+                        } else if resume_only {
+                            let detail = load_failure
+                                .unwrap_or_else(|| "unknown load failure".to_string());
+                            let _ = ready_tx.send(Err(io::Error::other(format!(
+                                "ACP session/load failed: {detail}"
+                            ))));
+                            return Ok(());
                         } else {
                             match connection
                                 .send_request(
@@ -2881,6 +2967,28 @@ mod tests {
         assert!(!pids.contains(&7000), "a live (owned) adapter must be spared");
         // 6000 is orphaned but not an adapter → never killed.
         assert!(!pids.contains(&6000), "a non-adapter orphan must be spared");
+    }
+
+    #[test]
+    fn anthropic_key_is_never_forwarded_to_agent_or_mcp_processes() {
+        assert_eq!(
+            agent_auth_env_vars_to_remove(AgentProvider::Claude, false),
+            vec!["ANTHROPIC_API_KEY"]
+        );
+        assert!(
+            agent_auth_env_vars_to_remove(AgentProvider::Codex, true)
+                .contains(&"ANTHROPIC_API_KEY"),
+            "the private Anthropic autonaming key must be scrubbed for every provider"
+        );
+        assert_eq!(
+            agent_auth_env_vars_to_remove(AgentProvider::Codex, false),
+            vec![
+                "ANTHROPIC_API_KEY",
+                "OPENAI_API_KEY",
+                "CODEX_API_KEY",
+                "DEFAULT_AUTH_REQUEST"
+            ]
+        );
     }
 
     /// The escalation contract: explicit Yolo DOES allow shell execution.

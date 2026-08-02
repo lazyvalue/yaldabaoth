@@ -96,6 +96,7 @@ fn info(sid: &str, label: &str, cwd: PathBuf) -> SessionInfo {
         connected: false,
         permission_mode: PermissionMode::ReadOnly,
         busy: false,
+        archived: false,
     }
 }
 

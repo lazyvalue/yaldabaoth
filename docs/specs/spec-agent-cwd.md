@@ -60,17 +60,20 @@ The spec introduces no new artifacts. It extends three existing ones and fixes o
 
 ### Display
 
-6. **Status Strip cwd field. [DRAFT]** The Status Strip (`spec-agent-window.md` §30) gains a cwd field. **Field order** (left to right): agent label → sub-agent breadcrumb (when focused, per `spec-agent-window.md` §27) → **cwd** → model id → permission mode → context-window usage → cumulative cost → turn/elapsed. The cwd sits between any sub-agent breadcrumb and the model id so it always reads as "where this agent operates" — adjacent to the agent's identity, not to its tokens.
+6. **Status Strip location row. [IMPLEMENTED]** The Status Strip
+   (`spec-agent-window.md` §30) ends with a dedicated location row. A linked Git
+   worktree renders as `WORKTREE <directory-name>`; any other location renders as
+   `CWD <shortened-path>`. The `CWD` prefix is bold.
 
     ```
-     claude-1   ~/ws/yalda   sonnet-4-7   auto-edit   12.3k / 200k (6%)   $0.18   turn 4 · 0:14
+     CWD ~/ws/yalda
     ```
 
     The displayed string is the shortened form of `slot.cwd`:
 
     - If the cwd starts with `$HOME`, the prefix is replaced with `~`.
     - If the resulting string is longer than 32 chars, the middle is elided with `…` so the leading two and trailing two path segments remain (e.g., `~/ws/some-very-long-project-name/…/src/components`).
-    - If the cwd matches the process cwd exactly, the field renders nothing — the process cwd is the implicit default and surfacing it on every session is visual noise. (This decision is reversible — if the user wants to always see cwd, a future option flips it on.)
+    - The location row is always visible, including when the cwd matches the process cwd.
 
     Hovering the cwd field shows the full absolute path. Clicking the cwd field has no effect in v1 (`:claude-cd` is the only path to change it).
 

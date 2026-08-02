@@ -448,9 +448,9 @@ pub(crate) fn doc_styled_line_element(
 
     // Wrap in InteractiveText so we can attach an on_click handler. A click
     // routes through `classify_link`: an external URL opens in the default
-    // browser (`open_external_link`), a note/local link navigates the focused
-    // tile to the file (`open_wiki_link`). View reached via the weak handle
-    // captured in RenderCtx.
+    // browser (`open_external_link`), while a note/local Markdown link opens
+    // the file in a new buffer tile (`open_wiki_link`). View reached via the
+    // weak handle captured in RenderCtx.
     let weak = match &ctx.weak_view {
         Some(w) => w.clone(),
         None => return styled.into_any_element(),
@@ -469,12 +469,13 @@ pub(crate) fn doc_styled_line_element(
             };
             let target = target.clone();
             let doc_dir = doc_dir.clone();
-            let _ = weak.update(app, |view, cx| match classify_link(&target) {
-                LinkTarget::External(url) => view.open_external_link(&url, cx),
-                LinkTarget::Wiki(t) => view.open_wiki_link(&t, doc_dir.as_deref(), cx),
+            let _ = weak.update(app, |view, cx| {
+                view.open_link_target(&target, doc_dir.as_deref(), cx);
             });
         })
         .into_any_element();
+    #[cfg(test)]
+    let el = probe_bounds_dyn(format!("doc-link-{block_idx}-{line_idx}"), el);
     register_line_on_paint(el, sink, key, layout)
 }
 
@@ -1889,8 +1890,9 @@ pub(crate) const WIKI_LINK_PREFIX: &str = "wiki:";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LinkTarget {
     /// An internal note / local-file reference — resolved relative to the doc
-    /// dir and opened in-app by `open_wiki_link`. Covers `wiki:`-prefixed
-    /// `[[note]]` links AND scheme-less / relative markdown links (`./a.md`).
+    /// dir and opened in a new in-app buffer tile by `open_wiki_link`. Covers
+    /// `wiki:`-prefixed `[[note]]` links AND scheme-less / relative markdown
+    /// links (`./a.md`).
     Wiki(String),
     /// An external URL — opened in the OS default handler by
     /// `open_external_link`. Restricted to `http`/`https`/`mailto` so `open`
@@ -1916,6 +1918,73 @@ pub(crate) fn classify_link(raw: &str) -> LinkTarget {
         return LinkTarget::External(t.to_string());
     }
     LinkTarget::Wiki(t.to_string())
+}
+
+/// Turn a local Markdown destination into a filesystem spelling:
+/// - `file:///tmp/a.md` → `/tmp/a.md`
+/// - `%20` and other percent escapes are decoded
+/// - `#heading` / `?query` and Codex-style `:line[:column]` suffixes are
+///   removed because they are navigation metadata, not part of the path.
+pub(crate) fn normalize_local_link_target(raw: &str) -> String {
+    let mut target = raw.trim();
+    if target.starts_with('<') && target.ends_with('>') && target.len() >= 2 {
+        target = &target[1..target.len() - 1];
+    }
+    if let Some(path) = target.strip_prefix("file://") {
+        target = path.strip_prefix("localhost").unwrap_or(path);
+    }
+    if let Some(end) = target.find(['#', '?']) {
+        target = &target[..end];
+    }
+
+    let mut decoded = percent_decode_path(target);
+    if !std::path::Path::new(&decoded).is_file() {
+        decoded = strip_source_position_suffix(&decoded).to_string();
+    }
+    decoded
+}
+
+fn percent_decode_path(raw: &str) -> String {
+    fn hex(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && let (Some(&hi), Some(&lo)) = (bytes.get(i + 1), bytes.get(i + 2))
+            && let (Some(hi), Some(lo)) = (hex(hi), hex(lo))
+        {
+            out.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn strip_source_position_suffix(path: &str) -> &str {
+    let Some((before_last, last)) = path.rsplit_once(':') else {
+        return path;
+    };
+    if !last.chars().all(|ch| ch.is_ascii_digit()) {
+        return path;
+    }
+    if let Some((before_line, line)) = before_last.rsplit_once(':')
+        && line.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return before_line;
+    }
+    before_last
 }
 
 /// Map a file extension to a syntect language token. Returns `None` for

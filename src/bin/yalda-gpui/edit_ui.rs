@@ -190,23 +190,24 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
-    /// Resolve a wiki link target (e.g. `notes`, `subdir/topic`) against
-    /// the source doc's directory and replace the focused tile with the
-    /// resulting Doc. Lookup order:
+    /// Resolve a wiki/local Markdown link target (e.g. `notes`,
+    /// `subdir/topic.md`) against the source doc's directory and open the
+    /// resulting Doc in a new buffer tile beside the source. Lookup order:
     ///   1. `<doc_dir>/<target>.md` — markdown convention; matches what
     ///      Obsidian / Foam / most wiki-aware editors do.
     ///   2. `<doc_dir>/<target>` — literal path, in case the user included
     ///      the extension already (or wants a non-md file).
     ///
-    /// If neither exists, log to stderr and no-op (the tile stays put;
-    /// nothing to navigate to).
+    /// If neither exists, log to stderr and no-op (the source tile stays put;
+    /// nothing opens).
     pub(crate) fn open_wiki_link(
         &mut self,
         target: &str,
         doc_dir: Option<&std::path::Path>,
         cx: &mut Context<Self>,
     ) {
-        let target = target.trim();
+        let normalized = normalize_local_link_target(target);
+        let target = normalized.trim();
         if target.is_empty() {
             return;
         }
@@ -231,34 +232,37 @@ impl YaldaGpuiView {
             eprintln!("wiki link: no file found for [[{}]]", target);
             return;
         };
-        let canon = path
-            .canonicalize()
-            .unwrap_or_else(|_| path.clone())
-            .display()
-            .to_string();
-        let label: SharedString = canon.into();
-        // 5c: bind the wiki-link target Doc to its pooled core (dedup by path),
-        // so it shares text/undo with any Edit view and live-tracks.
-        let (buf_id, core) = match self.workspace.open_and_retain(&path) {
-            Ok(pair) => pair,
-            Err(err) => {
-                eprintln!("wiki link: cannot open {}: {err}", path.display());
-                return;
-            }
+        // Build through the shared-buffer path, then add a distinct tile
+        // instead of replacing the document containing the clicked link.
+        let Some(content) = self.make_doc_content(&path) else {
+            return;
         };
-        let blocks = render_with_wiki(
-            &core.borrow().document().full_text(),
-            &self.theme,
-            Some(&path),
-        );
-        self.set_screen(App::Buffer(BufferApp::Viewing(DocState::viewing(
-            blocks,
-            label,
-            Some(DocSource::new(buf_id, core)),
-        ))));
+        if self
+            .workspace
+            .split_focused(workspace::SplitDir::V, content)
+            .is_none()
+        {
+            return;
+        }
+        self.workspace.retile_active();
         self.doc_selection = None;
         self.save_workspace_state();
         cx.notify();
+    }
+
+    /// Dispatch one rendered Markdown link. Web/mail links use the OS default
+    /// handler; local links resolve against `base_dir` and open in a new buffer
+    /// tile. Shared by document and agent-transcript click handlers.
+    pub(crate) fn open_link_target(
+        &mut self,
+        target: &str,
+        base_dir: Option<&std::path::Path>,
+        cx: &mut Context<Self>,
+    ) {
+        match classify_link(target) {
+            LinkTarget::External(url) => self.open_external_link(&url, cx),
+            LinkTarget::Wiki(path) => self.open_wiki_link(&path, base_dir, cx),
+        }
     }
 
     /// Open an external URL in the OS default handler (on macOS `open <url>` →

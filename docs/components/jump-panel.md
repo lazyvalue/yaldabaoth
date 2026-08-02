@@ -954,10 +954,10 @@ control into two aligned rows returned it to green.
 remains the tab target; the Jump Panel owns the requested 2×2 group layout and
 its internal vertical and horizontal hairlines.
 
-### UXI-JumpPanel-16 — Sessions can be archived without changing live activity
+### UXI-JumpPanel-16 — Archived sessions enter durable cold storage
 
-**Statement.** Archiving is a durable visibility flag on a server-backed agent
-session, not a third operational activity:
+**Statement.** Archiving is a durable server-owned lifecycle state on a
+server-backed agent session, not a third operational activity:
 
 - an archived session is absent from Waiting, Working, All, and the `Cmd-P`
   jump palette;
@@ -966,33 +966,53 @@ session, not a third operational activity:
 - archiving, unarchiving, and live activity changes never move that durable
   slot, so unarchiving restores the row to All and to whichever one of Waiting
   or Working currently applies;
-- an active archived session remains open and usable even though ordinary
-  navigation lists hide it;
+- archiving immediately unbinds every workspace tile showing that session and
+  leaves each tile on its ordinary live session picker;
+- after fsyncing the archive marker, the session server cancels any in-flight
+  turn, fences and drops the ACP pump/transport, clears queued prompts and its
+  live forwarder, and closes the WAL file descriptor. The WAL file and rebuilt
+  in-memory transcript remain intact;
+- server restart recovers archived metadata and transcript without spawning an
+  ACP adapter or opening that session's WAL for append;
+- unarchiving reopens the same WAL, fsyncs the live marker, and resumes the last
+  ACP session id. Prompt, restart, and model-change requests are rejected while
+  the session remains archived;
+- selecting the session explicitly from the **Archived** jump-panel tab opens
+  the preserved transcript read-only in a bare ephemeral agent view. This
+  direct visit does not unarchive it or add it to any tile picker;
 - the active agent's `<space>` menu offers exactly one contextual action:
   **archive session** or **unarchive session**;
 - right-clicking a jump-panel session row opens a cursor-anchored context menu
   with that same contextual action. `Esc` or click-away dismisses it.
 
-The flag is keyed by stable server sid and persisted with preferences. A
-session that does not yet have a sid cannot be archived; its local menu action
-is disabled and it has no archivable jump-row identity. `/clear` succession
-migrates the flag from the predecessor sid to the replacement sid alongside the
-existing durable order-slot migration.
+The state is keyed by stable server sid and persisted in that session's WAL.
+`Preferences::jump_archived_sessions` remains a GUI projection/order aid; at
+upgrade, its legacy GUI-only flags are migrated into server state before the
+first roster snapshot is adopted. A session that does not yet have a sid cannot
+be archived; its local menu action is disabled and it has no archivable
+jump-row identity. `/clear` succession migrates the projected flag from the
+predecessor sid to the replacement sid alongside the existing durable
+order-slot migration.
 
 **Applies to.** `jump_panel_view.rs` (`JumpAgentTab`, session projections,
-session-row right click), `jump_palette.rs` (candidate projection), `main.rs`
-(durable archive set, local-menu command, session context-menu overlay),
-`agent_ui.rs` (`/clear` identity succession), and `persist.rs`
-(`Preferences::jump_archived_sessions`).
+session-row right click, archive request and acknowledged local projection),
+`jump_palette.rs` (candidate projection), `main.rs` (projected archive set,
+local-menu command, session context-menu overlay), `agent_ui.rs` (roster
+migration, `SessionArchived` reduction, `show_pickers_for_session`, direct
+`jump_to_session`, `/clear` identity succession), `session_proto.rs`,
+`session_client.rs`, `session_wal.rs`, and `yalda-session-server/main.rs`.
 
 **Why.** Long-lived session histories need to leave everyday navigation without
-being killed or losing their curated position. Keeping archive orthogonal to
-activity prevents it from becoming a misleading replacement for Waiting or
-Working.
+being deleted or losing their curated position, but hidden sessions must not
+retain a subprocess and file descriptor indefinitely. Keeping archive
+orthogonal to activity prevents it from becoming a misleading replacement for
+Waiting or Working while giving it an explicit resource boundary.
 
-**Status.** `implemented` — archive state, filtering, persistence, both command
-surfaces, and painted-row interaction are headless-guarded. Exact visual balance
-of the four-tab strip and cursor-anchored popup remains harness gap #1.
+**Status.** `implemented` — server-owned cold archive, durable migration,
+resource release, filtering, immediate tile-to-picker transition, read-only
+transcript revisit, both command surfaces, and painted-row interaction are
+guarded. Exact visual balance of the four-tab strip and cursor-anchored popup
+remains harness gap #1.
 
 **Enforcement.**
 `verify_harness.rs::jump_session_archive_filters_tabs_palette_and_persists`
@@ -1003,6 +1023,11 @@ snapshot.
 drives the dynamic `<space>` menu command plus actual right-click and click
 events against the painted session row and context-menu item. It also proves a
 sid-less local session cannot be archived.
+`archive_unbinds_tiles_but_direct_jump_reopens_the_transcript` drives the shared
+archive mutator on a real bound session, proves its tile immediately becomes a
+picker without dropping the session or transcript, then drives the real local
+jump-panel dispatch and proves the transcript opens normally in an ephemeral
+view.
 `clear_keeps_the_sessions_jump_panel_slot` proves `/clear` migrates both the
 durable order slot and archive identity.
 

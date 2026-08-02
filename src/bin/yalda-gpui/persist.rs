@@ -583,8 +583,9 @@ pub(crate) struct Preferences {
     /// list suffices. `None`/absent = by-label (the default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) jump_session_order: Option<Vec<String>>,
-    /// Server session ids hidden from everyday jump navigation. Archive is a
-    /// durable visibility flag, independent of the session's live activity.
+    /// Local projection/cache of server session ids in durable cold archive.
+    /// The WAL-backed server bit is authoritative; this preserves navigation
+    /// before the first roster seed and migrates preferences from older builds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) jump_archived_sessions: Option<Vec<String>>,
     /// Folded jump-panel projects, keyed by durable project name (ProjectId is
@@ -1756,8 +1757,22 @@ thread_local! {
     pub(crate) static VIEW_MODEL_REBUILDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Load `.env` from the current directory (walking up to the filesystem root)
-/// into the process environment, for `UXI-AgentTile-27`'s `ANTHROPIC_API_KEY`.
+/// Private `.env` credential used by session autonaming. Unlike ordinary
+/// `.env` entries it is never copied into Yalda's process environment, so
+/// Claude/MCP subprocesses cannot accidentally treat it as their auth mode.
+static DOTENV_ANTHROPIC_API_KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub(crate) fn dotenv_anthropic_api_key() -> Option<String> {
+    DOTENV_ANTHROPIC_API_KEY.get().cloned()
+}
+
+pub(crate) fn is_private_dotenv_key(key: &str) -> bool {
+    key == "ANTHROPIC_API_KEY"
+}
+
+/// Load `.env` from the current directory (walking up to the filesystem root).
+/// Ordinary entries enter the process environment for compatibility.
+/// `ANTHROPIC_API_KEY` is retained privately for autonaming instead of exported.
 ///
 /// Deliberately tiny — no new dependency for `KEY=value`. Three rules:
 /// **real environment variables always win** (a `.env` never overrides what the
@@ -1782,6 +1797,12 @@ pub(crate) fn load_dotenv() {
         return;
     };
     for (key, value) in parse_dotenv(&contents) {
+        if is_private_dotenv_key(&key) {
+            if std::env::var_os(&key).is_none() && !value.trim().is_empty() {
+                let _ = DOTENV_ANTHROPIC_API_KEY.set(value);
+            }
+            continue;
+        }
         // SAFETY: single-threaded startup, before any thread is spawned.
         if std::env::var_os(&key).is_none() {
             unsafe { std::env::set_var(&key, &value) };

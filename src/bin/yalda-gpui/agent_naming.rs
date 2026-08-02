@@ -276,12 +276,13 @@ pub(crate) fn parse_naming_reply(reply: &str) -> SessionNaming {
     }
 }
 
-/// Read `ANTHROPIC_API_KEY` from the environment. `None` (rather than an error)
-/// when unset — autonaming fails silently by design (`UXI-AgentTile-27`
-/// property 4).
+/// Read Yalda's private autonaming credential. A real launch environment value
+/// wins over `.env`; the `.env` fallback is held in memory and never re-exported
+/// into the process environment. `None` when unset.
 pub(crate) fn naming_api_key() -> Option<String> {
     std::env::var("ANTHROPIC_API_KEY")
         .ok()
+        .or_else(crate::dotenv_anthropic_api_key)
         .map(|k| k.trim().to_string())
         .filter(|k| !k.is_empty())
 }

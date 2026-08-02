@@ -137,7 +137,9 @@ pub(crate) use gpui::{
     actions, div, img, point, px, rgb, rgba, size,
 };
 
-pub(crate) use yalda::acp_channel::{AcpChannelClient, AgentProvider};
+pub(crate) use yalda::acp_channel::{
+    AcpChannelClient, AgentProvider, ReplyEvent, YaldaFrontend,
+};
 pub(crate) use yalda::blocks::{ColumnAlignment, ListItem, RenderedBlock, StyledLine, StyledSpan};
 pub(crate) use yalda::cursor::CursorPos;
 pub(crate) use yalda::document::Document;
@@ -2585,8 +2587,9 @@ impl YaldaGpuiView {
 
     /// THE single bind choke (spec-agent-session-ownership.md). Show the
     /// session for `sid` in the focused tile, creating it via `make` if no
-    /// session already carries that sid. If a session already exists for the
-    /// sid it is FOCUSED (its `bound` reused), never bound twice (INV-1/INV-2).
+    /// session entity already carries that sid. This placement-oriented entry
+    /// point focuses an existing durable reference; direct navigation uses
+    /// `jump_to_session` to create an ephemeral reference (INV-1/INV-2).
     /// Returns the `SessionId` now bound to the focused tile.
     ///
     /// This is the choke for paths that know the sid UP FRONT. Paths whose sid
@@ -8444,9 +8447,9 @@ fn main() {
     // reparented to PID 1). Graceful exits reap via kill_on_drop; this catches
     // the crash/SIGKILL path that accumulated ~70 idle adapters over weeks.
     let _ = yalda::acp_channel::reap_orphaned_adapters();
-    // Load `.env` (gitignored) BEFORE anything reads the environment, so
-    // `ANTHROPIC_API_KEY` for session autonaming (UXI-AgentTile-27) can live in
-    // the repo root instead of the launching shell. Real env vars always win.
+    // Load `.env` (gitignored) BEFORE anything reads configuration. The
+    // autonaming ANTHROPIC_API_KEY is retained privately rather than exported
+    // into Yalda's environment (and therefore agent/MCP subprocesses).
     load_dotenv();
     // Relocate state written by older builds under <cache_dir>/yalda into the
     // durable `~/.yalda` home (ADR-0018), BEFORE any persisted state (prefs,

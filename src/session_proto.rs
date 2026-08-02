@@ -131,6 +131,15 @@ pub enum Request {
         label: String,
     },
 
+    /// Move a session between the live and cold archived lifecycle states.
+    /// Archived sessions retain their durable transcript but own no ACP
+    /// transport or open WAL descriptor.
+    #[serde(rename = "set_archived")]
+    SetArchived {
+        session_id: ServerSessionId,
+        archived: bool,
+    },
+
     /// Diagnostic snapshot of every managed session's live server-side state
     /// (ownership, subscribers, channel generation, etc.). Additive,
     /// read-only — no breaking changes to existing verbs.
@@ -208,6 +217,9 @@ pub struct SessionInfo {
     /// deserialize failure that breaks the whole session list.
     #[serde(default)]
     pub busy: bool,
+    /// Cold-storage lifecycle state. Additive for older servers/clients.
+    #[serde(default)]
+    pub archived: bool,
 }
 
 /// Diagnostic snapshot of the server's live session state (response to
@@ -243,6 +255,12 @@ pub struct AdminSessionInfo {
     pub subscriber_count: usize,
     pub channel_generation: u64,
     pub permission_mode: PermissionMode,
+    #[serde(default)]
+    pub archived: bool,
+    /// Whether the append handle is currently retained by the server. Archived
+    /// sessions should report false while their on-disk file remains intact.
+    #[serde(default)]
+    pub wal_open: bool,
 }
 
 // ── Server → GUI notifications (no response expected) ──────────────
@@ -351,6 +369,14 @@ pub enum Notification {
     SessionRenamed {
         session_id: ServerSessionId,
         label: String,
+    },
+
+    /// A session entered or left cold archive. Broadcast to every GUI so
+    /// navigation projections share one authoritative lifecycle state.
+    #[serde(rename = "session_archived")]
+    SessionArchived {
+        session_id: ServerSessionId,
+        archived: bool,
     },
 
     /// The server REFUSED a prompt (lease not held). Sent only to the

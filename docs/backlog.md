@@ -145,12 +145,13 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
   archived from the <space> command menu. If I am on an archived session, I
   should be able to flag it as unarchived. Right clicking on a session should in
   the jump panel should present a context menu. This should allow me to
-  archive/unarchive."* Scoped as a durable visibility flag orthogonal to live
-  Waiting/Working activity: archived sessions appear only in Archived, retain
-  their custom All slot, and return to the correct live tab when restored.
-  Both controls operate on the same server-sid-keyed flag. State, persistence,
-  menu dispatch, and painted-row interaction are headless-verified; only final
-  visual judgment of the four-tab strip and cursor popup remains runtime gap #1.
+  archive/unarchive."* Implemented as a durable server-owned cold lifecycle
+  orthogonal to Waiting/Working: archived sessions appear only in Archived,
+  retain their custom All slot, close their ACP transport and WAL descriptor,
+  and return to the correct live tab after resume. Legacy preference flags are
+  migrated into WAL state. State, persistence, resource release, menu dispatch,
+  and painted-row interaction are headless-verified; only final visual judgment
+  of the four-tab strip and cursor popup remains runtime gap #1.
 
 - **Closing a free session lands in the SAME project** — `NEEDS-RUNTIME` (branch
   `free-close-same-project`, 2026-07-24; amends `UXI-Workspace-9` clause 2).

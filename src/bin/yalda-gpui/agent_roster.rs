@@ -4,7 +4,8 @@
 //! keyed by server sid.
 //!
 //! It is a mirror of server truth: seeded by `list_sessions` at connect and
-//! kept live by the `SessionCreated` / `SessionClosed` / `SessionRenamed`
+//! kept live by the `SessionCreated` / `SessionClosed` / `SessionRenamed` /
+//! `SessionArchived`
 //! broadcasts the server already pushes (`apply_server_batch`, agent_ui.rs).
 //! Both the jump panel's "Agent sessions" section and the per-tile session
 //! selector render as **read-only projections** of this one roster, so a
@@ -93,6 +94,18 @@ impl AgentRoster {
         match self.by_sid.get_mut(sid) {
             Some(info) if info.connected != connected => {
                 info.connected = connected;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Update a session's server-authoritative cold-storage state. Archived
+    /// sessions remain roster entries, but no longer own a live ACP transport.
+    pub(crate) fn set_archived(&mut self, sid: &str, archived: bool) -> bool {
+        match self.by_sid.get_mut(sid) {
+            Some(info) if info.archived != archived => {
+                info.archived = archived;
                 true
             }
             _ => false,

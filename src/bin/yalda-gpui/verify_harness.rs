@@ -176,6 +176,105 @@ fn browser_start_dir_resolution(cx: &mut TestAppContext) {
     let _ = std::fs::remove_file(&file);
 }
 
+/// Clicking a local Markdown link must keep the source document open and add
+/// the target as a distinct, focused buffer tile. Drives real mouse dispatch
+/// through the rendered `InteractiveText`, not the navigation method directly.
+#[gpui::test]
+fn local_markdown_link_opens_new_buffer_tile(cx: &mut TestAppContext) {
+    use crate::{App, BufferApp};
+    use gpui::{Modifiers, point, px};
+
+    let dir =
+        std::env::temp_dir().join(format!("yalda-local-markdown-link-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create link fixture dir");
+    let source = dir.join("source.md");
+    let target = dir.join("target.md");
+    std::fs::write(&source, "[target](target.md)\n").expect("write source fixture");
+    std::fs::write(&target, "# Target\n").expect("write target fixture");
+
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+    view.update(vcx, |view, _| {
+        assert!(view.open_file(source.clone()), "open source fixture");
+        view.splash_until = None;
+    });
+    for _ in 0..2 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+
+    let source_id = view.read_with(vcx, |v, _| {
+        v.workspace.focused_window_id().expect("source tile")
+    });
+
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let (_, _, w, h) =
+        crate::layout_probe_get("doc-link-0-0").expect("Markdown link did not paint");
+    crate::layout_probe_end();
+    assert!(
+        w > 0.0 && h > 0.0,
+        "Markdown link painted no clickable area"
+    );
+
+    let at = view.read_with(vcx, |v, _| {
+        let bounds = v
+            .line_layouts
+            .borrow()
+            .get(&(0, 0))
+            .expect("link text layout")
+            .bounds();
+        point(
+            bounds.left() + px(2.0),
+            bounds.top() + bounds.size.height / 2.0,
+        )
+    });
+    vcx.simulate_mouse_move(at, None, Modifiers::default());
+    vcx.simulate_click(at, Modifiers::default());
+    vcx.run_until_parked();
+
+    view.read_with(vcx, |v, _| {
+        let workspace = v.workspace.active_workspace().expect("active workspace");
+        let leaves = workspace.layout.leaf_ids();
+        assert_eq!(leaves.len(), 2, "link click must add one buffer tile");
+        assert!(
+            leaves.contains(&source_id),
+            "the source tile must remain in the workspace"
+        );
+        assert_ne!(
+            workspace.focused, source_id,
+            "focus must move to the linked document"
+        );
+
+        let source_label = match &workspace.layout.find_leaf(source_id).unwrap().content {
+            App::Buffer(BufferApp::Viewing(doc)) => doc.file_label.as_ref(),
+            _ => panic!("source tile is no longer a viewed buffer"),
+        };
+        assert_eq!(
+            source_label,
+            source.canonicalize().unwrap().display().to_string()
+        );
+
+        let target_label = match &workspace
+            .layout
+            .find_leaf(workspace.focused)
+            .expect("target tile")
+            .content
+        {
+            App::Buffer(BufferApp::Viewing(doc)) => doc.file_label.as_ref(),
+            _ => panic!("linked document did not open as a viewed buffer"),
+        };
+        assert_eq!(
+            target_label,
+            target.canonicalize().unwrap().display().to_string()
+        );
+    });
+
+    let _ = std::fs::remove_file(&source);
+    let _ = std::fs::remove_file(&target);
+    let _ = std::fs::remove_dir(&dir);
+}
+
 /// Tier-3 latency gate: prove the Edit view does **O(changed)** highlight work
 /// per keystroke, not O(document). Open a 3000-line buffer, render it (cold:
 /// every line highlighted once), then perform a single-character insert and
@@ -4035,6 +4134,7 @@ fn install_agent_picker(
                 connected: true,
                 permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
                 busy: false,
+                archived: false,
             });
         }
         let mut tile = AgentTile::new();
@@ -4108,6 +4208,7 @@ fn selector_projection_reflects_binding_across_tiles(cx: &mut TestAppContext) {
                 connected: true,
                 permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
                 busy: false,
+                archived: false,
             });
         }
     });
@@ -4172,6 +4273,7 @@ fn agent_tile_picker_excludes_free_and_bound_archived_sessions(cx: &mut TestAppC
             connected: true,
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             busy: false,
+            archived: false,
         };
 
         // Two bound sessions occupy distinct tiles.
@@ -5120,14 +5222,15 @@ fn boot_with_transcript<'a>(
 /// REGRESSION (bug-0024): restore binds a tile before the async roster seed, so
 /// its temporary provider fallback can be Claude even when the WAL-backed
 /// session is Codex. A later `SessionCreated` roster event for that bound sid
-/// must repair the live AgentState and repaint BOTH visible identity surfaces:
-/// the tile status strip and the cached conversation turn header.
+/// must repair the live AgentState and repaint the cached conversation turn
+/// header. The compact tile header intentionally carries no separate provider
+/// badge; provider identity remains visible on each agent turn.
 ///
 /// Negative control: remove `recover_providers_from_roster` from the
 /// `SessionCreated` reducer. The state stays Claude, the Claude probes paint,
 /// and all Codex assertions below fail RED.
 #[gpui::test]
-fn codex_roster_identity_repairs_restored_tile_and_turn_header(cx: &mut TestAppContext) {
+fn codex_roster_identity_repairs_session_and_turn_header(cx: &mut TestAppContext) {
     use yalda::acp_channel::{AgentProvider, PermissionMode, ReplyEvent};
     use yalda::session_proto::{Notification as ServerNotification, SessionInfo};
 
@@ -5164,6 +5267,7 @@ fn codex_roster_identity_repairs_restored_tile_and_turn_header(cx: &mut TestAppC
                         connected: true,
                         permission_mode: PermissionMode::ReadOnly,
                         busy: false,
+                        archived: false,
                     },
                 },
                 ServerNotification::ReplyEvent {
@@ -5203,12 +5307,6 @@ fn codex_roster_identity_repairs_restored_tile_and_turn_header(cx: &mut TestAppC
     let turn_claude = crate::layout_probe_get("agent-turn-header-Claude");
     crate::layout_probe_end();
 
-    let (_, _, tile_w, tile_h) =
-        tile_codex.expect("the real agent tile must paint the Codex provider");
-    assert!(
-        tile_w > 4.0 && tile_h > 4.0,
-        "Codex tile badge has no painted area"
-    );
     let (_, _, turn_w, turn_h) =
         turn_codex.expect("the real transcript must paint a Codex turn header");
     assert!(
@@ -5216,8 +5314,12 @@ fn codex_roster_identity_repairs_restored_tile_and_turn_header(cx: &mut TestAppC
         "Codex transcript header has no painted area"
     );
     assert!(
-        tile_claude.is_none() && turn_claude.is_none(),
-        "no visible identity surface may still call this Codex session Claude"
+        tile_codex.is_none() && tile_claude.is_none(),
+        "the compact tile header must not regain a separate provider badge"
+    );
+    assert!(
+        turn_claude.is_none(),
+        "the visible turn identity may not still call this Codex session Claude"
     );
 }
 
@@ -6622,23 +6724,15 @@ fn global_menu_lists_and_switches_workspaces(cx: &mut TestAppContext) {
 /// The universal agent roster (universal-agent-list), driven through the REAL
 /// `apply_server_batch`: a `SessionCreated` broadcast for a session this GUI has
 /// NEVER opened makes it appear in the jump panel's agent rows (always-visible
-/// active sessions); a `SessionRenamed` updates its label in place; a
-/// `SessionClosed` removes it. This is the end-to-end wire the no-op hook used
-/// to drop on the floor.
+/// active sessions); `SessionRenamed` updates its label; `SessionArchived`
+/// moves it out of and back into live projections; `SessionClosed` removes it.
+/// This is the end-to-end wire the no-op hook used to drop on the floor.
 #[gpui::test]
 fn roster_surfaces_unopened_session_and_tracks_rename_close(cx: &mut TestAppContext) {
     use yalda::session_proto::Notification as ServerNotification;
     use yalda::session_proto::SessionInfo;
 
-    let (view, vcx) = cx.add_window_view(|window, cx| {
-        let fh = cx.focus_handle();
-        fh.focus(window);
-        YaldaGpuiView::new_browser(
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            Theme::default(),
-            fh,
-        )
-    });
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
     vcx.run_until_parked();
 
     let info = SessionInfo {
@@ -6651,6 +6745,7 @@ fn roster_surfaces_unopened_session_and_tracks_rename_close(cx: &mut TestAppCont
         connected: true,
         permission_mode: yalda::acp_channel::PermissionMode::ReadOnly,
         busy: false,
+        archived: false,
     };
 
     // A session created elsewhere on the server — never opened in this GUI.
@@ -6681,6 +6776,54 @@ fn roster_surfaces_unopened_session_and_tracks_rename_close(cx: &mut TestAppCont
     let rows = view.update(vcx, |v, cx| v.jump_panel_agent_rows(cx));
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].label, "renamed-session", "rename updates the row label");
+
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![ServerNotification::SessionArchived {
+                session_id: "srv-1".into(),
+                archived: true,
+            }],
+            cx,
+        );
+    });
+    assert!(view.read_with(vcx, |v, _| {
+        v.jump_archived_sessions.contains("srv-1")
+            && v.agent_roster.get("srv-1").is_some_and(|info| info.archived)
+    }));
+    assert!(
+        crate::agent_rows_for_tab(
+            view.update(vcx, |v, cx| v.jump_panel_agent_rows(cx))
+                .into_iter()
+                .enumerate()
+                .collect(),
+            crate::JumpAgentTab::All,
+        )
+            .iter()
+            .all(|(_, row)| !matches!(&row.target, crate::JumpTarget::Roster(s) if s == "srv-1")),
+        "cold archived session leaves the live projection"
+    );
+
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![ServerNotification::SessionArchived {
+                session_id: "srv-1".into(),
+                archived: false,
+            }],
+            cx,
+        );
+    });
+    assert!(
+        crate::agent_rows_for_tab(
+            view.update(vcx, |v, cx| v.jump_panel_agent_rows(cx))
+                .into_iter()
+                .enumerate()
+                .collect(),
+            crate::JumpAgentTab::All,
+        )
+            .iter()
+            .any(|(_, row)| matches!(&row.target, crate::JumpTarget::Roster(s) if s == "srv-1")),
+        "unarchive restores the live projection"
+    );
 
     // A close broadcast removes it from the roster (and so from the panel).
     view.update(vcx, |v, cx| {
@@ -7030,29 +7173,69 @@ fn agent_row_marks_name_the_live_states() {
     );
 }
 
-/// UXI-AgentTile-28: the agent TILE paints a status pill (the same `◆ working` /
-/// `✦ your turn` vocabulary as the jump panel) — it PAINTS while a reply is in
-/// flight, and a session that has never run a turn shows none. Layout probe on
-/// the real `render_agent` header (paint, not state).
-///
-/// Negative control: drop the pill child in `render_agent` → the painted assert
-/// fails (probe returns `None`).
+#[test]
+fn agent_header_uses_compact_activity_and_transient_editor_vocabulary() {
+    assert_eq!(crate::screens::agent_header_activity(true), ("*", "working"));
+    assert_eq!(crate::screens::agent_header_activity(false), ("+", "ready"));
+
+    assert_eq!(crate::screens::agent_editing_status_label(false, false), "");
+    assert_eq!(crate::screens::agent_editing_status_label(true, false), "•");
+    assert_eq!(crate::screens::agent_editing_status_label(false, true), "EXT");
+    let transient = crate::screens::agent_editing_status_label(true, true);
+    assert_eq!(transient, "• EXT");
+    for removed in ["CHATBOX", "WORKSHEET", "NORMAL", "INSERT", "L3:C12", "awaiting", "server"] {
+        assert!(!transient.contains(removed));
+    }
+
+    let folio = yalda::theme::AgentTheme::folio();
+    let supporting = crate::screens::agent_header_supporting_text_color(&folio);
+    assert_eq!(supporting, folio.agent_tint);
+    assert_ne!(supporting, folio.warm_accent, "header text must not be gold");
+    assert_ne!(supporting, folio.dim, "header text must not be tan");
+}
+
+#[test]
+fn agent_location_names_linked_worktrees_else_cwd() {
+    let root = std::env::temp_dir().join(format!(
+        "yalda-header-worktree-{}",
+        std::process::id()
+    ));
+    let worktree = root.join("header-layout");
+    let nested = worktree.join("docs");
+    std::fs::create_dir_all(&nested).expect("create worktree fixture");
+    std::fs::write(worktree.join(".git"), "gitdir: /tmp/fake\n")
+        .expect("mark linked worktree");
+    assert_eq!(
+        crate::screens::agent_location_label(&nested),
+        "WORKTREE header-layout"
+    );
+
+    let ordinary = root.join("ordinary");
+    std::fs::create_dir_all(&ordinary).expect("create cwd fixture");
+    assert!(crate::screens::agent_location_label(&ordinary).starts_with("CWD "));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The Agent Tile activity pill is always painted and keeps exactly the same
+/// width when it changes from `+ ready` to `* working`.
 #[gpui::test]
 fn agent_tile_paints_a_status_pill_while_working(cx: &mut TestAppContext) {
     let (view, vcx, id, _session) = boot_with_transcript(cx);
 
-    // A virgin session (no turn ever started, none completed): no pill.
+    // A virgin session is ready, not blank.
     crate::layout_probe_begin();
     view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
-    let quiet = crate::layout_probe_get("agent-status-pill");
+    let ready = crate::layout_probe_get("agent-status-pill")
+        .expect("a virgin session must paint its ready pill");
     crate::layout_probe_end();
     assert!(
-        quiet.is_none(),
-        "a session that has never run a turn shows no status pill (got {quiet:?})"
+        (ready.2 - crate::screens::AGENT_ACTIVITY_PILL_WIDTH).abs() < 0.5,
+        "ready pill has the fixed width: {ready:?}"
     );
 
-    // A reply in flight: the pill paints, with real size.
+    // A reply in flight changes the state, never the geometry.
     view.update(vcx, |v, cx| {
         v.with_session(id, cx, |c| {
             c.turn_phase = crate::TurnPhase::begin(std::time::Instant::now());
@@ -7065,15 +7248,14 @@ fn agent_tile_paints_a_status_pill_while_working(cx: &mut TestAppContext) {
     crate::layout_probe_end();
     let (_, _, w, h) = working.expect("the working pill must paint while a reply is in flight");
     assert!(
-        w > 20.0 && h > 6.0,
-        "the pill must have real painted size, got {w}x{h}"
+        (w - ready.2).abs() < 0.5 && h > 6.0,
+        "ready and working pills must share a fixed width: ready={ready:?}, working={working:?}"
     );
 }
 
-/// The context-window usage meter occupies its own header line. This protects
-/// the identity/model/permission row from being clipped in narrow 4×4 tiles.
+/// The context-window usage meter joins the activity header line.
 #[gpui::test]
-fn agent_usage_paints_on_its_own_header_line(cx: &mut TestAppContext) {
+fn agent_usage_paints_on_the_activity_header_line(cx: &mut TestAppContext) {
     let (view, vcx, id, _session) = boot_with_transcript(cx);
     view.update(vcx, |v, cx| {
         v.with_session(id, cx, |c| {
@@ -7089,12 +7271,24 @@ fn agent_usage_paints_on_its_own_header_line(cx: &mut TestAppContext) {
     view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
     let status = crate::layout_probe_get("agent-status-row").expect("primary status row paints");
+    let activity = crate::layout_probe_get("agent-activity-row").expect("activity row paints");
     let usage = crate::layout_probe_get("agent-usage-row").expect("usage row paints");
+    let location = crate::layout_probe_get("agent-location-row").expect("location row paints");
     crate::layout_probe_end();
 
     assert!(
-        usage.1 >= status.1 + status.3 - 0.5,
-        "usage must start below the primary row: status={status:?}, usage={usage:?}"
+        activity.1 >= status.1 + status.3 - 0.5,
+        "activity must start below identity: status={status:?}, activity={activity:?}"
+    );
+    assert!(
+        usage.1 >= activity.1 - 0.5
+            && usage.1 + usage.3 <= activity.1 + activity.3 + 0.5,
+        "usage must be vertically contained by the activity line: \
+         activity={activity:?}, usage={usage:?}"
+    );
+    assert!(
+        location.1 >= activity.1 + activity.3 - 0.5,
+        "location must start below activity: activity={activity:?}, location={location:?}"
     );
     assert!(usage.2 > 100.0 && usage.3 > 6.0, "usage line has real size: {usage:?}");
 }
@@ -7334,6 +7528,7 @@ fn free_agent_row_is_unbound_and_bindable(cx: &mut TestAppContext) {
         connected: true,
         permission_mode: yalda::acp_channel::PermissionMode::ReadOnly,
         busy: false,
+        archived: false,
     };
 
     // The end state of a free create: the session appears in the roster, bound
@@ -7418,6 +7613,7 @@ fn jump_panel_orders_local_and_roster_sessions_by_label(cx: &mut TestAppContext)
                     connected: true,
                     permission_mode: yalda::acp_channel::PermissionMode::ReadOnly,
                     busy: false,
+                    archived: false,
                 },
             }],
             cx,
@@ -7607,6 +7803,7 @@ fn viewing_a_waiting_agent_does_not_change_waiting_order(cx: &mut TestAppContext
         connected: true,
         permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
         busy: false,
+        archived: false,
     };
     view.update(vcx, |v, cx| {
         // Reverse label order makes chronology observable rather than getting
@@ -7739,6 +7936,7 @@ fn jump_project_agent_tabs_are_independent_and_all_appends(cx: &mut TestAppConte
         connected: true,
         permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
         busy,
+        archived: false,
     };
     view.update(vcx, |v, _| {
         v.agent_roster.upsert(info("S-wait", "wait", false));
@@ -7853,6 +8051,7 @@ fn jump_session_rows_do_not_paint_redundant_status_words(cx: &mut TestAppContext
         connected: true,
         permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
         busy,
+        archived: false,
     };
     view.update(vcx, |v, _| {
         v.agent_roster
@@ -7978,6 +8177,7 @@ fn jump_waiting_working_tabs_paint_live_counts(cx: &mut TestAppContext) {
         connected,
         permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
         busy,
+        archived: false,
     };
     view.update(vcx, |v, _| {
         v.agent_roster
@@ -8085,6 +8285,7 @@ fn jump_all_tab_groups_activity_with_headers(cx: &mut TestAppContext) {
         connected,
         permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
         busy,
+        archived: false,
     };
     view.update(vcx, |v, _| {
         v.agent_roster
@@ -8194,10 +8395,10 @@ fn jump_all_tab_groups_activity_with_headers(cx: &mut TestAppContext) {
     crate::layout_probe_end();
 }
 
-/// UXI-JumpPanel-16: archive is a visibility flag complementary to the ordinary
-/// tabs. Even when the sidebar itself is on Archived, Cmd-P must project the
-/// unarchived All roster rather than leaking archived sessions or inheriting the
-/// current tab filter.
+/// UXI-JumpPanel-16: cold archive is projected as a complementary navigation
+/// state. Even when the sidebar itself is on Archived, Cmd-P must project the
+/// unarchived All roster rather than leaking archived sessions or inheriting
+/// the current tab filter.
 #[gpui::test]
 fn jump_session_archive_filters_tabs_palette_and_persists(cx: &mut TestAppContext) {
     use crate::JumpAgentTab;
@@ -8217,6 +8418,7 @@ fn jump_session_archive_filters_tabs_palette_and_persists(cx: &mut TestAppContex
         connected: true,
         permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
         busy,
+        archived: false,
     };
     view.update(vcx, |v, _| {
         v.agent_roster.upsert(info("S-live", "live-session", false));
@@ -8298,6 +8500,7 @@ fn jump_session_archive_controls_toggle_the_same_durable_flag(cx: &mut TestAppCo
             connected: true,
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             busy: false,
+            archived: false,
         });
         pid
     });
@@ -8352,6 +8555,16 @@ fn jump_session_archive_controls_toggle_the_same_durable_flag(cx: &mut TestAppCo
     click_context_toggle(&view, vcx);
     assert!(!view.read_with(vcx, |v, _| v.jump_archived_sessions.contains("S-menu")));
 
+    // Unarchiving does not silently reclaim a tile. Explicitly visit the
+    // session again before exercising its tile-local command surface.
+    view.update(vcx, |v, cx| {
+        let id = v
+            .sessions
+            .locate(&ServerSid::new("S-menu"))
+            .expect("archived session remains open locally");
+        v.jump_to_agent(JumpTarget::Local(id), cx);
+    });
+
     // Space menu copy is contextual in both directions and dispatches the same
     // set_session_archived seam as the right-click menu.
     view.update(vcx, |v, cx| v.open_local_menu_inner(cx));
@@ -8367,6 +8580,15 @@ fn jump_session_archive_controls_toggle_the_same_durable_flag(cx: &mut TestAppCo
     });
     assert!(view.read_with(vcx, |v, _| v.jump_archived_sessions.contains("S-menu")));
 
+    // Archive moved the direct view to its picker. Visiting the Archived row
+    // explicitly restores the transcript view and its contextual Unarchive.
+    view.update(vcx, |v, cx| {
+        let id = v
+            .sessions
+            .locate(&ServerSid::new("S-menu"))
+            .expect("archived session remains open locally");
+        v.jump_to_agent(JumpTarget::Local(id), cx);
+    });
     view.update(vcx, |v, cx| v.open_local_menu_inner(cx));
     view.read_with(vcx, |v, _| {
         assert!(v.menu_ref().expect("space menu").menu.iter().any(|node| {
@@ -8384,6 +8606,74 @@ fn jump_session_archive_controls_toggle_the_same_durable_flag(cx: &mut TestAppCo
     view.update(vcx, |v, cx| {
         v.open_session_menu(JumpTarget::Local(crate::SessionId(u64::MAX)), (20.0, 20.0), cx);
         assert!(!v.overlay_is_session_menu());
+    });
+}
+
+/// UXI-JumpPanel-16: archiving is an immediate viewport transition. Every tile
+/// showing the session becomes a live picker, but the session and transcript
+/// stay alive; selecting the archived session directly from the jump panel
+/// opens that same transcript in a bare ephemeral view.
+///
+/// Negative control (mandatory): remove the `show_pickers_for_session` call
+/// from `set_session_archived`; the first picker assertion fails because the
+/// original workspace tile remains bound.
+#[gpui::test]
+fn archive_unbinds_tiles_but_direct_jump_reopens_the_transcript(
+    cx: &mut TestAppContext,
+) {
+    use crate::JumpTarget;
+
+    let (view, vcx, id, _session) = boot_with_transcript(cx);
+    // The real server transition is covered by session_resilience; keep this
+    // viewport/projection guard hermetic and synchronous.
+    view.update(vcx, |v, _| v.session_server = None);
+
+    view.update(vcx, |v, cx| v.set_session_archived("S1", true, cx));
+
+    view.read_with(vcx, |v, cx| {
+        assert!(v.jump_archived_sessions.contains("S1"));
+        assert!(
+            v.agent_tile().is_some_and(|tile| tile.picker().is_some()),
+            "archiving immediately replaces the bound workspace tile with its picker"
+        );
+        assert_eq!(
+            v.agent_tile_id_bound_to(id),
+            None,
+            "no workspace tile remains bound to the archived session"
+        );
+        assert!(
+            v.sessions.contains(id),
+            "archive keeps the live session in the store"
+        );
+        assert!(
+            v.read_session(id, cx, |state| {
+                state.editor.document().full_text().contains("session archived")
+            })
+            .unwrap_or(false),
+            "the preserved transcript contains the archive notice"
+        );
+    });
+
+    // This is the real dispatch used by a local Archived jump-panel row.
+    view.update(vcx, |v, cx| v.jump_to_agent(JumpTarget::Local(id), cx));
+
+    view.read_with(vcx, |v, cx| {
+        assert!(
+            v.workspace.active_is_ephemeral(),
+            "a direct visit opens the free archived session in a bare view"
+        );
+        assert_eq!(
+            v.agent_tile().and_then(|tile| tile.session()),
+            Some(id),
+            "the direct visit binds the preserved session to the visible tile"
+        );
+        assert!(
+            v.read_session(id, cx, |state| {
+                state.editor.document().full_text().contains("session archived")
+            })
+            .unwrap_or(false),
+            "the direct visit shows the preserved transcript normally"
+        );
     });
 }
 
@@ -8418,6 +8708,7 @@ fn archived_waiting_session_is_removed_from_the_painted_waiting_tab(
             connected: true,
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             busy: false,
+            archived: false,
         });
         v.select_jump_agent_tab(pid, JumpAgentTab::Waiting, cx);
         pid
@@ -8547,6 +8838,7 @@ fn jump_reorder_methods_reorder_and_gate_by_cwd(cx: &mut TestAppContext) {
         connected: true,
         permission_mode: yalda::acp_channel::PermissionMode::ReadOnly,
         busy: false,
+        archived: false,
     };
     // alpha: {a1, a2}; beta: {b1}.
     view.update(vcx, |v, _| {
@@ -8641,6 +8933,7 @@ fn clear_keeps_the_sessions_jump_panel_slot(cx: &mut TestAppContext) {
         connected: true,
         permission_mode: yalda::acp_channel::PermissionMode::ReadOnly,
         busy: false,
+        archived: false,
     };
     // One cwd group, two sessions. Labels are chosen so the USER's order is the
     // reverse of by-label order: any surviving slot proves the order list drove it.
@@ -12115,7 +12408,7 @@ fn panel_highlight_swaps_to_subagent(cx: &mut TestAppContext) {
         .expect("session");
     assert_eq!(
         focused,
-        Some(sub_key),
+        Some(crate::SubAgentKey::ToolCall(sub_key)),
         "highlighting the subagent must set focused_subagent (the view-swap trigger)"
     );
 
@@ -12154,7 +12447,9 @@ fn subagent_focus_swaps_the_painted_view(cx: &mut TestAppContext) {
     vcx.run_until_parked();
 
     // Focus the subagent → swap. Probe a clean paint pass.
-    view.update(vcx, |v, cx| v.focus_subagent(key, cx));
+    view.update(vcx, |v, cx| {
+        v.focus_subagent(crate::SubAgentKey::ToolCall(key), cx)
+    });
     crate::layout_probe_begin();
     view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
@@ -12228,7 +12523,9 @@ fn subagent_markdown_list_wraps_at_pane_width(cx: &mut TestAppContext) {
     });
     vcx.run_until_parked();
 
-    view.update(vcx, |v, cx| v.focus_subagent(key, cx));
+    view.update(vcx, |v, cx| {
+        v.focus_subagent(crate::SubAgentKey::ToolCall(key), cx)
+    });
     crate::layout_probe_begin();
     view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
@@ -14383,6 +14680,7 @@ fn opened_session_recovers_lost_label_from_roster(cx: &mut TestAppContext) {
         connected: true,
         permission_mode: yalda::acp_channel::PermissionMode::ReadOnly,
         busy: false,
+        archived: false,
     };
 
     let (lost_id, kept_id) = view.update(vcx, |v, cx| {
@@ -15201,6 +15499,7 @@ fn bind_refused_across_projects_allowed_within(cx: &mut TestAppContext) {
             connected: true,
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             busy: false,
+            archived: false,
         });
     });
     // The active workspace is project A, showing an unbound agent tile (selector).
@@ -16134,6 +16433,7 @@ fn autoname_summary_survives_a_gui_reload(cx: &mut TestAppContext) {
             connected: true,
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             busy: false,
+            archived: false,
         });
         v.jump_panel_agent_rows(cx)
             .into_iter()
@@ -16207,6 +16507,7 @@ fn roster_only_session_shows_live_status(cx: &mut TestAppContext) {
             connected: true,
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             busy: false,
+            archived: false,
         });
     });
     let status_of = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
@@ -16808,6 +17109,9 @@ fn archive_toggle_announces_in_console_and_transcript(cx: &mut TestAppContext) {
     use crate::TurnId;
     use yalda::session_proto::SessionInfo;
     let (view, vcx, id, _session) = boot_with_transcript(cx);
+    // This test exercises the acknowledged local reducer/announcement seam;
+    // the real wire transition has its own session_resilience integration test.
+    view.update(vcx, |v, _| v.session_server = None);
 
     // A second session that exists only in the roster — never opened here, so
     // it has no in-memory transcript to write into.
@@ -16822,6 +17126,7 @@ fn archive_toggle_announces_in_console_and_transcript(cx: &mut TestAppContext) {
             connected: true,
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             busy: false,
+            archived: false,
         });
     });
 
@@ -16946,6 +17251,7 @@ fn agent_coming_online_clears_the_unavailable_row(cx: &mut TestAppContext) {
                     connected: false,
                     permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
                     busy: false,
+                    archived: false,
                 },
             }],
             cx,

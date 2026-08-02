@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -173,6 +174,11 @@ enum Command {
         label: String,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+    SetArchived {
+        sid: ServerSessionId,
+        archived: bool,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     SetPermissionMode {
         sid: ServerSessionId,
         mode: PermissionMode,
@@ -202,6 +208,9 @@ enum Command {
     PublishChannel {
         sid: ServerSessionId,
         handle: TransportHandle,
+        /// Generation observed when this spawn was requested. Archive/restart
+        /// may fence a blocking handshake before it returns.
+        expected_generation: u64,
         is_respawn: bool,
         /// The spawn attempted `session/load` (it had a resume id) — arms the
         /// replay fence and is recorded as `ChannelOpened { resumed }`.
@@ -219,6 +228,7 @@ enum Command {
     },
     SpawnFailed {
         sid: ServerSessionId,
+        expected_generation: u64,
         reason: String,
     },
 
@@ -287,6 +297,12 @@ struct ManagedSession {
     label: String,
     cwd: PathBuf,
     provider: AgentProvider,
+    /// Last agent-owned session id. Unlike `channel.session_id()`, this
+    /// survives dropping the live transport for cold archive.
+    acp_session_id: Option<String>,
+    /// Durable lifecycle state. Archived sessions retain transcript metadata
+    /// but own neither a transport nor an open WAL handle.
+    archived: bool,
     /// The live ACP transport surface — the Send sub-handles of the
     /// `AcpChannelClient` whose `reply_rx` is owned by the pump thread. `None`
     /// while the subprocess is being spawned. The actor never holds the client
@@ -353,6 +369,9 @@ struct ManagedSession {
     /// transcript. `None` only if the WAL couldn't be opened (we degrade to
     /// in-memory-only rather than refusing to run).
     wal: Option<yalda::session_wal::SessionWal>,
+    /// Stable path retained while `wal` is closed so unarchive can reopen it
+    /// and explicit close can still remove it.
+    wal_path: Option<PathBuf>,
     /// Phase-8 Stage A (spec §2/§3): the authoritative durable `seq` for the
     /// canonical `AgentEvent` envelope — monotonic per `(session, generation)`,
     /// assigned at the server's `record()` chokepoint. During the additive
@@ -381,7 +400,7 @@ impl ManagedSession {
     fn info(&self) -> SessionInfo {
         SessionInfo {
             session_id: self.id.clone(),
-            acp_session_id: self.channel.as_ref().and_then(|c| c.session_id()),
+            acp_session_id: self.acp_session_id.clone(),
             label: self.label.clone(),
             cwd: self.cwd.clone(),
             provider: self.provider,
@@ -389,6 +408,7 @@ impl ManagedSession {
             connected: self.channel.as_ref().is_some_and(|c| c.is_connected()),
             permission_mode: self.permission_mode,
             busy: self.busy,
+            archived: self.archived,
         }
     }
 
@@ -691,6 +711,9 @@ impl ManagedSession {
             }
         }
         let acp_session_id = handle.session_id();
+        if acp_session_id.is_some() {
+            self.acp_session_id = acp_session_id.clone();
+        }
         if is_respawn {
             self.channel_generation = self.channel_generation.wrapping_add(1);
             let _ = self.gen_watch.send_replace(self.channel_generation);
@@ -767,6 +790,7 @@ fn new_managed_session(
     wal: Option<yalda::session_wal::SessionWal>,
     bridge_tx: Option<BridgeTx>,
 ) -> ManagedSession {
+    let wal_path = wal.as_ref().map(|wal| wal.path().to_path_buf());
     let event_log = yalda::event_log::EventLog::new();
     let (log_tx, _) = watch::channel(LogSnapshot {
         log: event_log.clone(),
@@ -778,6 +802,8 @@ fn new_managed_session(
         label,
         cwd,
         provider,
+        acp_session_id: None,
+        archived: false,
         channel: None,
         channel_generation: 0,
         gen_watch,
@@ -790,6 +816,7 @@ fn new_managed_session(
         event_log,
         replay_fence: 0,
         wal,
+        wal_path,
         agent_seq: 0,
         bridge_tx,
     }
@@ -987,6 +1014,16 @@ impl SessionManager {
         rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
     }
 
+    async fn send_set_archived(&self, sid: &str, archived: bool) -> Result<(), String> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let _ = self.cmd_tx.send(Command::SetArchived {
+            sid: sid.to_string(),
+            archived,
+            reply,
+        });
+        rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
+    }
+
     async fn send_set_permission_mode(
         &self,
         sid: &str,
@@ -1048,24 +1085,29 @@ fn restore_seed_from_disk(
     let recovered = yalda::session_wal::recover_all(&dir);
     for rs in recovered {
         let sid = rs.server_session_id.clone();
-        let Some(acp_session_id) = rs.acp_session_id.clone() else {
+        let acp_session_id = rs.acp_session_id.clone();
+        if !rs.archived && acp_session_id.is_none() {
             tracing::warn!(
                 session_id = %&sid[..8.min(sid.len())],
                 "discarding recovered session: no acp_session_id to resume"
             );
             let _ = std::fs::remove_file(&rs.path);
             continue;
-        };
+        }
 
-        let wal = match yalda::session_wal::SessionWal::reopen(rs.path.clone()) {
-            Ok(w) => Some(w),
-            Err(e) => {
-                tracing::error!(
-                    session_id = %&sid[..8.min(sid.len())],
-                    error = %e,
-                    "WAL reopen failed"
-                );
-                None
+        let wal = if rs.archived {
+            None
+        } else {
+            match yalda::session_wal::SessionWal::reopen(rs.path.clone()) {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    tracing::error!(
+                        session_id = %&sid[..8.min(sid.len())],
+                        error = %e,
+                        "WAL reopen failed"
+                    );
+                    None
+                }
             }
         };
 
@@ -1099,6 +1141,8 @@ fn restore_seed_from_disk(
             label: rs.label.clone(),
             cwd: rs.cwd.clone(),
             provider: rs.provider,
+            acp_session_id: acp_session_id.clone(),
+            archived: rs.archived,
             channel: None,
             channel_generation: 0,
             gen_watch,
@@ -1113,6 +1157,7 @@ fn restore_seed_from_disk(
             event_log,
             replay_fence: rs.turns,
             wal,
+            wal_path: Some(rs.path.clone()),
             agent_seq,
             // Recovered sessions must stream too (spec §5): hand each the same
             // canonical bridge sender so a resumed session's transcript folds
@@ -1124,17 +1169,22 @@ fn restore_seed_from_disk(
             session_id = %&sid[..8.min(sid.len())],
             events = session.event_log.len(),
             turns = rs.turns,
-            acp_session_id = %&acp_session_id[..8.min(acp_session_id.len())],
+            acp_session_id = %acp_session_id.as_deref().unwrap_or("<none>"),
+            archived = rs.archived,
             "recovering session"
         );
 
         sessions.insert(sid.clone(), session);
-        jobs.push(ResumeJob {
-            session_id: sid,
-            cwd: rs.cwd,
-            provider: rs.provider,
-            acp_session_id,
-        });
+        if !rs.archived
+            && let Some(acp_session_id) = acp_session_id
+        {
+            jobs.push(ResumeJob {
+                session_id: sid,
+                cwd: rs.cwd,
+                provider: rs.provider,
+                acp_session_id,
+            });
+        }
     }
     (sessions, jobs)
 }
@@ -1182,7 +1232,7 @@ fn spawn_resume_worker(
                     // gen 0, so the second is an idempotent no-op (its
                     // `reset_for_replay` would just rebuild the same prefix). Noted
                     // so a future reader doesn't treat the duplicate as a bug.
-                    publish_channel(&cmd_tx, &session_id, client, false, true);
+                    publish_channel(&cmd_tx, &session_id, client, 0, false, true);
                 }
                 Err(e) => {
                     tracing::error!(
@@ -1192,6 +1242,7 @@ fn spawn_resume_worker(
                     );
                     let _ = cmd_tx.send(Command::SpawnFailed {
                         sid: session_id,
+                        expected_generation: 0,
                         reason: format!("resume failed: {e}"),
                     });
                 }
@@ -1275,6 +1326,13 @@ impl Manager {
             Command::Rename { sid, label, reply } => {
                 let _ = reply.send(self.do_rename(&sid, label));
             }
+            Command::SetArchived {
+                sid,
+                archived,
+                reply,
+            } => {
+                let _ = reply.send(self.do_set_archived(&sid, archived));
+            }
             Command::SetPermissionMode { sid, mode, reply } => {
                 let _ = reply.send(self.do_set_permission_mode(&sid, mode));
             }
@@ -1297,12 +1355,15 @@ impl Manager {
             Command::PublishChannel {
                 sid,
                 handle,
+                expected_generation,
                 is_respawn,
                 resumed,
                 reply,
             } => {
                 let (published, undelivered, busy_now) = match self.sessions.get_mut(&sid) {
-                    Some(s) => {
+                    Some(s)
+                        if !s.archived && s.channel_generation == expected_generation =>
+                    {
                         let undelivered = s.apply_channel_state(handle, is_respawn, resumed);
                         (
                             Some((
@@ -1315,7 +1376,7 @@ impl Manager {
                             Some(s.busy),
                         )
                     }
-                    None => (None, Vec::new(), None),
+                    Some(_) | None => (None, Vec::new(), None),
                 };
                 // bug-0022: publish the post-spawn in-flight state to every GUI —
                 // a respawn clears it (unless a queued prompt flushed), and a GUI
@@ -1346,8 +1407,15 @@ impl Manager {
                 }
                 let _ = reply.send(published);
             }
-            Command::SpawnFailed { sid, reason } => {
-                if let Some(s) = self.sessions.get_mut(&sid) {
+            Command::SpawnFailed {
+                sid,
+                expected_generation,
+                reason,
+            } => {
+                if let Some(s) = self.sessions.get_mut(&sid)
+                    && !s.archived
+                    && s.channel_generation == expected_generation
+                {
                     s.record(Notification::SessionDetached {
                         session_id: sid.clone(),
                         reason,
@@ -1525,11 +1593,12 @@ impl Manager {
                         // `resumed` (create-with-resume) arms nothing here —
                         // the session's turns are 0, so the fence stays down
                         // and the adopted history records into the empty log.
-                        publish_channel(&cmd_tx, &session_id, client, false, resumed);
+                        publish_channel(&cmd_tx, &session_id, client, 0, false, resumed);
                     }
                     Err(e) => {
                         let _ = cmd_tx.send(Command::SpawnFailed {
                             sid: session_id,
+                            expected_generation: 0,
                             reason: format!("spawn failed: {e}"),
                         });
                     }
@@ -1556,8 +1625,12 @@ impl Manager {
                 }
                 // Explicit close = intentional end of life: delete the durable
                 // WAL so this session is NOT recovered on the next start.
-                if let Some(wal) = session.and_then(|s| s.wal) {
-                    wal.remove();
+                if let Some(session) = session {
+                    if let Some(wal) = session.wal {
+                        wal.remove();
+                    } else if let Some(path) = session.wal_path {
+                        let _ = std::fs::remove_file(path);
+                    }
                 }
                 let _ = self.events.send(Notification::SessionClosed {
                     session_id: session_id.to_string(),
@@ -1657,6 +1730,11 @@ impl Manager {
             .sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("no such session: {session_id}"))?;
+        if session.archived {
+            return Err(format!(
+                "session {session_id} is archived; unarchive it before sending a prompt"
+            ));
+        }
         // Log the user's prompt so re-attaching GUIs can replay it (and so it
         // survives a crash — UserPrompt is a turn boundary that fsyncs). Only
         // appended to event_log + WAL, not broadcast.
@@ -1744,13 +1822,23 @@ impl Manager {
     }
 
     fn do_restart(&mut self, session_id: &str) -> Result<(), String> {
-        let (cwd, provider, resume_id) = {
+        let (cwd, provider, resume_id, expected_generation) = {
             let session = self
                 .sessions
                 .get_mut(session_id)
                 .ok_or_else(|| format!("no such session: {session_id}"))?;
+            if session.archived {
+                return Err(format!(
+                    "session {session_id} is archived; unarchive it before restarting"
+                ));
+            }
             let resume = session.channel.as_ref().and_then(|c| c.session_id());
-            (session.cwd.clone(), session.provider, resume)
+            (
+                session.cwd.clone(),
+                session.provider,
+                resume,
+                session.channel_generation,
+            )
         };
 
         let cmd_tx = self.cmd_tx.clone();
@@ -1778,11 +1866,19 @@ impl Manager {
                         // A restart-with-resume replays history already in the
                         // log → arm the fence (suppress until the marker) so a
                         // force-restart doesn't double-record the transcript.
-                        publish_channel(&cmd_tx, &sid, client, true, resumed);
+                        publish_channel(
+                            &cmd_tx,
+                            &sid,
+                            client,
+                            expected_generation,
+                            true,
+                            resumed,
+                        );
                     }
                     Err(e) => {
                         let _ = cmd_tx.send(Command::SpawnFailed {
                             sid,
+                            expected_generation,
                             reason: format!("restart failed: {e}"),
                         });
                     }
@@ -1804,9 +1900,15 @@ impl Manager {
             // (the header label), which is the "names keep getting forgotten"
             // bug. A WAL error is logged, never fatal — the live broadcast below
             // still updates connected GUIs.
-            if let Some(wal) = session.wal.as_mut()
-                && let Err(e) = wal.append_rename(&label)
-            {
+            let result = if let Some(wal) = session.wal.as_mut() {
+                wal.append_rename(&label)
+            } else if let Some(path) = session.wal_path.clone() {
+                yalda::session_wal::SessionWal::reopen(path)
+                    .and_then(|mut wal| wal.append_rename(&label))
+            } else {
+                Ok(())
+            };
+            if let Err(e) = result {
                 tracing::error!(
                     session_id = %&session_id[..8.min(session_id.len())],
                     error = %e,
@@ -1819,6 +1921,142 @@ impl Manager {
             label,
         });
         Ok(())
+    }
+
+    /// Move a session into or out of cold storage. Archive is a real resource
+    /// boundary: persist the marker first, then fence/drop the pump, transport,
+    /// forwarder, and WAL handle. Unarchive reopens the same WAL and lazily
+    /// resumes the last ACP session id.
+    fn do_set_archived(&mut self, session_id: &str, archived: bool) -> Result<(), String> {
+        let mut resume: Option<(PathBuf, AgentProvider, Option<String>, u64)> = None;
+        let busy_was_true;
+        {
+            let session = self
+                .sessions
+                .get_mut(session_id)
+                .ok_or_else(|| format!("no such session: {session_id}"))?;
+            if session.archived == archived {
+                return Ok(());
+            }
+            busy_was_true = session.busy;
+
+            if archived {
+                let wal = session
+                    .wal
+                    .as_mut()
+                    .ok_or_else(|| format!("session {session_id} has no open durable WAL"))?;
+                wal.append_archived(true)
+                    .map_err(|e| format!("could not persist archive state: {e}"))?;
+
+                if let Some(channel) = session.channel.as_ref() {
+                    channel.cancel();
+                }
+                session.archived = true;
+                session.busy = false;
+                session.pending_prompts.clear();
+                session.replay_fence = 0;
+                session.channel_generation = session.channel_generation.wrapping_add(1);
+                session.agent_seq = 0;
+                let _ = session
+                    .gen_watch
+                    .send_replace(session.channel_generation);
+                session.channel = None;
+                if let Some(forwarder) = session.forwarder.take() {
+                    forwarder.evicted.store(true, Ordering::Release);
+                }
+                session.publish_snapshot();
+                drop(session.wal.take());
+            } else {
+                let path = session
+                    .wal_path
+                    .clone()
+                    .ok_or_else(|| format!("session {session_id} has no durable WAL path"))?;
+                let mut wal = yalda::session_wal::SessionWal::reopen(path)
+                    .map_err(|e| format!("could not reopen archived WAL: {e}"))?;
+                wal.append_archived(false)
+                    .map_err(|e| format!("could not persist unarchive state: {e}"))?;
+                session.wal = Some(wal);
+                session.archived = false;
+                resume = Some((
+                    session.cwd.clone(),
+                    session.provider,
+                    session.acp_session_id.clone(),
+                    session.channel_generation,
+                ));
+            }
+        }
+
+        if busy_was_true && archived {
+            self.broadcast_busy(session_id, false);
+        }
+        if archived {
+            self.broadcast_connected(session_id, false);
+        }
+        let _ = self.events.send(Notification::SessionArchived {
+            session_id: session_id.to_string(),
+            archived,
+        });
+
+        if let Some((cwd, provider, resume_id, expected_generation)) = resume {
+            self.spawn_channel(
+                session_id.to_string(),
+                cwd,
+                provider,
+                resume_id,
+                expected_generation,
+                false,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn spawn_channel(
+        &self,
+        sid: String,
+        cwd: PathBuf,
+        provider: AgentProvider,
+        resume_id: Option<String>,
+        expected_generation: u64,
+        is_respawn: bool,
+    ) -> Result<(), String> {
+        let cmd_tx = self.cmd_tx.clone();
+        let spawner = Arc::clone(&self.spawner);
+        std::thread::Builder::new()
+            .name(format!("acp-lifecycle-{}", &sid[..8.min(sid.len())]))
+            .spawn(move || {
+                unsafe {
+                    std::env::set_var("YALDA_SESSION_MANAGED", "1");
+                }
+                let cmd = configured_agent_command(provider);
+                let resumed = resume_id.is_some();
+                match spawner.spawn(
+                    provider,
+                    &cmd,
+                    Some(cwd),
+                    resume_id,
+                    YaldaFrontend::Gpui,
+                ) {
+                    Ok(client) => {
+                        publish_channel(
+                            &cmd_tx,
+                            &sid,
+                            client,
+                            expected_generation,
+                            is_respawn,
+                            resumed,
+                        );
+                    }
+                    Err(e) => {
+                        let _ = cmd_tx.send(Command::SpawnFailed {
+                            sid,
+                            expected_generation,
+                            reason: format!("lifecycle spawn failed: {e}"),
+                        });
+                    }
+                }
+            })
+            .map(|_| ())
+            .map_err(|e| format!("could not start lifecycle worker: {e}"))
     }
 
     fn do_set_permission_mode(
@@ -1842,6 +2080,11 @@ impl Manager {
             .sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("no such session: {session_id}"))?;
+        if session.archived {
+            return Err(format!(
+                "session {session_id} is archived; unarchive it before switching models"
+            ));
+        }
         // No live channel ⇒ the agent isn't spawned yet; the switch can't be
         // delivered (unlike permission mode, there's no persisted field to
         // re-apply on spawn). Surface it rather than silently dropping.
@@ -1869,6 +2112,8 @@ impl Manager {
                 subscriber_count: s.log_tx.receiver_count(),
                 channel_generation: s.channel_generation,
                 permission_mode: s.permission_mode,
+                archived: s.archived,
+                wal_open: s.wal.is_some(),
             })
             .collect();
         AdminSnapshot {
@@ -1900,6 +2145,7 @@ fn publish_channel(
     cmd_tx: &mpsc::UnboundedSender<Command>,
     session_id: &ServerSessionId,
     client: Box<dyn AgentTransport>,
+    expected_generation: u64,
     is_respawn: bool,
     resumed: bool,
 ) {
@@ -1909,6 +2155,7 @@ fn publish_channel(
         .send(Command::PublishChannel {
             sid: session_id.clone(),
             handle,
+            expected_generation,
             is_respawn,
             resumed,
             reply,
@@ -2399,6 +2646,23 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
                 }
             }
 
+            Request::SetArchived {
+                session_id,
+                archived,
+            } => {
+                if archived
+                    && let Some(handle) = subscribed.remove(&session_id)
+                {
+                    handle.abort();
+                }
+                match manager.send_set_archived(&session_id, archived).await {
+                    Ok(()) => Response::Ok {
+                        data: ResponseData::Ack,
+                    },
+                    Err(e) => Response::Error { message: e },
+                }
+            }
+
             Request::AdminStatus => Response::Ok {
                 data: ResponseData::AdminStatus {
                     snapshot: manager.send_admin_status().await,
@@ -2623,6 +2887,41 @@ async fn flush_tail(
 
 // ── Main ─────────────────────────────────────────���─────────────────
 
+/// launchd commonly starts GUI-adjacent processes with a 256-descriptor soft
+/// limit. A durable session consumes a WAL fd plus several pipes/kqueues for its
+/// ACP transport, so a perfectly healthy roster of a few dozen sessions can
+/// otherwise make the next `Command::spawn` fail with EMFILE. Raise only the
+/// soft limit, never beyond the inherited hard limit.
+#[cfg(unix)]
+fn raise_open_file_limit() -> io::Result<(libc::rlim_t, libc::rlim_t)> {
+    const DEFAULT_TARGET: libc::rlim_t = 4096;
+    let requested = std::env::var("YALDA_MAX_OPEN_FILES")
+        .ok()
+        .and_then(|value| value.parse::<libc::rlim_t>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_TARGET);
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let old = limit.rlim_cur;
+    let target = if limit.rlim_max == libc::RLIM_INFINITY {
+        requested
+    } else {
+        requested.min(limit.rlim_max)
+    };
+    if target > limit.rlim_cur {
+        limit.rlim_cur = target;
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok((old, limit.rlim_cur))
+}
+
 #[tokio::main]
 async fn main() -> io::Result<()> {
     // Structured logging FIRST, before any other work. Route to STDERR (the
@@ -2637,6 +2936,17 @@ async fn main() -> io::Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    #[cfg(unix)]
+    match raise_open_file_limit() {
+        Ok((old, new)) if new > old => {
+            tracing::info!(old, new, "raised open-file soft limit");
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(%error, "could not raise open-file soft limit");
+        }
+    }
 
     // Reap ACP adapters orphaned by a previously crashed/killed yalda (parent
     // reparented to PID 1) before doing anything else — graceful exits already
@@ -2851,5 +3161,83 @@ async fn main() -> io::Result<()> {
             );
         }
         tokio::spawn(handle_connection(stream, mgr, conn_id));
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn archive_releases_runtime_state_and_wal_but_keeps_durable_session() {
+        let dir = tempfile::tempdir().expect("WAL tempdir");
+        let wal = yalda::session_wal::SessionWal::create_for_provider(
+            dir.path(),
+            "cold-1",
+            "cold session",
+            std::path::Path::new("/tmp/project"),
+            PermissionMode::ReadOnly,
+            AgentProvider::Codex,
+        )
+        .expect("create WAL");
+        let wal_path = wal.path().to_path_buf();
+        let mut session = new_managed_session(
+            "cold-1".into(),
+            "cold session".into(),
+            PathBuf::from("/tmp/project"),
+            AgentProvider::Codex,
+            PermissionMode::ReadOnly,
+            Some(wal),
+            None,
+        );
+        session.acp_session_id = Some("acp-cold-1".into());
+        session.record(Notification::SessionAttached {
+            session_id: "cold-1".into(),
+            acp_session_id: session.acp_session_id.clone(),
+        });
+        session.busy = true;
+        session.pending_prompts.push(PromptPayload {
+            text: "queued".into(),
+            images: Vec::new(),
+        });
+
+        let (events, _) = broadcast::channel(16);
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let mut manager = Manager {
+            sessions: HashMap::from([("cold-1".into(), session)]),
+            events,
+            default_permission_mode: PermissionMode::ReadOnly,
+            cmd_tx,
+            spawner: Arc::new(RealAgentSpawner),
+            bridge_tx: None,
+        };
+
+        manager
+            .do_set_archived("cold-1", true)
+            .expect("archive transition");
+
+        let session = manager.sessions.get("cold-1").unwrap();
+        assert!(session.archived);
+        assert!(session.channel.is_none(), "transport handle must be released");
+        assert!(session.forwarder.is_none(), "forwarder must be released");
+        assert!(session.wal.is_none(), "archive must close the WAL descriptor");
+        assert!(!session.busy);
+        assert!(session.pending_prompts.is_empty());
+        assert_eq!(session.acp_session_id.as_deref(), Some("acp-cold-1"));
+        assert!(wal_path.exists(), "archive retains the durable transcript");
+
+        let admin = manager.do_admin_status();
+        assert!(admin.sessions[0].archived);
+        assert!(!admin.sessions[0].wal_open);
+        assert!(manager
+            .enqueue_prompt("cold-1", "must fail", Vec::new())
+            .unwrap_err()
+            .contains("archived"));
+
+        let recovered = yalda::session_wal::recover_one(&wal_path)
+            .expect("recover WAL")
+            .expect("recovered session");
+        assert!(recovered.archived);
+        assert_eq!(recovered.acp_session_id.as_deref(), Some("acp-cold-1"));
     }
 }

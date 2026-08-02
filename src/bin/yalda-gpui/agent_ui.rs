@@ -7,6 +7,42 @@
 
 use super::*;
 
+/// Load one Codex child thread as an inspector snapshot. This deliberately uses
+/// ACP `session/load` without a `session/new` fallback: inspecting a stale child
+/// id must never manufacture a replacement conversation.
+fn load_codex_subagent_thread(
+    thread_id: String,
+    cwd: PathBuf,
+) -> Result<SubAgentTranscript, String> {
+    let client = AcpChannelClient::spawn_resume_only_in_for(
+        AgentProvider::Codex,
+        "",
+        Some(cwd),
+        thread_id.clone(),
+        YaldaFrontend::Gpui,
+    )
+    .map_err(|e| format!("could not open Codex child thread: {e}"))?;
+
+    if client.session_id().as_deref() != Some(thread_id.as_str()) {
+        return Err("Codex loaded a different child thread than requested".into());
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut events = Vec::new();
+    loop {
+        match client.try_recv() {
+            Some(ReplyEvent::ReplayComplete) => break,
+            Some(event) => events.push(event),
+            None if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            None => return Err("Codex child-thread replay did not complete".into()),
+        }
+    }
+
+    Ok(SubAgentTranscript::from_reply_events(events))
+}
+
 /// Outcome of `bind_session_sid` (the live-view bind choke). `Bound` ⇒ the
 /// placeholder now carries the sid and the caller should attach; `Focused` ⇒ the
 /// sid was already owned, the orphan placeholder was dropped, and the tile was
@@ -40,7 +76,7 @@ impl YaldaGpuiView {
         // Replace the focused tile with an Agent tile (no buffer stash —
         // Agent and Buffer are orthogonal; the pooled file buffers stay
         // reachable via Cmd+O).
-        let mut tile = AgentTile::new();
+        let tile = AgentTile::new();
         // Inherit the active workspace's CWD (untitled.md "Agent inherits the
         // workspace CWD"); fall back to the process dir only when unset. Seeds
         // both the session-list query and the picker's "start new" cwd.
@@ -129,13 +165,60 @@ impl YaldaGpuiView {
         let Some(handle) = self.session_server.as_ref().map(|s| s.handle()) else {
             return;
         };
+        // Migration from the original GUI-only archive flag. Push those bits
+        // into the server before accepting its first authoritative snapshot,
+        // otherwise upgrading would leave every previously archived ACP
+        // subprocess revived.
+        let legacy_archived = self.jump_archived_sessions.clone();
         cx.spawn(async move |this, cx| {
-            let result: Result<Vec<_>, String> = cx
+            let result: Result<(Vec<_>, Vec<(String, String)>), String> = cx
                 .background_executor()
-                .spawn(async move { handle.list_sessions().map_err(|e| e.to_string()) })
+                .spawn(async move {
+                    let mut sessions = handle.list_sessions().map_err(|e| e.to_string())?;
+                    let mut migration_errors = Vec::new();
+                    for info in &mut sessions {
+                        if legacy_archived.contains(&info.session_id) && !info.archived {
+                            match handle.set_archived(&info.session_id, true) {
+                                Ok(()) => info.archived = true,
+                                Err(error) => migration_errors.push((
+                                    info.session_id.clone(),
+                                    format!(
+                                        "could not migrate archived session {}: {error}",
+                                        info.label
+                                    ),
+                                )),
+                            }
+                        }
+                    }
+                    Ok((sessions, migration_errors))
+                })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                if let Ok(sessions) = result {
+                if let Ok((sessions, migration_errors)) = result {
+                    let migration_failures: std::collections::HashSet<_> = migration_errors
+                        .iter()
+                        .map(|(sid, _)| sid.as_str())
+                        .collect();
+                    for (_, error) in &migration_errors {
+                        this.append_system_console(ConsoleLevel::Error, error, cx);
+                    }
+                    // Fold server truth into the legacy set used by the jump
+                    // panel and persisted preferences. Missing roster ids stay
+                    // untouched so a temporarily unavailable session is not
+                    // forgotten.
+                    let mut archive_changed = false;
+                    for info in &sessions {
+                        if migration_failures.contains(info.session_id.as_str()) {
+                            continue;
+                        }
+                        if info.archived {
+                            archive_changed |=
+                                this.jump_archived_sessions.insert(info.session_id.clone());
+                        } else {
+                            archive_changed |=
+                                this.jump_archived_sessions.remove(&info.session_id);
+                        }
+                    }
                     let changed = this.agent_roster.replace_all(sessions);
                     let order_changed = this.append_new_jump_sessions(
                         this.agent_roster
@@ -144,7 +227,7 @@ impl YaldaGpuiView {
                             .map(|s| s.session_id.clone())
                             .collect::<Vec<_>>(),
                     );
-                    if order_changed {
+                    if order_changed || archive_changed {
                         this.save_settings();
                     }
                     // bug-0016: the server WAL is authoritative for a session's
@@ -157,7 +240,12 @@ impl YaldaGpuiView {
                     // momentarily-stale roster.
                     let recovered_labels = this.recover_labels_from_roster(cx);
                     let recovered_providers = this.recover_providers_from_roster(cx);
-                    if changed || recovered_labels || recovered_providers || order_changed {
+                    if changed
+                        || recovered_labels
+                        || recovered_providers
+                        || order_changed
+                        || archive_changed
+                    {
                         cx.notify();
                     }
                 }
@@ -2068,6 +2156,7 @@ impl YaldaGpuiView {
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             usage: None,
             focused_subagent: None,
+            subagent_transcripts: std::collections::HashMap::new(),
             tasklist_open: false,
             subagents_open: false,
             sidepanel_hidden: false,
@@ -2864,6 +2953,13 @@ impl YaldaGpuiView {
                 ServerNotification::SessionRenamed { session_id, label } => {
                     self.agent_roster.rename(&session_id, &label);
                     self.reconcile_session_renamed(&session_id, &label, cx);
+                }
+                ServerNotification::SessionArchived {
+                    session_id,
+                    archived,
+                } => {
+                    self.agent_roster.set_archived(&session_id, archived);
+                    self.apply_session_archived_local(&session_id, archived, cx);
                 }
                 // bug-0022: live turn status for EVERY session, including ones
                 // this GUI never attached to (free sessions, or ones another GUI
@@ -4134,18 +4230,64 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
-    /// Set the focused sub-agent by its stable tool-call key (§27). The
-    /// main transcript swap is purely a render-time decision; this just
-    /// flips the field. Keying by `ToolCallKey` (not a positional index)
-    /// keeps focus pinned to the same sub-agent regardless of how the
-    /// derived `subagents()` list is ordered (ADR-0006 quick win #1).
-    pub(crate) fn focus_subagent(&mut self, key: ToolCallKey, cx: &mut Context<Self>) {
-        if let Some(mut c) = self.agent_mut(cx)
-            && c.tools.calls.contains_key(&key)
-        {
-            c.focused_subagent = Some(key);
+    /// Focus a provider-neutral subagent identity. Claude subagents remain
+    /// backed by their parent tool call; a Codex identity is its child thread
+    /// id and is replayed lazily into an inspector-only snapshot.
+    pub(crate) fn focus_subagent(&mut self, key: SubAgentKey, cx: &mut Context<Self>) {
+        let Some(id) = self.focused_bound_session() else {
+            return;
+        };
+        let Some(session) = self.session_entity(id) else {
+            return;
+        };
+
+        let (exists, cwd, thread_to_load) = {
+            let session = session.read(cx);
+            let state = &session.state;
+            let exists = state.subagents().iter().any(|sa| sa.key == key);
+            let thread_to_load = match &key {
+                SubAgentKey::CodexThread(thread_id)
+                    if !matches!(
+                        state.subagent_transcripts.get(thread_id),
+                        Some(SubAgentTranscriptLoad::Loading | SubAgentTranscriptLoad::Loaded(_))
+                    ) => Some(thread_id.clone()),
+                _ => None,
+            };
+            (exists, session.cwd.clone(), thread_to_load)
+        };
+        if !exists {
+            return;
         }
-        cx.notify();
+
+        let _ = self.with_session(id, cx, |state| {
+            state.focused_subagent = Some(key);
+            if let Some(thread_id) = &thread_to_load {
+                state
+                    .subagent_transcripts
+                    .insert(thread_id.clone(), SubAgentTranscriptLoad::Loading);
+            }
+        });
+
+        let Some(thread_id) = thread_to_load else {
+            return;
+        };
+        let thread_for_worker = thread_id.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { load_codex_subagent_thread(thread_for_worker, cwd) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let load = match result {
+                    Ok(transcript) => SubAgentTranscriptLoad::Loaded(transcript),
+                    Err(error) => SubAgentTranscriptLoad::Failed(error),
+                };
+                let _ = this.with_session(id, cx, |state| {
+                    state.subagent_transcripts.insert(thread_id, load);
+                });
+            });
+        })
+        .detach();
     }
 
     /// Return focus from a sub-agent transcript to the root agent (§27).
@@ -4263,7 +4405,7 @@ impl YaldaGpuiView {
     /// (the plan is read in the panel itself). No-op unless panel-focused with a
     /// row. Called after every highlight move.
     pub(crate) fn reveal_panel_selection(&mut self, cx: &mut Context<Self>) {
-        if let Some(mut c) = self.agent_mut(cx) {
+        let item = if let Some(c) = self.agent_mut(cx) {
             if c.focus != AgentFocus::Panel {
                 return;
             }
@@ -4271,17 +4413,15 @@ impl YaldaGpuiView {
             if rows.is_empty() {
                 return;
             }
-            let Some(item) = rows.get(c.panel_sel.min(rows.len() - 1)).cloned() else {
-                return;
-            };
-            match &item {
-                PanelItem::Subagent(key) if c.tools.calls.contains_key(key) => {
-                    c.focused_subagent = Some(key.clone());
-                }
-                _ => c.focused_subagent = None,
-            }
+            rows.get(c.panel_sel.min(rows.len() - 1)).cloned()
+        } else {
+            None
+        };
+        match item {
+            Some(PanelItem::Subagent(key)) => self.focus_subagent(key, cx),
+            Some(_) => self.unfocus_subagent(cx),
+            None => cx.notify(),
         }
-        cx.notify();
     }
 
     /// Activate the selected row of the active column (`Enter`): commit the

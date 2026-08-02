@@ -187,6 +187,12 @@ removes the shared-mutable substrate underneath them.
 ### Explicit resource lifetime (SHIPPED partial → DRAFT target)
 - SHIPPED (`81ae216`): `SessionServerClient::Drop` shuts the socket down, so the
   server observes disconnect promptly instead of at process exit.
+- SHIPPED (2026-08-01): archive is a durable cold-storage boundary. The actor
+  fsyncs an `Archive` WAL record before cancelling the turn and dropping the ACP
+  transport, pump generation, subscriber forwarder, pending prompts, and WAL
+  append handle. It retains only the WAL path, metadata, and rebuilt transcript.
+  Archived recovery opens no WAL descriptor and starts no resume worker;
+  unarchive reopens the WAL and resumes the last ACP session id.
 - DRAFT target: connection teardown is owned by an async end-to-end path (no
   detached sync reader thread blocked on `lines()` bridging to a sync GUI). The
   sync↔async bridge in `session_client.rs` and `acp_channel.rs` is where these
@@ -250,6 +256,17 @@ removes the shared-mutable substrate underneath them.
   until it measurably hurts). A **slow subscriber past the high-water backlog is
   disconnected** (forced clean reconnect) rather than allowed to pin unbounded
   growth — the owner/lease-holder is a hard ceiling and is never gapped.
+- **SHIPPED (2026-08-01): descriptor capacity tracks the persistent-session
+  model.** launchd commonly supplies a 256-file soft limit, while every restored
+  live ACP transport owns multiple pipes/kqueues plus its WAL descriptor. At
+  startup the server raises its own `RLIMIT_NOFILE` soft limit to 4096 (or the
+  inherited hard limit, whichever is lower; configurable with
+  `YALDA_MAX_OPEN_FILES`). Spawn errors preserve their OS error kind, so `EMFILE`
+  is reported as capacity exhaustion rather than the false “agent not on PATH.”
+- **SHIPPED (2026-08-01): inactive history does not consume live-session
+  descriptors.** Archiving closes that session's WAL handle and ACP transport;
+  closing an archived session deletes the retained WAL by path. `admin_status`
+  exposes `archived` and `wal_open` so this invariant is observable.
 
 ### Protocol versioning & capability negotiation (DRAFT)
 - `initialize` negotiates a protocol version and capability set, so the GUI and

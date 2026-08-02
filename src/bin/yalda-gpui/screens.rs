@@ -4,19 +4,64 @@
 
 use super::*;
 
-/// Process cwd, read once and cached for the process lifetime.
-///
-/// `render_agent` compares each session's per-slot cwd against the process cwd
-/// every frame (cursor blink, streamed chunk, cross-tile wakeup). The underlying
-/// `process_cwd()` (persist.rs) does a `getcwd(2)` syscall on every call — an
-/// O(1) but non-trivial per-frame cost on the paint thread. The cwd is
-/// process-stable (Yalda never `chdir`s after launch), so a one-time read is
-/// correct. Mirrors the `perf_enabled()` OnceLock idiom (main.rs:130); the
-/// static is intentionally defined here, local to screens.rs.
-fn cached_process_cwd() -> &'static std::path::Path {
-    use std::sync::OnceLock;
-    static CWD: OnceLock<std::path::PathBuf> = OnceLock::new();
-    CWD.get_or_init(process_cwd).as_path()
+/// Stable width for both Agent Tile activity states. `* working` and `+ ready`
+/// must not shove the turn timer sideways when a reply starts or finishes.
+pub(crate) const AGENT_ACTIVITY_PILL_WIDTH: f32 = 88.0;
+
+/// Only transient compose state belongs in the Agent Tile header. Editor mode
+/// and cursor position stay in the editor itself.
+pub(crate) fn agent_editing_status_label(dirty: bool, extend: bool) -> &'static str {
+    match (dirty, extend) {
+        (true, true) => "• EXT",
+        (true, false) => "•",
+        (false, true) => "EXT",
+        (false, false) => "",
+    }
+}
+
+/// Compact header activity vocabulary, always shown even on a new session.
+pub(crate) fn agent_header_activity(working: bool) -> (&'static str, &'static str) {
+    if working { ("*", "working") } else { ("+", "ready") }
+}
+
+/// Cool neutral copy for the Agent Tile header. In particular, Folio's `dim`
+/// and `warm_accent` are tan/gold and must never leak back into this surface.
+pub(crate) fn agent_header_supporting_text_color(
+    theme: &yalda::theme::AgentTheme,
+) -> yalda::style::Color {
+    theme.agent_tint
+}
+
+/// Name a linked Git worktree when `cwd` is inside one; otherwise show the
+/// shortened working directory. Linked worktrees have a `.git` file at their
+/// root; primary checkouts have a `.git` directory. Results are cached because
+/// this runs from the paint path.
+pub(crate) fn agent_location_label(cwd: &std::path::Path) -> String {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    thread_local! {
+        static LABELS: RefCell<HashMap<PathBuf, String>> = RefCell::new(HashMap::new());
+    }
+
+    let key = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    LABELS.with(|labels| {
+        if let Some(label) = labels.borrow().get(&key) {
+            return label.clone();
+        }
+        let worktree_name = key.ancestors().find_map(|ancestor| {
+            let dot_git = ancestor.join(".git");
+            dot_git.is_file().then(|| ancestor.file_name()).flatten()
+                .map(|name| name.to_string_lossy().into_owned())
+        });
+        let label = match worktree_name {
+            Some(name) => format!("WORKTREE {name}"),
+            None => format!("CWD {}", shorten_cwd_for_display(&key)),
+        };
+        labels.borrow_mut().insert(key, label.clone());
+        label
+    })
 }
 
 impl YaldaGpuiView {
@@ -885,9 +930,9 @@ impl YaldaGpuiView {
         let Some(session_ent) = self.session_entity(id) else {
             return self.render_agent_picker(root, tile, cx);
         };
-        let (active_slot_label, active_slot_cwd, active_provider) = {
+        let (active_slot_label, active_slot_cwd) = {
             let s = session_ent.read(cx);
-            (s.label.clone(), s.cwd.clone(), s.state.provider)
+            (s.label.clone(), s.cwd.clone())
         };
         // Weak handle to THIS view, captured by the status-strip / sidebar
         // click listeners (they re-enter via `weak.update(app, …)` at click
@@ -950,403 +995,151 @@ impl YaldaGpuiView {
         let compose_fg: Hsla = self.editor_fg();
         let top = self.theme.top_bar;
 
-        // ---- Status Strip (spec §30) ----
-        // Wrapping header showing agent label, sub-agent breadcrumb (when
-        // focused), model id, permission mode, and turn / elapsed. Context-window
-        // usage gets a dedicated second line so narrow desktop tiles don't clip
-        // the rest of their chrome. Any field
-        // whose underlying signal is absent renders nothing — no
-        // placeholder, no `?`. The strip is at most as wide as the
-        // data it has.
-        let strip_dim: Hsla = nc(at.dim);
-        let strip_warm: Hsla = nc(at.warm_accent);
+        // ---- Agent header ----
+        // Three semantic rows: identity/editor, live activity + usage, location.
+        // Cool agent prose colors replace the old gold/tan header accents.
+        let supporting: Hsla = nc(agent_header_supporting_text_color(at));
+        let muted = supporting.opacity(0.78);
+        let working_orange: Hsla = nc(at.jump_working);
+        let ready_green: Hsla = nc(at.tool_completed);
         let strip_fg = fg_or(top, STATUS_FG);
-
-        let mut strip = div()
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .items_center()
-            .px_4()
-            .py_1()
-            .min_h(px(28.0))
-            .bg(bg_or(top, STATUS_BG))
-            .text_color(strip_fg)
-            .font_weight(FontWeight::BOLD)
-            .text_size(px(12.0));
-        let mut usage_line: Option<AnyElement> = None;
-
-        // Agent label (slot label).
-        strip = strip.child(
+        let header_bg = bg_or(top, STATUS_BG);
+        let base_row = || {
             div()
-                .pr_2()
-                .child(SharedString::from(active_slot_label.clone())),
-        );
-        strip = strip.child(probe_bounds_dyn(
-            format!("agent-provider-{}", active_provider.label()),
-            div()
-                .mr_2()
-                .px_1()
-                .rounded_sm()
-                .bg(strip_dim.opacity(0.18))
-                .text_color(strip_dim)
-                .child(SharedString::from(active_provider.label()))
-                .into_any_element(),
-        ));
-
-        // Edit-surface status (moved up from the old footer): which surface +
-        // mode is active, the cursor position, and any transient status/awaiting
-        // note. This is the primary "what am I doing" readout, so it sits at the
-        // top next to the agent identity.
-        {
-            // Model C: the active edit surface is the COMPOSE buffer in both
-            // placements; the placement only changes the label (CHATBOX vs
-            // WORKSHEET). Mode + cursor read the compose, not the read-only
-            // transcript.
-            let in_chatbox = c.input_surface.is_chatbox();
-            let compose = c.input_surface.compose();
-            let mode_label = match (in_chatbox, compose.mode) {
-                (true, EditMode::Normal) => "CHATBOX",
-                (true, EditMode::Insert) => "CHATBOX INSERT",
-                (false, EditMode::Normal) => "WORKSHEET",
-                (false, EditMode::Insert) => "WORKSHEET INSERT",
-            };
-            let dirty_mark = if compose.editor.document().is_modified() {
-                "•"
-            } else {
-                ""
-            };
-            let extend_mark = if compose.editor.extend_mode() {
-                " EXT"
-            } else {
-                ""
-            };
-            let compose_cursor = compose.editor.cursor();
-            let mut status_text = format!(
-                "{}{}{} · L{}:C{}",
-                dirty_mark,
-                mode_label,
-                extend_mark,
-                compose_cursor.line + 1,
-                compose_cursor.col + 1,
-            );
-            if c.turn_phase.is_awaiting() {
-                status_text.push_str(" · …awaiting reply");
-            }
-            if let Some(msg) = &c.status {
-                status_text.push_str("  [");
-                status_text.push_str(msg);
-                status_text.push(']');
-            }
-            strip = strip.child(
-                div()
-                    .pr_2()
-                    .text_color(strip_dim)
-                    .font_weight(FontWeight::NORMAL)
-                    .child(SharedString::from(status_text)),
-            );
-        }
-
-        // Session-server indicator.
-        if c.server_managed {
-            strip = strip.child(
-                div()
-                    .pr_2()
-                    .text_color(strip_dim)
-                    .child(SharedString::new_static("server")),
-            );
-        }
-
-        // Sub-agent breadcrumb (only when focused).
-        if let Some(key) = c.focused_subagent.as_ref()
-            && let Some(sa) = c.tools.calls.get(key).and_then(classify_subagent)
-        {
-            let crumb = format!(" ⏵ {} ◂", sa.label);
-            strip = strip.child(
-                div()
-                    .pr_2()
-                    .text_color(strip_warm)
-                    .child(SharedString::from(crumb)),
-            );
-        }
-
-        // Per-slot cwd (spec-agent-cwd.md §6). Hidden when the slot cwd
-        // matches the process cwd — surfacing the implicit default on
-        // every session is noise. Tooltip with the absolute path is a
-        // follow-up (GPUI tooltip support is patchy on this version);
-        // for now the shortened display is the only affordance.
-        let proc_cwd = cached_process_cwd();
-        if active_slot_cwd.as_path() != proc_cwd {
-            let shortened = shorten_cwd_for_display(&active_slot_cwd);
-            strip = strip.child(
-                div()
-                    .pr_2()
-                    .text_color(strip_dim)
-                    .child(SharedString::from(shortened)),
-            );
-        }
-
-        // Model id: the authoritative value comes from the agent
-        // (`agent_model`, mirrored from `session/new`'s `config_options`).
-        // Fall back to the old best-effort guesses (session mode → channel
-        // command) only when the adapter never advertised a model — e.g. an
-        // older `claude-code-acp` that doesn't surface a model selector.
-        let model_label: Option<String> = c
-            .agent_model
-            .clone()
-            .or_else(|| c.agent_mode.as_ref().map(|m| m.0.to_string()))
-            .or_else(|| c.channel.as_ref().map(|ch| ch.command().to_string()));
-        if let Some(m) = model_label {
-            // Clickable when the agent advertised a model picklist: a click
-            // opens the local (space) menu where the "switch model" submenu
-            // lives — a mouse affordance for the keyboard `space M` path
-            // (UXI-AgentTile-16). Falls back to a plain label otherwise.
-            let has_models = !c.available_models.is_empty();
-            if has_models {
-                strip = strip.child(
-                    div()
-                        .id("agent-model-badge")
-                        .pr_2()
-                        .text_color(strip_dim)
-                        .hover(|s| s.text_color(strip_warm))
-                        .cursor_pointer()
-                        .child(SharedString::from(format!("{m} ▾")))
-                        // Dispatch the OpenLocalMenu action (not `cx.listener` —
-                        // the strip is assembled inside a `session_ent.update`
-                        // closure that already holds `cx`). The agent tile is
-                        // focused (we clicked its badge), so the menu opens on
-                        // the AGENT scope where "switch model" lives.
-                        .on_click(|_ev, window, cx| {
-                            window.dispatch_action(Box::new(crate::OpenLocalMenu), cx);
-                        }),
-                );
-            } else {
-                strip = strip.child(
-                    div()
-                        .pr_2()
-                        .text_color(strip_dim)
-                        .child(SharedString::from(m)),
-                );
-            }
-        }
-
-        // Permission mode — made prominent so the danger level of the
-        // current mode reads at a glance. Yolo (auto-approve everything,
-        // the no-config default) gets the warm/danger accent + bold; the
-        // restricted modes render dim. Stays at native chrome size (no
-        // text_scale). Cycle it with `<space> c m`.
-        //
-        // Sourced from session state (`c.permission_mode`), NOT the local
-        // `channel`: in session-server mode the agent/channel live in the
-        // server and `c.channel` is `None`, so gating on it hid the badge
-        // for every server-backed session. The session always has a mode
-        // (mirrored from `SessionInfo.permission_mode`), so always render.
-        {
-            let mode = c.permission_mode;
-            let mode_str = mode.short_label();
-            let is_yolo = matches!(mode, yalda::acp_channel::PermissionMode::Yolo);
-            let glyph = if is_yolo { "⚡" } else { "🔒" };
-            let badge = div()
-                .pr_2()
-                .text_color(if is_yolo { strip_warm } else { strip_dim })
-                .child(SharedString::from(format!("{glyph} perm: {mode_str}")));
-            let badge = if is_yolo {
-                badge.font_weight(FontWeight::BOLD)
-            } else {
-                badge.font_weight(FontWeight::NORMAL)
-            };
-            strip = strip.child(badge);
-        }
-
-        // Context-window usage — a subtle progress bar plus a compact number.
-        // The bar fills proportionally and shifts to the warm/danger accent as
-        // the window approaches full.
-        if let Some(usage) = &c.usage {
-            let used_k = (usage.tokens_used as f64) / 1000.0;
-            let total_k = (usage.tokens_total as f64) / 1000.0;
-            let frac = if usage.tokens_total > 0 {
-                (usage.tokens_used as f64 / usage.tokens_total as f64).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            let pct = frac * 100.0;
-            const BAR_W: f32 = 64.0;
-            let fill_w = (BAR_W * frac as f32).max(if frac > 0.0 { 2.0 } else { 0.0 });
-            let fill_color = if pct >= 85.0 { strip_warm } else { nc(at.user_bar) };
-            let track_bg = {
-                let mut h = strip_dim;
-                h.a = 0.22;
-                h
-            };
-            let track = div()
-                .w(px(BAR_W))
-                .h(px(5.0))
-                .rounded_full()
-                .bg(track_bg)
-                .child(div().w(px(fill_w)).h_full().rounded_full().bg(fill_color));
-            let label = format!("{:.0}k/{:.0}k ({:.0}%)", used_k, total_k, pct);
-            let usage = div()
                 .w_full()
                 .flex()
                 .flex_row()
+                .flex_wrap()
                 .items_center()
                 .gap_2()
                 .px_4()
                 .py_1()
-                .bg(bg_or(top, STATUS_BG))
-                .text_size(px(11.0))
-                .child(
-                    div()
-                        .flex_none()
-                        .text_color(strip_dim)
-                        .font_weight(FontWeight::BOLD)
-                        .child(SharedString::new_static("USAGE")),
-                )
-                .child(track)
-                .child(
-                    div()
-                        .text_color(strip_dim)
-                        .font_weight(FontWeight::NORMAL)
-                        .child(SharedString::from(label)),
-                );
-            usage_line = Some(probe_bounds(
-                "agent-usage-row",
-                div()
-                    .w_full()
-                    .child(usage)
-                    .into_any_element(),
-            ));
-        }
-
-        // Active sub-agents — the one readout that used to live only in the
-        // (now-removed) bottom info bar. Compact glyph+label list of any
-        // in-progress / pending subagents; omitted entirely when none.
-        {
-            use yalda::acp_channel::ToolCallStatus;
-            let active: Vec<String> = c
-                .subagents()
-                .iter()
-                .filter(|sa| {
-                    matches!(
-                        sa.status,
-                        ToolCallStatus::InProgress | ToolCallStatus::Pending
-                    )
-                })
-                .map(|sa| {
-                    let glyph = match sa.status {
-                        ToolCallStatus::InProgress => "\u{25d0}",
-                        ToolCallStatus::Pending => "\u{25cb}",
-                        _ => "\u{00b7}",
-                    };
-                    let label: String = if sa.label.chars().count() > 16 {
-                        let head: String = sa.label.chars().take(15).collect();
-                        format!("{}\u{2026}", head)
-                    } else {
-                        sa.label.clone()
-                    };
-                    format!("{}{}", glyph, label)
-                })
-                .collect();
-            if !active.is_empty() {
-                strip = strip.child(
-                    div()
-                        .pr_2()
-                        .text_color(strip_warm)
-                        .font_weight(FontWeight::NORMAL)
-                        .child(SharedString::from(active.join("  "))),
-                );
-            }
-        }
-
-        // Turn / elapsed. Show "turn N · M:SS" when a turn has run; "turn
-        // N" alone if no timer is active; nothing if no turns have run.
-        let completed_turns = c.channel.as_ref().map(|ch| ch.turn_count()).unwrap_or(0);
-        let display_turn = if c.turn_phase.is_awaiting() {
-            completed_turns + 1
-        } else {
-            completed_turns
+                .min_h(px(27.0))
+                .bg(header_bg)
+                .text_size(px(12.0))
         };
-        let turn_started = c.turn_phase.turn_started();
 
-        // Right side of the header strip: turn/elapsed plus a Stop button while
-        // a reply is in flight. Pushed right with a flex spacer so it anchors to
-        // the strip's trailing edge regardless of how much status sits left.
-        let mut header_right = div().flex().flex_row().items_center().gap_2();
-        let mut header_right_has_content = false;
-        // UXI-AgentTile-28: the tile says IN WORDS whether the agent is running or
-        // waiting on you — a filled pill in the same vocabulary the jump panel
-        // uses (`◆ working` / `✦ your turn`), so the two surfaces read as one
-        // language. The dim "· …awaiting reply" in the status strip was easy to
-        // miss with a wall of transcript above it.
-        if c.turn_phase.is_awaiting() || display_turn > 0 {
-            let working = c.turn_phase.is_awaiting();
-            let hue: Hsla = if working {
-                nc(at.jump_working)
+        // Row 1: session label · model badge · permission badge · editor state.
+        let mut identity_row = base_row()
+            .text_color(strip_fg)
+            .font_weight(FontWeight::BOLD)
+            .child(SharedString::from(active_slot_label.clone()));
+
+        let model_label = c
+            .agent_model
+            .clone()
+            .or_else(|| c.agent_mode.as_ref().map(|m| m.0.to_string()))
+            .or_else(|| c.channel.as_ref().map(|ch| ch.command().to_string()));
+        if let Some(model) = model_label {
+            let has_models = !c.available_models.is_empty();
+            let model_text = if has_models { format!("{model} ▾") } else { model };
+            let badge = div()
+                .id("agent-model-badge")
+                .px_2()
+                .py(px(1.0))
+                .rounded_md()
+                .bg(supporting.opacity(0.12))
+                .border_1()
+                .border_color(supporting.opacity(0.38))
+                .text_color(supporting)
+                .font_weight(FontWeight::NORMAL)
+                .child(SharedString::from(model_text));
+            identity_row = if has_models {
+                identity_row.child(
+                    badge
+                        .hover(|s| s.border_color(supporting).bg(supporting.opacity(0.2)))
+                        .cursor_pointer()
+                        .on_click(|_ev, window, cx| {
+                            window.dispatch_action(Box::new(crate::OpenLocalMenu), cx);
+                        }),
+                )
             } else {
-                nc(at.tool_completed)
+                identity_row.child(badge)
             };
-            // ONE vocabulary with the jump panel: same glyph, same word, derived
-            // from the same pure mapping (`agent_row_marks`).
-            let (glyph, word) = {
-                let (g, w) = agent_row_marks(if working {
-                    AgentDotStatus::Working
-                } else {
-                    AgentDotStatus::WaitingForYou
-                });
-                (g, w.unwrap_or(""))
-            };
-            let mut pill_bg = hue;
-            pill_bg.a = 0.15;
-            let mut pill_edge = hue;
-            pill_edge.a = 0.55;
-            header_right = header_right.child(probe_bounds(
-                "agent-status-pill",
+        }
+
+        let permission = c.permission_mode;
+        let is_yolo = matches!(permission, yalda::acp_channel::PermissionMode::Yolo);
+        let permission_glyph = if is_yolo { "⚡" } else { "🔒" };
+        let permission_badge = div()
+            .px_2()
+            .py(px(1.0))
+            .rounded_md()
+            .bg(supporting.opacity(0.11))
+            .border_1()
+            .border_color(supporting.opacity(0.38))
+            .text_color(strip_fg)
+            .font_weight(FontWeight::NORMAL)
+            .child(SharedString::from(format!(
+                "{permission_glyph} perm: {}",
+                permission.short_label()
+            )));
+        identity_row = identity_row.child(permission_badge);
+
+        let compose = c.input_surface.compose();
+        let edit_status = agent_editing_status_label(
+            compose.editor.document().is_modified(),
+            compose.editor.extend_mode(),
+        );
+        if !edit_status.is_empty() {
+            identity_row = identity_row.child(
                 div()
-                    .px_2()
-                    .py(px(1.0))
-                    .rounded_md()
-                    .bg(pill_bg)
-                    .border_1()
-                    .border_color(pill_edge)
-                    .text_color(hue)
-                    .child(SharedString::from(format!("{glyph} {word}")))
-                    .into_any_element(),
-            ));
-            header_right_has_content = true;
+                    .text_color(muted)
+                    .font_weight(FontWeight::NORMAL)
+                    .child(SharedString::new_static(edit_status)),
+            );
         }
-        if display_turn > 0 || turn_started.is_some() {
-            let elapsed_str = if let Some(t) = turn_started {
-                let s = t.elapsed().as_secs();
-                format!("{}:{:02}", s / 60, s % 60)
-            } else {
-                String::new()
-            };
-            let turn_color = if turn_started.is_some() {
-                strip_warm
-            } else {
-                strip_dim
-            };
-            let label = if elapsed_str.is_empty() {
-                format!("turn {}", display_turn)
-            } else {
-                format!("turn {} · {}", display_turn, elapsed_str)
-            };
-            header_right = header_right
-                .child(div().text_color(turn_color).child(SharedString::from(label)));
-            header_right_has_content = true;
-        }
-        // Stop button — dispatches the same StopAgent path as ⌘.; after a
-        // graceful cancel is already pending it escalates to a hard kill+resume.
-        if c.turn_phase.is_awaiting() {
+
+        // Row 2: fixed-width activity pill · turn/timer · Stop · usage.
+        let working = c.turn_phase.is_awaiting();
+        let (activity_glyph, activity_word) = agent_header_activity(working);
+        let activity_color = if working { working_orange } else { ready_green };
+        let activity_pill = probe_bounds(
+            "agent-status-pill",
+            div()
+                .w(px(AGENT_ACTIVITY_PILL_WIDTH))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .px_2()
+                .py(px(1.0))
+                .rounded_md()
+                .bg(activity_color.opacity(0.14))
+                .border_1()
+                .border_color(activity_color.opacity(0.52))
+                .text_color(activity_color)
+                .font_weight(FontWeight::BOLD)
+                .child(SharedString::from(format!("{activity_glyph} {activity_word}")))
+                .into_any_element(),
+        );
+        let display_turn = if working {
+            c.current_turn().max(1)
+        } else {
+            c.current_turn().saturating_sub(1)
+        };
+        let turn_label = match c.turn_phase.turn_started() {
+            Some(started) => {
+                let seconds = started.elapsed().as_secs();
+                format!("turn {display_turn} · {}:{:02}", seconds / 60, seconds % 60)
+            }
+            None => format!("turn {display_turn}"),
+        };
+        let mut activity_row = base_row()
+            .text_color(muted)
+            .font_weight(FontWeight::NORMAL)
+            .child(activity_pill)
+            .child(SharedString::from(turn_label));
+
+        if working {
             let stop_fg: Hsla = nc(at.tool_failed);
-            let escalating = c.turn_phase.stop_requested();
-            let stop_label = if escalating {
+            let stop_label = if c.turn_phase.stop_requested() {
                 "■ Force-restart ⌘."
             } else {
                 "■ Stop ⌘."
             };
             let weak_stop = weak_self.clone();
-            header_right = header_right.child(
+            activity_row = activity_row.child(
                 div()
                     .id("agent-stop-btn")
                     .flex()
@@ -1368,25 +1161,87 @@ impl YaldaGpuiView {
                     )
                     .child(SharedString::from(stop_label)),
             );
-            header_right_has_content = true;
-        }
-        if header_right_has_content {
-            strip = strip.child(div().flex_1()).child(header_right);
         }
 
-        let mut header = div()
+        // Context-window usage joins the activity row when supplied by the agent.
+        if let Some(usage) = c.usage.as_ref() {
+            let used_k = usage.tokens_used as f64 / 1000.0;
+            let total_k = usage.tokens_total as f64 / 1000.0;
+            let frac = if usage.tokens_total > 0 {
+                (usage.tokens_used as f64 / usage.tokens_total as f64).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let pct = frac * 100.0;
+            const BAR_W: f32 = 64.0;
+            let fill_w = (BAR_W * frac as f32).max(if frac > 0.0 { 2.0 } else { 0.0 });
+            let fill_color = if pct >= 85.0 { working_orange } else { ready_green };
+            let track = div()
+                .w(px(BAR_W))
+                .h(px(5.0))
+                .rounded_full()
+                .bg(supporting.opacity(0.18))
+                .child(div().w(px(fill_w)).h_full().rounded_full().bg(fill_color));
+            let label = format!("{used_k:.0}k/{total_k:.0}k ({pct:.0}%)");
+            let meter = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .text_size(px(11.0))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(supporting)
+                        .font_weight(FontWeight::BOLD)
+                        .child(SharedString::new_static("USAGE")),
+                )
+                .child(track)
+                .child(
+                    div()
+                        .text_color(muted)
+                        .font_weight(FontWeight::NORMAL)
+                        .child(SharedString::from(label)),
+                );
+            activity_row = activity_row.child(probe_bounds(
+                "agent-usage-row",
+                meter.into_any_element(),
+            ));
+        }
+
+        // Row 3: linked worktree name, otherwise the working directory.
+        let location_label = agent_location_label(&active_slot_cwd);
+        let mut location_row = base_row().text_color(muted);
+        if let Some(path) = location_label.strip_prefix("CWD ") {
+            location_row = location_row
+                .child(
+                    div()
+                        .font_weight(FontWeight::BOLD)
+                        .child(SharedString::new_static("CWD")),
+                )
+                .child(
+                    div()
+                        .font_weight(FontWeight::NORMAL)
+                        .child(SharedString::from(path.to_owned())),
+                );
+        } else {
+            location_row = location_row
+                .font_weight(FontWeight::NORMAL)
+                .child(SharedString::from(location_label));
+        }
+
+        let header = div()
             .w_full()
             .flex()
             .flex_col()
             .flex_none()
-            .bg(bg_or(top, STATUS_BG))
-            .child(probe_bounds("agent-status-row", strip.into_any_element()));
-        if let Some(line) = usage_line {
-            header = header.child(line);
-        }
-
-        // Status (mode, cursor, awaiting) and the Stop button now live in the
-        // header strip at the top; keyboard hints were removed. No footer.
+            .bg(header_bg)
+            .child(probe_bounds("agent-status-row", identity_row.into_any_element()))
+            .child(probe_bounds("agent-activity-row", activity_row.into_any_element()))
+            .child(probe_bounds(
+                "agent-location-row",
+                location_row.into_any_element(),
+            ));
 
         // Chatbox panel — rendered between body and the bottom edge when active.
         //
@@ -1908,7 +1763,7 @@ impl YaldaGpuiView {
                             first.to_string()
                         }
                     });
-                    let is_focused = focused_key.as_ref() == Some(&sa.tool_call_id);
+                    let is_focused = focused_key.as_ref() == Some(&sa.key);
                     let label_fg = if is_focused { nc(at.warm_accent) } else { self.editor_fg() };
                     // Two-line row (UXI-AgentTile-17): line 1 = status glyph + label;
                     // line 2 = the spawn-prompt snippet, dimmed + indented under the
@@ -1927,7 +1782,7 @@ impl YaldaGpuiView {
                         .bg(if selected { sel_bg } else { panel_transparent })
                         .cursor_pointer();
                     let weak = weak_self.clone();
-                    let row_key = sa.tool_call_id.clone();
+                    let row_key = sa.key.clone();
                     row = row.on_click(
                         move |_ev: &gpui::ClickEvent, _w: &mut Window, app: &mut GpuiApp| {
                             let key = row_key.clone();
@@ -2035,16 +1890,11 @@ impl YaldaGpuiView {
                 // transcript. `focused_subagent == None` (the common case) renders
                 // the normal transcript body built before this update.
                 .child(
-                    match c
-                        .focused_subagent
-                        .clone()
-                        .filter(|k| c.tools.calls.contains_key(k))
-                    {
-                        Some(key) => {
-                            let tc = c.tools.calls.get(&key).expect("checked");
-                            let label = classify_subagent(tc)
-                                .map(|s| s.label)
-                                .unwrap_or_else(|| "subagent".to_string());
+                    match c.focused_subagent.as_ref().and_then(|key| {
+                        c.subagents().into_iter().find(|subagent| &subagent.key == key)
+                    }) {
+                        Some(subagent) => {
+                            let label = subagent.label.clone();
                             let weak = weak_self.clone();
                             let back = div()
                                 .id("subagent-back")
@@ -2067,19 +1917,10 @@ impl YaldaGpuiView {
                                 .child(SharedString::new_static("← Back"))
                                 .child(
                                     div()
-                                        .text_color(strip_dim)
+                                        .text_color(muted)
                                         .font_weight(FontWeight::NORMAL)
                                         .child(SharedString::from(format!("· {label}"))),
                                 );
-                            // UXI-AgentTile-25: render the subagent's context as
-                            // beautiful sections (markdown prompt/report, code,
-                            // diffs, chips) — NOT raw JSON. No `font_family(mono)`
-                            // on the container: each section sets its own font.
-                            let mut content = div()
-                                .flex()
-                                .flex_col()
-                                .text_size(px(13.0))
-                                .text_color(compose_fg);
                             let tb_ctx = ToolBodyCtx {
                                 theme: &self.theme,
                                 body_font: self.body_font.clone(),
@@ -2088,12 +1929,148 @@ impl YaldaGpuiView {
                                 // Focused subagent view: show the whole report.
                                 markdown_block_cap: None,
                             };
-                            content = append_tool_body_rich(
-                                content,
-                                tc,
-                                ToolRenderPolicy::Full,
-                                &tb_ctx,
-                            );
+                            let content: gpui::AnyElement = match &subagent.key {
+                                SubAgentKey::ToolCall(key) => {
+                                    let mut content = div()
+                                        .flex()
+                                        .flex_col()
+                                        .text_size(px(13.0))
+                                        .text_color(compose_fg);
+                                    if let Some(tc) = c.tools.calls.get(key) {
+                                        content = append_tool_body_rich(
+                                            content,
+                                            tc,
+                                            ToolRenderPolicy::Full,
+                                            &tb_ctx,
+                                        );
+                                    }
+                                    content.into_any_element()
+                                }
+                                SubAgentKey::CodexThread(thread_id) => {
+                                    match c.subagent_transcripts.get(thread_id) {
+                                        None | Some(SubAgentTranscriptLoad::Loading) => div()
+                                            .id("subagent-thread-loading")
+                                            .py_4()
+                                            .text_color(muted)
+                                            .child(SharedString::new_static(
+                                                "Loading Codex subagent thread…",
+                                            ))
+                                            .into_any_element(),
+                                        Some(SubAgentTranscriptLoad::Failed(error)) => div()
+                                            .id("subagent-thread-error")
+                                            .flex()
+                                            .flex_col()
+                                            .gap_2()
+                                            .py_4()
+                                            .text_color(nc(at.tool_failed))
+                                            .child(SharedString::from(error.clone()))
+                                            .child(
+                                                div()
+                                                    .text_color(muted)
+                                                    .text_size(px(11.0))
+                                                    .child(SharedString::new_static(
+                                                        "Click the subagent row to retry.",
+                                                    )),
+                                            )
+                                            .into_any_element(),
+                                        Some(SubAgentTranscriptLoad::Loaded(transcript)) => {
+                                            let mut timeline = div()
+                                                .id("subagent-thread-transcript")
+                                                .flex()
+                                                .flex_col()
+                                                .gap_3()
+                                                .text_size(px(13.0))
+                                                .text_color(compose_fg);
+                                            if transcript.items.is_empty() {
+                                                timeline = timeline.child(
+                                                    div()
+                                                        .py_4()
+                                                        .text_color(muted)
+                                                        .child(SharedString::new_static(
+                                                            "No replayable transcript content.",
+                                                        )),
+                                                );
+                                            }
+                                            for item in &transcript.items {
+                                                match item {
+                                                    SubAgentTranscriptItem::User(text)
+                                                    | SubAgentTranscriptItem::Agent(text) => {
+                                                        let role = if matches!(
+                                                            item,
+                                                            SubAgentTranscriptItem::User(_)
+                                                        ) {
+                                                            "YOU"
+                                                        } else {
+                                                            "AGENT"
+                                                        };
+                                                        let blocks = render_with_wiki(
+                                                            text,
+                                                            &self.theme,
+                                                            None,
+                                                        );
+                                                        timeline = timeline.child(
+                                                            div()
+                                                                .flex()
+                                                                .flex_col()
+                                                                .gap_1()
+                                                                .child(
+                                                                    div()
+                                                                        .text_size(px(10.0))
+                                                                        .font_weight(
+                                                                            FontWeight::BOLD,
+                                                                        )
+                                                                        .text_color(muted)
+                                                                        .child(
+                                                                            SharedString::new_static(
+                                                                                role,
+                                                                            ),
+                                                                        ),
+                                                                )
+                                                                .child(render_markdown_column(
+                                                                    &blocks,
+                                                                    None,
+                                                                    &self.theme,
+                                                                    &self.body_font,
+                                                                    &self.code_font,
+                                                                    self.text_scale,
+                                                                )),
+                                                        );
+                                                    }
+                                                    SubAgentTranscriptItem::Tool(key) => {
+                                                        if let Some(tc) =
+                                                            transcript.tools.get(key)
+                                                        {
+                                                            let tool = append_tool_body_rich(
+                                                                div()
+                                                                    .flex()
+                                                                    .flex_col()
+                                                                    .child(
+                                                                        div()
+                                                                            .text_size(px(10.0))
+                                                                            .font_weight(
+                                                                                FontWeight::BOLD,
+                                                                            )
+                                                                            .text_color(muted)
+                                                                            .child(
+                                                                                SharedString::from(
+                                                                                    tc.title.clone(),
+                                                                                ),
+                                                                            ),
+                                                                    ),
+                                                                tc,
+                                                                ToolRenderPolicy::Full,
+                                                                &tb_ctx,
+                                                            );
+                                                            timeline = timeline.child(tool);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            timeline.into_any_element()
+                                        }
+                                    }
+                                }
+                            };
                             let body = div()
                                 .id("subagent-body")
                                 .flex()

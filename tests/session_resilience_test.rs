@@ -588,6 +588,74 @@ fn admin_status_reports_live_sessions() {
     );
 }
 
+/// Archive is a server lifecycle transition, not a GUI filter: the WAL file is
+/// retained while its append descriptor and ACP runtime are released, the state
+/// appears in both list/admin responses, and unarchive reopens the durable log.
+#[test]
+fn archive_is_cold_and_reversible_over_the_real_wire() {
+    let _g = serial_lock();
+    let server = TestServer::start();
+    server.activate_env();
+    let client = connect_as("gui-archive");
+    let created = client
+        .create_session(std::env::temp_dir(), "cold-wire".into(), None)
+        .expect("create archive fixture");
+    let wal_dir = server.socket.with_extension("wal");
+    assert_eq!(
+        std::fs::read_dir(&wal_dir).expect("WAL dir").count(),
+        1,
+        "created session owns one durable WAL"
+    );
+
+    client
+        .set_archived(&created.session_id, true)
+        .expect("archive request");
+    let listed = client.list_sessions().expect("list after archive");
+    let cold = listed
+        .iter()
+        .find(|info| info.session_id == created.session_id)
+        .expect("archived session remains listed");
+    assert!(cold.archived);
+    assert!(!cold.connected);
+    let admin = client.admin_status().expect("admin after archive");
+    let cold_admin = admin
+        .sessions
+        .iter()
+        .find(|info| info.session_id == created.session_id)
+        .expect("archived session remains managed");
+    assert!(cold_admin.archived);
+    assert!(!cold_admin.wal_open, "archive closes the append descriptor");
+    assert_eq!(
+        std::fs::read_dir(&wal_dir).expect("WAL dir").count(),
+        1,
+        "archive retains the transcript file"
+    );
+
+    client
+        .set_archived(&created.session_id, false)
+        .expect("unarchive request");
+    let admin = client.admin_status().expect("admin after unarchive");
+    let live = admin
+        .sessions
+        .iter()
+        .find(|info| info.session_id == created.session_id)
+        .expect("unarchived session remains managed");
+    assert!(!live.archived);
+    assert!(live.wal_open, "unarchive reopens the append descriptor");
+
+    client
+        .set_archived(&created.session_id, true)
+        .expect("rearchive before close");
+    client
+        .close_session(&created.session_id)
+        .expect("close archived session");
+    assert_eq!(
+        std::fs::read_dir(&wal_dir).expect("WAL dir").count(),
+        0,
+        "explicit close deletes a cold session's retained WAL"
+    );
+}
+
 /// The in-place `reconnect()` path the GUI pump uses (not a brand-new client).
 /// This is the exact code that runs when the server reader thread sees EOF and
 /// the pump rebuilds the connection — the LIVE GUI's actual reconnect mechanism.
