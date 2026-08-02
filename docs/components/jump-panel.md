@@ -51,16 +51,18 @@ Sections:
     - **● orange** — working (a reply is in flight).
     - **● green** — connected and idle → **ready for input / your turn**.
     - **○ dim** — disconnected or connecting. The whole row is also dimmed.
-  - Click → bound session focuses its tile; **free** session opens in an
-    ephemeral virtual workspace (torn down on switch-away).
+  - Click → every session opens in a detached ephemeral view (torn down on
+    switch-away); an existing workspace placement remains where it is
+    (`UXI-JumpPanel-19`).
   - The row bound to the **focused tile** carries a left accent bar
     (`UXI-JumpPanel-5`) — "this is where you are."
 
 ## References
 
-- `docs/components/README.md` § Terminology — **free** (a session no tile binds) and
-  **bare agent view** (the ephemeral workspace a free session opens in). The panel's
-  agent list is where free sessions live.
+- `docs/components/README.md` § Terminology — **free** (a session with no durable
+  workspace-tile reference) and
+  **bare agent view** (the ephemeral workspace a direct session visit opens).
+  The panel's agent list is where free sessions live.
 - `docs/specs/spec-jump-panel.md` — deeper design doc.
 - ADR-0021 — the ephemeral virtual-workspace decision that shaped free-session
   jump.
@@ -316,13 +318,14 @@ operational state. Two independent marks,
 1. **The active workspace row** — the row whose tab index equals
    `workspace.active_tab` — is always boxed **when that tab is listed** (i.e. it
    is non-ephemeral). If the active tab is an **ephemeral virtual workspace** (a
-   free session opened via ADR-0021), it isn't in the Workspaces list, so **no
+   direct session visit opened via ADR-0021), it isn't in the Workspaces list, so **no
    workspace row is marked**. The mark is a neutral left bar over the gray
    selected background.
-2. **The focused bound-session row** — the agent-session row bound to the
-   **focused tile** (`focused_bound_session()`) — is marked. When the focused tile
+2. **The focused viewed-session row** — the agent-session row shown by the
+   **focused tile** (`AgentTile::session()`) — is marked, including a detached
+   direct visit (`UXI-JumpPanel-19`). When the focused tile
    is a **buffer**, or an **unbound** agent tile (selector, no session), there is
-   **no session mark**. A roster-only / unopened session is never the focused bound
+   **no session mark**. A roster-only / unopened session is never the focused
    session, so it is never marked. A disconnected-but-focused session **still** gets
    its mark (it means "active," orthogonal to the status-dot color / row dim).
 
@@ -343,8 +346,7 @@ every listed row when the active tab is ephemeral.
 `jump_target_is_active` (the pure derivation), `jump_nav_row` (`active:
 Option<Hsla>` param → left `border_l_2` neutral bar + gray selected background),
 and `render_jump_panel` (workspace/session rows use `OverlayTheme::border` for the
-mark and `OverlayTheme::selected_bg` for selection). `focused_bound_session`
-(`main.rs`).
+mark and `OverlayTheme::selected_bg` for selection).
 
 **Why.** With several workspaces and many agent sessions listed, the user loses
 track of which one they're currently looking at. A clean accent mark on "where you
@@ -1126,3 +1128,42 @@ it exists for lifecycle messages recorded *before* GPUI builds the console view
 until the next launch. `append_system_console` pushes into the live
 `SystemConsoleView` and persists, which is what "write a log message to the
 system console" actually requires.
+
+### UXI-JumpPanel-19 — Direct session visits are detached from workspace placement
+
+**Statement.** Activating an agent session directly from either the jump panel
+or `Cmd-P` opens it in a bare ephemeral agent view, even when that session is
+already referenced by a tile in a real workspace. The direct tile is an ordinary
+second viewport reference to the same project session: it never moves, unbinds,
+or duplicates the session's durable workspace placement. Leaving the bare view
+tears down only that reference; returning to the workspace finds the session in
+its original tile. A free session stays free while viewed directly because the
+ephemeral reference is not placement.
+
+Session identity, ACP transport, transcript, and reducer state are owned once by
+the project/session domain (`AgentSessions` is the normalized runtime store).
+Workspaces own their tiles, and tiles hold only `SessionId` references. Whether a
+reference is durable is derived from its containing `Workspace::ephemeral` flag;
+there is no second "detached tile" state to keep synchronized.
+
+**Applies to.** `agent.rs::AgentTile::{Bound,session}`;
+`agent_ui.rs::{jump_to_agent,jump_to_session,agent_tile_id_bound_to,
+bound_sid_set,save_agent_ring}`; `workspace.rs::Workspace::ephemeral`; and
+`jump_palette.rs::activate_jump_palette_selection`, which deliberately shares
+the jump-panel dispatcher.
+
+**Why.** Choosing a session directly means "show me the session," not "take me
+to whichever workspace currently contains it." Workspace placement is durable
+spatial context and must remain present while the user makes a temporary direct
+visit.
+
+**Status.** `implemented` (headless).
+
+**Enforcement.** `verify_harness.rs::direct_session_visits_add_a_reference_and_keep_workspace_placement`
+drives the shared jump-panel dispatcher and the real `Cmd-P` key/activation path
+against a session already bound in a real workspace. It proves both entries open
+an ephemeral tile holding the same `SessionId`, the original durable placement
+remains unique, and switch-away reveals it unchanged. The free-session guard also
+proves an ephemeral reference does not count as placement. Negative control:
+restoring the former focus-existing-workspace branch fails on the missing
+ephemeral view.

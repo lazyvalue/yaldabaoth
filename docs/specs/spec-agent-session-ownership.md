@@ -1,4 +1,4 @@
-# Agent Session Ownership — one owner, 1:1, illegal states unrepresentable
+# Agent Session Ownership — project session, normalized state, viewport references
 
 Status: DRAFT (supersedes the binding/lifecycle parts of `spec-multi-session.md`
 and the multi-subscriber/lease parts of `spec-session-server-actor.md`).
@@ -6,8 +6,8 @@ and the multi-subscriber/lease parts of `spec-session-server-actor.md`).
 > **Extended by ADR-0028 / `docs/components/project.md` (Projects primitive):** a
 > session now also has a **project membership** — `Assigned` (a stored
 > `ProjectId`) or `Inferred` (`Projects::by_cwd(session.cwd)`) or `Unfiled`. The
-> 1:1 tile binding (INV-2 below) is additionally **gated to intra-project**: a
-> session may bind only to a tile whose workspace shares the session's project
+> durable tile placement (INV-2 below) is additionally **gated to intra-project**:
+> a session may be placed only in a workspace sharing the session's project
 > (`UXI-Project-6`). A session keeps its immutable spawn `cwd` (server-side ground
 > truth); only its *project* is derived. The store patterns here are the model the
 > `Projects` store mirrors.
@@ -46,13 +46,16 @@ for many-to-many binding evaporates.
 
 ## Decision
 
-1. **Strict 1:1.** A server session is shown in **exactly one** tile. A tile's
-   agent ring holds only **distinct** sessions. No mirroring.
-2. **One owner.** A single struct, `AgentSessions`, **owns** all agent session
-   state behind a private API. The `sid → session` index is private and
-   maintained *only* by its own methods. Illegal states (two sessions for one
-   sid; a session in two tiles) are unrepresentable because the only way to get
-   a session is through an API that returns the existing one.
+1. **Project owns the session; workspaces own viewports.** Each session belongs
+   logically to exactly one project. `AgentSessions` is the normalized runtime
+   store for session identity and state, keyed by `SessionId`; it is not layout.
+   Each workspace owns its `AgentTile`s, and every bound tile holds an ordinary
+   reference to a session. Multiple viewports may reference the same session.
+2. **One session entity per server sid.** The private `sid → session` index is
+   maintained *only* by `AgentSessions`. Illegal duplicate runtime entities
+   (and therefore duplicate transports/reducers) are unrepresentable because
+   the only way to obtain a session is through an API that returns the existing
+   one.
 3. **Ownership inversion.** Session *state* (`AgentState`, channel, label, cwd,
    resume id) moves **out** of the layout tree and into `AgentSessions`. Tiles
    hold lightweight **keys** (`SessionId`), not state. Routing becomes an O(1)
@@ -69,8 +72,8 @@ for many-to-many binding evaporates.
 /// sid (which is absent pre-attach and can change on resume-fallback).
 struct SessionId(u64);
 
-/// One agent conversation. State that used to live in AgentSlot.state + the
-/// slot's binding fields, now owned centrally.
+/// One project-owned agent conversation. State that used to live in
+/// AgentSlot.state + the slot's binding fields, now normalized centrally.
 struct AgentSession {
     state: AgentState,              // editor / transcript / tools / turn_phase / channel
     label: String,
@@ -80,8 +83,9 @@ struct AgentSession {
     // DELETED: is_driver, lease/owner/candidate fields.
 }
 
-/// THE owner. Private fields — the rest of the app touches sessions ONLY
-/// through this API. This is where the 1:1 invariant is enforced.
+/// The normalized runtime store. Private fields — the rest of the app touches
+/// session entities ONLY through this API. Project membership is resolved from
+/// the session's immutable spawn cwd through `Projects` (UXI-Project-2).
 struct AgentSessions {
     sessions: BTreeMap<SessionId, AgentSession>,
     by_sid: HashMap<String, SessionId>,   // private; maintained internally
@@ -114,34 +118,36 @@ impl AgentSessions {
 }
 ```
 
-Tiles change from owning state to holding *one* key:
+Tiles change from owning state to holding *one reference key*:
 
 ```rust
 enum App { Buffer(BufferApp), Agent(AgentTile) }
 
 struct AgentTile {                 // a VIEW onto one session, not a store
-    bound: Option<SessionId>,      // the session shown here; None ⇒ show the picker
+    bound: Option<SessionId>,      // reference to the shown session; None ⇒ picker
     underlying: Option<Box<BufferApp>>,
     picker: Option<SessionPicker>, // lists FREE sessions + "new"
 }
 ```
 
 A tile shows **exactly one** session at a time. There is no in-tile session
-ring; instead a tile can be **rebound** to any *free* session.
+ring. The same `SessionId` may be referenced by a durable workspace tile and a
+direct ephemeral viewport at once; both render the one shared session entity.
 
 ## Placement, free sessions, and rebind
 
-Sessions exist in the store independently of tiles — a session can be running
-with no tile displaying it. Placement is the (dynamic) map from tiles to the
-session each shows.
+Sessions exist in the project/session domain independently of tiles — a session
+can run with no viewport displaying it. Placement is the dynamic map from
+**non-ephemeral workspace** tiles to the session each shows. Ephemeral tiles are
+viewports but not placement.
 
-- **Free session** — a `SessionId` in the store that no tile currently binds.
-  Computed as `store.ids() − {tiles' bound ids}` (a cheap scan; tiles are few).
-  There is one source of truth for existence (the store) and one for placement
-  (the tiles), so nothing drifts.
-- **Bind** — point a tile at a free session: set `tile.bound = Some(id)`. Only a
-  free session (or the tile's own current one) is a legal target; binding a
-  session already shown elsewhere is refused (INV-2).
+- **Free session** — a `SessionId` with no durable workspace-tile reference.
+  Computed as `store.ids() − {bound ids in non-ephemeral workspaces}`. A bare
+  direct view does not change this classification.
+- **Bind/reference** — point a tile at a session: `tile.bound = Some(id)`.
+  Normal workspace picker placement accepts only a free session (or focuses its
+  existing placement), while direct navigation creates an ephemeral reference
+  regardless of whether durable placement exists.
 - **Rebind** — change `tile.bound` from A to a free B; A becomes free (it keeps
   running in the store / on the server — rebinding never kills a session).
 - **Close the tile** — frees its session (the session keeps running); the tile
@@ -157,10 +163,12 @@ switcher on an existing agent tile, both go through it.
 
 - **INV-1 — one session per sid.** `by_sid` is a map; `open_or_focus`/`bind_sid`
   are the only writers. Two `AgentSession`s for one sid cannot exist.
-- **INV-2 — at most one tile per session.** A `SessionId` is `bound` by at most
-  one `AgentTile`. A session bound by no tile is *free* and re-bindable. Enforced
-  by the bind/rebind operations, which only target free sessions; `open_or_focus`
-  on an already-shown sid focuses its tile instead of binding a second copy.
+- **INV-2 — viewport references do not own session state.** A `SessionId` has at
+  most one durable real-workspace placement under the current picker policy, but
+  may have additional ephemeral viewport references. Every tile uses the same
+  `AgentTile::Bound { session }` shape. Free-session and persistence calculations
+  scan only non-ephemeral workspaces; ordinary picker attach still focuses an
+  existing durable placement.
 - **INV-3 — one channel per session.** The channel/forwarder lives on the single
   `AgentSession`; closing it is the only detach. No second attach can occur
   because `open_or_focus` short-circuits on an existing sid.
@@ -172,8 +180,9 @@ switcher on an existing agent tile, both go through it.
 All ~11 bind paths collapse into one entry point on the view:
 
 ```rust
-/// Show `sid`'s session in a tile, creating it if needed. If it already
-/// exists, focus its tile instead of binding a second copy. Returns where it is.
+/// Resolve `sid` to its one session entity, creating it if needed. Placement
+/// surfaces may focus its durable tile; direct-navigation surfaces may create
+/// an additional ephemeral viewport reference.
 fn show_session(&mut self, sid: Option<&str>, want_new_tile: bool, cx) -> SessionId
 ```
 

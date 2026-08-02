@@ -13,6 +13,23 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Direct session visits are detached from workspace placement** — `DONE`
+  (2026-08-02 via `/new-ux`; `UXI-JumpPanel-19`). Captured verbatim: *"Visiting
+  a session directly (via the jump panel or the p-menu) should be different from
+  visiting it in a workspace. Going directly to it should show it detatched from
+  a workspace. However, it hsould still present in workspace when visited."*
+  Both entry surfaces now open a bare ephemeral workspace whose ordinary
+  `AgentTile::Bound` tile references the project session. The original tile
+  remains the unique durable placement, switch-away removes only the direct
+  reference, and placement/free/persistence projections exclude ephemeral
+  workspaces. Detachment is derived from the viewport's containing workspace;
+  it is not duplicated as tile state.
+  Close and `/clear` from the bare view preserve valid workspace placement.
+  `direct_session_visits_add_a_reference_and_keep_workspace_placement` drives the
+  jump-panel dispatcher plus real `Cmd-P` activation; restoring the former
+  focus-owner branch produced the expected RED. GPUI harness (518 passed, 1
+  ignored) and the non-test binary check are green.
+
 - **Sessions stuck showing "Unavailable"** — `NEEDS-RUNTIME` (2026-07-31 via
   `/bug`; `bug-0027`). Reported as *"frequently sessions are listed
   (temporarily) as 'unavailable'"*, then sharpened to *"this session is listed

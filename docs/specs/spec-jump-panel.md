@@ -43,13 +43,13 @@ open for more object types (files, Linear, etc.) later.
 - **Workspace row** → set `active_tab` to that tab (switch workspace). If a
   virtual workspace is currently active, switching away tears it down
   (ADR-0021).
-- **Bound agent session** (`agent_tile_id_bound_to(sid).is_some()`) → switch to
-  the tab containing its tile and focus that tile. No new tile created.
-- **Free agent session** (no tile binds it) → create an **ephemeral virtual
-  workspace** holding a single tile bound to that session, and make it active
-  (ADR-0021). Selecting a *different* free session replaces the current virtual
-  workspace rather than accumulating. Navigating to any real workspace/session
-  tears the virtual one down and returns the session to **free**.
+- **Any agent session** → create an **ephemeral virtual workspace** and make it
+  active (ADR-0021, `UXI-JumpPanel-19`). If the session already has a real
+  workspace tile, both tiles hold ordinary references to the same session and
+  the original placement is untouched. If it is free, the ephemeral tile still
+  references it, but does not make it durably placed. Selecting a different session replaces the current virtual
+  workspace rather than accumulating. Navigating to any real workspace tears
+  the virtual one down.
 
 ## Rendering — inline, not a cached child
 

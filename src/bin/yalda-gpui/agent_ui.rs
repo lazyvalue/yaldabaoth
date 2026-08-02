@@ -329,12 +329,15 @@ impl YaldaGpuiView {
             .expect("infinite range always yields a free label")
     }
 
-    /// The set of server sids currently BOUND to some tile (across all workspaces).
-    /// Their `AgentSession`s exist in the store; everything else in the store
-    /// or on the server is free.
+    /// The set of server sids placed in durable workspaces. Ephemeral bare
+    /// viewports are ordinary session references but do not count as placement;
+    /// everything with no durable reference remains free.
     pub(crate) fn bound_sid_set(&self) -> std::collections::HashSet<String> {
         let mut bound: std::collections::HashSet<String> = std::collections::HashSet::new();
         for wsp in self.workspace.workspaces.iter() {
+            if wsp.ephemeral {
+                continue;
+            }
             wsp.layout.for_each_leaf(&mut |w| {
                 if let App::Agent(tile) = &w.content
                     && let Some(id) = tile.session()
@@ -751,8 +754,9 @@ impl YaldaGpuiView {
         None
     }
 
-    /// The stable `WindowId` of the agent tile currently BOUND to session
-    /// `sid` (at most one, INV-2), scanning every workspace. Deliberately
+    /// The stable `WindowId` of the durable workspace tile currently referencing
+    /// session `sid` (at most one under today's placement policy), scanning every
+    /// non-ephemeral workspace. Deliberately
     /// focus-INDEPENDENT: the async close/reconcile paths use it to address a
     /// replacement selector's list back to the bound tile (INV-PR), so it must
     /// never depend on which tile holds focus. Directly unit-tested
@@ -760,6 +764,9 @@ impl YaldaGpuiView {
     /// focus-based routing fails CI rather than silently passing.
     pub(crate) fn agent_tile_id_bound_to(&self, sid: SessionId) -> Option<workspace::WindowId> {
         for wsp in self.workspace.workspaces.iter() {
+            if wsp.ephemeral {
+                continue;
+            }
             let mut found = None;
             wsp.layout.for_each_leaf(&mut |w| {
                 if let App::Agent(tile) = &w.content
@@ -775,33 +782,54 @@ impl YaldaGpuiView {
         None
     }
 
-    /// Jump-panel selection of an agent session (jump-panel; ADR-0021). If the
-    /// session is **bound** to a tile somewhere, focus that tile in place (no new
-    /// tile — preserves the 1:1 invariant). If it is **free** (no tile binds it),
-    /// open it in an **ephemeral virtual workspace** whose single tile binds it;
-    /// that workspace is torn down the instant the user navigates away
-    /// (`Frame::set_active_workspace`), returning the session to free. No-op if the
-    /// session id is no longer in the store.
+    /// Unbind every durable workspace tile showing `sid`, leaving the live
+    /// session in the store so it can still be opened explicitly from the jump
+    /// panel. A bare direct view is in an ephemeral workspace and stays open.
+    ///
+    /// Normal binding is 1:1, but scanning every workspace makes the archive
+    /// transition self-healing if a restored or otherwise inconsistent layout
+    /// ever contains more than one viewport for the same session.
+    pub(crate) fn show_pickers_for_session(&mut self, sid: SessionId) -> bool {
+        let mut changed = false;
+        for wsp in self.workspace.workspaces.iter_mut() {
+            if wsp.ephemeral {
+                continue;
+            }
+            wsp.layout.for_each_leaf_content_mut(&mut |content| {
+                if let App::Agent(tile) = content
+                    && tile.session() == Some(sid)
+                {
+                    tile.show_picker();
+                    changed = true;
+                }
+            });
+        }
+        changed
+    }
+
+    /// Direct jump-panel / `Cmd-P` visit (ADR-0021, UXI-JumpPanel-19). Every
+    /// session opens in an ephemeral bare view. If it already has a durable
+    /// workspace owner, the bare tile is another reference and the owner stays
+    /// exactly where it is. A free session keeps the existing bare-view behavior.
+    /// The ephemeral workspace is torn down on switch-away. No-op if `sid` is no
+    /// longer in the store.
     pub(crate) fn jump_to_session(&mut self, sid: SessionId, cx: &mut Context<Self>) {
         if !self.sessions.contains(sid) {
             return;
         }
-        if let Some(wid) = self.agent_tile_id_bound_to(sid) {
-            self.jump_to_window(wid);
-        } else {
-            let mut tile = AgentTile::new();
-            tile.bind(sid);
-            // UXI-Project-6: the ephemeral workspace lands under the SESSION's own
-            // project (resolved from its spawn cwd), so this bind is intra-project.
-            let proj = self
-                .sessions
-                .get(sid)
-                .map(|e| e.read(cx).cwd.clone())
-                .and_then(|c| self.projects.membership_for_cwd(&c).project())
-                .or_else(|| self.active_project(cx))
-                .unwrap_or_else(|| self.workspace.inherited_project());
-            self.workspace.open_ephemeral_workspace_in(App::Agent(tile), proj);
-        }
+        let mut tile = AgentTile::new();
+        tile.bind(sid);
+        // UXI-Project-6: the ephemeral workspace lands under the SESSION's own
+        // project (resolved from its spawn cwd), so a free-session bind remains
+        // intra-project and a detached visit retains the session's context.
+        let proj = self
+            .sessions
+            .get(sid)
+            .map(|e| e.read(cx).cwd.clone())
+            .and_then(|c| self.projects.membership_for_cwd(&c).project())
+            .or_else(|| self.active_project(cx))
+            .unwrap_or_else(|| self.workspace.inherited_project());
+        self.workspace.open_ephemeral_workspace_in(App::Agent(tile), proj);
         // You're now looking at this session — clear its "waiting on you" mark
         // eagerly (the pump also clears it, but this makes the dot update on the
         // same frame as the jump).
@@ -874,8 +902,8 @@ impl YaldaGpuiView {
     }
 
     /// Open a roster session (one not yet in this GUI's store) by its server
-    /// sid. If it's already opened here, delegate to `jump_to_session` (focus
-    /// its tile, or an ephemeral workspace if free). Otherwise open a fresh ephemeral
+    /// sid. If it's already opened here, delegate to `jump_to_session` (always
+    /// a bare ephemeral visit). Otherwise open a fresh ephemeral
     /// virtual workspace (ADR-0021) and attach the session into it, reusing the
     /// picker's bind+attach path (`picker_attach_existing`).
     pub(crate) fn jump_to_roster_session(&mut self, sid: String, cx: &mut Context<Self>) {
@@ -937,6 +965,25 @@ impl YaldaGpuiView {
             }
         }
         None
+    }
+
+    /// A destructive in-session replacement such as `/clear` may be invoked
+    /// from a direct view. Repoint both viewport references to the replacement
+    /// project session without moving either tile.
+    fn restore_owner_after_direct_replacement(
+        &mut self,
+        owner: Option<workspace::WindowId>,
+        replacement: SessionId,
+    ) {
+        let Some(owner) = owner else {
+            return;
+        };
+        if let Some(tile) = self.agent_tile_by_id_mut(owner) {
+            tile.bind(replacement);
+        }
+        if let Some(tile) = self.agent_tile_mut() {
+            tile.bind(replacement);
+        }
     }
 
     /// Clear the `pending_open_token` on whichever tile carries `token`.
@@ -1043,6 +1090,16 @@ impl YaldaGpuiView {
         let current = self.workspace.focused_window_id();
         match self.agent_tile_id_bound_to(owner) {
             Some(owner_win) if Some(owner_win) != current => {
+                // A direct roster visit can race with the same sid becoming
+                // locally owned before its attach resolves. Preserve direct-
+                // visit semantics: reuse the existing session state in this
+                // ephemeral viewport without disturbing its owner.
+                if self.workspace.active_is_ephemeral() {
+                    if let Some(tile) = self.agent_tile_mut() {
+                        tile.bind(owner);
+                    }
+                    return;
+                }
                 if let Some(tile) = self.agent_tile_mut() {
                     tile.show_picker();
                 }
@@ -1761,7 +1818,10 @@ impl YaldaGpuiView {
             self.spawn_close_session(sid, cx);
         }
         // Drop the session from the store (its channel/pump cancel on drop) and
-        // land the tile in a live selector.
+        // land every durable workspace reference in a live selector. When close
+        // is issued from a bare direct view, another reference may be elsewhere
+        // and must not retain a dangling key.
+        self.show_pickers_for_session(id);
         self.transcript_views.remove(&id);
         self.sessions.close(id);
         self.show_selector_on_focused_tile(cx);
@@ -1875,6 +1935,9 @@ impl YaldaGpuiView {
         // layout snapshot persists so restore rebinds each tile to ITS OWN
         // session (UXI-AgentTile-18), not by index.
         for wsp in self.workspace.workspaces.iter() {
+            if wsp.ephemeral {
+                continue;
+            }
             wsp.layout.for_each_leaf(&mut |window| {
                 if let App::Agent(tile) = &window.content
                     && let Some(id) = tile.session()
@@ -3637,6 +3700,14 @@ impl YaldaGpuiView {
         let provider = self
             .read_session(id, cx, |state| state.provider)
             .unwrap_or_default();
+        // UXI-JumpPanel-19: `/clear` from a direct bare view replaces the
+        // conversation but must keep its durable workspace placement. Remember
+        // that owner before dropping the old session.
+        let direct_owner = self
+            .workspace
+            .active_is_ephemeral()
+            .then(|| self.agent_tile_id_bound_to(id))
+            .flatten();
 
         // Forget persisted slots BEFORE re-opening so the new spawn hits
         // session/new, not session/load (a load would resume the conversation
@@ -3655,6 +3726,7 @@ impl YaldaGpuiView {
             self.spawn_close_session(sid, cx);
         }
         self.transcript_views.remove(&id);
+        self.show_pickers_for_session(id);
         self.sessions.close(id);
         if let Some(tile) = self.agent_tile_mut() {
             tile.show_picker();
@@ -3689,6 +3761,7 @@ impl YaldaGpuiView {
                 },
                 cx,
             );
+            self.restore_owner_after_direct_replacement(direct_owner, new_id);
             self.record_order_succession(new_id, predecessor_sid.clone());
             if let Some(tile) = self.agent_tile_mut() {
                 tile.set_pending(Some(open_token));
@@ -3718,6 +3791,7 @@ impl YaldaGpuiView {
                 },
                 cx,
             );
+            self.restore_owner_after_direct_replacement(direct_owner, new_id);
             self.record_order_succession(new_id, predecessor_sid.clone());
             self.start_session_pump(new_id, cx);
         }

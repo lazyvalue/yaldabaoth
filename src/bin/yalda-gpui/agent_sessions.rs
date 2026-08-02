@@ -1,11 +1,12 @@
-//! The single owner of agent-session state and identity (spec-agent-session-
-//! ownership.md). Every agent conversation lives here, keyed by a stable
-//! [`SessionId`]; the server-session-id → `SessionId` index is private and
-//! mutated *only* by this module's API. That is what makes the historical
-//! family of bugs — two tiles bound to one session, "attached ×4", duplicate
-//! forwarders — structurally impossible: the only way to obtain a session for a
-//! server sid is [`SessionStore::open_or_focus`], which returns the *existing*
-//! one rather than minting a second.
+//! The normalized owner of agent-session state and identity (spec-agent-session-
+//! ownership.md). Each conversation belongs logically to a project and lives
+//! here once, keyed by a stable [`SessionId`]. Workspace and ephemeral viewport
+//! tiles hold references to that key; several tiles may therefore show one
+//! conversation without duplicating its transport, reducer, or transcript.
+//! The server-session-id → `SessionId` index is private and mutated *only* by
+//! this module's API. That is what makes the historical "attached ×4" and
+//! duplicate-forwarder bugs structurally impossible: [`SessionStore::open_or_focus`]
+//! returns the existing entity rather than minting another one.
 //!
 //! The store is generic over the payload `P` so its invariants can be unit-
 //! tested without constructing the (large, gpui-bound) [`AgentSession`]. The
@@ -64,9 +65,10 @@ impl std::fmt::Display for ServerSid {
     }
 }
 
-/// Outcome of an idempotent bind: did we mint a new session, or is the sid
-/// already shown somewhere (so the caller should focus that tile, not bind a
-/// second copy)?
+/// Outcome of an idempotent identity bind: did we mint a new session entity,
+/// or does the server sid already resolve to one? The caller may focus an
+/// existing durable tile or create another viewport reference, depending on
+/// the entry surface.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub(crate) enum Bind {
     Created(SessionId),

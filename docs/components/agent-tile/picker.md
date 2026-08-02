@@ -11,7 +11,8 @@ shown read-only as in use.
 
 ## References
 
-- `docs/components/README.md` § Terminology — a session no tile binds is **free**.
+- `docs/components/README.md` § Terminology — a session with no durable
+  workspace-tile reference is **free**.
 - `docs/components/jump-panel.md` — `UXI-JumpPanel-16` owns the durable archived
   visibility flag and the Archived tab.
 - `docs/specs/spec-agent-session-ownership.md` — the 1:1 binding invariant.

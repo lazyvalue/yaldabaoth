@@ -1544,9 +1544,10 @@ fn jump_active_box_marks_focused_workspace_and_session(cx: &mut TestAppContext) 
 }
 
 /// Jump-panel selection of a FREE session opens an ephemeral virtual workspace
-/// (ADR-0021): a new single-tile workspace bound to the session, made active. Leaving
-/// it (any workspace switch) tears it down and returns the session to free —
-/// the session itself survives in the store the whole time.
+/// (ADR-0021): a new single-tile viewport references the session and becomes
+/// active. Because placement is defined only by durable workspace references,
+/// the session stays free while this bare viewport exists. Leaving it tears down
+/// only the reference; the session survives in the store the whole time.
 #[gpui::test]
 fn jump_to_free_session_opens_then_tears_down_ephemeral(cx: &mut TestAppContext) {
     let (view, vcx) = boot_browser(cx);
@@ -1569,9 +1570,18 @@ fn jump_to_free_session_opens_then_tears_down_ephemeral(cx: &mut TestAppContext)
             v.workspace.active_is_ephemeral(),
             "the ephemeral workspace is active"
         );
+        assert_eq!(
+            v.agent_tile().and_then(crate::AgentTile::session),
+            Some(sid),
+            "the ephemeral viewport references the session"
+        );
         assert!(
-            v.agent_tile_id_bound_to(sid).is_some(),
-            "the ephemeral tile binds the session"
+            v.agent_tile_id_bound_to(sid).is_none(),
+            "an ephemeral reference is not durable workspace placement"
+        );
+        assert!(
+            v.bound_sid_set().is_empty(),
+            "free/bound projection also ignores ephemeral references"
         );
     });
 
@@ -1592,8 +1602,8 @@ fn jump_to_free_session_opens_then_tears_down_ephemeral(cx: &mut TestAppContext)
 }
 
 /// Selecting a *different* free session while a virtual workspace is open
-/// REPLACES it (we never accumulate more than one ephemeral workspace), and the first
-/// session returns to free.
+/// REPLACES it (we never accumulate more than one ephemeral workspace). Both
+/// sessions remain free because neither has a durable workspace reference.
 #[gpui::test]
 fn jump_to_second_free_session_replaces_ephemeral(cx: &mut TestAppContext) {
     let (view, vcx) = boot_browser(cx);
@@ -1604,9 +1614,14 @@ fn jump_to_second_free_session_replaces_ephemeral(cx: &mut TestAppContext) {
     view.update(vcx, |v, cx| v.jump_to_session(b, cx));
     view.update(vcx, |v, _| {
         assert_eq!(v.workspace.workspaces.len(), 2, "still exactly one ephemeral workspace");
-        assert!(
-            v.agent_tile_id_bound_to(b).is_some(),
+        assert_eq!(
+            v.agent_tile().and_then(crate::AgentTile::session),
+            Some(b),
             "the second session is now shown"
+        );
+        assert!(
+            v.agent_tile_id_bound_to(b).is_none(),
+            "the second session still has no durable placement"
         );
         assert!(
             v.agent_tile_id_bound_to(a).is_none(),
@@ -1616,11 +1631,20 @@ fn jump_to_second_free_session_replaces_ephemeral(cx: &mut TestAppContext) {
     });
 }
 
-/// Jump-panel selection of a BOUND session focuses its existing tile in place —
-/// no new tile, no ephemeral workspace (the 1:1 invariant is preserved).
+/// UXI-JumpPanel-19: direct session activation adds a bare viewport reference
+/// even when the session already has a durable workspace tile. Both entry surfaces
+/// share `jump_to_agent`: first drive that dispatcher directly (the jump-panel
+/// row path), then drive `Cmd-P` + Enter through its real key handler.
+///
+/// Negative control: restore `jump_to_session`'s former
+/// `jump_to_window(owner_wid)` branch. The first assertion fails because no
+/// ephemeral workspace exists.
 #[gpui::test]
-fn jump_to_bound_session_focuses_existing_tile(cx: &mut TestAppContext) {
-    use crate::{App, BrowserWindow, BufferApp};
+fn direct_session_visits_add_a_reference_and_keep_workspace_placement(
+    cx: &mut TestAppContext,
+) {
+    use crate::{AgentTile, App, BrowserWindow, BufferApp};
+    cx.update(crate::register_keymap);
     let (view, vcx) = boot_browser(cx);
     // Workspace 0: an agent tile bound to S1.
     install_agent_slot(&view, vcx, Some("S1"));
@@ -1630,38 +1654,85 @@ fn jump_to_bound_session_focuses_existing_tile(cx: &mut TestAppContext) {
         let wsp = v.workspace.workspace_containing(wid).expect("tile in a workspace");
         (sid, wsp, wid)
     });
-    // Add a second workspace and switch to it, so jumping must cross back.
+    // Add a second workspace and start there. A direct visit must NOT navigate
+    // back to the owner's workspace.
     view.update(vcx, |v, cx| {
         v.workspace.push_workspace_inheriting(
             App::Buffer(BufferApp::Picking(BrowserWindow::standalone(PathBuf::from(".")))),
         );
+        v.workspace.set_active_workspace(1);
         cx.notify();
     });
     let workspaces_before = view.update(vcx, |v, _| v.workspace.workspaces.len());
 
-    view.update(vcx, |v, cx| v.jump_to_session(sid, cx));
+    // Jump-panel row dispatcher.
+    view.update(vcx, |v, cx| v.jump_to_agent(crate::JumpTarget::Local(sid), cx));
     view.update(vcx, |v, _| {
         assert_eq!(
             v.workspace.workspaces.len(),
-            workspaces_before,
-            "no new tile/workspace created for a bound session"
+            workspaces_before + 1,
+            "a direct visit opens one ephemeral workspace"
         );
+        assert!(v.workspace.active_is_ephemeral(), "the direct view is bare");
+        assert_eq!(v.agent_tile().and_then(AgentTile::session), Some(sid));
+        let mut viewport_refs = 0;
+        for wsp in &v.workspace.workspaces {
+            wsp.layout.for_each_leaf(&mut |window| {
+                if matches!(&window.content, App::Agent(tile) if tile.session() == Some(sid)) {
+                    viewport_refs += 1;
+                }
+            });
+        }
+        assert_eq!(viewport_refs, 2, "workspace and direct view both reference the session");
         assert_eq!(
-            v.workspace.active_workspace, owner_workspace,
-            "focus moved to the owner's workspace"
+            v.jump_active_session().0,
+            Some(sid),
+            "the direct viewport is still the session being viewed"
         );
         assert_eq!(
             v.agent_tile_id_bound_to(sid),
             Some(owner_wid),
-            "still the same single bound tile"
+            "the original tile remains the unique workspace binding"
+        );
+    });
+
+    // Leaving the direct view tears down only it and reveals the unchanged
+    // workspace placement.
+    view.update(vcx, |v, cx| v.select_workspace(owner_workspace, cx));
+    view.update(vcx, |v, _| {
+        assert_eq!(v.workspace.workspaces.len(), workspaces_before);
+        assert_eq!(v.workspace.active_workspace, owner_workspace);
+        assert_eq!(v.agent_tile().and_then(AgentTile::session), Some(sid));
+    });
+
+    // Repeat through the real Cmd-P overlay/key activation path.
+    view.update(vcx, |v, cx| v.select_workspace(1, cx));
+    vcx.simulate_keystrokes("cmd-p");
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let palette = v.jump_palette_mut().expect("cmd-p opened the palette");
+        palette.query = "claude-1".into();
+        palette.selected = 0;
+        cx.notify();
+    });
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    view.update(vcx, |v, _| {
+        assert!(v.workspace.active_is_ephemeral(), "Cmd-P also opens a bare view");
+        assert_eq!(v.agent_tile().and_then(AgentTile::session), Some(sid));
+        assert_eq!(v.jump_active_session().0, Some(sid));
+        assert_eq!(
+            v.agent_tile_id_bound_to(sid),
+            Some(owner_wid),
+            "Cmd-P leaves the durable workspace placement intact"
         );
     });
 }
 
-/// Strict 1:1: a server session is bound by at most ONE tile, even across
-/// workspaces. Resolving an AlreadyBound conflict must NOT bind a second tile to
-/// the owner — that regression let the same session show in two workspaces. The
-/// duplicate tile returns to a selector and focus navigates to the owner.
+/// Durable placement remains 1:1: a server session is placed in at most ONE
+/// non-ephemeral workspace tile. Resolving an AlreadyBound identity conflict
+/// must not create a second session entity or a second durable placement. This
+/// does not forbid the ephemeral viewport references covered by UXI-JumpPanel-19.
 #[gpui::test]
 fn agent_session_binds_at_most_one_tile(cx: &mut TestAppContext) {
     use crate::{AgentTile, App};
@@ -7305,9 +7376,14 @@ fn free_agent_row_is_unbound_and_bindable(cx: &mut TestAppContext) {
             .bind_sid(id, ServerSid::new("free-1"))
             .expect("fresh sid binds");
         v.jump_to_session(id, cx);
+        assert_eq!(
+            v.agent_tile().and_then(crate::AgentTile::session),
+            Some(id),
+            "selecting the free session opens a viewport reference"
+        );
         assert!(
-            v.agent_tile_id_bound_to(id).is_some(),
-            "selecting the free session binds it to a tile (create → attach later)"
+            v.agent_tile_id_bound_to(id).is_none(),
+            "a bare direct reference does not place the session in a workspace"
         );
         let _ = &target;
     });
