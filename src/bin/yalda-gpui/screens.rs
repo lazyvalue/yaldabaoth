@@ -1045,14 +1045,16 @@ impl YaldaGpuiView {
                 .font_weight(FontWeight::NORMAL)
                 .child(SharedString::from(model_text));
             identity_row = if has_models {
-                identity_row.child(
+                identity_row.child(probe_bounds(
+                    "agent-model-badge",
                     badge
                         .hover(|s| s.border_color(supporting).bg(supporting.opacity(0.2)))
                         .cursor_pointer()
                         .on_click(|_ev, window, cx| {
                             window.dispatch_action(Box::new(crate::OpenLocalMenu), cx);
-                        }),
-                )
+                        })
+                        .into_any_element(),
+                ))
             } else {
                 identity_row.child(badge)
             };
@@ -2139,6 +2141,12 @@ impl YaldaGpuiView {
         let root = root
             .key_context("AgentView")
             .on_key_down(cx.listener(Self::handle_claude_key))
+            // bug-0029: the status-strip `model ▾` badge opens the switcher by
+            // dispatching `OpenLocalMenu`, and a dispatched action only reaches a
+            // listener on the FOCUSED node's path — without this the click is
+            // silently dropped (the keyboard `space` path never needed it: the
+            // leader intercept calls `open_local_menu_inner` directly).
+            .on_action(cx.listener(Self::open_local_menu))
             .on_action(cx.listener(Self::quit))
             .on_action(cx.listener(Self::restart))
             // B2: Cmd+O is Buffer-scoped. On an Agent tile `open_browser_inner`

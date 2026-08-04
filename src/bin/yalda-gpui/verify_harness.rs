@@ -9760,6 +9760,98 @@ fn agent_reply_models_available_captures_picklist(cx: &mut TestAppContext) {
     });
 }
 
+/// bug-0029 / `UXI-AgentTile-16`: CLICKING the status-strip `model ▾` badge opens
+/// the model switcher. The badge's `on_click` dispatches `OpenLocalMenu`, which
+/// travels the FOCUSED node's dispatch path — so the `AgentView` root must
+/// register `on_action(Self::open_local_menu)` or the action is dropped and the
+/// click does nothing at all (the reported symptom: "I see a down arrow. But
+/// nothing is presented").
+///
+/// Drives the window's real mouse dispatch (`simulate_click`) at the badge's REAL
+/// painted rect — a hand-called `open_local_menu_inner` would prove nothing
+/// (anti-circling rule 1).
+///
+/// Negative control: drop `.on_action(cx.listener(Self::open_local_menu))` from the
+/// `AgentView` root in `render_agent` → no overlay opens and the first assert fails.
+#[gpui::test]
+fn agent_model_badge_click_opens_the_model_switcher(cx: &mut TestAppContext) {
+    use yalda::acp_channel::{ModelOption, ReplyEvent};
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let (view, vcx) = boot_browser(cx);
+    install_agent_slot(&view, &mut *vcx, Some("S1"));
+
+    // Advertise a picklist through the REAL reducer — this is what puts the `▾`
+    // on the badge (`has_models`) and makes it clickable at all.
+    let opts = vec![
+        ModelOption { id: "default".into(), label: "Default (recommended)".into() },
+        ModelOption { id: "claude-fable-5[1m]".into(), label: "Fable".into() },
+        ModelOption { id: "sonnet".into(), label: "Sonnet".into() },
+    ];
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![ServerNotification::ReplyEvent {
+                session_id: "S1".into(),
+                event: ReplyEvent::ModelsAvailable {
+                    current: "sonnet".into(),
+                    options: opts.clone(),
+                },
+            }],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    // The badge's REAL painted rect.
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let rect = crate::layout_probe_get("agent-model-badge");
+    crate::layout_probe_end();
+
+    let (x, y, w, h) = rect.expect("the model badge never painted");
+    assert!(w > 4.0 && h > 4.0, "badge painted with no area ({w}x{h}) — nothing to click");
+    let at = point(px(x + w / 2.0), px(y + h / 2.0));
+
+    view.read_with(vcx, |v, _| {
+        assert!(!v.overlay_is_menu(), "no menu is open before the click");
+    });
+
+    vcx.simulate_mouse_move(at, None, gpui::Modifiers::default());
+    vcx.simulate_click(at, gpui::Modifiers::default());
+    vcx.run_until_parked();
+
+    view.read_with(vcx, |v, _| {
+        let crate::ActiveOverlay::Menu(m) = &v.active_overlay else {
+            panic!(
+                "clicking the model ▾ badge presented NOTHING — the dispatched \
+                 OpenLocalMenu found no handler on the AgentView root (bug-0029)"
+            );
+        };
+        assert_eq!(m.header, "AGENT", "the badge opens the agent-scoped local menu");
+
+        // …and the menu it opens actually carries the advertised models, not the
+        // "(models not available yet)" placeholder.
+        let sub = m
+            .menu
+            .iter()
+            .find(|n| n.label == "switch model")
+            .expect("the local menu has a `switch model` submenu");
+        let yalda::menu::MenuAction::Submenu(children) = &sub.action else {
+            panic!("`switch model` must be a submenu");
+        };
+        let labels: Vec<&str> = children.iter().map(|c| c.label.as_str()).collect();
+        assert!(
+            labels.iter().any(|l| l.starts_with("Fable")),
+            "the advertised picklist is offered (got {labels:?})"
+        );
+        assert!(
+            labels.iter().any(|l| l.starts_with("Sonnet") && l.contains('✓')),
+            "the current model is marked (got {labels:?})"
+        );
+    });
+}
+
 /// Regression (the "still no models" bug): once a session is
 /// `agent_stream_authoritative` (it has completed a turn), the legacy
 /// `ReplyEvent` arm goes inert — so the picklist must ride the canonical
