@@ -85,7 +85,17 @@ struct ForwarderHandle {
     /// Set by the actor's high-water disconnect (spec §6). When `true`, the
     /// forwarder task exits at its next wake, closing its write half so the
     /// client gets a clean EOF + from-base reconnect (NOT a silent gap).
+    ///
+    /// **This flag kills the whole CONNECTION, not one session.** The write half
+    /// is per-connection (`stream.into_split()`), shared by every session
+    /// forwarder on it — shutting it down disconnects all of them. Only a real
+    /// high-water wedge may set this (bug-0028).
     evicted: std::sync::atomic::AtomicBool,
+    /// Set when ONE session's forwarder should stop while the connection stays
+    /// up — today, archiving that session (bug-0028). The forwarder exits at its
+    /// next wake without touching the shared write half, so the client's other
+    /// sessions keep streaming and nothing reconnects.
+    released: std::sync::atomic::AtomicBool,
 }
 
 impl ForwarderHandle {
@@ -93,8 +103,35 @@ impl ForwarderHandle {
         Self {
             sent_seq: std::sync::atomic::AtomicU64::new(initial_sent_seq),
             evicted: std::sync::atomic::AtomicBool::new(false),
+            released: std::sync::atomic::AtomicBool::new(false),
         }
     }
+}
+
+/// How a forwarder task must stop when the actor has flagged it. Split out as a
+/// pure mapping so "archive must not kill the connection" is guardable without
+/// a live socket (bug-0028).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwarderStop {
+    /// Exit AND shut the shared connection write half (client sees EOF and
+    /// reconnects from base). High-water wedge only.
+    ShutdownConnection,
+    /// Exit this session's forwarder only; leave the connection alone.
+    ThisSessionOnly,
+}
+
+/// The flag → stop-action mapping. `released` is checked first: it is the
+/// narrower, non-destructive action, so a handle carrying both must not escalate
+/// to a connection teardown.
+fn forwarder_stop_action(progress: &ForwarderHandle) -> Option<ForwarderStop> {
+    use std::sync::atomic::Ordering;
+    if progress.released.load(Ordering::Acquire) {
+        return Some(ForwarderStop::ThisSessionOnly);
+    }
+    if progress.evicted.load(Ordering::Acquire) {
+        return Some(ForwarderStop::ShutdownConnection);
+    }
+    None
 }
 
 /// A shared [`ForwarderHandle`] (the actor's clone + the forwarder task's clone).
@@ -1962,7 +1999,13 @@ impl Manager {
                     .send_replace(session.channel_generation);
                 session.channel = None;
                 if let Some(forwarder) = session.forwarder.take() {
-                    forwarder.evicted.store(true, Ordering::Release);
+                    // bug-0028: `released`, NOT `evicted`. `evicted` is the
+                    // high-water kill flag, and its handler shuts down the
+                    // per-CONNECTION write half — so archiving one session used
+                    // to tear down the GUI's whole socket and force every other
+                    // session to reconnect from base. Archiving one session must
+                    // stop exactly one forwarder.
+                    forwarder.released.store(true, Ordering::Release);
                 }
                 session.publish_snapshot();
                 drop(session.wal.take());
@@ -2757,14 +2800,27 @@ async fn forward_notifications(
         // task while the connection's read loop kept the socket open (a wedged
         // GUI under App Nap would never notice). The progress handle drops on
         // return (the actor already cleared `forwarder`, so the trim resumed).
-        if progress.evicted.load(Ordering::Acquire) {
-            tracing::warn!(
-                session_id = %&session_id[..8.min(session_id.len())],
-                "high-water disconnect: backlog past threshold — closing wedged forwarder's socket"
-            );
-            use tokio::io::AsyncWriteExt as _;
-            let _ = writer.lock().await.shutdown().await;
-            return false;
+        match forwarder_stop_action(progress) {
+            Some(ForwarderStop::ShutdownConnection) => {
+                tracing::warn!(
+                    session_id = %&session_id[..8.min(session_id.len())],
+                    "high-water disconnect: backlog past threshold — closing wedged forwarder's socket"
+                );
+                use tokio::io::AsyncWriteExt as _;
+                let _ = writer.lock().await.shutdown().await;
+                return false;
+            }
+            // bug-0028: this session was archived. Stop tailing it, but leave
+            // the shared per-connection write half open — every OTHER session on
+            // this connection is still streaming through it.
+            Some(ForwarderStop::ThisSessionOnly) => {
+                tracing::info!(
+                    session_id = %&session_id[..8.min(session_id.len())],
+                    "forwarder released (session archived); connection stays up"
+                );
+                return false;
+            }
+            None => {}
         }
         let offset = match snap.log.resolve_sent(*sent_seq, snap.generation) {
             yalda::event_log::CursorResolution::FromBase => 0,
@@ -3167,6 +3223,94 @@ async fn main() -> io::Result<()> {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    /// REGRESSION (bug-0028): archiving ONE session must not disconnect the
+    /// GUI. The per-connection write half is shared by every session forwarder
+    /// on that socket, and `evicted`'s handler shuts it down — so reusing
+    /// `evicted` to release an archived session's forwarder tore down the whole
+    /// connection and forced every other session to reconnect from base. The
+    /// user saw this as an unarchived session "having trouble starting up".
+    ///
+    /// Negative control: set `evicted` instead of `released` in
+    /// `do_set_archived`. The stop action becomes `ShutdownConnection` and this
+    /// fails on the "must not kill the shared connection" assertion.
+    #[test]
+    fn archiving_one_session_stops_its_forwarder_without_killing_the_connection() {
+        let dir = tempfile::tempdir().expect("WAL tempdir");
+        let wal = yalda::session_wal::SessionWal::create_for_provider(
+            dir.path(),
+            "cold-2",
+            "cold session",
+            std::path::Path::new("/tmp/project"),
+            PermissionMode::ReadOnly,
+            AgentProvider::Codex,
+        )
+        .expect("create WAL");
+        let mut session = new_managed_session(
+            "cold-2".into(),
+            "cold session".into(),
+            PathBuf::from("/tmp/project"),
+            AgentProvider::Codex,
+            PermissionMode::ReadOnly,
+            Some(wal),
+            None,
+        );
+        session.acp_session_id = Some("acp-cold-2".into());
+        // An attached GUI: this session has a live forwarder sharing the
+        // connection's write half with every other attached session.
+        let forwarder: ForwarderProgress = Arc::new(ForwarderHandle::new(0));
+        session.forwarder = Some(Arc::clone(&forwarder));
+
+        let (events, _) = broadcast::channel(16);
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let mut manager = Manager {
+            sessions: HashMap::from([("cold-2".into(), session)]),
+            events,
+            default_permission_mode: PermissionMode::ReadOnly,
+            cmd_tx,
+            spawner: Arc::new(RealAgentSpawner),
+            bridge_tx: None,
+        };
+
+        manager
+            .do_set_archived("cold-2", true)
+            .expect("archive transition");
+
+        // The forwarder must stop — an archived session streams nothing.
+        assert_eq!(
+            forwarder_stop_action(&forwarder),
+            Some(ForwarderStop::ThisSessionOnly),
+            "archiving must stop this session's forwarder"
+        );
+        // ...but it must NOT take the shared connection with it.
+        assert!(
+            !forwarder
+                .evicted
+                .load(std::sync::atomic::Ordering::Acquire),
+            "archive must not set the high-water kill flag — its handler shuts \
+             down the per-connection write half, disconnecting every OTHER \
+             session on this socket"
+        );
+        assert_ne!(
+            forwarder_stop_action(&forwarder),
+            Some(ForwarderStop::ShutdownConnection),
+            "archiving one session must never resolve to a connection teardown"
+        );
+
+        // The high-water wedge still escalates — this fix must not disarm it.
+        let wedged: ForwarderProgress = Arc::new(ForwarderHandle::new(0));
+        wedged
+            .evicted
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert_eq!(
+            forwarder_stop_action(&wedged),
+            Some(ForwarderStop::ShutdownConnection),
+            "a real high-water eviction must still close the socket"
+        );
+        // A handle with no flag keeps streaming.
+        let live: ForwarderProgress = Arc::new(ForwarderHandle::new(0));
+        assert_eq!(forwarder_stop_action(&live), None);
+    }
 
     #[test]
     fn archive_releases_runtime_state_and_wal_but_keeps_durable_session() {

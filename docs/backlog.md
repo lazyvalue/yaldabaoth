@@ -30,6 +30,22 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
   focus-owner branch produced the expected RED. GPUI harness (518 passed, 1
   ignored) and the non-test binary check are green.
 
+- **Archiving a session tore down the whole GUI connection** — `NEEDS-RUNTIME`
+  (2026-08-04 via `/bug`; `bug-0028`). Reported as *"when I unarchive a session
+  it has trouble starting up again."* Root cause is at archive time, not
+  unarchive: `do_set_archived` released the session's forwarder with
+  `ForwarderHandle::evicted`, but that is the **high-water kill flag** whose
+  handler shuts down the **per-connection** write half — so archiving one
+  session dropped every attached session and forced a from-base reconnect, and
+  the respawned session only looked broken. Likely the source of the
+  long-standing reconnect storm too. Fixed with a distinct `released` flag plus
+  a pure `forwarder_stop_action` mapping; guard
+  `archiving_one_session_stops_its_forwarder_without_killing_the_connection`
+  observed RED as `ShutdownConnection`. **Runtime-pending: server-side, so the
+  running daemon must be restarted.** The socket teardown itself is reasoned
+  from code, not observed live — a real two-session client repro is the
+  follow-up if the symptom survives a restart.
+
 - **Sessions stuck showing "Unavailable"** — `NEEDS-RUNTIME` (2026-07-31 via
   `/bug`; `bug-0027`). Reported as *"frequently sessions are listed
   (temporarily) as 'unavailable'"*, then sharpened to *"this session is listed
