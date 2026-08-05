@@ -1230,6 +1230,12 @@ tabs (`UXI-JumpPanel-14`):
    (`UXI-JumpPanel-2` clause 2): the manual axis in the tagged view is the tag
    folder, not the individual session, so session rows no longer drag.
 6. **Archived is unchanged** — a flat list, no tag folders.
+7. **The nesting is visible.** A tag folder header is a `🏷 tag` in the grouping
+   blue + a quiet count + a trailing hairline rule (so it reads as a header, not a
+   row). Its session rows are wrapped in an **indented container with a left guide
+   line**, so they clearly read as children *of* the tag. When both folders and
+   untagged rows exist, a **labeled `untagged` hairline separator** divides the
+   last folder from the loose rows below.
 
 **Applies to.** `jump_panel_view.rs`: `AgentRow.tags` (populated in
 `jump_panel_agent_rows` from `self.session_tags` by sid), the pure
@@ -1260,10 +1266,12 @@ keep their chronological within-folder order, only All sorts by label.
 residual, folder order = tag_order then alpha; **built-in NC**: empty order = alpha,
 the opposite folder order) and `jump_panel_groups_sessions_under_tag_folders`
 (drives the REAL section projection + render: a tagged session paints under its
-folder header with the `-tg0` id suffix, an untagged one paints flat below;
+folder header with the `-tg0` id suffix, an untagged one paints flat below, and the
+`untagged` separator paints **between** them and vanishes when no folders exist;
 `jump_all_tab_groups_activity_with_headers` proves All paints **no** activity
-heading and sorts untagged rows by label. **NC observed RED**: forcing the partition
-to treat every row as untagged → the folder header never paints). The literal
+heading and sorts untagged rows by label. **NCs observed RED**: forcing the partition
+to treat every row as untagged → the folder header never paints; disabling the
+separator render → the "separator paints" assert fires). The literal
 folder glyph/indent is harness gap #1.
 
 ### UXI-JumpPanel-21 — Tag folders reorder by drag and fold, per project, persisted

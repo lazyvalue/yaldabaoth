@@ -7129,6 +7129,25 @@ fn jump_panel_groups_sessions_under_tag_folders(cx: &mut TestAppContext) {
         .1;
     assert!(folder_y < tagged_y, "the folder header sits above its rows");
     assert!(tagged_y < plain_y, "untagged rows fall below the folders");
+    // The "untagged" separator sits between the last tagged row and the loose ones.
+    let sep_y = crate::layout_probe_get(&format!("jump-untagged-sep-{}", pid.0))
+        .expect("the untagged separator paints when folders AND loose rows coexist")
+        .1;
+    assert!(tagged_y < sep_y && sep_y < plain_y, "the separator divides tagged from untagged");
+    crate::layout_probe_end();
+
+    // With no tagged sessions (all loose) there are no folders, so the separator
+    // must NOT paint — it only exists to divide the two groups.
+    view.update(vcx, |v, _| {
+        v.session_tags.clear();
+    });
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    assert!(
+        crate::layout_probe_get(&format!("jump-untagged-sep-{}", pid.0)).is_none(),
+        "with no folders there is nothing to separate, so no separator paints"
+    );
     crate::layout_probe_end();
 }
 

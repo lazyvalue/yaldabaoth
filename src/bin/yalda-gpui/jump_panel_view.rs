@@ -1442,8 +1442,10 @@ impl YaldaGpuiView {
                 let tag_order =
                     self.jump_tag_order.get(&proj_name).cloned().unwrap_or_default();
                 let (folders, untagged) = partition_rows_by_tag(rows, &tag_order);
+                let had_folders = !folders.is_empty();
                 for (folder_idx, (tag, folder_rows)) in folders.into_iter().enumerate() {
                     let folded = self.tag_folder_folded(&proj_name, &tag);
+                    let folder_count = folder_rows.len();
                     let probe = format!("jump-tag-folder-{}-{folder_idx}", pid.0);
                     // Folder header: chevron (folds) + tag name + count. The label
                     // is the drag source + drop target for reorder (UXI-JumpPanel-21).
@@ -1490,14 +1492,38 @@ impl YaldaGpuiView {
                                 .flex_1()
                                 .min_w_0()
                                 .cursor_pointer()
-                                .text_color(supporting_text)
-                                .font_family(st.mono.clone())
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_size(px(st.pt * 0.82))
-                                .child(SharedString::from(format!(
-                                    "🏷 {tag}  ({})",
-                                    folder_rows.len()
-                                )))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                // Tag name in the grouping/subheader blue so a
+                                // folder reads as a header, not a session row.
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_color(electric)
+                                        .font_family(st.mono.clone())
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_size(px(st.pt * 0.82))
+                                        .child(SharedString::from(format!("🏷 {tag}"))),
+                                )
+                                // The count, quiet.
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_color(st.dim)
+                                        .font_family(st.mono.clone())
+                                        .text_size(px(st.pt * 0.72))
+                                        .child(SharedString::from(folder_count.to_string())),
+                                )
+                                // A trailing hairline rule fills the row so the
+                                // header spans the panel and separates cleanly.
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .h(px(1.0))
+                                        .bg(divider_color),
+                                )
                                 .on_drag(
                                     TagDrag {
                                         project: proj_for_drag.clone(),
@@ -1540,10 +1566,50 @@ impl YaldaGpuiView {
                     col = col.child(probe_bounds_dyn(probe, header.into_any_element()));
                     if !folded {
                         let suffix = format!("-tg{folder_idx}");
+                        // Wrap the folder's rows in an indented container with a
+                        // left guide line, so they clearly read as children OF the
+                        // tag header above them (UXI-JumpPanel-20).
+                        let mut body = div()
+                            .id(SharedString::from(format!("jump-tagbody-{}-{folder_idx}", pid.0)))
+                            .flex()
+                            .flex_col()
+                            .w_full()
+                            .ml(px(26.0))
+                            .border_l_1()
+                            .border_color(divider_color)
+                            .pl(px(2.0));
                         for (i, row) in folder_rows {
-                            col = render_flat_row(col, i, &row, &suffix, false, cx);
+                            body = render_flat_row(body, i, &row, &suffix, false, cx);
                         }
+                        col = col.child(body);
                     }
+                }
+                // A labeled hairline separates the tagged folders from the loose
+                // untagged sessions below — only when both are present.
+                if had_folders && !untagged.is_empty() {
+                    let sep = div()
+                        .w_full()
+                        .pl(px(20.0))
+                        .pr_3()
+                        .pt_2()
+                        .pb_1()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_color(st.dim)
+                                .font_family(st.mono.clone())
+                                .text_size(px(st.pt * 0.72))
+                                .child(SharedString::new_static("untagged")),
+                        )
+                        .child(div().flex_1().h(px(1.0)).bg(divider_color));
+                    col = col.child(probe_bounds_dyn(
+                        format!("jump-untagged-sep-{}", pid.0),
+                        sep.into_any_element(),
+                    ));
                 }
                 // Untagged residual, flat, below the folders.
                 for (i, row) in untagged {
