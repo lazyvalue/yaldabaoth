@@ -13,6 +13,18 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Session tags (jump-panel folders)** — `NEEDS-RUNTIME` (built + headless-guarded;
+  branch `session-tags`, via `/new-ux`). Spec'd as **UXI-AgentTile-33** (in-tile
+  `tag`/`untag` prompt, `<space> t/T`, mirrors the confirm-kill pattern),
+  **UXI-JumpPanel-20** (per-project tag folders in each tab: category-filtered,
+  multi-appearance, untagged flat below, All drops activity headings + sorts by
+  label) and **UXI-JumpPanel-21** (per-project drag order + fold, persisted). Tags
+  live in the id-keyed `session_tags.json` sidecar; order/fold in
+  `Preferences::{jump_tag_order, jump_folded_tags}`. 6 new guards + 4 observed-RED
+  negative controls; suite 523 (531 w/ test-support) green. Runtime gaps: the folder
+  glyph/indent **pixels** (gap #1) and the mouse-drag folder-reorder **gesture**
+  (gap #2).
+
 - **Direct session visits are detached from workspace placement** — `DONE`
   (2026-08-02 via `/new-ux`; `UXI-JumpPanel-19`). Captured verbatim: *"Visiting
   a session directly (via the jump panel or the p-menu) should be different from

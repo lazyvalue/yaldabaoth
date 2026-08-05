@@ -2521,6 +2521,18 @@ impl Compose {
         self.editor.document().full_text()
     }
 
+    /// Discard the current draft (text + staged images), returning to an empty
+    /// Insert-ready buffer. Used after an in-tile prompt (tag/untag,
+    /// UXI-AgentTile-33) consumes the user's typed answer so it never leaks into
+    /// the next real submit. Keeps the `bounds` Rc the paint path captures into.
+    pub(crate) fn reset(&mut self) {
+        self.editor = Editor::new(String::new(), std::path::PathBuf::from("*compose*"));
+        self.mode = EditMode::Insert;
+        self.list = ScrollAnchoredList::new(gpui::ListAlignment::Top, gpui::px(18.0));
+        self.window.set(ComposeWindow::default());
+        self.pending_images.clear();
+    }
+
     /// Recompute the caret-containment window from the CURRENT editor state and
     /// the given visible extent, store it (authoritative), and return it
     /// (spec-chatbox-caret-containment.md). The single integration point that
@@ -3398,6 +3410,15 @@ pub(crate) fn rebuild_agent_view_model(
     )
 }
 
+/// Which in-tile tag prompt is armed (UXI-AgentTile-33): `Add` a tag or
+/// `Remove` one. The prompt reuses the close-confirm mechanism — a transcript
+/// line + a submit interception — so the whole gesture is `<space> t <name> ⏎`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TagPromptKind {
+    Add,
+    Remove,
+}
+
 /// State held while the user is conversing with an ACP-attached coding
 /// agent. The transcript lives in an in-memory `Editor` (no on-disk file);
 /// agent replies are spliced in as frozen lines via the same lock-and-
@@ -3603,6 +3624,12 @@ pub(crate) struct AgentState {
     /// both cases nothing reaches the agent. Deliberately NOT persisted: an
     /// armed confirm is a live, in-the-moment gesture, not session state.
     pub(crate) close_confirm_armed: bool,
+    /// A tag/untag prompt is armed (UXI-AgentTile-33). Set by the space-menu
+    /// `tag session` / `untag session` (which append the `<Yaldabaoth System>`
+    /// prompt line); consumed by the NEXT submit — the trimmed text is the tag
+    /// name (added or removed), a blank cancels. Nothing reaches the agent.
+    /// Like the close confirm, deliberately NOT persisted.
+    pub(crate) tag_prompt: Option<TagPromptKind>,
     /// While a transcript mouse-selection is in flight, the blank-line the
     /// collapse pass must keep protecting — captured at mouse-down BEFORE the
     /// press moves the cursor (bug-0015). `None` when no drag is in flight, in
@@ -4025,6 +4052,7 @@ impl AgentState {
             subagents_open: true,
             sidepanel_hidden: false,
             close_confirm_armed: false,
+            tag_prompt: None,
             drag_protect_line: None,
             panel_col: PanelColumn::Tasklist,
             panel_sel: 0,
@@ -4108,6 +4136,7 @@ impl AgentState {
             subagents_open: true,
             sidepanel_hidden: false,
             close_confirm_armed: false,
+            tag_prompt: None,
             drag_protect_line: None,
             panel_col: PanelColumn::Tasklist,
             panel_sel: 0,

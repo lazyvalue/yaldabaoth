@@ -409,6 +409,11 @@ fn preferences_round_trip_with_text_scale() {
         jump_session_order: Some(vec!["sid-2".into(), "sid-1".into()]),
         jump_archived_sessions: Some(vec!["sid-old".into()]),
         jump_folded_projects: Some(vec!["Fulcrum".into(), "Yaldabaoth".into()]),
+        jump_tag_order: Some(std::collections::HashMap::from([(
+            "Yaldabaoth".to_string(),
+            vec!["urgent".to_string(), "frontend".to_string()],
+        )])),
+        jump_folded_tags: Some(vec!["Yaldabaoth\u{1f}frontend".into()]),
     };
     let json = serde_json::to_string(&prefs).unwrap();
     let back: Preferences = serde_json::from_str(&json).unwrap();
@@ -426,6 +431,15 @@ fn preferences_round_trip_with_text_scale() {
     assert_eq!(
         back.jump_folded_projects.as_deref(),
         Some(&["Fulcrum".into(), "Yaldabaoth".into()][..])
+    );
+    // UXI-JumpPanel-21: per-project tag order + folded-tag keys round-trip.
+    assert_eq!(
+        back.jump_tag_order.as_ref().and_then(|m| m.get("Yaldabaoth")).map(|v| v.as_slice()),
+        Some(&["urgent".to_string(), "frontend".to_string()][..])
+    );
+    assert_eq!(
+        back.jump_folded_tags.as_deref(),
+        Some(&["Yaldabaoth\u{1f}frontend".to_string()][..])
     );
 
     // Default (no zoom) is omitted from the serialized form.
