@@ -1630,6 +1630,8 @@ fn agent_local_menu() -> Vec<MenuNode> {
         MenuNode::entry("x", "close session", "claude-close"),
         MenuNode::entry("C", "clear session", "claude-clear"),
         MenuNode::entry("r", "rename session", "claude-rename"),
+        MenuNode::entry("t", "tag session", "claude-tag"),
+        MenuNode::entry("T", "untag session", "claude-untag"),
         MenuNode::entry("f", "focus transcript ⇄ compose", "agent-focus-toggle"),
         MenuNode::entry("S", "send selection", "claude-send-selection"),
         MenuNode::entry("m", "cycle permission mode", "claude-mode-cycle"),
@@ -1824,6 +1826,19 @@ struct YaldaGpuiView {
     /// Project names whose jump-panel children are hidden. Names, rather than
     /// runtime-local ProjectIds, make the preference durable across restart.
     jump_folded_projects: std::collections::HashSet<String>,
+    /// User's drag-reordered order of jump-panel tag folders, per project
+    /// (`Preferences::jump_tag_order`, UXI-JumpPanel-21). `project name → [tag]`;
+    /// unlisted tags sort after alphabetically. Keyed by durable project name
+    /// because tags are project-scoped.
+    jump_tag_order: HashMap<String, Vec<String>>,
+    /// Folded jump-panel tag folders, keyed by `"{project}\u{1f}{tag}"`
+    /// (`Preferences::jump_folded_tags`, UXI-JumpPanel-21). Absent = expanded.
+    jump_folded_tags: std::collections::HashSet<String>,
+    /// Per-session user tags, keyed by SERVER sid (UXI-JumpPanel-20). Loaded once
+    /// at construction from the id-keyed sidecar (`session_tags.json`), written on
+    /// every tag edit. The jump panel reads this to group sessions into tag
+    /// folders; a session with no entry (or an empty one) is untagged.
+    session_tags: HashMap<String, Vec<String>>,
     /// Jump-panel **order succession**: a placeholder session that is the
     /// continuation of a killed one (today: `/clear`, which closes the server
     /// session and creates a fresh one) maps to its PREDECESSOR's sid, so it
@@ -1917,11 +1932,15 @@ impl YaldaGpuiView {
             jump_archived_sessions: std::collections::HashSet::new(),
             jump_agent_tabs: HashMap::new(),
             jump_folded_projects: std::collections::HashSet::new(),
+            jump_tag_order: HashMap::new(),
+            jump_folded_tags: std::collections::HashSet::new(),
             jump_order_succession: HashMap::new(),
             recaps: HashMap::new(),
             roster_unread: HashMap::new(),
             // bug-0020: id-keyed autoname summaries, durable across restarts.
             session_summaries: crate::persist::load_session_summaries(),
+            // UXI-JumpPanel-20: id-keyed session tags, durable across restarts.
+            session_tags: crate::persist::load_session_tags(),
             #[cfg(test)]
             dev_rebuild_requests: Vec::new(),
         }
@@ -1975,11 +1994,15 @@ impl YaldaGpuiView {
             jump_archived_sessions: std::collections::HashSet::new(),
             jump_agent_tabs: HashMap::new(),
             jump_folded_projects: std::collections::HashSet::new(),
+            jump_tag_order: HashMap::new(),
+            jump_folded_tags: std::collections::HashSet::new(),
             jump_order_succession: HashMap::new(),
             recaps: HashMap::new(),
             roster_unread: HashMap::new(),
             // bug-0020: id-keyed autoname summaries, durable across restarts.
             session_summaries: crate::persist::load_session_summaries(),
+            // UXI-JumpPanel-20: id-keyed session tags, durable across restarts.
+            session_tags: crate::persist::load_session_tags(),
             #[cfg(test)]
             dev_rebuild_requests: Vec::new(),
         }
@@ -3346,6 +3369,12 @@ impl YaldaGpuiView {
                 let mut names: Vec<_> = self.jump_folded_projects.iter().cloned().collect();
                 names.sort();
                 names
+            }),
+            jump_tag_order: (!self.jump_tag_order.is_empty()).then(|| self.jump_tag_order.clone()),
+            jump_folded_tags: (!self.jump_folded_tags.is_empty()).then(|| {
+                let mut keys: Vec<_> = self.jump_folded_tags.iter().cloned().collect();
+                keys.sort();
+                keys
             }),
         });
     }
@@ -4998,6 +5027,8 @@ impl YaldaGpuiView {
             "claude-mode-cycle" => self.cycle_claude_permission_mode(cx),
             "claude-clear" => self.clear_agent_session(cx),
             "claude-rename" => self.open_rename_overlay(cx),
+            "claude-tag" => self.arm_tag_prompt(cx),
+            "claude-untag" => self.arm_untag_prompt(cx),
             "archive-session" => self.set_focused_session_archived(true, cx),
             "unarchive-session" => self.set_focused_session_archived(false, cx),
             "claude-cd" => self.open_change_agent_cwd_overlay(cx),
@@ -8611,6 +8642,13 @@ fn main() {
                         }
                         if let Some(names) = prefs.jump_folded_projects {
                             view.jump_folded_projects = names.into_iter().collect();
+                        }
+                        // Per-project tag-folder order + fold state (UXI-JumpPanel-21).
+                        if let Some(o) = prefs.jump_tag_order {
+                            view.jump_tag_order = o;
+                        }
+                        if let Some(keys) = prefs.jump_folded_tags {
+                            view.jump_folded_tags = keys.into_iter().collect();
                         }
                         // Universal agent roster (universal-agent-list): start
                         // the server pump + seed the roster at boot (not only

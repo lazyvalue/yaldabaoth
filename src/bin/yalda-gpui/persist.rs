@@ -158,6 +158,69 @@ pub(crate) fn forget_session_summaries(sids: &[String]) {
     }
 }
 
+// ── Session tags sidecar (`session_tags.json`, UXI-JumpPanel-20) ────────────
+// The same durability the summary gets: a flat `{server session id → [tag]}`
+// map, keyed by server sid so a free session's tags survive restart (the
+// cwd-keyed `acp_sessions.json` only holds tile-bound sessions). The GUI owns
+// the canonical in-memory copy (`YaldaGpuiView::session_tags`); this is its
+// on-disk twin, written whole from that copy on every tag edit.
+
+/// Path to the tags sidecar. `None` under test unless a test opts in via
+/// [`with_session_tags_path`] (same fail-safe as the summaries sidecar).
+pub(crate) fn session_tags_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        return TAGS_PATH_OVERRIDE.with(|c| c.borrow().clone());
+    }
+    #[cfg(not(test))]
+    {
+        yalda::paths::yalda_home().map(|d| d.join("session_tags.json"))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TAGS_PATH_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_session_tags_path<R>(path: PathBuf, f: impl FnOnce() -> R) -> R {
+    TAGS_PATH_OVERRIDE.with(|c| *c.borrow_mut() = Some(path));
+    let r = f();
+    TAGS_PATH_OVERRIDE.with(|c| *c.borrow_mut() = None);
+    r
+}
+
+/// Load the whole `sid → [tag]` map. Missing/unparseable => empty map; tags are
+/// a nicety, never a reason to fail a boot.
+pub(crate) fn load_session_tags() -> std::collections::HashMap<String, Vec<String>> {
+    let Some(path) = session_tags_path() else {
+        return std::collections::HashMap::new();
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return std::collections::HashMap::new();
+    };
+    serde_json::from_slice::<std::collections::HashMap<String, Vec<String>>>(&bytes)
+        .unwrap_or_default()
+}
+
+/// Persist the whole tags map from the GUI's canonical in-memory copy.
+/// Best-effort; entries with no tags are elided to keep the file tidy.
+pub(crate) fn save_session_tags(map: &std::collections::HashMap<String, Vec<String>>) {
+    let Some(path) = session_tags_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let pruned: std::collections::BTreeMap<&String, &Vec<String>> =
+        map.iter().filter(|(_, v)| !v.is_empty()).collect();
+    if let Ok(serialized) = serde_json::to_string_pretty(&pruned) {
+        let _ = std::fs::write(&path, serialized);
+    }
+}
+
 /// Yalda's process cwd, with a safe fallback. Used both as the default
 /// per-session cwd for new agent slots (spec-agent-cwd.md §1) and as the
 /// top-level key in `acp_sessions.json` / `workspace.json`.
@@ -592,6 +655,16 @@ pub(crate) struct Preferences {
     /// runtime-local). Absent means every project starts expanded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) jump_folded_projects: Option<Vec<String>>,
+    /// User's drag-reordered order of jump-panel tag folders, per project
+    /// (UXI-JumpPanel-21). `project name → [tag]`; folders render in this order,
+    /// any tag not listed sorts after alphabetically. Tags are project-scoped, so
+    /// the order is keyed by durable project name (like `jump_folded_projects`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) jump_tag_order: Option<std::collections::HashMap<String, Vec<String>>>,
+    /// Folded jump-panel tag folders, keyed by `"{project}\u{1f}{tag}"` composite
+    /// (UXI-JumpPanel-21). Absent means every folder starts expanded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) jump_folded_tags: Option<Vec<String>>,
 }
 
 pub(crate) fn load_preferences() -> Preferences {

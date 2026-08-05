@@ -79,3 +79,4 @@ strip**, the **transcript** (a cached child, `TranscriptView`), the **compose** 
 | UXI-AgentTile-30 | providers | Claude and Codex sessions coexist with durable provider identity | implemented |
 | UXI-AgentTile-31 | transcript | Narrow tiles wrap header chrome; usage owns a line | implemented |
 | UXI-AgentTile-32 | picker | Archived sessions never appear in the session picker | implemented |
+| UXI-AgentTile-33 | session-binding | Tagging a session prompts in the tile for a name | implemented |

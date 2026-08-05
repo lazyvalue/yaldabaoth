@@ -820,6 +820,13 @@ is covered by `tests.rs::preferences_round_trip_with_text_scale`.
 
 ### UXI-JumpPanel-14 — Every project has Waiting / Working / All ordinary agent tabs
 
+> **Panel-superseded in part by `UXI-JumpPanel-20`.** In the sidebar, the **All**
+> tab no longer paints the Working/Waiting/Unavailable activity partition described
+> in clause 3 — sessions there group under **tag folders** and sort by label. The
+> activity partition (`agent_row_groups_for_tab`) is retained and still drives the
+> **`Cmd-P`** empty-query order (`UXI-JumpPanel-9`), which is unchanged. Waiting and
+> Working tabs are otherwise as below (now with tag folders layered in).
+
 **Statement.** Directly below each expanded project's workspace rows, the jump
 panel renders three independently selectable ordinary agent tabs (the
 orthogonal fourth Archived tab is specified by `UXI-JumpPanel-16`):
@@ -1192,3 +1199,119 @@ remains unique, and switch-away reveals it unchanged. The free-session guard als
 proves an ephemeral reference does not count as placement. Negative control:
 restoring the former focus-existing-workspace branch fails on the missing
 ephemeral view.
+
+### UXI-JumpPanel-20 — Sessions group under collapsible tag folders within each project tab
+
+**Statement.** A session carries a set of user-assigned **tags** (`UXI-AgentTile-33`),
+keyed by server sid in the id-keyed `session_tags.json` sidecar. Within a project's
+agent-session tabs the jump panel groups sessions under **tag "folders"** —
+collapsible headers, one per tag — nested a level below the Waiting / Working / All
+tabs (`UXI-JumpPanel-14`):
+
+1. **Tags are project-scoped.** A session belongs to one project (its cwd), so its
+   tags only ever group it among that project's sessions. Two projects that both
+   have a tag named `urgent` are independent folders with independent order.
+2. **Only non-empty folders show, per category.** In the **Waiting** tab a tag
+   folder appears only if it holds ≥1 session currently Waiting; likewise Working.
+   In **All** a folder appears if it holds ≥1 non-archived session. A tag with no
+   session in the active tab does not render there.
+3. **A session appears once per tag it carries.** A session tagged `alpha` and
+   `urgent` renders under BOTH folders (multi-appearance). Its per-appearance
+   element ids are disambiguated by a folder-ordinal suffix so GPUI ids never
+   collide.
+4. **Untagged sessions are flat rows**, rendered **below** the folders within the
+   tab — never inside an "Untagged" folder, never duplicated at a folder level.
+5. **Waiting / Working keep their chronological order** within a folder (oldest
+   first, `UXI-JumpPanel-14`). **All drops the Working/Waiting/Unavailable activity
+   sub-headers entirely and sorts** — folders in the user's manual tag order
+   (`UXI-JumpPanel-21`), and sessions **alphabetically by label** within each folder
+   and within the untagged residual. This **supersedes** `UXI-JumpPanel-14`'s All
+   activity partition and the within-All session drag-order presentation
+   (`UXI-JumpPanel-2` clause 2): the manual axis in the tagged view is the tag
+   folder, not the individual session, so session rows no longer drag.
+6. **Archived is unchanged** — a flat list, no tag folders.
+
+**Applies to.** `jump_panel_view.rs`: `AgentRow.tags` (populated in
+`jump_panel_agent_rows` from `self.session_tags` by sid), the pure
+`partition_rows_by_tag(rows, tag_order) -> (folders, untagged)`, `render_jump_panel`
+(the per-tab folder/untagged render replacing the `agent_row_groups_for_tab` call
+for non-Archived tabs; All sorts its rows by label first), and `jump_session_row_el`
+(new `id_suffix` param). `agent_roster.rs`: the `session_tags.json` sidecar
+(`session_tags_path`, `load_session_tags`, `save_session_tags`, `add_session_tag`,
+`remove_session_tag`). `main.rs`: `self.session_tags` load/hydrate.
+
+**Why.** Grouping by cwd/project alone doesn't match how the user thinks about
+their agents; a tag folder ("frontend", "urgent") is manual curation, and letting a
+session sit in several folders lets one worker be both "urgent" and "frontend"
+without choosing.
+
+**Status.** `implemented`.
+
+**Deviation from plan.** Two. (1) `agent_row_groups_for_tab` (the All activity
+partition) is **retained, not removed** — `jump_palette.rs` still uses it so the
+`Cmd-P` empty-query order keeps the Working/Waiting/Unavailable presentation
+(`UXI-JumpPanel-9` unchanged); only the sidebar's All *render* dropped the activity
+headings. So the supersession of `UXI-JumpPanel-14`'s All partition is **panel-only**.
+(2) Untagged rows render **below** the folders (chosen placement); Waiting/Working
+keep their chronological within-folder order, only All sorts by label.
+
+**Enforcement.** `verify_harness.rs`:
+`session_tags_partition_folders_and_untagged` (pure: multi-appearance, untagged
+residual, folder order = tag_order then alpha; **built-in NC**: empty order = alpha,
+the opposite folder order) and `jump_panel_groups_sessions_under_tag_folders`
+(drives the REAL section projection + render: a tagged session paints under its
+folder header with the `-tg0` id suffix, an untagged one paints flat below;
+`jump_all_tab_groups_activity_with_headers` proves All paints **no** activity
+heading and sorts untagged rows by label. **NC observed RED**: forcing the partition
+to treat every row as untagged → the folder header never paints). The literal
+folder glyph/indent is harness gap #1.
+
+### UXI-JumpPanel-21 — Tag folders reorder by drag and fold, per project, persisted
+
+**Statement.** Tag folders are user-curated like the project sections
+(`UXI-JumpPanel-2`, `-13`):
+
+1. **Drag to reorder.** Dragging a tag-folder header onto another reorders the
+   folders **within that project**, persisted in
+   `Preferences::jump_tag_order` (a `project name → [tag]` map). The order is applied
+   as a **stable** sort by rank in the list, so an absent/empty order is a total
+   no-op (folders stay alphabetical) and a newly-seen tag sorts after the listed
+   ones. The order is keyed by durable **project name** (ProjectId is runtime-local),
+   the same key `UXI-JumpPanel-13` folds by.
+2. **Fold to collapse.** A tag folder's chevron toggles its collapse; folded hides
+   its session rows and unfolding restores them. Folded state persists per
+   project+tag in `Preferences::jump_folded_tags` (composite `"{project}\u{1f}{tag}"`
+   keys).
+3. **A tag folder never crosses projects.** A folder drag is scoped to its project
+   (the `TagDrag` payload carries the project name; the reorder re-checks it).
+
+**Applies to.** `jump_panel_view.rs`: `TagDrag` payload, `partition_rows_by_tag`
+(consumes `jump_tag_order[project]`), `reorder_tag`, `toggle_tag_fold`, the folder
+header `on_drag`/`drag_over`/`on_drop` + chevron `on_click` in `render_jump_panel`.
+`main.rs`: `self.jump_tag_order` (`HashMap<String, Vec<String>>`),
+`self.jump_folded_tags` (`HashSet<String>`), hydrated on boot and written by
+`save_settings`. `persist.rs`: `Preferences::{jump_tag_order, jump_folded_tags}`.
+
+**Why.** Alphabetical folders aren't how the user prioritizes; dragging the active
+tag to the top and remembering it is. Folding keeps a large project's panel
+scannable. Both are per-project because tags are project-scoped
+(`UXI-JumpPanel-20`).
+
+**Status.** `implemented`.
+
+**Deviation from plan.** The project-scope guard is expressed as "both the dragged
+and target tag must be present in the project" (a tag absent from the project — a
+foreign-project or ghost tag — is refused), rather than a separate payload re-check;
+the `TagDrag` payload still carries the project name for the `can_drop` gesture gate.
+
+**Enforcement.** `verify_harness.rs`:
+`jump_reorder_tag_folders_persists` (drives the REAL `reorder_tag`: folders reorder,
+`jump_tag_order[project]` is written, a ghost/foreign tag is refused; **NC observed
+RED**: early-return the reorder → "the manual order is stored per project" fires) and
+`jump_tag_folder_fold_hides_and_restores` (REAL `toggle_tag_fold` + render probe: the
+folded folder's row is absent while its header stays, unfolding returns the row;
+**NC observed RED**: drop the `!folded` render gate → "folded folder hides its row"
+fires). Preference round-trip is covered by
+`tests.rs::preferences_round_trip_with_text_scale` (the `jump_tag_order` +
+`jump_folded_tags` fields). The GPUI mouse-drag gesture itself is harness gap #2
+(no headless drag-dispatch seam).

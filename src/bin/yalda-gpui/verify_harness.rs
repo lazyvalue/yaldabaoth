@@ -1418,6 +1418,7 @@ fn agent_dot_status_mapping() {
         connected,
         awaiting,
         unread,
+        tags: Vec::new(),
     };
     // Reply in flight → working (unread irrelevant while working).
     assert_eq!(row(true, Some(true), false).dot_status(), AgentDotStatus::Working);
@@ -7010,6 +7011,287 @@ fn jump_panel_project_fold_hides_and_restores_children(cx: &mut TestAppContext) 
     crate::layout_probe_end();
 }
 
+// ── Session tags (UXI-JumpPanel-20/-21, UXI-AgentTile-33) ────────────────────
+
+/// UXI-JumpPanel-20: the pure tag partition. A row appears once per DISTINCT tag
+/// (multi-appearance); untagged rows fall to the residual; folders order by the
+/// project's manual `tag_order`, unlisted tags alphabetical after. The empty-order
+/// arm is the built-in negative control for the rank sort.
+#[test]
+fn session_tags_partition_folders_and_untagged() {
+    use crate::{partition_rows_by_tag, AgentRow, JumpTarget};
+    let row = |label: &str, tags: &[&str]| AgentRow {
+        target: JumpTarget::Roster(label.into()),
+        label: label.into(),
+        summary: None,
+        summary_pending: false,
+        archived: false,
+        cwd: std::path::PathBuf::from("/work"),
+        bound: false,
+        connected: true,
+        awaiting: Some(false),
+        unread: false,
+        order_sid: Some(label.into()),
+        state_entered_at: None,
+        tags: tags.iter().map(|s| s.to_string()).collect(),
+    };
+    let rows = vec![
+        (0usize, row("a", &["frontend", "urgent"])),
+        (1, row("b", &["urgent"])),
+        (2, row("c", &[])),
+    ];
+    let labels = |g: &[(usize, AgentRow)]| g.iter().map(|(_, r)| r.label.clone()).collect::<Vec<_>>();
+
+    // Manual order floats "urgent" first; "frontend" (unlisted) sorts alpha after.
+    let (folders, untagged) = partition_rows_by_tag(rows.clone(), &["urgent".to_string()]);
+    assert_eq!(folders.len(), 2, "one folder per distinct tag");
+    assert_eq!(folders[0].0, "urgent");
+    assert_eq!(labels(&folders[0].1), vec!["a", "b"], "urgent holds a and b");
+    assert_eq!(folders[1].0, "frontend");
+    assert_eq!(labels(&folders[1].1), vec!["a"], "a appears again under frontend (multi-appearance)");
+    assert_eq!(labels(&untagged), vec!["c"], "the tagless row is the residual");
+
+    // Negative control for the rank sort: with NO manual order, folders are
+    // alphabetical — "frontend" before "urgent" (the opposite of above).
+    let (alpha, _) = partition_rows_by_tag(rows, &[]);
+    assert_eq!(
+        alpha.iter().map(|(t, _)| t.clone()).collect::<Vec<_>>(),
+        vec!["frontend", "urgent"],
+        "empty tag_order = alphabetical folders"
+    );
+}
+
+/// Seed connected roster sessions rooted in the active project's cwd, returning
+/// its `ProjectId`. Shared by the tag render/fold/reorder tests.
+fn seed_project_sessions(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+    sessions: &[(&str, &str)], // (sid, label)
+) -> crate::project::ProjectId {
+    use yalda::session_proto::SessionInfo;
+    let (pid, cwd) = view.read_with(vcx, |v, _| {
+        let pid = v.workspace.active_workspace().expect("workspace").project();
+        (pid, v.projects.cwd_of(pid).expect("project cwd").to_path_buf())
+    });
+    view.update(vcx, |v, _| {
+        for (sid, label) in sessions {
+            v.agent_roster.upsert(SessionInfo {
+                session_id: (*sid).into(),
+                acp_session_id: None,
+                label: (*label).into(),
+                cwd: cwd.clone(),
+                provider: yalda::acp_channel::AgentProvider::Claude,
+                turns: 0,
+                connected: true,
+                permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+                busy: false,
+                archived: false,
+            });
+        }
+    });
+    pid
+}
+
+/// UXI-JumpPanel-20: a tagged session paints under its tag folder header; an
+/// untagged session paints flat below the folders (no folder). Non-vacuous: the
+/// tagged row uses the folder-ordinal id suffix (`-tg0`), the untagged row does
+/// not, and the untagged row paints BELOW the folder.
+#[gpui::test]
+fn jump_panel_groups_sessions_under_tag_folders(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_browser(cx);
+    let pid = seed_project_sessions(&view, &mut *vcx, &[("S-tag", "alpha"), ("S-plain", "plain")]);
+    view.update(vcx, |v, _| {
+        v.session_tags.insert("S-tag".into(), vec!["frontend".into()]);
+    });
+    let row_ids: std::collections::HashMap<String, usize> = view.update(vcx, |v, cx| {
+        v.jump_panel_sections(cx)
+            .0
+            .into_iter()
+            .find(|s| s.id == pid)
+            .expect("project section")
+            .sessions
+            .into_iter()
+            .map(|(i, r)| (r.label, i))
+            .collect()
+    });
+
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let folder_y = crate::layout_probe_get(&format!("jump-tag-folder-{}-0", pid.0))
+        .expect("the tagged session paints a folder header")
+        .1;
+    let tagged_y = crate::layout_probe_get(&format!("jump-session-row-{}-tg0", row_ids["alpha"]))
+        .expect("the tagged row paints under its folder (with the -tg0 id suffix)")
+        .1;
+    let plain_y = crate::layout_probe_get(&format!("jump-session-row-{}", row_ids["plain"]))
+        .expect("the untagged row paints flat (no suffix)")
+        .1;
+    assert!(folder_y < tagged_y, "the folder header sits above its rows");
+    assert!(tagged_y < plain_y, "untagged rows fall below the folders");
+    crate::layout_probe_end();
+}
+
+/// UXI-JumpPanel-21: folding a tag folder hides its session rows; unfolding
+/// restores them. The folder header itself stays painted while folded.
+#[gpui::test]
+fn jump_tag_folder_fold_hides_and_restores(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_browser(cx);
+    let pid = seed_project_sessions(&view, &mut *vcx, &[("S-tag", "alpha")]);
+    let (project_name, i) = view.update(vcx, |v, cx| {
+        v.session_tags.insert("S-tag".into(), vec!["frontend".into()]);
+        let name = v.projects.name_of(pid).to_string();
+        let i = v
+            .jump_panel_sections(cx)
+            .0
+            .into_iter()
+            .find(|s| s.id == pid)
+            .expect("section")
+            .sessions
+            .into_iter()
+            .find(|(_, r)| r.label == "alpha")
+            .expect("alpha row")
+            .0;
+        (name, i)
+    });
+    let row_probe = format!("jump-session-row-{i}-tg0");
+    let folder_probe = format!("jump-tag-folder-{}-0", pid.0);
+
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    assert!(crate::layout_probe_get(&row_probe).is_some(), "expanded folder paints its row");
+    crate::layout_probe_end();
+
+    view.update(vcx, |v, cx| v.toggle_tag_fold(&project_name, "frontend", cx));
+    view.read_with(vcx, |v, _| {
+        assert!(v.tag_folder_folded(&project_name, "frontend"), "fold state is set");
+    });
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    assert!(crate::layout_probe_get(&row_probe).is_none(), "folded folder hides its row");
+    assert!(crate::layout_probe_get(&folder_probe).is_some(), "the header stays painted while folded");
+    crate::layout_probe_end();
+
+    view.update(vcx, |v, cx| v.toggle_tag_fold(&project_name, "frontend", cx));
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    assert!(crate::layout_probe_get(&row_probe).is_some(), "unfolding restores the row");
+    crate::layout_probe_end();
+}
+
+/// UXI-JumpPanel-21: `reorder_tag` reorders a project's tag folders and persists
+/// the per-project order; a tag not present in the project is refused
+/// (project-scope guard). One session carries both tags so both folders exist.
+#[gpui::test]
+fn jump_reorder_tag_folders_persists(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_browser(cx);
+    let pid = seed_project_sessions(&view, &mut *vcx, &[("S-tag", "alpha")]);
+    let project_name = view.update(vcx, |v, _| {
+        v.session_tags.insert("S-tag".into(), vec!["alpha".into(), "beta".into()]);
+        v.projects.name_of(pid).to_string()
+    });
+    // Default order is alphabetical: alpha, beta.
+    view.read_with(vcx, |v, cx| {
+        assert_eq!(
+            v.ordered_project_tags(&project_name, cx),
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+    });
+    // Drop beta onto alpha → order becomes beta, alpha; persisted.
+    view.update(vcx, |v, cx| v.reorder_tag(&project_name, "beta", "alpha", cx));
+    view.read_with(vcx, |v, _| {
+        assert_eq!(
+            v.jump_tag_order.get(&project_name).map(|v| v.as_slice()),
+            Some(&["beta".to_string(), "alpha".to_string()][..]),
+            "the manual order is stored per project"
+        );
+    });
+    // Project-scope guard: a tag absent from this project can't be reordered.
+    view.update(vcx, |v, cx| v.reorder_tag(&project_name, "ghost", "alpha", cx));
+    view.read_with(vcx, |v, _| {
+        assert_eq!(
+            v.jump_tag_order.get(&project_name).map(|v| v.as_slice()),
+            Some(&["beta".to_string(), "alpha".to_string()][..]),
+            "a ghost tag drag changes nothing"
+        );
+    });
+}
+
+/// UXI-AgentTile-33: the `tag session` / `untag session` commands add/remove a tag
+/// on the focused session's sid via the REAL menu dispatch + submit path, putting
+/// NOTHING on the wire.
+#[cfg(feature = "test-support")]
+#[gpui::test]
+fn tag_session_command_adds_and_removes_via_sidecar(cx: &mut TestAppContext) {
+    let (view, vcx, id, controls) = boot_worksheet_channel(cx);
+    // Give the session a stable server sid — tags key by sid.
+    let sid = view.update(vcx, |v, _| {
+        if v.sessions.sid_of(id).is_none() {
+            v.sessions.bind_sid(id, ServerSid::new("TAG-SID")).expect("bind sid");
+        }
+        v.sessions.sid_of(id).expect("sid").as_str().to_string()
+    });
+
+    // ARM the add-tag prompt via the real menu command; the prompt line lands.
+    view.update(vcx, |v, cx| v.dispatch_menu_command("claude-tag", cx));
+    vcx.run_until_parked();
+    let transcript = view
+        .update(vcx, |v, cx| v.read_session(id, cx, |c| c.editor.document().full_text()))
+        .unwrap_or_default();
+    assert!(
+        transcript.contains(YaldaGpuiView::TAG_PROMPT),
+        "the tag prompt must be appended, got: {transcript:?}"
+    );
+
+    // Type the tag name and submit → it lands in the sidecar, nothing on the wire.
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| {
+            for ch in "frontend".chars() {
+                c.input_surface.compose_mut().editor.insert_char(ch);
+            }
+        });
+    });
+    view.update(vcx, |v, cx| v.submit_agent(cx));
+    vcx.run_until_parked();
+    assert!(
+        controls.prompt_rx.try_recv().is_err(),
+        "a submit consumed by the tag prompt must never reach the agent"
+    );
+    view.read_with(vcx, |v, _| {
+        assert_eq!(
+            v.session_tags.get(&sid).map(|t| t.as_slice()),
+            Some(&["frontend".to_string()][..]),
+            "the tag is stored on the session's sid"
+        );
+    });
+
+    // UNTAG the same tag → the set empties.
+    view.update(vcx, |v, cx| v.dispatch_menu_command("claude-untag", cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| {
+            for ch in "frontend".chars() {
+                c.input_surface.compose_mut().editor.insert_char(ch);
+            }
+        });
+    });
+    view.update(vcx, |v, cx| v.submit_agent(cx));
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert!(
+            v.session_tags.get(&sid).is_none_or(|t| t.is_empty()),
+            "untag removes the tag"
+        );
+    });
+    assert!(
+        controls.prompt_rx.try_recv().is_err(),
+        "the untag submit must not reach the agent either"
+    );
+}
+
 /// UXI-Project-4: the "New project" overlay creates an EMPTY project via the REAL
 /// path (`open_new_project_overlay` → edit cwd → `commit_new_project_overlay`).
 /// Its name is derived from the directory basename; equal basenames uniquify,
@@ -7669,6 +7951,7 @@ fn jump_reorder_ordering_applies_and_defaults_to_alpha() {
         unread: false,
         order_sid: Some(sid.into()),
         state_entered_at: None,
+        tags: Vec::new(),
     };
     // Two projects; alpha has two sessions (incoming by-label a,b), beta one.
     let mk = || {
@@ -7727,6 +8010,7 @@ fn jump_agent_state_tabs_filter_and_sort_without_moving_all() {
         unread,
         order_sid: Some(sid.into()),
         state_entered_at: Some(base - std::time::Duration::from_secs(age_secs)),
+        tags: Vec::new(),
     };
     // Incoming order represents the user's custom All order, deliberately
     // unrelated to either state's chronology.
@@ -8324,30 +8608,27 @@ fn jump_all_tab_groups_activity_with_headers(cx: &mut TestAppContext) {
     crate::layout_probe_begin();
     view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
-    let heading_y = |name: &str| {
-        crate::layout_probe_get(&format!("jump-agent-group-{}-{name}", pid.0))
-            .unwrap_or_else(|| panic!("All must paint the nonempty {name} heading"))
-            .1
-    };
-    let working_y = heading_y("working");
-    let waiting_y = heading_y("waiting");
-    let unavailable_y = heading_y("unavailable");
-    assert!(
-        working_y < waiting_y && waiting_y < unavailable_y,
-        "All headings must paint Working, Waiting, Unavailable"
-    );
-
+    // UXI-JumpPanel-20 clause 5 SUPERSEDES UXI-JumpPanel-14's All activity
+    // partition IN THE PANEL: the Working/Waiting/Unavailable headings are gone,
+    // and untagged rows sort alphabetically by label. (The Cmd-P palette below
+    // still projects the activity order via `agent_row_groups_for_tab`.)
+    for name in ["working", "waiting", "unavailable"] {
+        assert!(
+            crate::layout_probe_get(&format!("jump-agent-group-{}-{name}", pid.0)).is_none(),
+            "All must NOT paint the {name} activity heading anymore (tag-folder view)"
+        );
+    }
     let row_y = |label: &str| {
         let i = row_ids[label];
         crate::layout_probe_get(&format!("jump-session-row-{i}"))
             .unwrap_or_else(|| panic!("{label} row must paint"))
             .1
     };
-    let painted = ["work-two", "work-one", "wait-two", "wait-one", "offline"]
-        .map(row_y);
+    // All sorts untagged rows by label: offline, wait-one, wait-two, work-one, work-two.
+    let painted = ["offline", "wait-one", "wait-two", "work-one", "work-two"].map(row_y);
     assert!(
         painted.windows(2).all(|pair| pair[0] < pair[1]),
-        "groups reorder activities but preserve durable relative rank inside each"
+        "All must paint untagged rows in alphabetical label order"
     );
     crate::layout_probe_end();
 
@@ -8363,36 +8644,6 @@ fn jump_all_tab_groups_activity_with_headers(cx: &mut TestAppContext) {
         vec!["work-two", "work-one", "wait-two", "wait-one", "offline"],
         "empty Cmd-P mirrors the All tab's activity-grouped presentation order"
     );
-
-    // Empty exceptional/working sections disappear rather than leaving chrome
-    // between the tab strip and the only populated group.
-    view.update(vcx, |v, _| {
-        for (sid, label) in [
-            ("S-wait-2", "wait-two"),
-            ("S-work-2", "work-two"),
-            ("S-off", "offline"),
-            ("S-work-1", "work-one"),
-            ("S-wait-1", "wait-one"),
-        ] {
-            v.agent_roster.upsert(info(sid, label, false, true));
-        }
-    });
-    crate::layout_probe_begin();
-    view.update(vcx, |_, cx| cx.notify());
-    vcx.run_until_parked();
-    assert!(
-        crate::layout_probe_get(&format!("jump-agent-group-{}-working", pid.0)).is_none(),
-        "an empty Working group has no header"
-    );
-    assert!(
-        crate::layout_probe_get(&format!("jump-agent-group-{}-waiting", pid.0)).is_some(),
-        "the populated Waiting group keeps its header"
-    );
-    assert!(
-        crate::layout_probe_get(&format!("jump-agent-group-{}-unavailable", pid.0)).is_none(),
-        "an empty Unavailable group has no header"
-    );
-    crate::layout_probe_end();
 }
 
 /// UXI-JumpPanel-16: cold archive is projected as a complementary navigation
@@ -9046,6 +9297,7 @@ fn jump_panel_groups_agent_rows_by_cwd() {
         connected: true,
         awaiting: None,
         unread: false,
+        tags: Vec::new(),
     };
     // Two projects, one with two sessions; input order is by-label (a,b,c).
     let rows = vec![

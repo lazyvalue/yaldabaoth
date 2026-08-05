@@ -211,3 +211,72 @@ recording: the pre-existing `close_session_requires_typed_yes_confirmation` used
 already enters Insert, that `i` became literal text (`inope`). The test was updated to
 type directly, which is also what a real user now does. That failure is itself
 evidence the auto-insert lands on the real path.
+
+### UXI-AgentTile-33 — Tagging a session prompts in the tile for a name
+
+**Statement.** The agent space-menu gains two session commands that reuse the
+in-tile armed-prompt mechanism (`UXI-AgentTile-22`), not a modal:
+
+1. **`tag session`** arms an *add-tag* prompt and appends one line to the
+   session's own transcript, never sent to the agent:
+
+   ```
+   > <Yaldabaoth System>: Tag session — type a tag name (blank to cancel).
+   ```
+
+2. **`untag session`** arms a *remove-tag* prompt, listing the session's current
+   tags so the user knows what to type:
+
+   ```
+   > <Yaldabaoth System>: Untag session — type a tag to remove: alpha, urgent.
+   ```
+
+While a tag prompt is armed the **next submit is consumed** on either input
+surface (worksheet You-blocks or chatbox): nothing reaches the agent. The trimmed
+text is the tag name. Rules:
+
+- **Add** appends the tag to the session's tag set (a set — a duplicate is a
+  no-op) and confirms with a `― tagged "alpha"` notice. **Remove** drops the
+  named tag if present (`― untagged "alpha"`), else notes `no tag "x"`.
+- **Blank input cancels** — the prompt disarms, nothing changes, the draft is left
+  in the compose exactly as it was (the shared all-whitespace rule).
+- **A tag is per session, keyed by the server sid**, persisted in the id-keyed
+  `session_tags.json` sidecar (the same durability the summary gets,
+  `UXI-JumpPanel-20`). A session with **no sid yet** (mid-create) cannot be tagged:
+  the command notes `session not ready to tag` and arms nothing.
+- **Empty on untag** — a session with no tags answers `untag` with a
+  `no tags to remove` notice and does not arm.
+- Like the close confirm, arming an empty compose also drops the user into insert
+  so the whole gesture is `<space>` `t` `<name>` `⏎`; a non-empty draft suppresses
+  the focus move (nothing is cleared, ever).
+
+**Applies to.** `agent.rs::AgentState.tag_prompt` (`Option<TagPromptKind>`);
+`agent_ui.rs::{arm_tag_prompt, arm_untag_prompt, consume_tag_prompt,
+append_system_line, submit_compose}` (interception sits ABOVE the
+worksheet/chatbox branch, beside `consume_close_confirm`); `main.rs`
+`"claude-tag"` / `"claude-untag"` menu entries + `dispatch_menu_command` arms; the
+sidecar mutators `add_session_tag` / `remove_session_tag` (`agent_roster.rs`).
+
+**Why.** Tags are how the user curates the jump panel (`UXI-JumpPanel-20`), and
+the natural place to say "this session is `frontend`" is inside the session
+itself. Reusing the transcript-line prompt keeps it consistent with the existing
+close/rename session commands and leaves a durable record of the tag edit.
+
+**Status.** `implemented` (headless, end-to-end on the real paths). Menu keys
+`t` (tag) / `T` (untag).
+
+**Enforcement.** `verify_harness.rs::tag_session_command_adds_and_removes_via_sidecar`
+(behind `test-support`) — drives the REAL `dispatch_menu_command("claude-tag")` +
+REAL `submit_agent` → `submit_compose`: arming puts the prompt line in the
+transcript; a name submit puts **nothing on the wire** (`controls.prompt_rx`
+empty) and adds the tag to `session_tags[sid]`; `claude-untag` + the tag name
+removes it, again nothing on the wire. **Negative control observed RED:** disabling
+the `consume_tag_prompt` call → "the tag is stored on the session's sid" fires
+(the name fell through to a real submit instead).
+
+**Deviation from plan.** After a consume, the typed answer is discarded from the
+compose (new `Compose::reset()` + clearing `you_block_open` / `parked_you_blocks`)
+so it can't leak into a later real submit — the close confirm didn't need this
+because `yes` closes the tile and a cancel deliberately keeps the draft, whereas a
+tag edit stays in the same session. The `t`/`T` keys sit next to `r` (rename) in
+the space-menu.
