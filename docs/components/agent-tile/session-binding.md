@@ -212,71 +212,70 @@ already enters Insert, that `i` became literal text (`inope`). The test was upda
 type directly, which is also what a real user now does. That failure is itself
 evidence the auto-insert lands on the real path.
 
-### UXI-AgentTile-33 — Tagging a session prompts in the tile for a name
+### UXI-AgentTile-33 — Tagging a session opens a two-column add/remove dialog
 
-**Statement.** The agent space-menu gains two session commands that reuse the
-in-tile armed-prompt mechanism (`UXI-AgentTile-22`), not a modal:
+**Statement.** The agent space-menu's **`tag session…`** command (`t`) opens a
+modal **tag editor** (`session_tag_editor.rs`) — a two-column dialog for editing
+the focused session's tags, driveable entirely by keyboard OR mouse. It replaces
+the earlier in-tile add/remove prompt.
 
-1. **`tag session`** arms an *add-tag* prompt and appends one line to the
-   session's own transcript, never sent to the agent:
+Layout:
 
-   ```
-   > <Yaldabaoth System>: Tag session — type a tag name (blank to cancel).
-   ```
+- A type-to-filter **input** at the top.
+- **ADD** (left column) — every tag in use across all sessions that this session
+  doesn't already carry, filtered by the input; plus a synthetic **＋ create
+  "<typed>"** row when the typed text is a novel tag. Activating a row adds that
+  tag.
+- **ON THIS SESSION** (right column) — the session's current tags, each with a
+  trailing `✕`. Activating a row removes that tag.
 
-2. **`untag session`** arms a *remove-tag* prompt, listing the session's current
-   tags so the user knows what to type:
+Interaction:
 
-   ```
-   > <Yaldabaoth System>: Untag session — type a tag to remove: alpha, urgent.
-   ```
+- **Keyboard.** Typing edits the filter / new-tag text and focuses ADD; `↑↓` move
+  the highlight within the focused column; `tab` / `←` / `→` switch columns;
+  `enter` toggles the highlighted row (add from ADD, remove from ON THIS SESSION);
+  `backspace`/`delete` in the ON-THIS-SESSION column removes the highlight;
+  `esc` (or a click on the backdrop) closes.
+- **Mouse.** Clicking any row toggles it; hovering moves the highlight and focus
+  to that column.
+- Adding an already-present tag is a no-op (it's a set); after any add the filter
+  clears so the just-added tag hops to the right column.
 
-While a tag prompt is armed the **next submit is consumed** on either input
-surface (worksheet You-blocks or chatbox): nothing reaches the agent. The trimmed
-text is the tag name. Rules:
-
-- **Add** appends the tag to the session's tag set (a set — a duplicate is a
-  no-op) and confirms with a `― tagged "alpha"` notice. **Remove** drops the
-  named tag if present (`― untagged "alpha"`), else notes `no tag "x"`.
-- **Blank input cancels** — the prompt disarms, nothing changes, the draft is left
-  in the compose exactly as it was (the shared all-whitespace rule).
 - **A tag is per session, keyed by the server sid**, persisted in the id-keyed
-  `session_tags.json` sidecar (the same durability the summary gets,
-  `UXI-JumpPanel-20`). A session with **no sid yet** (mid-create) cannot be tagged:
-  the command notes `session not ready to tag` and arms nothing.
-- **Empty on untag** — a session with no tags answers `untag` with a
-  `no tags to remove` notice and does not arm.
-- Like the close confirm, arming an empty compose also drops the user into insert
-  so the whole gesture is `<space>` `t` `<name>` `⏎`; a non-empty draft suppresses
-  the focus move (nothing is cleared, ever).
+  `session_tags.json` sidecar (`UXI-JumpPanel-20`). A session with **no sid yet**
+  (mid-create) can't be tagged: the command sets a `session not ready to tag`
+  transient note and opens no dialog.
 
-**Applies to.** `agent.rs::AgentState.tag_prompt` (`Option<TagPromptKind>`);
-`agent_ui.rs::{arm_tag_prompt, arm_untag_prompt, consume_tag_prompt,
-append_system_line, submit_compose}` (interception sits ABOVE the
-worksheet/chatbox branch, beside `consume_close_confirm`); `main.rs`
-`"claude-tag"` / `"claude-untag"` menu entries + `dispatch_menu_command` arms; the
-sidecar mutators `add_session_tag` / `remove_session_tag` (`agent_roster.rs`).
+**Applies to.** `session_tag_editor.rs`: `TagEditorOverlay` / `TagEditorColumn` /
+`TagLeftRow`, `tag_editor_model` + `all_known_tags` (the pure column derivation),
+`open_tag_editor`, `handle_tag_editor_key`, `activate_tag_editor` /
+`tag_editor_add` / `tag_editor_remove`, `render_tag_editor`. `main.rs`:
+`ActiveOverlay::TagEditor`, its accessors, the `overlay_is_tag_editor` render +
+`capture_key_down` branch, and the `"claude-tag"` → `open_tag_editor` dispatch. The
+sidecar mutators `add_session_tag` / `remove_session_tag` (`agent_ui.rs`) are
+reused unchanged.
 
-**Why.** Tags are how the user curates the jump panel (`UXI-JumpPanel-20`), and
-the natural place to say "this session is `frontend`" is inside the session
-itself. Reusing the transcript-line prompt keeps it consistent with the existing
-close/rename session commands and leaves a durable record of the tag edit.
+**Why.** The user rejected the linear add-then-remove prompt: they want to see the
+session's tags and the pool of existing tags at once, and add/remove any of them in
+one place, by keyboard or mouse. A two-column dialog is that surface.
 
-**Status.** `implemented` (headless, end-to-end on the real paths). Menu keys
-`t` (tag) / `T` (untag).
+**Status.** `implemented` (headless). The `untag session` command and the whole
+`AgentState.tag_prompt` / `arm_*` / `consume_tag_prompt` / `Compose::reset`
+in-tile-prompt path are **removed** (superseded by this dialog).
 
-**Enforcement.** `verify_harness.rs::tag_session_command_adds_and_removes_via_sidecar`
-(behind `test-support`) — drives the REAL `dispatch_menu_command("claude-tag")` +
-REAL `submit_agent` → `submit_compose`: arming puts the prompt line in the
-transcript; a name submit puts **nothing on the wire** (`controls.prompt_rx`
-empty) and adds the tag to `session_tags[sid]`; `claude-untag` + the tag name
-removes it, again nothing on the wire. **Negative control observed RED:** disabling
-the `consume_tag_prompt` call → "the tag is stored on the session's sid" fires
-(the name fell through to a real submit instead).
+**Enforcement.** `verify_harness.rs`:
+`tag_editor_keyboard_adds_and_removes` (opens via the REAL
+`dispatch_menu_command("claude-tag")`, then `simulate_keystrokes` through the REAL
+capture handler: a typed novel tag + `enter` creates+adds it, `enter` again adds an
+existing known tag, `tab`+`enter` removes the first current tag, `esc` closes),
+`tag_editor_mouse_click_toggles` (clicks the painted `tag-editor-left-0` /
+`tag-editor-current-0` rows to add then remove, through the occluding card), and
+`tag_editor_requires_a_sid` (a sid-less session opens no dialog and sets the note).
+**Negative controls observed RED:** no-op'ing `tag_editor_add` fails both add
+asserts; no-op'ing `tag_editor_remove` fails both remove asserts.
 
-**Deviation from plan.** After a consume, the typed answer is discarded from the
-compose (new `Compose::reset()` + clearing `you_block_open` / `parked_you_blocks`)
-so it can't leak into a later real submit — the close confirm didn't need this
-because `yes` closes the tile and a cancel deliberately keeps the draft, whereas a
-tag edit stays in the same session. The `t`/`T` keys sit next to `r` (rename) in
-the space-menu.
+**Deviation from plan.** The requested "select from a list of in-use / previously
+used tags" is sourced from `all_known_tags` (the union of every session's tags in
+the sidecar) — there is no separate "history" store, so a tag becomes reusable
+once it's been applied anywhere. The ADD column hides tags already on the session
+(they live in the right column instead of showing as disabled).

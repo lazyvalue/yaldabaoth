@@ -78,6 +78,7 @@ mod edit_ui;
 mod highlight_cache;
 mod jump_palette;
 mod jump_panel_view;
+mod session_tag_editor;
 mod keymap_registry;
 mod keymap_tile;
 mod keymap_ui;
@@ -103,6 +104,7 @@ pub(crate) use agent_roster::*;
 pub(crate) use agent_sessions::*;
 pub(crate) use jump_palette::*;
 pub(crate) use jump_panel_view::*;
+pub(crate) use session_tag_editor::*;
 pub(crate) use keymap_registry::*;
 pub(crate) use keymap_tile::*;
 pub(crate) use keymap_view::*;
@@ -1472,6 +1474,9 @@ enum ActiveOverlay {
     /// over every non-ephemeral workspace + every agent session. Carries the
     /// query and the highlighted RANKED-list index.
     JumpPalette(JumpPaletteOverlay),
+    /// The session tag editor (UXI-AgentTile-33): a two-column add/remove dialog
+    /// over the focused session's tags (`session_tag_editor.rs`).
+    TagEditor(TagEditorOverlay),
     /// Project context menu (UXI-JumpPanel-8): a small popup anchored at the
     /// click position, offering the project-scoped create/delete actions. Carries
     /// the target project + the window-space anchor point (already clamped to the
@@ -1630,8 +1635,7 @@ fn agent_local_menu() -> Vec<MenuNode> {
         MenuNode::entry("x", "close session", "claude-close"),
         MenuNode::entry("C", "clear session", "claude-clear"),
         MenuNode::entry("r", "rename session", "claude-rename"),
-        MenuNode::entry("t", "tag session", "claude-tag"),
-        MenuNode::entry("T", "untag session", "claude-untag"),
+        MenuNode::entry("t", "tag session…", "claude-tag"),
         MenuNode::entry("f", "focus transcript ⇄ compose", "agent-focus-toggle"),
         MenuNode::entry("S", "send selection", "claude-send-selection"),
         MenuNode::entry("m", "cycle permission mode", "claude-mode-cycle"),
@@ -5027,8 +5031,7 @@ impl YaldaGpuiView {
             "claude-mode-cycle" => self.cycle_claude_permission_mode(cx),
             "claude-clear" => self.clear_agent_session(cx),
             "claude-rename" => self.open_rename_overlay(cx),
-            "claude-tag" => self.arm_tag_prompt(cx),
-            "claude-untag" => self.arm_untag_prompt(cx),
+            "claude-tag" => self.open_tag_editor(cx),
             "archive-session" => self.set_focused_session_archived(true, cx),
             "unarchive-session" => self.set_focused_session_archived(false, cx),
             "claude-cd" => self.open_change_agent_cwd_overlay(cx),
@@ -8084,6 +8087,22 @@ impl Render for YaldaGpuiView {
                 }))
                 .child(screen_view)
                 .child(self.render_jump_palette(cx))
+                .into_any_element();
+        }
+
+        // Session tag editor (UXI-AgentTile-33). Layered over the still-visible
+        // screen behind a click-away backdrop; the capture handler owns every key.
+        if self.overlay_is_tag_editor() {
+            return div()
+                .track_focus(&self.focus_handle)
+                .key_context("TagEditorView")
+                .size_full()
+                .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
+                    this.handle_tag_editor_key(ev, w, cx);
+                    cx.stop_propagation();
+                }))
+                .child(screen_view)
+                .child(self.render_tag_editor(cx))
                 .into_any_element();
         }
 

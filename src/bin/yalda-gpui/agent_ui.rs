@@ -1893,126 +1893,6 @@ impl YaldaGpuiView {
         true
     }
 
-    /// The add-tag prompt line (UXI-AgentTile-33). Local-only, never sent.
-    pub(crate) const TAG_PROMPT: &'static str =
-        "> <Yaldabaoth System>: Tag session — type a tag name (blank to cancel).";
-
-    /// Mirror the close-confirm's focus move (UXI-AgentTile-23) so the prompt
-    /// answer can be typed immediately when the compose is empty: chatbox → enter
-    /// Insert + focus compose; idle worksheet → open a You-block; mid-turn
-    /// worksheet → Insert but keep focus on the transcript (the B1 edge). A
-    /// non-empty draft is left untouched.
-    fn enter_insert_for_prompt(claude: &mut AgentState) {
-        if !claude.input_surface.compose().text().trim().is_empty() {
-            return;
-        }
-        if claude.input_surface.is_chatbox() {
-            claude.input_surface.compose_mut().mode = EditMode::Insert;
-            claude.focus = AgentFocus::Compose;
-        } else if claude.turn_phase.is_awaiting() {
-            claude.input_surface.compose_mut().mode = EditMode::Insert;
-        } else {
-            claude.open_you_block_at_cursor();
-        }
-    }
-
-    /// Arm the add-tag prompt (UXI-AgentTile-33): append the prompt line and set
-    /// the flag the next submit consumes. Requires a server sid to key the tag; a
-    /// mid-create session (no sid) notes that and arms nothing. No-op on an
-    /// unbound tile.
-    pub(crate) fn arm_tag_prompt(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.focused_bound_session() else {
-            return;
-        };
-        if self.sessions.sid_of(id).is_none() {
-            self.with_session(id, cx, |c| Self::append_system_notice(c, "session not ready to tag"));
-            cx.notify();
-            return;
-        }
-        self.with_session(id, cx, |claude| {
-            Self::append_system_line(claude, Self::TAG_PROMPT);
-            claude.tag_prompt = Some(TagPromptKind::Add);
-            Self::enter_insert_for_prompt(claude);
-        });
-        cx.notify();
-    }
-
-    /// Arm the remove-tag prompt (UXI-AgentTile-33). Lists the session's current
-    /// tags in the prompt line. A session with no tags notes that and arms
-    /// nothing; a session with no sid can't be tagged at all.
-    pub(crate) fn arm_untag_prompt(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.focused_bound_session() else {
-            return;
-        };
-        let Some(sid) = self.sessions.sid_of(id).map(|s| s.as_str().to_string()) else {
-            self.with_session(id, cx, |c| Self::append_system_notice(c, "session not ready to tag"));
-            cx.notify();
-            return;
-        };
-        let tags = self.session_tags.get(&sid).cloned().unwrap_or_default();
-        if tags.is_empty() {
-            self.with_session(id, cx, |c| Self::append_system_notice(c, "no tags to remove"));
-            cx.notify();
-            return;
-        }
-        let line = format!(
-            "> <Yaldabaoth System>: Untag session — type a tag to remove: {}.",
-            tags.join(", ")
-        );
-        self.with_session(id, cx, |claude| {
-            Self::append_system_line(claude, &line);
-            claude.tag_prompt = Some(TagPromptKind::Remove);
-            Self::enter_insert_for_prompt(claude);
-        });
-        cx.notify();
-    }
-
-    /// If a tag prompt is armed, CONSUME this submit and report `true`. The
-    /// trimmed answer is the tag name: a blank cancels; otherwise it is
-    /// added/removed on the session's sid and a `― tagged/untagged` notice is
-    /// appended. The typed answer is discarded from the compose so it never
-    /// leaks into a later real submit.
-    fn consume_tag_prompt(&mut self, id: SessionId, text: &str, cx: &mut Context<Self>) -> bool {
-        let Some(kind) = self.read_session(id, cx, |c| c.tag_prompt).flatten() else {
-            return false;
-        };
-        // Disarm first so no branch can leave it hot.
-        self.with_session(id, cx, |c| c.tag_prompt = None);
-        let name = text.trim().to_string();
-        if name.is_empty() {
-            cx.notify();
-            return true;
-        }
-        // Discard the typed answer from the compose/you-block draft.
-        self.with_session(id, cx, |c| {
-            c.input_surface.compose_mut().reset();
-            c.you_block_open = false;
-            c.parked_you_blocks.clear();
-        });
-        let notice = match self.sessions.sid_of(id).map(|s| s.as_str().to_string()) {
-            None => "session not ready to tag".to_string(),
-            Some(sid) => match kind {
-                TagPromptKind::Add => {
-                    if self.add_session_tag(&sid, &name) {
-                        format!("tagged \"{name}\"")
-                    } else {
-                        format!("already tagged \"{name}\"")
-                    }
-                }
-                TagPromptKind::Remove => {
-                    if self.remove_session_tag(&sid, &name) {
-                        format!("untagged \"{name}\"")
-                    } else {
-                        format!("no tag \"{name}\"")
-                    }
-                }
-            },
-        };
-        self.with_session(id, cx, |c| Self::append_system_notice(c, &notice));
-        cx.notify();
-        true
-    }
-
     /// Add `tag` to `sid`'s tag set (UXI-JumpPanel-20), persisting the sidecar.
     /// Returns `true` if the set changed (a duplicate is a no-op).
     pub(crate) fn add_session_tag(&mut self, sid: &str, tag: &str) -> bool {
@@ -2315,7 +2195,6 @@ impl YaldaGpuiView {
             subagents_open: false,
             sidepanel_hidden: false,
             close_confirm_armed: false,
-            tag_prompt: None,
             drag_protect_line: None,
             panel_col: PanelColumn::Tasklist,
             panel_sel: 0,
@@ -4927,11 +4806,6 @@ impl YaldaGpuiView {
                 .unwrap_or_default()
         };
         if self.consume_close_confirm(id, &answer, cx) {
-            return;
-        }
-        // UXI-AgentTile-33: an armed tag/untag prompt likewise swallows the next
-        // submit on either surface — the answer is the tag name.
-        if self.consume_tag_prompt(id, &answer, cx) {
             return;
         }
 

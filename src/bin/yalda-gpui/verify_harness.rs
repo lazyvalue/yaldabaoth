@@ -7373,76 +7373,118 @@ fn jump_reorder_tag_folders_persists(cx: &mut TestAppContext) {
     });
 }
 
-/// UXI-AgentTile-33: the `tag session` / `untag session` commands add/remove a tag
-/// on the focused session's sid via the REAL menu dispatch + submit path, putting
-/// NOTHING on the wire.
-#[cfg(feature = "test-support")]
+/// UXI-AgentTile-33: the tag-editor dialog adds a typed/new tag, adds an existing
+/// known tag from the ADD column, and removes a current tag — fully by keyboard,
+/// keyed by the session's sid. Drives the REAL menu open + capture key handler.
 #[gpui::test]
-fn tag_session_command_adds_and_removes_via_sidecar(cx: &mut TestAppContext) {
-    let (view, vcx, id, controls) = boot_worksheet_channel(cx);
-    // Give the session a stable server sid — tags key by sid.
-    let sid = view.update(vcx, |v, _| {
-        if v.sessions.sid_of(id).is_none() {
-            v.sessions.bind_sid(id, ServerSid::new("TAG-SID")).expect("bind sid");
-        }
-        v.sessions.sid_of(id).expect("sid").as_str().to_string()
+fn tag_editor_keyboard_adds_and_removes(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_browser(cx);
+    install_agent_slot(&view, &mut *vcx, Some("SID"));
+    // A tag used on another session, so the ADD column has an existing candidate.
+    view.update(vcx, |v, _| {
+        v.session_tags.insert("OTHER".into(), vec!["backend".into()]);
     });
 
-    // ARM the add-tag prompt via the real menu command; the prompt line lands.
     view.update(vcx, |v, cx| v.dispatch_menu_command("claude-tag", cx));
     vcx.run_until_parked();
-    let transcript = view
-        .update(vcx, |v, cx| v.read_session(id, cx, |c| c.editor.document().full_text()))
-        .unwrap_or_default();
-    assert!(
-        transcript.contains(YaldaGpuiView::TAG_PROMPT),
-        "the tag prompt must be appended, got: {transcript:?}"
-    );
+    view.read_with(vcx, |v, _| assert!(v.overlay_is_tag_editor(), "the dialog opens"));
 
-    // Type the tag name and submit → it lands in the sidecar, nothing on the wire.
-    view.update(vcx, |v, cx| {
-        v.with_session(id, cx, |c| {
-            for ch in "frontend".chars() {
-                c.input_surface.compose_mut().editor.insert_char(ch);
-            }
-        });
-    });
-    view.update(vcx, |v, cx| v.submit_agent(cx));
+    // Type a NEW tag + Enter → the "create" row adds it.
+    vcx.simulate_keystrokes("f r o n t e n d enter");
     vcx.run_until_parked();
-    assert!(
-        controls.prompt_rx.try_recv().is_err(),
-        "a submit consumed by the tag prompt must never reach the agent"
-    );
     view.read_with(vcx, |v, _| {
         assert_eq!(
-            v.session_tags.get(&sid).map(|t| t.as_slice()),
+            v.session_tags.get("SID").map(|t| t.as_slice()),
             Some(&["frontend".to_string()][..]),
-            "the tag is stored on the session's sid"
+            "typing a novel tag + enter creates and adds it"
         );
     });
 
-    // UNTAG the same tag → the set empties.
-    view.update(vcx, |v, cx| v.dispatch_menu_command("claude-untag", cx));
-    vcx.run_until_parked();
-    view.update(vcx, |v, cx| {
-        v.with_session(id, cx, |c| {
-            for ch in "frontend".chars() {
-                c.input_surface.compose_mut().editor.insert_char(ch);
-            }
-        });
-    });
-    view.update(vcx, |v, cx| v.submit_agent(cx));
+    // The ADD column now offers the existing "backend"; Enter adds it.
+    vcx.simulate_keystrokes("enter");
     vcx.run_until_parked();
     view.read_with(vcx, |v, _| {
-        assert!(
-            v.session_tags.get(&sid).is_none_or(|t| t.is_empty()),
-            "untag removes the tag"
+        let mut got = v.session_tags.get("SID").cloned().unwrap_or_default();
+        got.sort();
+        assert_eq!(got, vec!["backend".to_string(), "frontend".to_string()], "an existing tag adds");
+    });
+
+    // Switch to the Current column and remove the highlighted (first) tag.
+    vcx.simulate_keystrokes("tab enter");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert_eq!(
+            v.session_tags.get("SID").map(|t| t.as_slice()),
+            Some(&["frontend".to_string()][..]),
+            "tab into Current + enter removes the first current tag (backend)"
         );
     });
-    assert!(
-        controls.prompt_rx.try_recv().is_err(),
-        "the untag submit must not reach the agent either"
-    );
+
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| assert!(!v.overlay_is_tag_editor(), "esc closes the dialog"));
+}
+
+/// UXI-AgentTile-33: clicking a row in either column toggles that tag (mouse path,
+/// through the real painted rows).
+#[gpui::test]
+fn tag_editor_mouse_click_toggles(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_browser(cx);
+    install_agent_slot(&view, &mut *vcx, Some("SID"));
+    view.update(vcx, |v, _| {
+        v.session_tags.insert("OTHER".into(), vec!["backend".into()]);
+    });
+    view.update(vcx, |v, cx| v.dispatch_menu_command("claude-tag", cx));
+    vcx.run_until_parked();
+
+    let click = |vcx: &mut gpui::VisualTestContext, probe: &str| {
+        crate::layout_probe_begin();
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+        let (x, y, w, h) = crate::layout_probe_get(probe).unwrap_or_else(|| panic!("{probe} paints"));
+        crate::layout_probe_end();
+        let at = point(px(x + w / 2.0), px(y + h / 2.0));
+        vcx.simulate_mouse_move(at, None, gpui::Modifiers::default());
+        vcx.simulate_click(at, gpui::Modifiers::default());
+        vcx.run_until_parked();
+    };
+
+    // Click the available "backend" → added.
+    click(vcx, "tag-editor-left-0");
+    view.read_with(vcx, |v, _| {
+        assert_eq!(
+            v.session_tags.get("SID").map(|t| t.as_slice()),
+            Some(&["backend".to_string()][..]),
+            "clicking an available tag adds it"
+        );
+    });
+    // Click the current "backend" → removed.
+    click(vcx, "tag-editor-current-0");
+    view.read_with(vcx, |v, _| {
+        assert!(
+            v.session_tags.get("SID").is_none_or(|t| t.is_empty()),
+            "clicking a current tag removes it"
+        );
+    });
+}
+
+/// UXI-AgentTile-33: a session with no server sid can't be tagged (tags key by
+/// sid), so the command notes it and opens no dialog.
+#[gpui::test]
+fn tag_editor_requires_a_sid(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_browser(cx);
+    install_agent_slot(&view, &mut *vcx, None); // bound tile, but NO server sid
+    view.update(vcx, |v, cx| v.dispatch_menu_command("claude-tag", cx));
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert!(!v.overlay_is_tag_editor(), "a sid-less session opens no dialog");
+        assert!(
+            v.transient_status.as_deref().is_some_and(|s| s.contains("not ready")),
+            "it notes why, got: {:?}",
+            v.transient_status
+        );
+    });
 }
 
 /// UXI-Project-4: the "New project" overlay creates an EMPTY project via the REAL
