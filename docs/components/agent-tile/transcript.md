@@ -1,7 +1,8 @@
 # Agent Tile — Transcript
 
 Facet of the [Agent Tile](README.md) component. Owns `UXI-AgentTile-4..8`,
-`UXI-AgentTile-23`, `UXI-AgentTile-25`, `UXI-AgentTile-26`, `UXI-AgentTile-28`.
+`UXI-AgentTile-23`, `UXI-AgentTile-25`, `UXI-AgentTile-26`, `UXI-AgentTile-28`,
+`UXI-AgentTile-34`, `UXI-AgentTile-37`.
 
 ## Description
 
@@ -494,3 +495,84 @@ usage meter, `location_row`, and `header`).
 
 **Enforcement.** `verify_harness.rs::agent_usage_paints_on_the_activity_header_line`
 paints real usage state and proves identity → activity+usage → location order.
+
+### UXI-AgentTile-34 — `V`/`v` select agent text in the worksheet transcript
+
+**Statement.** In an **idle worksheet** with the **transcript focused** (Normal
+nav), the caret moving over agent text can select it, vim-style:
+
+- **`V` selects the whole current line** immediately (line-wise visual). A repeated
+  `V` / a following `j`/`k` extends the selection line by line.
+- **`v` starts char-wise visual** — it drops an anchor at the caret; a following
+  motion (`h`/`l`/`w`/…) extends the selection character by character.
+- The existing Kakoune-style keys stay bound and additive: `x` = extend-whole-line
+  (same action as `V`), `;` = collapse, `,` = flip, `%` = select-all.
+
+The selection is the transcript editor's own anchor/head selection — the SAME
+model the drag-select band and copy-on-select (`UXI-Selection-1`) render from —
+so it paints as a highlight band while the transcript is focused, and a live
+selection is what `r` quotes (`UXI-AgentTile-35`).
+
+**Applies to.** `keybind.rs` — the default normal-map `key('V') → "extend-line"`
+binding (beside `x`). The dispatch is the shared `dispatch_normal_core` the
+worksheet transcript-nav already routes through (`agent_ui.rs::handle_claude_key`
+fall-through). Selection state + band: `editor.rs` (`extend_by_line`,
+`toggle_extend_mode`, `selection_range`, `pre_move`) and
+`transcript_view.rs` (`sel_snap`, gated on `transcript_focused`).
+
+**Why.** `V` was **unbound**, so the vim instinct for whole-line select did
+nothing, and `v` alone paints nothing until you also move — so selecting agent
+text in the worksheet read as broken. Binding `V` to an immediate whole-line
+select makes the primary gesture work and gives instant feedback.
+
+**Status.** `implemented` — the binding + selection are headless (real keymap +
+real dispatch). The exact highlight **color/contrast** ("beautiful, clearly
+visible") is a paint/human-eye judgment (harness gap #1): `AgentTheme::selection_bg`
+per theme; tune by eye if a live `V` selection is not vivid enough on a given theme.
+
+**Deviation from plan.** `V` maps to a NEW action `"select-line"` (extend-mode ON +
+`extend_by_line`), not the pre-existing `"extend-line"` (`x`) as first scoped. A
+headless test caught that plain `extend-line` does not enable extend-mode, so `V`
+then `j` COLLAPSED the selection (the vim `V j` idiom broke); `select-line` turns
+extend-mode on so a following `V`/`j`/`k` grows it. `x` keeps the plain
+extend-line. The selection **color tuning** is deferred (gap #1) — the root cause
+of "selection doesn't work" was the unbound key + `v`-needs-motion, not (only) the
+hue, so the color is left for a live-eye pass rather than a blind retune of 8
+themes.
+
+**Enforcement.** `verify_harness.rs`: `worksheet_v_line_select_feeds_r` (real
+`handle_claude_key("V")` creates a non-empty selection whose text is the whole
+agent line) and `worksheet_v_char_select_feeds_r` (`v` + 5×`l` selects exactly
+`First`). Both then press `r` and assert the selection is the quote (see
+`UXI-AgentTile-35`). NC observed RED: dropping the selection branch collapses the
+quote to the first sentence. The painted band hue is gap #1.
+
+### UXI-AgentTile-37 — The replied-to source text shows a `>` marker when not editing
+
+**Statement.** When a pending worksheet reply quotes agent text
+(`UXI-AgentTile-21`/`-35`), the **source** line(s) it quotes render with a
+beautiful blockquote marker (a `>` / left bar + italic tint) in the transcript, so
+it is obvious what a pending reply refers to. The marker shows while you are **not
+typing in the reply block** (transcript nav, or the reply's compose dropped to
+Normal) and is hidden while you actively type the reply. It is **pending-scoped**:
+it appears while the reply quotes that source and clears when the reply is
+submitted or abandoned.
+
+**Applies to.** (planned) `agent.rs` — a `reply_source_range` captured in
+`reply_quote_at_cursor`, cleared in `close_you_block` / the `u`-pop / submit;
+`transcript_view.rs` — a new snapshot input + `TranscriptSeqs` seq, and a
+frozen-line render branch that styles the source range as a blockquote when the
+marker is active.
+
+**Why.** With a reply that lands at the tail (`UXI-AgentTile-36`) but quotes text
+far up in history, there is no visual back-link from the reply to its source; the
+marker restores that.
+
+**Status.** `not implemented` — tracked as
+`docs/projects/worksheet-reply-select/002-ticket-replied-to-marker.md`. It is a
+cached-transcript render change (new seq + paint tap) and mostly a paint
+deliverable (gap #1), staged after the selection/reply behavior.
+
+**Enforcement.** (planned) `verify_harness.rs` — a paint-tap guard that the source
+range renders with the blockquote style while the reply is pending + not being
+typed, and is absent after submit/abandon; NC by disabling the render branch.

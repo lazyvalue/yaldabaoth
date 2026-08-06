@@ -1945,6 +1945,23 @@ pub(crate) fn finalize_agent_turn(editor: &mut Editor) {
 /// counts as one sentence. A blank / whitespace-only `text` yields `""` (the
 /// caller treats that as "nothing to quote"). Heuristic — exotic punctuation is
 /// out of scope.
+/// Render `text` (which may contain `\n`) as a standard Markdown blockquote:
+/// every line prefixed with `> ` (a bare `>` for an empty line, so the quotation
+/// stays contiguous). Used to seed a reply from a multi-line transcript selection
+/// (UXI-AgentTile-35).
+pub(crate) fn blockquote_lines(text: &str) -> String {
+    text.split('\n')
+        .map(|l| {
+            if l.is_empty() {
+                ">".to_string()
+            } else {
+                format!("> {l}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub(crate) fn first_n_sentences(text: &str, n: usize) -> String {
     // Lower-cased, dot-stripped abbreviation stems (matched against the
     // `[alpha.]` run ending at a candidate terminator).
@@ -4644,25 +4661,50 @@ impl AgentState {
     /// regardless, so a stale prefix never lingers.
     pub(crate) fn reply_quote_at_cursor(&mut self) -> bool {
         let count = self.keybinds.take_count().unwrap_or(1).max(1);
-        let l = self.editor.cursor().line;
-        if !self.you_block_anchor_is_legal(l) {
+        // Quote SOURCE (UXI-AgentTile-35): an ACTIVE (non-empty) transcript
+        // selection — from `V` (whole line) / `v` (char-wise) — wins over the
+        // sentence-count heuristic and is quoted verbatim as a standard
+        // `>`-per-line blockquote. With no selection, quote the first N sentences
+        // of the caret's line (UXI-AgentTile-21, unchanged).
+        let sel = self
+            .editor
+            .selection_range()
+            .filter(|&((sl, sc), (el, ec))| (sl, sc) != (el, ec));
+        let quote = if sel.is_some() {
+            let text = self.editor.selection_text().unwrap_or_default();
+            blockquote_lines(text.trim_end_matches('\n'))
+        } else {
+            let l = self.editor.cursor().line;
+            let line = self.editor.document().line_text(l);
+            let q = first_n_sentences(line.trim_end_matches('\n'), count);
+            if q.is_empty() {
+                String::new()
+            } else {
+                format!("> {q}")
+            }
+        };
+        if quote.trim().is_empty() {
             return false;
         }
-        let line = self.editor.document().line_text(l);
-        let quote = first_n_sentences(line.trim_end_matches('\n'), count);
-        if quote.is_empty() {
-            return false;
+        // UXI-AgentTile-36: the quote may come from ANY agent turn, not just the
+        // latest — the reply is NOT anchored back in old history. Collapsing the
+        // selection leaves the caret at the selection head; `open_you_block_at_cursor`
+        // coerces a caret that isn't in the latest turn to the tail (anchor None),
+        // and the freeze path sends it as the current turn. So an older-turn reply
+        // lands in the current turn by construction.
+        if sel.is_some() {
+            self.editor.collapse_selection();
         }
-        // Open like `o` (establishes the legal anchor + parks any other active
-        // block), then REPLACE the compose draft with the seed. Replacing after
-        // the open discards only a draft parked AT THIS slot (a reply reseeds
-        // fresh by intent); every other parked block is preserved by the open.
+        // Open like `o` (establishes the anchor + parks any other active block),
+        // then REPLACE the compose draft with the seed. Replacing after the open
+        // discards only a draft parked AT THIS slot (a reply reseeds fresh by
+        // intent); every other parked block is preserved by the open.
         self.open_you_block_at_cursor();
         // Seed as a COMMITTED baseline (no undo history) so `u` can back the block
         // out (UXI-AgentTile-24): an untouched seeded reply has nothing to undo,
         // so the first `u` pops the block rather than erasing the quotation.
         self.input_surface =
-            InputSurface::with_committed_draft(InputModeKind::Worksheet, &format!("re\n> {quote}\n"));
+            InputSurface::with_committed_draft(InputModeKind::Worksheet, &format!("re\n{quote}\n"));
         self.input_surface.compose_mut().mode = EditMode::Insert;
         self.focus = AgentFocus::Compose;
         self.pending_reveal_cursor = true;

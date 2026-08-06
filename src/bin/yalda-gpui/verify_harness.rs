@@ -11625,6 +11625,291 @@ fn worksheet_r_seeds_reply_quote_from_agent_line(cx: &mut TestAppContext) {
     });
 }
 
+/// UXI-AgentTile-34 + UXI-AgentTile-35: `V` selects the whole agent line
+/// (line-wise visual) through the REAL keymap, and a live selection is what `r`
+/// quotes — the sentence-count heuristic is ignored. Drives the real
+/// `handle_claude_key` dispatch (V and r) end-to-end.
+///
+/// Negative control (observed RED): drop the `sel.is_some()` branch in
+/// `reply_quote_at_cursor` (always take the sentence path) → the quote collapses
+/// to `re\n> First sentence.\n` and the whole-line assert fires.
+#[gpui::test]
+fn worksheet_v_line_select_feeds_r(cx: &mut TestAppContext) {
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::session_proto::Notification as ServerNotification;
+    let (view, vcx, _id, _session) = boot_with_transcript(cx); // worksheet nav
+    let ev = |e: ReplyEvent| ServerNotification::ReplyEvent {
+        session_id: "S1".into(),
+        event: e,
+    };
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                ev(ReplyEvent::Chunk(
+                    "First sentence. Second sentence. Third sentence.\n".into(),
+                )),
+                ev(ReplyEvent::TurnEnded { count: 1 }),
+            ],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        let (s, _e) = c.latest_agent_turn_range().unwrap_or((0, 0));
+        c.editor.cursor_mut().line = s;
+        c.editor.cursor_mut().col = 0;
+    });
+    // `V` selects the WHOLE current line.
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("V"), w, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        let sel = c
+            .editor
+            .selection_range()
+            .filter(|&((sl, sc), (el, ec))| (sl, sc) != (el, ec));
+        assert!(sel.is_some(), "V created a non-empty selection");
+        assert_eq!(
+            c.editor.selection_text().unwrap_or_default().trim_end(),
+            "First sentence. Second sentence. Third sentence.",
+            "V selected the entire agent line"
+        );
+    });
+    // `r` quotes the SELECTION, not just the first sentence.
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("r"), w, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert!(c.you_block_open, "r opened a reply block");
+        assert_eq!(
+            c.input_surface.compose().text(),
+            "re\n> First sentence. Second sentence. Third sentence.\n",
+            "the whole-line selection is the quote; sentence-count ignored"
+        );
+    });
+}
+
+/// UXI-AgentTile-34 + UXI-AgentTile-35: `v` (char-wise visual) + motions selects
+/// PART of an agent line, and `r` quotes exactly that partial selection.
+///
+/// Negative control (observed RED): same as above — dropping the selection branch
+/// makes `r` quote the first whole sentence, not the 5-char `First`.
+#[gpui::test]
+fn worksheet_v_char_select_feeds_r(cx: &mut TestAppContext) {
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::session_proto::Notification as ServerNotification;
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    let ev = |e: ReplyEvent| ServerNotification::ReplyEvent {
+        session_id: "S1".into(),
+        event: e,
+    };
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                ev(ReplyEvent::Chunk("First sentence here.\n".into())),
+                ev(ReplyEvent::TurnEnded { count: 1 }),
+            ],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        let (s, _e) = c.latest_agent_turn_range().unwrap_or((0, 0));
+        c.editor.cursor_mut().line = s;
+        c.editor.cursor_mut().col = 0;
+    });
+    // `v` starts char-wise visual; five `l` extend the head to col 5 ⇒ "First".
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("v"), w, cx));
+    for _ in 0..5 {
+        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("l"), w, cx));
+    }
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert_eq!(
+            c.editor.selection_text().unwrap_or_default(),
+            "First",
+            "v + 5×l selected the first five chars"
+        );
+    });
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("r"), w, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert_eq!(
+            c.input_surface.compose().text(),
+            "re\n> First\n",
+            "the partial char-wise selection is quoted verbatim"
+        );
+    });
+}
+
+/// UXI-AgentTile-36: a reply quoting an OLDER agent turn is allowed, and it lands
+/// in the CURRENT turn at the tail (anchor `None`), never mid-history. Tags line 0
+/// as an old `Llm(1)` and the rest as the latest `Llm(2)` exactly like
+/// `worksheet_stale_anchor_is_rejected` (the synthetic stream can't advance the
+/// turn number). Selects ONLY the old line so the caret rests on it.
+///
+/// Negative control (observed RED): restore the
+/// `if !you_block_anchor_is_legal(l) { return false }` guard at the top of
+/// `reply_quote_at_cursor` → `r` no-ops over the older line (`you_block_open`
+/// stays false).
+#[gpui::test]
+fn worksheet_r_replies_across_turn_boundary(cx: &mut TestAppContext) {
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::session_proto::Notification as ServerNotification;
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    let ev = |e: ReplyEvent| ServerNotification::ReplyEvent {
+        session_id: "S1".into(),
+        event: e,
+    };
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(vec![ev(ReplyEvent::Chunk("aa\nbb\ncc\ndd\n".into()))], cx);
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        let lc = c.editor.document().line_count();
+        // line 0 = OLD turn Llm(1); every other content line = latest Llm(2).
+        let a0 = c.editor.anchor_for_line(0);
+        c.editor
+            .metadata_mut::<crate::TurnId>()
+            .insert(a0, crate::TurnId::Llm(1));
+        for l in 1..lc {
+            let a = c.editor.anchor_for_line(l);
+            c.editor
+                .metadata_mut::<crate::TurnId>()
+                .insert(a, crate::TurnId::Llm(2));
+        }
+        assert!(
+            !c.you_block_anchor_is_legal(0),
+            "line 0 is an OLD turn — the boundary this test crosses"
+        );
+        c.editor.cursor_mut().line = 0;
+        c.editor.cursor_mut().col = 0;
+    });
+    // `V` selects the whole OLD line; `r` replies across the boundary.
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("V"), w, cx));
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("r"), w, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert!(
+            c.you_block_open,
+            "r opened a reply over the OLDER turn (boundary lifted)"
+        );
+        assert_eq!(
+            c.input_surface.compose().text(),
+            "re\n> aa\n",
+            "the older line's text is the quote"
+        );
+        assert_eq!(
+            c.effective_you_block_anchor(),
+            None,
+            "the reply anchors at the TAIL (current turn), never mid-history"
+        );
+    });
+}
+
+/// UXI-AgentTile-34: `V` turns on extend-mode, so a following `j` GROWS the
+/// selection into the next line instead of collapsing it (the vim `V j` idiom).
+///
+/// Negative control (observed RED): bind `V` to plain `"extend-line"` (no
+/// `set_extend_mode(true)`) → `j` after `V` collapses the selection (end line
+/// stays 0 / selection empty).
+#[gpui::test]
+fn worksheet_v_then_j_extends_selection(cx: &mut TestAppContext) {
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::session_proto::Notification as ServerNotification;
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    let ev = |e: ReplyEvent| ServerNotification::ReplyEvent {
+        session_id: "S1".into(),
+        event: e,
+    };
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                ev(ReplyEvent::Chunk("one\ntwo\nthree\n".into())),
+                ev(ReplyEvent::TurnEnded { count: 1 }),
+            ],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        let (s, _e) = c.latest_agent_turn_range().unwrap_or((0, 0));
+        c.editor.cursor_mut().line = s;
+        c.editor.cursor_mut().col = 0;
+    });
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("V"), w, cx));
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("j"), w, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        let ((sl, _), (el, _)) = c
+            .editor
+            .selection_range()
+            .filter(|&((a, b), (x, y))| (a, b) != (x, y))
+            .expect("V then j keeps a non-empty selection");
+        let base = c.latest_agent_turn_range().unwrap_or((0, 0)).0;
+        assert_eq!(sl, base, "selection still anchored at the first line");
+        assert_eq!(el, base + 1, "j grew the selection into the next line");
+    });
+}
+
+/// UXI-AgentTile-35: a multi-line selection (all in the latest turn) is quoted
+/// `>`-per-line through the real `V`+`V`+`r` path.
+#[gpui::test]
+fn worksheet_multiline_selection_quotes_per_line(cx: &mut TestAppContext) {
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::session_proto::Notification as ServerNotification;
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    let ev = |e: ReplyEvent| ServerNotification::ReplyEvent {
+        session_id: "S1".into(),
+        event: e,
+    };
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                ev(ReplyEvent::Chunk("alpha\nbeta\ngamma\n".into())),
+                ev(ReplyEvent::TurnEnded { count: 1 }),
+            ],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        let (s, _e) = c.latest_agent_turn_range().unwrap_or((0, 0));
+        c.editor.cursor_mut().line = s;
+        c.editor.cursor_mut().col = 0;
+    });
+    // `V` `V` selects the first two lines line-wise.
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("V"), w, cx));
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("V"), w, cx));
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert_eq!(
+            c.editor.selection_text().unwrap_or_default(),
+            "alpha\nbeta",
+            "V V selected two whole lines"
+        );
+    });
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("r"), w, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert_eq!(
+            c.input_surface.compose().text(),
+            "re\n> alpha\n> beta\n",
+            "multi-line selection quoted `>`-per-line"
+        );
+    });
+}
+
 /// UXI-AgentTile-24: `u` in an open worksheet You-block backs the reply out,
 /// undo-style. Common flow `r → Esc → u` pops the block on the FIRST `u` (the
 /// seeded quote is a committed baseline with no undo history). The layered case

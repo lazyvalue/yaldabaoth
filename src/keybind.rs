@@ -296,6 +296,10 @@ impl Default for KeybindManager {
         single.insert(key('d'), "delete-selection".into());
         single.insert(key('c'), "change-selection".into());
         single.insert(key('x'), "extend-line".into());
+        // Vim-muscle: `V` selects the whole current line immediately AND turns on
+        // extend-mode, so a following `V` / `j` / `k` grows the selection instead
+        // of collapsing it (UXI-AgentTile-34). `x` keeps the plain extend-line.
+        single.insert(key('V'), "select-line".into());
         single.insert(key(';'), "collapse-selection".into());
         single.insert(key(','), "flip-selection".into());
         single.insert(key('%'), "select-all".into());

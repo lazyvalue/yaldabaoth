@@ -35,6 +35,17 @@ fn nightfox_jump_panel_colors_are_art_directed() {
 /// Counts + joins the first N sentences; a decimal point and a common
 /// abbreviation do NOT split; a run with no terminator is one sentence; blank
 /// yields "" (the caller's "nothing to quote" signal).
+/// UXI-AgentTile-35: a multi-line selection is quoted as a standard Markdown
+/// blockquote — `> ` on every line, a bare `>` for an empty line.
+#[test]
+fn blockquote_lines_prefixes_every_line() {
+    assert_eq!(blockquote_lines("solo"), "> solo");
+    assert_eq!(blockquote_lines("aa\nbb\ncc"), "> aa\n> bb\n> cc");
+    // Empty interior line stays contiguous with a bare `>`.
+    assert_eq!(blockquote_lines("aa\n\nbb"), "> aa\n>\n> bb");
+    assert_eq!(blockquote_lines(""), ">");
+}
+
 #[test]
 fn first_n_sentences_splits_and_respects_abbrevs() {
     // Count + single-space join.
