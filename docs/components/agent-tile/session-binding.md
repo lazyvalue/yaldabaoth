@@ -229,17 +229,23 @@ Layout:
 - **ON THIS SESSION** (right column) — the session's current tags, each with a
   trailing `✕`. Activating a row removes that tag.
 
-Interaction:
+Interaction is **modal**, consistent with the rest of the app's editors:
 
-- **Keyboard.** Typing edits the filter / new-tag text and focuses ADD; `↑↓` move
-  the highlight within the focused column; `tab` / `←` / `→` switch columns;
-  `enter` toggles the highlighted row (add from ADD, remove from ON THIS SESSION);
-  `backspace`/`delete` in the ON-THIS-SESSION column removes the highlight;
-  `esc` (or a click on the backdrop) closes.
+- **Normal mode** (on open) — vim navigation: `j`/`k` (or `↑↓`) move within the
+  focused column; `h`/`l` (or `←`/`→`/`tab`) switch columns; `enter` toggles the
+  highlighted row (add from ADD, remove from ON THIS SESSION); `x`/`d`/`delete`
+  remove in the Current column; `i` (or `a`/`/`) enters Insert; `esc`/`q` (or a
+  click on the backdrop) closes.
+- **Insert mode** — typing edits the filter / new-tag text (and focuses ADD);
+  `enter` adds the highlighted ADD row; `esc` returns to Normal.
 - **Mouse.** Clicking any row toggles it; hovering moves the highlight and focus
-  to that column.
+  to that column — independent of mode.
 - Adding an already-present tag is a no-op (it's a set); after any add the filter
   clears so the just-added tag hops to the right column.
+
+The palette is **neutral**: selection is the overlay's gray wash and the cool
+`agent_tint`/`jump_subheader` accents — never `warm_accent` (the forbidden
+gold/brown).
 
 - **A tag is per session, keyed by the server sid**, persisted in the id-keyed
   `session_tags.json` sidecar (`UXI-JumpPanel-20`). A session with **no sid yet**
@@ -265,9 +271,11 @@ in-tile-prompt path are **removed** (superseded by this dialog).
 
 **Enforcement.** `verify_harness.rs`:
 `tag_editor_keyboard_adds_and_removes` (opens via the REAL
-`dispatch_menu_command("claude-tag")`, then `simulate_keystrokes` through the REAL
-capture handler: a typed novel tag + `enter` creates+adds it, `enter` again adds an
-existing known tag, `tab`+`enter` removes the first current tag, `esc` closes),
+`dispatch_menu_command("claude-tag")` in Normal mode, then `simulate_keystrokes`
+through the REAL capture handler: `i` enters Insert, a typed novel tag + `enter`
+creates+adds it, `enter` again adds an existing known tag, `esc` returns to Normal
+without closing, vim `l` focuses the Current column, `x` removes the highlight, and
+`esc` in Normal closes; NC observed RED by breaking `i`→Insert),
 `tag_editor_mouse_click_toggles` (clicks the painted `tag-editor-left-0` /
 `tag-editor-current-0` rows to add then remove, through the occluding card), and
 `tag_editor_requires_a_sid` (a sid-less session opens no dialog and sets the note).

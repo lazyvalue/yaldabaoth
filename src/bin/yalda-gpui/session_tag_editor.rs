@@ -22,8 +22,16 @@ pub(crate) enum TagEditorColumn {
     Current,
 }
 
+/// Modal editing, consistent with the rest of the app: **Normal** navigates with
+/// vim keys, **Insert** types into the filter/new-tag field.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TagEditorMode {
+    Normal,
+    Insert,
+}
+
 /// Overlay state: the target session, the typed filter/new-tag text, the focused
-/// column and the highlighted row within it.
+/// column + highlighted row, and the modal editing mode.
 pub(crate) struct TagEditorOverlay {
     #[allow(dead_code)] // reserved: re-resolve the tile if focus moves while open
     pub(crate) session: SessionId,
@@ -31,6 +39,7 @@ pub(crate) struct TagEditorOverlay {
     pub(crate) input: String,
     pub(crate) column: TagEditorColumn,
     pub(crate) selected: usize,
+    pub(crate) mode: TagEditorMode,
 }
 
 /// A row in the ADD (left) column: an existing known tag, or the synthetic
@@ -142,6 +151,7 @@ impl YaldaGpuiView {
             input: String::new(),
             column: TagEditorColumn::Available,
             selected: 0,
+            mode: TagEditorMode::Normal,
         }));
         cx.notify();
     }
@@ -202,8 +212,8 @@ impl YaldaGpuiView {
         cx: &mut Context<Self>,
     ) {
         let press = keystroke_to_keypress(&ev.keystroke);
-        // Length of the focused column, as a value (drop the borrow before mut).
-        let (col, len) = {
+        // Mode + focused-column length, as values (drop the borrow before mut).
+        let (mode, col, len) = {
             let Some(ov) = self.tag_editor_ref() else {
                 return;
             };
@@ -212,66 +222,104 @@ impl YaldaGpuiView {
                 TagEditorColumn::Available => m.left.len(),
                 TagEditorColumn::Current => m.current.len(),
             };
-            (ov.column, len)
+            (ov.mode, ov.column, len)
         };
-        match press.key {
-            Key::Esc => {
-                self.clear_overlay();
-                cx.notify();
+        let unmodified = !press.modifiers.contains(KMods::PLATFORM)
+            && !press.modifiers.contains(KMods::CONTROL)
+            && !press.modifiers.contains(KMods::ALT);
+        let move_sel = |this: &mut Self, delta: i32, cx: &mut Context<Self>| {
+            if let Some(o) = this.tag_editor_mut()
+                && len > 0
+            {
+                o.selected = ((o.selected as i32 + delta).rem_euclid(len as i32)) as usize;
             }
-            Key::Enter => self.activate_tag_editor(cx),
-            Key::Tab | Key::BackTab | Key::Left | Key::Right => {
-                if let Some(o) = self.tag_editor_mut() {
-                    o.column = match o.column {
+            cx.notify();
+        };
+        let focus_col = |this: &mut Self, c: TagEditorColumn, cx: &mut Context<Self>| {
+            if let Some(o) = this.tag_editor_mut() {
+                o.column = c;
+                o.selected = 0;
+            }
+            cx.notify();
+        };
+
+        match mode {
+            // ── INSERT: type into the filter/new-tag field. ──────────────────
+            TagEditorMode::Insert => match press.key {
+                Key::Esc => {
+                    if let Some(o) = self.tag_editor_mut() {
+                        o.mode = TagEditorMode::Normal;
+                    }
+                    cx.notify();
+                }
+                Key::Enter => self.activate_tag_editor(cx),
+                Key::Down => move_sel(self, 1, cx),
+                Key::Up => move_sel(self, -1, cx),
+                Key::Backspace => {
+                    if let Some(o) = self.tag_editor_mut() {
+                        o.input.pop();
+                        o.selected = 0;
+                    }
+                    cx.notify();
+                }
+                Key::Char(c) if unmodified => {
+                    if let Some(o) = self.tag_editor_mut() {
+                        o.input.push(c);
+                        o.column = TagEditorColumn::Available;
+                        o.selected = 0;
+                    }
+                    cx.notify();
+                }
+                _ => {}
+            },
+            // ── NORMAL: vim navigation across the two columns. ───────────────
+            TagEditorMode::Normal => match press.key {
+                Key::Esc => {
+                    self.clear_overlay();
+                    cx.notify();
+                }
+                Key::Char('q') if unmodified => {
+                    self.clear_overlay();
+                    cx.notify();
+                }
+                // Enter Insert to filter/create.
+                Key::Char('i') | Key::Char('a') | Key::Char('/') if unmodified => {
+                    if let Some(o) = self.tag_editor_mut() {
+                        o.mode = TagEditorMode::Insert;
+                        o.column = TagEditorColumn::Available;
+                    }
+                    cx.notify();
+                }
+                // j/k (+ arrows) move within the focused column.
+                Key::Char('j') if unmodified => move_sel(self, 1, cx),
+                Key::Down => move_sel(self, 1, cx),
+                Key::Char('k') if unmodified => move_sel(self, -1, cx),
+                Key::Up => move_sel(self, -1, cx),
+                // h/l (+ arrows / tab) switch columns.
+                Key::Char('h') | Key::Left if unmodified => {
+                    focus_col(self, TagEditorColumn::Available, cx)
+                }
+                Key::Left => focus_col(self, TagEditorColumn::Available, cx),
+                Key::Char('l') | Key::Right if unmodified => {
+                    focus_col(self, TagEditorColumn::Current, cx)
+                }
+                Key::Right => focus_col(self, TagEditorColumn::Current, cx),
+                Key::Tab | Key::BackTab => {
+                    let next = match col {
                         TagEditorColumn::Available => TagEditorColumn::Current,
                         TagEditorColumn::Current => TagEditorColumn::Available,
                     };
-                    o.selected = 0;
+                    focus_col(self, next, cx);
                 }
-                cx.notify();
-            }
-            Key::Down => {
-                if let Some(o) = self.tag_editor_mut()
-                    && len > 0
+                // Enter toggles; x/d/Delete remove in the Current column.
+                Key::Enter => self.activate_tag_editor(cx),
+                Key::Char('x') | Key::Char('d') | Key::Delete
+                    if col == TagEditorColumn::Current =>
                 {
-                    o.selected = (o.selected + 1) % len;
+                    self.activate_tag_editor(cx)
                 }
-                cx.notify();
-            }
-            Key::Up => {
-                if let Some(o) = self.tag_editor_mut()
-                    && len > 0
-                {
-                    o.selected = (o.selected + len - 1) % len;
-                }
-                cx.notify();
-            }
-            // In the Current column, Backspace/Delete removes the highlighted tag;
-            // in the Available column it edits the filter text.
-            Key::Backspace if col == TagEditorColumn::Current => self.activate_tag_editor(cx),
-            Key::Delete if col == TagEditorColumn::Current => self.activate_tag_editor(cx),
-            Key::Backspace => {
-                if let Some(o) = self.tag_editor_mut() {
-                    o.input.pop();
-                    o.selected = 0;
-                }
-                cx.notify();
-            }
-            // Typing always edits the filter/new-tag text and focuses the ADD
-            // column (unmodified chars only — a Cmd/Ctrl/Alt chord dies here).
-            Key::Char(c)
-                if !press.modifiers.contains(KMods::PLATFORM)
-                    && !press.modifiers.contains(KMods::CONTROL)
-                    && !press.modifiers.contains(KMods::ALT) =>
-            {
-                if let Some(o) = self.tag_editor_mut() {
-                    o.input.push(c);
-                    o.column = TagEditorColumn::Available;
-                    o.selected = 0;
-                }
-                cx.notify();
-            }
-            _ => {}
+                _ => {}
+            },
         }
     }
 
@@ -279,7 +327,8 @@ impl YaldaGpuiView {
         let st = DetailStyle {
             fg: self.editor_fg(),
             dim: nc(self.theme.agent.dim),
-            accent: nc(self.theme.agent.warm_accent),
+            // Never `warm_accent` (the forbidden gold/brown) — the cool agent tint.
+            accent: nc(self.theme.agent.agent_tint),
             err: nc(self.theme.agent.jump_header),
             mono: self.code_font.clone(),
             prose: self.body_font.clone(),
@@ -293,9 +342,8 @@ impl YaldaGpuiView {
         let input_fg: Hsla = nc(ov_theme.input);
         let electric = nc(self.theme.agent.jump_subheader);
         let ready = nc(self.theme.agent.tool_completed);
-        let accent = nc(self.theme.agent.frozen_bar);
-        let mut sel_bg = accent;
-        sel_bg.a = 0.15;
+        // Selection is the overlay's NEUTRAL gray wash — no warm/brown accent.
+        let sel_bg = nc(jump_selection_color(ov_theme));
         let divider = {
             let mut c = st.dim;
             c.a = 0.4;
@@ -309,6 +357,8 @@ impl YaldaGpuiView {
         let focus = ov.column;
         let selected = ov.selected;
         let input = ov.input.clone();
+        let mode = ov.mode;
+        let inserting = mode == TagEditorMode::Insert;
 
         // ── Header + type-to-filter input.
         let header = div()
@@ -318,13 +368,42 @@ impl YaldaGpuiView {
             .font_weight(FontWeight::BOLD)
             .text_size(px(11.0))
             .child(SharedString::new_static("TAG SESSION"));
+        // Modal input, consistent with the app's editors: a `NORMAL`/`INSERT`
+        // badge, and the block caret only shows while inserting.
         let input_row = div()
             .px_4()
             .py_2()
-            .text_color(input_fg)
-            .text_size(px(14.0))
-            .font_family(st.mono.clone())
-            .child(SharedString::from(format!("{input}\u{2588}")));
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(if inserting { ready } else { st.dim })
+                    .font_family(st.mono.clone())
+                    .text_size(px(10.0))
+                    .child(SharedString::new_static(if inserting {
+                        "INSERT"
+                    } else {
+                        "NORMAL"
+                    })),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_color(input_fg)
+                    .text_size(px(14.0))
+                    .font_family(st.mono.clone())
+                    .child(SharedString::from(if inserting {
+                        format!("{input}\u{2588}")
+                    } else if input.is_empty() {
+                        "press i to type".to_string()
+                    } else {
+                        input.clone()
+                    })),
+            );
 
         // ── Column headers.
         let col_head = |text: &'static str, active: bool| {
@@ -383,7 +462,7 @@ impl YaldaGpuiView {
                         .flex_1()
                         .min_w_0()
                         .text_size(px(13.0))
-                        .text_color(if is_sel { accent } else { st.fg })
+                        .text_color(st.fg)
                         .child(SharedString::from(if is_new {
                             format!("create \u{201c}{name}\u{201d}")
                         } else {
@@ -445,7 +524,7 @@ impl YaldaGpuiView {
                         .flex_1()
                         .min_w_0()
                         .text_size(px(13.0))
-                        .text_color(if is_sel { accent } else { st.fg })
+                        .text_color(st.fg)
                         .child(SharedString::from(format!("🏷 {tag}"))),
                 )
                 .child(
@@ -488,9 +567,11 @@ impl YaldaGpuiView {
             .py_1()
             .text_color(label_fg)
             .text_size(px(11.0))
-            .child(SharedString::new_static(
-                "type:filter/create  tab:switch  ↑↓:move  enter:toggle  esc:done",
-            ));
+            .child(SharedString::new_static(if inserting {
+                "type to filter/create   enter:add   esc:normal"
+            } else {
+                "i:type   hjkl:move   enter:toggle   x:remove   esc:close"
+            }));
 
         // Click-away backdrop (closes) under an occluding card.
         let backdrop = div()

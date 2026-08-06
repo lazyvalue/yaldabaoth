@@ -7373,9 +7373,10 @@ fn jump_reorder_tag_folders_persists(cx: &mut TestAppContext) {
     });
 }
 
-/// UXI-AgentTile-33: the tag-editor dialog adds a typed/new tag, adds an existing
-/// known tag from the ADD column, and removes a current tag — fully by keyboard,
-/// keyed by the session's sid. Drives the REAL menu open + capture key handler.
+/// UXI-AgentTile-33: the modal tag-editor dialog. `i` enters Insert to
+/// filter/create; a typed novel tag + Enter adds it; Enter again adds an existing
+/// known tag; `esc` returns to Normal; vim `l` moves to the Current column and `x`
+/// removes. Drives the REAL menu open + capture key handler.
 #[gpui::test]
 fn tag_editor_keyboard_adds_and_removes(cx: &mut TestAppContext) {
     cx.update(crate::register_keymap);
@@ -7388,20 +7389,27 @@ fn tag_editor_keyboard_adds_and_removes(cx: &mut TestAppContext) {
 
     view.update(vcx, |v, cx| v.dispatch_menu_command("claude-tag", cx));
     vcx.run_until_parked();
-    view.read_with(vcx, |v, _| assert!(v.overlay_is_tag_editor(), "the dialog opens"));
+    view.read_with(vcx, |v, _| {
+        assert!(v.overlay_is_tag_editor(), "the dialog opens");
+        assert_eq!(
+            v.tag_editor_ref().unwrap().mode,
+            crate::TagEditorMode::Normal,
+            "opens in Normal mode"
+        );
+    });
 
-    // Type a NEW tag + Enter → the "create" row adds it.
-    vcx.simulate_keystrokes("f r o n t e n d enter");
+    // `i` → Insert; type a NEW tag; Enter adds via the "create" row.
+    vcx.simulate_keystrokes("i f r o n t e n d enter");
     vcx.run_until_parked();
     view.read_with(vcx, |v, _| {
         assert_eq!(
             v.session_tags.get("SID").map(|t| t.as_slice()),
             Some(&["frontend".to_string()][..]),
-            "typing a novel tag + enter creates and adds it"
+            "i + type + enter creates and adds the novel tag"
         );
     });
 
-    // The ADD column now offers the existing "backend"; Enter adds it.
+    // Still Insert; the ADD column now offers the existing "backend"; Enter adds it.
     vcx.simulate_keystrokes("enter");
     vcx.run_until_parked();
     view.read_with(vcx, |v, _| {
@@ -7410,20 +7418,30 @@ fn tag_editor_keyboard_adds_and_removes(cx: &mut TestAppContext) {
         assert_eq!(got, vec!["backend".to_string(), "frontend".to_string()], "an existing tag adds");
     });
 
-    // Switch to the Current column and remove the highlighted (first) tag.
-    vcx.simulate_keystrokes("tab enter");
+    // `esc` returns to Normal (does NOT close); vim `l` focuses the Current column.
+    vcx.simulate_keystrokes("escape l");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        let ov = v.tag_editor_ref().expect("still open after esc-to-normal");
+        assert_eq!(ov.mode, crate::TagEditorMode::Normal, "esc leaves Insert, not the dialog");
+        assert_eq!(ov.column, crate::TagEditorColumn::Current, "l moves to the Current column");
+    });
+
+    // `x` removes the highlighted current tag (backend, sorted first).
+    vcx.simulate_keystrokes("x");
     vcx.run_until_parked();
     view.read_with(vcx, |v, _| {
         assert_eq!(
             v.session_tags.get("SID").map(|t| t.as_slice()),
             Some(&["frontend".to_string()][..]),
-            "tab into Current + enter removes the first current tag (backend)"
+            "x removes the highlighted current tag (backend)"
         );
     });
 
+    // `esc` in Normal closes.
     vcx.simulate_keystrokes("escape");
     vcx.run_until_parked();
-    view.read_with(vcx, |v, _| assert!(!v.overlay_is_tag_editor(), "esc closes the dialog"));
+    view.read_with(vcx, |v, _| assert!(!v.overlay_is_tag_editor(), "esc in Normal closes the dialog"));
 }
 
 /// UXI-AgentTile-33: clicking a row in either column toggles that tag (mouse path,
