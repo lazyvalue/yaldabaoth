@@ -336,7 +336,9 @@ impl YaldaGpuiView {
             pt: 13.0,
         };
         let ov_theme = &self.theme.overlay;
-        let popup_bg: Hsla = nc(ov_theme.bg);
+        // The standard elevated surface shared by the command menu, the jump
+        // panel, and the Doom console (UXI-JumpPanel-11) — not the raw overlay bg.
+        let popup_bg: Hsla = menu_panel_bg(self.editor_bg());
         let popup_border: Hsla = nc(ov_theme.border);
         let label_fg: Hsla = nc(ov_theme.label);
         let input_fg: Hsla = nc(ov_theme.input);
