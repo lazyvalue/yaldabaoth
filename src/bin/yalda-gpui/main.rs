@@ -8146,6 +8146,12 @@ pub(crate) struct DocRenderTap {
     /// from `selection` (doc-view, block-relative) because transcript blocks key
     /// selection by RAW document line via `RenderCtx::block_hits`.
     pub block_selection: Vec<(usize, usize, usize)>,
+    /// bug-0030: `(raw_line, char_start, char_end)` for parsed-BLOCK content
+    /// (transcript bullet lists + table cells) painted with a selection QUAD in
+    /// the even-split band path (`register_block_hits_on_paint`). Distinct from
+    /// `block_selection` (the code-block run-bg path) so a guard can prove the
+    /// band highlight — not just the hit band — actually painted.
+    pub band_selection: Vec<(usize, usize, usize)>,
     /// The block that drew the left cursor bar, if any.
     pub cursor_bar_block: Option<usize>,
 }

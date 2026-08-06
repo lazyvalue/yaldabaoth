@@ -148,10 +148,10 @@ retained only for tables. A companion correctness fix pairs `FlatItem::Block`s
 against **parsed-only** ranges (`resolved_blocks` filtered), so a detected-but-
 unparsed range above a code block can't shift its `raw_base`.
 
-**Bounds.** Tables (the other `FlatItem::Block`) still use the even-split band path
-and paint no in-cell highlight yet — not reported, tracked as follow-up. Nested code
-blocks inside a blockquote/list (`block_hits: None` in the recursion) are also out
-of scope.
+**Bounds.** Tables (the other `FlatItem::Block`) keep the even-split band path;
+their in-cell highlight is now painted there — see **UXI-Selection-4** (bug-0030).
+Nested code blocks inside a blockquote/list (`block_hits: None` in the recursion)
+are still out of scope.
 
 **Status.** `implemented` — headless on the REAL paint path.
 
@@ -164,3 +164,46 @@ and that release copies the code. **Two negative controls, each observed RED:** 
 `block_hits: None` at the block arm ⇒ the fence lines reappear in the bands; (b)
 disable `apply_selection_bg_to_runs` ⇒ the highlight tap is empty ("no selection
 highlight was painted").
+
+### UXI-Selection-4 — Selecting inside a parsed table cell is visible
+
+**Statement.** A mouse drag inside a markdown **table** in the agent transcript MUST
+paint the selection **highlight** on the selected span, exactly like prose and code.
+Selecting a cell is not "model-only": the user sees the highlight, and it lands where
+the drag selects.
+
+**Why this is load-bearing (bug-0030; the table face of the same family as
+bug-0017).** A table renders as a single `FlatItem::Block`, and — unlike a code
+block, which took the painting `block_hits` path — a table stayed on the even-split
+band path (`register_block_hits_on_paint`). That path registered per-cell hit bands
+(so the model selected + the clipboard copied) but painted **no** highlight: the
+block's `RenderCtx` has `doc_selection: None` and the band wrapper drew no selection
+background. The user saw nothing move — the exact "model selects, screen shows
+nothing" defect bug-0017 fixed for code, one block type over.
+
+**Mechanism of the guarantee.** `register_block_hits_on_paint` receives the active
+`selection` + `sel_bg`. At paint, for each cell band it already has, it projects the
+selection onto the cell's raw line, intersects with the cell's char span, and paints
+a highlight **quad** over `[x(start) .. x(end)] × band` using the SAME uniform
+monospace-width model `hit_test_tokens` uses (`col = start_char + round((x-left)/w *
+count)`). Because the highlight and the hit test share one geometry, the painted
+highlight lands exactly where the drag selects — consistent by construction, immune
+to the block's padding. The quad is painted before the inner content (behind the
+glyphs). Bullet lists are NOT `FlatItem::Block`s (they render as prose
+`FlatItem::Line`s and already highlight via the prose path), so they are unaffected.
+
+**Bounds.** Doc-view (rendered `.md`) list-item / table-cell selection paint is a
+latent sibling gap (`block_inner` recursion carries `doc_selection: None`) — not the
+reported transcript case, out of scope here.
+
+**Status.** `implemented` — headless on the REAL paint path.
+
+**Enforcement.** `verify_harness.rs::transcript_block_table_selection_is_painted`:
+freezes a markdown table, focuses the transcript, drives the REAL
+`transcript_mouse_down`/`_move` across the email cell, and asserts (via the paint tap
+`DocRenderTap.band_selection`) that the highlight PAINTED on the data row with a real,
+cell-bounded span (chars 10..21, so a whole-row smear would fail), and that release
+copies `scott@x.com`. **Negative control (observed RED):** pass `None` for the band
+call's `selection` ⇒ `band_selection` empty ⇒ "no selection highlight was painted over
+the table cell." Hit registration is untouched by that revert, so the guard tests the
+PAINT, not the already-working copy.

@@ -905,14 +905,29 @@ pub(crate) fn register_block_hits_on_paint(
     inner: AnyElement,
     sink: std::rc::Rc<RefCell<Vec<TokenHit>>>,
     rows: Vec<(usize, Vec<(usize, usize)>)>,
+    selection: Option<((usize, usize), (usize, usize))>,
+    sel_bg: Hsla,
 ) -> AnyElement {
-    RegisterBlockHitsOnPaint { inner, sink, rows }.into_any_element()
+    RegisterBlockHitsOnPaint {
+        inner,
+        sink,
+        rows,
+        selection,
+        sel_bg,
+    }
+    .into_any_element()
 }
 
 struct RegisterBlockHitsOnPaint {
     inner: AnyElement,
     sink: std::rc::Rc<RefCell<Vec<TokenHit>>>,
     rows: Vec<(usize, Vec<(usize, usize)>)>,
+    /// bug-0030: active transcript selection in raw `(line, col)` doc coords
+    /// (focused only) so this even-split band path can PAINT the highlight — not
+    /// just register hits. `None` when nothing is selected / transcript unfocused.
+    selection: Option<((usize, usize), (usize, usize))>,
+    /// Selection background color for the painted quad.
+    sel_bg: Hsla,
 }
 
 impl IntoElement for RegisterBlockHitsOnPaint {
@@ -989,6 +1004,37 @@ impl Element for RegisterBlockHitsOnPaint {
                             size: gpui::size(px(col_w), px(band_h)),
                         },
                     });
+                    // bug-0030: paint the selection highlight over the selected
+                    // sub-span of THIS cell using the SAME uniform monospace-width
+                    // model `hit_test_tokens` uses (`x = left + within/count * col_w`),
+                    // so the highlight lands exactly where a click/drag selects.
+                    // Without this a bullet list / table cell registered hits (copy
+                    // worked) but painted NO highlight — the user saw nothing.
+                    if let Some(((sl, sc), (el, ec))) = self.selection
+                        && *count > 0
+                        && *raw_line >= sl
+                        && *raw_line <= el
+                    {
+                        let sel_s = if *raw_line == sl { sc } else { 0 };
+                        let sel_e = if *raw_line == el { ec } else { usize::MAX };
+                        let cs = sel_s.max(*start_char);
+                        let ce = sel_e.min(start_char + count);
+                        if ce > cs {
+                            let x_s = left + (cs - start_char) as f32 / *count as f32 * col_w;
+                            let x_e = left + (ce - start_char) as f32 / *count as f32 * col_w;
+                            window.paint_quad(gpui::fill(
+                                Bounds {
+                                    origin: gpui::point(px(x_s), px(top)),
+                                    size: gpui::size(px(x_e - x_s), px(band_h)),
+                                },
+                                self.sel_bg,
+                            ));
+                            #[cfg(test)]
+                            DOC_RENDER_TAP.with(|t| {
+                                t.borrow_mut().band_selection.push((*raw_line, cs, ce))
+                            });
+                        }
+                    }
                 }
             }
         }

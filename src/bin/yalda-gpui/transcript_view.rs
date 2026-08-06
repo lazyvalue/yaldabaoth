@@ -1424,7 +1424,16 @@ impl TranscriptView {
                                         })
                                         .collect()
                                 };
-                                register_block_hits_on_paint(el, token_sink_snap.clone(), rows)
+                                // bug-0030: pass the active selection + bg so the
+                                // band path PAINTS the highlight (bullet lists /
+                                // table cells), not just registers hit bands.
+                                register_block_hits_on_paint(
+                                    el,
+                                    token_sink_snap.clone(),
+                                    rows,
+                                    sel_snap,
+                                    nc(at_snap.selection_bg),
+                                )
                             }
                             _ => el,
                         }

@@ -5745,6 +5745,140 @@ fn transcript_block_table_is_mouse_selectable(cx: &mut TestAppContext) {
     assert_eq!((ll, lc), (2, 10), "the cell's left edge maps to the cell START char");
 }
 
+/// REGRESSION (bug-0030): dragging over a TABLE CELL in the transcript
+/// registered hit bands (so the model selected + the clipboard copied) but
+/// painted NO selection highlight — the user saw nothing and reported "can't
+/// highlight table cells." Code blocks got the paint (bug-0017) via the per-line
+/// `block_hits` path; the OTHER parsed `FlatItem::Block` (tables) stayed on the
+/// even-split `register_block_hits_on_paint` band path, which registered hits but
+/// never painted a highlight. The fix paints a selection QUAD in the SAME band
+/// geometry the hits use (same uniform-width model as `hit_test_tokens`), so the
+/// highlight lands exactly where the drag selects. (Bullet lists render as prose
+/// `FlatItem::Line`s, not Blocks — they already highlight via the prose path;
+/// this bug was the Block path only.)
+///
+/// Drives the REAL `transcript_mouse_down/move` across the data row and asserts
+/// the highlight painted via `DocRenderTap.band_selection`.
+///
+/// Negative control: at the `FlatItem::Block` band call in `transcript_view.rs`
+/// pass `None` for the selection (revert the wiring) → `band_selection` stays
+/// empty → the non-empty assert fires RED for the right reason (no highlight
+/// painted). Hit registration is untouched by that revert, proving this guards
+/// the PAINT, not the already-working copy.
+#[gpui::test]
+fn transcript_block_table_selection_is_painted(cx: &mut TestAppContext) {
+    use gpui::{Modifiers, MouseButton};
+    let (view, vcx, id, session) = boot_with_transcript(cx);
+
+    // A markdown table frozen as a parsed `FlatItem::Block`. Raw lines:
+    //   0 | Name | Email |   1 | --- | --- |   2 | Scott | scott@x.com |
+    session.update(vcx, |s, cx: &mut gpui::Context<crate::AgentSession>| {
+        s.state.editor.programmatic_insert(
+            0,
+            "| Name | Email |\n| --- | --- |\n| Scott | scott@x.com |\n",
+        );
+        s.state.editor.add_frozen_lines(0, 3);
+        // Focus the transcript so the selection band renders (§4.5).
+        s.state.focus = crate::AgentFocus::Transcript;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+
+    let has_block = session.read_with(vcx, |s, _| {
+        s.state
+            .view_model
+            .flat_items_cache
+            .iter()
+            .any(|it| matches!(it, crate::FlatItem::Block(_)))
+    });
+    assert!(has_block, "the frozen table did not render as a FlatItem::Block");
+
+    let tv = view
+        .update(vcx, |v, _| v.transcript_views.get(&id).cloned())
+        .expect("transcript view exists");
+    let tokens: Vec<crate::TokenHit> = tv.update(vcx, |t, _| t.token_hits.borrow().clone());
+    // The EMAIL cell of the data row (raw line 2, chars 10..21) — its own band.
+    let email_cell = tokens
+        .iter()
+        .find(|t| t.line_idx == 2 && t.start_char == 10)
+        .expect("data row registers the EMAIL cell band (bug-0008)")
+        .bounds;
+    let midy = email_cell.top() + (email_cell.bottom() - email_cell.top()) / 2.0;
+
+    // Reset the paint tap, then drive a REAL drag ACROSS the email cell.
+    YaldaGpuiView::test_reset_doc_render_tap();
+    let start_pos = point(email_cell.left() + px(1.0), midy);
+    let end_pos = point(email_cell.right() - px(1.0), midy);
+    tv.update(vcx, |t, cx| {
+        t.transcript_mouse_down(
+            &gpui::MouseDownEvent {
+                button: MouseButton::Left,
+                position: start_pos,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            },
+            cx,
+        );
+        t.transcript_mouse_move(
+            &gpui::MouseMoveEvent {
+                position: end_pos,
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Modifiers::default(),
+            },
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    // The selection highlight was actually PAINTED over the dragged cell (raw
+    // line 2) — the assert every prior table "fix" lacked.
+    let tap = YaldaGpuiView::test_doc_render_tap();
+    assert!(
+        !tap.band_selection.is_empty(),
+        "no selection highlight was painted over the table cell (bug-0030)"
+    );
+    assert!(
+        tap.band_selection.iter().any(|(l, _, _)| *l == 2),
+        "the highlight must cover the dragged data row (raw line 2); painted {:?}",
+        tap.band_selection
+    );
+    // Non-vacuity: at least one painted range has real width, and it stays WITHIN
+    // the email cell's char span (10..=21) — a whole-row smear would exceed it.
+    assert!(
+        tap.band_selection
+            .iter()
+            .any(|(l, s, e)| *l == 2 && e > s && *s >= 10 && *e <= 21),
+        "the painted highlight must be a real, cell-bounded span (10..21); got {:?}",
+        tap.band_selection
+    );
+
+    // Release copies the cell text — the copy path was already working; keep it
+    // covered so the paint fix can't regress it.
+    tv.update(vcx, |t, cx| {
+        t.transcript_mouse_up(
+            &gpui::MouseUpEvent {
+                button: MouseButton::Left,
+                position: end_pos,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            },
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    let clip = view
+        .update(vcx, |_, cx| cx.read_from_clipboard())
+        .and_then(|it| it.text())
+        .unwrap_or_default();
+    assert!(
+        clip.contains("scott@x.com"),
+        "drag over the email cell did not copy its text; clip = {clip:?}"
+    );
+}
+
 /// bug-0003: when the transcript is FOCUSED, the caret's line renders via the
 /// caret-injection path. That path used to register NO token hits, so a
 /// mouse-down anchoring on the caret line snapped to a different line and the
