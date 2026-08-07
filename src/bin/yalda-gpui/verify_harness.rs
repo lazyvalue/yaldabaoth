@@ -18543,33 +18543,3 @@ fn agent_coming_online_clears_the_unavailable_row(cx: &mut TestAppContext) {
         "a departed agent returns to unavailable"
     );
 }
-
-#[gpui::test]
-fn scratch_doc_bullet_wrap(cx: &mut TestAppContext) {
-    let long = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega and more words to force wrapping across the pane width here";
-    let md = format!("{long}\n\n- {long}\n");
-    let (view, vcx) = cx.add_window_view(|window, cx| {
-        let focus_handle = cx.focus_handle();
-        focus_handle.focus(window);
-        let mut v = YaldaGpuiView::new_browser(
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            Theme::default(),
-            focus_handle,
-        );
-        v.test_open_doc(&md);
-        v
-    });
-    view.update(vcx, |v, cx| v.set_text_scale(1.0, cx));
-    for _ in 0..3 {
-        view.update(vcx, |_, cx| cx.notify());
-        vcx.run_until_parked();
-    }
-    crate::layout_probe_begin();
-    view.update(vcx, |_, cx| cx.notify());
-    vcx.run_until_parked();
-    let p = crate::layout_probe_get("doc-block-inner-0");
-    let l = crate::layout_probe_get("doc-block-inner-1");
-    crate::layout_probe_end();
-    eprintln!("SCRATCH paragraph inner = {:?}", p);
-    eprintln!("SCRATCH bullet    inner = {:?}", l);
-}
