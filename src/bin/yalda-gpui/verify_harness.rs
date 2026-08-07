@@ -11301,6 +11301,84 @@ fn compose_insert_arrows_move_caret(cx: &mut TestAppContext) {
     assert_eq!(col(&view, vcx), 0, "Home moves the compose caret to col 0");
 }
 
+/// UXI-TextEditing-3 (buffer editor): pressing Enter at the end of an INDENTED list
+/// item continues the list AT THE SAME INDENT — a nested `-` stays nested, it
+/// does not jump back to column 0. Drives the REAL `handle_edit_key` Enter path
+/// (`dispatch_insert_core` → `list_continuation_action`).
+///
+/// Negative control (observed RED): drop the `{indent}` in
+/// `list_continuation_action`'s `Continue(format!("{indent}{continuation}"))` →
+/// the new item is `- ` at column 0 and the leading-spaces assert fails.
+#[gpui::test]
+fn buffer_enter_continues_nested_list_at_same_indent(cx: &mut TestAppContext) {
+    use crate::EditOps;
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let fh = cx.focus_handle();
+        fh.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            fh,
+        )
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |v, _| v.test_open_edit("  - foo\n"));
+    let key = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext, k: &str| {
+        view.update_in(vcx, |v, w, cx| v.handle_edit_key(&ws_bare_key(k), w, cx));
+    };
+    key(&view, vcx, "end"); // caret to end of "  - foo"
+    key(&view, vcx, "enter");
+    key(&view, vcx, "x");
+    let line = view.update(vcx, |v, _| v.edit_mut().unwrap().editor.line_text_at_cursor());
+    assert_eq!(
+        line.trim_end_matches('\n'),
+        "  - x",
+        "Enter on a 2-space-indented bullet must continue the marker at the same \
+         indent (got {line:?})"
+    );
+}
+
+/// UXI-TextEditing-3 (worksheet/chatbox compose): the SAME indent-preserving list
+/// continuation holds in the agent compose, because it routes through the same
+/// `dispatch_insert_core`. Drives the REAL `handle_claude_key` Enter path over a
+/// worksheet You-block seeded with an indented bullet.
+///
+/// Negative control: shares `list_continuation_action`'s `{indent}` with the
+/// buffer test — removing it makes the continued line `- ` at column 0.
+#[gpui::test]
+fn compose_enter_continues_nested_list_at_same_indent(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_worksheet_nav(cx);
+    // `i` opens the tail You-block in Insert.
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
+    vcx.run_until_parked();
+    // Seed an indented bullet with the caret at its end (avoids the keystroke
+    // helper's inability to emit literal spaces).
+    view.update(vcx, |v, cx| {
+        use crate::EditOps;
+        let id = v.focused_bound_session().expect("bound");
+        v.with_session(id, cx, |c| {
+            let ed = &mut c.input_surface.compose_mut().editor;
+            ed.programmatic_insert(0, "  - foo");
+            let cur = ed.cursor_mut();
+            cur.line = 0;
+            cur.col = "  - foo".chars().count();
+        });
+    });
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("enter"), w, cx));
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("x"), w, cx));
+    let line = view.update(vcx, |v, cx| {
+        use crate::EditOps;
+        let id = v.focused_bound_session().expect("bound");
+        v.read_session(id, cx, |c| c.input_surface.compose().editor.line_text_at_cursor())
+            .expect("session")
+    });
+    assert_eq!(
+        line.trim_end_matches('\n'),
+        "  - x",
+        "Enter on an indented bullet in the compose must keep the nesting (got {line:?})"
+    );
+}
+
 /// An unbound Cmd chord must NOT type its bare letter into the buffer (cmd-s /
 /// cmd-z reflexes) nor fire the letter's vim action. Drives the REAL
 /// `handle_edit_key`. NEGATIVE CONTROL: drop the `platform` mapping in

@@ -49,3 +49,29 @@ remains authoritative until fully moved.
 
 <!-- TODO(migration): move INV-UX-2 (word-wrap) here as UXI-TextEditing-2, then
      specify the helix-style selection/motion/operator model as further UXI-TextEditing-N. -->
+
+### UXI-TextEditing-3 — Enter continues a list/quote at the same indent (nesting is preserved)
+
+**Statement.** Pressing Enter at the end of a markdown list / TODO / blockquote
+line continues it: the next line starts with the SAME leading indent plus the
+same marker (bullets keep their glyph, ordered items increment, checkboxes reset
+to unchecked, blockquotes repeat `> `). A **nested** (indented) item stays at its
+indent level — it never jumps back to column 0. Enter on an *empty* list item
+instead clears the dangling marker and drops to a blank line (ends the list).
+Splitting mid-line (caret not at end-of-line) keeps the plain-newline behavior.
+
+**Applies to.** Every editable surface, via the shared insert path
+(`dispatch_insert_core` → `list_continuation_action`): the buffer editor
+(Code + WP), and the agent compose in BOTH placements (worksheet + chatbox).
+Bare Enter in the compose inserts a newline (it never submits — Ctrl-Enter
+submits), so list continuation applies there too.
+
+**Why.** Nesting a list is a core editing gesture; losing the indent on every
+newline makes multi-level lists unusable.
+
+**Status.** `implemented` — behavior pre-existed in `list_continuation_action`;
+now guarded.
+
+**Enforcement.** `verify_harness.rs::buffer_enter_continues_nested_list_at_same_indent`
++ `compose_enter_continues_nested_list_at_same_indent` (shared `{indent}` NC
+observed RED); marker rules by `edit_ui.rs::list_continuation_tests`.
