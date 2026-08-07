@@ -254,13 +254,30 @@ impl FileBrowser {
         }
     }
 
-    /// Navigate to parent directory. No-op at filesystem root.
+    /// Navigate to parent directory, landing the cursor on the directory we
+    /// just came from (not the top) so `l`/`h` in-and-out keeps your place.
+    /// No-op at filesystem root.
     pub fn go_parent(&mut self) {
         if let Some(parent) = self.current_dir.parent() {
+            let came_from = self.current_dir.clone();
             self.current_dir = parent.to_path_buf();
             self.selected = 0;
             self.clear_filter();
             self.refresh();
+            self.select_path(&came_from);
+        }
+    }
+
+    /// Move the cursor onto the visible entry whose path equals `path` (the file
+    /// or directory you just left). No-op while filtering, or if `path` is not a
+    /// row in the current directory. Used by `go_parent` (land on the child dir)
+    /// and by the buffer→browser open (land on the open file).
+    pub fn select_path(&mut self, path: &Path) {
+        if !self.filter_text.is_empty() {
+            return;
+        }
+        if let Some(idx) = self.entries.iter().position(|e| e.name != ".." && e.path == path) {
+            self.selected = idx;
         }
     }
 
@@ -740,5 +757,37 @@ mod tests {
             !names.iter().any(|n| n == "widgetry/notes.txt"),
             "a file matched only via its parent-dir name must NOT appear: {names:?}"
         );
+    }
+
+    #[test]
+    fn go_parent_lands_on_the_child_dir_just_left() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        // Parent holds several dirs so the target isn't accidentally at index 0
+        // (after the `..` row). Names chosen so "child" sorts late.
+        for d in ["aaa", "bbb", "child", "zzz"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        let mut fb = FileBrowser::new(root.join("child"));
+        fb.go_parent();
+        let sel = fb.selected_entry().expect("a selection after go_parent");
+        assert_eq!(
+            sel.path,
+            root.join("child"),
+            "cursor must land on the directory we came from, not the top"
+        );
+    }
+
+    #[test]
+    fn select_path_lands_on_the_named_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        for f in ["a.md", "target.md", "z.md"] {
+            touch(&root.join(f));
+        }
+        let mut fb = FileBrowser::new(root.clone());
+        fb.select_path(&root.join("target.md"));
+        let sel = fb.selected_entry().expect("a selection");
+        assert_eq!(sel.path, root.join("target.md"), "cursor lands on the file we came from");
     }
 }

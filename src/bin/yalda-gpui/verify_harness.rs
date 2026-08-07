@@ -176,6 +176,56 @@ fn browser_start_dir_resolution(cx: &mut TestAppContext) {
     let _ = std::fs::remove_file(&file);
 }
 
+/// UXI-Buffer-2: opening the file picker from a file-backed buffer lands the
+/// cursor ON the file you just left (not the top of the list) — "already be on
+/// the file I just left". Drives the REAL `open_browser_inner` entry point over
+/// a real on-disk file and reads the resulting `Picking` browser's selection.
+///
+/// Negative control (observed RED): drop the `fb.select_path(path)` call in
+/// `open_browser_inner` (or the `select_path` body in `file_browser.rs`) → the
+/// selection stays at index 0 (the `..` row) and the filename assert fails.
+#[gpui::test]
+fn open_picker_lands_on_the_file_just_left(cx: &mut TestAppContext) {
+    use crate::{App, BufferApp};
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        )
+    });
+    vcx.run_until_parked();
+
+    // A real directory with several files so the target isn't incidentally first.
+    let dir = std::env::temp_dir().join(format!("yalda-picker-land-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in ["aaa.md", "mmm-target.md", "zzz.md"] {
+        std::fs::write(dir.join(f), b"# x\n").unwrap();
+    }
+    let target = dir.join("mmm-target.md");
+
+    view.update(vcx, |v, _cx| {
+        assert!(v.open_file(target.clone()), "open the target file");
+    });
+    view.update(vcx, |v, cx| v.open_browser_inner(cx));
+    vcx.run_until_parked();
+
+    let selected_name = view.read_with(vcx, |v, _| match v.workspace.focused_content() {
+        Some(App::Buffer(BufferApp::Picking(bw))) => {
+            bw.fb.selected_entry().map(|e| e.name.clone())
+        }
+        _ => None,
+    });
+    assert_eq!(
+        selected_name.as_deref(),
+        Some("mmm-target.md"),
+        "the picker cursor must sit on the file we opened from, not the top"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Clicking a local Markdown link must keep the source document open and add
 /// the target as a distinct, focused buffer tile. Drives real mouse dispatch
 /// through the rendered `InteractiveText`, not the navigation method directly.

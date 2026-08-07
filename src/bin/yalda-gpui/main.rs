@@ -2929,6 +2929,13 @@ impl YaldaGpuiView {
         // continuity, else the workspace cwd, else the process dir. Computed
         // BEFORE `replace_focused_content` moves the prior buffer out.
         let dir = self.browser_start_dir();
+        // The file we're leaving, so the picker's cursor lands ON it (not the
+        // top of the list) — "already be on the file I just left".
+        let leaving: Option<PathBuf> = self
+            .workspace
+            .focused_content()
+            .and_then(screen_file_label)
+            .map(|l| PathBuf::from(l.as_ref()));
         // Transition the focused Buffer to Picking IN PLACE, stashing the prior
         // mode on `BrowserWindow.underlying` so Esc/q restores it (B4). Picking
         // a file discards the underlying and replaces the picker with the picked
@@ -2949,6 +2956,10 @@ impl YaldaGpuiView {
             .and_then(|id| self.browser_sort.get(&id))
         {
             fb.set_sort_order(order);
+        }
+        // Land the cursor on the file we came from (a row in `dir`).
+        if let Some(path) = &leaving {
+            fb.select_path(path);
         }
         // Narrow the prior App to its BufferApp mode. The match above
         // guarantees `prior` is a Buffer (Viewing/Editing), so the stash is

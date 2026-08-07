@@ -48,3 +48,13 @@ versa. Primary code home: `screens.rs::render_doc` / `render_edit` /
   irrelevant hits. Guard: `file_browser.rs`
   `search_skips_ignored_dirs_and_matches_filename_not_path`,
   `fuzzy_score_requires_subsequence_and_ranks_boundaries`.
+- **`UXI-Buffer-2` (the picker remembers where you were).** The `Picking` view's
+  cursor lands on the entry you just left, not the top of the list: (a) opening
+  the picker from a file-backed buffer (`Cmd+O` → `open_browser_inner`) selects
+  that file's row; (b) going to the parent directory (`FileBrowser::go_parent`,
+  `h`) selects the child directory you came from. Both go through
+  `FileBrowser::select_path` (a no-op while filtering or if the path is not a row
+  in the listing). Rationale: in-and-out navigation should keep your place.
+  Guards: `file_browser.rs` `go_parent_lands_on_the_child_dir_just_left`,
+  `select_path_lands_on_the_named_file`; `verify_harness.rs`
+  `open_picker_lands_on_the_file_just_left`.
