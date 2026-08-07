@@ -6,6 +6,78 @@ use crate::worktree;
 const MAX_SEARCH_RESULTS: usize = 200;
 const MAX_SEARCH_DEPTH: usize = 8;
 
+/// Directory names the recursive fuzzy find never descends into — build output,
+/// dependency caches, VCS metadata. Descending into `target/` (a Rust build dir
+/// with tens of thousands of files) was the bulk of the "slow + finds too much"
+/// problem: the search walked all of it and matched on the full path. These are
+/// matched by exact directory name (case-insensitive), independent of the
+/// dotfile rule (`target`/`node_modules` are not dotfiles).
+const IGNORED_DIRS: &[&str] = &[
+    "target",
+    "node_modules",
+    ".git",
+    "dist",
+    "build",
+    "out",
+    ".next",
+    ".nuxt",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".cache",
+    "vendor",
+    ".idea",
+    ".gradle",
+    "DerivedData",
+];
+
+/// Fuzzy subsequence score of `query` against `text` (both compared
+/// lowercased). Returns `Some(score)` — higher is better — when every char of
+/// `query` appears in `text` in order, else `None`. Contiguous runs and matches
+/// at a word boundary (string start or just after a separator) score higher, so
+/// `fb` ranks `file_browser.rs` above an incidental `…f…b…` scatter. This is the
+/// core of the finder: matching a *subsequence of the filename* (not a substring
+/// of the whole path) is what stops every parent-directory component from
+/// producing a hit.
+pub fn fuzzy_score(text: &str, query: &str) -> Option<i32> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let hay: Vec<char> = text.chars().flat_map(char::to_lowercase).collect();
+    let needle: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
+    let mut score = 0i32;
+    let mut hi = 0usize;
+    let mut last_match: Option<usize> = None;
+    for &nc in &needle {
+        let mut found = false;
+        while hi < hay.len() {
+            if hay[hi] == nc {
+                score += 1;
+                if last_match == Some(hi.wrapping_sub(1)) {
+                    score += 4; // contiguous with the previous matched char
+                }
+                let boundary = hi == 0 || matches!(hay[hi - 1], '/' | '_' | '-' | '.' | ' ');
+                if boundary {
+                    score += 6; // start of a word / path component
+                }
+                last_match = Some(hi);
+                hi += 1;
+                found = true;
+                break;
+            }
+            hi += 1;
+        }
+        if !found {
+            return None;
+        }
+    }
+    // Prefer denser matches: a short name beats a long one at equal match shape.
+    score -= hay.len() as i32 / 16;
+    Some(score)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortOrder {
     Name,
@@ -347,31 +419,30 @@ impl FileBrowser {
             0,
             self.show_hidden,
         );
-        // Sort by match quality: exact filename > starts-with > shorter path > alphabetical
+        // Rank by fuzzy score of the filename (DESC — higher is better), then
+        // shorter path, then alphabetical. `search_target` picks the same field
+        // the recursive matcher matched on, so ranking and inclusion agree.
         let q = query.clone();
         self.search_results.sort_by(|a, b| {
-            fn score(name: &str, query: &str) -> u8 {
-                let lower = name.to_lowercase();
-                // Extract just the filename from the relative path
-                let filename = name.rsplit('/').next().unwrap_or(name).to_lowercase();
-                if filename == query {
-                    0 // exact filename match
-                } else if filename.starts_with(query) {
-                    1 // filename starts with query
-                } else if lower == query {
-                    2 // exact path match
-                } else if filename.contains(query) {
-                    3 // filename contains query
-                } else {
-                    4 // path contains query
-                }
-            }
-            let sa = score(&a.name, &q);
-            let sb = score(&b.name, &q);
-            sa.cmp(&sb)
+            let sa = fuzzy_score(Self::search_target(&a.name, &q), &q).unwrap_or(i32::MIN);
+            let sb = fuzzy_score(Self::search_target(&b.name, &q), &q).unwrap_or(i32::MIN);
+            sb.cmp(&sa)
                 .then_with(|| a.name.len().cmp(&b.name.len()))
                 .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
+    }
+
+    /// Which string a `search_results` row (whose `name` is a path relative to
+    /// `current_dir`) is fuzzy-matched/ranked against: the whole relative path
+    /// when the query looks path-like (contains `/`), otherwise just the
+    /// filename. Filename-only matching is what keeps the finder from lighting
+    /// up on every parent-directory component.
+    fn search_target<'a>(relative: &'a str, query: &str) -> &'a str {
+        if query.contains('/') {
+            relative
+        } else {
+            relative.rsplit('/').next().unwrap_or(relative)
+        }
     }
 
     // ── Worktree mode ────────────────────────────────────────────
@@ -574,7 +645,11 @@ impl FileBrowser {
                 .display()
                 .to_string();
 
-            if relative.to_lowercase().contains(query) {
+            // Fuzzy-match the FILENAME (or the whole relative path for a
+            // path-like query), not a substring of the full path — so a query
+            // matches names, not every ancestor directory it happens to sit
+            // under. `query` is already lowercased by the caller.
+            if fuzzy_score(Self::search_target(&relative, query), query).is_some() {
                 let size = if metadata.is_file() {
                     Some(metadata.len())
                 } else {
@@ -590,9 +665,80 @@ impl FileBrowser {
                 });
             }
 
-            if is_dir {
+            // Never descend into build output / dependency caches / VCS dirs —
+            // the main cause of the finder being slow and swamped.
+            if is_dir && !IGNORED_DIRS.iter().any(|d| d.eq_ignore_ascii_case(&name)) {
                 Self::search_recursive(base, &path, query, results, depth + 1, show_hidden);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn touch(path: &Path) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, b"x").unwrap();
+    }
+
+    #[test]
+    fn fuzzy_score_requires_subsequence_and_ranks_boundaries() {
+        // Non-subsequence → no match.
+        assert!(fuzzy_score("readme.md", "zzz").is_none());
+        // Subsequence match.
+        assert!(fuzzy_score("file_browser.rs", "fb").is_some());
+        // A boundary/prefix match outranks a scattered one.
+        let boundary = fuzzy_score("file_browser.rs", "fb").unwrap();
+        let scattered = fuzzy_score("affable_number.rs", "fb").unwrap();
+        assert!(
+            boundary > scattered,
+            "boundary match ({boundary}) must outrank scattered ({scattered})"
+        );
+        // Empty query matches everything (browsing, not filtering).
+        assert_eq!(fuzzy_score("anything", ""), Some(0));
+    }
+
+    #[test]
+    fn search_skips_ignored_dirs_and_matches_filename_not_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // A source file we WANT to find.
+        touch(&root.join("src/widget.rs"));
+        // Build output that must be ignored even though its path contains "src".
+        touch(&root.join("target/debug/build/src_generated_widget.rs"));
+        touch(&root.join("node_modules/pkg/widget.js"));
+        // A file whose PARENT dir matches the query but whose NAME does not —
+        // must NOT appear (the "finds too much" regression).
+        touch(&root.join("widgetry/notes.txt"));
+
+        let mut fb = FileBrowser::new(root.to_path_buf());
+        fb.set_filter("widget");
+        let names: Vec<String> = fb
+            .visible_entries()
+            .iter()
+            .map(|e| e.name.replace('\\', "/"))
+            .collect();
+
+        assert!(
+            names.iter().any(|n| n == "src/widget.rs"),
+            "the real source file must be found: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("target/")),
+            "target/ must be skipped: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("node_modules/")),
+            "node_modules/ must be skipped: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "widgetry/notes.txt"),
+            "a file matched only via its parent-dir name must NOT appear: {names:?}"
+        );
     }
 }

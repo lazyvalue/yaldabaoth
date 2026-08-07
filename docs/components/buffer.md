@@ -35,4 +35,16 @@ versa. Primary code home: `screens.rs::render_doc` / `render_edit` /
 
 ## UX invariants
 
-_(none migrated yet — add via /new-ux as behavior is specified.)_
+- **`UXI-Buffer-1` (fuzzy find is name-scoped and prunes build output).** The
+  `Picking` view's filter is a recursive fuzzy find rooted at the browser's
+  `current_dir`. It matches a **subsequence of the filename** (or the whole
+  relative path only when the query contains `/`), never a substring of the full
+  path — so a match reflects the file's name, not every ancestor directory it
+  sits under. It **never descends** into build-output / dependency-cache / VCS
+  directories (`target`, `node_modules`, `.git`, `dist`, `build`, `vendor`,
+  `__pycache__`, … — see `IGNORED_DIRS`). Results rank by fuzzy score (boundary /
+  contiguous matches first), then shorter path, then name. Rationale: matching
+  the full path and walking `target/` made the finder slow and swamped with
+  irrelevant hits. Guard: `file_browser.rs`
+  `search_skips_ignored_dirs_and_matches_filename_not_path`,
+  `fuzzy_score_requires_subsequence_and_ranks_boundaries`.
