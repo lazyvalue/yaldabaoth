@@ -13,6 +13,31 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Worksheet reply: select-to-quote, older-turn replies, replied-to marker** —
+  `NEEDS-RUNTIME` for the shipped parts (branch `worksheet-reply-select`, via
+  `/new-ux`; project `docs/projects/worksheet-reply-select/`). Captured verbatim:
+  (1) *"When moving my cursor around in agent worksheet mode I want to be able to
+  select agent text: either a whole line or part of a line, with V and v. If I have
+  text selected that is what is entered into the reply text when I do 'r'."*
+  (2) *"I want to be able to reply to agent text earlier than the most recent agent
+  turn. The reply text is sent in my next (current) turn."*
+  (3) *"I want the text that is being replied to to be more obvious in the
+  transcript. Add > when not editing."*
+  **DONE (ticket 001):** `V` = whole-line visual (+ extend-mode so `V`/`j`/`k`
+  grow), `v` = char-wise visual, both through the real keymap; an active selection
+  is the `r` quote (sentence-count ignored; multi-line ⇒ `>`-per-line); `r` replies
+  across the turn boundary and lands in the current turn at the tail
+  (**UXI-AgentTile-34/-35/-36**). 6 new guards + unit test; 3 observed-RED negative
+  controls; suite green. Runtime gap: the selection highlight **color/contrast**
+  ("beautiful, clearly visible") is gap #1 — tune `AgentTheme::selection_bg` by eye
+  once a live `V` selection is triggerable.
+  **DONE (ticket 002):** the `>` replied-to source marker (**UXI-AgentTile-37**) —
+  a pending reply's quoted source lines show a `>` gutter glyph + blockquote-colored
+  left bar in the transcript when NOT typing in the block; clears on submit/abandon.
+  Threaded through `TranscriptSeqs`/`TranscriptPrep`; paint-tap guard +2 observed-RED
+  NCs. Suite **534** green. Gaps: exact glyph/bar **hue** (gap #1); text italic on
+  the source line deferred.
+
 - **Session tags (jump-panel folders)** — `NEEDS-RUNTIME` (built + headless-guarded;
   branch `session-tags`, via `/new-ux`). Spec'd as **UXI-AgentTile-33** (in-tile
   `tag`/`untag` prompt, `<space> t/T`, mirrors the confirm-kill pattern),

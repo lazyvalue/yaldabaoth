@@ -8173,11 +8173,21 @@ pub(crate) struct DocRenderTap {
     pub band_selection: Vec<(usize, usize, usize)>,
     /// The block that drew the left cursor bar, if any.
     pub cursor_bar_block: Option<usize>,
+    /// UXI-AgentTile-37: transcript line indices painted with the `>` replied-to
+    /// marker this frame (a pending reply's quoted source, shown when not typing).
+    pub reply_marker: Vec<usize>,
 }
 
 #[cfg(test)]
 thread_local! {
     static DOC_RENDER_TAP: RefCell<DocRenderTap> = RefCell::new(DocRenderTap::default());
+}
+
+/// Test-only: record that transcript `line_idx` painted the `>` replied-to marker
+/// this frame (UXI-AgentTile-37). Called from the transcript render arm.
+#[cfg(test)]
+pub(crate) fn push_reply_marker_line(line_idx: usize) {
+    DOC_RENDER_TAP.with(|t| t.borrow_mut().reply_marker.push(line_idx));
 }
 
 /// Concatenate a `StyledLine`'s span texts into a plain string. Used by the

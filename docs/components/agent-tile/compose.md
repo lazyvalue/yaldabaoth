@@ -1,6 +1,7 @@
 # Agent Tile — Compose
 
-Facet of the [Agent Tile](README.md) component. Owns `UXI-AgentTile-9..14`, `-21`, `-24`.
+Facet of the [Agent Tile](README.md) component. Owns `UXI-AgentTile-9..14`, `-21`,
+`-24`, `-35`, `-36`.
 
 ## Description
 
@@ -595,3 +596,67 @@ draft is empty, and `focus == Transcript`. Negative control: skip the pop branch
 exercises the layered case (`i`, type, `escape`, `u` undoes the typing and the
 block stays open; a further `u` pops it), guarding "undo first, then pop." Painted
 glyphs remain harness gap #1.
+
+### UXI-AgentTile-35 — An active transcript selection is the `r` reply quote
+
+**Statement.** When a **non-empty transcript selection** is active (from `V`/`v`,
+`UXI-AgentTile-34`, or a mouse drag) and you press `r`, the reply You-block is
+seeded with **the selected text**, quoted verbatim — the sentence-count heuristic
+of `UXI-AgentTile-21` is **ignored**. The selection is rendered as a standard
+Markdown blockquote: a single-line selection seeds `re\n> <selection>\n`; a
+multi-line selection seeds `>`-per-line (`re\n> line1\n> line2\n…\n`, a bare `>`
+for an empty line). With **no** selection, `r` falls back to the existing
+first-N-sentences quote of the caret's line (`UXI-AgentTile-21`). The selection is
+collapsed once captured, and the seed is a committed baseline so `u` still backs
+the block out (`UXI-AgentTile-24`).
+
+**Applies to.** `agent.rs` — `reply_quote_at_cursor` (the `selection_range().filter(non-empty)`
+branch, `editor.selection_text()`, and the pure `blockquote_lines` helper) and
+`editor.rs` `selection_text` / `collapse_selection`. The `r` dispatch is unchanged
+(`agent_ui.rs::handle_claude_key`).
+
+**Why.** Replying to a *specific* span the agent wrote is more precise than
+"the first N sentences of the line under the caret." Selecting the exact text and
+pressing `r` quotes exactly that.
+
+**Status.** `implemented`.
+
+**Enforcement.** `verify_harness.rs`: `worksheet_v_line_select_feeds_r` (whole line
+via `V`), `worksheet_v_char_select_feeds_r` (partial via `v`+`l`), and
+`worksheet_r_replies_across_turn_boundary` (multi-line ⇒ `>`-per-line). Pure:
+`tests.rs::blockquote_lines_prefixes_every_line`. The existing single-sentence
+tests (`worksheet_r_seeds_reply_quote_from_agent_line`,
+`worksheet_count_r_quotes_n_sentences`) still pass — the no-selection fallback is
+byte-identical. NC observed RED: drop the selection branch ⇒ the whole-line/partial
+asserts collapse to the first sentence.
+
+### UXI-AgentTile-36 — `r` replies across the turn boundary, into the current turn
+
+**Statement.** `r` (with or without a selection) may quote agent text in **any**
+agent turn, not only the latest — the older-turn refusal is gone. The reply itself
+is **not** anchored back in old history: because a caret/anchor that isn't in the
+latest turn resolves to the tail (`open_you_block_at_cursor` snaps only a legal
+anchor, else `None`; `collect_you_blocks` coerces a non-latest anchor to `None`;
+`freeze_you_blocks` freezes a `None` anchor at EOF), the reply lands in the
+**current turn** at the transcript tail and is sent as an ordinary pending user
+turn. So "reply to something the agent said earlier, sent in my current turn" holds
+by construction.
+
+**Applies to.** `agent.rs` — `reply_quote_at_cursor` (the removed
+`you_block_anchor_is_legal` refusal). The tail-coercion it relies on
+(`open_you_block_at_cursor`, `collect_you_blocks`, `freeze_you_blocks`,
+`effective_you_block_anchor`) is unchanged and already-guarded
+(`worksheet_stale_anchor_is_rejected`).
+
+**Why.** Quoting older agent text meant hand-retyping it; the latest-turn gate on
+`r` blocked the natural "reply to that thing from three turns ago" flow. Lifting
+the gate — while keeping the reply at the tail — makes it one keystroke.
+
+**Status.** `implemented`.
+
+**Enforcement.** `verify_harness.rs::worksheet_r_replies_across_turn_boundary` —
+tags line 0 as an old `Llm(1)`, the rest `Llm(2)`, parks the caret on the older
+line, and asserts `r` opens the reply, quotes the older text, and
+`effective_you_block_anchor() == None` (tail). NC observed RED: restore the
+`if !you_block_anchor_is_legal(l) { return false }` guard ⇒ `r` no-ops on the
+older line.

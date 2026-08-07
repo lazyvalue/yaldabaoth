@@ -130,6 +130,11 @@ pub(crate) struct TranscriptSeqs {
     /// submit changes this so the cached transcript re-renders the inline set. (Copy
     /// fingerprint, so a hash not the Vec.) 0 when idle-chatbox/none.
     pub(crate) parked_fp: u64,
+    /// UXI-AgentTile-37: the source line range a pending reply quotes, shown as a
+    /// `>` blockquote marker when NOT typing. A render input — opening/closing a
+    /// reply, or dropping the block Insert→Normal (which reveals the marker), must
+    /// bust the cache.
+    pub(crate) reply_marker: Option<(usize, usize)>,
 }
 
 impl TranscriptSeqs {
@@ -183,6 +188,7 @@ impl TranscriptSeqs {
                 c.parked_you_blocks.hash(&mut h);
                 h.finish()
             },
+            reply_marker: c.reply_marker_range(),
         }
     }
 
@@ -541,6 +547,7 @@ impl TranscriptView {
             lockable_through_snap,
             sel_snap,
             mode_snap,
+            reply_marker_snap,
             cursor_line,
             cursor_col,
             turn_started_snap,
@@ -695,6 +702,9 @@ impl TranscriptView {
                 None
             };
             let mode_snap = c.mode;
+            // UXI-AgentTile-37: the source line range that shows the `>` replied-to
+            // marker right now (pending reply + not typing), else None.
+            let reply_marker_snap = c.reply_marker_range();
             let turn_started_snap = c.turn_phase.turn_started();
             let last_event_at_snap = c.turn_phase.last_event_at();
 
@@ -797,6 +807,7 @@ impl TranscriptView {
                 lockable_through_snap,
                 sel_snap,
                 mode_snap,
+                reply_marker_snap,
                 cursor_line,
                 cursor_col,
                 turn_started_snap,
@@ -1085,6 +1096,25 @@ impl TranscriptView {
                                 Some(TurnId::System) | None => ("   ".into(), dim_fg),
                             }
                         };
+                        // UXI-AgentTile-37: a source line a PENDING reply quotes shows
+                        // a `>` blockquote marker — a `>` in the gutter + a blockquote
+                        // left bar — so it is obvious what the reply refers to. Shown
+                        // only when not typing in the block (`reply_marker_snap` is
+                        // None while composing).
+                        let is_marker_line = reply_marker_snap
+                            .map(|(s, e)| line_idx >= s && line_idx < e)
+                            .unwrap_or(false);
+                        let (bar_color, label_text, label_color) = if is_marker_line {
+                            let bq: Hsla =
+                                theme_snap.blockquote_bar.fg.map(nc).unwrap_or(frozen_bar);
+                            (bq, SharedString::from("  >"), bq)
+                        } else {
+                            (bar_color, label_text, label_color)
+                        };
+                        #[cfg(test)]
+                        if is_marker_line {
+                            crate::push_reply_marker_line(line_idx);
+                        }
                         // Row background: the transient nav-focus highlight on the
                         // cursor row wins (shown ONLY while the transcript is focused
                         // for navigation — `cursor_line == usize::MAX` otherwise, so
@@ -1760,6 +1790,9 @@ struct TranscriptPrep {
     lockable_through_snap: usize,
     sel_snap: Option<((usize, usize), (usize, usize))>,
     mode_snap: EditMode,
+    /// UXI-AgentTile-37: source line range `[start,end)` of a pending reply's quote
+    /// to mark with a `>` blockquote, or `None` (no reply / typing in the block).
+    reply_marker_snap: Option<(usize, usize)>,
     cursor_line: usize,
     cursor_col: usize,
     turn_started_snap: Option<std::time::Instant>,

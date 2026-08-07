@@ -816,6 +816,12 @@ impl YaldaGpuiView {
             "flip-selection" => editor.flip_selection(),
             "select-all" => editor.select_all(),
             "extend-line" => editor.extend_by_line(),
+            // `V`: line-wise visual — select the whole line AND enter extend-mode
+            // so a following `V`/`j`/`k` grows the selection (UXI-AgentTile-34).
+            "select-line" => {
+                editor.set_extend_mode(true);
+                editor.extend_by_line();
+            }
             "toggle-extend-mode" => {
                 editor.toggle_extend_mode();
                 if editor.extend_mode() && editor.selection_anchor().is_none() {
