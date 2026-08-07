@@ -165,7 +165,7 @@ impl HighlightCache {
         theme: &Theme,
         edit_seq: u64,
     ) -> Rc<Vec<Rc<LineHl>>> {
-        self.snapshot_inner(lines, theme, edit_seq, None)
+        self.snapshot_inner(lines, theme, edit_seq, &[], None)
     }
 
     /// Like `snapshot`, but with syntect-based code block highlighting.
@@ -174,9 +174,10 @@ impl HighlightCache {
         lines: &[String],
         theme: &Theme,
         edit_seq: u64,
+        frozen_ranges: &[(usize, usize)],
         hl: &Highlighter,
     ) -> Rc<Vec<Rc<LineHl>>> {
-        self.snapshot_inner(lines, theme, edit_seq, Some(hl))
+        self.snapshot_inner(lines, theme, edit_seq, frozen_ranges, Some(hl))
     }
 
     fn snapshot_inner(
@@ -184,6 +185,11 @@ impl HighlightCache {
         lines: &[String],
         theme: &Theme,
         edit_seq: u64,
+        // bug-0033: contiguous frozen (committed agent-message) spans. A code
+        // fence is bounded to the span it opens in — the running FenceState is
+        // RESET at every span boundary so a stray/unclosed ``` can't bleed its
+        // code highlighting into later turns / the live draft.
+        frozen_ranges: &[(usize, usize)],
         hl: Option<&Highlighter>,
     ) -> Rc<Vec<Rc<LineHl>>> {
         let fp = ThemeFp::of(theme);
@@ -225,9 +231,32 @@ impl HighlightCache {
 
         let mut fence = FenceState::new();
         let mut recomputed = 0;
+        // bug-0033: track which frozen span each line belongs to so the fence can
+        // be RESET at every boundary. `region` = the containing range's start, or
+        // -1 for a non-frozen line; a pointer walks the sorted ranges in O(1)
+        // amortized. A boundary (region change) means a new agent message / the
+        // live draft, where an open fence from the previous span must not leak.
+        let mut ri = 0usize;
+        let mut prev_region: i64 = i64::MIN;
         // index drives parallel collections (lines + self.{hashes,fence_before,lines})
         #[allow(clippy::needless_range_loop)]
         for i in 0..n {
+            while ri < frozen_ranges.len() && frozen_ranges[ri].1 <= i {
+                ri += 1;
+            }
+            let region: i64 = if ri < frozen_ranges.len()
+                && i >= frozen_ranges[ri].0
+                && i < frozen_ranges[ri].1
+            {
+                frozen_ranges[ri].0 as i64
+            } else {
+                -1
+            };
+            if region != prev_region {
+                fence = FenceState::new();
+            }
+            prev_region = region;
+
             let h = hash_line(&lines[i]);
             let entry_fp = FenceFp::of(&fence);
             let reuse = self.hashes[i] == h && self.fence_before[i] == entry_fp;
@@ -521,9 +550,40 @@ mod tests {
         let ls = lines(
             "# Heading\nplain **bold** text\n```rust\nlet x = 1;\nfn f() {}\n```\nafter fence",
         );
-        let snap = cache.snapshot_syn(&ls, &theme, 1, &hl);
+        let snap = cache.snapshot_syn(&ls, &theme, 1, &[], &hl);
         assert_syn_raw_matches_batch(&snap, &ls, &theme, &hl);
         assert_eq!(cache.last_recomputed, ls.len());
+    }
+
+    /// bug-0033: a stray/unclosed ``` in one agent turn must NOT bleed code
+    /// highlighting into a later turn — the fence resets at the frozen-span
+    /// boundary.
+    ///
+    /// Negative control (observed RED): remove the `fence = FenceState::new()`
+    /// reset at the region boundary → the turn-2 line highlights as in-fence code
+    /// and no longer equals the fresh-fence highlight.
+    #[test]
+    fn fence_resets_at_frozen_turn_boundary_no_bleed() {
+        let theme = Theme::default();
+        let hl = Highlighter::new();
+        let mut cache = HighlightCache::new();
+        // Turn 1 = lines 0..2 (a stray open fence + one line, never closed).
+        // Turn 2 = line 2 (its own normal text).
+        let ls = lines("```\nagent text\nnext turn text");
+        let frozen = [(0usize, 2usize), (2usize, 3usize)];
+        let snap = cache.snapshot_syn(&ls, &theme, 1, &frozen, &hl);
+        let fresh =
+            highlight_one_line("next turn text", &FenceState::new(), &theme, false, Some(&hl)).0;
+        assert_eq!(
+            snap[2].raw, fresh,
+            "turn-2 line bled as code — the fence was not reset at the turn boundary"
+        );
+        // And the in-turn stray line IS still styled as code (the fence is honored
+        // WITHIN its own turn) — proves the test is non-vacuous.
+        assert_ne!(
+            snap[1].raw, fresh,
+            "the stray fence should still color its own turn's line as code"
+        );
     }
 
     #[test]
@@ -532,10 +592,10 @@ mod tests {
         let hl = Highlighter::new();
         let mut cache = HighlightCache::new();
         let ls = lines("aaa\nbbb\nccc\nddd\neee");
-        cache.snapshot_syn(&ls, &theme, 1, &hl);
+        cache.snapshot_syn(&ls, &theme, 1, &[], &hl);
         let mut edited = ls.clone();
         edited[2] = "ccc changed".into();
-        let snap = cache.snapshot_syn(&edited, &theme, 2, &hl);
+        let snap = cache.snapshot_syn(&edited, &theme, 2, &[], &hl);
         // One line edited (outside any fence) → exactly one re-highlight.
         assert_eq!(cache.last_recomputed, 1);
         assert_syn_raw_matches_batch(&snap, &edited, &theme, &hl);
@@ -549,10 +609,10 @@ mod tests {
         let hl = Highlighter::new();
         let mut cache = HighlightCache::new();
         let ls = lines("intro\n```rust\nlet x = 1;\nlet y = 2;\n```\nouttro");
-        cache.snapshot_syn(&ls, &theme, 1, &hl);
+        cache.snapshot_syn(&ls, &theme, 1, &[], &hl);
         let mut edited = ls.clone();
         edited[3] = "let y = 22;".into();
-        let snap = cache.snapshot_syn(&edited, &theme, 2, &hl);
+        let snap = cache.snapshot_syn(&edited, &theme, 2, &[], &hl);
         assert_eq!(cache.last_recomputed, 1);
         assert_syn_raw_matches_batch(&snap, &edited, &theme, &hl);
     }
@@ -563,8 +623,8 @@ mod tests {
         let hl = Highlighter::new();
         let mut cache = HighlightCache::new();
         let ls = lines("alpha\n```rust\nlet z = 0;\n```\nbravo");
-        let first = cache.snapshot_syn(&ls, &theme, 7, &hl);
-        let second = cache.snapshot_syn(&ls, &theme, 7, &hl);
+        let first = cache.snapshot_syn(&ls, &theme, 7, &[], &hl);
+        let second = cache.snapshot_syn(&ls, &theme, 7, &[], &hl);
         assert!(cache.last_was_skip);
         assert_eq!(cache.last_recomputed, 0);
         assert!(Rc::ptr_eq(&first, &second));

@@ -806,15 +806,25 @@ pub(crate) fn detect_block_ranges(
         // Fenced code block: starts with ``` (optionally with language)
         if trimmed.starts_with("```") {
             let start = i;
+            // bug-0033: the closing fence must be within the SAME frozen agent
+            // message (the contiguous frozen range containing `start`). A fence
+            // never spans turns — searching to EOF let a stray/unclosed ``` pair
+            // with a LATER turn's ``` and swallow everything between (incl. user
+            // turns) into one code block. Bound the search to the turn's end.
+            let turn_end = frozen_ranges
+                .iter()
+                .find(|&&(s, e)| start >= s && start < e)
+                .map(|&(_, e)| e)
+                .unwrap_or(lines.len());
             i += 1;
-            // Find closing fence. Track whether we actually matched one —
-            // exhausting the buffer is NOT a close (INV-11). A streaming,
-            // still-open fence must render its arrived lines as plain Lines
-            // until the closing delimiter freezes, so each new line stays
-            // its own FlatItem (keeping the count-keyed scroll path live)
-            // and we avoid an O(block) re-parse-to-EOF every chunk (F12).
+            // Find closing fence within the turn. Track whether we actually
+            // matched one — exhausting the turn is NOT a close (INV-11). A
+            // streaming, still-open fence must render its arrived lines as plain
+            // Lines until the closing delimiter freezes, so each new line stays
+            // its own FlatItem (keeping the count-keyed scroll path live) and we
+            // avoid an O(block) re-parse-to-EOF every chunk (F12).
             let mut closed = false;
-            while i < lines.len() {
+            while i < turn_end {
                 if lines[i].trim().starts_with("```") && lines[i].trim().len() <= trimmed.len() + 20
                 {
                     i += 1; // include the closing fence
@@ -824,10 +834,14 @@ pub(crate) fn detect_block_ranges(
                 i += 1;
             }
             // Only emit a block range once the closing fence is present
-            // (symmetric to the >=3-row table rule below). Without a match
-            // the loop ran to EOF, so leave these lines unblocked.
+            // (symmetric to the >=3-row table rule below). Without a match, leave
+            // the opening fence + its lines unblocked; resume scanning from the
+            // line AFTER the opening fence so the rest of the turn is parsed
+            // normally (tables etc.) instead of being swallowed.
             if closed && i > start + 1 {
                 ranges.push((start, i));
+            } else if !closed {
+                i = start + 1;
             }
             continue;
         }

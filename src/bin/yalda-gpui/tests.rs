@@ -35,6 +35,44 @@ fn nightfox_jump_panel_colors_are_art_directed() {
 /// Counts + joins the first N sentences; a decimal point and a common
 /// abbreviation do NOT split; a run with no terminator is one sentence; blank
 /// yields "" (the caller's "nothing to quote" signal).
+/// bug-0033: a code fence is bounded to its own agent turn (frozen range). A
+/// stray/unclosed ``` must NOT pair with a later turn's ``` and swallow everything
+/// between into one block; a balanced in-turn block is still detected.
+#[test]
+fn detect_block_ranges_bounds_fence_to_turn() {
+    // Turn 1 = frozen (0,2): a stray open ``` that never closes in the turn.
+    // Turn 2 = frozen (3,5): its own ```. Line 2 is a user line between them.
+    let ls: Vec<String> = [
+        "```",             // 0  turn 1 stray fence
+        "agent text",      // 1  turn 1
+        "user reply",      // 2  (between turns)
+        "```",             // 3  turn 2 fence
+        "more",            // 4  turn 2
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let frozen = [(0usize, 2usize), (3usize, 5usize)];
+    let ranges = detect_block_ranges(&ls, &frozen);
+    for &(s, e) in &ranges {
+        assert!(
+            !(s <= 1 && e >= 3),
+            "a fence bled across the turn boundary into a block ({s},{e})"
+        );
+    }
+
+    // Balanced in-turn block is still detected.
+    let ls2: Vec<String> = ["```rust", "let x = 1;", "```", "after"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let ranges2 = detect_block_ranges(&ls2, &[(0usize, 4usize)]);
+    assert!(
+        ranges2.contains(&(0, 3)),
+        "a balanced in-turn code block must still be a block; got {ranges2:?}"
+    );
+}
+
 /// bug-0031: the caret is a BEAM while a selection is active, a BLOCK otherwise.
 #[test]
 fn caret_mode_during_selection_beams_only_with_selection() {

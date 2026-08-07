@@ -608,10 +608,16 @@ impl TranscriptView {
             };
             let lines: &Vec<String> = &lines_rc;
 
+            // Frozen ranges drive the structural-block cache, the view-model
+            // fingerprint, AND (bug-0033) the per-message fence reset in the
+            // highlighter — computed BEFORE highlighting so it can be passed in.
+            let frozen_ranges: Vec<(usize, usize)> = c.editor.frozen_lines().to_vec();
+            let frozen_line_count: usize = frozen_ranges.iter().map(|(s, e)| e - s).sum();
+
             // Per-line highlight (incremental cache or full bypass).
             let hl_snap: std::rc::Rc<Vec<std::rc::Rc<LineHl>>> = if hl_cache_enabled() {
                 c.highlight_cache
-                    .snapshot_syn(lines, &theme, edit_seq, &syntect_hl)
+                    .snapshot_syn(lines, &theme, edit_seq, &frozen_ranges, &syntect_hl)
             } else {
                 let raw = highlight_markdown_lines_syn(lines, &theme, &syntect_hl);
                 let stripped = highlight_markdown_lines_stripped_syn(lines, &theme, &syntect_hl);
@@ -622,11 +628,6 @@ impl TranscriptView {
                         .collect(),
                 )
             };
-
-            // Frozen ranges drive both the structural-block cache and the
-            // view-model fingerprint.
-            let frozen_ranges: Vec<(usize, usize)> = c.editor.frozen_lines().to_vec();
-            let frozen_line_count: usize = frozen_ranges.iter().map(|(s, e)| e - s).sum();
 
             // ── View-model memoization (S1) ──
             let view_model_fp: u64 = c.view_model_fingerprint(line_count, frozen_line_count);

@@ -1280,9 +1280,11 @@ impl EditState {
             self.lines_cache_seq = edit_seq;
             rc
         };
+        // Buffer/doc highlight: one document, no agent-turn boundaries — fences
+        // span the whole file normally (bug-0033 per-turn reset is transcript-only).
         let snap = self
             .highlight_cache
-            .snapshot_syn(&lines_rc, theme, edit_seq, hl);
+            .snapshot_syn(&lines_rc, theme, edit_seq, &[], hl);
         (lines_rc, snap)
     }
 }
