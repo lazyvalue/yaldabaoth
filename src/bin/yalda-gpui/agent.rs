@@ -3553,6 +3553,14 @@ pub(crate) struct AgentState {
     /// turn) and sends their combined text; an empty active-block discard leaves
     /// the parked ones intact.
     pub(crate) parked_you_blocks: Vec<(Option<usize>, String)>,
+    /// UXI-AgentTile-37: the transcript source line range `[start, end)` a PENDING
+    /// reply quotes — set by `reply_quote_at_cursor` (the caret line, or the whole
+    /// selection's line span), cleared on submit/abandon (`close_you_block` + the
+    /// empty-Esc discard + the `u`-pop). While `Some`, the source lines render with
+    /// a `>` blockquote marker in the transcript so it is obvious what the reply
+    /// refers to — shown only when NOT typing in the block (see
+    /// `reply_marker_range`).
+    pub(crate) reply_source_range: Option<(usize, usize)>,
     /// Last-seen full snapshot of the agent's plan. Updated on every ACP
     /// `Plan` notification (which carries a complete plan, not a delta —
     /// see spec-agent-window.md §21). Consumed by the Tasklist sidebar.
@@ -4028,6 +4036,7 @@ impl AgentState {
             you_block_open: false,
             you_block_anchor: None,
             parked_you_blocks: Vec::new(),
+            reply_source_range: None,
             current_plan: None,
             agent_mode: None,
             agent_model: None,
@@ -4111,6 +4120,7 @@ impl AgentState {
             you_block_open: false,
             you_block_anchor: None,
             parked_you_blocks: Vec::new(),
+            reply_source_range: None,
             current_plan: None,
             agent_mode: None,
             agent_model: None,
@@ -4670,11 +4680,17 @@ impl AgentState {
             .editor
             .selection_range()
             .filter(|&((sl, sc), (el, ec))| (sl, sc) != (el, ec));
-        let quote = if sel.is_some() {
+        // Source line range `[start, end)` the quote is drawn from — the whole
+        // selection's line span, or the single caret line (UXI-AgentTile-37: the
+        // replied-to marker highlights exactly these lines).
+        let source_range;
+        let quote = if let Some(((sl, _), (el, _))) = sel {
+            source_range = (sl, el + 1);
             let text = self.editor.selection_text().unwrap_or_default();
             blockquote_lines(text.trim_end_matches('\n'))
         } else {
             let l = self.editor.cursor().line;
+            source_range = (l, l + 1);
             let line = self.editor.document().line_text(l);
             let q = first_n_sentences(line.trim_end_matches('\n'), count);
             if q.is_empty() {
@@ -4686,6 +4702,7 @@ impl AgentState {
         if quote.trim().is_empty() {
             return false;
         }
+        self.reply_source_range = Some(source_range);
         // UXI-AgentTile-36: the quote may come from ANY agent turn, not just the
         // latest — the reply is NOT anchored back in old history. Collapsing the
         // selection leaves the caret at the selection head; `open_you_block_at_cursor`
@@ -4758,6 +4775,22 @@ impl AgentState {
         // Parked insertion points (rule 6) are worksheet-only drafts; a turn begin /
         // replay / leaving the worksheet abandons them too.
         self.parked_you_blocks.clear();
+        // UXI-AgentTile-37: the reply is gone (submitted / turn began / worksheet
+        // left) ⇒ its replied-to marker clears with it.
+        self.reply_source_range = None;
+    }
+
+    /// UXI-AgentTile-37: the transcript line range `[start, end)` that should show
+    /// the `>` replied-to marker RIGHT NOW — `reply_source_range` while the reply
+    /// is pending, but ONLY when you are not actively typing in the block (so the
+    /// marker is a resting back-link, hidden while you compose). "Typing" =
+    /// compose-focused in Insert; transcript nav or the block dropped to Normal
+    /// both show it.
+    pub(crate) fn reply_marker_range(&self) -> Option<(usize, usize)> {
+        let range = self.reply_source_range?;
+        let typing = self.focus == AgentFocus::Compose
+            && self.input_surface.compose().mode == EditMode::Insert;
+        (!typing).then_some(range)
     }
 
     /// UXI-AgentTile-11 / UXI-AgentTile-12: is the inline You-block currently the live editing

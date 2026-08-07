@@ -11910,6 +11910,89 @@ fn worksheet_multiline_selection_quotes_per_line(cx: &mut TestAppContext) {
     });
 }
 
+/// UXI-AgentTile-37: the replied-to source line shows a `>` blockquote marker in
+/// the transcript when NOT typing in the reply block, and it clears on abandon.
+/// Drives the real `r` → `escape` → `u` keystroke path and asserts BOTH the state
+/// (`reply_marker_range`) and the PAINT (`DocRenderTap.reply_marker`).
+///
+/// Negative controls (observed RED, each separately):
+///  - render branch: skip `push_reply_marker_line` / the `is_marker_line` override
+///    → the paint tap is empty even though the state says the marker is active.
+///  - clear-on-pop: drop `reply_source_range = None` in the `u`-pop branch → the
+///    marker survives after the reply is abandoned.
+#[gpui::test]
+fn worksheet_replied_to_source_shows_marker_when_not_typing(cx: &mut TestAppContext) {
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::session_proto::Notification as ServerNotification;
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    let ev = |e: ReplyEvent| ServerNotification::ReplyEvent {
+        session_id: "S1".into(),
+        event: e,
+    };
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                ev(ReplyEvent::Chunk("hello there.\n".into())),
+                ev(ReplyEvent::TurnEnded { count: 1 }),
+            ],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    let src = view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        let (s, _e) = c.latest_agent_turn_range().unwrap_or((0, 0));
+        c.editor.cursor_mut().line = s;
+        c.editor.cursor_mut().col = 0;
+        s
+    });
+    // `r` opens the reply, seeded + in Insert. WHILE TYPING the marker is hidden.
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("r"), w, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert_eq!(c.reply_source_range, Some((src, src + 1)), "source captured");
+        assert_eq!(
+            c.reply_marker_range(),
+            None,
+            "marker hidden while typing in the block"
+        );
+    });
+    // `escape` drops the compose to Normal → NOT typing → the marker is shown.
+    YaldaGpuiView::test_reset_doc_render_tap();
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert_eq!(
+            c.reply_marker_range(),
+            Some((src, src + 1)),
+            "marker shown once not typing"
+        );
+    });
+    let tap = YaldaGpuiView::test_doc_render_tap();
+    assert!(
+        tap.reply_marker.contains(&src),
+        "the `>` marker PAINTED on the source line {src}; got {:?}",
+        tap.reply_marker
+    );
+    // `u` pops the reply (seeded baseline has no undo history) → marker clears.
+    YaldaGpuiView::test_reset_doc_render_tap();
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("u"), w, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert_eq!(c.reply_source_range, None, "reply abandoned ⇒ source cleared");
+        assert_eq!(c.reply_marker_range(), None, "marker gone after pop");
+    });
+    let tap = YaldaGpuiView::test_doc_render_tap();
+    assert!(
+        !tap.reply_marker.contains(&src),
+        "no marker paints after the reply is popped; got {:?}",
+        tap.reply_marker
+    );
+}
+
 /// UXI-AgentTile-24: `u` in an open worksheet You-block backs the reply out,
 /// undo-style. Common flow `r → Esc → u` pops the block on the FIRST `u` (the
 /// seeded quote is a committed baseline with no undo history). The layered case

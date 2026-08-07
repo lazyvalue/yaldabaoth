@@ -558,21 +558,39 @@ Normal) and is hidden while you actively type the reply. It is **pending-scoped*
 it appears while the reply quotes that source and clears when the reply is
 submitted or abandoned.
 
-**Applies to.** (planned) `agent.rs` — a `reply_source_range` captured in
-`reply_quote_at_cursor`, cleared in `close_you_block` / the `u`-pop / submit;
-`transcript_view.rs` — a new snapshot input + `TranscriptSeqs` seq, and a
-frozen-line render branch that styles the source range as a blockquote when the
-marker is active.
+**Applies to.** `agent.rs` — `reply_source_range: Option<(usize, usize)>` captured
+in `reply_quote_at_cursor` (the selection's line span or the caret line), cleared
+in `close_you_block` (submit / turn-begin / replay), the empty-Esc discard, and the
+`u`-pop (`agent_ui.rs`); the `reply_marker_range()` gate (`Some` only while a reply
+is pending AND not compose-Insert). `transcript_view.rs` — `TranscriptSeqs::reply_marker`
+(the render-input seq), the `reply_marker_snap` threaded through `TranscriptPrep`,
+and the frozen-line render branch that, per source line, sets a blockquote-colored
+left bar + a `>` gutter glyph. `main.rs` — `DocRenderTap::reply_marker` + the
+`push_reply_marker_line` test tap.
 
 **Why.** With a reply that lands at the tail (`UXI-AgentTile-36`) but quotes text
 far up in history, there is no visual back-link from the reply to its source; the
 marker restores that.
 
-**Status.** `not implemented` — tracked as
-`docs/projects/worksheet-reply-select/002-ticket-replied-to-marker.md`. It is a
-cached-transcript render change (new seq + paint tap) and mostly a paint
-deliverable (gap #1), staged after the selection/reply behavior.
+**Status.** `implemented` — the state gate + render branch are headless (real
+keystrokes + the paint tap). The exact glyph/bar hue is gap #1 (human eye).
 
-**Enforcement.** (planned) `verify_harness.rs` — a paint-tap guard that the source
-range renders with the blockquote style while the reply is pending + not being
-typed, and is absent after submit/abandon; NC by disabling the render branch.
+**Deviation from plan.** The marker renders as a `>` in the line's **gutter**
+(right-aligned `  >`) plus a blockquote-colored 3px left bar — NOT a literal `> `
+prepended to the agent text. The gutter placement keeps the source text's columns
+untouched, so transcript hit-testing / caret / copy on that line stay aligned
+(prepending a `> ` would offset them). Text **italic** on the source line was left
+out of this pass (bar + glyph already read as a quote); it's a cheap follow-up if a
+live eye wants it. The planned `transcript_021_*` render-count test was not added
+separately — the marker input lives in `TranscriptSeqs` (so the existing perf
+suite's "chatbox typing leaves the transcript flat" still passes with the marker
+inert), and the paint test below proves the marker input DOES re-render when it
+moves.
+
+**Enforcement.** `verify_harness.rs::worksheet_replied_to_source_shows_marker_when_not_typing`
+— real `r` → `escape` → `u`: asserts `reply_marker_range()` is `None` while typing
+(Insert), `Some((src, src+1))` once dropped to Normal, and that the `>` marker
+PAINTED on the source line via `DocRenderTap.reply_marker`; then `u` pops the reply
+and both the state and the paint clear. **Two NCs observed RED:** (a) force
+`is_marker_line = false` ⇒ the paint tap is empty though the state says active; (b)
+drop `reply_source_range = None` in the `u`-pop ⇒ the marker survives the abandon.

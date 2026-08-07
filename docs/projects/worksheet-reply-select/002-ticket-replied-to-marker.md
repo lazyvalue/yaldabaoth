@@ -1,6 +1,6 @@
-# 002 — The `>` replied-to source marker (when not editing)
+# 002 — The `>` replied-to source marker (when not editing) — DONE
 
-Implements **UXI-AgentTile-37**. The source agent line(s) a pending worksheet
+Implements **UXI-AgentTile-37** (DONE). The source agent line(s) a pending worksheet
 reply quotes render with a beautiful blockquote marker (`>` / left bar + italic)
 in the transcript, so it is obvious what a pending reply refers to. Shown while
 NOT typing in the reply block; pending-scoped (clears on submit / abandon).
@@ -13,20 +13,19 @@ compose is not the active typing surface.
 
 ## Subtasks
 
-- [ ] Capture the quoted source range in `AgentState` (`reply_source_range:
-      Option<(usize, usize)>` or a small `Vec`) inside `reply_quote_at_cursor`
+- [x] Capture the quoted source range in `AgentState`
+      (`reply_source_range: Option<(usize, usize)>`) inside `reply_quote_at_cursor`
       (both the selection and sentence branches).
-- [ ] Clear it on submit (`freeze_you_blocks` path), on `close_you_block`, and on
-      the `u`-pop back-out (UXI-AgentTile-24).
-- [ ] Thread it into the transcript render: add to the `TranscriptView` snapshot
-      + a `TranscriptSeqs` seq (per the cached-surface rule), and add a
-      `transcript_021_*` render-count test.
-- [ ] Frozen-line render branch: when the marker is active AND the reply is not
-      being typed (`!(focus==Compose && compose.mode==Insert)`), style each source
-      line as a blockquote (left bar + italic, theme `blockquote_bar` /
-      `blockquote_text`).
-- [ ] Decide "not typing" gate precisely and keep it consistent with
-      `inline_you_block_active`.
+- [x] Clear it on submit (`close_you_block`, called from the submit path), the
+      empty-Esc discard, and the `u`-pop back-out (UXI-AgentTile-24).
+- [x] Thread it into the transcript render: `TranscriptSeqs::reply_marker` +
+      `TranscriptPrep::reply_marker_snap`. (The `transcript_021_*` count test was
+      not added separately — see the deviation in UXI-AgentTile-37.)
+- [x] Frozen-line render branch: when the marker is active AND not typing
+      (`reply_marker_range()` gate), draw a `>` gutter glyph + blockquote-colored
+      left bar. (Gutter `>`, not an inline prefix; italic deferred — see deviation.)
+- [x] "Not typing" gate = `reply_marker_range()`: `Some` while a reply is pending
+      and NOT `focus==Compose && compose.mode==Insert`.
 
 ## Verification
 

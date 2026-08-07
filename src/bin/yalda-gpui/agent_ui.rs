@@ -2183,6 +2183,7 @@ impl YaldaGpuiView {
             you_block_open: false,
             you_block_anchor: None,
             parked_you_blocks: Vec::new(),
+            reply_source_range: None,
             current_plan: None,
             agent_mode: None,
             agent_model: None,
@@ -6065,6 +6066,7 @@ impl YaldaGpuiView {
                         c.input_surface = InputSurface::new(InputModeKind::Worksheet);
                         c.you_block_open = false;
                         c.you_block_anchor = None;
+                        c.reply_source_range = None; // UXI-AgentTile-37: reply abandoned
                     }
                     c.focus = AgentFocus::Transcript;
                 }
@@ -6109,6 +6111,7 @@ impl YaldaGpuiView {
                     c.input_surface = InputSurface::new(InputModeKind::Worksheet);
                     c.you_block_open = false;
                     c.you_block_anchor = None;
+                    c.reply_source_range = None; // UXI-AgentTile-37: reply popped
                     c.focus = AgentFocus::Transcript;
                 }
                 c.pending_reveal_cursor = true;

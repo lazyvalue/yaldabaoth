@@ -32,7 +32,7 @@ Replying to agent text in the worksheet was weak on three axes:
 | # | Ticket | Status |
 |---|--------|--------|
 | 001 | `V`/`v` selection + selection-feeds-`r` + reply past the turn boundary | DONE (UXI-AgentTile-34/-35/-36) |
-| 002 | The `>` replied-to source marker (when not editing) | READY (UXI-AgentTile-37, not implemented) |
+| 002 | The `>` replied-to source marker (when not editing) | DONE (UXI-AgentTile-37) |
 
 ## Links
 

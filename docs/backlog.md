@@ -28,11 +28,15 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
   is the `r` quote (sentence-count ignored; multi-line ⇒ `>`-per-line); `r` replies
   across the turn boundary and lands in the current turn at the tail
   (**UXI-AgentTile-34/-35/-36**). 6 new guards + unit test; 3 observed-RED negative
-  controls; suite 533 green. Runtime gap: the selection highlight **color/contrast**
+  controls; suite green. Runtime gap: the selection highlight **color/contrast**
   ("beautiful, clearly visible") is gap #1 — tune `AgentTheme::selection_bg` by eye
   once a live `V` selection is triggerable.
-  **READY (ticket 002):** the `>` replied-to source marker (**UXI-AgentTile-37**,
-  not implemented) — a cached-transcript render change, staged.
+  **DONE (ticket 002):** the `>` replied-to source marker (**UXI-AgentTile-37**) —
+  a pending reply's quoted source lines show a `>` gutter glyph + blockquote-colored
+  left bar in the transcript when NOT typing in the block; clears on submit/abandon.
+  Threaded through `TranscriptSeqs`/`TranscriptPrep`; paint-tap guard +2 observed-RED
+  NCs. Suite **534** green. Gaps: exact glyph/bar **hue** (gap #1); text italic on
+  the source line deferred.
 
 - **Session tags (jump-panel folders)** — `NEEDS-RUNTIME` (built + headless-guarded;
   branch `session-tags`, via `/new-ux`). Spec'd as **UXI-AgentTile-33** (in-tile
