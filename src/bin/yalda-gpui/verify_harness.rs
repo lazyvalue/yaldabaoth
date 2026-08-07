@@ -11379,6 +11379,56 @@ fn compose_enter_continues_nested_list_at_same_indent(cx: &mut TestAppContext) {
     );
 }
 
+/// UXI-TextEditing-4: the Code edit view soft-wraps a line whose long run has NO
+/// whitespace to break at (a bullet holding a long path / URL). Before the fix
+/// `build_wrapped_line` emitted one over-wide token child that `flex_wrap` could
+/// not break, so the run overflowed and was clipped by the body's
+/// `overflow_x_hidden` — the "wrapping fails on bullets" report. Char-breaking
+/// the token lets the row wrap to many lines.
+///
+/// The honest seam is the layout probe (a geometry bug): a bullet with a
+/// ~600-char unbroken token is FAR wider than the pane, so a real wrap paints a
+/// tall row; a clip paints ~1 line. Non-vacuous: the token can't fit on one line.
+///
+/// Negative control (observed RED): revert `chunk_long_token` in
+/// `build_wrapped_line` (emit the token whole) → `code-line-0` paints ~1 line
+/// tall and the `> 4 lines` assert fails.
+#[gpui::test]
+fn code_edit_wraps_unbroken_token_in_bullet(cx: &mut TestAppContext) {
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let fh = cx.focus_handle();
+        fh.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            fh,
+        )
+    });
+    vcx.run_until_parked();
+    // A bullet whose content is one unbroken 600-char token (no whitespace).
+    let tok: String = std::iter::repeat('a').take(600).collect();
+    view.update(vcx, |v, _| v.test_open_edit(&format!("- {tok}\n")));
+    view.update(vcx, |v, cx| v.set_text_scale(1.0, cx));
+    for _ in 0..3 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let line = crate::layout_probe_get("code-line-0");
+    crate::layout_probe_end();
+
+    let (_, _, w, h) = line.expect("the code line must paint");
+    // One 13px row is ~16–20px tall; a genuine wrap of a 600-char run is many
+    // rows. Assert it wrapped to well more than a single line.
+    assert!(
+        h > 80.0,
+        "an unbroken 600-char token in a bullet must char-wrap, not clip to one \
+         line: code-line-0 painted {w}x{h}"
+    );
+}
+
 /// An unbound Cmd chord must NOT type its bare letter into the buffer (cmd-s /
 /// cmd-z reflexes) nor fire the letter's vim action. Drives the REAL
 /// `handle_edit_key`. NEGATIVE CONTROL: drop the `platform` mapping in

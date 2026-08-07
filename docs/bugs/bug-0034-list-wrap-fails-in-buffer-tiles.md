@@ -1,8 +1,9 @@
 # bug-0034: list-wrap-fails-in-buffer-tiles
 
-**Status:** OPEN
+**Status:** FIXED (edit-view unbreakable-token clipping) — one narrow-split
+suspicion remains unconfirmed (see last log entry)
 **First seen:** 2026-08-06
-**Component:** docs/components/TextEditing, docs/components/common (markdown render)
+**Component:** docs/components/common/text-editing (UXI-TextEditing-4)
 
 ## Symptom
 
@@ -111,3 +112,33 @@ error (a ~130-char token that fit the 1507px pane). Corrected finding #2 above.
 Only remaining suspect is edit-list `ListSizingBehavior::Auto` collapse at narrow
 split-pane widths, which needs a live-app read (not `simulate_resize`). Still
 OPEN; still no speculative fix.
+
+### 2026-08-07 — FOUND + FIXED: edit views clip unbreakable tokens
+
+Localized the real defect after the user said "look elsewhere in buffers." The
+rendered doc view is fine; the **Code + WP edit views** (and the worksheet
+transcript) render through `build_wrapped_line`, which tokenizes at whitespace
+and lays the tokens out with `flex_wrap`. `flex_wrap` only breaks BETWEEN token
+children, so a single run with NO whitespace — a path / URL / hash — became one
+over-wide child that overflowed the row and was CLIPPED by the body's
+`overflow_x_hidden` (screens.rs even had a comment "Clip the rare unbroken
+token"). On a bullet holding a long path this reads exactly as "word wrapping
+fails on bullets": the tail is invisible.
+
+Fix: `chunk_overlong_tokens` in `agent.rs` splits any non-whitespace token
+longer than `MAX_UNBROKEN_TOKEN` (40) into `OVERLONG_TOKEN_CHUNK` (16)-char
+pieces before layout, so `flex_wrap` can break between the chunks. The chunks
+abut, so the `reg` sink's (start_char, count) accounting is byte-for-byte
+unchanged — caret injection, selection, hit-testing, and links are unaffected
+(the full 544-test gpui suite + the caret-invariant fuzz oracle stay green).
+
+Verified: `verify_harness.rs::code_edit_wraps_unbroken_token_in_bullet` — layout
+probe asserts a 600-char bullet token paints a TALL (>80px) wrapped row.
+Negative control observed RED twice (before the fix, and by reverting the
+`chunk_overlong_tokens(tokens)` call): the row paints `1542x45.5` (~1 line) and
+the assert fails. Guard promoted to `UXI-TextEditing-4`.
+
+Remaining OPEN thread (separate): the narrow-split `ListSizingBehavior::Auto`
+suspicion is neither confirmed nor reproduced (needs a live read). If the user
+still sees whitespace-separated bullets fail to wrap in a thin split, reopen with
+that repro — this fix only addresses the unbreakable-token clip.

@@ -75,3 +75,29 @@ now guarded.
 **Enforcement.** `verify_harness.rs::buffer_enter_continues_nested_list_at_same_indent`
 + `compose_enter_continues_nested_list_at_same_indent` (shared `{indent}` NC
 observed RED); marker rules by `edit_ui.rs::list_continuation_tests`.
+
+### UXI-TextEditing-4 — A long unbreakable run soft-wraps, it is never clipped
+
+**Statement.** On a `build_wrapped_line` surface (the Code + WP edit views, the
+worksheet transcript/compose), a single run with no whitespace to wrap at — a
+path, URL, or hash — soft-wraps to the next line rather than overflowing the row
+and being clipped by the surface's `overflow_x_hidden`. This is most visible on a
+bullet whose content is a long path (the "word wrapping fails on bullet points /
+lists" report). Ordinary words are unaffected; only runs longer than
+`MAX_UNBROKEN_TOKEN` (40 chars) are char-chunked, into `OVERLONG_TOKEN_CHUNK`
+(16-char) pieces that fit even a thin split pane.
+
+**Applies to.** Every `build_wrapped_line` surface. (The rendered doc view
+already char-wraps via gpui `StyledText`; the chatbox compose intentionally
+*scrolls* long runs horizontally per its caret-containment spec, so it is out of
+scope.)
+
+**Why.** `flex_wrap` only breaks BETWEEN token children; one over-wide child
+overflows and is clipped, so the tail of a long path in a bullet was invisible.
+The chunks abut, so caret / selection / hit-test offsets are unchanged.
+
+**Status.** `implemented` — `agent.rs::chunk_overlong_tokens` in
+`build_wrapped_line`.
+
+**Enforcement.** `verify_harness.rs::code_edit_wraps_unbroken_token_in_bullet`
+(layout probe; the un-chunked NC paints ~1 line and fails RED).

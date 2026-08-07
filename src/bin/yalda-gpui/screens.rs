@@ -530,7 +530,7 @@ impl YaldaGpuiView {
                 None,
             );
 
-            div()
+            let row = div()
                 .flex()
                 .flex_row()
                 // Fill the list width so `content`'s `flex_1` has a bounded
@@ -540,8 +540,10 @@ impl YaldaGpuiView {
                 // they overflow and get clipped by the body's overflow_x_hidden.
                 .w_full()
                 .child(gutter)
-                .child(content)
-                .into_any_element()
+                .child(content);
+            #[cfg(test)]
+            let row = probe_bounds_dyn(format!("code-line-{line_idx}"), row.into_any_element());
+            row.into_any_element()
         };
 
         div()

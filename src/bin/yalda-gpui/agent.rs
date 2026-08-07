@@ -1173,6 +1173,46 @@ pub(crate) fn caret_mode_during_selection(mode: EditMode, active_selection: bool
     }
 }
 
+/// A non-whitespace token longer than this (chars) is considered "unbreakable"
+/// prose the user did not mean as one atomic word — a path / URL / hash — and is
+/// char-chunked so it can soft-wrap. Ordinary words never reach it, so normal
+/// whitespace wrapping is untouched.
+const MAX_UNBROKEN_TOKEN: usize = 40;
+/// Chunk width (chars) an over-long token is split into. Small enough that one
+/// chunk fits even a narrow split pane (~16 * char_w), so wrapping still works
+/// when a buffer tile is split thin.
+const OVERLONG_TOKEN_CHUNK: usize = 16;
+
+/// Split any non-whitespace token longer than [`MAX_UNBROKEN_TOKEN`] into
+/// [`OVERLONG_TOKEN_CHUNK`]-char pieces (same style), leaving whitespace tokens
+/// and normal-length words as-is. The pieces abut, so a caller that sums token
+/// char-counts for offsets sees no change. Fast-paths to the input when nothing
+/// is over-long (the overwhelming common case).
+fn chunk_overlong_tokens(tokens: Vec<Segment>) -> Vec<Segment> {
+    let is_ws = |t: &str| matches!(t.chars().next(), Some(' ') | Some('\t'));
+    if !tokens
+        .iter()
+        .any(|(t, _)| !is_ws(t) && t.chars().count() > MAX_UNBROKEN_TOKEN)
+    {
+        return tokens;
+    }
+    let mut out: Vec<Segment> = Vec::with_capacity(tokens.len());
+    for (text, style) in tokens {
+        if is_ws(&text) || text.chars().count() <= MAX_UNBROKEN_TOKEN {
+            out.push((text, style));
+            continue;
+        }
+        let chars: Vec<char> = text.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let end = (i + OVERLONG_TOKEN_CHUNK).min(chars.len());
+            out.push((chars[i..end].iter().collect(), style));
+            i = end;
+        }
+    }
+    out
+}
+
 pub(crate) fn build_wrapped_line(
     segs: &[Segment],
     line_str: &str,
@@ -1268,6 +1308,17 @@ pub(crate) fn build_wrapped_line(
             tokens.push((current, *style));
         }
     }
+
+    // Char-break any single token too long to ever fit on a line — a path, URL,
+    // or hash with no whitespace to wrap at. `flex_wrap` only breaks BETWEEN
+    // token children, so one over-wide child would overflow the row and get
+    // clipped by the surface's `overflow_x_hidden` (the "word wrapping fails on
+    // bullet points / lists" report — a bullet holding a long path). Splitting
+    // it into fixed-size chunks lets the row wrap. Offsets stay contiguous (the
+    // chunks abut), so the `reg` sink's (start_char, count) accounting — and thus
+    // hit-testing / selection / links — is unchanged. Normal words (shorter than
+    // the threshold) are untouched, so ordinary whitespace wrapping is identical.
+    let tokens = chunk_overlong_tokens(tokens);
 
     // Empty-line placeholder so the row still occupies a visual line. Register a
     // zero-width hit at col 0 so a click/drag can still anchor on a blank line.
