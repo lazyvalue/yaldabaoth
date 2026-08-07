@@ -4727,6 +4727,9 @@ impl AgentState {
         if sel.is_some() {
             self.editor.collapse_selection();
         }
+        // bug-0032: a reply is not a lingering selection gesture — clear extend
+        // mode so returning to transcript nav after the reply doesn't auto-highlight.
+        self.editor.set_extend_mode(false);
         // Open like `o` (establishes the anchor + parks any other active block),
         // then REPLACE the compose draft with the seed. Replacing after the open
         // discards only a draft parked AT THIS slot (a reply reseeds fresh by

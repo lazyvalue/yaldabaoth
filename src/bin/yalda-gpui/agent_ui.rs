@@ -5980,11 +5980,30 @@ impl YaldaGpuiView {
                 return;
             }
             if press.modifiers.is_empty() && press.key == Key::Esc {
-                // Esc from transcript navigation returns focus to the compose ONLY
-                // where a compose surface is actually visible: the chatbox box, or
-                // the mid-turn box. In an idle WORKSHEET there is no bottom box and
-                // Esc must NOT focus an invisible compose (bug-hunt-2 B1, found by the
-                // fuzzer) — nav is the resting state, so Esc is a no-op there.
+                // bug-0032: Esc first CANCELS an active selection / exits extend
+                // mode, matching dispatch_normal_core. The worksheet's own Esc
+                // branch shadowed that, so `V`/`v` left `extend_mode` stuck ON and
+                // every subsequent motion auto-highlighted with no way out.
+                let cancelled = self
+                    .with_session(focused_id, cx, |c| {
+                        if c.editor.extend_mode() || c.editor.selection_range().is_some() {
+                            c.editor.set_extend_mode(false);
+                            c.editor.clear_selection();
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                if cancelled {
+                    cx.notify();
+                    return;
+                }
+                // Otherwise Esc returns focus to the compose ONLY where a compose
+                // surface is actually visible: the chatbox box, or the mid-turn box.
+                // In an idle WORKSHEET there is no bottom box and Esc must NOT focus
+                // an invisible compose (bug-hunt-2 B1, found by the fuzzer) — nav is
+                // the resting state, so Esc is a no-op there.
                 if let Some(mut c) = self.agent_mut(cx)
                     && (c.input_surface.is_chatbox() || c.turn_phase.is_awaiting())
                 {

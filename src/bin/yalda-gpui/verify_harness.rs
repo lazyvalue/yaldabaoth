@@ -11928,6 +11928,116 @@ fn worksheet_multiline_selection_quotes_per_line(cx: &mut TestAppContext) {
     });
 }
 
+/// bug-0032: `Esc` in transcript nav exits extend mode + collapses the selection,
+/// so subsequent navigation no longer auto-highlights. Drives real keystrokes.
+///
+/// Negative control (observed RED): drop the Esc cancel branch → after `Esc` the
+/// editor is still in extend mode, so the next `j` GROWS a selection (non-empty).
+#[gpui::test]
+fn worksheet_esc_exits_extend_mode_stops_autohighlight(cx: &mut TestAppContext) {
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::session_proto::Notification as ServerNotification;
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    let ev = |e: ReplyEvent| ServerNotification::ReplyEvent {
+        session_id: "S1".into(),
+        event: e,
+    };
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                ev(ReplyEvent::Chunk("one\ntwo\nthree\n".into())),
+                ev(ReplyEvent::TurnEnded { count: 1 }),
+            ],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        let (s, _e) = c.latest_agent_turn_range().unwrap_or((0, 0));
+        c.editor.cursor_mut().line = s;
+        c.editor.cursor_mut().col = 0;
+    });
+    // Enter char-select and extend — extend mode is now ON.
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("v"), w, cx));
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("l"), w, cx));
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert!(c.editor.extend_mode(), "v turned extend mode on");
+        assert!(
+            c.editor.selection_range().is_some(),
+            "a selection is active"
+        );
+    });
+    // Esc cancels the selection + exits extend mode.
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert!(!c.editor.extend_mode(), "Esc exited extend mode");
+        assert!(
+            c.editor.selection_range().is_none(),
+            "Esc collapsed the selection"
+        );
+    });
+    // Now plain navigation must NOT auto-highlight.
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("j"), w, cx));
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("j"), w, cx));
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        let sel = c
+            .editor
+            .selection_range()
+            .filter(|&((sl, sc), (el, ec))| (sl, sc) != (el, ec));
+        assert!(sel.is_none(), "navigating after Esc must not highlight; got {sel:?}");
+    });
+}
+
+/// bug-0032: the reply gesture clears extend mode, so returning to nav after a
+/// `V`→`r` reply doesn't leave you stuck auto-highlighting.
+///
+/// Negative control (observed RED): drop `set_extend_mode(false)` in
+/// `reply_quote_at_cursor` → `extend_mode` stays ON after `r`.
+#[gpui::test]
+fn worksheet_reply_clears_extend_mode(cx: &mut TestAppContext) {
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::session_proto::Notification as ServerNotification;
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    let ev = |e: ReplyEvent| ServerNotification::ReplyEvent {
+        session_id: "S1".into(),
+        event: e,
+    };
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                ev(ReplyEvent::Chunk("hello world.\n".into())),
+                ev(ReplyEvent::TurnEnded { count: 1 }),
+            ],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        let (s, _e) = c.latest_agent_turn_range().unwrap_or((0, 0));
+        c.editor.cursor_mut().line = s;
+        c.editor.cursor_mut().col = 0;
+    });
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("V"), w, cx));
+    view.update(vcx, |v, cx| {
+        assert!(
+            v.agent_mut(cx).unwrap().editor.extend_mode(),
+            "V turned extend mode on"
+        );
+    });
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("r"), w, cx));
+    view.update(vcx, |v, cx| {
+        assert!(
+            !v.agent_mut(cx).unwrap().editor.extend_mode(),
+            "r cleared extend mode"
+        );
+    });
+}
+
 /// bug-0031: in char-select mode (`v` + motion) the caret on the cursor line
 /// renders as a BEAM at the selection's edge, not a BLOCK one cell past the
 /// highlight — so caret and selection line up. Drives real keystrokes and asserts
