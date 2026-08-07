@@ -8176,6 +8176,10 @@ pub(crate) struct DocRenderTap {
     /// UXI-AgentTile-37: transcript line indices painted with the `>` replied-to
     /// marker this frame (a pending reply's quoted source, shown when not typing).
     pub reply_marker: Vec<usize>,
+    /// bug-0031: on the transcript cursor line, whether the caret painted as a BEAM
+    /// (`true`, Insert-style — during an active selection) or a BLOCK (`false`).
+    /// `None` if no cursor line painted this frame.
+    pub caret_beam_on_cursor_line: Option<bool>,
 }
 
 #[cfg(test)]
@@ -8188,6 +8192,13 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn push_reply_marker_line(line_idx: usize) {
     DOC_RENDER_TAP.with(|t| t.borrow_mut().reply_marker.push(line_idx));
+}
+
+/// Test-only: record how the caret painted on the transcript cursor line this frame
+/// (`true` = beam, `false` = block). bug-0031.
+#[cfg(test)]
+pub(crate) fn push_caret_beam(is_beam: bool) {
+    DOC_RENDER_TAP.with(|t| t.borrow_mut().caret_beam_on_cursor_line = Some(is_beam));
 }
 
 /// Concatenate a `StyledLine`'s span texts into a plain string. Used by the

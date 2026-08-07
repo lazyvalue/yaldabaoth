@@ -11928,6 +11928,67 @@ fn worksheet_multiline_selection_quotes_per_line(cx: &mut TestAppContext) {
     });
 }
 
+/// bug-0031: in char-select mode (`v` + motion) the caret on the cursor line
+/// renders as a BEAM at the selection's edge, not a BLOCK one cell past the
+/// highlight — so caret and selection line up. Drives real keystrokes and asserts
+/// what the render actually painted (`DocRenderTap.caret_beam_on_cursor_line`).
+///
+/// Negative control (observed RED): revert `caret_mode_during_selection` to return
+/// `mode` always (drop the beam) → the caret paints as a BLOCK during the selection
+/// (`caret_beam_on_cursor_line == Some(false)`).
+#[gpui::test]
+fn worksheet_char_select_caret_is_beam(cx: &mut TestAppContext) {
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::session_proto::Notification as ServerNotification;
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    let ev = |e: ReplyEvent| ServerNotification::ReplyEvent {
+        session_id: "S1".into(),
+        event: e,
+    };
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                ev(ReplyEvent::Chunk("First sentence here.\n".into())),
+                ev(ReplyEvent::TurnEnded { count: 1 }),
+            ],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        let (s, _e) = c.latest_agent_turn_range().unwrap_or((0, 0));
+        c.editor.cursor_mut().line = s;
+        c.editor.cursor_mut().col = 0;
+    });
+    // Start a char-wise selection and extend it.
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("v"), w, cx));
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("l"), w, cx));
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("l"), w, cx));
+    vcx.run_until_parked();
+    // Reset the tap, extend once more to force a fresh paint of the cursor line.
+    YaldaGpuiView::test_reset_doc_render_tap();
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("l"), w, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        // Non-vacuous: a non-empty selection really is active.
+        assert!(
+            c.editor
+                .selection_range()
+                .map(|((sl, sc), (el, ec))| (sl, sc) != (el, ec))
+                .unwrap_or(false),
+            "a non-empty selection is active"
+        );
+    });
+    let tap = YaldaGpuiView::test_doc_render_tap();
+    assert_eq!(
+        tap.caret_beam_on_cursor_line,
+        Some(true),
+        "the caret painted as a BEAM (flush with the selection), not a block"
+    );
+}
+
 /// UXI-AgentTile-37: the replied-to source line shows a `>` blockquote marker in
 /// the transcript when NOT typing in the reply block, and it clears on abandon.
 /// Drives the real `r` → `escape` → `u` keystroke path and asserts BOTH the state
@@ -18243,4 +18304,34 @@ fn agent_coming_online_clears_the_unavailable_row(cx: &mut TestAppContext) {
         AgentActivity::Unavailable,
         "a departed agent returns to unavailable"
     );
+}
+
+#[gpui::test]
+fn scratch_doc_bullet_wrap(cx: &mut TestAppContext) {
+    let long = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega and more words to force wrapping across the pane width here";
+    let md = format!("{long}\n\n- {long}\n");
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        let mut v = YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        );
+        v.test_open_doc(&md);
+        v
+    });
+    view.update(vcx, |v, cx| v.set_text_scale(1.0, cx));
+    for _ in 0..3 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let p = crate::layout_probe_get("doc-block-inner-0");
+    let l = crate::layout_probe_get("doc-block-inner-1");
+    crate::layout_probe_end();
+    eprintln!("SCRATCH paragraph inner = {:?}", p);
+    eprintln!("SCRATCH bullet    inner = {:?}", l);
 }

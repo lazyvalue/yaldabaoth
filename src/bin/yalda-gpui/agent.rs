@@ -1146,6 +1146,19 @@ fn transcript_link_element(
     el
 }
 
+/// bug-0031: which caret glyph to draw on the cursor line. While a **non-empty
+/// selection** is active the caret renders as a BEAM (Insert-style, a zero-width
+/// mark before `cursor_col`) instead of a Normal-mode BLOCK — so it sits flush at
+/// the selection's trailing edge (`[start, cursor_col)`) rather than as a block one
+/// cell PAST the highlight. Copy/selection ranges are untouched; this is glyph-only.
+pub(crate) fn caret_mode_during_selection(mode: EditMode, active_selection: bool) -> EditMode {
+    if active_selection {
+        EditMode::Insert
+    } else {
+        mode
+    }
+}
+
 pub(crate) fn build_wrapped_line(
     segs: &[Segment],
     line_str: &str,
@@ -1270,6 +1283,8 @@ pub(crate) fn build_wrapped_line(
 
     // Cursor line: walk tokens by visual column and inject the caret at the
     // cursor's column boundary, splitting the containing token if needed.
+    #[cfg(test)]
+    crate::push_caret_beam(matches!(mode, EditMode::Insert)); // bug-0031
     let line_chars = line_str.chars().count();
     let cursor_col = cursor_col.min(line_chars);
     let token_lens: Vec<usize> = tokens.iter().map(|(t, _)| t.chars().count()).collect();

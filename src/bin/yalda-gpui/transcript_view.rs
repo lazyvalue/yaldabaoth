@@ -1036,12 +1036,21 @@ impl TranscriptView {
                             weak_view: weak_self.clone(),
                             base_dir: link_base_dir.clone(),
                         });
+                        // bug-0031: while a non-empty selection is active, the
+                        // caret on the cursor line renders as a BEAM at the
+                        // selection edge (not a block one cell past the highlight),
+                        // so it lines up with the selection.
+                        let active_sel = line_idx == cursor_line
+                            && sel_snap
+                                .map(|((sl, sc), (el, ec))| (sl, sc) != (el, ec))
+                                .unwrap_or(false);
+                        let caret_mode = crate::caret_mode_during_selection(mode_snap, active_sel);
                         let content = build_wrapped_line(
                             &segs,
                             &line_str,
                             line_idx == cursor_line,
                             cursor_col,
-                            mode_snap,
+                            caret_mode,
                             cursor_color,
                             base_style,
                             line_base_fg,

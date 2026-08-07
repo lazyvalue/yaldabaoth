@@ -35,6 +35,22 @@ fn nightfox_jump_panel_colors_are_art_directed() {
 /// Counts + joins the first N sentences; a decimal point and a common
 /// abbreviation do NOT split; a run with no terminator is one sentence; blank
 /// yields "" (the caller's "nothing to quote" signal).
+/// bug-0031: the caret is a BEAM while a selection is active, a BLOCK otherwise.
+#[test]
+fn caret_mode_during_selection_beams_only_with_selection() {
+    use crate::EditMode;
+    assert_eq!(
+        caret_mode_during_selection(EditMode::Normal, true),
+        EditMode::Insert,
+        "active selection ⇒ beam"
+    );
+    assert_eq!(
+        caret_mode_during_selection(EditMode::Normal, false),
+        EditMode::Normal,
+        "no selection ⇒ block"
+    );
+}
+
 /// UXI-AgentTile-35: a multi-line selection is quoted as a standard Markdown
 /// blockquote — `> ` on every line, a bare `>` for an empty line.
 #[test]
