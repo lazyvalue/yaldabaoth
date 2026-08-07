@@ -34,10 +34,17 @@ A Buffer tile has three text surfaces, all checked headlessly this session:
    - WP: paragraph 1510×45.5 vs bullet 1510×51.5 (bullet taller only by the
      UXI-ParagraphSpacing-1 list gap).
    → **No bullet-specific whitespace-wrap failure at valid widths.**
-2. A long UNBROKEN token (path/URL, no spaces) does NOT wrap in the doc view —
-   paragraph AND bullet both stay one line (22.5px) and overflow. This is a
-   SHARED gap (no char/overflow-wrap), not bullet-specific — but a user whose
-   bullets hold long paths would notice it there first. Candidate root cause.
+2. ~~A long UNBROKEN token does NOT wrap in the doc view.~~ **CORRECTED
+   2026-08-07:** this was a measurement error — the ~130-char test token simply
+   *fit* the 1507px pane, so it never needed to wrap. Re-tested with a genuinely
+   over-long token (600 `a`s, far wider than any pane): the doc view **does**
+   char-wrap it — paragraph AND bullet both became ~6 lines (90.5px). So gpui
+   `StyledText` breaks over-long words at char boundaries. **The rendered doc
+   view has no wrap defect** (whitespace wrap AND char-wrap both work, bullets ==
+   paragraphs). The edit views' `build_wrapped_line` (whitespace-token
+   `flex_wrap`) would NOT char-break a single over-long token, but that is a
+   niche case (a 600-char unbroken token while typing) clipped by
+   `overflow_x_hidden`, and is not "wrapping fails on bullets".
 3. Narrow-width headless numbers are UNRELIABLE: `simulate_resize(360×700)`
    leaves the probe x-origin at 368 (unchanged) and collapses BOTH paragraph and
    bullet to min-content (~91px, word-per-line). Artifact of the virtualized
@@ -47,11 +54,11 @@ A Buffer tile has three text surfaces, all checked headlessly this session:
 **Could not localize a bullet-specific wrap failure on the real render path.**
 Per the anti-circling rules, no speculative fix was shipped.
 
-Two plausible real causes remain, both needing a concrete repro to confirm:
-- (A) unbroken-token char-wrap gap (finding #2) — real, shared by all prose.
-- (B) `ListSizingBehavior::Auto` on the edit lists min-content-collapsing at
-  narrow (split-pane) widths — suspected but not cleanly reproduced headlessly
-  because `simulate_resize` doesn't reflow the list.
+One plausible real cause remains, needing a concrete repro to confirm:
+- `ListSizingBehavior::Auto` on the EDIT lists min-content-collapsing at narrow
+  (split-pane) widths — suspected but not cleanly reproduced headlessly because
+  `simulate_resize` doesn't reflow the virtualized list. (Finding #2's
+  unbroken-token idea is RETRACTED — the doc view char-wraps fine.)
 
 ## Planned solution
 
@@ -70,6 +77,10 @@ since `simulate_resize` is an unreliable headless proxy here).
 - Assuming the doc-view list collapses like the UXI-AgentTile-26 transcript bug
   did — DISPROVEN headlessly: doc-view bullets wrap identically to paragraphs at
   valid widths (the `flex_1().min_w_0()` double-nest already holds).
+- Assuming unbroken tokens don't char-wrap in the doc view — DISPROVEN: gpui
+  `StyledText` char-wraps a 600-char token into ~6 lines (the earlier "1 line"
+  reading was a token that FIT the pane). Do NOT ship a char-wrap "fix" for the
+  doc view; there is nothing to fix there.
 - Trusting `simulate_resize` narrow-width layout numbers — they are an artifact
   (x-origin unchanged, both blocks collapse to min-content). Do NOT localize a
   narrow-width bug from them; use a live-app read instead.
@@ -87,7 +98,16 @@ a temporary `wp-line-{i}` probe. Compared a long paragraph vs a long bullet with
 "Context / root cause" above. Reverted all scratch instrumentation
 (`git checkout`); tree clean; `cargo build --bin yalda-gpui` green.
 
-Outcome: could not reproduce a bullet-specific wrap failure at a valid width;
-found a shared unbroken-token char-wrap gap as the leading candidate. Left OPEN
-pending a concrete repro (view + markdown + pane width). No code committed —
-shipping a fix here would be a guess against an un-localized symptom.
+Outcome: could not reproduce a bullet-specific wrap failure at a valid width.
+Left OPEN pending a concrete repro (view + markdown + pane width). No code
+committed — shipping a fix here would be a guess against an un-localized symptom.
+
+### 2026-08-07 — retraction of the unbroken-token candidate
+
+Re-tested with a 600-char unbroken token (far wider than any pane): the doc view
+char-wraps it into ~6 lines (paragraph AND bullet). So the doc view has NO wrap
+defect — the earlier "unbroken tokens don't wrap" finding was a measurement
+error (a ~130-char token that fit the 1507px pane). Corrected finding #2 above.
+Only remaining suspect is edit-list `ListSizingBehavior::Auto` collapse at narrow
+split-pane widths, which needs a live-app read (not `simulate_resize`). Still
+OPEN; still no speculative fix.
