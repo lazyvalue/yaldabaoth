@@ -73,3 +73,6 @@ a ticket.
   happened in a session. `/plan` is the umbrella that threads these together for
   work too big for one session — it points at the specs/ADRs and tracks the
   tickets that execute them.
+- `/cog-plan` is the executable dependency graph for approved multi-step work;
+  `/cog-execute` drives that graph. The project/ticket record remains durable
+  product context, while Cog is authoritative for live execution state.

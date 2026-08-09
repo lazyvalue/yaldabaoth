@@ -1,0 +1,4 @@
+interface:
+  display_name: "Execute Cog Graph"
+  short_description: "Drive a Cog graph through completion"
+  default_prompt: "Use $cog-execute to resume and complete this Cog graph."

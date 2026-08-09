@@ -18,7 +18,7 @@ You MUST create a task for each of these items and complete them in order:
 5. **Write spec** — save to `docs/specs/{module}/spec-{name}.md` (or `docs/specs/spec-{name}.md` for top-level / cross-module specs)
 6. **Spec self-review** — quick inline check for placeholders, contradictions, ambiguity, scope (see below)
 7. **Adversarial review** — spawn a subagent via the Agent tool using the prompt at `.claude/skills/spec/adversarial-review.md`. Pass the spec path and the paths of any cross-referenced specs. Present the reviewer's checklist output to the user **verbatim**, alongside the spec path. Do not summarize, triage, or rebut it. Do not loop it back into the drafter — the user decides what to act on.
-8. **User reviews written spec** — ask user to review the spec file and the reviewer's checklist. Stop there — yalda does not have a separate plan/implement flow; the user takes the approved spec to a coding session directly.
+8. **User reviews written spec** — ask user to review the spec file and the reviewer's checklist. Stop there. After approval, `/cog-plan` materializes the executable dependency graph and `/cog-execute` drives it; use `/plan` as well when the effort needs a durable multi-session project/ticket record.
 
 ## Inputs
 

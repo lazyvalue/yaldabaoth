@@ -1,0 +1,4 @@
+interface:
+  display_name: "Plan with Cog"
+  short_description: "Build a durable Cog dependency graph"
+  default_prompt: "Use $cog-plan to turn this approved work into an executable dependency graph."

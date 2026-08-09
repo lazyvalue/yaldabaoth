@@ -86,6 +86,41 @@ land and keep the session task list in sync; new threads get a new ticket
 (`NNN+1`), not scope creep. Live on `main`. Example:
 `docs/projects/agent-model-refactor/`.
 
+### Mandatory Cog orchestration
+
+Use Cog as the mandatory execution source of truth for every non-trivial request
+to specify, plan, implement, or change product/process behavior. Small, genuinely
+single-step edits do not need a graph. The user's request authorizes creation of
+the planning graph; ask again only when scope is ambiguous or the plan expands it.
+
+Before editing tracked files:
+
+1. Confirm `cogd` is reachable with `cog graph list`.
+2. Create or import a graph and use actor `claude-code` for every mutation.
+3. Show the graph id and `cog graph render <id> --frontiers` to the user.
+
+Then claim each ready node before doing its work and close it only after its
+acceptance criteria are verified, attaching meaningful JSON output. Heartbeat
+long claims. Record cross-cutting decisions and deviations as graph notes, and
+node-local facts as node notes. Update the graph before doing newly discovered
+work. Re-read graph status, ready nodes, inputs, logs, and notes instead of
+relying on conversation memory.
+
+- `/cog-plan <goal>` decomposes approved work into a dependency graph. It is
+  distinct from `/plan`, which maintains Yaldabaoth's durable project/ticket
+  record under `docs/projects/`; use both when work needs both forms of record.
+- `/cog-execute <graph-id>` resumes and drives a graph to completion.
+- Claude's task list or prose plan may supplement Cog but cannot replace it.
+- An empty ready set is not completion. Claim and close omega, confirm
+  `cog graph status <id>` is `complete`, and capture the final frontier render.
+- Finish non-trivial work with `/worklog`, validate it using
+  `scripts/check-cog-worklog.sh <worklog>`, and include the graph id, final
+  status, and render in the handoff.
+
+Never reconstruct a graph after implementation to simulate compliance. If Cog
+is unavailable, stop before tracked-file edits and surface the prerequisite. The
+user may explicitly opt out of Cog for a particular request.
+
 **Definition of done:** builds + tests + pasted evidence + runtime-checked-or-
 flagged + artifacts updated. "Compiles" is not done, and neither is "a green test"
 — the test must exercise the REAL path the user's action runs and be observed RED

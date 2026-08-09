@@ -20,11 +20,17 @@ without re-deriving state from git. Worklog = the *past* (what happened);
 2. **Write the entry** to `docs/worklog/YYYY-MM-DD-<slug>.md` using
    `docs/worklog/template.md`. Slug = a few words on the session's theme.
    Convert relative dates to absolute. One line per branch with its commit.
+   Populate the mandatory **Cog execution evidence** from the actual graph: id,
+   initial render, claim/close outputs, note sequences/topics, complete status,
+   and final render.
 3. **Update `docs/backlog.md`** — move finished items out, add new open/deferred/
    flagged ones with status (`IN-FLIGHT`/`READY`/`DEFERRED`/`NEEDS-DECISION`/
    `NEEDS-RUNTIME`) and a reason. Cross-link ADRs.
 4. **Link, don't duplicate** — point at ADRs for rationale and the backlog for
    open work; the worklog narrates, it doesn't restate them.
+5. **Validate Cog evidence** with
+   `scripts/check-cog-worklog.sh <worklog>`. Do not hand off non-trivial work
+   with a failing evidence check.
 
 ## Constraints
 

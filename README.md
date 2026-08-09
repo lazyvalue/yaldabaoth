@@ -12,6 +12,13 @@ existing sessions show their provider in the selector and the bound tile shows i
 in the status strip. Provider ownership is durable, so clear, restart, resume, and
 working-directory changes keep using the same backend.
 
+Repository automation uses Cog for durable orchestration of
+non-trivial changes. Start a reachable `cogd`, then use `/cog-plan <goal>` and
+`/cog-execute <graph-id>`. Claude Code discovers these project skills under
+`.claude/skills/`; Codex uses the compatibility links under `.agents/skills/`.
+The canonical lifecycle policy is in `CLAUDE.md`, with `AGENTS.md` as the bridge
+for non-Claude hosts.
+
 Codex setup:
 
 ```sh
