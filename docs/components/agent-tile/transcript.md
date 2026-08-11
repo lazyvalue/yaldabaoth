@@ -22,6 +22,8 @@ highlight, and a thinking indicator while awaiting. Append-only / ordered
 - `docs/components/agent-tile/README.md` — parent component.
 - `docs/components/common/paragraph-spacing.md` — the transcript's markdown
   blocks + list items obey `ParagraphSpacing` (`UXI-ParagraphSpacing-1`).
+- `docs/components/common/diagram.md` — a `mermaid` fenced block renders inline as
+  its diagram image in the transcript (`UXI-Diagram-1`).
 
 ## UX invariants
 

@@ -18593,3 +18593,153 @@ fn agent_coming_online_clears_the_unavailable_row(cx: &mut TestAppContext) {
         "a departed agent returns to unavailable"
     );
 }
+
+// ── UXI-Diagram-1: inline mermaid diagrams ──────────────────────────────────
+//
+// Three headless guards over the REAL paths. The only genuine runtime gaps are
+// the actual `mmdc` subprocess (gap 2) and the rasterized PNG pixels (gap 1);
+// the render mechanism is stubbed via `crate::set_test_renderer` so the whole
+// classify → reconcile → off-thread request → completion pipeline runs without
+// `mmdc` installed.
+
+/// Single marker-based render stub, installed by every diagram guard. Branching
+/// on the SOURCE (not on which stub is set) makes it race-free under cargo's
+/// parallel test threads: the global override is only ever written to this one
+/// fn pointer, never cleared, so tests can't stomp each other's renderer.
+/// Source containing `FAIL` → error (mmdc-unavailable case); otherwise a valid
+/// 1×1 transparent PNG so a successful render decodes.
+fn diagram_stub(source: &str, _theme: crate::MermaidTheme) -> Result<Vec<u8>, String> {
+    if source.contains("FAIL") {
+        return Err("stub: mmdc unavailable".to_string());
+    }
+    Ok(vec![
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ])
+}
+
+/// (a) A ` ```mermaid ` fence classifies to `RenderedBlock::Diagram` via the
+/// REAL markdown parser the doc/transcript both use (`render::render`); a
+/// non-mermaid fence stays a `CodeBlock`.
+///
+/// Negative control (observed RED): revert the `is_mermaid` branch in
+/// `src/render.rs` (always push `CodeBlock`) → the first assert fails.
+#[gpui::test]
+fn diagram_001_mermaid_fence_classifies_to_diagram(_cx: &mut TestAppContext) {
+    let theme = Theme::default();
+    let blocks = yalda::render::render("```mermaid\ngraph TD; A-->B;\n```\n", &theme);
+    assert!(
+        matches!(
+            blocks.first(),
+            Some(yalda::blocks::RenderedBlock::Diagram { .. })
+        ),
+        "a ```mermaid fence must classify to RenderedBlock::Diagram, got {:?}",
+        blocks.first()
+    );
+    let rust = yalda::render::render("```rust\nfn a() {}\n```\n", &theme);
+    assert!(
+        matches!(
+            rust.first(),
+            Some(yalda::blocks::RenderedBlock::CodeBlock { .. })
+        ),
+        "a non-mermaid fence must stay a CodeBlock, got {:?}",
+        rust.first()
+    );
+}
+
+/// (b) When the renderer is unavailable/errors, the real pipeline (open doc →
+/// per-frame reconcile → off-thread request → completion) resolves the diagram
+/// to `Failed` — the fallback-to-raw-source trigger — and the block still paints
+/// (never blank).
+///
+/// Negative control (observed RED): revert the `self.reconcile_diagrams(cx)`
+/// call in `main.rs render()` → no request is ever issued, the cache stays
+/// empty, and the `state_of == "failed"` assert fails.
+#[gpui::test]
+fn diagram_002_render_failure_falls_back_to_source(cx: &mut TestAppContext) {
+    crate::set_test_renderer(Some(diagram_stub));
+
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        let mut v = YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        );
+        // `FAIL` in the source drives the stub to the mmdc-unavailable branch.
+        v.test_open_doc("```mermaid\ngraph TD; FAIL-->B;\n```\n");
+        v
+    });
+    for _ in 0..3 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+
+    let theme_name = view.read_with(vcx, |v, _| v.theme.name);
+    let key = crate::diagram_key(
+        "graph TD; FAIL-->B;",
+        crate::MermaidTheme::from_theme_name(theme_name),
+    );
+    view.read_with(vcx, |v, _| {
+        assert_eq!(
+            v.diagrams.borrow().state_of(key),
+            Some("failed"),
+            "a failed render must resolve to Failed (the fallback trigger); got {:?}",
+            v.diagrams.borrow().state_of(key)
+        );
+    });
+
+    // Non-vacuous: the mermaid block still paints its raw-source fallback.
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let painted = crate::layout_probe_get("doc-block-0");
+    crate::layout_probe_end();
+    let (_, _, _, h) = painted.expect("mermaid fallback block did not paint (blank!)");
+    assert!(h > 0.0, "fallback block painted with zero height");
+}
+
+/// (c) A successful render drives the real off-thread request to `Ready` with a
+/// decoded image — the state the paint arm swaps to `img()` on.
+///
+/// Negative control (observed RED): revert the `Ok(bytes) => …set Ready` arm in
+/// `request_diagram`'s completion (leave the entry `Pending`) → the
+/// `state_of == "ready"` assert fails.
+#[gpui::test]
+fn diagram_003_successful_render_reaches_ready(cx: &mut TestAppContext) {
+    crate::set_test_renderer(Some(diagram_stub));
+
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        )
+    });
+
+    view.update(vcx, |v, cx| {
+        let name = v.theme.name;
+        v.request_diagram("graph TD; A-->B;", name, cx);
+    });
+    vcx.run_until_parked();
+
+    let theme_name = view.read_with(vcx, |v, _| v.theme.name);
+    let key = crate::diagram_key(
+        "graph TD; A-->B;",
+        crate::MermaidTheme::from_theme_name(theme_name),
+    );
+    view.read_with(vcx, |v, _| {
+        assert_eq!(
+            v.diagrams.borrow().state_of(key),
+            Some("ready"),
+            "a successful render must resolve to Ready; got {:?}",
+            v.diagrams.borrow().state_of(key)
+        );
+    });
+}

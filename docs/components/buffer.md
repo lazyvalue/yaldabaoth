@@ -32,6 +32,8 @@ versa. Primary code home: `screens.rs::render_doc` / `render_edit` /
 - `docs/components/common/text-zoom.md` — the Doc/Edit views obey `TextZoom`.
 - `docs/components/common/paragraph-spacing.md` — the Doc view + WP obey
   `ParagraphSpacing` (`UXI-ParagraphSpacing-1`).
+- `docs/components/common/diagram.md` — a `mermaid` fenced block renders inline as
+  its diagram image in the `Viewing` (Doc) view (`UXI-Diagram-1`).
 
 ## UX invariants
 

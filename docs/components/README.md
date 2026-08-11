@@ -57,7 +57,8 @@ holds the detail for a slice. The UXI ids stay owned by the component, not the f
 - [system-console.md](system-console.md) — `SystemConsole`. A drop-down,
   persistent operational log and self-rebuild/relaunch surface.
 - [common/](common/README.md) — shared behaviors: `TextEditing`, `Selection`,
-  `TextZoom`, `Blockquote`, `ParagraphSpacing`, `Menu` (leader command panel).
+  `TextZoom`, `Blockquote`, `ParagraphSpacing`, `Menu` (leader command panel),
+  `Diagram` (inline mermaid rendering).
 
 ## Terminology (use these words)
 

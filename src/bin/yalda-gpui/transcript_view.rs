@@ -503,9 +503,11 @@ impl TranscriptView {
             syntect_hl,
             show_heading_markers,
             text_scale,
+            diagrams: diagrams_snap,
         } = {
             let root = root_ent.read(cx);
             RootSnapshot {
+                diagrams: root.diagrams.clone(),
                 theme: root.theme.clone(),
                 agent_theme: root.theme.agent.clone(),
                 code_font: root.code_font.clone(),
@@ -970,6 +972,7 @@ impl TranscriptView {
             let self_editor_fg = editor_fg;
             let token_sink_snap = token_sink.clone();
             let block_ranges_by_item = block_ranges_by_item.clone();
+            let diagrams_snap = diagrams_snap.clone();
             move |idx: usize, _w: &mut Window, _app: &mut GpuiApp| -> AnyElement {
                 let item = &flat_items[idx];
                 match item {
@@ -1416,6 +1419,7 @@ impl TranscriptView {
                             block_count: 0,
                             show_heading_markers,
                             block_hits,
+                            diagrams: Some(diagrams_snap.clone()),
                         };
                         let inner = block_inner(&ctx, rendered_block);
                         // UXI-ParagraphSpacing-1: base 4px plus HALF the readability
@@ -1773,6 +1777,12 @@ struct RootSnapshot {
     editor_fg_u32: u32,
     frozen_fg_u32: u32,
     syntect_hl: std::rc::Rc<yalda::highlight::Highlighter>,
+    /// Read handle on the root's rendered-mermaid-diagram cache (`UXI-Diagram-1`).
+    /// Threaded into the `FlatItem::Block` `RenderCtx` so a `Diagram` block
+    /// paints its ready image (or the raw-source fallback). Root-owned; the
+    /// render completion pushes via `notify_transcript_views`, so no per-session
+    /// seq is needed.
+    diagrams: std::rc::Rc<RefCell<DiagramCache>>,
     /// Global heading-marker toggle (agent-chat-only). Pushed via
     /// `notify_transcript_views`, so it busts the cache without a per-session
     /// seq. Threaded into the `FlatItem::Block` `RenderCtx`.

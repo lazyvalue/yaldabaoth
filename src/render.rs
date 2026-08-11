@@ -153,12 +153,25 @@ impl<'a, 't> Renderer<'a, 't> {
                         self.plain_code_lines(&code_text)
                     };
 
-                    blocks.push(RenderedBlock::CodeBlock {
-                        language,
-                        lines,
-                        source_file: false,
-                        start_line: 0,
-                    });
+                    // A ` ```mermaid ` fence becomes a Diagram block (rendered
+                    // to an image off-thread by the frontend), carrying the
+                    // highlighted `lines` as placeholder/fallback. Any other
+                    // language stays a CodeBlock. See UXI-Diagram-1.
+                    let is_mermaid = language
+                        .as_deref()
+                        .and_then(|l| l.split_whitespace().next())
+                        .is_some_and(|tok| tok.eq_ignore_ascii_case("mermaid"));
+                    if is_mermaid {
+                        let source = code_text.strip_suffix('\n').unwrap_or(&code_text).to_string();
+                        blocks.push(RenderedBlock::Diagram { source, lines });
+                    } else {
+                        blocks.push(RenderedBlock::CodeBlock {
+                            language,
+                            lines,
+                            source_file: false,
+                            start_line: 0,
+                        });
+                    }
                 }
                 Event::Start(Tag::Table(alignments)) => {
                     let aligns: Vec<ColumnAlignment> = alignments

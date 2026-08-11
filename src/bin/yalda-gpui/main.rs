@@ -69,6 +69,7 @@
 
 mod agent;
 mod agent_naming;
+mod diagram;
 mod agent_roster;
 mod agent_sessions;
 mod agent_ui;
@@ -100,6 +101,7 @@ mod verify_harness;
 mod yux;
 pub(crate) use agent::*;
 pub(crate) use agent_naming::*;
+pub(crate) use diagram::*;
 pub(crate) use agent_roster::*;
 pub(crate) use agent_sessions::*;
 pub(crate) use jump_palette::*;
@@ -1684,6 +1686,12 @@ struct YaldaGpuiView {
     /// the unzoomed default; clamped to [MIN_TEXT_SCALE, MAX_TEXT_SCALE] on
     /// every adjustment.
     text_scale: f32,
+    /// Rendered-mermaid-diagram cache (`UXI-Diagram-1`), keyed by
+    /// `hash(source + theme + width)`. Shared behind `Rc<RefCell<…>>` so the
+    /// paint path reads it (via `RenderCtx`) and `request_diagram`'s off-thread
+    /// completion writes it. Read-only during render; written only from the
+    /// spawn callback (an event context).
+    diagrams: Rc<RefCell<DiagramCache>>,
     /// Last observed outer-window restore size. Kept in the view so every
     /// settings save preserves it, and updated only by the window-bounds
     /// observer (never as a render side effect).
@@ -1907,6 +1915,7 @@ impl YaldaGpuiView {
             window_width_px: DEFAULT_WINDOW_WIDTH_PX,
             window_height_px: DEFAULT_WINDOW_HEIGHT_PX,
             show_agent_heading_markers: true,
+            diagrams: Default::default(),
             keymap_registry: KeymapRegistry::load(),
             desktop_grid_cols: DEFAULT_DESKTOP_GRID_COLS,
             desktop_grid_rows: DEFAULT_DESKTOP_GRID_ROWS,
@@ -1969,6 +1978,7 @@ impl YaldaGpuiView {
             window_width_px: DEFAULT_WINDOW_WIDTH_PX,
             window_height_px: DEFAULT_WINDOW_HEIGHT_PX,
             show_agent_heading_markers: true,
+            diagrams: Default::default(),
             keymap_registry: KeymapRegistry::load(),
             desktop_grid_cols: DEFAULT_DESKTOP_GRID_COLS,
             desktop_grid_rows: DEFAULT_DESKTOP_GRID_ROWS,
@@ -7782,6 +7792,12 @@ impl Render for YaldaGpuiView {
                 });
             }
         }
+
+        // UXI-Diagram-1: ensure every mermaid Diagram block visible on either
+        // markdown surface has a render in flight. Idempotent (dedups by cache
+        // key) and mutation-only (spawns off-thread; the completion notifies,
+        // never this pass), so it is safe to run every frame here.
+        self.reconcile_diagrams(cx);
 
         // Behavior 9 (spec-menu-scopes.md): if the focused window changed
         // while a menu was open, dismiss it — stale entries must not

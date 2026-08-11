@@ -124,6 +124,7 @@ impl YaldaGpuiView {
         let line_layouts = self.line_layouts.clone();
         let weak_view = cx.entity().downgrade();
         let blocks_rc = d.blocks_rc();
+        let diagrams = self.diagrams.clone();
 
         let render_fn = move |idx: usize, _w: &mut Window, _app: &mut GpuiApp| -> AnyElement {
             let Some(block) = blocks_rc.get(idx) else {
@@ -148,6 +149,7 @@ impl YaldaGpuiView {
                 // Doc view uses `doc_selection`/`line_layouts`, not the
                 // transcript code-block hit path.
                 block_hits: None,
+                diagrams: Some(diagrams.clone()),
             };
             let el = block_element(&ctx, idx, block);
             // UXI-ParagraphSpacing-1 test seam: expose each doc block's painted

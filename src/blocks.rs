@@ -64,6 +64,17 @@ pub enum RenderedBlock {
         alignments: Vec<ColumnAlignment>,
     },
     HorizontalRule,
+    /// A ` ```mermaid ` fenced block. `source` is the exact fence body (the
+    /// mermaid text), rendered off-thread to a diagram image by the frontend;
+    /// `lines` are the syntax-highlighted source lines used as the placeholder
+    /// (until the image is ready) and the fallback (when the renderer is
+    /// absent or errors). Structurally distinct from `CodeBlock` so renderers
+    /// can paint an image and opt out of per-line code hit-testing.
+    /// See `UXI-Diagram-1` (`docs/components/common/diagram.md`).
+    Diagram {
+        source: String,
+        lines: Vec<StyledLine>,
+    },
     Image {
         alt: String,
         url: String,

@@ -577,6 +577,20 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ## Features
 
+- **Render mermaid diagrams inline** — `NEEDS-RUNTIME` (built 2026-08-11 via
+  `/new-ux`, branch `mermaid-diagrams`, Cog graph `sve`; `UXI-Diagram-1`). A
+  ` ```mermaid ` fence renders as its diagram inline on the agent transcript AND the
+  buffer Viewing surface (shared `block_inner`); Editing shows raw source. Mechanism
+  A (locked): async shell to `mmdc` → PNG, painted via `img()`, cached by
+  `hash(source+theme)`; placeholder + fallback = raw highlighted source (+ note) when
+  `mmdc` is absent/errors — never blank; theme-matched. No zoom/click v1; the image
+  opts out of per-line hit-testing. Headless-guarded (`diagram_001/002/003`, 3
+  negative controls observed RED); 547 bin + 166 lib green. Deviations: width dropped
+  from the cache key (paint can't know layout width); nested-in-list mermaid falls
+  back to source (only top-level surfaces wire the handle); no cache eviction on
+  theme switch (new key requested, old entry lingers). Runtime gaps (the only
+  `NEEDS-RUNTIME`): gap 1 the actual PNG pixels, gap 2 the live `mmdc` subprocess
+  (needs `mmdc` on `PATH`).
 - **Close session needs a confirm** — `NEEDS-RUNTIME` (built 2026-07-21 via
   `/new-ux`; `UXI-AgentTile-22`). The agent space-menu `x` no longer closes: it
   appends `> <Yaldabaoth System>: Confirm close session (yes or any key for no)?`

@@ -28,3 +28,5 @@ them by id.
   agent transcript, WP), scaled with zoom.
 - [menu.md](menu.md) — `Menu`: the leader command panel (the floating "Sigil Card"),
   shared by every tile's `space` / `.` / `?` leaders. `UXI-Menu-1..4`.
+- [diagram.md](diagram.md) — `Diagram`: a `mermaid` fenced block renders inline as
+  its diagram image on the agent transcript + buffer `Viewing`. `UXI-Diagram-1`.

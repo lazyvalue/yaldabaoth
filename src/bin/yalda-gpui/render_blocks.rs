@@ -597,6 +597,12 @@ pub(crate) struct RenderCtx<'a> {
     /// so code-block selection was invisible and grabbed the wrong lines). The
     /// doc/edit views leave this `None` (they use `doc_selection`/`line_layouts`).
     pub(crate) block_hits: Option<BlockHits>,
+    /// Read handle on the root view's rendered-diagram cache (`UXI-Diagram-1`).
+    /// The `RenderedBlock::Diagram` arm looks up `hash(source + theme + width)`
+    /// and paints the ready image, or the raw-source placeholder/fallback.
+    /// Read-only here; populated at the two top-level render sites (doc view +
+    /// transcript), `None` in nested/edit contexts (they inherit the parent's).
+    pub(crate) diagrams: Option<std::rc::Rc<RefCell<DiagramCache>>>,
 }
 
 /// bug-0017: side channel that makes a transcript code Block's content lines
@@ -1365,6 +1371,7 @@ pub(crate) fn block_element(ctx: &RenderCtx<'_>, idx: usize, block: &RenderedBlo
         show_heading_markers: ctx.show_heading_markers,
         // Nested/doc-view blocks don't use the transcript code-block hit path.
         block_hits: None,
+        diagrams: ctx.diagrams.clone(),
     };
     let base = block_inner(&inner_ctx, block);
 
@@ -1570,6 +1577,38 @@ pub(crate) fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElem
             }
             col.into_any_element()
         }
+        RenderedBlock::Diagram { source, lines } => {
+            // UXI-Diagram-1. Paint the rendered mermaid PNG when it is ready;
+            // otherwise paint the raw highlighted source — as a placeholder
+            // while the async render runs, or as the fallback (plus a note)
+            // when `mmdc` is absent or errored. READ-ONLY: this path never
+            // requests a render or notifies (that happens in the reconcile
+            // pass; see `dispatch-notify` / `request_diagram`). The rendered
+            // image opts out of the per-line code hit-testing that
+            // `CodeBlock` participates in — there is no text to select in a
+            // bitmap; the raw source stays selectable in the Editing view.
+            let ready = ctx.diagrams.as_ref().and_then(|cache| {
+                let key = diagram_key(source, MermaidTheme::from_theme_name(ctx.theme.name));
+                match cache.borrow().get(key) {
+                    Some(DiagramRender::Ready(image)) => Some(Ok(image.clone())),
+                    Some(DiagramRender::Failed(msg)) => Some(Err(msg.clone())),
+                    // Pending or not-yet-requested: placeholder.
+                    _ => None,
+                }
+            });
+            match ready {
+                Some(Ok(image)) => div()
+                    .child(img(image).max_w_full().object_fit(ObjectFit::Contain))
+                    .into_any_element(),
+                other => {
+                    let note = match other {
+                        Some(Err(msg)) => Some(msg),
+                        _ => None,
+                    };
+                    diagram_fallback_column(ctx, lines, note)
+                }
+            }
+        }
         RenderedBlock::BlockQuote { blocks } => {
             let bar = ctx.theme.blockquote_bar;
             let txt = ctx.theme.blockquote_text;
@@ -1599,6 +1638,7 @@ pub(crate) fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElem
                         show_heading_markers: ctx.show_heading_markers,
                         // Nested blocks don't use the transcript code-block hit path.
                         block_hits: None,
+                        diagrams: ctx.diagrams.clone(),
                     },
                     b,
                 ));
@@ -1719,6 +1759,7 @@ pub(crate) fn list_item_element(
                 show_heading_markers: ctx.show_heading_markers,
                 // Nested blocks don't use the transcript code-block hit path.
                 block_hits: None,
+                diagrams: ctx.diagrams.clone(),
             },
             b,
         ));
@@ -2117,6 +2158,7 @@ pub(crate) fn render_markdown_column(
         block_count: blocks.len(),
         show_heading_markers: false,
         block_hits: None,
+        diagrams: None,
     };
     let cap = max_blocks.unwrap_or(blocks.len());
     let gap = paragraph_gap(text_scale);
@@ -2218,8 +2260,9 @@ pub(crate) fn expand_wiki_links_in_block(block: &mut RenderedBlock, theme: &Them
             }
         }
         // Code blocks: deliberately untouched. `[[foo]]` inside a fenced
-        // block is code text, not a link.
-        RenderedBlock::CodeBlock { .. } => {}
+        // block is code text, not a link. A mermaid Diagram is the same — its
+        // source is code, not prose (UXI-Diagram-1).
+        RenderedBlock::CodeBlock { .. } | RenderedBlock::Diagram { .. } => {}
         RenderedBlock::BlockQuote { blocks } => expand_wiki_links_in_blocks(blocks, theme),
         RenderedBlock::List { items, .. } => {
             for item in items.iter_mut() {
@@ -2241,6 +2284,57 @@ pub(crate) fn expand_wiki_links_in_block(block: &mut RenderedBlock, theme: &Them
         | RenderedBlock::Image { .. }
         | RenderedBlock::Metadata { .. } => {}
     }
+}
+
+/// Paint a mermaid `Diagram` block's raw highlighted source (`UXI-Diagram-1`):
+/// the placeholder while the async render runs, and the fallback when `mmdc` is
+/// absent or errors. Mirrors the fenced-`CodeBlock` column (tinted background +
+/// per-line highlight), tagged `[mermaid]`, with an optional trailing note line
+/// carrying the render error. Never blank.
+fn diagram_fallback_column(
+    ctx: &RenderCtx<'_>,
+    lines: &[StyledLine],
+    note: Option<String>,
+) -> AnyElement {
+    let code_fg = ncolor_to_u32(ctx.theme.editor_fg, DEFAULT_FG);
+    let bg = ctx.theme.code_block_bg;
+    let mut col = div()
+        .flex()
+        .flex_col()
+        .font_family(ctx.code_font.clone())
+        .text_color(rgb(code_fg))
+        .p_2()
+        .rounded_md()
+        .bg(bg_or(bg, BG))
+        .child(
+            div()
+                .text_color(rgb(0x6272a4))
+                .text_size(px(11.0))
+                .pb_1()
+                .child("[mermaid]"),
+        );
+    let row_style = NStyle::default();
+    for (li, line) in lines.iter().enumerate() {
+        col = col.child(doc_styled_line_element(
+            ctx,
+            line,
+            row_style,
+            code_fg,
+            &ctx.code_font,
+            &ctx.code_font,
+            li,
+        ));
+    }
+    if let Some(msg) = note {
+        col = col.child(
+            div()
+                .text_color(rgb(0x6272a4))
+                .text_size(px(11.0))
+                .pt_1()
+                .child(format!("mermaid: {msg}")),
+        );
+    }
+    col.into_any_element()
 }
 
 /// Does this block contain any link (hyperlink span or expanded wiki link)?
@@ -2265,6 +2359,9 @@ pub(crate) fn block_contains_link(block: &RenderedBlock) -> bool {
         RenderedBlock::HorizontalRule => false,
         // Frontmatter carries no expanded links (bug-0014).
         RenderedBlock::Metadata { .. } => false,
+        // A mermaid Diagram has no links: its source is code, and the rendered
+        // image opts out of hit-testing (UXI-Diagram-1).
+        RenderedBlock::Diagram { .. } => false,
         // An image is itself a navigable target (it carries a URL).
         RenderedBlock::Image { .. } => true,
     }
