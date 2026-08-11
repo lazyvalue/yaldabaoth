@@ -101,11 +101,22 @@ pub struct Document {
 
 impl Document {
     pub fn from_text(text: String, file_path: PathBuf) -> Self {
+        Self::from_text_with_edit_seq(text, file_path, 0)
+    }
+
+    /// Construct a whole-buffer replacement at a caller-owned generation.
+    /// `EditorCore::replace_text` uses this to keep the generation monotonic
+    /// across a reload instead of aliasing existing generation-keyed caches.
+    pub(crate) fn from_text_with_edit_seq(
+        text: String,
+        file_path: PathBuf,
+        edit_seq: u64,
+    ) -> Self {
         Self {
             rope: Rope::from_str(&text),
             file_path,
             modified: false,
-            edit_seq: 0,
+            edit_seq,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             pending_undo: None,
