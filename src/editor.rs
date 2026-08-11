@@ -298,10 +298,14 @@ impl EditAccess for Editor {
 
 impl EditorCore {
     pub fn new(text: String, file_path: PathBuf) -> Self {
+        Self::new_with_edit_seq(text, file_path, 0)
+    }
+
+    fn new_with_edit_seq(text: String, file_path: PathBuf, edit_seq: u64) -> Self {
         let mut tree_state = TreeState::new();
         tree_state.parse(text.as_bytes(), None);
 
-        let document = Document::from_text(text, file_path);
+        let document = Document::from_text_with_edit_seq(text, file_path, edit_seq);
         Self {
             document,
             tree_state,
@@ -313,6 +317,16 @@ impl EditorCore {
             last_llm_open: false,
             atomic_blocks: Vec::new(),
         }
+    }
+
+    /// Replace the whole buffer while preserving the core's monotonic content
+    /// generation. Shared Buffer views memoize extracted lines, syntax spans,
+    /// WP classifications, and rendered blocks by `Document::edit_seq`; using
+    /// `EditorCore::new` in place would reset that key to zero and let an old
+    /// snapshot alias the replacement text (bug-0035).
+    pub fn replace_text(&mut self, text: String, file_path: PathBuf) {
+        let next_edit_seq = self.document.edit_seq().wrapping_add(1);
+        *self = Self::new_with_edit_seq(text, file_path, next_edit_seq);
     }
 
     // --- LineAnchor + LineMetadata (§E1, §E2) ---
@@ -2144,6 +2158,18 @@ fn char_to_line_ceil(doc: &Document, char_idx: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replace_text_preserves_monotonic_content_generation() {
+        let path = std::path::PathBuf::from("reload.md");
+        let mut core = EditorCore::new("old".to_string(), path.clone());
+        assert_eq!(core.document().edit_seq(), 0);
+
+        core.replace_text("new".to_string(), path);
+
+        assert_eq!(core.document().full_text(), "new");
+        assert_eq!(core.document().edit_seq(), 1);
+    }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum TurnId {

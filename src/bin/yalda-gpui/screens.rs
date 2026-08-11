@@ -4,6 +4,42 @@
 
 use super::*;
 
+/// Test-only record of the source text and syntax background that the real
+/// virtualized Buffer edit renderer handed to GPUI for a visible line.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct EditRenderLineTap {
+    pub(crate) line_idx: usize,
+    pub(crate) text: String,
+    pub(crate) has_code_bg: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static EDIT_RENDER_TAP: RefCell<Vec<EditRenderLineTap>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn edit_render_tap_begin() {
+    EDIT_RENDER_TAP.with(|tap| tap.borrow_mut().clear());
+}
+
+#[cfg(test)]
+pub(crate) fn edit_render_tap_snapshot() -> Vec<EditRenderLineTap> {
+    EDIT_RENDER_TAP.with(|tap| tap.borrow().clone())
+}
+
+#[cfg(test)]
+fn push_edit_render_line(line_idx: usize, text: &str, segs: &[Segment], code_bg: NStyle) {
+    EDIT_RENDER_TAP.with(|tap| {
+        tap.borrow_mut().push(EditRenderLineTap {
+            line_idx,
+            text: text.to_string(),
+            has_code_bg: segs.iter().any(|(_, style)| style.bg == code_bg.bg),
+        });
+    });
+}
+
 /// Stable width for both Agent Tile activity states. `* working` and `+ ready`
 /// must not shove the turn timer sideways when a reply starts or finishes.
 pub(crate) const AGENT_ACTIVITY_PILL_WIDTH: f32 = 88.0;
@@ -493,6 +529,8 @@ impl YaldaGpuiView {
         let code_font = self.code_font.clone();
         let editor_fg = self.editor_fg();
         let selection_bg = self.theme.agent.selection_bg;
+        #[cfg(test)]
+        let code_block_style = self.theme.code_block_bg;
         let text_size = px(14.0 * self.text_scale);
 
         let render_fn = move |line_idx: usize, _w: &mut Window, _app: &mut GpuiApp| -> AnyElement {
@@ -504,6 +542,9 @@ impl YaldaGpuiView {
             if let Some(sel) = sel {
                 segs = apply_line_selection(&segs, &line_str, sel, line_idx, base_style, selection_bg);
             }
+
+            #[cfg(test)]
+            push_edit_render_line(line_idx, &line_str, &segs, code_block_style);
 
             let gutter = div()
                 .w(px(40.0))

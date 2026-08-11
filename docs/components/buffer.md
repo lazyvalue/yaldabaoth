@@ -60,3 +60,13 @@ versa. Primary code home: `screens.rs::render_doc` / `render_edit` /
   Guards: `file_browser.rs` `go_parent_lands_on_the_child_dir_just_left`,
   `select_path_lands_on_the_named_file`; `verify_harness.rs`
   `open_picker_lands_on_the_file_just_left`.
+- **`UXI-Buffer-3` (reload invalidates every derived view).** Reloading a
+  file-backed Buffer replaces the shared core's text for every tile viewing or
+  editing that file, and advances the core's monotonic content generation. No
+  derived snapshot keyed by that generation—rendered blocks, extracted source
+  lines, RAW/WP syntax spans, or WP line kinds—may survive the replacement.
+  Rationale: rebuilding the core with a fresh generation of zero could alias an
+  existing cache key, leaving old text and an old open-fence style painted after
+  reload. Guard: `verify_harness.rs`
+  `buffer_reload_does_not_reuse_old_syntax_state`; generation seam:
+  `editor.rs::replace_text_preserves_monotonic_content_generation`.

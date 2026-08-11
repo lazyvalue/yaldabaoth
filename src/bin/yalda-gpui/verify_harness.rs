@@ -405,6 +405,50 @@ fn edit_view_keystroke_is_o_changed(cx: &mut TestAppContext) {
     );
 }
 
+/// Regression: reloading a Buffer must invalidate the edit render snapshots
+/// even when the replacement document's fresh `edit_seq` numerically equals
+/// the generation already cached by the view. The old path replaced the shared
+/// `EditorCore` with `EditorCore::new` (sequence reset to zero), so this exact
+/// initial-sequence reload reused the old source and its open-fence code style.
+#[gpui::test]
+fn buffer_reload_does_not_reuse_old_syntax_state(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("reload-highlight.md");
+    std::fs::write(&path, "```rust\nlet old = 1;\n").expect("write initial file");
+    let view_path = path.clone();
+
+    let (view, vcx) = cx.add_window_view(move |window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        let mut v = YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        );
+        v.test_open_edit_at_path("```rust\nlet old = 1;\n", view_path);
+        v
+    });
+
+    vcx.run_until_parked();
+
+    std::fs::write(&path, "plain\nreloaded plain\n").expect("replace file on disk");
+    crate::screens::edit_render_tap_begin();
+    view.update(vcx, |v, cx| v.reload_focused_from_disk(cx));
+    vcx.run_until_parked();
+
+    let painted = crate::screens::edit_render_tap_snapshot();
+    let line = painted
+        .iter()
+        .rev()
+        .find(|line| line.line_idx == 1)
+        .expect("reloaded second line painted through the real Buffer render path");
+    assert_eq!(line.text, "reloaded plain", "reload must paint the new text");
+    assert!(
+        !line.has_code_bg,
+        "plain reloaded text must not retain the old unclosed-fence code style"
+    );
+}
+
 /// Regression (scroll anchoring): `splice_list_to_items` must keep the
 /// viewport anchored across a line edit, NOT snap it to item 0. The old path
 /// `ListState::reset()`-ed on every line-count change, which nulls

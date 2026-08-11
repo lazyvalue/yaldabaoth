@@ -30,12 +30,19 @@ impl YaldaGpuiView {
     /// `build_edit_body_code` highlight path.
     #[cfg(test)]
     pub(crate) fn test_open_edit(&mut self, text: &str) {
+        self.test_open_edit_at_path(text, PathBuf::from("/tmp/harness.md"));
+    }
+
+    /// Test-only variant backed by a real path, for actions such as reload that
+    /// resolve their target from the focused Buffer label.
+    #[cfg(test)]
+    pub(crate) fn test_open_edit_at_path(&mut self, text: &str, path: PathBuf) {
         let core: workspace::SharedCore = std::rc::Rc::new(std::cell::RefCell::new(
-            yalda::editor::EditorCore::new(text.to_string(), PathBuf::from("/tmp/harness.md")),
+            yalda::editor::EditorCore::new(text.to_string(), path.clone()),
         ));
         let mut e = EditState::new(
             SharedEditor::new(1, core),
-            "harness.md".into(),
+            path.display().to_string().into(),
             EditView::Code,
         );
         e.mode = EditMode::Insert;
@@ -322,7 +329,7 @@ impl YaldaGpuiView {
                         return;
                     }
                 };
-                *core.borrow_mut() = EditorCore::new(text, path);
+                core.borrow_mut().replace_text(text, path);
                 // The text may have shrunk; reset the focused view's cursor to
                 // the top so it can't dangle past the new end (matches the old
                 // reload-replaces-editor behavior). Other shared views keep
@@ -347,7 +354,7 @@ impl YaldaGpuiView {
                 };
                 let (blocks, source) = match pooled {
                     Some((id, core)) => {
-                        *core.borrow_mut() = EditorCore::new(text, path.clone());
+                        core.borrow_mut().replace_text(text, path.clone());
                         let blocks = render_with_wiki(
                             &core.borrow().document().full_text(),
                             &self.theme,
