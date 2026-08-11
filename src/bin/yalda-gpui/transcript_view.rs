@@ -55,6 +55,50 @@ pub(crate) fn committed_row_bg(tag: Option<TurnId>, user_turn_bg: Hsla) -> Hsla 
     }
 }
 
+/// Project the editor's raw-column selection onto one painted transcript line
+/// and apply UXI-AgentTile-38's universal palette. Frozen Markdown may replace
+/// source markers (`- ` → `• `), so its range must cross the same raw→rendered
+/// alignment used by the production `FlatItem::Line` path.
+pub(crate) fn apply_transcript_line_selection(
+    segs: &[Segment],
+    raw_line: &str,
+    is_frozen: bool,
+    selection: Option<((usize, usize), (usize, usize))>,
+    line_idx: usize,
+    selection_bg: NColor,
+    selection_fg: NColor,
+) -> Vec<Segment> {
+    let Some(sel) = selection else {
+        return segs.to_vec();
+    };
+    let line_chars = raw_line.chars().count();
+    let Some((s, e_col)) = line_selection_range(sel, line_idx, line_chars) else {
+        return segs.to_vec();
+    };
+    if e_col <= s {
+        return segs.to_vec();
+    }
+
+    let (paint_start, paint_end) = if is_frozen {
+        let rendered: String = segs.iter().map(|(text, _)| text.as_str()).collect();
+        if rendered == raw_line {
+            (s, e_col)
+        } else {
+            let map = crate::stripped_to_raw_cols(raw_line, &rendered);
+            (
+                crate::raw_to_stripped_col(&map, s),
+                crate::raw_to_stripped_col(&map, e_col),
+            )
+        }
+    } else {
+        (s, e_col)
+    };
+    if paint_end <= paint_start {
+        return segs.to_vec();
+    }
+    apply_selection_style(segs, paint_start, paint_end, selection_bg, selection_fg)
+}
+
 /// User-facing label for a transcript turn header. `TurnRole::Claude` is the
 /// historical internal name for an agent/LLM turn; the visible label follows
 /// the session's actual provider.
@@ -998,38 +1042,15 @@ impl TranscriptView {
                                 *style = style.fg(author_tint);
                             }
                         }
-                        if let Some(sel) = sel_snap {
-                            let line_chars = line_str.chars().count();
-                            if let Some((s, e_col)) =
-                                line_selection_range(sel, line_idx, line_chars)
-                                && e_col > s
-                            {
-                                // The editor selection is in RAW document columns; on a
-                                // frozen (stripped) line the segs are rendered, so map
-                                // the band into rendered space so it lines up with the
-                                // painted text (bug-0006). Identity for raw lines.
-                                let (bs, be) = if is_frozen {
-                                    let rendered: String =
-                                        segs.iter().map(|(t, _)| t.as_str()).collect();
-                                    if rendered == line_str {
-                                        (s, e_col)
-                                    } else {
-                                        let map =
-                                            crate::stripped_to_raw_cols(&line_str, &rendered);
-                                        (
-                                            crate::raw_to_stripped_col(&map, s),
-                                            crate::raw_to_stripped_col(&map, e_col),
-                                        )
-                                    }
-                                } else {
-                                    (s, e_col)
-                                };
-                                if be > bs {
-                                    segs =
-                                        apply_selection_bg(&segs, bs, be, at_snap.selection_bg);
-                                }
-                            }
-                        }
+                        segs = apply_transcript_line_selection(
+                            &segs,
+                            &line_str,
+                            is_frozen,
+                            sel_snap,
+                            line_idx,
+                            at_snap.selection_bg,
+                            author_tint,
+                        );
 
                         let line_base_fg = if is_frozen {
                             frozen_fg_u32

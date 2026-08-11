@@ -2682,6 +2682,122 @@ fn apply_selection_bg_full_segment_gets_bg() {
     assert!(out.iter().all(|(_, st)| st.bg == Some(NColor::Red)));
 }
 
+/// A transcript selection is one visual state, regardless of the Markdown token
+/// beneath it. In particular, selecting an entire bullet line must not leave
+/// the marker green while ordinary selected prose uses the agent's cool blue.
+#[test]
+fn transcript_whole_line_selection_unifies_bullet_and_prose_color() {
+    let theme = Theme::default();
+    let line = "- selected prose".to_string();
+    let mut segs = yalda::md_highlight::highlight_markdown_lines_stripped(
+        std::slice::from_ref(&line),
+        &theme,
+    )
+    .remove(0);
+    for (_, style) in &mut segs {
+        if *style == theme.paragraph {
+            *style = style.fg(theme.agent.agent_tint);
+        }
+    }
+
+    let selected = apply_transcript_line_selection(
+        &segs,
+        &line,
+        true,
+        Some(((0, 0), (0, line.chars().count()))),
+        0,
+        theme.agent.selection_bg,
+        theme.agent.agent_tint,
+    );
+    let marker = selected
+        .iter()
+        .find(|(text, _)| text.contains('•'))
+        .expect("rendered bullet marker");
+    let prose = selected
+        .iter()
+        .find(|(text, _)| text.contains("selected prose"))
+        .expect("rendered prose");
+
+    assert_eq!(
+        marker.1.bg,
+        Some(theme.agent.selection_bg),
+        "whole-line selection must reach the substituted bullet glyph"
+    );
+    assert_eq!(prose.1.bg, marker.1.bg, "selection background is universal");
+    assert_eq!(
+        marker.1.fg, prose.1.fg,
+        "selected bullet marker must use the same blue foreground as selected prose"
+    );
+}
+
+#[test]
+fn stripped_bullet_marker_maps_back_to_raw_marker() {
+    let map = stripped_to_raw_cols("- selected", "• selected");
+    assert_eq!(map[0], 0, "rendered bullet maps to the raw dash");
+    assert_eq!(map[1], 1, "space after the bullet keeps its raw column");
+    assert_eq!(raw_to_stripped_col(&map, 2), 2, "prose begins at rendered col 2");
+    assert_eq!(
+        map.last().copied(),
+        Some("- selected".chars().count()),
+        "the alignment reaches raw EOL instead of collapsing at the marker"
+    );
+
+    let marker_only = stripped_to_raw_cols("-", "•");
+    assert_eq!(
+        marker_only,
+        vec![0, 1],
+        "a substituted marker advances through raw EOL"
+    );
+
+    let deletion = stripped_to_raw_cols("-x", "x");
+    assert_eq!(
+        deletion,
+        vec![1, 2],
+        "ordinary deletion must not take the bullet-substitution branch"
+    );
+
+    let missing = stripped_to_raw_cols("abc", "z");
+    assert_eq!(
+        missing,
+        vec![3, 3],
+        "a rendered glyph absent from raw text saturates safely at EOL"
+    );
+}
+
+#[test]
+fn transcript_selection_color_keeps_inline_code_monospace() {
+    let theme = Theme::default();
+    let code = vec![("code".to_string(), theme.code_inline)];
+    let selected = apply_selection_style(
+        &code,
+        0,
+        4,
+        theme.agent.selection_bg,
+        theme.agent.agent_tint,
+    );
+
+    assert_eq!(selected[0].1.fg, Some(theme.agent.agent_tint));
+    assert_eq!(selected[0].1.bg, Some(theme.agent.selection_bg));
+    assert!(
+        style_uses_code_font(selected[0].1, Some(theme.agent.selection_bg)),
+        "universal selection colors must not change inline-code typography"
+    );
+}
+
+#[test]
+fn transcript_selection_style_changes_only_requested_span() {
+    let segs = vec![("abc".to_string(), NStyle::default().fg(NColor::White))];
+    let selected = apply_selection_style(&segs, 1, 2, NColor::Blue, NColor::LightBlue);
+
+    assert_eq!(seg_text(&selected), "abc");
+    assert_eq!(selected.len(), 3, "selection boundaries split the source run");
+    assert_eq!(selected[0], ("a".to_string(), segs[0].1));
+    assert_eq!(selected[1].0, "b");
+    assert_eq!(selected[1].1.bg, Some(NColor::Blue));
+    assert_eq!(selected[1].1.fg, Some(NColor::LightBlue));
+    assert_eq!(selected[2], ("c".to_string(), segs[0].1));
+}
+
 #[test]
 fn apply_selection_bg_splits_segment_at_boundary() {
     // Selection covers chars 1..2 of a 3-char segment → expect 3 segments:

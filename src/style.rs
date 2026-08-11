@@ -40,6 +40,9 @@ impl Modifier {
     pub const CROSSED_OUT: Self = Self(1 << 3);
     pub const REVERSED: Self = Self(1 << 4);
     pub const DIM: Self = Self(1 << 5);
+    /// Preserve semantic monospace typography when a visual overlay replaces
+    /// the foreground/background colors that normally identify inline code.
+    pub const MONOSPACE: Self = Self(1 << 6);
 
     pub const fn bits(self) -> u16 {
         self.0
