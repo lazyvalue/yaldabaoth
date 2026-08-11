@@ -1562,6 +1562,7 @@ fn gpui_menu() -> Vec<MenuNode> {
         MenuNode::entry("R", "rebuild and restart all", "dev-restart-all"),
         MenuNode::entry("m", "mark tile", "mark-tile"),
         MenuNode::entry("x", "close tile", "close-window"),
+        MenuNode::entry("X", "close workspace", "close-workspace"),
     ]
 }
 
@@ -2775,8 +2776,9 @@ impl YaldaGpuiView {
     }
 
     /// Close the workspace at `idx`. Returns false if the workspace's content has unsaved
-    /// modifications (refusing to close). If it's the last wsp, quits.
-    fn close_buffer_at(&mut self, idx: usize, cx: &mut Context<Self>) -> bool {
+    /// modifications (refusing to close). The sole-workspace floor is a no-op;
+    /// workspace closure never quits the app (UXI-Workspace-13).
+    fn close_buffer_at(&mut self, idx: usize) -> bool {
         if idx >= self.workspace.workspaces.len() {
             return true;
         }
@@ -2789,7 +2791,6 @@ impl YaldaGpuiView {
             return false;
         }
         if self.workspace.workspaces.len() <= 1 {
-            cx.quit();
             return true;
         }
         self.workspace.close_workspace(idx);
@@ -3880,19 +3881,27 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
-    /// Close the active workspace. Spec Behavior 5: ClaudeWindows drop their ACP
-    /// channels (subprocess killed via kill_on_drop). When the last workspace is
-    /// closed, quit the app for now (placeholder-workspace Behavior 2 is a
-    /// follow-up).
+    /// Close the active workspace. Its tiles are references onto store-owned
+    /// content, so removing Agent tiles frees their sessions without killing
+    /// them. The sole-workspace floor is a no-op; this action never quits the
+    /// app (UXI-Workspace-13).
     fn close_workspace(&mut self, _: &CloseWorkspace, _w: &mut Window, cx: &mut Context<Self>) {
+        if self.close_active_workspace() {
+            cx.notify();
+        }
+    }
+
+    /// Shared workspace-close semantics for the global action and the `.` menu.
+    /// Returns whether a workspace was removed. Deliberately has no GPUI
+    /// context: this layout mutation has no capability to quit the app.
+    fn close_active_workspace(&mut self) -> bool {
         if self.workspace.workspaces.len() <= 1 {
-            cx.quit();
-            return;
+            return false;
         }
         let idx = self.workspace.active_workspace;
         self.workspace.close_workspace(idx);
         self.save_workspace_state();
-        cx.notify();
+        true
     }
 
     fn rename_workspace(&mut self, _: &RenameWorkspace, _w: &mut Window, cx: &mut Context<Self>) {
@@ -5179,14 +5188,9 @@ impl YaldaGpuiView {
                 cx.notify();
             }
             "close-workspace" => {
-                if self.workspace.workspaces.len() <= 1 {
-                    cx.quit();
-                    return;
+                if self.close_active_workspace() {
+                    cx.notify();
                 }
-                let idx = self.workspace.active_workspace;
-                self.workspace.close_workspace(idx);
-                self.save_workspace_state();
-                cx.notify();
             }
             "next-workspace" => {
                 if self.workspace.workspaces.len() > 1 {
@@ -6814,7 +6818,7 @@ impl YaldaGpuiView {
             Key::Char('d') => {
                 let filtered = self.filtered_buffer_indices();
                 if let Some(&buf_idx) = filtered.get(selected) {
-                    self.close_buffer_at(buf_idx, cx);
+                    self.close_buffer_at(buf_idx);
                     let count = self.filtered_buffer_indices().len();
                     if let Some(bs) = self.buffer_mut()
                         && bs.selected >= count

@@ -13,6 +13,24 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Close a workspace without closing its sessions or quitting the app** —
+  `DONE` (2026-08-11 via `/new-ux`; `UXI-Workspace-13`; Cog graph `ubr`).
+  Captured verbatim: *"Add a workspace command to close the workspace. Shouldn't
+  close any actual sessions, just the tiles they're bound to"* and *"Closing a
+  workspace should never quit the app"*. The `.` workspace menu uses uppercase
+  `X` for **close workspace**, preserving lowercase `x` as **close tile**. Closing
+  a non-last workspace drops all of its tiles, so any sessions they referenced
+  remain alive in the session store and become free. Closing the sole workspace
+  is a no-op; it never exits Yalda. Both command entry points share a
+  no-`Context` helper, so workspace closure cannot request application quit.
+  `workspace_menu_uppercase_x_selects_close_workspace` pins the literal menu
+  keys; `closing_workspace_frees_sessions_and_never_quits` drives the real menu
+  dispatch and `Cmd-Shift-W`, proving the workspace/tile disappears while its
+  server session remains store-owned and free. Removing the sole-workspace floor
+  produced the expected RED on the real render path; all three mutations of the
+  close helper were caught. Full GPUI suite: 549 passed, 1 ignored; non-test GUI
+  check green. No runtime gap.
+
 - **Worksheet reply: select-to-quote, older-turn replies, replied-to marker** —
   `NEEDS-RUNTIME` for the shipped parts (branch `worksheet-reply-select`, via
   `/new-ux`; project `docs/projects/worksheet-reply-select/`). Captured verbatim:

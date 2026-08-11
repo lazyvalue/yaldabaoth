@@ -1281,6 +1281,115 @@ fn ctrl_digit_switches_workspace(cx: &mut TestAppContext) {
     });
 }
 
+/// UXI-Workspace-13: the workspace menu's `close-workspace` command removes
+/// only the active workspace and its tiles. A session shown by one of those
+/// tiles remains alive in the owning `AgentSessions` store and becomes free.
+/// The sole-workspace floor is a no-op through BOTH the menu dispatcher and
+/// the production `Cmd-Shift-W` action; workspace closure never quits Yalda.
+///
+/// Drives the REAL `dispatch_menu_command("close-workspace")` path and the real
+/// keymap/action/handler path.
+///
+/// Negative control (observed RED): remove `close_active_workspace`'s
+/// sole-workspace return so it calls `Frame::close_workspace` at the floor; the
+/// real notify/render path reaches `chrome.rs` with zero workspaces and panics
+/// indexing the active workspace. The helper deliberately takes no GPUI
+/// Context, so quitting is structurally unavailable to workspace closure
+/// (GPUI's headless platform implements `quit()` as a no-op and cannot serve as
+/// an honest direct oracle for that call).
+#[gpui::test]
+fn closing_workspace_frees_sessions_and_never_quits(cx: &mut TestAppContext) {
+    use crate::{AgentTile, App};
+    use yalda::session_proto::SessionInfo;
+
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_browser(cx);
+    let session = add_free_session(&view, vcx, "workspace-close-survivor");
+    let server_sid = "workspace-close-S1";
+
+    // Put the session in a second, active real workspace. The workspace owns
+    // only the AgentTile reference; `sessions` owns the live session.
+    let session_cwd = view.update(vcx, |v, _cx| {
+        let cwd = v.agent_base_cwd();
+        v.sessions
+            .bind_sid(session, ServerSid::new(server_sid))
+            .expect("fresh server sid binds");
+        v.agent_roster.upsert(SessionInfo {
+            session_id: server_sid.into(),
+            acp_session_id: None,
+            label: "workspace-close-survivor".into(),
+            cwd: cwd.clone(),
+            provider: yalda::acp_channel::AgentProvider::Claude,
+            turns: 1,
+            connected: true,
+            permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+            busy: false,
+            archived: false,
+        });
+        let mut tile = AgentTile::new();
+        tile.bind(session);
+        let project = v.workspace.inherited_project();
+        v.workspace.push_initial_workspace(App::Agent(tile), project);
+        cwd
+    });
+    view.read_with(vcx, |v, _cx| {
+        assert_eq!(v.workspace.workspaces.len(), 2, "test has two workspaces");
+        assert!(
+            v.agent_tile_id_bound_to(session).is_some(),
+            "the session starts bound to the active workspace's tile"
+        );
+        assert!(v.bound_sid_set().contains(server_sid));
+    });
+
+    // Exact command carried by the uppercase-X menu leaf.
+    view.update(vcx, |v, cx| v.dispatch_menu_command("close-workspace", cx));
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _cx| {
+        assert_eq!(v.workspace.workspaces.len(), 1, "the active workspace is gone");
+        assert!(
+            v.sessions.contains(session),
+            "dropping the workspace's Agent tile must not close its session"
+        );
+        assert_eq!(
+            v.agent_tile_id_bound_to(session),
+            None,
+            "the removed tile no longer binds the session"
+        );
+        assert!(
+            !v.bound_sid_set().contains(server_sid),
+            "the surviving session is no longer durably placed"
+        );
+        let (free, bound) = v.picker_projection(&session_cwd);
+        assert!(
+            free.iter().any(|row| row.sid == server_sid),
+            "the surviving session is offered as free for placement"
+        );
+        assert!(bound.iter().all(|row| row.sid != server_sid));
+    });
+
+    // Menu dispatch on the sole workspace is a no-op.
+    view.update(vcx, |v, cx| v.dispatch_menu_command("close-workspace", cx));
+    assert_eq!(
+        view.read_with(vcx, |v, _cx| v.workspace.workspaces.len()),
+        1,
+        "the menu cannot remove the sole workspace"
+    );
+    vcx.run_until_parked();
+
+    // The global action has the same floor and, critically, does not quit.
+    vcx.simulate_keystrokes("cmd-shift-w");
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(vcx, |v, _cx| v.workspace.workspaces.len()),
+        1,
+        "Cmd-Shift-W cannot remove the sole workspace or quit the app"
+    );
+    assert!(
+        view.read_with(vcx, |v, _cx| v.sessions.contains(session)),
+        "the session remains alive after every workspace-close entry point"
+    );
+}
+
 /// bug-0011 REGRESSION: an UNBOUND agent tile (the session selector/picker,
 /// `render_agent_picker`) was the one screen root missing `.workspace_nav(cx)`, so
 /// while the picker was focused `ctrl-<n>` (GotoWorkspace) and `cmd-shift-[]`

@@ -2886,7 +2886,8 @@ fn gpui_menu_has_required_entries() {
     // Workspace menu holds: set cwd, new agent/buffer/linear, theme
     // nightfox/folio, plane view zoom-in/zoom-out/reset (the retired
     // manual/master-stack/monocle/columns/desktop mode leaves are gone —
-    // infinite-plane Stage D), rebuild+restart, mark tile, close tile.
+    // infinite-plane Stage D), rebuild+restart, mark tile, close tile, and
+    // close workspace.
     let expected = [
         "workspace-set-cwd",
         "new-agent-tile",
@@ -2901,6 +2902,7 @@ fn gpui_menu_has_required_entries() {
         "dev-restart-all",
         "mark-tile",
         "close-window",
+        "close-workspace",
     ];
     for e in expected {
         assert!(
@@ -2941,6 +2943,27 @@ fn menu_state_round_trip_picks_command() {
     let cmd = state.process_key(KeyPress::new(Key::Char('c'), KMods::NONE), &menu);
     assert_eq!(cmd, Some("workspace-set-cwd".to_string()));
     assert!(!state.is_active(), "menu should close after a leaf select");
+}
+
+#[test]
+fn workspace_menu_uppercase_x_selects_close_workspace() {
+    let menu = gpui_menu();
+
+    let mut upper = MenuState::new();
+    upper.open();
+    assert_eq!(
+        upper.process_key(KeyPress::new(Key::Char('X'), KMods::NONE), &menu),
+        Some("close-workspace".to_string()),
+        "uppercase X closes the workspace"
+    );
+
+    let mut lower = MenuState::new();
+    lower.open();
+    assert_eq!(
+        lower.process_key(KeyPress::new(Key::Char('x'), KMods::NONE), &menu),
+        Some("close-window".to_string()),
+        "lowercase x remains close tile"
+    );
 }
 
 #[test]
