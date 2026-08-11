@@ -672,3 +672,47 @@ validation. `verify_harness.rs`:
 `window_resize_observer_persists_the_size_for_next_launch` drives GPUI's real
 window-resize observer, reads the written preferences, and feeds them through
 the production startup-size helper.
+
+### UXI-Workspace-13 — Closing a workspace removes its tiles, not its sessions or the app
+
+**Statement.** The workspace `.` menu exposes uppercase `X` as **close
+workspace**; lowercase `x` remains **close tile**. Closing the active workspace
+removes that workspace and every tile it owns only when another workspace
+remains. An Agent tile is only a reference to its session, so removing the tile
+does not stop, close, archive, or delete the session: the session remains alive
+in `AgentSessions` and, when no other durable workspace tile references it,
+becomes free and available for placement again. Closing the sole remaining
+workspace is a no-op. No workspace-close entry point quits the app.
+
+**Applies to.** `main.rs`: `gpui_menu` (`X` → `close-workspace`),
+`dispatch_menu_command("close-workspace")`, and the global `CloseWorkspace`
+action (`Cmd-Shift-W`). `workspace.rs`: `Frame::close_workspace`, whose tile
+drop only releases session references because `AgentSessions` owns session
+identity and runtime state. Existing lowercase `x` / `close-window` behavior is
+unchanged.
+
+**Why.** A workspace is a layout of views onto ongoing work. Dismissing that
+layout must not terminate the work behind its Agent tiles, and a layout command
+must never be an implicit application-quit command.
+
+**Status.** `implemented` (headless).
+
+**Enforcement.** `tests.rs::workspace_menu_uppercase_x_selects_close_workspace`
+pins the literal menu chord and proves lowercase `x` still resolves to
+`close-window`. `verify_harness.rs::closing_workspace_frees_sessions_and_never_quits`
+drives the real `dispatch_menu_command("close-workspace")` path over an active
+workspace containing a bound server-managed Agent session: the workspace and
+tile disappear, the session remains in `AgentSessions`, its durable binding is
+gone, and the selector projects it as free. The same test dispatches again at
+the sole-workspace floor and drives the real `Cmd-Shift-W` keymap/action/handler
+path; both retain the workspace and session. Negative control: removing the
+sole-workspace early return sent the real notify/render path into `chrome.rs`
+with zero workspaces and failed RED. `cargo mutants` caught all three generated
+mutations of `close_active_workspace`, including `<=` → `>`.
+
+**Deviation from plan.** GPUI 0.2.2's headless `Platform::quit()` is itself a
+no-op, so restoring the former `cx.quit()` produced a false-green direct negative
+control. The implementation was tightened instead: `close_active_workspace`
+takes no GPUI `Context`, making app quit structurally unavailable to both the
+menu and action routes; handlers only notify when it reports that a workspace
+was removed. The floor mutation above guards the remaining state predicate.
