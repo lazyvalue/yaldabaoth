@@ -2,7 +2,7 @@
 
 Facet of the [Agent Tile](README.md) component. Owns `UXI-AgentTile-4..8`,
 `UXI-AgentTile-23`, `UXI-AgentTile-25`, `UXI-AgentTile-26`, `UXI-AgentTile-28`,
-`UXI-AgentTile-34`, `UXI-AgentTile-37`.
+`UXI-AgentTile-34`, `UXI-AgentTile-37`, `UXI-AgentTile-38`.
 
 ## Description
 
@@ -528,19 +528,17 @@ text in the worksheet read as broken. Binding `V` to an immediate whole-line
 select makes the primary gesture work and gives instant feedback.
 
 **Status.** `implemented` — the binding + selection are headless (real keymap +
-real dispatch). The exact highlight **color/contrast** ("beautiful, clearly
-visible") is a paint/human-eye judgment (harness gap #1): `AgentTheme::selection_bg`
-per theme; tune by eye if a live `V` selection is not vivid enough on a given theme.
+real dispatch). The universal token palette inside the selection is specified by
+`UXI-AgentTile-38`; exact perceived contrast remains a paint/human-eye judgment
+(harness gap #1).
 
 **Deviation from plan.** `V` maps to a NEW action `"select-line"` (extend-mode ON +
 `extend_by_line`), not the pre-existing `"extend-line"` (`x`) as first scoped. A
 headless test caught that plain `extend-line` does not enable extend-mode, so `V`
 then `j` COLLAPSED the selection (the vim `V j` idiom broke); `select-line` turns
 extend-mode on so a following `V`/`j`/`k` grows it. `x` keeps the plain
-extend-line. The selection **color tuning** is deferred (gap #1) — the root cause
-of "selection doesn't work" was the unbound key + `v`-needs-motion, not (only) the
-hue, so the color is left for a live-eye pass rather than a blind retune of 8
-themes.
+extend-line. The selection color normalization deferred here is now implemented
+by `UXI-AgentTile-38`.
 
 **Enforcement.** `verify_harness.rs`: `worksheet_v_line_select_feeds_r` (real
 `handle_claude_key("V")` creates a non-empty selection whose text is the whole
@@ -548,6 +546,44 @@ agent line) and `worksheet_v_char_select_feeds_r` (`v` + 5×`l` selects exactly
 `First`). Both then press `r` and assert the selection is the quote (see
 `UXI-AgentTile-35`). NC observed RED: dropping the selection branch collapses the
 quote to the first sentence. The painted band hue is gap #1.
+
+### UXI-AgentTile-38 — Selected transcript text has one universal color treatment
+
+**Statement.** Inside an active transcript selection, every prose/Markdown
+token uses the selection background and the line's ordinary prose foreground.
+A selected bullet or ordered-list marker therefore uses the same cool blue as
+selected agent prose, rather than keeping its unselected green syntax color.
+The rule applies to partial and whole-line selections and to other decorative
+Markdown foregrounds as well; font semantics such as bold, italic, and
+monospace inline code remain intact.
+
+**Applies to.** `transcript_view.rs`, the `FlatItem::Line` selection projection;
+`render_blocks.rs::apply_selection_style` and `style_uses_code_font`; and the
+frontend-neutral `Modifier::MONOSPACE` marker used only when selection replaces
+the colors that previously identified inline code.
+
+**Why.** Selection is one interaction state, not another syntax-highlighting
+layer. Leaving a bullet green inside a blue prose selection made a whole-line
+`V` highlight look fragmented and suggested that the marker was outside the
+selection. The selection projection must also align Markdown's rendered `•` with
+its raw `-`, `*`, or `+`; treating rendering as deletion-only collapsed the bullet
+mapping to end-of-line and could leave the entire displayed list item unpainted.
+Author tint still distinguishes agent from user lines when selected.
+
+**Status.** `implemented`. Exact perceived contrast remains harness gap #1, but
+the selected foreground/background values and retained code-font decision are
+deterministic and headlessly verified.
+
+**Enforcement.** `tests.rs`
+`transcript_whole_line_selection_unifies_bullet_and_prose_color` builds the real
+stripped Markdown segments for a bullet and proves the selected marker and prose
+have identical foreground/background colors. Negative control observed RED:
+the background-only selection path left the marker `Rgb(80,250,123)` and prose
+`Rgb(169,208,224)`; exercising the exact production projection also exposed the
+rendered-marker/raw-marker alignment collapse. `stripped_bullet_marker_maps_back_to_raw_marker`
+locks that substitution mapping, and
+`transcript_selection_color_keeps_inline_code_monospace` proves color
+normalization does not change inline-code typography.
 
 ### UXI-AgentTile-37 — The replied-to source text shows a `>` marker when not editing
 

@@ -163,6 +163,14 @@ pub(crate) fn span_uses_code_font(
     is_code_bg || fg == Some(NColor::Rgb(241, 250, 140))
 }
 
+/// Semantic wrapper around the legacy color proxies. Selection styling can
+/// replace both colors, so it marks spans that were code with `MONOSPACE`
+/// before applying the universal selection palette.
+pub(crate) fn style_uses_code_font(style: NStyle, selection_bg: Option<NColor>) -> bool {
+    style.modifier.contains(Modifier::MONOSPACE)
+        || span_uses_code_font(style.bg, style.fg, selection_bg)
+}
+
 pub(crate) fn styled_line_element(
     line: &StyledLine,
     base_style: NStyle,
@@ -200,7 +208,7 @@ pub(crate) fn styled_line_element(
             let len = span.text.len();
             text.push_str(&span.text);
 
-            let font = if span_uses_code_font(combined.bg, combined.fg, selection_bg) {
+            let font = if style_uses_code_font(combined, selection_bg) {
                 font_for(combined, code_font)
             } else {
                 font_for(combined, body_font)
@@ -2730,3 +2738,49 @@ pub(crate) fn apply_selection_bg(
     result
 }
 
+/// Apply the transcript's universal selection palette to a character range.
+/// Unlike [`apply_selection_bg`], this replaces syntax foregrounds too: a list
+/// marker, heading marker, link, or emphasis span reads exactly like selected
+/// prose. Inline code records its semantic monospace role before its identifying
+/// colors are replaced, so selection changes color without changing typography.
+pub(crate) fn apply_selection_style(
+    segs: &[Segment],
+    start_col: usize,
+    end_col: usize,
+    bg: NColor,
+    fg: NColor,
+) -> Vec<Segment> {
+    let mut result: Vec<Segment> = Vec::new();
+    let mut col = 0usize;
+    for (text, style) in segs {
+        let mut current_text = String::new();
+        let mut current_style = *style;
+        let mut started = false;
+        for ch in text.chars() {
+            let is_selected = col >= start_col && col < end_col;
+            let new_style = if is_selected {
+                let was_code = style_uses_code_font(*style, None);
+                let mut selected = style.bg(bg).fg(fg);
+                if was_code {
+                    selected = selected.add_modifier(Modifier::MONOSPACE);
+                }
+                selected
+            } else {
+                *style
+            };
+            if started && new_style != current_style {
+                result.push((std::mem::take(&mut current_text), current_style));
+                current_style = new_style;
+            } else if !started {
+                current_style = new_style;
+                started = true;
+            }
+            current_text.push(ch);
+            col += 1;
+        }
+        if !current_text.is_empty() {
+            result.push((current_text, current_style));
+        }
+    }
+    result
+}

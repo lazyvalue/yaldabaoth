@@ -1026,8 +1026,10 @@ pub(crate) fn caret_token_split(token_lens: &[usize], cursor_col: usize) -> Opti
 }
 
 /// Map each char of the STRIPPED (markdown-removed) render of a line to its column in
-/// the RAW document line (bug-0006). Stripping only DELETES chars, so the rendered
-/// string is a subsequence of the raw line; align greedily left-to-right. Returns a
+/// the RAW document line (bug-0006). Stripping normally deletes chars, so the
+/// rendered string is usually a subsequence of the raw line; align greedily left-to-right.
+/// The one intentional substitution is an unordered-list marker (`-`/`*`/`+`
+/// becomes `•`), which maps to the raw marker at the same position. Returns a
 /// vec of length `stripped.chars().count() + 1`: entry `i` is the raw col of the i-th
 /// rendered char, and the final entry is the raw col just past the last matched char
 /// (the line-end position for hit-testing). Identity when `stripped == raw`.
@@ -1036,13 +1038,16 @@ pub(crate) fn stripped_to_raw_cols(raw: &str, stripped: &str) -> Vec<usize> {
     let mut map = Vec::with_capacity(stripped.chars().count() + 1);
     let mut ri = 0usize;
     for sc in stripped.chars() {
+        if sc == '•' && matches!(raw_chars.get(ri), Some('-' | '*' | '+')) {
+            map.push(ri);
+            ri += 1;
+            continue;
+        }
         while ri < raw_chars.len() && raw_chars[ri] != sc {
             ri += 1;
         }
         map.push(ri.min(raw_chars.len()));
-        if ri < raw_chars.len() {
-            ri += 1;
-        }
+        ri = ri.saturating_add(1).min(raw_chars.len());
     }
     map.push(ri.min(raw_chars.len()));
     map
