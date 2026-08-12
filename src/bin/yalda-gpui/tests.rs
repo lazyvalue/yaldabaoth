@@ -4015,6 +4015,7 @@ fn plane_persist_test_workspace() -> PersistedWorkspace {
         desktop_slots: Vec::new(),
         desktop_spans: Vec::new(),
         camera: None,
+        view: workspace::WorkspaceView::Plane,
         cwd: Some("/tmp".into()),
         legacy_kv: Default::default(),
     }
@@ -4047,6 +4048,44 @@ fn plane_persist_round_trips_signed_slots_and_camera() {
         "negative-coordinate slot round-trips intact: {:?}",
         back.desktop_slots
     );
+}
+
+/// UXI-Workspace-14: the tile arrangement (`view`) round-trips, an OLD snapshot
+/// with no `view` field loads as `Plane`, and an UNKNOWN value from a newer
+/// binary degrades to `Plane` (never dropping the snapshot).
+#[test]
+fn workspace_view_round_trips_and_unknown_defaults_plane() {
+    // Round-trip Columns.
+    let mut wsp = plane_persist_test_workspace();
+    wsp.view = workspace::WorkspaceView::Columns;
+    let json = serde_json::to_string(&wsp).expect("serialize");
+    assert!(json.contains("\"columns\""), "view serializes as a string: {json}");
+    let back: PersistedWorkspace = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back.view, workspace::WorkspaceView::Columns, "columns survives");
+
+    // Absent field (old snapshot) ⇒ Plane via #[serde(default)].
+    let old = r#"{
+        "auto_name": "plane-1",
+        "display_name": null,
+        "focused_window": 1,
+        "layout": { "leaf": { "id": 1, "kind": "claude", "data": { "session_id": null } } },
+        "cwd": "/tmp"
+    }"#;
+    let none: PersistedWorkspace = serde_json::from_str(old).expect("old snapshot loads");
+    assert_eq!(none.view, workspace::WorkspaceView::Plane, "absent view ⇒ Plane");
+
+    // Unknown value from a newer binary ⇒ Plane, snapshot NOT dropped.
+    let future = r#"{
+        "auto_name": "plane-1",
+        "display_name": null,
+        "focused_window": 1,
+        "layout": { "leaf": { "id": 1, "kind": "claude", "data": { "session_id": null } } },
+        "view": "hyperflow",
+        "cwd": "/tmp"
+    }"#;
+    let unknown: PersistedWorkspace =
+        serde_json::from_str(future).expect("unknown view must NOT drop the snapshot");
+    assert_eq!(unknown.view, workspace::WorkspaceView::Plane, "unknown view ⇒ Plane");
 }
 
 /// A LITERAL old-format `workspace.json` workspace (unsigned `desktop_slots`, NO

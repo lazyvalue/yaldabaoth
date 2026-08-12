@@ -15425,6 +15425,98 @@ fn plane_focused_tile_renders_when_off_viewport(cx: &mut TestAppContext) {
     );
 }
 
+/// UXI-Workspace-14: the columns arrangement lays EVERY tile out as an
+/// equal-width, full-height column, side by side — including a tile the plane
+/// would cull off-viewport. Drives the REAL toggle handler (`Ctrl-W a` / the `.`
+/// menu both call `toggle_workspace_columns` → `Workspace::toggle_view`), not a
+/// hand-set `view` field.
+///
+/// The fixture (`boot_desktop_two_tiles`) parks B at slot (0,100) — far off the
+/// 800×600 viewport — so on the PLANE only A paints (proven first, for
+/// non-vacuity). After the toggle BOTH tiles paint as columns: B is now on
+/// screen, to the RIGHT of A, at roughly equal width and full height.
+///
+/// NEGATIVE CONTROL (observed RED): in `render_focused_window`, drop the
+/// `WorkspaceView::Columns` arm (always call `render_desktop`). Re-run: after the
+/// toggle B is still culled and the `columns-tile-*` probes never paint → the
+/// "both tiles paint as columns" asserts fire. Restored after.
+#[gpui::test]
+fn columns_view_arranges_tiles_side_by_side(cx: &mut TestAppContext) {
+    let (view, vcx, focused_id, other_id) = boot_desktop_two_tiles(cx);
+
+    // ── On the PLANE, B (slot col 100) is off-viewport and culled. Establish
+    // that first so "columns shows B" is a real, non-vacuous contrast. ──
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let plane_a = crate::layout_probe_get(&format!("plane-tile-content-{focused_id}"));
+    let plane_b = crate::layout_probe_get(&format!("plane-tile-content-{other_id}"));
+    crate::layout_probe_end();
+    assert!(plane_a.is_some(), "sanity: focused tile A must paint on the plane");
+    assert!(
+        plane_b.is_none(),
+        "fixture broken: B must be culled off-viewport on the plane so the columns \
+         contrast is non-vacuous"
+    );
+
+    // ── Toggle to columns via the REAL handler (the keybinding / menu path). ──
+    view.update_in(vcx, |v, w, cx| {
+        v.toggle_workspace_columns(&crate::ToggleWorkspaceColumns, w, cx)
+    });
+    let view_mode = view.read_with(vcx, |v, _| v.workspace.active_workspace().unwrap().view);
+    assert_eq!(
+        view_mode,
+        crate::workspace::WorkspaceView::Columns,
+        "the toggle handler must flip the arrangement to Columns"
+    );
+    for _ in 0..2 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+
+    // ── In columns, BOTH tiles paint side by side. ──
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let col_a = crate::layout_probe_get(&format!("columns-tile-{focused_id}"));
+    let col_b = crate::layout_probe_get(&format!("columns-tile-{other_id}"));
+    // The live content must render inside each column, not just the frame.
+    let live_a = crate::layout_probe_get(&format!("plane-tile-content-{focused_id}"));
+    let live_b = crate::layout_probe_get(&format!("plane-tile-content-{other_id}"));
+    crate::layout_probe_end();
+
+    let (ax, ay, aw, ah) = col_a.expect("column A frame did not paint in columns view");
+    let (bx, _by, bw, bh) = col_b.expect(
+        "column B frame did not paint in columns view — the tile the plane culled \
+         must appear as a column (UXI-Workspace-14)",
+    );
+    assert!(live_a.is_some(), "column A's live content must paint");
+    assert!(
+        live_b.is_some(),
+        "column B's live content must paint — the culled plane tile is now visible"
+    );
+    // Side by side: B sits strictly to the right of A and does not overlap it.
+    assert!(
+        bx > ax && bx >= ax + aw - 1.0,
+        "columns must be side by side (A at x={ax} w={aw}, B at x={bx}) — B must be \
+         to the RIGHT of A with no overlap"
+    );
+    // Equal width (flex_1) and full height, within a small tolerance.
+    assert!(
+        (aw - bw).abs() <= 2.0,
+        "columns must be equal width (A={aw}, B={bw})"
+    );
+    assert!(
+        ah > 1.0 && (ah - bh).abs() <= 2.0,
+        "columns must be full, equal height (A={ah}, B={bh})"
+    );
+    // Non-vacuity: the tiles occupy real horizontal space inside the viewport.
+    assert!(
+        aw > 50.0 && ay >= 0.0,
+        "column A painted with no real area (x={ax}, y={ay}, w={aw})"
+    );
+}
+
 /// bug-0012 (UXI-Workspace-6): in a workspace holding exactly ONE tile, a new
 /// tile lands at the SAME row, directly to the RIGHT of it — never diagonally.
 /// Both tiles use the configured default 4×4 span, so the new anchor is four

@@ -27,6 +27,58 @@ impl YaldaGpuiView {
     /// Render the active workspace's layout tree. Leaves dispatch to per-kind
     /// render methods; splits become flex containers (row for V splits,
     /// col for H splits) with weighted children.
+    /// Build a single tile's LIVE content element, shared by the plane
+    /// (`render_desktop`) and columns (`render_columns`) arrangements so both
+    /// render exactly the same per-kind body.
+    ///
+    /// The leaf-root CONTRACT (see `screen_root` in render()): the per-kind
+    /// renderers never set their own root layout — they expect a div that is
+    /// already `size_full + flex + flex_col` with the editor colors. Missing any
+    /// piece breaks them: without flex_col the header/body/footer stack in block
+    /// layout and the flex_1 virtualized body collapses to its minimum height
+    /// (content huddled at the top of the tile, dead space below). The focused
+    /// tile (and only it) carries the focus handle so the keyboard survives.
+    fn render_tile_content(
+        &mut self,
+        id: workspace::WindowId,
+        content: &mut App,
+        is_focused: bool,
+        attach_focus: bool,
+        base_bg: Hsla,
+        content_fg: Hsla,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let base = div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(base_bg)
+            .text_color(content_fg);
+        let leaf_root = if is_focused && attach_focus {
+            base.track_focus(&self.focus_handle)
+        } else {
+            base
+        };
+        let inner: AnyElement = match content {
+            App::Buffer(BufferApp::Viewing(d)) => {
+                self.render_doc(leaf_root, d, cx).into_any_element()
+            }
+            App::Buffer(BufferApp::Editing(e)) => {
+                self.render_edit(leaf_root, e, cx).into_any_element()
+            }
+            App::Buffer(BufferApp::Picking(b)) => {
+                self.render_browser(leaf_root, b, cx).into_any_element()
+            }
+            App::Agent(tile) => self.render_agent(leaf_root, tile, cx).into_any_element(),
+            App::Linear(tile) => self.render_linear(leaf_root, tile, cx).into_any_element(),
+            App::Keymap(tile) => self.render_keymap(leaf_root, tile, cx).into_any_element(),
+        };
+        // Tag the LIVE content so the layout probe can assert it paints (the
+        // semantic-zoom guard `plane_card_zoom_paints_placeholders_not_live_content`
+        // asserts it is ABSENT at Card/Minimap — only the Full/columns path builds it).
+        probe_bounds_dyn(format!("plane-tile-content-{id}"), inner)
+    }
+
     pub(crate) fn render_focused_window(
         &mut self,
         root: gpui::Div,
@@ -50,11 +102,170 @@ impl YaldaGpuiView {
         // &mut Layout<App> (a field inside self.workspace.workspaces)
         // is disjoint from &self.render_X's other field accesses.
         let layout = unsafe { &mut *layout_ptr };
-        // The plane is the ONLY workspace interior (infinite-plane, Stage D): a
-        // workspace IS a Plane (Behavior 1), so the workspace always renders as the
-        // desktop/plane canvas. The old split-tree branch (`render_layout`) is
-        // retired along with the mode surface.
-        self.render_desktop(root, layout, focused_id, attach_focus, rail_focusable, cx)
+        // Arrangement (UXI-Workspace-14): the same tiles render EITHER as the
+        // infinite plane (the default) or as equal-width columns. The plane is
+        // the workspace interior (infinite-plane, Stage D); columns is a pure
+        // view over the same content tree, leaving the plane slots untouched.
+        match self.workspace.workspaces[workspace_idx].view {
+            workspace::WorkspaceView::Columns => {
+                self.render_columns(root, layout, focused_id, attach_focus, rail_focusable, cx)
+            }
+            workspace::WorkspaceView::Plane => {
+                self.render_desktop(root, layout, focused_id, attach_focus, rail_focusable, cx)
+            }
+        }
+    }
+
+    /// Columns arrangement (`UXI-Workspace-14`): every tile is an equal-width,
+    /// full-height column, side by side in signed plane reading order
+    /// (top→bottom, left→right — the order `focus_next` traverses). No camera,
+    /// pan, zoom, drag, or resize — a column's width is `flex_1`, so the app
+    /// window's width divides evenly across the tiles. Click-to-focus
+    /// (`UXI-Workspace-9`) still applies; the focused tile carries the focus
+    /// handle so the keyboard survives. The `ToggleWorkspaceColumns` action is
+    /// wired on the container so you can switch back to the plane.
+    fn render_columns(
+        &mut self,
+        root: gpui::Div,
+        layout: &mut workspace::Layout<App>,
+        focused_id: workspace::WindowId,
+        attach_focus: bool,
+        rail_focusable: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let workspace_idx = self.workspace.active_workspace;
+        // Keep the plane slots seeded/consistent even while in columns so that
+        // toggling back to the plane shows a valid arrangement and focus
+        // navigation (`sequence_neighbor`, which traverses `desktop.slots`)
+        // works for tiles created while in columns. View-only — no reveal/pan.
+        {
+            let new_tile_span =
+                workspace::Span::new(self.desktop_grid_rows, self.desktop_grid_cols);
+            let wsp = &mut self.workspace.workspaces[workspace_idx];
+            let leaves = wsp.layout.leaf_ids();
+            wsp.desktop
+                .reconcile_near_with_span(&leaves, Some(focused_id), new_tile_span);
+        }
+
+        let base_bg = self.editor_bg();
+        let content_fg = self.editor_fg();
+        let dim: Hsla = nc(self.theme.agent.dim);
+        let accent: Hsla = rgb(CURSOR_BAR_COLOR).into();
+        let tile_bg = tint_bg(base_bg, 0.5, 0.06, 0.02);
+        let title_bg = tint_bg(base_bg, 0.5, 0.12, 0.05);
+
+        // Column order: signed reading order over the plane slots (the same
+        // order the plane numbers tiles and `focus_next` walks), so a tile keeps
+        // its relative position when you flip arrangements. Any slotless leaf
+        // (should not happen after the reconcile above) is appended in tree order.
+        let wsp = &self.workspace.workspaces[workspace_idx];
+        let mut order: Vec<workspace::WindowId> = {
+            let mut slotted: Vec<(workspace::Slot, workspace::WindowId)> =
+                wsp.desktop.slots.iter().map(|&(id, s)| (s, id)).collect();
+            slotted.sort_by_key(|&(s, _)| s);
+            slotted.into_iter().map(|(_, id)| id).collect()
+        };
+        for id in layout.leaf_ids() {
+            if !order.contains(&id) {
+                order.push(id);
+            }
+        }
+
+        let mut container = root
+            .size_full()
+            .flex()
+            .flex_row()
+            .gap(px(DESKTOP_GUTTER))
+            .p(px(DESKTOP_GUTTER))
+            .bg(base_bg)
+            .overflow_hidden()
+            // Wire the arrangement toggle on the container (the common ancestor
+            // of the focused tile in this view) so `Ctrl-W a` / the menu can flip
+            // back to the plane.
+            .on_action(cx.listener(Self::toggle_workspace_columns));
+
+        for id in order {
+            let is_focused = id == focused_id;
+            let Some(window) = layout.find_leaf_mut(id) else {
+                continue; // stale entry; reconcile drops it next frame
+            };
+            let content_ptr: *mut App = &mut window.content as *mut _;
+            // SAFETY: same argument as `render_desktop` — no structural tree
+            // mutation happens during this render pass.
+            let content = unsafe { &mut *content_ptr };
+            let title = Self::desktop_tile_title(&self.sessions, content, cx);
+            let mark = self.workspace.marks.mark_for_window(id);
+
+            let inner = self.render_tile_content(
+                id,
+                content,
+                is_focused,
+                attach_focus,
+                base_bg,
+                content_fg,
+                cx,
+            );
+
+            let mut title_bar = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .h(px(DESKTOP_TITLE_H))
+                .px_2()
+                .flex_none()
+                .bg(title_bg)
+                .text_size(px(11.0))
+                .text_color(if is_focused { accent } else { dim })
+                .child(title);
+            if let Some(m) = mark {
+                title_bar =
+                    title_bar.child(div().px_1().text_color(accent).child(format!("[{m}]")));
+            }
+
+            // UXI-Workspace-9 (click-to-focus): a LEFT press in an unfocused
+            // tile's body focuses it and is CONSUMED. Same capture-phase handler
+            // as the plane, resolving focus at event time (not captured here).
+            let tile_body = div()
+                .flex_1()
+                .min_h_0()
+                .overflow_hidden()
+                .child(inner)
+                .capture_any_mouse_down(cx.listener(
+                    move |this, ev: &MouseDownEvent, _w, cx| {
+                        if ev.button != MouseButton::Left {
+                            return;
+                        }
+                        if this.workspace.focused_window_id() == Some(id) {
+                            return;
+                        }
+                        this.desktop_focus_click(id, cx);
+                        cx.stop_propagation();
+                    },
+                ));
+
+            let column = div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .rounded_md()
+                .bg(tile_bg)
+                .border_1()
+                .border_color(if is_focused { accent } else { dim.opacity(0.4) })
+                .child(title_bar)
+                .child(tile_body);
+            // Tag the column frame so the layout probe can assert the tiles paint
+            // side by side (increasing x, equal width, full height).
+            container = container.child(probe_bounds_dyn(
+                format!("columns-tile-{id}"),
+                column.into_any_element(),
+            ));
+        }
+
+        self.wrap_leaf_with_rail(container.into_any_element(), rail_focusable, cx)
     }
 
     /// Desktop mode (spec-desktop-mode.md): fixed-size tiles at slot
@@ -208,6 +419,8 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::zoom_out_workspace))
             .on_action(cx.listener(Self::zoom_in_workspace))
             .on_action(cx.listener(Self::reset_workspace_view))
+            // Arrangement toggle (UXI-Workspace-14): flip the plane to columns.
+            .on_action(cx.listener(Self::toggle_workspace_columns))
             // Wheel/trackpad routing (Stage C, spec Behavior 5). This handler
             // fires in the BUBBLE phase, so at Full a scroll a live tile's inner
             // list already consumed still reaches here — `desktop_scroll` guards
@@ -383,45 +596,8 @@ impl YaldaGpuiView {
                 continue;
             }
 
-            // The leaf-root CONTRACT (see `screen_root` in render() and the
-            // split-child roots in render_layout): the per-kind renderers
-            // never set their own root layout — they expect a div that is
-            // already `size_full + flex + flex_col` with the editor colors.
-            // Missing any piece breaks them: without flex_col the header/
-            // body/footer stack in block layout and the flex_1 virtualized
-            // body collapses to its minimum height (content huddled at the
-            // top of the tile, dead space below).
-            let base = div()
-                .size_full()
-                .flex()
-                .flex_col()
-                .bg(base_bg)
-                .text_color(content_fg);
-            let leaf_root = if is_focused && attach_focus {
-                base.track_focus(&self.focus_handle)
-            } else {
-                base
-            };
-            let inner: AnyElement = match content {
-                App::Buffer(BufferApp::Viewing(d)) => {
-                    self.render_doc(leaf_root, d, cx).into_any_element()
-                }
-                App::Buffer(BufferApp::Editing(e)) => {
-                    self.render_edit(leaf_root, e, cx).into_any_element()
-                }
-                App::Buffer(BufferApp::Picking(b)) => {
-                    self.render_browser(leaf_root, b, cx).into_any_element()
-                }
-                App::Agent(tile) => self.render_agent(leaf_root, tile, cx).into_any_element(),
-                App::Linear(tile) => self.render_linear(leaf_root, tile, cx).into_any_element(),
-                App::Keymap(tile) => self.render_keymap(leaf_root, tile, cx).into_any_element(),
-            };
-            // Tag the LIVE content so the layout probe can assert it paints at
-            // Full and is ABSENT at Card/Minimap (the semantic-zoom guard,
-            // `plane_card_zoom_paints_placeholders_not_live_content`). Only the
-            // Full branch reaches here — the Card/Minimap branch above returns
-            // early with no live content built.
-            let inner = probe_bounds_dyn(format!("plane-tile-content-{id}"), inner);
+            let inner =
+                self.render_tile_content(id, content, is_focused, attach_focus, base_bg, content_fg, cx);
 
             let mut title_bar = div()
                 .flex()

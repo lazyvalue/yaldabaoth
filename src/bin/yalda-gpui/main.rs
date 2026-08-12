@@ -318,6 +318,9 @@ actions!(
         ZoomInWorkspace,
         ResetWorkspaceView,
         DesktopTileSize,
+        // Arrangement toggle (UXI-Workspace-14): flip the active workspace
+        // between the infinite plane and equal-width columns. `Ctrl-W a`.
+        ToggleWorkspaceColumns,
         // Phase 3: tags
         ClearTagView,
         TagViewChord,
@@ -1558,6 +1561,7 @@ fn gpui_menu() -> Vec<MenuNode> {
                 MenuNode::entry("0", "reset to origin", "plane-reset-view"),
             ],
         ),
+        MenuNode::entry("a", "toggle plane / columns", "workspace-toggle-columns"),
         MenuNode::entry("r", "rebuild and restart gui", "dev-restart-gui"),
         MenuNode::entry("R", "rebuild and restart all", "dev-restart-all"),
         MenuNode::entry("m", "mark tile", "mark-tile"),
@@ -2104,6 +2108,9 @@ impl YaldaGpuiView {
             wsp.master_ratio = pws.master_ratio;
             wsp.master_count = pws.master_count;
             wsp.tag_view = pws.tag_view;
+            // Restore the tile arrangement (UXI-Workspace-14). Old snapshots
+            // (no field) load as `Plane` via `#[serde(default)]`.
+            wsp.view = pws.view;
             wsp.desktop = workspace::DesktopState {
                 // Restored leaves keep their persisted WindowIds, so the
                 // id-keyed slots round-trip with no mapping. Stale ids (or an
@@ -4142,6 +4149,22 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
+    /// `Ctrl-W a` (and the `.` workspace menu) — toggle the active workspace's
+    /// tile arrangement between the infinite plane and equal-width columns
+    /// (`UXI-Workspace-14`). Pure view flip: no tile moves, so switching back is
+    /// lossless. Persists so the arrangement survives a round-trip.
+    fn toggle_workspace_columns(
+        &mut self,
+        _: &ToggleWorkspaceColumns,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace_idx = self.workspace.active_workspace;
+        self.workspace.workspaces[workspace_idx].toggle_view();
+        self.save_workspace_state();
+        cx.notify();
+    }
+
     // ---- Layout patterns (spec-layout-patterns.md) -------------------------
 
     // Phase 1: marks
@@ -5227,6 +5250,13 @@ impl YaldaGpuiView {
             "plane-reset-view" => {
                 let workspace_idx = self.workspace.active_workspace;
                 self.workspace.workspaces[workspace_idx].desktop.reset_view();
+                self.save_workspace_state();
+                cx.notify();
+            }
+            // Arrangement toggle (UXI-Workspace-14): plane ⇄ columns.
+            "workspace-toggle-columns" => {
+                let workspace_idx = self.workspace.active_workspace;
+                self.workspace.workspaces[workspace_idx].toggle_view();
                 self.save_workspace_state();
                 cx.notify();
             }

@@ -492,6 +492,49 @@ impl Detail {
     }
 }
 
+/// How a workspace arranges its tiles (`UXI-Workspace-14`). Two arrangements
+/// over the SAME set of tiles (the `Layout<C>` content tree):
+/// - `Plane` — the infinite signed-grid plane with the pan/semantic-zoom camera
+///   (the default; every other `UXI-Workspace-*` describes it).
+/// - `Columns` — every tile laid out as an equal-width, full-height column,
+///   side by side in signed reading order. Camera/pan/zoom/drag are irrelevant
+///   here; the tiles' plane slots are left untouched so toggling back to `Plane`
+///   restores the exact arrangement.
+///
+/// This is a pure VIEW choice — like the camera it never moves or removes a
+/// tile, so switching back and forth is lossless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WorkspaceView {
+    #[default]
+    Plane,
+    Columns,
+}
+
+/// Serialize as `"plane" | "columns"`.
+impl serde::Serialize for WorkspaceView {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(match self {
+            WorkspaceView::Plane => "plane",
+            WorkspaceView::Columns => "columns",
+        })
+    }
+}
+
+/// Hand-rolled deserialize with an unknown-string fallback to `Plane` — the SAME
+/// safety `Detail`/`LayoutMode` use: an arrangement value from a newer binary
+/// degrades to `Plane` rather than failing the parse and dropping the whole
+/// workspace snapshot.
+impl<'de> serde::Deserialize<'de> for WorkspaceView {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(match s.as_str() {
+            "columns" => WorkspaceView::Columns,
+            // "plane" and any string from the future
+            _ => WorkspaceView::Plane,
+        })
+    }
+}
+
 /// The per-plane view state (`spec-infinite-plane-workspace.md` D2). Pure view;
 /// it never moves a tile (Constraint C1). `pan` is the plane point at the
 /// viewport's top-left expressed in **pitch-independent slot units** — a given
@@ -1133,6 +1176,11 @@ pub struct Workspace<C> {
     /// layout tree above remains the content owner. Kept (not cleared) when
     /// switching away from Desktop so the arrangement survives round-trips.
     pub desktop: DesktopState,
+    /// How this workspace arranges its tiles (`UXI-Workspace-14`): the infinite
+    /// [`WorkspaceView::Plane`] (default) or [`WorkspaceView::Columns`]. A pure
+    /// view choice over the SAME tiles — toggling never moves a tile, and the
+    /// plane slots survive a round-trip through `Columns`.
+    pub view: WorkspaceView,
     /// The **project** this workspace belongs to (ADR-0028, `UXI-Project-2`).
     /// **Private and required**: a `Workspace` cannot be constructed without one (build
     /// via [`Workspace::with_layout`]), so no workspace — real or ephemeral — can exist
@@ -1170,8 +1218,19 @@ impl<C> Workspace<C> {
             master_count: 1,
             tag_view: BTreeSet::new(),
             desktop: DesktopState::default(),
+            view: WorkspaceView::default(),
             project,
         }
+    }
+
+    /// Toggle this workspace's tile arrangement between `Plane` and `Columns`
+    /// (`UXI-Workspace-14`). Pure view flip — no tile is moved or removed.
+    /// Caller is responsible for `cx.notify()` + persist.
+    pub fn toggle_view(&mut self) {
+        self.view = match self.view {
+            WorkspaceView::Plane => WorkspaceView::Columns,
+            WorkspaceView::Columns => WorkspaceView::Plane,
+        };
     }
 
     pub fn display_label(&self) -> &str {
@@ -2681,6 +2740,7 @@ mod tests {
             master_count: 1,
             tag_view: BTreeSet::new(),
             desktop: DesktopState::default(),
+            view: WorkspaceView::default(),
             project: ProjectId(0),
         });
         // Ensure window-id allocator skips past the ids we hand-rolled.
@@ -2983,6 +3043,7 @@ mod tests {
             master_count: 1,
             tag_view: BTreeSet::new(),
             desktop: DesktopState::default(),
+            view: WorkspaceView::default(),
             project: ProjectId(0),
         });
         let w = Window {
@@ -3012,6 +3073,7 @@ mod tests {
             master_count: 1,
             tag_view: BTreeSet::new(),
             desktop: DesktopState::default(),
+            view: WorkspaceView::default(),
             project: ProjectId(0),
         });
         let w = Window {
@@ -3050,6 +3112,7 @@ mod tests {
             master_count: 1,
             tag_view: BTreeSet::new(),
             desktop: DesktopState::default(),
+            view: WorkspaceView::default(),
             project: ProjectId(0),
         });
         let (window, empty) = ws.detach_focused().unwrap();
