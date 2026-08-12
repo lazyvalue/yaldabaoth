@@ -891,10 +891,15 @@ pub(crate) fn parse_block_range(
 ) -> BlockParse {
     let slice: String = lines[start..end].join("\n");
     let blocks = render_with_wiki(&slice, theme, None);
-    // Take the first Table or CodeBlock produced.
+    // Take the first Table, CodeBlock, or mermaid Diagram produced. Diagram must
+    // be promoted to a structural `FlatItem::Block` so it reaches `block_inner`'s
+    // Diagram arm in the transcript — otherwise a ` ```mermaid ` fence falls back
+    // to raw text lines and never renders as an image (UXI-Diagram-1).
     for b in blocks {
         match &b {
-            RenderedBlock::Table { .. } | RenderedBlock::CodeBlock { .. } => {
+            RenderedBlock::Table { .. }
+            | RenderedBlock::CodeBlock { .. }
+            | RenderedBlock::Diagram { .. } => {
                 return BlockParse::Parsed(b);
             }
             _ => {}

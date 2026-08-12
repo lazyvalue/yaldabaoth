@@ -18896,3 +18896,64 @@ fn diagram_003_successful_render_reaches_ready(cx: &mut TestAppContext) {
         );
     });
 }
+
+/// REGRESSION (UXI-Diagram-1): a ` ```mermaid ` fence in the AGENT TRANSCRIPT must
+/// promote to a `FlatItem::Block(Diagram)` so it reaches the paint arm and renders
+/// as an image. The transcript has its OWN block-promoter (`parse_block_range`)
+/// separate from the buffer doc path; it originally recognized only Table/CodeBlock,
+/// so a mermaid fence fell back to raw text lines and never rendered (the "nothing
+/// in the transcript" report).
+///
+/// Drives the REAL transcript: freeze a mermaid fence (as a committed agent block),
+/// let the real view-model rebuild + the per-frame reconcile run, then assert (1) the
+/// fence promoted to a Diagram block and (2) the real merman pipeline reached Ready.
+///
+/// Negative control (observed RED): drop `RenderedBlock::Diagram` from the
+/// `parse_block_range` match → the fence falls back to lines → no Diagram block →
+/// the promotion assert fails.
+#[gpui::test]
+fn diagram_006_mermaid_fence_renders_in_agent_transcript(cx: &mut TestAppContext) {
+    let (view, vcx, id, session) = boot_with_transcript(cx);
+
+    // A mermaid fence, frozen so it is a committed transcript block (4 lines).
+    session.update(vcx, |s, cx: &mut gpui::Context<crate::AgentSession>| {
+        s.state
+            .editor
+            .programmatic_insert(0, "```mermaid\nflowchart TD\n  A --> B\n```\n");
+        s.state.editor.add_frozen_lines(0, 4);
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+
+    // (1) Promotion: the fence must be a Diagram FlatItem::Block, not raw lines.
+    let has_diagram = session.read_with(vcx, |s, _| {
+        s.state.view_model.flat_items_cache.iter().any(|it| {
+            matches!(it, crate::FlatItem::Block(rc)
+                if matches!(rc.as_ref(), yalda::blocks::RenderedBlock::Diagram { .. }))
+        })
+    });
+    assert!(
+        has_diagram,
+        "a ```mermaid fence in the transcript must promote to a Diagram FlatItem::Block"
+    );
+
+    // (2) End-to-end: the per-frame reconcile requested a render and the real
+    // in-process merman pipeline reached Ready for that source.
+    for _ in 0..3 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+    let theme_name = view.read_with(vcx, |v, _| v.theme.name);
+    let key = crate::diagram_key(
+        "flowchart TD\n  A --> B",
+        crate::MermaidTheme::from_theme_name(theme_name),
+    );
+    let state = view.read_with(vcx, |v, _| v.diagrams.borrow().state_of(key));
+    assert_eq!(
+        state,
+        Some("ready"),
+        "the transcript mermaid block must render to Ready via the real pipeline; got {state:?}"
+    );
+}
