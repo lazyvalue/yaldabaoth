@@ -1010,6 +1010,12 @@ pub(crate) struct PersistedWorkspace {
     /// `Camera::default()` (origin, `Full`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) camera: Option<PersistedCamera>,
+    /// The workspace's tile arrangement (`UXI-Workspace-14`): `"plane"` (default)
+    /// or `"columns"`. Absent in old snapshots → `Plane`; an unknown value from a
+    /// newer binary degrades to `Plane` (the hand-rolled `WorkspaceView`
+    /// deserialize) rather than dropping the whole snapshot.
+    #[serde(default)]
+    pub(crate) view: workspace::WorkspaceView,
     /// The workspace's working directory (ADR-0023). `None` in old snapshots
     /// (pre-typed-cwd) → migrated from `legacy_kv["cwd"]` on restore, else the
     /// process dir.
@@ -1345,6 +1351,9 @@ pub(crate) fn snapshot_workspace(
                     pan: t.desktop.camera.pan,
                     zoom: t.desktop.camera.zoom,
                 }),
+                // The tile arrangement (UXI-Workspace-14), so a columns
+                // workspace reopens in columns.
+                view: t.view,
                 // Persist the workspace's PROJECT cwd (ADR-0028): the cwd lives on
                 // the project now, so we resolve `t.project()` through the store.
                 // Restore re-points the workspace at whatever project roots this

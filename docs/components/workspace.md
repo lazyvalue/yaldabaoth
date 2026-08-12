@@ -716,3 +716,58 @@ control. The implementation was tightened instead: `close_active_workspace`
 takes no GPUI `Context`, making app quit structurally unavailable to both the
 menu and action routes; handlers only notify when it reports that a workspace
 was removed. The floor mutation above guards the remaining state predicate.
+
+### UXI-Workspace-14 — A workspace switches between the plane and a columns arrangement
+
+**Statement.** A workspace carries a **`view: WorkspaceView`** — either `Plane`
+(the default infinite-plane arrangement every other `UXI-Workspace-*` describes)
+or `Columns`. One command toggles between them: **`Ctrl-W a`** (and the `.`
+workspace menu's "toggle plane / columns"). In `Columns` every tile of the
+workspace renders as an **equal-width, full-height column**, side by side, in
+signed plane **reading order** (top→bottom, left→right — the order the plane
+numbers tiles and `focus_next` traverses). A column's width is `flex_1`, so the
+app-window width divides evenly across the tiles; there is no camera, pan, zoom,
+drag, or edge-resize in columns.
+
+1. **The toggle is a pure VIEW flip** (like the camera, `UXI-Workspace-3`): it
+   never moves, re-seeds, or removes a tile. The plane slots/spans are left
+   untouched, so toggling back to `Plane` restores the exact prior arrangement.
+2. **Every tile appears** — including one the plane would cull off-viewport. The
+   focused tile carries the focus handle so the keyboard survives, and
+   click-to-focus (`UXI-Workspace-9`) still applies to each column's body.
+3. **It persists** (`view`, absent/unknown ⇒ `Plane`), so a columns workspace
+   reopens in columns.
+
+**Applies to.** `workspace.rs`: `WorkspaceView` enum (hand-rolled serde,
+unknown→`Plane`, mirroring `Detail`/`LayoutMode`), the `Workspace.view` field +
+`Workspace::toggle_view`. `chrome.rs`: `render_focused_window` branches on
+`view`; `render_columns` (flex-row of equal-width columns); the shared
+`render_tile_content` helper (extracted so plane + columns render identical
+per-kind bodies); the `ToggleWorkspaceColumns` action wired on BOTH the plane
+canvas root and the columns container. `main.rs`: the `ToggleWorkspaceColumns`
+action + `toggle_workspace_columns` handler + `workspace-toggle-columns` menu
+command + the `.` menu entry. `keymap_registry.rs`: `ctrl-w a`. `persist.rs`:
+`PersistedWorkspace.view` (`#[serde(default)]`) + save; `main.rs` restore
+(`wsp.view = pws.view`).
+
+**Why.** The plane is a boundless spatial canvas; sometimes the user wants every
+tile visible at once in a simple, dense side-by-side layout without panning.
+Columns gives that as a lossless alternate view over the same tiles.
+
+**Status.** `implemented` (headless).
+
+**Enforcement.** `verify_harness.rs::columns_view_arranges_tiles_side_by_side`
+drives the REAL `toggle_workspace_columns` handler (the keybinding/menu path) on
+a two-tile fixture where B is parked off-viewport: on the plane B is culled
+(proven first, for non-vacuity); after the toggle BOTH tiles paint as columns —
+B to the right of A, equal width, full height — via the layout probe
+(`columns-tile-{id}` + `plane-tile-content-{id}`). Negative-control-verified RED
+(drop the `Columns` arm → B still culled, `columns-tile-*` never paint).
+`tests.rs::workspace_view_round_trips_and_unknown_defaults_plane` pins the serde
+round-trip + absent/unknown → `Plane`.
+
+**Deviation from plan.** None. The toggle handler is the exact method both the
+`Ctrl-W a` binding and the `workspace-toggle-columns` menu command dispatch, so
+the guard drives it directly rather than a proxy. The real macOS `Ctrl-W a`
+chord *firing* is the usual `simulate_keystrokes`-vs-OS gap (CLAUDE.md rule 4),
+but the binding is a `Ctrl-W`+plain-letter sequence (reliable, like `Ctrl-W 0`).
