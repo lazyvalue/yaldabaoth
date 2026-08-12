@@ -65,7 +65,10 @@ impl ThemeName {
             | Self::GruvboxDark
             | Self::SolarizedDark
             | Self::FinancialTimesDark => "base16-ocean.dark",
-            Self::SolarizedLight | Self::FinancialTimes | Self::Folio => "base16-ocean.light",
+            Self::SolarizedLight | Self::FinancialTimes => "base16-ocean.light",
+            // Custom hand-built palette (see `highlight::folio_theme`); the pale
+            // base16-ocean.light accents are too low-contrast on Folio's linen bg.
+            Self::Folio => crate::highlight::FOLIO_SYNTECT_THEME,
         }
     }
 }

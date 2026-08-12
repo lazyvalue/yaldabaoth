@@ -7,7 +7,9 @@ use crate::style::Style;
 use crate::theme::Theme;
 
 pub fn render(markdown: &str, theme: &Theme) -> Vec<RenderedBlock> {
-    let highlighter = Highlighter::new();
+    // Match the theme so code fences aren't always base16-ocean.dark regardless
+    // of the active theme (e.g. dark tokens washing out on Folio's linen bg).
+    let highlighter = Highlighter::with_syntect_theme(theme.name.syntect_theme());
     render_with_highlighter(markdown, theme, &highlighter)
 }
 
@@ -602,6 +604,54 @@ mod frontmatter_tests {
             lines.len(),
             3,
             "one styled line per frontmatter source line; got {lines:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod highlight_theme_tests {
+    use super::*;
+    use crate::style::Color;
+    use crate::theme::ThemeName;
+
+    fn code_fg(theme: &Theme, needle: &str) -> Color {
+        let md = "```rust\nlet s = \"hi\";\n```\n";
+        let blocks = render(md, theme);
+        let lines = blocks
+            .iter()
+            .find_map(|b| match b {
+                RenderedBlock::CodeBlock { lines, .. } => Some(lines),
+                _ => None,
+            })
+            .expect("a code block");
+        lines
+            .iter()
+            .flat_map(|l| &l.spans)
+            .find(|s| s.text.contains(needle))
+            .unwrap_or_else(|| panic!("no token containing {needle:?}"))
+            .style
+            .fg
+            .expect("token fg")
+    }
+
+    /// The markdown *block* path (buffer Viewing + sub-agent timeline) must honor
+    /// the active theme, not always paint base16-ocean.dark. Under Folio the
+    /// string token is Folio sage; under a dark theme it differs.
+    ///
+    /// Negative control: revert `render()` to `Highlighter::new()` and both the
+    /// `== sage` assert and the `!=` assert fail (dark tokens under both themes).
+    #[test]
+    fn code_fences_follow_the_active_theme() {
+        let folio_string = code_fg(&Theme::folio(), "\"");
+        assert_eq!(
+            folio_string,
+            Color::Rgb(0x49, 0x5f, 0x4e),
+            "Folio code fence string should be sage, not base16-ocean.dark"
+        );
+        let dark_string = code_fg(&Theme::from_name(ThemeName::Dracula), "\"");
+        assert_ne!(
+            folio_string, dark_string,
+            "block path must vary syntax colors by theme"
         );
     }
 }
