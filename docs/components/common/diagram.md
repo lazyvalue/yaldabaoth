@@ -76,7 +76,11 @@ agent transcript (`TranscriptView`) and the buffer `Viewing` surface (`YaldaView
 - **Editing is unchanged.** The buffer `Editing` (raw source) surface renders the
   mermaid text as ordinary code — you edit the source there.
 - **v1 scope.** No click-to-enlarge. The diagram does NOT couple to `Cmd` text-zoom
-  (`TextZoom`) — it fits to the container width. The rendered image opts OUT of the
+  (`TextZoom`). It paints at an explicit display width — the PNG's pixel width ÷
+  `RENDER_SCALE` (merman rasterizes at 2× for crispness), clamped to
+  `MAX_DIAGRAM_WIDTH_PX` (620) and to the pane via `max_w_full`; height auto-derives
+  from the image aspect. Without an explicit width gpui paints an `img()` at its
+  intrinsic PIXEL size (2×) — enormous. The rendered image opts OUT of the
   code-block per-line hit-testing (`UXI-Selection-3`): no copy-on-select over the
   bitmap. The raw source remains selectable in `Editing`.
 

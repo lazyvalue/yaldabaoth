@@ -49,15 +49,48 @@ impl MermaidTheme {
     }
 }
 
+/// merman renders at `RENDER_SCALE`× so the raster stays crisp when displayed;
+/// the paint size is the pixel size ÷ this factor (then capped).
+pub(crate) const RENDER_SCALE: f32 = 2.0;
+
+/// Upper bound on a diagram's on-screen width (px). Keeps a big flowchart from
+/// spanning the whole (wide) editor / transcript; height follows by aspect. gpui
+/// sizes an `img()` with both dimensions `Auto` to the intrinsic PIXEL size, so
+/// without an explicit width a `RENDER_SCALE`× raster paints at 2× and looks
+/// enormous — the display width is computed and clamped here instead.
+pub(crate) const MAX_DIAGRAM_WIDTH_PX: f32 = 620.0;
+
 /// The render state of one diagram, keyed in [`DiagramCache`].
 pub(crate) enum DiagramRender {
     /// A background render is in flight; paint the raw source placeholder.
     Pending,
-    /// A decoded PNG ready to paint via `img()`.
-    Ready(Arc<gpui::Image>),
+    /// A decoded PNG ready to paint via `img()`, with its computed on-screen
+    /// width (px) — the raster's pixel width ÷ `RENDER_SCALE`, clamped to
+    /// `MAX_DIAGRAM_WIDTH_PX`. Height auto-derives from the image aspect.
+    Ready(Arc<gpui::Image>, f32),
     /// merman could not render this diagram (unsupported type / parse error);
     /// paint raw source + this note.
     Failed(String),
+}
+
+/// The pixel width from a PNG's IHDR (big-endian `u32` at byte offset 16), if the
+/// buffer looks like a PNG. Used to compute the on-screen display width without a
+/// full decode.
+fn png_pixel_width(bytes: &[u8]) -> Option<u32> {
+    const PNG_SIG: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    if bytes.len() < 24 || bytes[..8] != PNG_SIG {
+        return None;
+    }
+    Some(u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]))
+}
+
+/// The clamped on-screen width (px) for a rendered diagram PNG: pixel width ÷
+/// `RENDER_SCALE`, capped at `MAX_DIAGRAM_WIDTH_PX`. Falls back to the cap if the
+/// PNG size can't be read.
+fn diagram_display_width(bytes: &[u8]) -> f32 {
+    png_pixel_width(bytes)
+        .map(|pw| (pw as f32 / RENDER_SCALE).min(MAX_DIAGRAM_WIDTH_PX))
+        .unwrap_or(MAX_DIAGRAM_WIDTH_PX)
 }
 
 /// Per-view cache of rendered mermaid diagrams, keyed by `hash(source + theme)`.
@@ -89,7 +122,7 @@ impl DiagramCache {
     pub(crate) fn state_of(&self, key: u64) -> Option<&'static str> {
         self.entries.get(&key).map(|s| match s {
             DiagramRender::Pending => "pending",
-            DiagramRender::Ready(_) => "ready",
+            DiagramRender::Ready(..) => "ready",
             DiagramRender::Failed(_) => "failed",
         })
     }
@@ -150,7 +183,7 @@ fn render_mermaid_png_real(source: &str, theme: MermaidTheme) -> Result<Vec<u8>,
     // scale 2.0 keeps the raster crisp on HiDPI; transparent background (None)
     // matches the block's own background.
     let raster = merman::render::raster::RasterOptions {
-        scale: 2.0,
+        scale: RENDER_SCALE,
         background: None,
         jpeg_quality: 90,
     };
@@ -241,13 +274,19 @@ impl YaldaGpuiView {
                 {
                     let mut cache = this.diagrams.borrow_mut();
                     match result {
-                        Ok(bytes) => cache.set(
-                            key,
-                            DiagramRender::Ready(Arc::new(gpui::Image::from_bytes(
-                                gpui::ImageFormat::Png,
-                                bytes,
-                            ))),
-                        ),
+                        Ok(bytes) => {
+                            let width = diagram_display_width(&bytes);
+                            cache.set(
+                                key,
+                                DiagramRender::Ready(
+                                    Arc::new(gpui::Image::from_bytes(
+                                        gpui::ImageFormat::Png,
+                                        bytes,
+                                    )),
+                                    width,
+                                ),
+                            )
+                        }
                         Err(err) => cache.set(key, DiagramRender::Failed(err)),
                     }
                 }
@@ -300,5 +339,38 @@ mod merman_tests {
             "unrenderable source must Err (drives fallback), got {:?}",
             r.map(|b| b.len())
         );
+    }
+
+    /// The display width is the PNG's pixel width ÷ `RENDER_SCALE`, clamped to
+    /// `MAX_DIAGRAM_WIDTH_PX` — so a `RENDER_SCALE`× raster never paints at 2×
+    /// and a big diagram never spans the whole pane (the "absolutely massive"
+    /// report). Guards the sizing math directly.
+    #[test]
+    fn display_width_unscales_and_caps() {
+        use super::{diagram_display_width, MAX_DIAGRAM_WIDTH_PX, RENDER_SCALE};
+        // A synthetic PNG header (IHDR width = 800px).
+        let png = |w: u32| {
+            let mut b = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+            b.extend_from_slice(&[0, 0, 0, 13]); // IHDR length
+            b.extend_from_slice(b"IHDR");
+            b.extend_from_slice(&w.to_be_bytes()); // width @ offset 16
+            b.extend_from_slice(&100u32.to_be_bytes()); // height
+            b.extend_from_slice(&[8, 6, 0, 0, 0]); // bit depth, color, …
+            b
+        };
+        // 800px raster at 2× → 400px display (under the cap).
+        assert_eq!(
+            diagram_display_width(&png(800)),
+            (800.0 / RENDER_SCALE),
+            "an under-cap diagram displays at pixel width ÷ scale"
+        );
+        // A huge raster clamps to the cap.
+        assert_eq!(
+            diagram_display_width(&png(4000)),
+            MAX_DIAGRAM_WIDTH_PX,
+            "an oversize diagram is clamped to MAX_DIAGRAM_WIDTH_PX"
+        );
+        // Non-PNG bytes fall back to the cap (never zero / unbounded).
+        assert_eq!(diagram_display_width(b"not a png"), MAX_DIAGRAM_WIDTH_PX);
     }
 }

@@ -1598,15 +1598,24 @@ pub(crate) fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElem
             let ready = ctx.diagrams.as_ref().and_then(|cache| {
                 let key = diagram_key(source, MermaidTheme::from_theme_name(ctx.theme.name));
                 match cache.borrow().get(key) {
-                    Some(DiagramRender::Ready(image)) => Some(Ok(image.clone())),
+                    Some(DiagramRender::Ready(image, width)) => Some(Ok((image.clone(), *width))),
                     Some(DiagramRender::Failed(msg)) => Some(Err(msg.clone())),
                     // Pending or not-yet-requested: placeholder.
                     _ => None,
                 }
             });
             match ready {
-                Some(Ok(image)) => div()
-                    .child(img(image).max_w_full().object_fit(ObjectFit::Contain))
+                // Explicit display WIDTH (height stays `Auto` → gpui derives it
+                // from the image aspect); `max_w_full` clamps on a narrow pane.
+                // Without a set width gpui paints the img at its intrinsic PIXEL
+                // size (2× the render scale) — enormous. See UXI-Diagram-1.
+                Some(Ok((image, width))) => div()
+                    .child(
+                        img(image)
+                            .w(px(width))
+                            .max_w_full()
+                            .object_fit(ObjectFit::Contain),
+                    )
                     .into_any_element(),
                 other => {
                     let note = match other {
