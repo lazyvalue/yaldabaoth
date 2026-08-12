@@ -121,6 +121,76 @@ pub(crate) fn set_test_renderer(f: Option<TestRenderFn>) {
     *TEST_RENDERER.lock().unwrap() = f;
 }
 
+/// Resolve the `mmdc` executable: `YALDA_MMDC` override → `PATH` → common
+/// absolute install locations. `None` if nothing executable is found. A GUI app
+/// launched from Finder/Dock inherits a minimal `PATH` (no nvm/Homebrew node
+/// bin), so `PATH` alone is not enough — hence the absolute-location probe.
+/// Recomputed per render (a handful of `stat`s; the render spawns a browser, so
+/// this cost is noise).
+fn resolve_mmdc() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("YALDA_MMDC") {
+        let p = std::path::PathBuf::from(p);
+        if is_executable_file(&p) {
+            return Some(p);
+        }
+    }
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let cand = dir.join("mmdc");
+            if is_executable_file(&cand) {
+                return Some(cand);
+            }
+        }
+    }
+    mmdc_fallback_candidates()
+        .into_iter()
+        .find(|c| is_executable_file(c))
+}
+
+/// Common absolute locations `mmdc` installs to when `PATH` won't carry it,
+/// newest-nvm-version first.
+fn mmdc_fallback_candidates() -> Vec<std::path::PathBuf> {
+    let mut cands = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        // nvm: ~/.nvm/versions/node/<ver>/bin/mmdc — prefer the newest version
+        // (versions sort ascending; probe them high-to-low).
+        if let Ok(entries) = std::fs::read_dir(home.join(".nvm/versions/node")) {
+            let mut versions: Vec<std::path::PathBuf> =
+                entries.flatten().map(|e| e.path()).collect();
+            versions.sort();
+            for v in versions.into_iter().rev() {
+                cands.push(v.join("bin/mmdc"));
+            }
+        }
+        cands.push(home.join(".volta/bin/mmdc"));
+        cands.push(home.join(".asdf/shims/mmdc"));
+        cands.push(home.join(".npm-global/bin/mmdc"));
+    }
+    cands.push(std::path::PathBuf::from("/opt/homebrew/bin/mmdc"));
+    cands.push(std::path::PathBuf::from("/usr/local/bin/mmdc"));
+    cands
+}
+
+/// A regular, executable file (symlinks followed). Used to validate an `mmdc`
+/// candidate before spawning it.
+fn is_executable_file(p: &std::path::Path) -> bool {
+    let Ok(meta) = std::fs::metadata(p) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 /// Render mermaid `source` to PNG bytes. Blocking — MUST run on a background
 /// executor, never the paint thread. Shells out to `mmdc`.
 fn render_mermaid_png(source: &str, theme: MermaidTheme) -> Result<Vec<u8>, String> {
@@ -142,7 +212,19 @@ fn render_mermaid_png(source: &str, theme: MermaidTheme) -> Result<Vec<u8>, Stri
 
     std::fs::write(&in_path, source).map_err(|e| format!("write temp: {e}"))?;
 
-    let run = process::Command::new("mmdc")
+    // Resolve the `mmdc` executable. A GUI process launched from Finder/Dock
+    // inherits a minimal `PATH` that usually excludes the nvm / Homebrew node
+    // bin dirs where `mmdc` lives, so a bare `Command::new("mmdc")` would fail
+    // even though `mmdc` works in a terminal. Probe `PATH` first, then common
+    // absolute install locations; `YALDA_MMDC` overrides everything.
+    let Some(mmdc) = resolve_mmdc() else {
+        let _ = std::fs::remove_file(&in_path);
+        return Err(
+            "mmdc not found (checked YALDA_MMDC, PATH, nvm/Homebrew/volta locations)".to_string(),
+        );
+    };
+
+    let run = process::Command::new(&mmdc)
         .arg("-i")
         .arg(&in_path)
         .arg("-o")
@@ -172,12 +254,6 @@ fn render_mermaid_png(source: &str, theme: MermaidTheme) -> Result<Vec<u8>, Stri
 }
 
 impl YaldaGpuiView {
-    /// Ensure a render exists for this diagram (source × theme × width). Called
-    /// from the non-render reconcile pass — NEVER from a render path. If the key
-    /// is already cached (pending/ready/failed) this is a no-op; otherwise it
-    /// marks the entry `Pending` and spawns the blocking `mmdc` render on the
-    /// background executor, writing the result and invalidating BOTH the doc
-    /// view and every transcript view from the completion callback.
     /// Non-render reconcile: find every mermaid `Diagram` block currently shown
     /// on either markdown surface — buffer `Viewing` docs and agent transcripts
     /// — and ensure a render is in flight for each. Idempotent: `request_diagram`
@@ -229,6 +305,12 @@ impl YaldaGpuiView {
         }
     }
 
+    /// Ensure a render exists for this diagram (source × theme). Called from the
+    /// non-render reconcile pass — NEVER from a render path. If the key is already
+    /// cached (pending/ready/failed) this is a no-op; otherwise it marks the entry
+    /// `Pending` and spawns the blocking `mmdc` render on the background executor,
+    /// writing the result and invalidating BOTH the doc view and every transcript
+    /// view from the completion callback.
     pub(crate) fn request_diagram(&mut self, source: &str, theme: ThemeName, cx: &mut Context<Self>) {
         let mtheme = MermaidTheme::from_theme_name(theme);
         let key = diagram_key(source, mtheme);
@@ -266,5 +348,57 @@ impl YaldaGpuiView {
             });
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::{is_executable_file, mmdc_fallback_candidates, resolve_mmdc};
+    use std::path::Path;
+
+    #[test]
+    fn fallback_candidates_probe_mmdc_in_known_locations() {
+        let cands = mmdc_fallback_candidates();
+        assert!(
+            cands.iter().all(|c| c.file_name().unwrap() == "mmdc"),
+            "every candidate must be an mmdc path"
+        );
+        assert!(
+            cands
+                .iter()
+                .any(|c| c == Path::new("/opt/homebrew/bin/mmdc")),
+            "Homebrew (Apple-silicon) location must be probed"
+        );
+        assert!(
+            cands.iter().any(|c| c == Path::new("/usr/local/bin/mmdc")),
+            "Homebrew (Intel) / npm-global location must be probed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_executable_file_gates_on_the_exec_bit() {
+        // A real executable, a non-existent path, and a readable-but-not-exec file.
+        assert!(is_executable_file(Path::new("/bin/sh")), "sh is executable");
+        assert!(
+            !is_executable_file(Path::new("/no/such/mmdc")),
+            "missing path is not executable"
+        );
+        assert!(
+            !is_executable_file(Path::new("/etc/hosts")),
+            "a plain data file must not count as executable"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn yalda_mmdc_override_is_honored_when_executable() {
+        // SAFETY: single-threaded test; no other test reads YALDA_MMDC.
+        unsafe { std::env::set_var("YALDA_MMDC", "/bin/sh") };
+        assert_eq!(resolve_mmdc(), Some(std::path::PathBuf::from("/bin/sh")));
+        unsafe { std::env::set_var("YALDA_MMDC", "/no/such/mmdc") };
+        // A bad override falls through to PATH / fallbacks (which won't be /bin/sh).
+        assert_ne!(resolve_mmdc(), Some(std::path::PathBuf::from("/no/such/mmdc")));
+        unsafe { std::env::remove_var("YALDA_MMDC") };
     }
 }
