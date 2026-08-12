@@ -4,14 +4,15 @@
 //! RenderedBlock::Diagram); this module turns its source into a PNG **off the
 //! paint thread** and caches the result so the shared `block_inner` paint
 //! dispatch (both the agent transcript and the buffer Viewing surface) can paint
-//! it inline. The render is an async shell-out to `mmdc`
-//! (`@mermaid-js/mermaid-cli`). Until the PNG is ready — or if `mmdc` is absent /
-//! errors — the block paints its raw highlighted source (the paint arm handles
+//! it inline. Rendering is **in-process** via `merman` (native Rust: parse →
+//! layout → SVG → resvg raster) — no `mmdc`, no Node/Chromium, no `PATH`
+//! dependency. Until the PNG is ready — or if `merman` can't render that diagram
+//! type — the block paints its raw highlighted source (the paint arm handles
 //! that; see `render_blocks.rs`).
 //!
 //! Rules honored here (see `yux/CLAUDE.md` + root `CLAUDE.md`):
-//! - the blocking `mmdc` run happens on `background_executor()`, never the paint
-//!   thread;
+//! - the CPU-bound `merman` render happens on `background_executor()`, never the
+//!   paint thread;
 //! - the cache is written and both surfaces invalidated from the spawn
 //!   completion callback (an event context), never from a render path.
 
@@ -39,7 +40,7 @@ impl MermaidTheme {
         }
     }
 
-    /// The `-t` flag value passed to `mmdc`.
+    /// The mermaid built-in theme name (merman `MermaidConfig` `theme` value).
     fn flag(self) -> &'static str {
         match self {
             Self::Default => "default",
@@ -54,12 +55,13 @@ pub(crate) enum DiagramRender {
     Pending,
     /// A decoded PNG ready to paint via `img()`.
     Ready(Arc<gpui::Image>),
-    /// `mmdc` was absent or the render failed; paint raw source + this note.
+    /// merman could not render this diagram (unsupported type / parse error);
+    /// paint raw source + this note.
     Failed(String),
 }
 
-/// Per-view cache of rendered mermaid diagrams, keyed by
-/// `hash(source + theme + width bucket)`. Owned by the root view behind an
+/// Per-view cache of rendered mermaid diagrams, keyed by `hash(source + theme)`.
+/// Owned by the root view behind an
 /// `Rc<RefCell<…>>` so the paint path (via `RenderCtx`) can read it and the
 /// spawn completion can write it.
 #[derive(Default)]
@@ -121,136 +123,44 @@ pub(crate) fn set_test_renderer(f: Option<TestRenderFn>) {
     *TEST_RENDERER.lock().unwrap() = f;
 }
 
-/// Resolve the `mmdc` executable: `YALDA_MMDC` override → `PATH` → common
-/// absolute install locations. `None` if nothing executable is found. A GUI app
-/// launched from Finder/Dock inherits a minimal `PATH` (no nvm/Homebrew node
-/// bin), so `PATH` alone is not enough — hence the absolute-location probe.
-/// Recomputed per render (a handful of `stat`s; the render spawns a browser, so
-/// this cost is noise).
-fn resolve_mmdc() -> Option<std::path::PathBuf> {
-    if let Ok(p) = std::env::var("YALDA_MMDC") {
-        let p = std::path::PathBuf::from(p);
-        if is_executable_file(&p) {
-            return Some(p);
-        }
-    }
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            let cand = dir.join("mmdc");
-            if is_executable_file(&cand) {
-                return Some(cand);
-            }
-        }
-    }
-    mmdc_fallback_candidates()
-        .into_iter()
-        .find(|c| is_executable_file(c))
-}
-
-/// Common absolute locations `mmdc` installs to when `PATH` won't carry it,
-/// newest-nvm-version first.
-fn mmdc_fallback_candidates() -> Vec<std::path::PathBuf> {
-    let mut cands = Vec::new();
-    if let Some(home) = dirs::home_dir() {
-        // nvm: ~/.nvm/versions/node/<ver>/bin/mmdc — prefer the newest version
-        // (versions sort ascending; probe them high-to-low).
-        if let Ok(entries) = std::fs::read_dir(home.join(".nvm/versions/node")) {
-            let mut versions: Vec<std::path::PathBuf> =
-                entries.flatten().map(|e| e.path()).collect();
-            versions.sort();
-            for v in versions.into_iter().rev() {
-                cands.push(v.join("bin/mmdc"));
-            }
-        }
-        cands.push(home.join(".volta/bin/mmdc"));
-        cands.push(home.join(".asdf/shims/mmdc"));
-        cands.push(home.join(".npm-global/bin/mmdc"));
-    }
-    cands.push(std::path::PathBuf::from("/opt/homebrew/bin/mmdc"));
-    cands.push(std::path::PathBuf::from("/usr/local/bin/mmdc"));
-    cands
-}
-
-/// A regular, executable file (symlinks followed). Used to validate an `mmdc`
-/// candidate before spawning it.
-fn is_executable_file(p: &std::path::Path) -> bool {
-    let Ok(meta) = std::fs::metadata(p) else {
-        return false;
-    };
-    if !meta.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        meta.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
-
-/// Render mermaid `source` to PNG bytes. Blocking — MUST run on a background
-/// executor, never the paint thread. Shells out to `mmdc`.
+/// Render mermaid `source` to PNG bytes. CPU-bound — MUST run on a background
+/// executor, never the paint thread. Renders IN-PROCESS via `merman` (native
+/// Rust: parse → layout → SVG → resvg raster), so there is no `mmdc` subprocess,
+/// no Node/Chromium, and no `PATH` dependency. `merman` covers a subset of
+/// mermaid's diagram types (flowchart, sequence, class, ER, XY); anything it
+/// can't render returns `Ok(None)` here, which the caller surfaces as the
+/// raw-source fallback.
 fn render_mermaid_png(source: &str, theme: MermaidTheme) -> Result<Vec<u8>, String> {
     #[cfg(test)]
     if let Some(f) = *TEST_RENDERER.lock().unwrap() {
         return f(source, theme);
     }
+    render_mermaid_png_real(source, theme)
+}
 
-    // mmdc reads an input file and writes an output file; it has no stdin mode.
-    // Stage both in a unique temp path so concurrent renders don't collide.
-    let mut key = std::collections::hash_map::DefaultHasher::new();
-    source.hash(&mut key);
-    theme.hash(&mut key);
-    std::process::id().hash(&mut key);
-    let stem = format!("yalda-mermaid-{:016x}", key.finish());
-    let dir = std::env::temp_dir();
-    let in_path = dir.join(format!("{stem}.mmd"));
-    let out_path = dir.join(format!("{stem}.png"));
+/// The real (never-stubbed) merman render. Split out so tests can exercise the
+/// actual engine without racing the process-global `TEST_RENDERER` seam.
+fn render_mermaid_png_real(source: &str, theme: MermaidTheme) -> Result<Vec<u8>, String> {
+    // The app theme drives mermaid's built-in `default`/`dark` palette so the
+    // diagram matches the surrounding UI.
+    let mut config = merman::MermaidConfig::empty_object();
+    config.set_value("theme", serde_json::Value::from(theme.flag()));
 
-    std::fs::write(&in_path, source).map_err(|e| format!("write temp: {e}"))?;
-
-    // Resolve the `mmdc` executable. A GUI process launched from Finder/Dock
-    // inherits a minimal `PATH` that usually excludes the nvm / Homebrew node
-    // bin dirs where `mmdc` lives, so a bare `Command::new("mmdc")` would fail
-    // even though `mmdc` works in a terminal. Probe `PATH` first, then common
-    // absolute install locations; `YALDA_MMDC` overrides everything.
-    let Some(mmdc) = resolve_mmdc() else {
-        let _ = std::fs::remove_file(&in_path);
-        return Err(
-            "mmdc not found (checked YALDA_MMDC, PATH, nvm/Homebrew/volta locations)".to_string(),
-        );
+    let renderer = merman::render::HeadlessRenderer::new().with_site_config(config);
+    // scale 2.0 keeps the raster crisp on HiDPI; transparent background (None)
+    // matches the block's own background.
+    let raster = merman::render::raster::RasterOptions {
+        scale: 2.0,
+        background: None,
+        jpeg_quality: 90,
     };
 
-    let run = process::Command::new(&mmdc)
-        .arg("-i")
-        .arg(&in_path)
-        .arg("-o")
-        .arg(&out_path)
-        .arg("-t")
-        .arg(theme.flag())
-        .arg("-b")
-        .arg("transparent")
-        .output();
-
-    let bytes = match run {
-        Ok(o) if o.status.success() => {
-            std::fs::read(&out_path).map_err(|e| format!("read png: {e}"))
-        }
-        Ok(o) => Err(format!(
-            "mmdc failed: {}",
-            String::from_utf8_lossy(&o.stderr).trim()
-        )),
-        // The common no-tooling case: keep the message short and human.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err("mmdc not found".to_string()),
-        Err(e) => Err(format!("mmdc: {e}")),
-    };
-
-    let _ = std::fs::remove_file(&in_path);
-    let _ = std::fs::remove_file(&out_path);
-    bytes
+    match renderer.render_png_sync(source, &raster) {
+        Ok(Some(bytes)) => Ok(bytes),
+        // merman parsed nothing renderable (empty or an unsupported diagram type).
+        Ok(None) => Err("unsupported or empty mermaid diagram".to_string()),
+        Err(e) => Err(format!("mermaid render failed: {e}")),
+    }
 }
 
 impl YaldaGpuiView {
@@ -352,53 +262,43 @@ impl YaldaGpuiView {
 }
 
 #[cfg(test)]
-mod resolve_tests {
-    use super::{is_executable_file, mmdc_fallback_candidates, resolve_mmdc};
-    use std::path::Path;
+mod merman_tests {
+    use super::{render_mermaid_png_real, MermaidTheme};
 
+    /// The REAL in-process merman engine renders a basic flowchart to a PNG,
+    /// headlessly, with no subprocess/browser. This is what used to be the
+    /// "live mmdc subprocess" runtime gap — now a plain unit test.
+    ///
+    /// Calls `render_mermaid_png_real` directly (not the `TEST_RENDERER`-gated
+    /// wrapper) so a stub another test left installed can't intercept it.
     #[test]
-    fn fallback_candidates_probe_mmdc_in_known_locations() {
-        let cands = mmdc_fallback_candidates();
+    fn real_merman_renders_flowchart_to_png() {
+        let bytes = render_mermaid_png_real(
+            "flowchart TD\n  A[Start] --> B{Choice}\n  B -->|yes| C[Done]\n  B -->|no| A",
+            MermaidTheme::Dark,
+        )
+        .expect("merman must render a basic flowchart");
         assert!(
-            cands.iter().all(|c| c.file_name().unwrap() == "mmdc"),
-            "every candidate must be an mmdc path"
+            bytes.len() > 200,
+            "expected a non-trivial PNG, got {} bytes",
+            bytes.len()
         );
-        assert!(
-            cands
-                .iter()
-                .any(|c| c == Path::new("/opt/homebrew/bin/mmdc")),
-            "Homebrew (Apple-silicon) location must be probed"
-        );
-        assert!(
-            cands.iter().any(|c| c == Path::new("/usr/local/bin/mmdc")),
-            "Homebrew (Intel) / npm-global location must be probed"
+        assert_eq!(
+            &bytes[..4],
+            &[0x89, 0x50, 0x4E, 0x47],
+            "output bytes must carry the PNG magic number"
         );
     }
 
-    #[cfg(unix)]
+    /// Unrenderable source resolves to `Err` (the raw-source fallback trigger),
+    /// never a panic.
     #[test]
-    fn is_executable_file_gates_on_the_exec_bit() {
-        // A real executable, a non-existent path, and a readable-but-not-exec file.
-        assert!(is_executable_file(Path::new("/bin/sh")), "sh is executable");
+    fn unrenderable_source_errors_without_panic() {
+        let r = render_mermaid_png_real("this is not a mermaid diagram", MermaidTheme::Default);
         assert!(
-            !is_executable_file(Path::new("/no/such/mmdc")),
-            "missing path is not executable"
+            r.is_err(),
+            "unrenderable source must Err (drives fallback), got {:?}",
+            r.map(|b| b.len())
         );
-        assert!(
-            !is_executable_file(Path::new("/etc/hosts")),
-            "a plain data file must not count as executable"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn yalda_mmdc_override_is_honored_when_executable() {
-        // SAFETY: single-threaded test; no other test reads YALDA_MMDC.
-        unsafe { std::env::set_var("YALDA_MMDC", "/bin/sh") };
-        assert_eq!(resolve_mmdc(), Some(std::path::PathBuf::from("/bin/sh")));
-        unsafe { std::env::set_var("YALDA_MMDC", "/no/such/mmdc") };
-        // A bad override falls through to PATH / fallbacks (which won't be /bin/sh).
-        assert_ne!(resolve_mmdc(), Some(std::path::PathBuf::from("/no/such/mmdc")));
-        unsafe { std::env::remove_var("YALDA_MMDC") };
     }
 }
