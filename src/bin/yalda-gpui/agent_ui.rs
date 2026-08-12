@@ -370,6 +370,13 @@ impl YaldaGpuiView {
                 turns: info.turns,
                 connected: info.connected,
                 permission_mode: info.permission_mode,
+                // UXI-AgentTile-39: reuse the jump panel's sid-keyed tags so the
+                // picker groups by the same tag the user already sees there.
+                tags: self
+                    .session_tags
+                    .get(info.session_id.as_str())
+                    .cloned()
+                    .unwrap_or_default(),
             };
             if open_sids.contains(&info.session_id) {
                 bound.push(ps);
@@ -377,6 +384,20 @@ impl YaldaGpuiView {
                 free.push(ps);
             }
         }
+        // UXI-AgentTile-39: order the FREE list into tag folders — grouped by the
+        // session's single group key (alphabetically-first tag), tag folders in
+        // alphabetical order, the untagged group last, label order within a
+        // group. render_agent_picker walks this order and emits a header at each
+        // group boundary; agent_picker_move / agent_picker_activate index into
+        // this same order, so grouping never desyncs the row↔session mapping.
+        // `entries_by_label` already yielded label order, so a stable sort by
+        // group key alone preserves the intra-group label order.
+        free.sort_by(|a, b| match (a.group_key(), b.group_key()) {
+            (Some(x), Some(y)) => x.cmp(y),
+            (Some(_), None) => std::cmp::Ordering::Less, // tagged before untagged
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        });
         (free, bound)
     }
 

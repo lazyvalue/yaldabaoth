@@ -4445,6 +4445,63 @@ fn selector_projection_reflects_binding_across_tiles(cx: &mut TestAppContext) {
     });
 }
 
+/// UXI-AgentTile-39: the Agent Tile session picker groups its FREE list into tag
+/// folders. `picker_projection` returns the free sessions grouped by their single
+/// group key (alphabetically-first tag), tag folders in alphabetical order, the
+/// untagged group last, label order preserved within a group. Because
+/// `agent_picker_move` / `agent_picker_activate` index into this same order,
+/// asserting the projected order proves a click on row `i+2` resolves to the
+/// intended session.
+///
+/// Negative control: remove the group-key sort in `picker_projection` and the
+/// free list falls back to plain label order (claude-1..claude-4), so the
+/// grouped-order assertion below fails RED.
+#[gpui::test]
+fn session_picker_groups_free_sessions_by_tag(cx: &mut TestAppContext) {
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+    vcx.run_until_parked();
+
+    // Four free roster sessions (cwd "."), seeded in label order by the helper.
+    install_agent_picker(
+        &view,
+        &mut *vcx,
+        &[
+            ("S1", "claude-1"),
+            ("S2", "claude-2"),
+            ("S3", "claude-3"),
+            ("S4", "claude-4"),
+        ],
+    );
+    // Tag them so grouping crosses label order: claude-1 → "beta",
+    // claude-2 + claude-3 → "alpha", claude-4 stays untagged. Set via the real
+    // mutator (sid-keyed, the same store the jump panel reads).
+    view.update(vcx, |v, _cx| {
+        assert!(v.add_session_tag("S1", "beta"));
+        assert!(v.add_session_tag("S2", "alpha"));
+        assert!(v.add_session_tag("S3", "alpha"));
+    });
+    // Render the picker with the tags set — exercises the header-emission path in
+    // render_agent_picker without panicking.
+    vcx.run_until_parked();
+
+    view.read_with(vcx, |v, _cx| {
+        let (free, _bound) = v.picker_projection(&v.agent_base_cwd());
+        let order: Vec<&str> = free.iter().map(|s| s.label.as_str()).collect();
+        // alpha folder (claude-2, claude-3 by label), then beta (claude-1), then
+        // the untagged group (claude-4) last.
+        assert_eq!(
+            order,
+            vec!["claude-2", "claude-3", "claude-1", "claude-4"],
+            "free list is grouped by tag (alpha, beta, untagged), label order within a group"
+        );
+        // group_key resolves the folder each row lands in.
+        assert_eq!(free[0].group_key(), Some("alpha"));
+        assert_eq!(free[1].group_key(), Some("alpha"));
+        assert_eq!(free[2].group_key(), Some("beta"));
+        assert_eq!(free[3].group_key(), None, "claude-4 is untagged, filed last");
+    });
+}
+
 /// UXI-AgentTile-32: archive is a visibility boundary for the Agent Tile
 /// picker, not only for the Jump Panel and Cmd-P. Both selectable FREE rows and
 /// read-only IN USE rows exclude archived sids while preserving equivalent

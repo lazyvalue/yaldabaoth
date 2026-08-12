@@ -5124,6 +5124,20 @@ pub(crate) struct PickerSession {
     pub(crate) turns: usize,
     pub(crate) connected: bool,
     pub(crate) permission_mode: yalda::acp_channel::PermissionMode,
+    /// The session's tags (sid-keyed `session_tags`, the same set the jump panel
+    /// shows). Used to group the free list into tag folders (UXI-AgentTile-39).
+    pub(crate) tags: Vec<String>,
+}
+
+impl PickerSession {
+    /// The single tag folder this session files under in the picker: the
+    /// alphabetically-first of its tags, or `None` for the untagged group
+    /// (UXI-AgentTile-39). A session appears once, so it cannot fan out across
+    /// every tag the way a jump-panel row does — the picker's activation indices
+    /// require exactly one row per session.
+    pub(crate) fn group_key(&self) -> Option<&str> {
+        self.tags.iter().map(String::as_str).min()
+    }
 }
 
 /// In-tile session chooser shown when an Agent tile has no `bound` session:

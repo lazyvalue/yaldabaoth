@@ -609,6 +609,20 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ## Features
 
+- **Agent tile picker groups sessions by tag** — `NEEDS-RUNTIME` (built via
+  `/new-ux`, Cog graph `6so` complete; `UXI-AgentTile-39`; on `main`). The unbound
+  agent-tile session picker organizes its free sessions into tag folders using the
+  same sid-keyed `session_tags` the jump panel shows. Each free session appears
+  once under one group (its alphabetically-first tag), tag folders alphabetical,
+  untagged last; a non-interactive header (`tag` / `UNTAGGED`) precedes each group;
+  no headers when no free session carries a tag. Create-new rows, project scoping,
+  and IN USE read-only rows unchanged. Impl: `PickerSession.tags` + `group_key()`,
+  group-sort in `picker_projection`, header emission in `render_agent_picker`
+  (`picker_tag_header`). Headless-guarded:
+  `session_picker_groups_free_sessions_by_tag` (NC observed RED); 560 bin tests
+  green. Runtime gap: the exact painted look of the folder headers (pixel/glyph)
+  is the only unverified piece.
+
 - **Render mermaid diagrams inline** — `NEEDS-RUNTIME` (built 2026-08-11 via
   `/new-ux`, Cog graph `sve`; renderer swapped to native merman 2026-08-12, Cog
   graph `zwh`, ADR-0031; `UXI-Diagram-1`; on `main`). A ` ```mermaid ` fence renders

@@ -2634,8 +2634,27 @@ impl YaldaGpuiView {
                     )),
             );
         } else {
+            // UXI-AgentTile-39: the FREE list arrives grouped by tag (see
+            // picker_projection). Walk it and emit a non-interactive folder
+            // header whenever the group key changes — but only when at least one
+            // free session carries a tag, so a tagless picker keeps its flat
+            // layout. Headers are visual rows only: they consume no activation
+            // index, so `row = i + 2` still maps to the free session.
+            let any_tagged = free.iter().any(|s| s.group_key().is_some());
+            let mut prev_group: Option<Option<String>> = None;
             for (i, s) in free.iter().enumerate() {
                 let row = i + 2;
+                if any_tagged {
+                    let group = s.group_key().map(str::to_owned);
+                    if prev_group.as_ref() != Some(&group) {
+                        let header = match &group {
+                            Some(tag) => SharedString::from(tag.clone()),
+                            None => SharedString::new_static("UNTAGGED"),
+                        };
+                        list = list.child(self.picker_tag_header(header, ov));
+                        prev_group = Some(group);
+                    }
+                }
                 let liveness = if s.connected { "live" } else { "idle" };
                 let sub = format!(
                     "{} · {} turn{} · {}",
@@ -2813,6 +2832,20 @@ impl YaldaGpuiView {
             );
         }
         r
+    }
+
+    /// A non-interactive tag-folder header in the session picker
+    /// (UXI-AgentTile-39). Styled like the "IN USE" divider: dim, small, bold —
+    /// a visual grouping row that carries no activation index.
+    fn picker_tag_header(&self, title: SharedString, ov: &OverlayTheme) -> gpui::Div {
+        div()
+            .px_2()
+            .pt_2()
+            .pb_0p5()
+            .text_size(px(11.0))
+            .text_color(nc(ov.label))
+            .font_weight(FontWeight::BOLD)
+            .child(title)
     }
 
     pub(crate) fn render_browser(
