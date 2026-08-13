@@ -3864,6 +3864,10 @@ impl AgentState {
             let len = self.editor.document().line_len_chars(target);
             let col = self.editor.cursor().col.min(len);
             self.editor.cursor_mut().col = col;
+            // The shared normal dispatcher normalized the pre-hop line. If the
+            // invisible tool anchor moved the active end again, restore `V`'s
+            // whole-line boundary on the actual visible destination.
+            self.editor.normalize_linewise_selection();
         }
     }
 

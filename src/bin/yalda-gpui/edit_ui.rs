@@ -677,6 +677,7 @@ impl YaldaGpuiView {
                 for _ in 0..n {
                     editor.move_down(false);
                 }
+                editor.normalize_linewise_selection();
             }
             "move-up" => {
                 editor.pre_move(false);
@@ -684,30 +685,36 @@ impl YaldaGpuiView {
                     editor.cursor_move_up();
                 }
                 editor.clamp_cursor_col(false);
+                editor.normalize_linewise_selection();
             }
             "move-left" => {
                 editor.pre_move(false);
                 for _ in 0..n {
                     editor.cursor_move_left();
                 }
+                editor.normalize_linewise_selection();
             }
             "move-right" => {
                 editor.pre_move(false);
                 for _ in 0..n {
                     editor.move_right_clamped(false);
                 }
+                editor.normalize_linewise_selection();
             }
             "move-line-start" => {
                 editor.pre_move(false);
                 editor.cursor_move_line_start();
+                editor.normalize_linewise_selection();
             }
             "move-line-first-non-blank" => {
                 editor.pre_move(false);
                 editor.move_cursor_first_non_blank();
+                editor.normalize_linewise_selection();
             }
             "move-line-end" => {
                 editor.pre_move(false);
                 editor.move_cursor_line_end(false);
+                editor.normalize_linewise_selection();
             }
             // ---- Word motions: create a fresh selection from cursor → motion target ----
             "move-word-forward" => {
@@ -715,18 +722,21 @@ impl YaldaGpuiView {
                 for _ in 0..n {
                     editor.move_cursor_word_forward();
                 }
+                editor.normalize_linewise_selection();
             }
             "move-word-backward" => {
                 editor.pre_move(true);
                 for _ in 0..n {
                     editor.move_cursor_word_backward();
                 }
+                editor.normalize_linewise_selection();
             }
             "move-word-end" => {
                 editor.pre_move(true);
                 for _ in 0..n {
                     editor.move_cursor_word_end();
                 }
+                editor.normalize_linewise_selection();
             }
             // ---- Doc-level jumps ----
             "goto-top" => {
@@ -737,6 +747,7 @@ impl YaldaGpuiView {
                     Some(n) => editor.jump_to_line(n.saturating_sub(1)),
                     None => editor.cursor_jump_top(),
                 }
+                editor.normalize_linewise_selection();
             }
             "goto-bottom" => {
                 editor.pre_move(false);
@@ -746,6 +757,7 @@ impl YaldaGpuiView {
                     Some(n) => editor.jump_to_line(n.saturating_sub(1)),
                     None => editor.jump_cursor_bottom(),
                 }
+                editor.normalize_linewise_selection();
             }
             // ---- Half / full page paging ----
             // The Edit + Agent render paths both scroll-to-reveal the cursor
@@ -754,18 +766,22 @@ impl YaldaGpuiView {
             "half-page-down" => {
                 editor.pre_move(false);
                 Self::page_cursor(editor, HALF_PAGE_LINES as isize);
+                editor.normalize_linewise_selection();
             }
             "half-page-up" => {
                 editor.pre_move(false);
                 Self::page_cursor(editor, -(HALF_PAGE_LINES as isize));
+                editor.normalize_linewise_selection();
             }
             "full-page-down" => {
                 editor.pre_move(false);
                 Self::page_cursor(editor, FULL_PAGE_LINES as isize);
+                editor.normalize_linewise_selection();
             }
             "full-page-up" => {
                 editor.pre_move(false);
                 Self::page_cursor(editor, -(FULL_PAGE_LINES as isize));
+                editor.normalize_linewise_selection();
             }
             // ---- Put (paste) — deferred to the caller for clipboard access ----
             "paste" => return NormalOutcome::Paste { before: false },
@@ -823,12 +839,9 @@ impl YaldaGpuiView {
             "flip-selection" => editor.flip_selection(),
             "select-all" => editor.select_all(),
             "extend-line" => editor.extend_by_line(),
-            // `V`: line-wise visual — select the whole line AND enter extend-mode
-            // so a following `V`/`j`/`k` grows the selection (UXI-AgentTile-34).
-            "select-line" => {
-                editor.set_extend_mode(true);
-                editor.extend_by_line();
-            }
+            // `V`: true linewise visual mode. Unlike plain extend-mode, every
+            // following motion is normalized back to whole logical lines.
+            "select-line" => editor.select_linewise(),
             "toggle-extend-mode" => {
                 editor.toggle_extend_mode();
                 if editor.extend_mode() && editor.selection_anchor().is_none() {

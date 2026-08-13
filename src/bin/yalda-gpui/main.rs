@@ -1038,6 +1038,12 @@ trait EditOps: EditAccess {
     fn extend_by_line(&mut self) {
         self.edit(|v, c| v.extend_by_line(c));
     }
+    fn select_linewise(&mut self) {
+        self.edit(|v, c| v.select_linewise(c));
+    }
+    fn normalize_linewise_selection(&mut self) {
+        self.edit(|v, c| v.normalize_linewise_selection(c));
+    }
     fn yank_selection(&self) -> Option<String> {
         self.read_core(|c| self.view().yank_selection(c))
     }

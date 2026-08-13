@@ -248,6 +248,11 @@ pub struct EditorView {
     selection_anchor: Option<CursorPos>,
     /// When true, motions extend the selection rather than collapsing it.
     extend_mode: bool,
+    /// `V`-style linewise selection is a distinct flavor of extend mode. Its
+    /// anchor line stays fixed while the active cursor end is normalized to a
+    /// full logical-line boundary after every motion. Characterwise `v` keeps
+    /// this false even when its endpoints happen to be line-aligned.
+    linewise_extend_mode: bool,
     in_insert_mode: bool,
 }
 
@@ -911,6 +916,7 @@ impl EditorView {
             cursor: CursorPos::new(),
             selection_anchor: None,
             extend_mode: false,
+            linewise_extend_mode: false,
             in_insert_mode: false,
         }
     }
@@ -933,10 +939,16 @@ impl EditorView {
 
     pub fn set_extend_mode(&mut self, on: bool) {
         self.extend_mode = on;
+        if !on {
+            self.linewise_extend_mode = false;
+        }
     }
 
     pub fn toggle_extend_mode(&mut self) {
         self.extend_mode = !self.extend_mode;
+        // Lowercase `v` always means characterwise visual mode. If it is used
+        // to leave a linewise selection, a later `v` starts characterwise.
+        self.linewise_extend_mode = false;
     }
 
     // --- Selection ---
@@ -1018,6 +1030,54 @@ impl EditorView {
             self.selection_anchor = Some(a);
             self.cursor.col = core.document.line_len_chars(l);
         }
+    }
+
+    /// Enter true `V`-style linewise selection, or grow its active end by one
+    /// logical line when `V` is repeated. The first press converts any current
+    /// characterwise range to whole-line endpoints; subsequent presses continue
+    /// in the current direction (down when the range is still one line).
+    pub fn select_linewise(&mut self, core: &EditorCore) {
+        if self.linewise_extend_mode {
+            let origin = self.selection_anchor.map(|a| a.line).unwrap_or(self.cursor.line);
+            if self.cursor.line < origin {
+                self.cursor.line = self.cursor.line.saturating_sub(1);
+            } else {
+                self.cursor.line = (self.cursor.line + 1)
+                    .min(core.document.line_count().saturating_sub(1));
+            }
+        } else {
+            self.extend_mode = true;
+            self.linewise_extend_mode = true;
+            if self.selection_anchor.is_none() {
+                self.selection_anchor = Some(self.cursor);
+            }
+        }
+        self.normalize_linewise_selection(core);
+    }
+
+    /// Re-align a linewise selection after a motion. The anchor's logical line
+    /// is the fixed origin; its column flips between start/end when the active
+    /// cursor crosses that origin, so `V j` and `V k` both cover complete lines.
+    pub fn normalize_linewise_selection(&mut self, core: &EditorCore) {
+        if !self.linewise_extend_mode {
+            return;
+        }
+        let Some(mut anchor) = self.selection_anchor else {
+            self.selection_anchor = Some(self.cursor);
+            return self.normalize_linewise_selection(core);
+        };
+        let last = core.document.line_count().saturating_sub(1);
+        anchor.line = anchor.line.min(last);
+        self.cursor.line = self.cursor.line.min(last);
+        if self.cursor.line < anchor.line {
+            anchor.set_col(core.document.line_len_chars(anchor.line));
+            self.cursor.set_col(0);
+        } else {
+            anchor.set_col(0);
+            self.cursor
+                .set_col(core.document.line_len_chars(self.cursor.line));
+        }
+        self.selection_anchor = Some(anchor);
     }
 
     fn selection_char_range(&self, core: &EditorCore) -> Option<(usize, usize)> {
@@ -2001,6 +2061,14 @@ impl Editor {
 
     pub fn extend_by_line(&mut self) {
         self.view.extend_by_line(&self.core);
+    }
+
+    pub fn select_linewise(&mut self) {
+        self.view.select_linewise(&self.core);
+    }
+
+    pub fn normalize_linewise_selection(&mut self) {
+        self.view.normalize_linewise_selection(&self.core);
     }
 
     pub fn selection_text(&self) -> Option<String> {
