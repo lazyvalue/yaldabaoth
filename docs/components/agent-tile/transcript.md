@@ -503,12 +503,15 @@ paints real usage state and proves identity → activity+usage → location orde
 **Statement.** In an **idle worksheet** with the **transcript focused** (Normal
 nav), the caret moving over agent text can select it, vim-style:
 
-- **`V` selects the whole current line** immediately (line-wise visual). A repeated
-  `V` / a following `j`/`k` extends the selection line by line.
+- **`V` selects the whole current line** immediately and enters a distinct
+  **linewise** visual state. A repeated `V` or any following motion keeps both
+  endpoints on logical-line boundaries; in particular, `j`/`k` include the
+  complete destination line regardless of its length.
 - **`v` starts char-wise visual** — it drops an anchor at the caret; a following
   motion (`h`/`l`/`w`/…) extends the selection character by character.
-- The existing Kakoune-style keys stay bound and additive: `x` = extend-whole-line
-  (same action as `V`), `;` = collapse, `,` = flip, `%` = select-all.
+- The existing Kakoune-style keys stay bound and additive: `x` = extend the
+  current selection by one whole line (one-shot, not linewise visual state),
+  `;` = collapse, `,` = flip, `%` = select-all.
 
 The selection is the transcript editor's own anchor/head selection — the SAME
 model the drag-select band and copy-on-select (`UXI-Selection-1`) render from —
@@ -518,34 +521,41 @@ selection is what `r` quotes (`UXI-AgentTile-35`).
 **Applies to.** `keybind.rs` — the default normal-map `key('V') → "extend-line"`
 binding (beside `x`). The dispatch is the shared `dispatch_normal_core` the
 worksheet transcript-nav already routes through (`agent_ui.rs::handle_claude_key`
-fall-through). Selection state + band: `editor.rs` (`extend_by_line`,
-`toggle_extend_mode`, `selection_range`, `pre_move`) and
+fall-through). Selection state + band: `editor.rs` (`linewise_extend_mode`,
+`select_linewise`, `normalize_linewise_selection`, `toggle_extend_mode`,
+`selection_range`, `pre_move`) and
 `transcript_view.rs` (`sel_snap`, gated on `transcript_focused`).
 
 **Why.** `V` was **unbound**, so the vim instinct for whole-line select did
 nothing, and `v` alone paints nothing until you also move — so selecting agent
-text in the worksheet read as broken. Binding `V` to an immediate whole-line
-select makes the primary gesture work and gives instant feedback.
+text in the worksheet read as broken. The first implementation made the initial
+range whole-line but reused characterwise extend mode afterward: `V j` inherited
+the first line's sticky column and stopped in the middle of a longer destination
+line. A distinct linewise state is required so every motion preserves the
+gesture's contract rather than only its first frame.
 
 **Status.** `implemented` — the binding + selection are headless (real keymap +
 real dispatch). The universal token palette inside the selection is specified by
 `UXI-AgentTile-38`; exact perceived contrast remains a paint/human-eye judgment
 (harness gap #1).
 
-**Deviation from plan.** `V` maps to a NEW action `"select-line"` (extend-mode ON +
-`extend_by_line`), not the pre-existing `"extend-line"` (`x`) as first scoped. A
-headless test caught that plain `extend-line` does not enable extend-mode, so `V`
-then `j` COLLAPSED the selection (the vim `V j` idiom broke); `select-line` turns
-extend-mode on so a following `V`/`j`/`k` grows it. `x` keeps the plain
-extend-line. The selection color normalization deferred here is now implemented
-by `UXI-AgentTile-38`.
+**Deviation from plan.** `V` maps to a NEW action `"select-line"`
+(`select_linewise`), not the pre-existing `"extend-line"` (`x`) as first scoped.
+The intermediate implementation only turned generic extend-mode on; bug-0037
+showed that this grew to the next line at a character column rather than the full
+line. `EditorView` now records linewise state separately and normalizes motion
+endpoints to the start/end boundaries. `x` keeps the plain extend-line action.
+The selection color normalization deferred here is implemented by
+`UXI-AgentTile-38`.
 
 **Enforcement.** `verify_harness.rs`: `worksheet_v_line_select_feeds_r` (real
 `handle_claude_key("V")` creates a non-empty selection whose text is the whole
-agent line) and `worksheet_v_char_select_feeds_r` (`v` + 5×`l` selects exactly
-`First`). Both then press `r` and assert the selection is the quote (see
-`UXI-AgentTile-35`). NC observed RED: dropping the selection branch collapses the
-quote to the first sentence. The painted band hue is gap #1.
+agent line), `worksheet_v_then_j_extends_selection` and
+`worksheet_v_then_k_selects_whole_previous_line` (real `V` plus vertical motion
+across deliberately unequal line lengths selects both complete lines), and
+`worksheet_v_char_select_feeds_r` (`v` + 5×`l` remains exactly `First`). The
+vertical guard was observed RED before bug-0037's fix: `V j` selected only
+`"one\ntwo"` from the longer second line. The painted band hue is gap #1.
 
 ### UXI-AgentTile-38 — Selected transcript text has one universal color treatment
 

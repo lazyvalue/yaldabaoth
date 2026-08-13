@@ -12219,12 +12219,14 @@ fn worksheet_r_replies_across_turn_boundary(cx: &mut TestAppContext) {
     });
 }
 
-/// UXI-AgentTile-34: `V` turns on extend-mode, so a following `j` GROWS the
-/// selection into the next line instead of collapsing it (the vim `V j` idiom).
+/// UXI-AgentTile-34: `V` turns on linewise extend-mode, so a following `j`
+/// selects the WHOLE next line instead of collapsing the selection or stopping
+/// at the sticky character column inherited from the first line (the vim `V j`
+/// idiom).
 ///
-/// Negative control (observed RED): bind `V` to plain `"extend-line"` (no
-/// `set_extend_mode(true)`) → `j` after `V` collapses the selection (end line
-/// stays 0 / selection empty).
+/// Negative control (observed RED): before the distinct linewise state and
+/// post-motion normalization, the exact-text assertion got `"one\ntwo"` — the
+/// sticky column cut the longer second line off after three characters.
 #[gpui::test]
 fn worksheet_v_then_j_extends_selection(cx: &mut TestAppContext) {
     use yalda::acp_channel::ReplyEvent;
@@ -12237,7 +12239,9 @@ fn worksheet_v_then_j_extends_selection(cx: &mut TestAppContext) {
     view.update(vcx, |v, cx| {
         v.apply_server_batch(
             vec![
-                ev(ReplyEvent::Chunk("one\ntwo\nthree\n".into())),
+                ev(ReplyEvent::Chunk(
+                    "one\ntwo is deliberately much longer\nthree\n".into(),
+                )),
                 ev(ReplyEvent::TurnEnded { count: 1 }),
             ],
             cx,
@@ -12263,6 +12267,60 @@ fn worksheet_v_then_j_extends_selection(cx: &mut TestAppContext) {
         let base = c.latest_agent_turn_range().unwrap_or((0, 0)).0;
         assert_eq!(sl, base, "selection still anchored at the first line");
         assert_eq!(el, base + 1, "j grew the selection into the next line");
+        assert_eq!(
+            c.editor.selection_text().unwrap_or_default(),
+            "one\ntwo is deliberately much longer",
+            "V then j selects both complete logical lines, independent of their lengths"
+        );
+    });
+}
+
+/// UXI-AgentTile-34: the upward half of true linewise visual mode. Starting on
+/// a short second line, `V k` must include the complete longer first line and
+/// keep the active cursor at that line's start boundary.
+#[gpui::test]
+fn worksheet_v_then_k_selects_whole_previous_line(cx: &mut TestAppContext) {
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::session_proto::Notification as ServerNotification;
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    let ev = |e: ReplyEvent| ServerNotification::ReplyEvent {
+        session_id: "S1".into(),
+        event: e,
+    };
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                ev(ReplyEvent::Chunk(
+                    "first is deliberately much longer\ntwo\nthree\n".into(),
+                )),
+                ev(ReplyEvent::TurnEnded { count: 1 }),
+            ],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        let base = c.latest_agent_turn_range().unwrap_or((0, 0)).0;
+        c.editor.cursor_mut().set_pos(base + 1, 0);
+    });
+
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("V"), w, cx));
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("k"), w, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        let base = c.latest_agent_turn_range().unwrap_or((0, 0)).0;
+        assert_eq!(
+            c.editor.selection_text().unwrap_or_default(),
+            "first is deliberately much longer\ntwo",
+            "V then k selects both complete logical lines"
+        );
+        assert_eq!(
+            (c.editor.cursor().line, c.editor.cursor().col),
+            (base, 0),
+            "the upward linewise head rests at the first selected line's start"
+        );
     });
 }
 
