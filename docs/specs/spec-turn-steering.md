@@ -2,11 +2,13 @@
 
 **Status:** DRAFT (implemented on branch `agent-steering`)
 
-**Last updated:** 2026-06-26
+**Last updated:** 2026-08-12
 
 > **SCOPE NOTE (supersedes the queue/chips described below).** The shipped design
-> is **immediate delivery only**: a submit always sends at once (mid-turn via the
-> worker's `promptQueueing` concurrent driver) and commits the user turn; on send
+> is **provider-aware delivery**: Claude sends at once (mid-turn via the
+> worker's `promptQueueing` concurrent driver), while Codex gracefully cancels
+> an in-flight turn before sending the normal message as its replacement prompt;
+> both commit the user turn on a successful send. On send
 > failure the draft is left in the compose for retry. The earlier **client-side
 > steering queue + cancelable chips + `flush_idle_steering`** were removed (an
 > unrequested addition that, once its chips UI was reverted, hid the user's text
@@ -36,7 +38,7 @@
 
 ## Overview
 
-Users want to interrupt or redirect the agent mid-task, like the Claude Code TUI.
+Users want to interrupt or redirect the agent mid-task with a normal message.
 The TUI does this **in-process** via the Claude Agent SDK's *streaming-input*
 mode — it injects a user message straight into the running agent loop. yalda
 talks to Claude over **ACP**, a protocol boundary, so the TUI's mechanism is not
@@ -68,6 +70,10 @@ Delivery model:
   processes it after the current turn. This is the v2-ready shape: if the agent
   ever negotiates v2, the same path flips to true generation-time injection with
   no UI change.
+- **Interrupt then prompt (Codex):** a normal message submitted while Codex is
+  awaiting sends ACP `session/cancel` through the existing graceful-stop
+  transport, then sends the new prompt. It does not enter the Stop button's
+  `StopRequested` / force-restart state; idle Codex submits do not cancel.
 - **Offline queue (IMPLEMENTED, fallback):** if the send fails (disconnected), the
   message is held in `AgentState.steering` and retried at the next turn boundary
   (`flush_idle_steering`) — FIFO, never dropped. Surfaced as cancelable chips.
@@ -96,6 +102,9 @@ Named artifacts:
    advertises `promptQueueing`, its driver forwards each prompt concurrently
    (`FuturesUnordered`, no wait on the in-flight turn), bumping the turn counter
    per settled prompt. Non-capable agents use the unchanged sequential driver.
+3. For **Codex**, `submit_compose` detects `provider == Codex && awaiting` and
+   sends one graceful cancel before `send_prompt_to_session`. Claude never takes
+   this branch. The replacement prompt still uses the ordinary send/commit path.
 
 ### Offline queue / retry (IMPLEMENTED)
 

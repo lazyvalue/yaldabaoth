@@ -14170,6 +14170,129 @@ fn steering_submit_while_awaiting_sends_immediately(cx: &mut TestAppContext) {
     );
 }
 
+/// bug-0036 / UXI-AgentTile-13 (REAL submit + transport path): a normal
+/// message submitted while Codex is working must gracefully cancel the current
+/// turn before the new prompt is handled. The same submit while idle must not
+/// cancel, and Claude keeps its promptQueueing steering behavior without a
+/// cancel. This drives `submit_agent` → `submit_compose` →
+/// `send_prompt_to_session` against the in-process production channel and
+/// observes both outbound transport queues.
+///
+/// Negative control: remove the Codex-awaiting interrupt call from
+/// `submit_compose`; the second `try_recv_cancel` assertion fails RED with
+/// "mid-turn Codex submit must interrupt" while all prompt assertions still
+/// pass.
+#[cfg(feature = "test-support")]
+#[gpui::test]
+fn codex_normal_message_interrupts_in_flight_turn(cx: &mut TestAppContext) {
+    use yalda::acp_channel::AgentProvider;
+
+    let (view, vcx, id, mut controls) = boot_worksheet_channel(cx);
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| c.provider = AgentProvider::Codex);
+    });
+
+    // CONTROL 1: the ordinary idle Codex submit starts a turn but never emits
+    // a cancellation.
+    worksheet_real_submit(&view, vcx, "first codex prompt");
+    let first = controls
+        .prompt_rx
+        .try_recv()
+        .expect("first prompt reached channel");
+    assert_eq!(first.text, "first codex prompt");
+    assert!(!controls.try_recv_cancel(), "idle Codex submit must not cancel");
+
+    // The turn is genuinely in flight through the production submit path.
+    let awaiting = view
+        .update(vcx, |v, cx| {
+            v.read_session(id, cx, |c| c.turn_phase.is_awaiting())
+        })
+        .expect("session");
+    assert!(awaiting, "first real submit must put Codex mid-turn");
+
+    // Type the normal follow-up through the real mid-turn key route, then use
+    // the same submit action the UI invokes.
+    for ch in "change course".chars() {
+        view.update_in(vcx, |v, w, cx| {
+            v.handle_claude_key(&ws_bare_key(&ch.to_string()), w, cx)
+        });
+    }
+    view.update(vcx, |v, cx| v.submit_agent(cx));
+    vcx.run_until_parked();
+
+    assert!(
+        controls.try_recv_cancel(),
+        "mid-turn Codex submit must interrupt the running turn"
+    );
+    let second = controls
+        .prompt_rx
+        .try_recv()
+        .expect("follow-up reached channel");
+    assert_eq!(second.text, "change course");
+    let (compose_empty, committed) = view
+        .update(vcx, |v, cx| {
+            v.read_session(id, cx, |c| {
+                (
+                    c.input_surface.compose().text().is_empty(),
+                    c.editor.document().full_text().contains("change course"),
+                )
+            })
+        })
+        .expect("session");
+    assert!(compose_empty, "successful replacement clears the compose");
+    assert!(committed, "successful replacement is committed as a user turn");
+
+    // CONTROL 2: provider specificity. Claude's normal mid-turn submit keeps
+    // the established promptQueueing steer and must not emit a cancel.
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| c.provider = AgentProvider::Claude);
+    });
+    for ch in "keep going".chars() {
+        view.update_in(vcx, |v, w, cx| {
+            v.handle_claude_key(&ws_bare_key(&ch.to_string()), w, cx)
+        });
+    }
+    view.update(vcx, |v, cx| v.submit_agent(cx));
+    vcx.run_until_parked();
+
+    assert!(
+        !controls.try_recv_cancel(),
+        "mid-turn Claude submit must retain queue-style steering without cancel"
+    );
+    let third = controls
+        .prompt_rx
+        .try_recv()
+        .expect("Claude steer reached channel");
+    assert_eq!(third.text, "keep going");
+
+    // CONTROL 3: a Codex turn already in StopRequested has a graceful cancel
+    // pending. A replacement message supersedes that lifecycle state but must
+    // not enqueue a duplicate cancel (which could race against the new prompt).
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| {
+            c.provider = AgentProvider::Codex;
+            c.turn_phase.request_stop(std::time::Instant::now());
+        });
+    });
+    for ch in "resume now".chars() {
+        view.update_in(vcx, |v, w, cx| {
+            v.handle_claude_key(&ws_bare_key(&ch.to_string()), w, cx)
+        });
+    }
+    view.update(vcx, |v, cx| v.submit_agent(cx));
+    vcx.run_until_parked();
+
+    assert!(
+        !controls.try_recv_cancel(),
+        "Codex submit after StopRequested must not duplicate the pending cancel"
+    );
+    let fourth = controls
+        .prompt_rx
+        .try_recv()
+        .expect("post-stop replacement reached channel");
+    assert_eq!(fourth.text, "resume now");
+}
+
 /// `stop_agent_inner` (the function Esc and ⌘. both call) interrupts ONLY when a
 /// turn is in flight: Idle stays Idle; Awaiting → StopRequested.
 #[gpui::test]

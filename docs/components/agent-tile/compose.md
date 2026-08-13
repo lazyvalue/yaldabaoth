@@ -327,18 +327,26 @@ CONTROL (boot session types + paints) makes it non-vacuous. **Negative control
 `transcript_view_for` → RED, `after_r/after_s == 0` and `you-block` never paints —
 the exact user symptom.**
 
-### UXI-AgentTile-13 — A submit is delivered immediately (even mid-turn); failed sends queue, never drop (stop is ⌘., not Esc)
+### UXI-AgentTile-13 — A mid-turn submit steers Claude and interrupts Codex; failed sends stay editable (stop is ⌘., not Esc)
 
 > **Numbering note:** `INV-UX-6` is reserved for the parallel `toolgroup-expand-key`
 > branch (tool-group collapse). This invariant is `INV-UX-7` to avoid a collision
 > at integrate time.
 
-**Statement.** Submitting a message **sends it to the agent immediately, even
-while a turn is in flight**, and commits it as a user turn — it does **not** start
-a duplicate competing local turn (a mid-turn steer rides the in-flight turn; the
-running clocks are not reset). When the agent advertises the `promptQueueing`
-capability the worker forwards the prompt concurrently, so the agent receives the
-steer mid-turn and processes it the instant the current turn finishes. If the send
+**Statement.** Submitting a message sends it to the agent and commits it as a
+user turn even while work is in flight. The mid-turn behavior follows the
+provider's interaction model:
+
+- **Claude:** the submit is an immediate steer. When the adapter advertises
+  `promptQueueing`, the worker forwards the prompt concurrently and Claude
+  processes it as soon as the current turn finishes; the running clocks are not
+  reset.
+- **Codex:** the submit first sends one graceful ACP `session/cancel` for the
+  running turn, then sends the typed message as the replacement prompt. This is
+  the normal-message interruption path; it does not enter the Stop button's
+  `StopRequested` / second-press force-restart state.
+
+If the prompt send
 **fails** (offline / reconnecting) the draft is **left in the compose** with a
 status so the user can retry — never silently moved or dropped. The stop gesture is
 **`⌘.`** (`stop_agent` → `session/cancel`; a second press force-restarts). **`Esc`
@@ -346,26 +354,34 @@ is NOT a stop** — it is the worksheet mode key (Insert→Normal, leave-block),
 binding it to stop conflicted with mode switching, so it was unbound (2026-06-29).
 
 **Applies to.** The agent tile: `submit_compose` / `send_prompt_to_session`
-(`agent_ui.rs`) and the worker's concurrent driver (`acp_channel.rs`, gated on
-`promptQueueing`). There is no client-side steering queue — delivery is immediate.
+(`agent_ui.rs`), the shared graceful-cancel transport used by Stop, and the
+worker's concurrent driver (`acp_channel.rs`, gated on `promptQueueing`). There
+is no client-side steering queue.
 
-**Why.** Over ACP **v1 a prompt is a turn** and there is no mid-turn input
-message — but the live agent (`claude-agent-acp`) advertises a vendor capability
+**Why.** Over ACP **v1 a prompt is a turn** and there is no portable mid-turn
+input message. The live Claude agent advertises a vendor capability
 `_meta.claudeCode.promptQueueing` and (verified by live probe) **accepts a
 `session/prompt` while a turn is in flight**, queueing it without interrupting.
 yalda's worker previously *serialized* (awaited each turn before sending the next),
 so a steer couldn't reach the agent until the boundary; the concurrent driver
-fixes that. ACP v2 (the `unstable_protocol_v2` draft) is NOT yet honored by the
-agent — it negotiates down to v1 — so promptQueueing is the real mechanism, and
+fixes that for Claude. Codex does not treat a normal queued prompt as an
+interruption, so its user-facing redirect composes ACP's portable
+`session/cancel` with the replacement prompt. ACP v2 (the
+`unstable_protocol_v2` draft) is NOT yet honored by the Claude agent — it
+negotiates down to v1 — so promptQueueing remains Claude's real mechanism, and
 this design is the v2-ready shape (`spec-turn-steering.md`).
 
-**Status.** `implemented` — state, ordering, and transport verified.
+**Status.** `implemented` — provider-specific state, ordering, and transport are
+guarded headlessly; the live Codex subprocess remains the documented runtime gap.
 
 **Enforcement.** Headless in `verify_harness.rs`:
 `steering_submit_while_awaiting_sends_immediately` (mid-turn submit sends + commits
 + doesn't reset the turn), `steering_midturn_ordering_and_dedup` (steer lands after
 prior agent content, committed once, agent echo deduped — via the real reducer),
-and `esc_interrupts_in_flight_turn` / `stop_interrupts_only_when_in_flight`.
+`codex_normal_message_interrupts_in_flight_turn` (real submit and in-process
+transport: idle Codex no cancel; mid-turn Codex cancel + prompt; mid-turn Claude
+prompt without cancel), and `esc_does_not_stop_in_flight_turn` /
+`stop_interrupts_only_when_in_flight`.
 Transport (live, not headless): `tests/steering_midturn_live.rs` drives the REAL
 worker + REAL `claude-agent-acp` and proves a mid-turn steer is delivered and
 processed; the v2-refused / promptQueueing facts were confirmed by a live probe.

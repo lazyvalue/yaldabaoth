@@ -1452,7 +1452,7 @@ impl AcpChannelClient {
                 prompt_rx,
                 set_model_rx,
                 reply_tx,
-                _cancel_rx: cancel_rx,
+                cancel_rx,
                 connected,
             },
         )
@@ -1472,8 +1472,10 @@ pub struct TestChannelControls {
     /// Inject `ReplyEvent`s (chunks / `TurnEnded`) the pump will read via
     /// `try_recv` — the seam for driving a turn to completion in-process.
     pub reply_tx: std_mpsc::Sender<ReplyEvent>,
-    /// Kept alive so `cancel()` doesn't error; unused otherwise.
-    _cancel_rx: futures::channel::mpsc::UnboundedReceiver<()>,
+    /// Kept alive so `cancel()` doesn't error and exposed through
+    /// [`try_recv_cancel`](Self::try_recv_cancel) so GUI tests can prove a real
+    /// submit reached the production cancellation transport.
+    cancel_rx: futures::channel::mpsc::UnboundedReceiver<()>,
     /// Flip to `false` to simulate the worker dying (EOF) — the next `send()`
     /// then fails, exercising the "send failed — reconnecting" path.
     pub connected: Arc<AtomicBool>,
@@ -1484,6 +1486,11 @@ impl TestChannelControls {
     /// Non-blocking pull of the next model id a `set_model()` enqueued, if any.
     pub fn try_recv_set_model(&self) -> Option<String> {
         self.set_model_rx.try_recv().ok()
+    }
+
+    /// Non-blocking observation of one graceful ACP cancel request.
+    pub fn try_recv_cancel(&mut self) -> bool {
+        self.cancel_rx.try_recv().is_ok()
     }
 }
 
