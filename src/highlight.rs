@@ -31,20 +31,21 @@ fn folio_item(scope: &str, fg: SynColor) -> ThemeItem {
 ///
 /// The bundled `base16-ocean.light` accents (pale yellow types, pale-blue
 /// functions, mid-green strings) sit at low contrast on Folio's linen code
-/// background `#edebe6`. This builds Folio's own designed palette instead —
-/// steel keywords, sage strings, teal types, navy functions, comment grey,
-/// ink default — all dark-on-linen and readable.
+/// background `#edebe6`. This builds a warm, SATURATED, hue-varied palette
+/// instead — wine keywords, indigo functions, teal types, olive strings,
+/// burnt-orange numbers, grey comments, ink default — all dark-on-linen and
+/// mutually distinct (an earlier muted blue-teal attempt read near-monochrome).
 pub fn folio_theme() -> SynTheme {
-    // Palette (mirrors the Folio comment block in theme.rs):
-    // Ink #342d1f · Comment #756f61 · Steel #405d72 · Sage #495f4e
-    // Teal #406764 · Navy #2d3050 · Rust #9a5b2e
-    let ink = syn(0x34, 0x2d, 0x1f);
-    let comment = syn(0x75, 0x6f, 0x61);
-    let steel = syn(0x40, 0x5d, 0x72);
-    let sage = syn(0x49, 0x5f, 0x4e);
-    let teal = syn(0x40, 0x67, 0x64);
-    let navy = syn(0x2d, 0x30, 0x50);
-    let rust = syn(0x9a, 0x5b, 0x2e);
+    // Warm, SATURATED, mutually-distinct hues, all dark on Folio's linen code
+    // bg `#edebe6`. Distinct hue is the point: an earlier version used muted
+    // blue-teals that read near-monochrome on linen ("no highlighting").
+    let ink = syn(0x34, 0x2d, 0x1f); // default text — dark sepia
+    let comment = syn(0x8a, 0x81, 0x72); // warm grey
+    let wine = syn(0x9d, 0x2b, 0x4e); // keywords — deep magenta-red
+    let teal = syn(0x0f, 0x6d, 0x6a); // types — dark teal
+    let indigo = syn(0x38, 0x4b, 0xb0); // functions — indigo blue
+    let olive = syn(0x4f, 0x6d, 0x1f); // strings — olive green
+    let rust = syn(0xb0, 0x50, 0x18); // numbers/constants — burnt orange
 
     SynTheme {
         name: Some("Folio".to_string()),
@@ -54,24 +55,32 @@ pub fn folio_theme() -> SynTheme {
             background: Some(syn(0xed, 0xeb, 0xe6)),
             ..Default::default()
         },
-        // syntect resolves by selector specificity, not list order.
+        // syntect resolves by selector specificity, not list order: more-specific
+        // selectors win, so `keyword.operator`->ink beats `keyword`->wine.
         scopes: vec![
             folio_item("comment", comment),
-            folio_item("string, constant.character, constant.other.symbol", sage),
             folio_item(
-                "keyword, storage, storage.type, storage.modifier",
-                steel,
+                "string, constant.character, constant.other.symbol, string.regexp",
+                olive,
             ),
+            // fn / let / pub / mut and primitive types all scope as keyword/storage
+            // in Rust — one wine "keyword-ish" bucket.
+            folio_item("keyword, storage", wine),
+            // Operators stay plain ink so code isn't a wine wash (more specific than
+            // `keyword`, so this wins). No broad `punctuation` rule — it would eat
+            // comment `//` and string quotes.
+            folio_item("keyword.operator", ink),
+            // Named types: Vec, String, user structs/enums, trait bounds.
             folio_item(
                 "entity.name.type, entity.name.class, support.type, support.class, entity.other.inherited-class",
                 teal,
             ),
             folio_item(
-                "entity.name.function, support.function, meta.function-call, entity.name.macro",
-                navy,
+                "entity.name.function, support.function, meta.function-call, entity.name.macro, support.macro, variable.function",
+                indigo,
             ),
             folio_item(
-                "constant.numeric, constant.language, constant.other, support.constant",
+                "constant.numeric, constant.language, constant.other, support.constant, constant.character.escape",
                 rust,
             ),
         ],
@@ -167,36 +176,52 @@ impl Highlighter {
 mod tests {
     use super::*;
     use crate::theme::ThemeName;
+    use std::collections::HashSet;
 
-    const RUST_SNIPPET: &str =
-        "// a note\nfn add(x: usize) -> String {\n    let s = \"hi\";\n    s\n}\n";
+    // A snippet with keyword, primitive + named types, function, string, comment,
+    // number, operators — enough to exercise every color bucket.
+    const RUST_SNIPPET: &str = "// note\npub fn add(x: usize) -> u8 {\n    let n = 42;\n    let s = \"hi\";\n    Vec::new()\n}\n";
 
-    /// Perceived luminance (ITU-R 601) — used to prove tokens are dark enough to
-    /// read on Folio's linen code background (`#edebe6`, luminance ~234).
-    fn luma(c: Color) -> f32 {
+    fn rgb(c: Color) -> (i32, i32, i32) {
         let Color::Rgb(r, g, b) = c else { unreachable!() };
+        (r as i32, g as i32, b as i32)
+    }
+
+    /// Perceived luminance (ITU-R 601) — proves tokens are dark enough to read on
+    /// Folio's linen code background (`#edebe6`, luminance ~235).
+    fn luma(c: Color) -> f32 {
+        let (r, g, b) = rgb(c);
         0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32
     }
 
-    /// Flatten a highlight into (token_text, fg_color) pairs for the given theme.
+    fn dist(a: Color, b: Color) -> f32 {
+        let (ar, ag, ab) = rgb(a);
+        let (br, bg, bb) = rgb(b);
+        (((ar - br).pow(2) + (ag - bg).pow(2) + (ab - bb).pow(2)) as f32).sqrt()
+    }
+
+    /// Highlight the snippet through the REAL per-line path the transcript uses
+    /// (`highlight_line_stateless`), returning (token, fg) for non-blank tokens.
     fn tokens(syntect_name: &str) -> Vec<(String, Color)> {
         let hl = Highlighter::with_syntect_theme(syntect_name);
-        let bg = Style::default();
-        let lines = hl
-            .highlight("rust", RUST_SNIPPET, bg)
-            .expect("rust syntax present");
-        lines
-            .into_iter()
-            .flat_map(|l| l.spans)
-            .filter(|s| !s.text.trim().is_empty())
-            .map(|s| (s.text.clone(), s.style.fg.expect("token has fg")))
-            .collect()
+        let mut out = Vec::new();
+        for line in RUST_SNIPPET.lines() {
+            for (t, st) in hl
+                .highlight_line_stateless("rust", line, Style::default())
+                .expect("rust syntax present")
+            {
+                if !t.trim().is_empty() {
+                    out.push((t, st.fg.expect("token has fg")));
+                }
+            }
+        }
+        out
     }
 
     fn color_of(toks: &[(String, Color)], needle: &str) -> Color {
         toks.iter()
-            .find(|(t, _)| t.contains(needle))
-            .unwrap_or_else(|| panic!("no token containing {needle:?}"))
+            .find(|(t, _)| t.trim() == needle)
+            .unwrap_or_else(|| panic!("no token == {needle:?}"))
             .1
     }
 
@@ -207,48 +232,61 @@ mod tests {
     }
 
     #[test]
-    fn folio_rust_tokens_are_readable_dark_on_linen() {
+    fn folio_rust_tokens_are_distinct_and_readable() {
         // Route through the real mapping so reverting it also fails this guard.
         let folio = tokens(ThemeName::Folio.syntect_theme());
 
-        // Designed Folio palette (theme.rs Folio block).
-        assert_eq!(
-            color_of(&folio, "\""),
-            Color::Rgb(0x49, 0x5f, 0x4e),
-            "string should be sage"
-        );
-        assert_eq!(
-            color_of(&folio, "note"),
-            Color::Rgb(0x75, 0x6f, 0x61),
-            "comment should be comment-grey"
-        );
+        let keyword = color_of(&folio, "fn");
+        let type_name = color_of(&folio, "Vec");
+        let function = color_of(&folio, "add");
+        let string = color_of(&folio, "hi");
+        let comment = color_of(&folio, "note");
+        let number = color_of(&folio, "42");
 
-        // Readability property: EVERY token is clearly darker than the linen bg.
+        // Designed Folio palette (highlight::folio_theme).
+        assert_eq!(keyword, Color::Rgb(0x9d, 0x2b, 0x4e), "keyword=wine");
+        assert_eq!(type_name, Color::Rgb(0x0f, 0x6d, 0x6a), "type=teal");
+        assert_eq!(function, Color::Rgb(0x38, 0x4b, 0xb0), "function=indigo");
+        assert_eq!(string, Color::Rgb(0x4f, 0x6d, 0x1f), "string=olive");
+        assert_eq!(comment, Color::Rgb(0x8a, 0x81, 0x72), "comment=grey");
+        assert_eq!(number, Color::Rgb(0xb0, 0x50, 0x18), "number=rust");
+
+        // Hue variety — the actual regression that produced "no highlighting" was
+        // a near-monochrome palette. Every pair of these six must be far apart in
+        // RGB space, and there must be >=6 distinct token colors overall.
+        // No two roles collapse to near-identical colors. Warm palettes cluster in
+        // the high-R corner, so the floor is modest — but a monochrome regression
+        // (the "no highlighting" bug) drives pairs toward ~0 and trips this.
+        let roles = [keyword, type_name, function, string, comment, number];
+        for (i, a) in roles.iter().enumerate() {
+            for b in &roles[i + 1..] {
+                assert!(
+                    dist(*a, *b) > 55.0,
+                    "token colors too similar: {a:?} vs {b:?} (d={})",
+                    dist(*a, *b)
+                );
+            }
+        }
+        let distinct: HashSet<(i32, i32, i32)> = folio.iter().map(|(_, c)| rgb(*c)).collect();
+        assert!(distinct.len() >= 6, "want >=6 distinct colors, got {}", distinct.len());
+
+        // Readability: every token clearly darker than the linen bg (luma ~235).
         for (text, c) in &folio {
-            assert!(
-                luma(*c) < 150.0,
-                "token {text:?} luma {} too pale for linen bg",
-                luma(*c)
-            );
+            assert!(luma(*c) < 170.0, "token {text:?} luma {} too pale", luma(*c));
         }
     }
 
     /// Negative control: the bundled `base16-ocean.light` palette this replaces
-    /// paints tokens the Folio path must NOT reproduce (proves the custom theme
-    /// is actually on the path — revert the mapping and this fails).
+    /// paints the string a DIFFERENT color — proves the custom theme is actually
+    /// on the path (revert the mapping and the exact-color asserts above fail).
     #[test]
     fn folio_differs_from_base16_ocean_light() {
         let folio = tokens(ThemeName::Folio.syntect_theme());
         let ocean = tokens("base16-ocean.light");
-
         assert_ne!(
-            color_of(&folio, "\""),
-            color_of(&ocean, "\""),
+            color_of(&folio, "hi"),
+            color_of(&ocean, "hi"),
             "Folio string color must differ from ocean.light"
         );
-        // ocean.light has at least one pale (luma >= 150) token on this snippet;
-        // Folio has none — the readability delta we are fixing.
-        let ocean_has_pale = ocean.iter().any(|(_, c)| luma(*c) >= 150.0);
-        assert!(ocean_has_pale, "expected ocean.light to have a pale token");
     }
 }

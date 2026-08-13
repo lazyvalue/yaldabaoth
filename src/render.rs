@@ -642,11 +642,11 @@ mod highlight_theme_tests {
     /// `== sage` assert and the `!=` assert fail (dark tokens under both themes).
     #[test]
     fn code_fences_follow_the_active_theme() {
-        let folio_string = code_fg(&Theme::folio(), "\"");
+        let folio_string = code_fg(&Theme::folio(), "hi");
         assert_eq!(
             folio_string,
-            Color::Rgb(0x49, 0x5f, 0x4e),
-            "Folio code fence string should be sage, not base16-ocean.dark"
+            Color::Rgb(0x4f, 0x6d, 0x1f),
+            "Folio code fence string should be olive, not base16-ocean.dark"
         );
         let dark_string = code_fg(&Theme::from_name(ThemeName::Dracula), "\"");
         assert_ne!(
