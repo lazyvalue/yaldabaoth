@@ -4663,9 +4663,12 @@ impl YaldaGpuiView {
 
     /// `cx`-only stop, callable from the menu dispatch (which has no `Window`).
     pub(crate) fn stop_agent_inner(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.focused_bound_session() else {
+            return;
+        };
         // Only meaningful mid-turn.
         let awaiting = self
-            .agent_read(cx, |c| c.turn_phase.is_awaiting())
+            .read_session(id, cx, |c| c.turn_phase.is_awaiting())
             .unwrap_or(false);
         if !awaiting {
             if let Some(mut claude) = self.agent_mut(cx) {
@@ -4693,22 +4696,7 @@ impl YaldaGpuiView {
         }
 
         // First Stop → graceful ACP session/cancel.
-        let server_sid = self.active_server_session_id();
-        let sent = if let Some(sid) = &server_sid {
-            self.session_server
-                .as_ref()
-                .and_then(|s| s.cancel(sid).ok())
-                .is_some()
-        } else {
-            self.agent_read(cx, |claude| match claude.channel.as_ref() {
-                Some(channel) => {
-                    channel.cancel();
-                    true
-                }
-                None => false,
-            })
-            .unwrap_or(false)
-        };
+        let sent = self.cancel_session_transport(id, cx);
         if let Some(mut claude) = self.agent_mut(cx) {
             claude.turn_phase.request_stop(std::time::Instant::now());
             claude.status = Some(if sent {
@@ -4718,6 +4706,28 @@ impl YaldaGpuiView {
             });
         }
         cx.notify();
+    }
+
+    /// Send one best-effort graceful ACP cancel through whichever transport owns
+    /// `id`. Shared by the explicit Stop action and Codex normal-message
+    /// interruption; lifecycle policy stays with the caller.
+    fn cancel_session_transport(&self, id: SessionId, cx: &GpuiApp) -> bool {
+        let server_sid = self.sessions.sid_of(id).map(|sid| sid.to_string());
+        if let Some(sid) = &server_sid {
+            self.session_server
+                .as_ref()
+                .and_then(|s| s.cancel(sid).ok())
+                .is_some()
+        } else {
+            self.read_session(id, cx, |claude| match claude.channel.as_ref() {
+                Some(channel) => {
+                    channel.cancel();
+                    true
+                }
+                None => false,
+            })
+            .unwrap_or(false)
+        }
     }
 
     /// Hard recovery for a wedged turn: kill the agent subprocess and respawn
@@ -4889,14 +4899,29 @@ impl YaldaGpuiView {
             return;
         }
 
-        // STEERING (spec-turn-steering.md, UXI-AgentTile-13): a submit is delivered
-        // IMMEDIATELY — even mid-turn. For agents that advertise `promptQueueing`
-        // (claude-agent-acp) the worker forwards the prompt concurrently, so the
-        // agent receives the steer while the current turn is still streaming and
-        // processes it the instant that turn finishes. `send_prompt_to_session`
-        // commits the user turn on a successful write. On send FAILURE we LEAVE
-        // the draft in the compose (no clear, no queue) with a status so the user
-        // can retry — the message is never moved out of sight or dropped.
+        // PROVIDER-AWARE STEERING (spec-turn-steering.md, UXI-AgentTile-13):
+        // Claude keeps its promptQueueing path, where the steer rides the current
+        // turn. Codex normal messages are interrupts: gracefully cancel a CLEAN
+        // in-flight turn before sending the replacement prompt. Do not take this
+        // branch for StopRequested — that turn already has a cancel pending, and
+        // `send_prompt_to_session` will supersede that phase with a fresh Awaiting
+        // turn. The cancel is transport-only: normal-message interruption never
+        // enters StopRequested or the Stop button's second-press force-restart
+        // policy.
+        let interrupt_codex = self
+            .read_session(id, cx, |c| {
+                c.provider == AgentProvider::Codex
+                    && matches!(c.turn_phase, TurnPhase::Awaiting { .. })
+            })
+            .unwrap_or(false);
+        if interrupt_codex {
+            self.cancel_session_transport(id, cx);
+        }
+
+        // `send_prompt_to_session` commits the user turn on a successful write.
+        // On send FAILURE we LEAVE the draft in the compose (no clear, no queue)
+        // with a status so the user can retry — the message is never moved out of
+        // sight or dropped.
         // UXI-AgentTile-11 rule 5: a worksheet reply freezes IN PLACE at the You-block's
         // anchor (between the latest turn's lines); chatbox / tail submits append
         // at EOF (anchor = None). Only meaningful when a block is open + idle.

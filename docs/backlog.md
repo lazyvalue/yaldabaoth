@@ -13,6 +13,20 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Normal messages interrupt an in-flight Codex turn** — `NEEDS-RUNTIME`
+  (2026-08-12 via `/bug`; `bug-0036`, `UXI-AgentTile-13`; Cog graph `bkb`).
+  Captured verbatim: *"i can't seem to interrupt codex sessions with normal
+  messages. i have to click stop. fix it."* Normal submit now recognizes a clean
+  `Awaiting` Codex turn, sends one graceful ACP `session/cancel`, and then sends
+  the typed replacement prompt without entering the Stop button's
+  `StopRequested` / force-restart lifecycle. Claude keeps promptQueueing
+  steering; idle Codex and already-stopping Codex turns do not emit an extra
+  cancel. The real submit and in-process production channel guard observed the
+  expected missing-cancel RED; both provider/phase predicate mutants were
+  caught; 569 GUI tests and the release build are green. Runtime gap: restart
+  the running app to load the new binary, then confirm the interaction against
+  a live Codex subprocess.
+
 - **Switch a workspace between plane and columns arrangements** — `DONE`
   (2026-08-12 via `/new-ux`; `UXI-Workspace-14`; Cog graph `snf`). Captured
   verbatim: *"I want to be able to move a workspace from plane tile arrangement
