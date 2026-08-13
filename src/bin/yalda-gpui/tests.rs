@@ -1785,6 +1785,56 @@ fn theme_switch_invalidate_reparses_code_blocks() {
     );
 }
 
+/// INV-UX-1 (cursor + text always visible): the WP edit view's code-line
+/// background MUST follow the active theme, not a hardcoded dark swatch. Folio's
+/// fenced-code syntax tokens are dark (designed for its linen `code_block_bg`);
+/// the old hardcoded `0x21222c` painted them — and the caret's character —
+/// dark-on-dark ("moving the cursor through a code block loses the cursor").
+///
+/// Drives the REAL value the WP render paints (`wp_code_block_bg_rgb`) and
+/// asserts it contrasts with the darkest token the REAL Folio highlighter emits.
+///
+/// Negative control: revert `wp_code_block_bg_rgb` to `0x21222c` → the Folio bg
+/// goes dark, contrast collapses below the threshold, and this fails.
+#[test]
+fn wp_code_bg_contrasts_with_folio_syntax_tokens() {
+    use yalda::highlight::Highlighter;
+    use yalda::style::{Color, Style};
+
+    fn luma(r: u8, g: u8, b: u8) -> f32 {
+        0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32
+    }
+    fn u32_luma(c: u32) -> f32 {
+        luma((c >> 16) as u8, (c >> 8) as u8, c as u8)
+    }
+
+    let folio = Theme::folio();
+    let bg = wp_code_block_bg_rgb(&folio);
+    assert_ne!(bg, 0x21222c, "WP code bg must not be the hardcoded dark swatch");
+
+    // Darkest token the real Folio highlighter emits on a representative line.
+    let hl = Highlighter::with_syntect_theme(folio.name.syntect_theme());
+    let darkest = hl
+        .highlight_line_stateless("rust", "pub fn add(x: usize) -> u8 { 42 }", Style::default())
+        .expect("rust highlighting")
+        .into_iter()
+        .filter(|(t, _)| !t.trim().is_empty())
+        .filter_map(|(_, s)| match s.fg {
+            Some(Color::Rgb(r, g, b)) => Some(luma(r, g, b)),
+            _ => None,
+        })
+        .fold(f32::MAX, f32::min);
+
+    let contrast = (u32_luma(bg) - darkest).abs();
+    assert!(
+        contrast > 120.0,
+        "WP code bg (luma {:.0}) must contrast with the darkest Folio token (luma {:.0}); got {:.0}",
+        u32_luma(bg),
+        darkest,
+        contrast
+    );
+}
+
 /// Cost probe for the worksheet-keystroke path: repeated rebuilds over a
 /// large transcript with the frozen prefix unchanged. Prints the per-
 /// rebuild cost; the assert is a generous debug-build ceiling that only

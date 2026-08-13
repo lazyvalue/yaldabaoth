@@ -113,6 +113,25 @@ pub(crate) fn bg_or(s: NStyle, fallback: u32) -> Hsla {
     }
 }
 
+/// Packed-RGB background for a code line/block in the WordProcessor edit view.
+///
+/// MUST follow `theme.code_block_bg` — the same surface the fenced-code syntax
+/// colors are designed against. A hardcoded dark bg here (the old `0x21222c`)
+/// renders a light theme's DARK code tokens dark-on-dark (Folio "lost cursor"
+/// regression). The doc view and transcript already use `theme.code_block_bg`;
+/// this keeps WP consistent.
+pub(crate) fn wp_code_block_bg_rgb(theme: &Theme) -> u32 {
+    match theme.code_block_bg.bg {
+        Some(c) => ncolor_to_u32(c, 0x21222c),
+        None => 0x21222c,
+    }
+}
+
+/// `wp_code_block_bg_rgb` as a gpui color for the render path.
+pub(crate) fn wp_code_block_bg(theme: &Theme) -> Hsla {
+    rgb(wp_code_block_bg_rgb(theme)).into()
+}
+
 /// Tint a background color by blending in a hue at `saturation` and
 /// shifting lightness by `lightness_delta`. Used to derive subtle per-turn
 /// card backgrounds from the theme's editor_bg.

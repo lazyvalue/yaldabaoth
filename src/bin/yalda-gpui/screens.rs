@@ -649,6 +649,9 @@ impl YaldaGpuiView {
         let editor_fg = self.editor_fg();
         let selection_bg = self.theme.agent.selection_bg;
         let text_scale = self.text_scale;
+        // Code-line bg follows the active theme (Folio's dark tokens were
+        // invisible on the old hardcoded dark bg). See `wp_code_block_bg`.
+        let wp_code_bg = wp_code_block_bg(&self.theme);
 
         let render_fn = move |line_idx: usize, _w: &mut Window, _app: &mut GpuiApp| -> AnyElement {
             let line_str = lines_snap.get(line_idx).cloned().unwrap_or_default();
@@ -733,7 +736,10 @@ impl YaldaGpuiView {
                     .font_weight(font_weight)
                     .px_2()
                     .py_0p5()
-                    .bg(rgb(0x21222c))
+                    // Theme-driven: the fenced-code syntax colors are designed
+                    // against `theme.code_block_bg`; a hardcoded dark bg made a
+                    // light theme's dark tokens (and the caret char) invisible.
+                    .bg(wp_code_bg)
                     .child(content),
                 WpLineKind::Empty => div()
                     .flex()
