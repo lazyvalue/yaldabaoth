@@ -11,6 +11,9 @@ impl YaldaGpuiView {
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.browser_text_captured() {
+            return; // filter/rename capture owns arrows + j/k
+        }
         if let Some(b) = self.browser_mut() {
             if let Some(wm) = &mut b.fb.worktree_mode {
                 wm.move_down();
@@ -21,6 +24,9 @@ impl YaldaGpuiView {
         }
     }
     pub(crate) fn browser_up(&mut self, _: &BrowserUp, _w: &mut Window, cx: &mut Context<Self>) {
+        if self.browser_text_captured() {
+            return; // filter/rename capture owns arrows + j/k
+        }
         if let Some(b) = self.browser_mut() {
             if let Some(wm) = &mut b.fb.worktree_mode {
                 wm.move_up();
@@ -36,6 +42,9 @@ impl YaldaGpuiView {
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.browser_text_captured() {
+            return; // `l`/right must be filter-query text, not "open selected"
+        }
         if let Some(b) = self.browser_mut()
             && b.fb.worktree_mode.is_some()
         {
@@ -58,6 +67,9 @@ impl YaldaGpuiView {
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.browser_text_captured() {
+            return; // `h`/left/`-` must be filter-query text, not "go up"
+        }
         if let Some(b) = self.browser_mut() {
             if b.fb.worktree_mode.is_some() {
                 return; // no-op in worktree mode
@@ -72,6 +84,9 @@ impl YaldaGpuiView {
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.browser_text_captured() {
+            return; // `w` must be filter-query text, not "show worktrees"
+        }
         if let Some(b) = self.browser_mut() {
             if b.fb.worktree_mode.is_some() {
                 b.fb.exit_worktree_mode();
@@ -87,6 +102,9 @@ impl YaldaGpuiView {
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.browser_text_captured() {
+            return; // `.` must be filter-query text, not "toggle hidden"
+        }
         if let Some(b) = self.browser_mut() {
             b.fb.toggle_hidden();
             cx.notify();
@@ -98,6 +116,9 @@ impl YaldaGpuiView {
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.browser_text_captured() {
+            return; // `s` must be filter-query text, not "cycle sort"
+        }
         let id = self.workspace.focused_window_id();
         let order = self.browser_mut().map(|b| {
             b.fb.cycle_sort();
@@ -117,6 +138,12 @@ impl YaldaGpuiView {
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.browser_text_captured() {
+            // Esc/`q` while filtering or renaming is handled by the capture
+            // key handler (clear filter / cancel rename) — it must NOT close
+            // the tile or type into the query as a side effect.
+            return;
+        }
         // If in worktree mode, Esc exits that overlay instead of closing.
         if let Some(b) = self.browser_mut()
             && b.fb.worktree_mode.is_some()
@@ -172,6 +199,9 @@ impl YaldaGpuiView {
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.browser_text_captured() {
+            return; // `r` must be filter-query / rename text, not "begin rename"
+        }
         if let Some(b) = self.browser_mut() {
             b.fb.begin_rename();
             cx.notify();
@@ -184,6 +214,11 @@ impl YaldaGpuiView {
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // While renaming, `/` is filename text (capture handler); don't hijack it
+        // to open search. In filter mode `/` intentionally TOGGLES search off.
+        if self.browser_mut().is_some_and(|b| b.fb.rename.is_some()) {
+            return;
+        }
         if let Some(b) = self.browser_mut() {
             if b.fb.filter_mode {
                 b.fb.clear_filter();
@@ -309,6 +344,26 @@ impl YaldaGpuiView {
             }
             _ => {}
         }
+    }
+
+    /// True while the browser is capturing text — a `/` filter query or an
+    /// inline rename. In these modes the capture-phase key handler
+    /// (`handle_browser_filter_key`) OWNS every keystroke.
+    ///
+    /// GPUI 0.2.2 dispatches bound ACTIONS *before* capture key listeners
+    /// (`window.rs::dispatch_key_event`: the `match_result.bindings` loop runs,
+    /// then `finish_dispatch_key_event` runs the listeners). So a capture
+    /// listener's `stop_propagation` can never cancel an already-dispatched
+    /// action. That means every bare-letter / arrow `BrowserView` binding
+    /// (`l`/right → BrowserEnter opens the file, `h`/left/`-` → BrowserParent,
+    /// `r` → rename, `s` → sort, `q`/esc → close, `j`/`k` → move) would fire its
+    /// action *before* the filter handler could treat the key as text — opening
+    /// or navigating mid-search (bug-0038). Every such action guards on this so
+    /// it no-ops while text is being captured; the capture handler alone drives
+    /// filter/rename input.
+    pub(crate) fn browser_text_captured(&mut self) -> bool {
+        self.browser_mut()
+            .is_some_and(|b| b.fb.filter_mode || b.fb.rename.is_some())
     }
 
     // ---- Rail (persistent side column, spec-rail.md) -----------------------

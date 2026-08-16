@@ -11696,6 +11696,119 @@ fn focused_in_insert_mode_browser_arm(cx: &mut TestAppContext) {
     );
 }
 
+/// bug-0038: in the file-picker `/` search mode, non-`Char` keys that were also
+/// bound to a `BrowserView` action leaked to that action — `right`→BrowserEnter
+/// OPENED the selected file mid-search (and `left`→BrowserParent navigated up).
+/// The capture-phase filter handler only stopped propagation for a handful of
+/// keys; its `_ => {}` fall-through let the rest reach their bindings. It now
+/// swallows EVERY key while filtering. Drives the real keymap: `/`, a query, then
+/// the actual `right` keystroke.
+///
+/// Negative control (observed RED): revert `_ => cx.stop_propagation()` back to
+/// `_ => {}` in `handle_browser_filter_key` → `right` fires BrowserEnter →
+/// `open_file` flips the tile to `Viewing` and both asserts below fail.
+#[gpui::test]
+fn browser_filter_arrow_key_does_not_open_file(cx: &mut TestAppContext) {
+    use crate::{App, BufferApp};
+
+    // A hermetic temp dir with a file the filter can select (plus a decoy so the
+    // match isn't the only row).
+    let dir = std::env::temp_dir().join(format!("yalda-picker-filter-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in ["aaa-decoy.txt", "target-file.txt"] {
+        std::fs::write(dir.join(f), b"x\n").unwrap();
+    }
+
+    cx.update(crate::register_keymap);
+    let dir_for_view = dir.clone();
+    let (view, vcx) = cx.add_window_view(move |window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        crate::with_no_session_server(|| {
+            YaldaGpuiView::new_browser(dir_for_view.clone(), Theme::default(), focus_handle)
+        })
+    });
+    view.update(vcx, |v, cx| {
+        v.splash_until = None;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+
+    // Enter `/` search and type a query that selects the FILE (recursive search
+    // ranks the exact/shortest match first → selected == the file).
+    vcx.simulate_keystrokes("/");
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("t a r g e t");
+    vcx.run_until_parked();
+
+    // Pre-condition: we are filtering and the selected entry is a real FILE, so a
+    // leaked BrowserEnter would genuinely open something (non-vacuous NC).
+    view.read_with(vcx, |v, _| match v.workspace.focused_content() {
+        Some(App::Buffer(BufferApp::Picking(bw))) => {
+            assert!(bw.fb.filter_mode, "filter mode is active after `/` + query");
+            let sel = bw.fb.selected_entry().expect("a selected search result");
+            assert!(!sel.is_dir, "the selected entry is a file, not a dir");
+            assert!(
+                sel.name.to_lowercase().contains("target"),
+                "the query selected the target file, got {:?}",
+                sel.name
+            );
+        }
+        _ => panic!("expected a Picking browser after `/` + query"),
+    });
+
+    // The operative action: `right` while filtering. Must NOT open the file.
+    vcx.simulate_keystrokes("right");
+    vcx.run_until_parked();
+
+    view.read_with(vcx, |v, _| match v.workspace.focused_content() {
+        Some(App::Buffer(BufferApp::Picking(bw))) => {
+            assert!(
+                bw.fb.filter_mode,
+                "`right` in search mode is swallowed — filter stays active, no file opened"
+            );
+        }
+        _ => panic!(
+            "`right` in search mode must NOT open the file — the tile flipped away \
+             from the picker (BrowserEnter leaked)"
+        ),
+    });
+
+    // The letter-leak face of the same defect: `h` is bound to BrowserParent.
+    // GPUI dispatches (and CONSUMES) the action before the capture handler, so
+    // pre-fix `h` navigated to the parent dir mid-search. The guard makes it a
+    // harmless no-op: the dir does not change and we stay in the same filtered
+    // picker. (A bound key is swallowed, not appended — see the bug log's known
+    // limitation.)
+    let (dir_before, filter_before) =
+        view.read_with(vcx, |v, _| match v.workspace.focused_content() {
+            Some(App::Buffer(BufferApp::Picking(bw))) => {
+                (bw.fb.current_dir().to_path_buf(), bw.fb.filter_text().to_string())
+            }
+            _ => panic!("still a picker before `h`"),
+        });
+    vcx.simulate_keystrokes("h");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| match v.workspace.focused_content() {
+        Some(App::Buffer(BufferApp::Picking(bw))) => {
+            assert!(bw.fb.filter_mode, "still filtering after a bound letter");
+            assert_eq!(
+                bw.fb.current_dir(),
+                dir_before.as_path(),
+                "`h` must NOT navigate to the parent dir mid-search (BrowserParent leaked)"
+            );
+            assert_eq!(
+                bw.fb.filter_text(),
+                filter_before,
+                "`h` is swallowed, not treated as a navigation"
+            );
+        }
+        _ => panic!("`h` in search mode must NOT navigate away from the picker"),
+    });
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// UXI-AgentTile-11 rules 1–3: in the worksheet, navigation is free (no compose chrome);
 /// an Insert-entry key (`i`) opens a You-block (compose focus + Insert); leaving
 /// Insert with NO non-whitespace text DISCARDS it — the transcript is
