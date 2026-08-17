@@ -105,3 +105,29 @@ unchanged. `paste_into_compose` now delegates to the same helper.
 `simulate_keystrokes("cmd-v")` — the REAL action dispatch — instead of calling
 `handle_claude_key`. Negative control: remove the image block from
 `paste_from_clipboard` → BOTH tests RED (observed). 568 pass.
+
+## 2026-08-16 (3) — no pre-send indication in worksheet-idle mode
+
+User: "when pasting an image in worksheet or chatbox mode I want indication it's
+in the buffer; indication only appears after sent." Probed both modes:
+
+- **Chatbox / mid-turn** — the `🖼` chip DID paint before send (probe
+  `compose-image-chips` returned real area). Works.
+- **Worksheet-idle** — `show_compose` (`screens.rs`) is
+  `is_chatbox() || turn_phase.is_awaiting()`, so an idle worksheet renders NO
+  compose panel — and the chip row lived only INSIDE that panel. So a paste had
+  zero on-screen indication until send (which then shows the transcript `🖼`
+  marker). Probe confirmed: `compose-box` = None, `compose-image-chips` = None
+  after paste, while the image was staged in state.
+
+**Fix (3).** Extracted `render_agent::pending_image_chip_strip` and render it in
+BOTH places: inside the compose panel (chatbox/mid-turn, unchanged) and as a
+standalone strip pinned to the bottom of the agent tile's main column when
+`show_compose == false` and images are staged (worksheet-idle). INV-UX-21
+property 2 updated.
+
+**Guards (3).** `image_paste_chip_paints_before_send_chatbox` and
+`…_worksheet_idle` — paint probes asserting the chip has real area. The worksheet
+one is non-vacuous (asserts `compose-box` is None, so the strip is the only
+indication). Negative control: delete the standalone-strip arm in `render_agent`
+→ worksheet test RED, chatbox test green (observed). 570 pass.

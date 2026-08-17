@@ -10233,6 +10233,96 @@ fn image_paste_direct_read_stages_even_with_text_on_clipboard(cx: &mut TestAppCo
     );
 }
 
+/// PROBE: a pasted-image chip PAINTS above the chatbox before send (INV-UX-21
+/// property 2). A state-only assert can't catch a repaint miss (the reported
+/// symptom: "indication only appears after sent"). Boots chatbox mode, pastes an
+/// image via the real cmd-v action, and asserts the `compose-image-chips` element
+/// painted with real area.
+#[gpui::test]
+fn image_paste_chip_paints_before_send_chatbox(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    let png: Vec<u8> = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 7, 7, 7];
+    crate::system_console::set_clipboard_image_test_override(Some(png));
+
+    // Force chatbox mode so the pinned compose panel is shown.
+    view.update(vcx, |v, cx| {
+        let is_cb = v.agent_read(cx, |c| c.input_surface.is_chatbox()).unwrap_or(false);
+        if !is_cb { v.toggle_agent_input_mode(cx); }
+    });
+    vcx.run_until_parked();
+
+    crate::layout_probe_begin();
+    vcx.simulate_keystrokes("cmd-v");
+    vcx.run_until_parked();
+    let rect = crate::layout_probe_get("compose-image-chips");
+    crate::layout_probe_end();
+    crate::system_console::set_clipboard_image_test_override(None);
+
+    // Precondition: the image really staged (so a missing paint is a paint bug,
+    // not a missing image).
+    let staged = view
+        .update(vcx, |v, cx| v.agent_read(cx, |c| c.input_surface.compose().pending_images.len()))
+        .expect("session");
+    assert_eq!(staged, 1, "image staged onto the compose");
+
+    let (_x, _y, w, h) = rect.expect("the pending-image chip never painted before send");
+    assert!(w > 4.0 && h > 4.0, "chip painted with no area ({w}x{h})");
+}
+
+/// PROBE: the reported bug — in WORKSHEET-IDLE mode there is no compose panel
+/// (`show_compose` is false), so before this fix a pasted image had NO on-screen
+/// indication until send. The standalone chip strip must paint here too
+/// (INV-UX-21 property 2; bug-0039 follow-up). Negative control: delete the
+/// `else if let Some(strip) = …` standalone-strip arm in `render_agent` and this
+/// goes RED (the chatbox test stays green — it uses the in-panel strip).
+#[gpui::test]
+fn image_paste_chip_paints_before_send_worksheet_idle(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    let png: Vec<u8> = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 5, 5, 5];
+    crate::system_console::set_clipboard_image_test_override(Some(png));
+
+    // Force worksheet mode (idle) — the state with no compose panel.
+    view.update(vcx, |v, cx| {
+        let is_cb = v.agent_read(cx, |c| c.input_surface.is_chatbox()).unwrap_or(false);
+        if is_cb {
+            v.toggle_agent_input_mode(cx);
+        }
+    });
+    vcx.run_until_parked();
+
+    crate::layout_probe_begin();
+    vcx.simulate_keystrokes("cmd-v");
+    vcx.run_until_parked();
+    let chip = crate::layout_probe_get("compose-image-chips");
+    let box_rect = crate::layout_probe_get("compose-box");
+    crate::layout_probe_end();
+    crate::system_console::set_clipboard_image_test_override(None);
+
+    let staged = view
+        .update(vcx, |v, cx| {
+            v.agent_read(cx, |c| {
+                (
+                    c.input_surface.compose().pending_images.len(),
+                    c.input_surface.is_chatbox(),
+                )
+            })
+        })
+        .expect("session");
+    assert_eq!(staged.0, 1, "image staged onto the compose");
+    assert!(!staged.1, "test must be in worksheet mode (no compose panel)");
+    // Guard is non-vacuous: worksheet-idle really has NO compose box painted, so
+    // the chip strip is the ONLY indication.
+    assert!(
+        box_rect.is_none(),
+        "precondition: worksheet-idle paints no compose box (got {box_rect:?})"
+    );
+
+    let (_x, _y, w, h) = chip.expect("the pending-image chip never painted in worksheet-idle");
+    assert!(w > 4.0 && h > 4.0, "chip painted with no area ({w}x{h})");
+}
+
 /// Boot a REAL worksheet session backed by an in-process test channel (NO server
 /// sid) so a real `submit` takes the `channel.send()==Ok` path and drives the
 /// production mid-turn transition — the seam that closes verification gap #2 for

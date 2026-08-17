@@ -959,8 +959,13 @@ Three hard properties:
    plain-text type, which mac image copies do (a URL/filename rides alongside the
    image), so the image was silently dropped (bug-0039). GPUI's own image entries
    remain the fallback for non-mac platforms.
-2. **Visible before send.** Each staged image renders as a `🖼 <label>` chip
-   above the compose box so the user sees what will go with the next submit.
+2. **Visible before send, in every mode.** Each staged image renders as a
+   `🖼 <label>` chip so the user sees what will go with the next submit — inside
+   the compose panel in chatbox / mid-turn mode, AND as a standalone strip pinned
+   to the bottom of the agent tile in **worksheet-idle** mode, where there is no
+   compose panel (`show_compose == false`). Before bug-0039's follow-up, the chip
+   lived only inside the compose panel, so a worksheet-idle paste had NO on-screen
+   indication until send. Shared builder: `render_agent::pending_image_chip_strip`.
 3. **Sent as a content block; cleared after.** On submit (both the chatbox/tail
    path `send_prompt_to_session` and the worksheet path `submit_worksheet_blocks`)
    the attachments become ACP `ContentBlock::Image`s appended after the text block

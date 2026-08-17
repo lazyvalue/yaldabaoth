@@ -946,6 +946,40 @@ impl YaldaGpuiView {
         Some(probe_bounds("recap-panel", panel.into_any_element()))
     }
 
+    /// The staged-image chip strip (INV-UX-21 property 2): one `🖼 label` chip
+    /// per pending attachment, tinted with the accent so they read as pending
+    /// payload. Rendered inside the compose panel in chatbox/mid-turn mode AND as
+    /// a standalone strip in worksheet-idle mode (where there is no compose panel)
+    /// so a paste is always visible BEFORE send (bug-0039 follow-up). `labels` is
+    /// `🖼 …`-prefixed; empty ⇒ `None`.
+    pub(crate) fn pending_image_chip_strip(
+        labels: &[SharedString],
+        bg: Hsla,
+        border: Hsla,
+        fg: Hsla,
+        font: SharedString,
+    ) -> Option<gpui::AnyElement> {
+        if labels.is_empty() {
+            return None;
+        }
+        let mut chips = div().flex().flex_row().flex_wrap().gap_1().px_4().pt_1();
+        for label in labels {
+            chips = chips.child(
+                div()
+                    .px_2()
+                    .rounded_md()
+                    .bg(bg)
+                    .border_1()
+                    .border_color(border)
+                    .text_size(px(11.0))
+                    .font_family(font.clone())
+                    .text_color(fg)
+                    .child(label.clone()),
+            );
+        }
+        Some(probe_bounds("compose-image-chips", chips.into_any_element()))
+    }
+
     /// Render the Claude (ACP) screen. Frozen lines (Claude's prior turns)
     /// get a left bar + dim color; the editable region (the user's pending
     /// draft and any inline replies) renders normally with cursor splice.
@@ -1312,6 +1346,18 @@ impl YaldaGpuiView {
         // ONLY mid-turn (the chatbox — rule 7). An idle You-block renders INLINE in
         // the transcript at its anchor (FlatItem::YouBlock), not here. Navigating
         // idle shows NO compose chrome. Chatbox mode always shows its pinned box.
+        // Staged image attachments (pasted via Cmd+V) → chip labels. Computed at
+        // the outer scope so the strip renders in BOTH the compose panel
+        // (chatbox/mid-turn) and standalone in worksheet-idle where no compose
+        // panel shows — a paste must be visible before send (INV-UX-21 prop 2).
+        let pending_image_labels: Vec<SharedString> = c
+            .input_surface
+            .compose()
+            .pending_images
+            .iter()
+            .map(|p| SharedString::from(format!("🖼 {}", p.label)))
+            .collect();
+
         let show_compose = c.input_surface.is_chatbox() || c.turn_phase.is_awaiting();
         let compose_panel = if !show_compose {
             None
@@ -1321,16 +1367,6 @@ impl YaldaGpuiView {
             // steering box (the idle worksheet draft renders INLINE as the YouBlock,
             // never here). So it never wears the worksheet flush/accent/"You" chrome.
             let is_worksheet = false;
-            // Staged image attachments (pasted via Cmd+V) → chip labels, captured
-            // before the mutable compose borrow below. Rendered as chips above the
-            // box so the user sees what will be sent (UXI-AgentTile-14).
-            let pending_image_labels: Vec<SharedString> = c
-                .input_surface
-                .compose()
-                .pending_images
-                .iter()
-                .map(|p| SharedString::from(format!("🖼 {}", p.label)))
-                .collect();
             let tb = c.input_surface.compose_mut();
             // Logical lines shown before the box caps height + scrolls. At/below
             // this the panel renders every line directly (grows to content,
@@ -1593,29 +1629,14 @@ impl YaldaGpuiView {
             // flush (full column width, no margin) vs chatbox's inset box.
             // Image-attachment chips, above the box: one per staged paste, tinted
             // with the accent so they read as pending payload (UXI-AgentTile-14).
-            if !pending_image_labels.is_empty() {
-                let mut chips = div()
-                    .flex()
-                    .flex_row()
-                    .flex_wrap()
-                    .gap_1()
-                    .px_4()
-                    .pt_1();
-                for label in pending_image_labels {
-                    chips = chips.child(
-                        div()
-                            .px_2()
-                            .rounded_md()
-                            .bg(compose_panel_bg)
-                            .border_1()
-                            .border_color(compose_cursor_color)
-                            .text_size(px(11.0))
-                            .font_family(compose_code_font.clone())
-                            .text_color(compose_fg)
-                            .child(label),
-                    );
-                }
-                panel = panel.child(probe_bounds("compose-image-chips", chips.into_any_element()));
+            if let Some(strip) = Self::pending_image_chip_strip(
+                &pending_image_labels,
+                compose_panel_bg,
+                compose_cursor_color,
+                compose_fg,
+                compose_code_font.clone(),
+            ) {
+                panel = panel.child(strip);
             }
             Some(
                 panel
@@ -2171,6 +2192,19 @@ impl YaldaGpuiView {
         }
         if let Some(panel) = compose_panel {
             main_col = main_col.child(panel);
+        } else if let Some(strip) = Self::pending_image_chip_strip(
+            &pending_image_labels,
+            compose_panel_bg,
+            nc(at.cursor),
+            compose_fg,
+            self.code_font.clone(),
+        ) {
+            // Worksheet-idle: no compose panel, but a pasted image must still show
+            // its chip before send (INV-UX-21 prop 2; bug-0039 follow-up). Pin the
+            // strip to the bottom of the main column.
+            main_col = main_col.child(
+                div().flex().flex_col().flex_none().pb_1().child(strip),
+            );
         }
         // Content area: the main column on the left, the segmented Plan/Subagents
         // sidepanel on the right (when either segment is open).
