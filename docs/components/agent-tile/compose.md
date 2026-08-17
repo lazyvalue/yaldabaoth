@@ -39,7 +39,7 @@ to read it; a long line flows onto the next visual row.
 unreadable and you lose sight of what you wrote. Wrapping keeps the whole draft
 visible.
 
-**Status.** `implemented` (runtime-unverified for paint, per the GPUI headless gap).
+**Status.** `implemented`.
 The compose **word-wraps**: `wrap_line_cols` (agent.rs) partitions each logical
 line into ≤width visual rows at space boundaries (over-long words hard-break),
 covering every char; `build_chatbox_wrapped_line` renders one visual row per
@@ -53,8 +53,11 @@ the vertical caret-containment is kept.
 **Enforcement.** Headless: `wrap_line_cols_word_wraps_and_covers_every_char`
 (wraps, hard-breaks, covers every char, ≥1 row, makes progress) +
 `caret_visual_row_places_caret_on_a_rendered_row` (caret always on a rendered
-row). Runtime (GPUI paint not headless): type a line wider than the box in both
-placements and confirm it wraps with the caret visible.
+row). `verify_harness.rs::worksheet_r_first_paint_uses_transcript_width` drives
+the real `r` reply path and asserts from painted geometry that a newly opened,
+unmeasured inline reply uses the wide transcript viewport instead of the old
+40-column emergency fallback. Runtime remains useful for visually checking both
+placements, but the reported first-paint failure is headlessly guarded.
 
 ### UXI-AgentTile-10 — Worksheet renders inline-flush; chatbox renders as a pinned box
 

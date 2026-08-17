@@ -41,6 +41,33 @@ use super::*;
 /// moved — the invalidation GPUI needs to repaint the just-typed text.
 pub(crate) const YOU_BLOCK_SPLICE_LABEL: &str = "you_block_splice";
 
+/// Horizontal chrome between the transcript viewport edge and an inline
+/// You-block's text. Used only before the block's own `CaptureBounds` has
+/// painted; once measured, the exact compose width always wins.
+const INLINE_YOU_BLOCK_INSET_PX: f32 = 16.0;
+
+/// Resolve the wrap width for an inline You-block. A newly opened block has no
+/// measured compose bounds on its first render, but its transcript viewport has
+/// already painted (there must be agent text for `r` to quote). Use that real
+/// available width rather than leaving the seeded reply in the old narrow
+/// 40-column emergency layout until another keystroke happens.
+pub(crate) fn inline_you_block_wrap_cols(
+    measured_cols: usize,
+    transcript_width_px: f32,
+) -> usize {
+    if measured_cols > 0 {
+        measured_cols
+    } else if transcript_width_px > 1.0 {
+        let content_width =
+            (transcript_width_px - INLINE_YOU_BLOCK_INSET_PX).max(crate::CHATBOX_CHAR_W);
+        (content_width / crate::CHATBOX_CHAR_W)
+            .floor()
+            .max(1.0) as usize
+    } else {
+        40
+    }
+}
+
 /// The RESTING row background for a committed transcript line (UXI-AgentTile-4 /
 /// UXI-AgentTile-23, ADR-0027): a **user** turn (`TurnId::User`) gets the faint
 /// `user_turn_bg` tint so the user's own contributions stand out; agent, tool,
@@ -884,6 +911,17 @@ impl TranscriptView {
             }
         });
 
+        // The compose's exact bounds are written only when the inline block
+        // paints. On the first render after `r`, they are necessarily zero; a
+        // hard-coded 40-column fallback made long seeded quotes render as a
+        // narrow strip and stay that way until another event invalidated the
+        // cached transcript. The transcript viewport is already measured by
+        // then, so it is the authoritative first-paint fallback.
+        let transcript_width_px =
+            f32::from(self.scroll.list_state.viewport_bounds().size.width);
+        let you_wrap_cols =
+            inline_you_block_wrap_cols(you_wrap_cols, transcript_width_px);
+
         // Per-flat-item raw line range for each `FlatItem::Block`, paired in the
         // SAME ascending order the renderer emits blocks (bug-0008). Lets the block
         // render arm register per-raw-line hit-test bands so tables/lists/code are
@@ -958,10 +996,8 @@ impl TranscriptView {
                     let bw = yb.bounds.get().2;
                     if bw > 1.0 {
                         (bw / crate::CHATBOX_CHAR_W).floor().max(1.0) as usize
-                    } else if you_wrap_cols > 0 {
-                        you_wrap_cols
                     } else {
-                        40
+                        you_wrap_cols
                     }
                 };
                 let (caret_vrow, _, _) = crate::compose_visual_metrics(
@@ -1647,10 +1683,8 @@ impl TranscriptView {
                         let box_w = bounds.as_ref().map(|b| b.get().2).unwrap_or(0.0);
                         let wrap_cols = if box_w > 1.0 {
                             (box_w / crate::CHATBOX_CHAR_W).floor().max(1.0) as usize
-                        } else if you_wrap_cols > 0 {
-                            you_wrap_cols
                         } else {
-                            40
+                            you_wrap_cols
                         };
                         // INTENT — co-authoring a document: the inline You-block renders
                         // EVERY line and GROWS with its content. It is part of the doc

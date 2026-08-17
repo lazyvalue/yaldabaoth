@@ -178,6 +178,35 @@ fn is_blockquote_line_matches_leading_marker_only() {
     assert!(!is_blockquote_line("   "));
 }
 
+#[test]
+fn inline_you_block_wrap_width_prefers_measurement_then_viewport() {
+    assert_eq!(
+        crate::inline_you_block_wrap_cols(73, 1_574.0),
+        73,
+        "the block's exact painted measurement wins"
+    );
+    assert_eq!(
+        crate::inline_you_block_wrap_cols(0, 1_574.0),
+        194,
+        "an unmeasured first paint derives columns from the transcript viewport"
+    );
+    assert_eq!(
+        crate::inline_you_block_wrap_cols(0, 0.0),
+        40,
+        "40 columns remains only the pre-layout emergency fallback"
+    );
+    assert_eq!(
+        crate::inline_you_block_wrap_cols(0, 1.0),
+        40,
+        "a one-pixel pre-layout sentinel is not a usable viewport"
+    );
+    assert_eq!(
+        crate::inline_you_block_wrap_cols(0, 8.0),
+        1,
+        "a tiny measured viewport still makes forward progress"
+    );
+}
+
 /// Agent-chat heading-marker toggle (the only markdown the user wants visible
 /// in transcripts): `heading_line_with_markers` re-inserts the literal `#`
 /// markers pulldown strips, as a leading span, with one space before the text.

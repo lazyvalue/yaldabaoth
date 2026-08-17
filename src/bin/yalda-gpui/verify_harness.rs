@@ -12375,6 +12375,63 @@ fn worksheet_r_seeds_reply_quote_from_agent_line(cx: &mut TestAppContext) {
     });
 }
 
+/// REGRESSION (runtime report: a freshly seeded worksheet reply sometimes wraps
+/// into a narrow ~40-column strip despite a wide transcript). `r` opens the real
+/// inline You-block before its compose bounds have ever painted; the unmeasured
+/// width path must use the already-painted transcript viewport, not the old
+/// 40-column emergency fallback. The source sentence is deliberately wider than
+/// 40 columns but comfortably narrower than this harness viewport, so a correct
+/// first settled paint keeps the quote on one visual row.
+#[gpui::test]
+fn worksheet_r_first_paint_uses_transcript_width(cx: &mut TestAppContext) {
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    let ev = |e: ReplyEvent| ServerNotification::ReplyEvent {
+        session_id: "S1".into(),
+        event: e,
+    };
+    let sentence = format!("{}.", "wide worksheet reply text ".repeat(5));
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                ev(ReplyEvent::Chunk(format!("{sentence}\n"))),
+                ev(ReplyEvent::TurnEnded { count: 1 }),
+            ],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        let (s, _e) = c.latest_agent_turn_range().expect("agent turn");
+        c.editor.cursor_mut().line = s;
+    });
+    let (_, _, viewport_w, _) =
+        probe_dirty(&view, vcx, "transcript-viewport").expect("transcript viewport paints");
+    crate::layout_probe_begin();
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("r"), w, cx));
+    vcx.run_until_parked();
+    let (_, _, block_w, block_h) =
+        crate::layout_probe_get("you-block").expect("seeded You-block paints on first settle");
+    crate::layout_probe_end();
+    assert!(
+        viewport_w > 800.0,
+        "precondition: this is a genuinely wide transcript ({viewport_w}px)"
+    );
+    assert!(
+        block_w > viewport_w * 0.8,
+        "the inline reply occupies the transcript column: block {block_w}px, viewport {viewport_w}px"
+    );
+    assert!(
+        block_h < 115.0,
+        "a ~130-char quote fits one visual row in a {viewport_w}px transcript; \
+         {block_h}px means it used the narrow unmeasured-width fallback"
+    );
+}
+
 /// UXI-AgentTile-34 + UXI-AgentTile-35: `V` selects the whole agent line
 /// (line-wise visual) through the REAL keymap, and a live selection is what `r`
 /// quotes — the sentence-count heuristic is ignored. Drives the real
