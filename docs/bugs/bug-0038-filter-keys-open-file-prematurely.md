@@ -47,21 +47,28 @@ let the capture handler own input. Added `browser_text_captured()` and an early
 `browser_cycle_sort`, `browser_close`, `browser_rename`. `browser_filter` (`/`)
 guards on rename only, preserving the "`/` toggles search off" gesture.
 
-**Known limitation (follow-up):** because a matched action consumes the event
-before the capture listener can append it, bound keys (`l h j k s q w r -`) are
-now *swallowed* during search rather than typed into the query. Search still
-works via fuzzy matching on the remaining characters, but those letters can't be
-entered literally. A full fix (letters typeable in search) needs the browser to
-stop binding bare letters and route all keys through one handler, or to register
-filter capture as a pre-binding keystroke interceptor — larger than this bug.
+**Real fix (typeability restored):** the guards alone SWALLOW bound letters
+(`l h j k s q w r -`) during search — search became unusable, since most
+filenames contain them. The proper fix is to stop the bindings from matching at
+all while filtering: render the browser under a different **key context**
+(`BrowserFilter`, and `RailFilter` for the rail) that has NO bare-letter/arrow
+bindings. GPUI resolves a key against the dispatch path's contexts; with no
+`BrowserView`/`RailView` binding matched, the event flows to the capture handler,
+which types the key into the query. Global `cmd-*` bindings (`None` context)
+still work. `dispatch_key_event` redraws before each keystroke when dirty, so the
+context is always fresh — no one-frame skew. The action-handler guards stay as
+defense-in-depth (they never fire during filter now, because no binding matches).
 
 ## Approaches already tried (do NOT repeat)
 
 - **Catch-all `cx.stop_propagation()` in the capture handler's `_` arm.** Does
   NOT work: GPUI dispatches the action before the capture listener, so
   propagation is already spent — the file still opened. Verified: the guard test
-  stayed RED with only this change. The listener cannot cancel an action; the fix
-  must live in the action handlers.
+  stayed RED with only this change. The listener cannot cancel an action.
+- **Action-handler guards ALONE (no context switch).** Stops the premature open
+  but SWALLOWS bound letters during search (the action consumes the event before
+  the capture handler can append it) — search becomes unusable. Must be paired
+  with the key-context switch so the bindings never match while filtering.
 
 ---
 
@@ -92,4 +99,39 @@ change (BrowserParent didn't leak).
 - Remove the `browser_parent` guard → `h` navigates to parent (clears filter);
   test fails "still filtering after a bound letter".
 
-Full GUI suite green (564 passed, 1 ignored live test). Fix + guard on `main`.
+Full GUI suite green (564 passed, 1 ignored live test). Fix + guard on `main`
+(commit `e0c2def`).
+
+### 2026-08-16 (later) — Key-context switch restores typeability; rail fixed too
+
+The guard-only fix stopped the premature open but SWALLOWED bound letters
+(`l h j k s q w r -`) during search — the reporter flagged that search was then
+useless (most filenames contain those letters). Root of the swallow: GPUI
+dispatches a matched action *and consumes the event* before the capture handler,
+so a bound key never reached the query.
+
+**Real fix:** render the browser under a distinct **key context** while capturing
+text so the bindings don't match and every key flows to the capture handler:
+- `src/bin/yalda-gpui/screens.rs::render_browser` — `key_context` is
+  `"BrowserFilter"` when `filter_mode || rename.is_some()`, else `"BrowserView"`.
+- `src/bin/yalda-gpui/chrome.rs::render_rail` — `key_context` is `"RailFilter"`
+  when the rail's file browser is filtering, else `"RailView"`.
+`BrowserFilter`/`RailFilter` have no bindings in `DEFAULT_BINDINGS`, so bound
+letters/arrows fall through to `handle_browser_filter_key` /
+`handle_rail_filter_key` and are typed into the query. The action-handler guards
+from the first entry stay as defense-in-depth (unreached during filter now).
+
+**Verified (real keymap, `simulate_keystrokes`):**
+- `browser_filter_arrow_key_does_not_open_file` — extended: after `right` (no
+  open) it types the bound letters `-`/`l` and asserts the query becomes
+  `"target-file"` (letters TYPED, not swallowed).
+- `rail_filter_bound_keys_type_into_query` — Cmd-B opens a focused rail, `/`
+  enters filter, then `s`/`w`/`-` are typed → asserts query `"sw-"`, no worktree
+  mode, dir unchanged.
+
+**Negative controls (both RED, restored):**
+- Force `BrowserFilter`→`BrowserView` → bound letters swallowed, query
+  `"tagetfie"` ≠ `"target-file"`.
+- Force `RailFilter`→`RailView` → `w` opens worktree mode; assert fails.
+
+Full GUI suite green (565 passed, 1 ignored). On `main`.

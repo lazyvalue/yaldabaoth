@@ -1550,8 +1550,17 @@ impl YaldaGpuiView {
         };
 
         // When focused, attach the focus handle inside the RailView key
-        // context so its context-scoped bindings (j/k/enter/…) match.
-        let mut col = col.key_context("RailView");
+        // context so its context-scoped bindings (j/k/enter/…) match. While the
+        // rail's file browser is in `/` filter mode, switch to `RailFilter`
+        // (which has NO bare-letter/`-`/`s`/`w` bindings) so those keys are typed
+        // into the query instead of firing rail actions — GPUI dispatches actions
+        // before the capture handler, so the context switch is the only way to
+        // let `handle_rail_filter_key` see the key as text (bug-0038).
+        let rail_filtering = matches!(
+            &rail.content,
+            workspace::RailContent::FileBrowser(fb) if fb.filter_mode
+        );
+        let mut col = col.key_context(if rail_filtering { "RailFilter" } else { "RailView" });
         if focused {
             col = col.track_focus(&self.focus_handle);
         }

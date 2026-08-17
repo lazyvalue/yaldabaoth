@@ -11774,39 +11774,118 @@ fn browser_filter_arrow_key_does_not_open_file(cx: &mut TestAppContext) {
         ),
     });
 
-    // The letter-leak face of the same defect: `h` is bound to BrowserParent.
-    // GPUI dispatches (and CONSUMES) the action before the capture handler, so
-    // pre-fix `h` navigated to the parent dir mid-search. The guard makes it a
-    // harmless no-op: the dir does not change and we stay in the same filtered
-    // picker. (A bound key is swallowed, not appended — see the bug log's known
-    // limitation.)
-    let (dir_before, filter_before) =
-        view.read_with(vcx, |v, _| match v.workspace.focused_content() {
-            Some(App::Buffer(BufferApp::Picking(bw))) => {
-                (bw.fb.current_dir().to_path_buf(), bw.fb.filter_text().to_string())
-            }
-            _ => panic!("still a picker before `h`"),
-        });
-    vcx.simulate_keystrokes("h");
+    // The letter-leak face of the same defect: `h`/`r`/`s`/`l` are bound to
+    // BrowserParent/Rename/Sort/Enter. GPUI dispatches (and CONSUMES) those
+    // actions before the capture handler, so pre-fix they navigated / renamed /
+    // opened mid-search AND never reached the query. The `BrowserFilter` context
+    // makes those bindings not match, so each is TYPED INTO THE QUERY. Type the
+    // remaining letters of "target-file"; a fully-typed bound-letter query must
+    // still be a real, editable search string (not a pile of side effects).
+    let dir_before = view.read_with(vcx, |v, _| match v.workspace.focused_content() {
+        Some(App::Buffer(BufferApp::Picking(bw))) => bw.fb.current_dir().to_path_buf(),
+        _ => panic!("still a picker before typing bound letters"),
+    });
+    // filter so far is "target" (from "t a r g e t"); finish "target-file".
+    vcx.simulate_keystrokes("- f i l e");
     vcx.run_until_parked();
     view.read_with(vcx, |v, _| match v.workspace.focused_content() {
         Some(App::Buffer(BufferApp::Picking(bw))) => {
-            assert!(bw.fb.filter_mode, "still filtering after a bound letter");
+            assert!(bw.fb.filter_mode, "still filtering after bound letters");
             assert_eq!(
                 bw.fb.current_dir(),
                 dir_before.as_path(),
-                "`h` must NOT navigate to the parent dir mid-search (BrowserParent leaked)"
+                "bound letters must NOT navigate away mid-search"
             );
             assert_eq!(
                 bw.fb.filter_text(),
-                filter_before,
-                "`h` is swallowed, not treated as a navigation"
+                "target-file",
+                "every bound letter (`-`, `l`) is TYPED into the query, not swallowed \
+                 or fired as an action — got {:?}",
+                bw.fb.filter_text()
             );
         }
-        _ => panic!("`h` in search mode must NOT navigate away from the picker"),
+        _ => panic!("typing bound letters must NOT leave the picker"),
     });
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// bug-0038 (rail face): the file-browser RAIL has the same defect. `RailView`
+/// binds `s`/`w`/`-`/enter/j/k as actions, and GPUI dispatches those before the
+/// rail's capture filter handler, so pre-fix typing them in `/` search fired the
+/// action (cycle sort / open worktrees / go to parent) instead of editing the
+/// query. The `RailFilter` context (active while the rail's browser filters)
+/// stops those bindings from matching, so each key is typed into the query.
+///
+/// Negative control: force `RailFilter`→`RailView` in `render_rail` → `w` opens
+/// worktree mode, `-` navigates to the parent, and the query never fills; the
+/// asserts below fail.
+#[gpui::test]
+fn rail_filter_bound_keys_type_into_query(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_browser(cx);
+
+    // Cmd-B opens a FOCUSED file-browser rail (RailState::new → focused: true).
+    vcx.simulate_keystrokes("cmd-b");
+    vcx.run_until_parked();
+    // Enter `/` rail filter.
+    vcx.simulate_keystrokes("/");
+    vcx.run_until_parked();
+
+    // Read the rail's file browser. Panics if the rail isn't a focused,
+    // filtering file browser — that itself proves the `/` reached the rail.
+    let read_fb = |view: &gpui::Entity<YaldaGpuiView>,
+                   vcx: &mut gpui::VisualTestContext,
+                   f: &dyn Fn(&crate::FileBrowser)| {
+        view.read_with(vcx, |v, _| {
+            let rail = v
+                .workspace
+                .active_workspace()
+                .and_then(|t| t.rail.as_ref())
+                .expect("a rail is open");
+            match &rail.content {
+                crate::workspace::RailContent::FileBrowser(fb) => f(fb),
+                _ => panic!("the rail is a file browser"),
+            }
+        });
+    };
+
+    read_fb(&view, vcx, &|fb| assert!(fb.filter_mode, "`/` entered rail filter"));
+    let dir_before =
+        view.read_with(vcx, |v, _| match &v
+            .workspace
+            .active_workspace()
+            .and_then(|t| t.rail.as_ref())
+            .unwrap()
+            .content
+        {
+            crate::workspace::RailContent::FileBrowser(fb) => fb.current_dir().to_path_buf(),
+            _ => unreachable!(),
+        });
+
+    // Type keys that ARE bound rail actions: `s`=RailCycleSort, `w`=RailWorktrees,
+    // `-`=RailParent. Each must become query text, not fire its action.
+    vcx.simulate_keystrokes("s w -");
+    vcx.run_until_parked();
+
+    read_fb(&view, vcx, &move |fb| {
+        assert!(fb.filter_mode, "rail still filtering after bound keys");
+        assert!(
+            fb.worktree_mode.is_none(),
+            "`w` must be query text — it must NOT open worktree mode (RailWorktrees leaked)"
+        );
+        assert_eq!(
+            fb.current_dir(),
+            dir_before.as_path(),
+            "`-` must be query text — it must NOT go to the parent dir (RailParent leaked)"
+        );
+        assert_eq!(
+            fb.filter_text(),
+            "sw-",
+            "bound rail keys (`s`, `w`, `-`) are typed into the query, not fired — got {:?}",
+            fb.filter_text()
+        );
+    });
 }
 
 /// UXI-AgentTile-11 rules 1–3: in the worksheet, navigation is free (no compose chrome);

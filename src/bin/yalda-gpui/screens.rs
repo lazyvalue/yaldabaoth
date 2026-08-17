@@ -3067,7 +3067,24 @@ impl YaldaGpuiView {
             (header, list, hint)
         };
 
-        root.key_context("BrowserView")
+        // While the browser is capturing text (`/` filter query or an inline
+        // rename), dispatch under a DIFFERENT key context that has NO
+        // bare-letter/arrow bindings. GPUI 0.2.2 dispatches matched actions
+        // *before* capture key listeners and consumes the event, so a
+        // `BrowserView` binding (`l`/right→open, `h`/`-`→parent, `r`→rename, `s`,
+        // `q`, `j`/`k`, …) would fire its action before `handle_browser_filter_key`
+        // could treat the key as query text. Under `BrowserFilter` those bindings
+        // don't match, so every key falls through to the capture handler and is
+        // typed into the query / rename buffer (bug-0038). Global `cmd-*` bindings
+        // (registered with `None` context) still work. `dispatch_key_event`
+        // redraws before each keystroke when dirty, so the context is always
+        // fresh for the next key — no one-frame skew.
+        let key_ctx = if b.fb.filter_mode || b.fb.rename.is_some() {
+            "BrowserFilter"
+        } else {
+            "BrowserView"
+        };
+        root.key_context(key_ctx)
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
                 this.handle_browser_filter_key(ev, w, cx);
             }))
