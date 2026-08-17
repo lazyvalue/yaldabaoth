@@ -2115,7 +2115,7 @@ impl YaldaGpuiView {
             wsp.master_count = pws.master_count;
             wsp.tag_view = pws.tag_view;
             // Restore the tile arrangement (UXI-Workspace-14). Old snapshots
-            // (no field) load as `Plane` via `#[serde(default)]`.
+            // (no field) load as `Columns` via `#[serde(default)]`.
             wsp.view = pws.view;
             wsp.desktop = workspace::DesktopState {
                 // Restored leaves keep their persisted WindowIds, so the

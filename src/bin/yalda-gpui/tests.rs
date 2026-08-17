@@ -4100,11 +4100,11 @@ fn plane_persist_round_trips_signed_slots_and_camera() {
     );
 }
 
-/// UXI-Workspace-14: the tile arrangement (`view`) round-trips, an OLD snapshot
-/// with no `view` field loads as `Plane`, and an UNKNOWN value from a newer
-/// binary degrades to `Plane` (never dropping the snapshot).
+/// UXI-Workspace-14: both tile arrangements (`view`) round-trip, an OLD snapshot
+/// with no `view` field loads as the `Columns` default, and an UNKNOWN value from
+/// a newer binary degrades to `Columns` (never dropping the snapshot).
 #[test]
-fn workspace_view_round_trips_and_unknown_defaults_plane() {
+fn workspace_view_round_trips_and_unknown_defaults_columns() {
     // Round-trip Columns.
     let mut wsp = plane_persist_test_workspace();
     wsp.view = workspace::WorkspaceView::Columns;
@@ -4113,7 +4113,17 @@ fn workspace_view_round_trips_and_unknown_defaults_plane() {
     let back: PersistedWorkspace = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(back.view, workspace::WorkspaceView::Columns, "columns survives");
 
-    // Absent field (old snapshot) ⇒ Plane via #[serde(default)].
+    // Explicit Plane remains an honored persisted preference.
+    wsp.view = workspace::WorkspaceView::Plane;
+    let json = serde_json::to_string(&wsp).expect("serialize plane");
+    let back: PersistedWorkspace = serde_json::from_str(&json).expect("deserialize plane");
+    assert_eq!(
+        back.view,
+        workspace::WorkspaceView::Plane,
+        "plane survives"
+    );
+
+    // Absent field (old snapshot) ⇒ Columns via #[serde(default)].
     let old = r#"{
         "auto_name": "plane-1",
         "display_name": null,
@@ -4122,9 +4132,13 @@ fn workspace_view_round_trips_and_unknown_defaults_plane() {
         "cwd": "/tmp"
     }"#;
     let none: PersistedWorkspace = serde_json::from_str(old).expect("old snapshot loads");
-    assert_eq!(none.view, workspace::WorkspaceView::Plane, "absent view ⇒ Plane");
+    assert_eq!(
+        none.view,
+        workspace::WorkspaceView::Columns,
+        "absent view ⇒ Columns"
+    );
 
-    // Unknown value from a newer binary ⇒ Plane, snapshot NOT dropped.
+    // Unknown value from a newer binary ⇒ Columns, snapshot NOT dropped.
     let future = r#"{
         "auto_name": "plane-1",
         "display_name": null,
@@ -4135,7 +4149,11 @@ fn workspace_view_round_trips_and_unknown_defaults_plane() {
     }"#;
     let unknown: PersistedWorkspace =
         serde_json::from_str(future).expect("unknown view must NOT drop the snapshot");
-    assert_eq!(unknown.view, workspace::WorkspaceView::Plane, "unknown view ⇒ Plane");
+    assert_eq!(
+        unknown.view,
+        workspace::WorkspaceView::Columns,
+        "unknown view ⇒ Columns"
+    );
 }
 
 /// A LITERAL old-format `workspace.json` workspace (unsigned `desktop_slots`, NO

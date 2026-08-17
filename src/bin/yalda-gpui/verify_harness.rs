@@ -15740,6 +15740,9 @@ fn boot_desktop_two_tiles<'a>(
         // Every workspace is a plane now (infinite-plane, Stage D); place the tiles.
         let wsp = v.workspace.active_workspace_mut().unwrap();
         wsp.layout_mode = crate::workspace::LayoutMode::Plane;
+        // This helper exists specifically for plane camera/placement tests. Keep
+        // that precondition explicit now that Columns is the product default.
+        wsp.view = crate::workspace::WorkspaceView::Plane;
         let leaves = wsp.layout.leaf_ids();
         wsp.desktop.reconcile(&leaves);
         wsp.desktop.set_anchor(win_a, crate::workspace::Slot::new(0, 0));
@@ -15858,8 +15861,9 @@ fn plane_focused_tile_renders_when_off_viewport(cx: &mut TestAppContext) {
 /// UXI-Workspace-14: the columns arrangement lays EVERY tile out as an
 /// equal-width, full-height column, side by side — including a tile the plane
 /// would cull off-viewport. Drives the REAL toggle handler (`Ctrl-W a` / the `.`
-/// menu both call `toggle_workspace_columns` → `Workspace::toggle_view`), not a
-/// hand-set `view` field.
+/// menu both call `toggle_workspace_columns` → `Workspace::toggle_view`). The
+/// fixture explicitly starts in `Plane` so this toggle guard remains independent
+/// of the product's default arrangement.
 ///
 /// The fixture (`boot_desktop_two_tiles`) parks B at slot (0,100) — far off the
 /// 800×600 viewport — so on the PLANE only A paints (proven first, for

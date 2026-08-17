@@ -1010,9 +1010,9 @@ pub(crate) struct PersistedWorkspace {
     /// `Camera::default()` (origin, `Full`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) camera: Option<PersistedCamera>,
-    /// The workspace's tile arrangement (`UXI-Workspace-14`): `"plane"` (default)
-    /// or `"columns"`. Absent in old snapshots → `Plane`; an unknown value from a
-    /// newer binary degrades to `Plane` (the hand-rolled `WorkspaceView`
+    /// The workspace's tile arrangement (`UXI-Workspace-14`): `"columns"` (default)
+    /// or `"plane"`. Absent in old snapshots → `Columns`; an unknown value from a
+    /// newer binary degrades to `Columns` (the hand-rolled `WorkspaceView`
     /// deserialize) rather than dropping the whole snapshot.
     #[serde(default)]
     pub(crate) view: workspace::WorkspaceView,
