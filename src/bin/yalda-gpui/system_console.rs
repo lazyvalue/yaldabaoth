@@ -56,6 +56,136 @@ pub(crate) fn install_yaldabaoth_app_icon() {
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn install_yaldabaoth_app_icon() {}
 
+/// Pick the PNG bytes to stage for a pasted image, preferring a real PNG rep
+/// over a TIFF that had to be transcoded, and rejecting empty payloads. Pure so
+/// the preference/empty logic is headlessly testable — the mac-only FFI that
+/// fetches the two pasteboard blobs lives in [`read_clipboard_image_png`].
+pub(crate) fn select_clipboard_png_bytes(
+    png: Option<Vec<u8>>,
+    tiff_as_png: Option<Vec<u8>>,
+) -> Option<Vec<u8>> {
+    png.filter(|b| !b.is_empty())
+        .or_else(|| tiff_as_png.filter(|b| !b.is_empty()))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam for [`read_clipboard_image_png`]: headless tests must NOT touch
+    /// the real OS pasteboard (non-deterministic, and it would read the user's
+    /// actual clipboard). Default `None` ⇒ "no image"; a test sets `Some(bytes)`
+    /// to simulate a clipboard image. The real OS read is exercised only by the
+    /// `#[ignore]` `read_clipboard_image_png_os_*` test.
+    static CLIPBOARD_IMAGE_TEST_OVERRIDE: std::cell::RefCell<Option<Vec<u8>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Set the headless test override for the pasteboard image read. Passing
+/// `Some(bytes)` makes the next [`read_clipboard_image_png`] return those bytes
+/// without touching the OS; `None` clears it back to "no image".
+#[cfg(test)]
+pub(crate) fn set_clipboard_image_test_override(bytes: Option<Vec<u8>>) {
+    CLIPBOARD_IMAGE_TEST_OVERRIDE.with(|c| *c.borrow_mut() = bytes);
+}
+
+/// Read a clipboard image as PNG bytes, or `None` if the board holds no image.
+/// In production this reads the real macOS pasteboard
+/// ([`read_clipboard_image_png_os`]); under `cfg(test)` it returns the injected
+/// override (default `None`) so headless tests stay deterministic and never read
+/// the developer's real clipboard.
+#[cfg(not(test))]
+pub(crate) fn read_clipboard_image_png() -> Option<Vec<u8>> {
+    read_clipboard_image_png_os()
+}
+
+#[cfg(test)]
+pub(crate) fn read_clipboard_image_png() -> Option<Vec<u8>> {
+    CLIPBOARD_IMAGE_TEST_OVERRIDE.with(|c| c.borrow().clone())
+}
+
+/// Read an image directly off the macOS general pasteboard, returning PNG bytes.
+///
+/// This exists because GPUI 0.2.2's `read_from_clipboard`
+/// (`platform/mac/platform.rs`) short-circuits to a **string-only**
+/// `ClipboardItem` whenever the pasteboard advertises any `public.utf8-plain-text`
+/// type — it never reaches its image branch. macOS image copies from browsers,
+/// Finder, and many apps put a text/URL representation on the board alongside the
+/// image, so GPUI silently drops the image and Cmd+V pastes nothing (or the URL).
+/// We bypass GPUI and read `public.png` ourselves, transcoding a TIFF-only board
+/// to PNG via `NSBitmapImageRep`. Returns `None` when the board holds no image.
+#[cfg(target_os = "macos")]
+pub(crate) fn read_clipboard_image_png_os() -> Option<Vec<u8>> {
+    use cocoa::appkit::{NSPasteboard, NSPasteboardTypePNG, NSPasteboardTypeTIFF};
+    use cocoa::base::{id, nil};
+    use cocoa::foundation::{NSAutoreleasePool, NSData, NSUInteger};
+    use objc::{class, msg_send, sel, sel_impl};
+
+    // SAFETY: GPUI has initialized AppKit before its run callback, so the general
+    // pasteboard is live. `dataForType:` returns a retained-by-autorelease NSData
+    // (or nil); we copy its bytes into an owned Vec before draining the pool, so
+    // nothing escapes the autorelease scope. `NSBitmapImageRep` is a standard
+    // AppKit class reachable by name for the TIFF→PNG transcode.
+    unsafe {
+        let pool = NSAutoreleasePool::new(nil);
+
+        // Copy the bytes behind an NSData into an owned Vec. `bytes` is nil for a
+        // zero-length NSData (documented), which we treat as empty.
+        unsafe fn nsdata_to_vec(data: id) -> Vec<u8> {
+            if data == nil {
+                return Vec::new();
+            }
+            unsafe {
+                let len = NSData::length(data) as usize;
+                let ptr = NSData::bytes(data) as *const u8;
+                if ptr.is_null() || len == 0 {
+                    return Vec::new();
+                }
+                std::slice::from_raw_parts(ptr, len).to_vec()
+            }
+        }
+
+        let pb: id = NSPasteboard::generalPasteboard(nil);
+
+        // Prefer a PNG representation already on the board.
+        let png_data: id = pb.dataForType(NSPasteboardTypePNG);
+        let png = Some(nsdata_to_vec(png_data)).filter(|b| !b.is_empty());
+
+        // Otherwise transcode a TIFF rep to PNG via NSBitmapImageRep.
+        let tiff_as_png = if png.is_some() {
+            None
+        } else {
+            let tiff_data: id = pb.dataForType(NSPasteboardTypeTIFF);
+            if tiff_data == nil {
+                None
+            } else {
+                let rep: id = msg_send![class!(NSBitmapImageRep), imageRepWithData: tiff_data];
+                if rep == nil {
+                    None
+                } else {
+                    // NSBitmapImageFileType::PNG == 4; empty properties dict.
+                    let props: id = msg_send![class!(NSDictionary), dictionary];
+                    let out: id = msg_send![
+                        rep,
+                        representationUsingType: 4u64 as NSUInteger
+                        properties: props
+                    ];
+                    Some(nsdata_to_vec(out)).filter(|b| !b.is_empty())
+                }
+            }
+        };
+
+        let result = select_clipboard_png_bytes(png, tiff_as_png);
+        pool.drain();
+        result
+    }
+}
+
+/// Non-macOS stub: image paste falls back to GPUI's clipboard entries, which on
+/// other platforms surface `ClipboardEntry::Image` without the mac short-circuit.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn read_clipboard_image_png_os() -> Option<Vec<u8>> {
+    None
+}
+
 pub(crate) fn yaldabaoth_logo_image() -> Arc<gpui::Image> {
     static LOGO: OnceLock<Arc<gpui::Image>> = OnceLock::new();
     LOGO.get_or_init(|| {
@@ -710,4 +840,86 @@ fn system_console_navigation_uses_standard_scroll_keys() {
         Some(-150.0)
     );
     assert!(YALDABAOTH_LOGO_BYTES.starts_with(b"\x89PNG\r\n\x1a\n"));
+}
+
+/// Guards the PNG-preference + empty-rejection logic that decides which
+/// pasteboard blob becomes the staged image (`read_clipboard_image_png` calls
+/// this after the mac FFI fetch). The mac string short-circuit is what dropped
+/// pasted images (bug-0039); this is the pure half of the fix. Negative control:
+/// change `png.filter(...).or_else(...)` to just `tiff_as_png` and the
+/// prefers-PNG assert goes RED.
+#[cfg(test)]
+#[test]
+fn select_clipboard_png_prefers_png_and_rejects_empty() {
+    let png = vec![0x89, b'P', b'N', b'G'];
+    let tiff = vec![1u8, 2, 3];
+
+    // A real PNG rep wins over a transcoded TIFF.
+    assert_eq!(
+        select_clipboard_png_bytes(Some(png.clone()), Some(tiff.clone())),
+        Some(png.clone())
+    );
+    // TIFF-only board falls back to the transcoded PNG.
+    assert_eq!(
+        select_clipboard_png_bytes(None, Some(tiff.clone())),
+        Some(tiff.clone())
+    );
+    // Empty PNG is not a real image — fall through to TIFF.
+    assert_eq!(
+        select_clipboard_png_bytes(Some(Vec::new()), Some(tiff.clone())),
+        Some(tiff)
+    );
+    // No image data at all.
+    assert_eq!(select_clipboard_png_bytes(None, None), None);
+    assert_eq!(
+        select_clipboard_png_bytes(Some(Vec::new()), Some(Vec::new())),
+        None
+    );
+}
+
+/// Real-pasteboard round-trip for the mac image-paste fix (bug-0039). `#[ignore]`
+/// because it CLOBBERS the developer's system clipboard and needs a live AppKit
+/// pasteboard — this is the documented gap-2 (live OS integration) remedy, run
+/// manually: `cargo test --bin yalda-gpui -- --ignored read_clipboard_image_png`.
+/// Reproduces the exact failure: an image copied ALONGSIDE a text/URL rep (what
+/// browsers/Finder put on the board). GPUI's `read_from_clipboard` returns the
+/// string only and drops the image; `read_clipboard_image_png` must still recover
+/// the PNG. Negative control: swap the body to `cx.read_from_clipboard()` and it
+/// returns None because of the mac string short-circuit.
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+#[ignore]
+fn read_clipboard_image_png_os_recovers_png_beside_text() {
+    use cocoa::appkit::{NSPasteboard, NSPasteboardTypePNG, NSPasteboardTypeString};
+    use cocoa::base::{id, nil};
+    use cocoa::foundation::{NSAutoreleasePool, NSData, NSString, NSUInteger};
+    use objc::{msg_send, sel, sel_impl};
+
+    // SAFETY: standalone pasteboard access; no NSApplication run loop required.
+    unsafe {
+        let pool = NSAutoreleasePool::new(nil);
+        let pb: id = NSPasteboard::generalPasteboard(nil);
+        let _: () = msg_send![pb, clearContents];
+
+        // A real PNG (the embedded logo) plus a plain-text URL rep, mimicking a
+        // browser/Finder image copy that triggers GPUI's string short-circuit.
+        let png_data: id = NSData::dataWithBytes_length_(
+            nil,
+            YALDABAOTH_LOGO_BYTES.as_ptr().cast(),
+            YALDABAOTH_LOGO_BYTES.len() as NSUInteger,
+        );
+        let _: bool = msg_send![pb, setData: png_data forType: NSPasteboardTypePNG];
+        let url: id = NSString::alloc(nil).init_str("https://example.com/logo.png");
+        let _: bool = msg_send![pb, setString: url forType: NSPasteboardTypeString];
+
+        let got = read_clipboard_image_png_os();
+        pool.drain();
+
+        let png = got.expect("PNG must be recovered even with a text rep present");
+        assert!(!png.is_empty(), "recovered PNG must be non-empty");
+        assert!(
+            png.starts_with(b"\x89PNG\r\n\x1a\n"),
+            "recovered bytes must be a PNG"
+        );
+    }
 }

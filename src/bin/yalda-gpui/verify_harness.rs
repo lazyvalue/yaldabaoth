@@ -10171,6 +10171,61 @@ fn image_paste_stages_pending_attachment(cx: &mut TestAppContext) {
     );
 }
 
+/// Guards the mac fix (bug-0039): even when GPUI's clipboard would surface a
+/// string-only item (its `read_from_clipboard` short-circuits whenever the board
+/// carries text), `paste_into_compose` still stages the image because it reads
+/// the pasteboard PNG directly via `read_clipboard_image_png`. Here the direct
+/// read is injected through the test override, and GPUI's clipboard holds ONLY
+/// text — reproducing the exact runtime scenario. Without the direct-read step in
+/// `paste_into_compose`, the text is pasted and no image is staged (RED).
+#[gpui::test]
+fn image_paste_direct_read_stages_even_with_text_on_clipboard(cx: &mut TestAppContext) {
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    let png: Vec<u8> = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 9, 9, 9];
+
+    // GPUI clipboard has ONLY a text rep (the mac short-circuit scenario)…
+    view.update(vcx, |_, cx| {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+            "https://example.com/cat.png".to_string(),
+        ));
+    });
+    // …while the direct pasteboard read returns the image bytes.
+    crate::system_console::set_clipboard_image_test_override(Some(png.clone()));
+
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_cmd_key("v"), w, cx));
+    vcx.run_until_parked();
+    crate::system_console::set_clipboard_image_test_override(None);
+
+    let staged = view
+        .update(vcx, |v, cx| {
+            v.agent_read(cx, |c| {
+                c.input_surface
+                    .compose()
+                    .pending_images
+                    .iter()
+                    .map(|p| (p.mime_type.clone(), p.data.clone()))
+                    .collect::<Vec<_>>()
+            })
+        })
+        .expect("session");
+    assert_eq!(staged.len(), 1, "direct pasteboard read stages the image despite text on the clipboard");
+    assert_eq!(staged[0].0, "image/png");
+    use base64::Engine as _;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&staged[0].1)
+        .expect("valid base64");
+    assert_eq!(decoded, png, "staged bytes are the direct-read PNG, not the clipboard text");
+
+    // The URL text was NOT pasted into the compose.
+    let compose_text = view
+        .update(vcx, |v, cx| v.agent_read(cx, |c| c.input_surface.compose().text()))
+        .expect("session");
+    assert!(
+        !compose_text.contains("example.com"),
+        "the accompanying URL text must not land in the compose; got {compose_text:?}"
+    );
+}
+
 /// Boot a REAL worksheet session backed by an in-process test channel (NO server
 /// sid) so a real `submit` takes the `channel.send()==Ok` path and drives the
 /// production mid-turn transition — the seam that closes verification gap #2 for

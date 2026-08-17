@@ -6280,7 +6280,32 @@ impl YaldaGpuiView {
     pub(crate) fn paste_into_compose(&mut self, cx: &mut Context<Self>) {
         let item = cx.read_from_clipboard();
         let mut staged = 0usize;
-        if let Some(item) = &item {
+
+        // Images first, read straight off the macOS pasteboard. GPUI's
+        // `read_from_clipboard` returns a string-only item whenever the board
+        // carries any plain-text type (which mac image copies do — a URL/filename
+        // rides alongside the image), so its `ClipboardEntry::Image` branch is
+        // never reached and the image is dropped. `read_clipboard_image_png`
+        // bypasses that; see `system_console::read_clipboard_image_png`.
+        if let Some(png) = crate::system_console::read_clipboard_image_png()
+            && !png.is_empty()
+            && let Some(mut c) = self.agent_mut(cx)
+        {
+            use base64::Engine;
+            let cb = c.input_surface.compose_mut();
+            let n = cb.pending_images.len() + 1;
+            cb.pending_images.push(PendingImage {
+                data: base64::engine::general_purpose::STANDARD.encode(&png),
+                mime_type: "image/png".to_string(),
+                label: format!("image {n} (PNG)"),
+            });
+            staged += 1;
+        }
+
+        // Fallback for non-mac platforms (and any board GPUI does surface as an
+        // image entry): stage GPUI's own image entries when the direct read found
+        // nothing.
+        if staged == 0 && let Some(item) = &item {
             for entry in item.entries() {
                 if let gpui::ClipboardEntry::Image(img) = entry
                     && let Some(mut pending) = pending_image_from_clipboard(img)

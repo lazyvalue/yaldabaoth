@@ -949,10 +949,16 @@ documented at the tests.
 that image as a **pending attachment** on the compose rather than typing text.
 Three hard properties:
 
-1. **Stage, don't type.** The image is base64-encoded (with its mime type, taken
-   from GPUI's clipboard `ImageFormat`) and pushed to `Compose::pending_images`;
-   the compose editor text is untouched. A clipboard with no image falls back to
-   an ordinary text paste. Image bytes never enter the compose/transcript text.
+1. **Stage, don't type.** The image is base64-encoded and pushed to
+   `Compose::pending_images`; the compose editor text is untouched. A clipboard
+   with no image falls back to an ordinary text paste. Image bytes never enter the
+   compose/transcript text. **On macOS the image is read straight off the
+   `NSPasteboard` (`system_console::read_clipboard_image_png`, normalized to
+   `image/png`) rather than through GPUI's `read_from_clipboard`** — GPUI 0.2.2's
+   mac path short-circuits to a string-only item whenever the board carries any
+   plain-text type, which mac image copies do (a URL/filename rides alongside the
+   image), so the image was silently dropped (bug-0039). GPUI's own image entries
+   remain the fallback for non-mac platforms.
 2. **Visible before send.** Each staged image renders as a `🖼 <label>` chip
    above the compose box so the user sees what will go with the next submit.
 3. **Sent as a content block; cleared after.** On submit (both the chatbox/tail
@@ -965,7 +971,10 @@ Three hard properties:
    (no typed text) is sendable. Attachments are **ephemeral** — not persisted in
    the WAL, so a resumed transcript shows the marker's text but not the image.
 
-**Applies to.** `agent_ui.rs` — `paste_into_compose` / `pending_image_from_clipboard`
+**Applies to.** `system_console.rs` — `read_clipboard_image_png` /
+`read_clipboard_image_png_os` (mac NSPasteboard read, PNG then TIFF→PNG) /
+`select_clipboard_png_bytes`; `agent_ui.rs` — `paste_into_compose` /
+`pending_image_from_clipboard`
 / `image_ext` / `image_turn_marker`, `send_prompt_to_session`,
 `submit_worksheet_blocks`; the `PendingImage` model + `Compose::pending_images`
 (`agent.rs`); the chip row in `render_agent` (`screens.rs`); `ImageAttachment` /
@@ -1109,6 +1118,16 @@ reproduced.
 
 ## Revision history
 
+- 2026-08-16 — INV-UX-21 mac fix (bug-0039): pasted images were dropped on
+  macOS because GPUI 0.2.2's `read_from_clipboard` returns a string-only item
+  whenever the board carries any plain-text type, and mac image copies put a
+  URL/filename alongside the image. `paste_into_compose` now reads the PNG
+  straight off `NSPasteboard` (`read_clipboard_image_png`, PNG then TIFF→PNG),
+  falling back to GPUI entries off-mac. Guards: `select_clipboard_png_*`
+  (pure), `image_paste_direct_read_stages_even_with_text_on_clipboard`
+  (headless, real `paste_into_compose` with text-only GPUI clipboard + injected
+  direct read), `read_clipboard_image_png_os_recovers_png_beside_text`
+  (`#[ignore]` real-pasteboard round-trip, gap-2). All negative-controlled RED.
 - 2026-07-12 — Added INV-UX-23: a moved transcript fingerprint is ALWAYS
   rendered (no stale tail). Fixes the intermittent "last agent message doesn't
   render" bug: the transcript's self-notify is silently dropped by gpui
