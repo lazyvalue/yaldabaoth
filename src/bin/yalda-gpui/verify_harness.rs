@@ -10118,13 +10118,17 @@ fn boot_worksheet_nav(
 /// UXI-AgentTile-14: Cmd+V with an image on the clipboard stages it as a pending
 /// attachment on the compose (rather than typing garbage), base64-encoded with
 /// its mime type — the payload that becomes an ACP `ContentBlock::Image`. Drives
-/// the REAL key handler (`handle_claude_key` → `paste_into_compose`) against the
-/// REAL test-platform clipboard.
+/// the REAL Cmd+V action (`cmd-v` → `PasteFromClipboard` → `paste_from_clipboard`
+/// → `stage_clipboard_images_onto_compose`) against the REAL test-platform
+/// clipboard — the path the user's keystroke actually takes (bug-0039: Cmd+V
+/// dispatches the bound action BEFORE the agent key handler, so the old test that
+/// called `handle_claude_key` directly guarded dead code).
 ///
 /// Negative control: delete the `cb.pending_images.push(pending)` in
-/// `paste_into_compose` and the staged-count assert fails RED (nothing staged).
+/// `stage_clipboard_images_onto_compose` and the staged-count assert fails RED.
 #[gpui::test]
 fn image_paste_stages_pending_attachment(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
     let (view, vcx, _id, _session) = boot_with_transcript(cx);
     // A distinctive fake PNG byte payload on the clipboard.
     let png: Vec<u8> = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3];
@@ -10135,8 +10139,8 @@ fn image_paste_stages_pending_attachment(cx: &mut TestAppContext) {
             cx.write_to_clipboard(gpui::ClipboardItem::new_image(&img));
         });
     }
-    // Cmd+V through the real key path.
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_cmd_key("v"), w, cx));
+    // Cmd+V through the REAL action-dispatch path.
+    vcx.simulate_keystrokes("cmd-v");
     vcx.run_until_parked();
 
     let staged = view
@@ -10171,15 +10175,18 @@ fn image_paste_stages_pending_attachment(cx: &mut TestAppContext) {
     );
 }
 
-/// Guards the mac fix (bug-0039): even when GPUI's clipboard would surface a
-/// string-only item (its `read_from_clipboard` short-circuits whenever the board
-/// carries text), `paste_into_compose` still stages the image because it reads
-/// the pasteboard PNG directly via `read_clipboard_image_png`. Here the direct
-/// read is injected through the test override, and GPUI's clipboard holds ONLY
-/// text — reproducing the exact runtime scenario. Without the direct-read step in
-/// `paste_into_compose`, the text is pasted and no image is staged (RED).
+/// Guards the mac fix (bug-0039) on the REAL Cmd+V action path: even when GPUI's
+/// clipboard surfaces a string-only item (its `read_from_clipboard`
+/// short-circuits whenever the board carries text), `paste_from_clipboard` still
+/// stages the image because `stage_clipboard_images_onto_compose` reads the
+/// pasteboard PNG directly via `read_clipboard_image_png`. Here the direct read
+/// is injected through the test override, and GPUI's clipboard holds ONLY text —
+/// reproducing the exact runtime scenario, driven through `cmd-v` →
+/// `PasteFromClipboard`. Without the direct-read step the URL text is pasted and
+/// no image is staged (RED).
 #[gpui::test]
 fn image_paste_direct_read_stages_even_with_text_on_clipboard(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
     let (view, vcx, _id, _session) = boot_with_transcript(cx);
     let png: Vec<u8> = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 9, 9, 9];
 
@@ -10192,7 +10199,7 @@ fn image_paste_direct_read_stages_even_with_text_on_clipboard(cx: &mut TestAppCo
     // …while the direct pasteboard read returns the image bytes.
     crate::system_console::set_clipboard_image_test_override(Some(png.clone()));
 
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_cmd_key("v"), w, cx));
+    vcx.simulate_keystrokes("cmd-v");
     vcx.run_until_parked();
     crate::system_console::set_clipboard_image_test_override(None);
 

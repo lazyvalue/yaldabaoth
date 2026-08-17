@@ -6277,16 +6277,19 @@ impl YaldaGpuiView {
     /// a `PendingImage` attachment (rendered as a chip, sent as an ACP
     /// `ContentBlock::Image` on submit); otherwise the clipboard text is pasted
     /// into the compose editor. Multiple image entries stage multiple chips.
-    pub(crate) fn paste_into_compose(&mut self, cx: &mut Context<Self>) {
+    /// Stage any clipboard image(s) onto the focused agent tile's compose as
+    /// pending attachments (INV-UX-21), returning how many were staged. On macOS
+    /// the image is read straight off the pasteboard
+    /// (`system_console::read_clipboard_image_png`) because GPUI's
+    /// `read_from_clipboard` returns a string-only item whenever the board carries
+    /// any plain-text type — which mac image copies do, a URL/filename riding
+    /// alongside the image — so its `ClipboardEntry::Image` branch is never reached
+    /// (bug-0039). Other platforms fall back to GPUI's own image entries. Sets the
+    /// "N image(s) attached" status when >0. Does NOT notify — the caller does.
+    pub(crate) fn stage_clipboard_images_onto_compose(&mut self, cx: &mut Context<Self>) -> usize {
         let item = cx.read_from_clipboard();
         let mut staged = 0usize;
 
-        // Images first, read straight off the macOS pasteboard. GPUI's
-        // `read_from_clipboard` returns a string-only item whenever the board
-        // carries any plain-text type (which mac image copies do — a URL/filename
-        // rides alongside the image), so its `ClipboardEntry::Image` branch is
-        // never reached and the image is dropped. `read_clipboard_image_png`
-        // bypasses that; see `system_console::read_clipboard_image_png`.
         if let Some(png) = crate::system_console::read_clipboard_image_png()
             && !png.is_empty()
             && let Some(mut c) = self.agent_mut(cx)
@@ -6319,22 +6322,25 @@ impl YaldaGpuiView {
                 }
             }
         }
+
+        if staged > 0 && let Some(mut c) = self.agent_mut(cx) {
+            c.status = Some(
+                format!("{staged} image{} attached", if staged == 1 { "" } else { "s" }).into(),
+            );
+        }
+        staged
+    }
+
+    pub(crate) fn paste_into_compose(&mut self, cx: &mut Context<Self>) {
+        let staged = self.stage_clipboard_images_onto_compose(cx);
         if staged == 0 {
             // No image on the clipboard — ordinary text paste into the compose.
-            if let Some(text) = item.as_ref().and_then(|i| i.text())
+            if let Some(text) = cx.read_from_clipboard().as_ref().and_then(|i| i.text())
                 && let Some(mut c) = self.agent_mut(cx)
             {
                 let cb = c.input_surface.compose_mut();
                 Self::put_text(&mut cb.editor, &text, false);
             }
-        } else if let Some(mut c) = self.agent_mut(cx) {
-            c.status = Some(
-                format!(
-                    "{staged} image{} attached",
-                    if staged == 1 { "" } else { "s" }
-                )
-                .into(),
-            );
         }
         cx.notify();
     }

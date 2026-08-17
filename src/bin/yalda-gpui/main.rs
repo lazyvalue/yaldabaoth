@@ -3706,6 +3706,20 @@ impl YaldaGpuiView {
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Agent tile: an image on the clipboard stages as a pending attachment
+        // (INV-UX-21) rather than pasting text. Cmd+V dispatches THIS action
+        // (bound globally to `PasteFromClipboard`, keymap_registry.rs), and GPUI
+        // dispatches bound actions BEFORE `on_key_down` — so the image path must
+        // live here, not in `handle_claude_key` (whose Cmd+V branch never runs;
+        // bug-0039). mac reads the pasteboard directly to dodge GPUI's string
+        // short-circuit.
+        if self.focused_bound_session().is_some()
+            && self.stage_clipboard_images_onto_compose(cx) > 0
+        {
+            cx.notify();
+            return;
+        }
+
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };

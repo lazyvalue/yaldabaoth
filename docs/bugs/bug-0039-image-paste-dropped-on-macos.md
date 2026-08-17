@@ -78,3 +78,30 @@ test entry returns the injected value.
   marker, not the image. Unchanged by this fix.
 - Whether the live `claude-agent-acp` advertises the ACP `image` prompt capability
   is still the separate NEEDS-RUNTIME question from the original INV-UX-21 work.
+
+## 2026-08-16 (2) — second root cause: Cmd+V never reached the fix
+
+The direct-pasteboard read landed, but the user reported "when I paste nothing
+happens." The first fix was in **dead code**.
+
+`cmd-v` is bound globally to the `PasteFromClipboard` **action**
+(`keymap_registry.rs:144`), and GPUI 0.2.2 dispatches bound actions BEFORE
+`on_key_down` key listeners (the same dispatch-order fact as bug-0038). So a real
+Cmd+V runs `paste_from_clipboard` (`main.rs`) — NOT the `handle_claude_key` branch
+that called `paste_into_compose`. `paste_from_clipboard` did
+`read_from_clipboard().and_then(|i| i.text())` and returned early when there was no
+text, so a pure-image clipboard produced **nothing**.
+
+The first headless guard drove `handle_claude_key` directly, so it passed while
+the real path stayed broken — exactly anti-circling rules 1 (drive the REAL entry
+point) and 4 (`simulate_keystrokes` action dispatch vs a hand-called handler).
+
+**Fix (2).** Extracted `stage_clipboard_images_onto_compose` (agent_ui.rs) and
+called it from `paste_from_clipboard` BEFORE the text early-return: an agent tile
+with a clipboard image stages it and returns; otherwise the text paste runs
+unchanged. `paste_into_compose` now delegates to the same helper.
+
+**Guards (2).** Both `image_paste_*` tests now `register_keymap` +
+`simulate_keystrokes("cmd-v")` — the REAL action dispatch — instead of calling
+`handle_claude_key`. Negative control: remove the image block from
+`paste_from_clipboard` → BOTH tests RED (observed). 568 pass.
