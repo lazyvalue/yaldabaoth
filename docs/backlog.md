@@ -28,18 +28,21 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
   a live Codex subprocess.
 
 - **Switch a workspace between plane and columns arrangements** — `DONE`
-  (2026-08-12 via `/new-ux`; `UXI-Workspace-14`; Cog graph `snf`). Captured
+  (2026-08-12 via `/new-ux`; `UXI-Workspace-14`; Cog graph `snf`, default-policy
+  follow-up `1i9` on 2026-08-16). Captured
   verbatim: *"I want to be able to move a workspace from plane tile arrangement
   to columns (all tiles arranged in columns). Should be able to switch between
-  views."* A per-workspace `WorkspaceView { Plane, Columns }` (default `Plane`)
+  views."* A per-workspace `WorkspaceView { Plane, Columns }` (default `Columns`)
   toggled by `Ctrl-W a` and the `.` workspace menu ("toggle plane / columns").
   `Columns` renders every tile as an equal-width, full-height column in signed
   reading order; it is a lossless VIEW flip (plane slots untouched, toggle back
   restores the arrangement) and persists. Guard:
+  `new_workspace_defaults_to_columns` pins the production creation path;
   `columns_view_arranges_tiles_side_by_side` drives the real toggle handler and
   asserts (via layout probe) both tiles paint side by side — including one the
-  plane culled — negative-control-verified RED. `workspace_view_round_trips_and_
-  unknown_defaults_plane` pins persistence. Builds + 559 bin tests green.
+  plane culled — negative-control-verified RED.
+  `workspace_view_round_trips_and_unknown_defaults_columns` pins explicit
+  preferences plus absent/unknown fallback. Builds + 574 bin tests green.
 
 - **Close a workspace without closing its sessions or quitting the app** —
   `DONE` (2026-08-11 via `/new-ux`; `UXI-Workspace-13`; Cog graph `ubr`).
