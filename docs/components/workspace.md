@@ -720,8 +720,8 @@ was removed. The floor mutation above guards the remaining state predicate.
 ### UXI-Workspace-14 — A workspace switches between the plane and a columns arrangement
 
 **Statement.** A workspace carries a **`view: WorkspaceView`** — either `Plane`
-(the default infinite-plane arrangement every other `UXI-Workspace-*` describes)
-or `Columns`. One command toggles between them: **`Ctrl-W a`** (and the `.`
+(the infinite-plane arrangement every other `UXI-Workspace-*` describes) or
+`Columns` (the default). One command toggles between them: **`Ctrl-W a`** (and the `.`
 workspace menu's "toggle plane / columns"). In `Columns` every tile of the
 workspace renders as an **equal-width, full-height column**, side by side, in
 signed plane **reading order** (top→bottom, left→right — the order the plane
@@ -735,11 +735,11 @@ drag, or edge-resize in columns.
 2. **Every tile appears** — including one the plane would cull off-viewport. The
    focused tile carries the focus handle so the keyboard survives, and
    click-to-focus (`UXI-Workspace-9`) still applies to each column's body.
-3. **It persists** (`view`, absent/unknown ⇒ `Plane`), so a columns workspace
-   reopens in columns.
+3. **It persists** (`view`, absent/unknown ⇒ `Columns`), so either explicit
+   arrangement reopens unchanged and a fresh workspace starts in columns.
 
 **Applies to.** `workspace.rs`: `WorkspaceView` enum (hand-rolled serde,
-unknown→`Plane`, mirroring `Detail`/`LayoutMode`), the `Workspace.view` field +
+unknown→`Columns`, the current default), the `Workspace.view` field +
 `Workspace::toggle_view`. `chrome.rs`: `render_focused_window` branches on
 `view`; `render_columns` (flex-row of equal-width columns); the shared
 `render_tile_content` helper (extracted so plane + columns render identical
@@ -763,11 +763,16 @@ a two-tile fixture where B is parked off-viewport: on the plane B is culled
 B to the right of A, equal width, full height — via the layout probe
 (`columns-tile-{id}` + `plane-tile-content-{id}`). Negative-control-verified RED
 (drop the `Columns` arm → B still culled, `columns-tile-*` never paint).
-`tests.rs::workspace_view_round_trips_and_unknown_defaults_plane` pins the serde
-round-trip + absent/unknown → `Plane`.
+`workspace.rs::new_workspace_defaults_to_columns` pins the production
+`Frame::with_initial` path.
+`tests.rs::workspace_view_round_trips_and_unknown_defaults_columns` pins both
+explicit serde round-trips + absent/unknown → `Columns`.
 
-**Deviation from plan.** None. The toggle handler is the exact method both the
-`Ctrl-W a` binding and the `workspace-toggle-columns` menu command dispatch, so
-the guard drives it directly rather than a proxy. The real macOS `Ctrl-W a`
-chord *firing* is the usual `simulate_keystrokes`-vs-OS gap (CLAUDE.md rule 4),
-but the binding is a `Ctrl-W`+plain-letter sequence (reliable, like `Ctrl-W 0`).
+**Deviation from plan.** The original columns-view implementation had none. The
+2026-08-16 default-columns follow-up made `boot_desktop_two_tiles` set `Plane`
+explicitly because its camera/placement guards had implicitly inherited the old
+product default. The toggle handler is the exact method both the `Ctrl-W a`
+binding and the `workspace-toggle-columns` menu command dispatch, so the guard
+drives it directly rather than a proxy. The real macOS `Ctrl-W a` chord *firing*
+is the usual `simulate_keystrokes`-vs-OS gap (CLAUDE.md rule 4), but the binding
+is a `Ctrl-W`+plain-letter sequence (reliable, like `Ctrl-W 0`).

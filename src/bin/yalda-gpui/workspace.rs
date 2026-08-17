@@ -495,18 +495,18 @@ impl Detail {
 /// How a workspace arranges its tiles (`UXI-Workspace-14`). Two arrangements
 /// over the SAME set of tiles (the `Layout<C>` content tree):
 /// - `Plane` — the infinite signed-grid plane with the pan/semantic-zoom camera
-///   (the default; every other `UXI-Workspace-*` describes it).
+///   (every other `UXI-Workspace-*` describes it).
 /// - `Columns` — every tile laid out as an equal-width, full-height column,
-///   side by side in signed reading order. Camera/pan/zoom/drag are irrelevant
-///   here; the tiles' plane slots are left untouched so toggling back to `Plane`
-///   restores the exact arrangement.
+///   side by side in signed reading order. This is the default. Camera/pan/zoom/
+///   drag are irrelevant here; the tiles' plane slots are left untouched so
+///   toggling back to `Plane` restores the exact arrangement.
 ///
 /// This is a pure VIEW choice — like the camera it never moves or removes a
 /// tile, so switching back and forth is lossless.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WorkspaceView {
-    #[default]
     Plane,
+    #[default]
     Columns,
 }
 
@@ -520,17 +520,17 @@ impl serde::Serialize for WorkspaceView {
     }
 }
 
-/// Hand-rolled deserialize with an unknown-string fallback to `Plane` — the SAME
+/// Hand-rolled deserialize with an unknown-string fallback to `Columns` — the SAME
 /// safety `Detail`/`LayoutMode` use: an arrangement value from a newer binary
-/// degrades to `Plane` rather than failing the parse and dropping the whole
+/// degrades to the default rather than failing the parse and dropping the whole
 /// workspace snapshot.
 impl<'de> serde::Deserialize<'de> for WorkspaceView {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
         Ok(match s.as_str() {
-            "columns" => WorkspaceView::Columns,
-            // "plane" and any string from the future
-            _ => WorkspaceView::Plane,
+            "plane" => WorkspaceView::Plane,
+            // "columns" and any string from the future use the current default.
+            _ => WorkspaceView::Columns,
         })
     }
 }
@@ -1177,7 +1177,7 @@ pub struct Workspace<C> {
     /// switching away from Desktop so the arrangement survives round-trips.
     pub desktop: DesktopState,
     /// How this workspace arranges its tiles (`UXI-Workspace-14`): the infinite
-    /// [`WorkspaceView::Plane`] (default) or [`WorkspaceView::Columns`]. A pure
+    /// [`WorkspaceView::Plane`] or the default [`WorkspaceView::Columns`]. A pure
     /// view choice over the SAME tiles — toggling never moves a tile, and the
     /// plane slots survive a round-trip through `Columns`.
     pub view: WorkspaceView,
@@ -2702,6 +2702,16 @@ mod tests {
         assert_eq!(ws.alloc_window_id(), 2);
         assert_eq!(ws.alloc_buffer_id(), 1);
         assert_eq!(ws.alloc_buffer_id(), 2);
+    }
+
+    #[test]
+    fn new_workspace_defaults_to_columns() {
+        let ws = Frame::with_initial(TestContent("a"), ProjectId(0));
+        assert_eq!(
+            ws.active_workspace().expect("initial workspace").view,
+            WorkspaceView::Columns,
+            "the production new-workspace path starts in columns"
+        );
     }
 
     #[test]
