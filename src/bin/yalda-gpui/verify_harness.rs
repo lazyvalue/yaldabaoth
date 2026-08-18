@@ -19692,3 +19692,292 @@ fn diagram_006_mermaid_fence_renders_in_agent_transcript(cx: &mut TestAppContext
         "the transcript mermaid block must render to Ready via the real pipeline; got {state:?}"
     );
 }
+
+// ── Cog explorer tile (cog.rs / cog_view.rs / cog_ui.rs) ─────────────────────
+// The Cog tile is a read-only two-pane explorer (UXI-Cog-1..3). Its body is a
+// cached child (CogView). Tests drive the REAL reducer (`cog_apply`) with
+// synthetic data and the real key/select/scroll methods; the live `cog`
+// subprocess is genuine-gap #2 and is deliberately NOT run here (tests stay
+// hermetic — `install_cog_tile` creates the tile without a fetch).
+
+#[cfg(test)]
+fn boot_with_cog<'a>(
+    cx: &'a mut TestAppContext,
+) -> (
+    gpui::Entity<YaldaGpuiView>,
+    &'a mut gpui::VisualTestContext,
+    gpui::Entity<crate::CogView>,
+    crate::workspace::WindowId,
+) {
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        )
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        v.splash_until = None;
+        v.install_cog_tile(cx);
+    });
+    vcx.run_until_parked();
+    let (cv, wid) = view.update(vcx, |v, _cx| {
+        let wid = v.workspace.focused_window_id().expect("focused window");
+        let cv = match v.workspace.focused_content() {
+            Some(crate::App::Cog(tile)) => tile
+                .view
+                .clone()
+                .expect("render_cog lazily creates the CogView"),
+            _ => panic!("expected a focused Cog tile"),
+        };
+        (cv, wid)
+    });
+    (view, vcx, cv, wid)
+}
+
+#[cfg(test)]
+fn cog_tile_req(view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext) -> u64 {
+    view.update(vcx, |v, _| match v.workspace.focused_content() {
+        Some(crate::App::Cog(tile)) => tile.req,
+        _ => panic!("expected a Cog tile"),
+    })
+}
+
+#[cfg(test)]
+fn cog_test_graph(id: &str, name: &str) -> crate::CogGraph {
+    crate::CogGraph {
+        id: id.into(),
+        name: name.into(),
+        description: format!("{name} description"),
+        omega: "om".into(),
+        sealed: false,
+        prototype: false,
+    }
+}
+
+#[cfg(test)]
+fn cog_test_node(id: &str, name: &str, status: &str, content: serde_json::Value) -> crate::CogNode {
+    crate::CogNode {
+        id: id.into(),
+        name: name.into(),
+        content,
+        status: status.into(),
+        output: None,
+    }
+}
+
+/// A node whose content is 200 lines — taller than any test viewport, so its
+/// right pane genuinely overflows and the scroll offset is not clamped to 0.
+#[cfg(test)]
+fn cog_tall_node(id: &str, name: &str, status: &str) -> crate::CogNode {
+    let big = (0..200)
+        .map(|i| format!("content line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    cog_test_node(id, name, status, serde_json::json!(big))
+}
+
+/// A synthetic bundle: the given nodes, one status transition + one note per
+/// node, no edges.
+#[cfg(test)]
+fn cog_test_bundle(nodes: Vec<crate::CogNode>) -> crate::CogBundle {
+    let mut logs: std::collections::BTreeMap<String, Vec<crate::CogLogEntry>> =
+        std::collections::BTreeMap::new();
+    let mut notes: std::collections::BTreeMap<String, Vec<crate::CogNote>> =
+        std::collections::BTreeMap::new();
+    for n in &nodes {
+        logs.insert(
+            n.id.clone(),
+            vec![crate::CogLogEntry {
+                seq: 0,
+                at: 1_786_989_281_753_564_000,
+                actor: "claude-code".into(),
+                kind: "status_changed".into(),
+                data: serde_json::json!({"to": n.status}),
+            }],
+        );
+        notes.insert(
+            n.id.clone(),
+            vec![crate::CogNote {
+                at: 1_786_989_281_753_564_000,
+                actor: "claude-code".into(),
+                topic: Some("deviation".into()),
+                data: serde_json::json!({"summary": format!("a note on {}", n.id)}),
+            }],
+        );
+    }
+    crate::CogBundle {
+        graph: cog_test_graph("g1", "Graph One"),
+        status: Default::default(),
+        nodes,
+        edges: vec![],
+        logs,
+        notes,
+    }
+}
+
+/// UXI-Cog-1: a Cog tile's real reducer, fed a graph list, lands on the graph
+/// explorer state with the graphs present.
+#[gpui::test]
+fn cog_opens_on_graph_explorer(cx: &mut TestAppContext) {
+    let (view, vcx, cv, wid) = boot_with_cog(cx);
+    let req = cog_tile_req(&view, vcx);
+    view.update(vcx, |v, cx| {
+        v.cog_apply(
+            wid,
+            req,
+            Ok(crate::CogFetch::Graphs(vec![
+                cog_test_graph("a", "Alpha"),
+                cog_test_graph("b", "Beta"),
+            ])),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    let (in_graphs, len) = cv.update(vcx, |c, _| (c.in_graphs(), c.list_len()));
+    assert!(in_graphs, "a Cog tile lands on the graph explorer");
+    assert_eq!(len, 2, "both graphs are listed");
+}
+
+/// UXI-Cog-2/-3: selecting a different node advances the selection AND resets
+/// the right detail pane to the top (a fresh node starts at its header). The
+/// scroll reset is the negative-control target: revert the `set_offset` in
+/// `select_move` and this fails with the offset still non-zero.
+#[gpui::test]
+fn cog_node_selection_resets_right_scroll(cx: &mut TestAppContext) {
+    let (view, vcx, cv, wid) = boot_with_cog(cx);
+    let req = cog_tile_req(&view, vcx);
+    view.update(vcx, |v, cx| {
+        v.cog_apply(
+            wid,
+            req,
+            Ok(crate::CogFetch::Graph(Box::new(cog_test_bundle(vec![
+                cog_tall_node("n1", "first", "done"),
+                cog_tall_node("n2", "second", "open"),
+            ])))),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    // Scroll the right pane down, then select the next node.
+    view.update(vcx, |v, cx| v.cog_scroll(300.0, cx));
+    vcx.run_until_parked();
+    let scrolled = cv.update(vcx, |c, _| c.right_scroll_y());
+    assert!(scrolled < 0.0, "right pane scrolled down (y={scrolled})");
+
+    view.update(vcx, |v, cx| v.cog_select(1, cx));
+    vcx.run_until_parked();
+    let (sel, after) = cv.update(vcx, |c, _| (c.selected_index(), c.right_scroll_y()));
+    assert_eq!(sel, 1, "selection advanced to the second node");
+    assert_eq!(after, 0.0, "changing node resets the right pane to the top");
+}
+
+/// UXI-Cog-3: the right pane scrolls on `d`/`u` and clamps at the top.
+#[gpui::test]
+fn cog_right_pane_scrolls_and_clamps(cx: &mut TestAppContext) {
+    let (view, vcx, cv, wid) = boot_with_cog(cx);
+    let req = cog_tile_req(&view, vcx);
+    view.update(vcx, |v, cx| {
+        v.cog_apply(
+            wid,
+            req,
+            Ok(crate::CogFetch::Graph(Box::new(cog_test_bundle(vec![
+                cog_tall_node("n1", "only", "done"),
+            ])))),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    view.update(vcx, |v, cx| v.cog_scroll(200.0, cx));
+    vcx.run_until_parked();
+    let y = cv.update(vcx, |c, _| c.right_scroll_y());
+    assert!((y - -200.0).abs() < 0.5, "scrolled down by 200px (y={y})");
+
+    view.update(vcx, |v, cx| v.cog_scroll(-1000.0, cx));
+    vcx.run_until_parked();
+    let y = cv.update(vcx, |c, _| c.right_scroll_y());
+    assert_eq!(y, 0.0, "scrolling up past the top clamps to 0");
+}
+
+/// yux rule 5: the Cog body is a cached child. A root-only notify (unrelated
+/// surface) leaves its render count FLAT; a body payload change busts it once.
+#[gpui::test]
+fn cog_body_is_cached(cx: &mut TestAppContext) {
+    crate::perf_reset("cog");
+    let (view, vcx, cv, wid) = boot_with_cog(cx);
+    let req = cog_tile_req(&view, vcx);
+    view.update(vcx, |v, cx| {
+        v.cog_apply(
+            wid,
+            req,
+            Ok(crate::CogFetch::Graph(Box::new(cog_test_bundle(vec![
+                cog_test_node("n1", "only", "done", serde_json::json!({"purpose": "a"})),
+            ])))),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    let base = crate::perf_render_count("cog");
+    assert!(base >= 1, "cog body renders at least once");
+
+    // Root-only notify (no cog change) → cached body render stays flat.
+    for _ in 0..5 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+    let flat = crate::perf_render_count("cog");
+    assert_eq!(flat, base, "root notify must NOT re-render the cached cog body");
+
+    // A body payload change (mutation-site notify) busts the cache exactly once.
+    cv.update(vcx, |c, cx| {
+        c.set_state(crate::CogViewState::Error("boom".into()));
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    let after = crate::perf_render_count("cog");
+    assert_eq!(after, base + 1, "a body payload change re-renders the body once");
+}
+
+/// UXI-Cog-2/-3 (PAINT, non-vacuous): a node with tall detail paints a right-pane
+/// content taller than its viewport — i.e. it genuinely overflows and is
+/// scrollable, not merely styled `overflow_y_scroll`.
+#[gpui::test]
+fn cog_detail_paints_and_overflows(cx: &mut TestAppContext) {
+    let (view, vcx, _cv, wid) = boot_with_cog(cx);
+    let req = cog_tile_req(&view, vcx);
+
+    // A node whose content is 200 lines — far taller than any test viewport.
+    let big = (0..200)
+        .map(|i| format!("content line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let node = cog_test_node("n1", "huge", "done", serde_json::json!(big));
+
+    crate::layout_probe_begin();
+    view.update(vcx, |v, cx| {
+        v.cog_apply(
+            wid,
+            req,
+            Ok(crate::CogFetch::Graph(Box::new(cog_test_bundle(vec![node])))),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    let viewport = crate::layout_probe_get("cog-right");
+    let content = crate::layout_probe_get("cog-right-content");
+    crate::layout_probe_end();
+
+    let (_, _, _, vp_h) = viewport.expect("right pane viewport did not paint");
+    let (_, _, _, ct_h) = content.expect("right pane content did not paint");
+    assert!(vp_h > 0.0, "viewport has real height ({vp_h})");
+    assert!(
+        ct_h > vp_h,
+        "content ({ct_h}px) must overflow the viewport ({vp_h}px) — a genuine, \
+         non-vacuous scroll (200-line node)"
+    );
+}

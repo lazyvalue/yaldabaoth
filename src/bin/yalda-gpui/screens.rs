@@ -296,6 +296,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::enter_wp))
             .on_action(cx.listener(Self::open_agent))
             .on_action(cx.listener(Self::open_linear))
+            .on_action(cx.listener(Self::open_cog))
             .on_action(cx.listener(Self::open_keymap))
             .on_action(cx.listener(Self::open_menu))
             .on_action(cx.listener(Self::open_local_menu))
@@ -460,6 +461,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::open_browser))
             .on_action(cx.listener(Self::open_agent))
             .on_action(cx.listener(Self::open_linear))
+            .on_action(cx.listener(Self::open_cog))
             .on_action(cx.listener(Self::open_keymap))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
@@ -2240,6 +2242,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::open_browser))
             .on_action(cx.listener(Self::open_agent))
             .on_action(cx.listener(Self::open_linear))
+            .on_action(cx.listener(Self::open_cog))
             .on_action(cx.listener(Self::open_keymap))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
@@ -2402,6 +2405,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::open_browser))
             .on_action(cx.listener(Self::open_agent))
             .on_action(cx.listener(Self::open_linear))
+            .on_action(cx.listener(Self::open_cog))
             .on_action(cx.listener(Self::open_keymap))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
@@ -2441,6 +2445,118 @@ impl YaldaGpuiView {
             .child(body_area)
     }
 
+    /// Render a Cog explorer tile (`App::Cog`): a slim header bar plus the
+    /// cached two-pane body (`CogView`). Navigation-only — no text input — so the
+    /// header just advertises the keys; all keys route through `handle_cog_key`.
+    pub(crate) fn render_cog(
+        &mut self,
+        root: gpui::Div,
+        tile: &mut CogTile,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        // The body is a cached child entity (yux), lazily created here.
+        let weak = cx.entity().downgrade();
+        let view = tile
+            .view
+            .get_or_insert_with(|| cx.new(|_| CogView::new(weak)))
+            .clone();
+
+        let scale = self.text_scale;
+        let base = px(14.0 * scale);
+        let dim = nc(self.theme.agent.dim);
+        let accent = nc(self.theme.agent.warm_accent);
+        let fg = self.editor_fg();
+        let bg = self.editor_bg();
+
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .w_full()
+            .px_4()
+            .py_2()
+            .bg(bg_or(self.theme.top_bar, STATUS_BG))
+            .border_b_1()
+            .border_color(dim)
+            .font_family(self.code_font.clone())
+            .text_size(base)
+            .child(
+                div()
+                    .flex_none()
+                    .pr_1()
+                    .text_color(accent)
+                    .font_weight(FontWeight::BOLD)
+                    .child(SharedString::from("cog › ")),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_color(fg)
+                    .child(SharedString::from(tile.title())),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .pl_2()
+                    .text_color(dim)
+                    .child(SharedString::new_static(
+                        "j/k select · ⏎ open · esc back · d/u scroll · r refresh",
+                    )),
+            );
+
+        let body_area = div()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .child(cached_child(view));
+
+        root.key_context("CogView")
+            .on_key_down(cx.listener(Self::handle_cog_key))
+            .on_action(cx.listener(Self::quit))
+            .on_action(cx.listener(Self::restart))
+            .on_action(cx.listener(Self::open_browser))
+            .on_action(cx.listener(Self::open_agent))
+            .on_action(cx.listener(Self::open_linear))
+            .on_action(cx.listener(Self::open_cog))
+            .on_action(cx.listener(Self::open_keymap))
+            .on_action(cx.listener(Self::zoom_in))
+            .on_action(cx.listener(Self::zoom_out))
+            .on_action(cx.listener(Self::zoom_reset))
+            .on_action(cx.listener(Self::toggle_theme))
+            .on_action(cx.listener(Self::copy_selection))
+            .on_action(cx.listener(Self::paste_from_clipboard))
+            .on_action(cx.listener(Self::rename_workspace))
+            .on_action(cx.listener(Self::move_tile))
+            .on_action(cx.listener(Self::also_show_tile))
+            .on_action(cx.listener(Self::close_window))
+            .on_action(cx.listener(Self::focus_left))
+            .on_action(cx.listener(Self::focus_right))
+            .on_action(cx.listener(Self::focus_up))
+            .on_action(cx.listener(Self::focus_down))
+            .on_action(cx.listener(Self::focus_next))
+            .on_action(cx.listener(Self::focus_prev))
+            .on_action(cx.listener(Self::toggle_file_browser_rail))
+            .on_action(cx.listener(Self::toggle_jump_panel))
+            .on_action(cx.listener(Self::open_jump_palette))
+            .workspace_nav(cx)
+            .on_action(cx.listener(Self::toggle_outline_rail))
+            .on_action(cx.listener(Self::flip_rail_side))
+            .on_action(cx.listener(Self::zoom_out_workspace))
+            .on_action(cx.listener(Self::zoom_in_workspace))
+            .on_action(cx.listener(Self::reset_workspace_view))
+            .on_action(cx.listener(Self::desktop_tile_size_overlay))
+            .on_action(cx.listener(Self::tag_view_chord))
+            .on_action(cx.listener(Self::tag_toggle_chord))
+            .on_action(cx.listener(Self::clear_tag_view))
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(bg)
+            .child(header)
+            .child(body_area)
+    }
+
     /// Render the keybindings reference tile (`App::Keymap`). The whole surface
     /// (header + filter line + grouped list) lives in the cached `KeymapView`
     /// body, so this just lazily creates + embeds it and wires the key handler +
@@ -2472,6 +2588,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::open_browser))
             .on_action(cx.listener(Self::open_agent))
             .on_action(cx.listener(Self::open_linear))
+            .on_action(cx.listener(Self::open_cog))
             .on_action(cx.listener(Self::open_keymap))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
@@ -2576,6 +2693,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::close_window))
             .on_action(cx.listener(Self::open_agent))
             .on_action(cx.listener(Self::open_linear))
+            .on_action(cx.listener(Self::open_cog))
             .on_action(cx.listener(Self::open_keymap))
             .on_action(cx.listener(Self::open_browser))
             .on_action(cx.listener(Self::focus_left))
@@ -2786,6 +2904,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::close_window))
             .on_action(cx.listener(Self::open_agent))
             .on_action(cx.listener(Self::open_linear))
+            .on_action(cx.listener(Self::open_cog))
             .on_action(cx.listener(Self::open_keymap))
             .on_action(cx.listener(Self::open_browser))
             .on_action(cx.listener(Self::focus_left))
@@ -3139,6 +3258,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::restart))
             .on_action(cx.listener(Self::open_agent))
             .on_action(cx.listener(Self::open_linear))
+            .on_action(cx.listener(Self::open_cog))
             .on_action(cx.listener(Self::open_keymap))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))

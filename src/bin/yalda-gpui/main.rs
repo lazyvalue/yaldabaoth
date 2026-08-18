@@ -82,6 +82,9 @@ mod jump_panel_view;
 mod session_tag_editor;
 mod keymap_registry;
 mod keymap_tile;
+mod cog;
+mod cog_ui;
+mod cog_view;
 mod keymap_ui;
 mod keymap_view;
 mod linear;
@@ -110,6 +113,8 @@ pub(crate) use session_tag_editor::*;
 pub(crate) use keymap_registry::*;
 pub(crate) use keymap_tile::*;
 pub(crate) use keymap_view::*;
+pub(crate) use cog::*;
+pub(crate) use cog_view::*;
 pub(crate) use linear::*;
 pub(crate) use linear_view::*;
 pub(crate) use persist::*;
@@ -210,6 +215,7 @@ actions!(
         EnterWp,
         OpenAgent,
         OpenLinear,
+        OpenCog,
         OpenKeymap,
         OpenMenu,
         OpenLocalMenu,
@@ -1310,6 +1316,8 @@ enum App {
     Buffer(BufferApp),
     Agent(AgentTile),
     Linear(LinearTile),
+    /// The Cog graph explorer (`cog.rs` / `cog_view.rs`).
+    Cog(CogTile),
     /// The keybindings reference + rebind sheet (`keymap_tile.rs`).
     Keymap(KeymapTile),
 }
@@ -1325,6 +1333,7 @@ impl App {
             // Agent/Linear and Buffer are orthogonal — they stash no buffer.
             App::Agent(_) => None,
             App::Linear(_) => None,
+            App::Cog(_) => None,
             App::Keymap(_) => None,
         }
     }
@@ -1547,6 +1556,7 @@ fn gpui_menu() -> Vec<MenuNode> {
                 MenuNode::entry("a", "agent", "new-agent-tile"),
                 MenuNode::entry("b", "buffer", "new-buffer-tile"),
                 MenuNode::entry("l", "linear", "new-linear-tile"),
+                MenuNode::entry("c", "cog", "new-cog-tile"),
                 MenuNode::entry("k", "keybindings", "new-keymap-tile"),
             ],
         ),
@@ -1665,6 +1675,13 @@ fn linear_local_menu() -> Vec<MenuNode> {
         MenuNode::entry("i", "edit query", "linear-edit"),
         MenuNode::entry("o", "open in browser", "linear-open-url"),
         MenuNode::entry("y", "copy URL", "linear-copy-url"),
+    ]
+}
+
+fn cog_local_menu() -> Vec<MenuNode> {
+    vec![
+        MenuNode::entry("g", "back to graph list", "cog-graphs"),
+        MenuNode::entry("r", "refresh", "cog-refresh"),
     ]
 }
 
@@ -2941,8 +2958,8 @@ impl YaldaGpuiView {
         match self.workspace.focused_content().expect("no focused window") {
             // Already picking — nothing to do.
             App::Buffer(BufferApp::Picking(_)) => return,
-            // Agent/Linear/Keymap tile: out of scope. No buffer here to pick into.
-            App::Agent(_) | App::Linear(_) | App::Keymap(_) => {
+            // Agent/Linear/Cog/Keymap tile: out of scope. No buffer here to pick into.
+            App::Agent(_) | App::Linear(_) | App::Cog(_) | App::Keymap(_) => {
                 self.transient_status = Some("no buffer here".into());
                 cx.notify();
                 return;
@@ -3205,6 +3222,7 @@ impl YaldaGpuiView {
             // the audited invalidation path that makes that re-read take effect.
             self.notify_transcript_views(MissReason::TextStyle, cx);
             self.notify_linear_views(MissReason::TextStyle, cx);
+            self.notify_cog_views(MissReason::TextStyle, cx);
             self.notify_keymap_views(MissReason::TextStyle, cx);
             cx.notify();
         }
@@ -3522,6 +3540,7 @@ impl YaldaGpuiView {
         // busts each live transcript view directly (event context, fact 4).
         self.notify_transcript_views(MissReason::Refresh, cx);
         self.notify_linear_views(MissReason::Refresh, cx);
+        self.notify_cog_views(MissReason::Refresh, cx);
         self.notify_keymap_views(MissReason::Refresh, cx);
         self.notify_system_console(MissReason::Refresh, cx);
         self.save_settings();
@@ -4812,6 +4831,7 @@ impl YaldaGpuiView {
                 (browser_local_menu(), "BROWSE", HashSet::new())
             }
             Some(App::Linear(_)) => (linear_local_menu(), "LINEAR", HashSet::new()),
+            Some(App::Cog(_)) => (cog_local_menu(), "COG", HashSet::new()),
             Some(App::Keymap(_)) => (keymap_local_menu(), "KEYBINDINGS", HashSet::new()),
             None => return,
         };
@@ -4976,6 +4996,9 @@ impl YaldaGpuiView {
                     .unwrap_or(false);
                 !picker && tile.mode == LinearMode::Insert
             }
+            // The Cog explorer never captures text — it is navigation-only, so
+            // leaders are always live.
+            Some(App::Cog(_)) => false,
             // The keymap tile captures text while filtering or rebinding — the
             // leaders must be suppressed then so keys reach the box.
             Some(App::Keymap(_)) => self.keymap_captures_text(cx),
@@ -5131,6 +5154,8 @@ impl YaldaGpuiView {
             "linear-edit" => self.linear_set_mode(LinearMode::Insert, cx),
             "linear-open-url" => self.linear_open_url(cx),
             "linear-copy-url" => self.linear_copy_url(cx),
+            "cog-graphs" => self.cog_load_graphs(cx),
+            "cog-refresh" => self.cog_refresh_focused(cx),
             "keymap-filter" => self.keymap_menu_filter(cx),
             "keymap-rebind" => self.keymap_menu_rebind(cx),
             "keymap-reset" => self.keymap_menu_reset(cx),
@@ -5366,6 +5391,24 @@ impl YaldaGpuiView {
                 {
                     self.workspace.retile_active();
                     self.open_linear_inner(cx);
+                    self.save_workspace_state();
+                    cx.notify();
+                }
+            }
+            "new-cog-tile" => {
+                // Split a new tile (focus lands on it), then swap it for a
+                // Cog explorer via `open_cog_inner` — mirrors new-linear-tile.
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                if self
+                    .workspace
+                    .split_focused(
+                        workspace::SplitDir::V,
+                        App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd))),
+                    )
+                    .is_some()
+                {
+                    self.workspace.retile_active();
+                    self.open_cog_inner(cx);
                     self.save_workspace_state();
                     cx.notify();
                 }
@@ -8509,6 +8552,7 @@ fn workspace_strip_label(wsp: &workspace::Workspace<App>) -> String {
             App::Buffer(BufferApp::Picking(_)) => format!("Browser ({})", wsp.display_label()),
             App::Agent(_) => format!("Claude ({})", wsp.display_label()),
             App::Linear(tile) => tile.title(),
+            App::Cog(tile) => tile.title(),
             App::Keymap(_) => "Keybindings".to_string(),
         }
     } else {
@@ -8866,6 +8910,7 @@ fn main() {
                     MenuItem::action("Open File Browser", OpenBrowser),
                     MenuItem::action("Open Claude Session", OpenAgent),
                     MenuItem::action("Open Linear", OpenLinear),
+                    MenuItem::action("Open Cog Explorer", OpenCog),
                     MenuItem::action("Keyboard Shortcuts", OpenKeymap),
                 ],
             },
