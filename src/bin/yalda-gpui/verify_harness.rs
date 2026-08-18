@@ -1615,6 +1615,7 @@ fn agent_dot_status_mapping() {
         archived: false,
         target: JumpTarget::Roster("s".into()),
         label: "x".into(),
+        provider: yalda::acp_channel::AgentProvider::Claude,
         summary: None,
         cwd: std::path::PathBuf::from("/"),
         bound: false,
@@ -7417,6 +7418,7 @@ fn session_tags_partition_folders_and_untagged() {
     let row = |label: &str, tags: &[&str]| AgentRow {
         target: JumpTarget::Roster(label.into()),
         label: label.into(),
+        provider: yalda::acp_channel::AgentProvider::Claude,
         summary: None,
         summary_pending: false,
         archived: false,
@@ -8414,6 +8416,7 @@ fn jump_reorder_ordering_applies_and_defaults_to_alpha() {
     let row = |sid: &str, label: &str, cwd: &str| AgentRow {
         target: JumpTarget::Roster(sid.into()),
         label: label.into(),
+        provider: yalda::acp_channel::AgentProvider::Claude,
         summary: None,
         summary_pending: false,
         archived: false,
@@ -8473,6 +8476,7 @@ fn jump_agent_state_tabs_filter_and_sort_without_moving_all() {
                age_secs: u64| AgentRow {
         target: JumpTarget::Roster(sid.into()),
         label: label.into(),
+        provider: yalda::acp_channel::AgentProvider::Claude,
         summary: None,
         summary_pending: false,
         archived: false,
@@ -8843,6 +8847,104 @@ fn jump_session_rows_do_not_paint_redundant_status_words(cx: &mut TestAppContext
         assert!(
             crate::layout_probe_get(&format!("jump-session-status-word-{i}")).is_none(),
             "{label} must not repeat its state as right-edge text"
+        );
+    }
+    crate::layout_probe_end();
+}
+
+/// UXI-JumpPanel-22: mixed-provider sessions expose their authoritative owner
+/// on every real jump-panel row without displacing the independent leading
+/// operational-status mark. This covers both server-authoritative roster rows
+/// and the local-only pre-roster projection.
+///
+/// Negative control: before `jump_session_row_el` painted the trailing provider
+/// mark (and exposed the leading mark probe), the row itself painted but the
+/// first `jump-session-provider-*` assertion below failed RED.
+#[gpui::test]
+fn jump_panel_session_rows_paint_provider_ownership_marks(cx: &mut TestAppContext) {
+    use crate::{AgentSession, AgentState, JumpTarget};
+    use std::collections::HashMap;
+    use yalda::acp_channel::{AgentProvider, PermissionMode};
+    use yalda::session_proto::SessionInfo;
+
+    assert_eq!(crate::agent_provider_mark(AgentProvider::Claude), "✳");
+    assert_eq!(crate::agent_provider_mark(AgentProvider::Codex), "⌬");
+
+    let (view, vcx) = boot_browser(cx);
+    let (pid, cwd) = view.update(vcx, |v, _| {
+        let pid = v.workspace.active_workspace().expect("workspace").project();
+        (pid, v.projects.cwd_of(pid).expect("project cwd").to_path_buf())
+    });
+    let info = |sid: &str, label: &str, provider: AgentProvider, busy: bool| SessionInfo {
+        session_id: sid.into(),
+        acp_session_id: None,
+        label: label.into(),
+        cwd: cwd.clone(),
+        provider,
+        turns: 0,
+        connected: true,
+        permission_mode: PermissionMode::ReadOnly,
+        busy,
+        archived: false,
+    };
+    view.update(vcx, |v, cx| {
+        v.agent_roster
+            .upsert(info("provider-claude", "alpha claude", AgentProvider::Claude, false));
+        v.agent_roster
+            .upsert(info("provider-codex", "beta codex", AgentProvider::Codex, true));
+        let _ = v.show_local_session(
+            AgentSession {
+                state: AgentState::new_server_managed_for(AgentProvider::Codex, None),
+                label: "gamma local codex".into(),
+                cwd: cwd.clone(),
+                resume_id: None,
+            },
+            cx,
+        );
+        cx.notify();
+    });
+
+    let rows: HashMap<String, (usize, AgentProvider, JumpTarget)> = view.update(vcx, |v, cx| {
+        v.jump_panel_sections(cx)
+            .0
+            .into_iter()
+            .find(|section| section.id == pid)
+            .expect("project section")
+            .sessions
+            .into_iter()
+            .map(|(i, row)| (row.label, (i, row.provider, row.target)))
+            .collect()
+    });
+    assert_eq!(rows["alpha claude"].1, AgentProvider::Claude);
+    assert!(matches!(rows["alpha claude"].2, JumpTarget::Roster(ref sid) if sid == "provider-claude"));
+    assert_eq!(rows["beta codex"].1, AgentProvider::Codex);
+    assert!(matches!(rows["beta codex"].2, JumpTarget::Roster(ref sid) if sid == "provider-codex"));
+    assert_eq!(rows["gamma local codex"].1, AgentProvider::Codex);
+    assert!(matches!(rows["gamma local codex"].2, JumpTarget::Local(_)));
+
+    crate::layout_probe_begin();
+    for _ in 0..3 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+    for label in ["alpha claude", "beta codex", "gamma local codex"] {
+        let (i, provider, _) = &rows[label];
+        assert!(
+            crate::layout_probe_get(&format!("jump-session-row-{i}")).is_some(),
+            "{label} row must paint, making its mark assertions non-vacuous"
+        );
+        assert!(
+            crate::layout_probe_get(&format!(
+                "jump-session-provider-{i}-{}",
+                provider.label()
+            ))
+            .is_some(),
+            "{label} must paint its {} ownership mark",
+            provider.label()
+        );
+        assert!(
+            crate::layout_probe_get(&format!("jump-session-status-mark-{i}")).is_some(),
+            "{label} must retain its independent leading operational-status mark"
         );
     }
     crate::layout_probe_end();
@@ -9764,6 +9866,7 @@ fn jump_panel_groups_agent_rows_by_cwd() {
         archived: false,
         target: JumpTarget::Roster(label.into()),
         label: label.into(),
+        provider: yalda::acp_channel::AgentProvider::Claude,
         summary: None,
         cwd: std::path::PathBuf::from(cwd),
         bound: false,
