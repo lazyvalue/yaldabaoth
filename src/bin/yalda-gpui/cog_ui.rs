@@ -1,0 +1,338 @@
+//! Cog explorer App methods on `YaldaGpuiView`: open the tile, fetch the graph
+//! list / a graph bundle off the paint thread, fold the result into the tile's
+//! cached [`CogView`], drive left selection + right-pane scroll, and the
+//! per-tile key handler. The body render lives in `cog_view.rs`; the subprocess
+//! client + data model in `cog.rs`.
+
+use super::*;
+
+impl YaldaGpuiView {
+    /// Open a Cog explorer tile. Replaces the focused tile's content with a
+    /// fresh `App::Cog` and kicks off the graph-list fetch. No-op if already
+    /// on a Cog tile.
+    pub(crate) fn open_cog(&mut self, _: &OpenCog, _w: &mut Window, cx: &mut Context<Self>) {
+        self.open_cog_inner(cx);
+    }
+
+    pub(crate) fn open_cog_inner(&mut self, cx: &mut Context<Self>) {
+        if self.install_cog_tile(cx) {
+            self.cog_load_graphs(cx);
+        }
+    }
+
+    /// Swap the focused tile for a fresh Cog explorer. Returns `false` (no-op) if
+    /// already on a Cog tile. Does NOT fetch — the caller kicks the graph load.
+    /// Split out so tests can install a tile without the live `cog` subprocess.
+    pub(crate) fn install_cog_tile(&mut self, cx: &mut Context<Self>) -> bool {
+        if matches!(
+            self.workspace.focused_content().expect("no focused window"),
+            App::Cog(_)
+        ) {
+            return false;
+        }
+        self.set_screen(App::Cog(CogTile::new()));
+        cx.notify();
+        true
+    }
+
+    /// Fetch the graph explorer list into the focused Cog tile.
+    pub(crate) fn cog_load_graphs(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.workspace.focused_window_id() else {
+            return;
+        };
+        let view = self.ensure_cog_view(target, cx);
+        let req = {
+            let Some(tile) = self.cog_tile_by_id_mut(target) else {
+                return;
+            };
+            tile.req += 1;
+            tile.title = "Cog".into();
+            tile.req
+        };
+        if let Some(v) = &view {
+            v.update(cx, |cv, vcx| {
+                cv.set_state(CogViewState::Loading("loading graphs…".into()));
+                vcx.notify();
+            });
+        }
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { cog::list_graphs().map(CogFetch::Graphs) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.cog_apply(target, req, result, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Open the graph highlighted in the focused tile's explorer: bump the
+    /// request id, set the title + loading, and load the bundle off the paint
+    /// thread.
+    pub(crate) fn cog_open_selected_graph(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.workspace.focused_window_id() else {
+            return;
+        };
+        let sel = self.cog_focused_tile_view().and_then(|v| {
+            let cv = v.read(cx);
+            cv.selected_graph_id().map(|id| (id, cv.selected_graph_label()))
+        });
+        let Some((id, label)) = sel else {
+            return;
+        };
+        let req = {
+            let Some(tile) = self.cog_tile_by_id_mut(target) else {
+                return;
+            };
+            tile.req += 1;
+            if let Some(l) = &label {
+                tile.title = l.clone();
+            }
+            tile.req
+        };
+        self.cog_set_view(
+            target,
+            CogViewState::Loading(format!("loading {id}…")),
+            cx,
+        );
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    cog::load_graph(&id).map(|b| CogFetch::Graph(Box::new(b)))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.cog_apply(target, req, result, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Fold a completed fetch into the tile that requested it (by stable
+    /// `WindowId`). Discards if the tile is gone, isn't a Cog tile, or has
+    /// issued a newer request.
+    pub(crate) fn cog_apply(
+        &mut self,
+        target: workspace::WindowId,
+        req: u64,
+        result: Result<CogFetch, String>,
+        cx: &mut Context<Self>,
+    ) {
+        match self.cog_tile_by_id_mut(target) {
+            Some(tile) if tile.req == req => {}
+            _ => return,
+        }
+        let state = match result {
+            Ok(CogFetch::Graphs(graphs)) => CogViewState::Graphs { graphs, selected: 0 },
+            Ok(CogFetch::Graph(bundle)) => CogViewState::Graph { bundle, selected: 0 },
+            Err(e) => CogViewState::Error(e),
+        };
+        self.cog_set_view(target, state, cx);
+    }
+
+    /// Push a new body state onto the tile's cached view (mutation-site notify),
+    /// then notify the root for the workspace-strip title.
+    fn cog_set_view(
+        &mut self,
+        target: workspace::WindowId,
+        state: CogViewState,
+        cx: &mut Context<Self>,
+    ) {
+        let view = self.cog_tile_by_id_mut(target).and_then(|t| t.view.clone());
+        if let Some(v) = view {
+            v.update(cx, |cv, vcx| {
+                cv.set_state(state);
+                vcx.notify();
+            });
+        }
+        cx.notify();
+    }
+
+    /// Move the left selection in the focused Cog tile.
+    pub(crate) fn cog_select(&mut self, delta: i32, cx: &mut Context<Self>) {
+        if let Some(v) = self.cog_focused_tile_view() {
+            v.update(cx, |cv, vcx| {
+                cv.select_move(delta);
+                vcx.notify();
+            });
+        }
+    }
+
+    /// Scroll the focused Cog tile's right detail pane.
+    pub(crate) fn cog_scroll(&mut self, down: f32, cx: &mut Context<Self>) {
+        if let Some(v) = self.cog_focused_tile_view() {
+            v.update(cx, |cv, vcx| {
+                cv.scroll_right(down);
+                vcx.notify();
+            });
+        }
+    }
+
+    /// Push a global-invalidation (theme / zoom) onto every Cog tile's cached
+    /// body — the body reads the global theme/font/zoom off the root, which is
+    /// in no per-tile seq. Mirrors `notify_linear_views`.
+    pub(crate) fn notify_cog_views(&mut self, reason: MissReason, cx: &mut Context<Self>) {
+        let mut views: Vec<Entity<CogView>> = Vec::new();
+        for wsp in self.workspace.workspaces.iter() {
+            wsp.layout.for_each_leaf(&mut |w| {
+                if let App::Cog(tile) = &w.content
+                    && let Some(v) = &tile.view
+                {
+                    views.push(v.clone());
+                }
+            });
+        }
+        for v in views {
+            let label = v.read(cx).perf_label();
+            record_notify(label, reason);
+            v.update(cx, |_cv, vcx| vcx.notify());
+        }
+    }
+
+    fn cog_focused_tile_view(&self) -> Option<Entity<CogView>> {
+        match self.workspace.focused_content()? {
+            App::Cog(tile) => tile.view.clone(),
+            _ => None,
+        }
+    }
+
+    /// Get-or-create the cached [`CogView`] for the tile at `target`.
+    fn ensure_cog_view(
+        &mut self,
+        target: workspace::WindowId,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<CogView>> {
+        match self.cog_tile_by_id_mut(target) {
+            Some(tile) => {
+                if let Some(v) = &tile.view {
+                    return Some(v.clone());
+                }
+            }
+            None => return None,
+        }
+        let weak = cx.entity().downgrade();
+        let view = cx.new(|_| CogView::new(weak));
+        let tile = self.cog_tile_by_id_mut(target)?;
+        tile.view = Some(view.clone());
+        Some(view)
+    }
+
+    fn cog_tile_by_id_mut(&mut self, id: workspace::WindowId) -> Option<&mut CogTile> {
+        for wsp in self.workspace.workspaces.iter_mut() {
+            if let Some(w) = wsp.layout.find_leaf_mut(id) {
+                return match &mut w.content {
+                    App::Cog(tile) => Some(tile),
+                    _ => None,
+                };
+            }
+        }
+        None
+    }
+
+    /// Key handler for a focused Cog tile. The tile is navigation-only (no text
+    /// entry): `j`/`k` move the left selection, `Enter`/`o` opens the highlighted
+    /// graph, `Esc`/`h` returns to the graph list, `d`/`u`/PageDown/PageUp scroll
+    /// the right pane, `r` reloads. Leaders (`space`/`.`/`?`) are handled first.
+    pub(crate) fn handle_cog_key(
+        &mut self,
+        ev: &KeyDownEvent,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Let global Cmd/Ctrl shortcuts fall through to their actions.
+        if ev.keystroke.modifiers.platform || ev.keystroke.modifiers.control {
+            return;
+        }
+        let press = keystroke_to_keypress(&ev.keystroke);
+
+        // Universal leaders: this tile never captures text, so `space`/`.`/`?`
+        // always open the menus first.
+        if self.leader_intercept(&press, cx) {
+            return;
+        }
+
+        let in_graphs = self
+            .cog_focused_tile_view()
+            .map(|v| v.read(cx).in_graphs())
+            .unwrap_or(false);
+
+        match press.key {
+            Key::Char('j') | Key::Down => self.cog_select(1, cx),
+            Key::Char('k') | Key::Up => self.cog_select(-1, cx),
+            Key::Enter | Key::Char('o') | Key::Char('l') => {
+                if in_graphs {
+                    self.cog_open_selected_graph(cx);
+                }
+            }
+            Key::Esc | Key::Char('h') => {
+                if !in_graphs {
+                    self.cog_load_graphs(cx);
+                }
+            }
+            Key::Char('d') => self.cog_scroll(220.0, cx),
+            Key::Char('u') => self.cog_scroll(-220.0, cx),
+            Key::PageDown => self.cog_scroll(440.0, cx),
+            Key::PageUp => self.cog_scroll(-440.0, cx),
+            Key::Char('r') => {
+                if in_graphs {
+                    self.cog_load_graphs(cx);
+                } else {
+                    self.cog_reload_current(cx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Refresh the focused Cog tile from the local menu: reload the open graph,
+    /// or the graph list if none is open.
+    pub(crate) fn cog_refresh_focused(&mut self, cx: &mut Context<Self>) {
+        let in_graphs = self
+            .cog_focused_tile_view()
+            .map(|v| v.read(cx).in_graphs())
+            .unwrap_or(true);
+        if in_graphs {
+            self.cog_load_graphs(cx);
+        } else {
+            self.cog_reload_current(cx);
+        }
+    }
+
+    /// Reload the currently-open graph bundle (the `r` refresh in a graph).
+    fn cog_reload_current(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.workspace.focused_window_id() else {
+            return;
+        };
+        let Some(id) = self
+            .cog_focused_tile_view()
+            .and_then(|v| v.read(cx).current_graph_id())
+        else {
+            return;
+        };
+        let req = {
+            let Some(tile) = self.cog_tile_by_id_mut(target) else {
+                return;
+            };
+            tile.req += 1;
+            tile.req
+        };
+        self.cog_set_view(target, CogViewState::Loading(format!("reloading {id}…")), cx);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    cog::load_graph(&id).map(|b| CogFetch::Graph(Box::new(b)))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.cog_apply(target, req, result, cx);
+            });
+        })
+        .detach();
+    }
+}

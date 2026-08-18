@@ -13,6 +13,25 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Cog graph explorer tile** — `NEEDS-RUNTIME` (2026-08-17 via `/new-ux`;
+  `UXI-Cog-1..3`; branch `cog-explorer`). Captured verbatim: *"I want a cog graph
+  explorer tile. In left pane of tile should be able to select nodes. In right
+  pane should be able to see contents and notes. Right pane should be scrollable.
+  I should also be able to see the status and status transitions of everything. A
+  new tile should have a file explorer view that lets me pick which graph I want
+  to explore."* New `App::Cog` tile: left pane lists graphs (explorer) then the
+  selected graph's nodes (selectable); right pane shows the selected node's
+  content, status, status-transition log, and notes, and is scrollable. Backed by
+  the local `cog` CLI (subprocess client). Built on the `App::Linear` /
+  `LinearView` cached-yux template. Opens with `Cmd-G` / `Ctrl-G`, the `.` → new →
+  cog menu, and the File menu; `⚙` glyph, `COG` local menu. 5 headless guards in
+  `verify_harness.rs` (`cog_opens_on_graph_explorer`,
+  `cog_node_selection_resets_right_scroll`, `cog_right_pane_scrolls_and_clamps`,
+  `cog_body_is_cached`, `cog_detail_paints_and_overflows`); 2 negative controls
+  observed RED; 577 GUI tests pass. Runtime gap #2 (the live `cog` subprocess ↔ tile
+  loop): restart the app and confirm the real `cog graph list` / `graph get` /
+  `node log` calls render against `cogd`.
+
 - **Normal messages interrupt an in-flight Codex turn** — `NEEDS-RUNTIME`
   (2026-08-12 via `/bug`; `bug-0036`, `UXI-AgentTile-13`; Cog graph `bkb`).
   Captured verbatim: *"i can't seem to interrupt codex sessions with normal

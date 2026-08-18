@@ -77,6 +77,7 @@ const DEFAULT_BINDINGS: &[DefaultBinding] = &[
     b!("ctrl-shift-e", "EnterWp",          YV, "Editing", "Edit — word processor"),
     b!("ctrl-k",       "OpenAgent",        YV, "Apps & files", "Open agent"),
     b!("ctrl-l",       "OpenLinear",       YV, "Apps & files", "Open Linear"),
+    b!("ctrl-g",       "OpenCog",          YV, "Apps & files", "Open Cog explorer"),
     b!("tab",          "NextBuffer",       YV, "Buffers", "Next buffer"),
     b!("shift-tab",    "PrevBuffer",       YV, "Buffers", "Previous buffer"),
 
@@ -86,6 +87,7 @@ const DEFAULT_BINDINGS: &[DefaultBinding] = &[
     b!("cmd-o",             "OpenBrowser",     GLOBAL, "Apps & files", "Open file browser"),
     b!("cmd-k",             "OpenAgent",       GLOBAL, "Apps & files", "Open agent"),
     b!("cmd-l",             "OpenLinear",      GLOBAL, "Apps & files", "Open Linear"),
+    b!("cmd-g",             "OpenCog",         GLOBAL, "Apps & files", "Open Cog explorer"),
     b!("cmd-/",             "OpenKeymap",      GLOBAL, "Apps & files", "Open keybindings reference"),
     b!("cmd-1",             "ToggleTasklist",  AV,     "Agent", "Toggle tasklist sidebar"),
     b!("cmd-2",             "ToggleSubagents", AV,     "Agent", "Toggle subagents sidebar"),

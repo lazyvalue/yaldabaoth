@@ -71,6 +71,7 @@ impl YaldaGpuiView {
             }
             App::Agent(tile) => self.render_agent(leaf_root, tile, cx).into_any_element(),
             App::Linear(tile) => self.render_linear(leaf_root, tile, cx).into_any_element(),
+            App::Cog(tile) => self.render_cog(leaf_root, tile, cx).into_any_element(),
             App::Keymap(tile) => self.render_keymap(leaf_root, tile, cx).into_any_element(),
         };
         // Tag the LIVE content so the layout probe can assert it paints (the
@@ -803,6 +804,7 @@ impl YaldaGpuiView {
                 .map(|s| s.read(cx).label.clone())
                 .unwrap_or_else(|| "claude".to_string()),
             App::Linear(tile) => tile.title(),
+            App::Cog(tile) => tile.title(),
             App::Keymap(tile) => tile.title(),
         }
     }
@@ -825,6 +827,7 @@ impl YaldaGpuiView {
             App::Buffer(BufferApp::Viewing(_)) => "▢",
             App::Buffer(BufferApp::Picking(_)) => "◇",
             App::Linear(_) => "◈",
+            App::Cog(_) => "⚙",
             App::Keymap(_) => "⌘",
         }
     }
@@ -1584,6 +1587,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::open_browser))
             .on_action(cx.listener(Self::open_agent))
             .on_action(cx.listener(Self::open_linear))
+            .on_action(cx.listener(Self::open_cog))
             .on_action(cx.listener(Self::open_keymap))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
