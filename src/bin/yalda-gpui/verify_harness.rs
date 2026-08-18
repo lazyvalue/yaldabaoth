@@ -16386,6 +16386,179 @@ fn columns_view_arranges_tiles_side_by_side(cx: &mut TestAppContext) {
     );
 }
 
+/// UXI-Workspace-15 real path: the registered upper-case motion commands swap
+/// complete footprints, preserve stable focus, honor Columns' visible axes,
+/// and `Ctrl-W u` restores the prior placement. Observed RED with directional
+/// swap and undo independently disabled in their production handlers.
+#[gpui::test]
+fn ctrl_w_uppercase_swaps_footprints_in_plane_and_columns(cx: &mut TestAppContext) {
+    use crate::workspace::{Slot, Span, WorkspaceView};
+    cx.update(crate::register_keymap);
+    let (view, vcx, win_a, win_b) = boot_desktop_two_tiles(cx);
+
+    view.update(vcx, |v, cx| {
+        let wsp = v.workspace.active_workspace_mut().unwrap();
+        wsp.view = WorkspaceView::Plane;
+        wsp.desktop.set_anchor(win_a, Slot::new(0, 0));
+        wsp.desktop.set_span(win_a, Span::new(2, 2));
+        wsp.desktop.set_anchor(win_b, Slot::new(0, 4));
+        wsp.desktop.set_span(win_b, Span::new(3, 1));
+        wsp.focused = win_a;
+        wsp.desktop.last_reveal = Some(win_a);
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    let before = view.read_with(vcx, |v, _| {
+        let wsp = v.workspace.active_workspace().unwrap();
+        (wsp.desktop.rect_of(win_a), wsp.desktop.rect_of(win_b), wsp.focused)
+    });
+
+    vcx.simulate_keystrokes("ctrl-w shift-l");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        let wsp = v.workspace.active_workspace().unwrap();
+        assert_eq!(wsp.desktop.rect_of(win_a), before.1, "A adopts B's complete footprint");
+        assert_eq!(wsp.desktop.rect_of(win_b), before.0, "B adopts A's complete footprint");
+        assert_eq!(wsp.focused, win_a, "stable focused id travels with its tile");
+    });
+
+    vcx.simulate_keystrokes("ctrl-w u");
+    vcx.run_until_parked();
+    let restored = view.read_with(vcx, |v, _| {
+        let wsp = v.workspace.active_workspace().unwrap();
+        (wsp.desktop.rect_of(win_a), wsp.desktop.rect_of(win_b), wsp.focused)
+    });
+    assert_eq!(restored, before, "Ctrl-W u restores Plane placement");
+
+    view.update(vcx, |v, cx| {
+        let wsp = v.workspace.active_workspace_mut().unwrap();
+        wsp.view = WorkspaceView::Columns;
+        wsp.focused = win_a;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("ctrl-w shift-j");
+    vcx.run_until_parked();
+    let after_vertical = view.read_with(vcx, |v, _| {
+        let wsp = v.workspace.active_workspace().unwrap();
+        (wsp.desktop.rect_of(win_a), wsp.desktop.rect_of(win_b))
+    });
+    assert_eq!(after_vertical, (before.0, before.1), "Columns J is a no-op");
+
+    vcx.simulate_keystrokes("ctrl-w shift-l");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        let wsp = v.workspace.active_workspace().unwrap();
+        assert_eq!(wsp.desktop.rect_of(win_a), before.1);
+        assert_eq!(wsp.desktop.rect_of(win_b), before.0);
+        assert_eq!(wsp.focused, win_a);
+    });
+}
+
+/// UXI-Workspace-15 real path for promotion and both rotation directions.
+/// Observed RED with promote, forward rotate, and backward rotate separately
+/// disabled in the production handlers.
+#[gpui::test]
+fn ctrl_w_promote_and_rotate_three_tiles(cx: &mut TestAppContext) {
+    use crate::{AgentTile, App};
+    use crate::workspace::{Slot, SplitDir};
+    cx.update(crate::register_keymap);
+    let (view, vcx, win_a, win_b) = boot_desktop_two_tiles(cx);
+    let win_c = view.update(vcx, |v, cx| {
+        let win_c = v
+            .workspace
+            .split_focused(SplitDir::H, App::Agent(AgentTile::new()))
+            .expect("third tile");
+        let wsp = v.workspace.active_workspace_mut().unwrap();
+        let leaves = wsp.layout.leaf_ids();
+        wsp.desktop.reconcile(&leaves);
+        wsp.desktop.set_anchor(win_a, Slot::new(0, 0));
+        wsp.desktop.set_anchor(win_b, Slot::new(0, 4));
+        wsp.desktop.set_anchor(win_c, Slot::new(0, 8));
+        wsp.focused = win_b;
+        cx.notify();
+        win_c
+    });
+    vcx.run_until_parked();
+    let slots = |v: &YaldaGpuiView| {
+        let d = &v.workspace.active_workspace().unwrap().desktop;
+        (d.slot_of(win_a), d.slot_of(win_b), d.slot_of(win_c))
+    };
+    let original = view.read_with(vcx, |v, _| slots(v));
+
+    vcx.simulate_keystrokes("ctrl-w enter");
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(vcx, |v, _| slots(v)),
+        (original.1, original.0, original.2),
+        "promote swaps focused B with the first footprint"
+    );
+    vcx.simulate_keystrokes("ctrl-w u");
+    vcx.run_until_parked();
+    assert_eq!(view.read_with(vcx, |v, _| slots(v)), original);
+
+    vcx.simulate_keystrokes("ctrl-w r");
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(vcx, |v, _| slots(v)),
+        (original.1, original.2, original.0),
+        "forward rotation moves each tile to the next footprint"
+    );
+    vcx.simulate_keystrokes("ctrl-w u");
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("ctrl-w shift-r");
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(vcx, |v, _| slots(v)),
+        (original.2, original.0, original.1),
+        "backward rotation is the inverse cycle"
+    );
+}
+
+/// UXI-Workspace-15 real picker path: cancel is inert and Enter swaps the
+/// selected target while retaining stable focus. Observed RED with picker
+/// commit disabled in production.
+#[gpui::test]
+fn ctrl_w_x_picker_cancels_and_swaps_selected_tile(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (view, vcx, win_a, win_b) = boot_desktop_two_tiles(cx);
+    let before = view.read_with(vcx, |v, _| {
+        let wsp = v.workspace.active_workspace().unwrap();
+        (wsp.desktop.rect_of(win_a), wsp.desktop.rect_of(win_b))
+    });
+
+    vcx.simulate_keystrokes("ctrl-w x");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        let picker = v.tile_swap_picker_ref().expect("picker opens");
+        assert_eq!(picker.source, win_a);
+        assert_eq!(picker.targets, vec![win_b]);
+    });
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(view.read_with(vcx, |v, _| v.tile_swap_picker_ref().is_none()));
+    assert_eq!(
+        view.read_with(vcx, |v, _| {
+            let wsp = v.workspace.active_workspace().unwrap();
+            (wsp.desktop.rect_of(win_a), wsp.desktop.rect_of(win_b))
+        }),
+        before,
+        "picker cancel is mutation-free"
+    );
+
+    vcx.simulate_keystrokes("ctrl-w x");
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        let wsp = v.workspace.active_workspace().unwrap();
+        assert_eq!(wsp.desktop.rect_of(win_a), before.1);
+        assert_eq!(wsp.desktop.rect_of(win_b), before.0);
+        assert_eq!(wsp.focused, win_a);
+        assert!(v.tile_swap_picker_ref().is_none());
+    });
+}
+
 /// bug-0012 (UXI-Workspace-6): in a workspace holding exactly ONE tile, a new
 /// tile lands at the SAME row, directly to the RIGHT of it — never diagonally.
 /// Both tiles use the configured default 4×4 span, so the new anchor is four

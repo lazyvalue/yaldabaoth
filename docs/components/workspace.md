@@ -776,3 +776,72 @@ binding and the `workspace-toggle-columns` menu command dispatch, so the guard
 drives it directly rather than a proxy. The real macOS `Ctrl-W a` chord *firing*
 is the usual `simulate_keystrokes`-vs-OS gap (CLAUDE.md rule 4), but the binding
 is a `Ctrl-W`+plain-letter sequence (reliable, like `Ctrl-W 0`).
+
+### UXI-Workspace-15 — Placement commands rearrange stable tiles through stable footprints
+
+**Statement.** The `Ctrl-W` workspace family includes dwm-style placement
+commands which rearrange the active workspace without changing what any tile is:
+
+- `Ctrl-W H/J/K/L` swaps the focused tile with its nearest spatial neighbor to
+  the left/down/up/right respectively. In `Plane`, the target is exactly the
+  tile that the corresponding lower-case focus command (`Ctrl-W h/j/k/l`) would
+  select; the `Columns` specialization is defined below.
+- `Ctrl-W Return` promotes the focused tile by swapping it with the first tile
+  in signed plane reading order. In `Columns`, that is the leftmost column.
+- `Ctrl-W x` opens a keyboard-operated **Swap tile** picker containing every
+  other tile in the active workspace; selecting a row performs the swap and
+  `Esc` cancels without mutation.
+- `Ctrl-W r` / `Ctrl-W R` rotates all tiles forward / backward through signed
+  plane reading order.
+- `Ctrl-W u` undoes the most recent successful placement command. Undo is a
+  bounded, workspace-local history of complete placement snapshots; a new
+  successful placement after undo replaces the popped history naturally. It
+  does not undo tile creation, closing, drag, edge-resize, camera changes, or
+  workspace switching.
+
+A tile's **placement footprint** is its `(anchor Slot, Span)`. Swapping exchanges
+the two complete footprints, not the Apps inside the tiles and not just their
+anchors. Rotation assigns each complete footprint to the next/previous stable
+`WindowId`. This is dwm slot semantics: moving into a differently-sized region
+adopts that region's size. Complete-footprint exchange cannot introduce overlap,
+even when the two spans differ.
+
+The focused `WindowId` remains focused and travels to its new footprint. Its App,
+agent-session binding, title, marks, and other tile-local state travel with that
+stable id. The camera is unchanged; the existing minimum-reveal behavior may pan
+only as needed to show the now-moved focused tile. Every successful command is
+persisted immediately. A one-tile workspace, promotion when already first,
+rotation with fewer than two tiles, a direction with no neighbor, or picker
+cancel is a strict no-op and does not create an undo entry.
+
+`Columns` is a view over the same persisted plane placements
+(`UXI-Workspace-14`), so the commands mutate those placements in both views.
+`H`/`L` exchange adjacent visible columns. Because full-height columns have no
+visible tile above or below, `J`/`K` are no-ops in `Columns`; they must not use a
+hidden plane neighbor that contradicts the visible arrangement. Promotion,
+picker swap, rotation, and undo are lossless across a Plane⇄Columns toggle.
+
+**Applies to.** `workspace.rs`: complete placement snapshot/history and
+`swap_placements`, `promote_focused`, `rotate_placements`, `undo_arrangement`;
+view-aware neighbor resolution on `Workspace`. `main.rs`: actions, handlers,
+`SwapTilePicker` overlay, persistence + notify. `keymap_registry.rs`: the bindings
+above. `chrome.rs`: action wiring on both Plane and Columns roots.
+
+**Why.** Lower-case `Ctrl-W` motion already makes tile focus keyboard-native.
+The matching upper-case grammar makes layout manipulation equally direct, while
+complete footprints reconcile dwm's ordered-slot behavior with Yaldabaoth's
+free-sized infinite plane. The picker covers distant/off-screen targets without
+overloading spatial navigation.
+
+**Status.** `implemented (headless)`.
+
+**Enforcement.** Pure `workspace.rs` tests pin footprint exchange, spatial and
+reading-order target selection, rotation direction, undo, no-overlap, and no-op
+history behavior. The real-path guards
+`ctrl_w_uppercase_swaps_footprints_in_plane_and_columns`,
+`ctrl_w_promote_and_rotate_three_tiles`, and
+`ctrl_w_x_picker_cancels_and_swaps_selected_tile` drive the production keymap →
+action → handler paths and assert persistable placement plus stable focus. They
+were observed RED by temporarily disabling directional swap, undo, promotion,
+each rotation direction, and picker commit; every mutation failed at its
+command-specific assertion before the production implementation was restored.

@@ -103,6 +103,23 @@ instead.
 | `Tab` / `Shift-Tab` | next / previous buffer |
 | `Esc` | clear selection, exit extend mode |
 
+## Workspace tile placement
+
+Workspace commands use the `Ctrl-W` prefix. Placement commands move a tile's
+complete footprint—position and size—while the focused tile, its app, and its
+session identity stay together.
+
+| Key | Action |
+| --- | --- |
+| `Ctrl-W H/J/K/L` | swap the focused tile with its left/down/up/right neighbor |
+| `Ctrl-W Enter` | promote the focused tile to the first position |
+| `Ctrl-W x` | choose any other tile to swap with (`j`/`k`, `Enter`, `Esc`) |
+| `Ctrl-W r` / `Ctrl-W R` | rotate all tile placements forward / backward |
+| `Ctrl-W u` | undo the most recent successful placement command |
+
+In Columns, `H` and `L` swap adjacent columns; `J` and `K` are no-ops. The same
+placements survive a lossless Plane/Columns toggle.
+
 ## Browsers
 
 - `:buffers` (or `Space → b`) — fullscreen buffer list

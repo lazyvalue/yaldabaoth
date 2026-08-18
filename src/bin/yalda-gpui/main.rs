@@ -250,6 +250,16 @@ actions!(
         FocusDown,
         FocusNext,
         FocusPrev,
+        // Dwm-style stable-footprint placement commands (UXI-Workspace-15).
+        SwapTileLeft,
+        SwapTileDown,
+        SwapTileUp,
+        SwapTileRight,
+        PromoteTile,
+        SwapTilePicker,
+        RotateTilesForward,
+        RotateTilesBackward,
+        UndoArrangement,
         // Browser view
         BrowserDown,
         BrowserUp,
@@ -1407,6 +1417,17 @@ struct WorkspacePicker {
     selected: usize,
 }
 
+/// Active-workspace tile chooser for `Ctrl-W x` (UXI-Workspace-15). Targets
+/// are stable WindowIds captured in signed reading order. The source workspace
+/// and focused id are retained so a stale overlay can only cancel, never swap a
+/// different tile after an out-of-band structural change.
+struct TileSwapPicker {
+    workspace_index: usize,
+    source: workspace::WindowId,
+    targets: Vec<workspace::WindowId>,
+    selected: usize,
+}
+
 /// Single-line input overlay used by both Claude-session rename and
 /// workspace rename. Pre-filled with the current label; Enter commits, Esc
 /// cancels, empty input cancels.
@@ -1484,6 +1505,7 @@ enum ActiveOverlay {
     Menu(MenuOverlay),
     BufferSwitcher(BufferSwitcher),
     WorkspacePicker(WorkspacePicker),
+    TileSwapPicker(TileSwapPicker),
     Rename(RenameOverlay),
     TagInput(TagInputOverlay),
     /// "New project" cwd input (UXI-Project-4).
@@ -2176,12 +2198,12 @@ impl YaldaGpuiView {
             // Restore the tile arrangement (UXI-Workspace-14). Old snapshots
             // (no field) load as `Columns` via `#[serde(default)]`.
             wsp.view = pws.view;
-            wsp.desktop = workspace::DesktopState {
+            wsp.desktop = workspace::DesktopState::restored(
                 // Restored leaves keep their persisted WindowIds, so the
                 // id-keyed slots round-trip with no mapping. Stale ids (or an
                 // absent field) are handled by the first desktop render's
                 // reconcile/seed (spec Behavior 7).
-                slots: {
+                {
                     let mut v: Vec<(workspace::WindowId, workspace::Slot)> = pws
                         .desktop_slots
                         .into_iter()
@@ -2193,25 +2215,21 @@ impl YaldaGpuiView {
                     v.sort_by_key(|&(_, s)| s);
                     v
                 },
-                spans: pws
+                pws
                     .desktop_spans
                     .into_iter()
                     .map(|(id, rows, cols)| (id, workspace::Span::new(rows, cols)))
                     .collect(),
                 // Restore the plane's saved camera (D4 / Behavior 7); an absent
                 // field (old snapshot) falls back to the origin at Full.
-                camera: pws
+                pws
                     .camera
                     .map(|c| workspace::Camera {
                         pan: c.pan,
                         zoom: c.zoom,
                     })
                     .unwrap_or_default(),
-                drag: None,
-                resize: None,
-                pan_drag: None,
-                last_reveal: None,
-            };
+            );
             ws.workspaces.push(wsp);
             ws.next_workspace_index += 1;
         }
@@ -4162,6 +4180,116 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
+    fn finish_arrangement_change(&mut self, changed: bool, cx: &mut Context<Self>) {
+        if changed {
+            self.save_workspace_state();
+            cx.notify();
+        }
+    }
+
+    fn swap_tile_direction_inner(
+        &mut self,
+        direction: workspace::FocusDir,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = self
+            .workspace
+            .active_workspace_mut()
+            .is_some_and(|wsp| wsp.swap_focused_direction(direction));
+        self.finish_arrangement_change(changed, cx);
+    }
+
+    fn swap_tile_left(&mut self, _: &SwapTileLeft, _w: &mut Window, cx: &mut Context<Self>) {
+        self.swap_tile_direction_inner(workspace::FocusDir::Left, cx);
+    }
+
+    fn swap_tile_down(&mut self, _: &SwapTileDown, _w: &mut Window, cx: &mut Context<Self>) {
+        self.swap_tile_direction_inner(workspace::FocusDir::Down, cx);
+    }
+
+    fn swap_tile_up(&mut self, _: &SwapTileUp, _w: &mut Window, cx: &mut Context<Self>) {
+        self.swap_tile_direction_inner(workspace::FocusDir::Up, cx);
+    }
+
+    fn swap_tile_right(&mut self, _: &SwapTileRight, _w: &mut Window, cx: &mut Context<Self>) {
+        self.swap_tile_direction_inner(workspace::FocusDir::Right, cx);
+    }
+
+    fn promote_tile(&mut self, _: &PromoteTile, _w: &mut Window, cx: &mut Context<Self>) {
+        let changed = self
+            .workspace
+            .active_workspace_mut()
+            .is_some_and(workspace::Workspace::promote_focused);
+        self.finish_arrangement_change(changed, cx);
+    }
+
+    fn rotate_tiles_forward(
+        &mut self,
+        _: &RotateTilesForward,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = self
+            .workspace
+            .active_workspace_mut()
+            .is_some_and(|wsp| wsp.rotate_placements(true));
+        self.finish_arrangement_change(changed, cx);
+    }
+
+    fn rotate_tiles_backward(
+        &mut self,
+        _: &RotateTilesBackward,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = self
+            .workspace
+            .active_workspace_mut()
+            .is_some_and(|wsp| wsp.rotate_placements(false));
+        self.finish_arrangement_change(changed, cx);
+    }
+
+    fn undo_arrangement(&mut self, _: &UndoArrangement, _w: &mut Window, cx: &mut Context<Self>) {
+        let changed = self
+            .workspace
+            .active_workspace_mut()
+            .is_some_and(workspace::Workspace::undo_arrangement);
+        self.finish_arrangement_change(changed, cx);
+    }
+
+    fn open_swap_tile_picker(
+        &mut self,
+        _: &SwapTilePicker,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.has_overlay() {
+            return;
+        }
+        let workspace_index = self.workspace.active_workspace;
+        let Some(wsp) = self.workspace.active_workspace() else {
+            return;
+        };
+        let source = wsp.focused;
+        let targets: Vec<_> = wsp
+            .desktop
+            .slots
+            .iter()
+            .map(|&(id, _)| id)
+            .filter(|&id| id != source)
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        self.open_overlay(ActiveOverlay::TileSwapPicker(TileSwapPicker {
+            workspace_index,
+            source,
+            targets,
+            selected: 0,
+        }));
+        cx.notify();
+    }
+
     /// The slot a KEYBOARD-driven semantic-zoom step re-anchors on
     /// (spec-infinite-plane-workspace.md Behavior 3): the focused tile's slot,
     /// or the viewport-center slot when nothing is focused / the focused tile has
@@ -4598,6 +4726,9 @@ impl YaldaGpuiView {
     fn overlay_is_workspace(&self) -> bool {
         matches!(self.active_overlay, ActiveOverlay::WorkspacePicker(_))
     }
+    fn overlay_is_tile_swap(&self) -> bool {
+        matches!(self.active_overlay, ActiveOverlay::TileSwapPicker(_))
+    }
     fn overlay_is_rename(&self) -> bool {
         matches!(self.active_overlay, ActiveOverlay::Rename(_))
     }
@@ -4711,6 +4842,20 @@ impl YaldaGpuiView {
     }
     fn workspace_picker_mut(&mut self) -> Option<&mut WorkspacePicker> {
         if let ActiveOverlay::WorkspacePicker(p) = &mut self.active_overlay {
+            Some(p)
+        } else {
+            None
+        }
+    }
+    fn tile_swap_picker_ref(&self) -> Option<&TileSwapPicker> {
+        if let ActiveOverlay::TileSwapPicker(p) = &self.active_overlay {
+            Some(p)
+        } else {
+            None
+        }
+    }
+    fn tile_swap_picker_mut(&mut self) -> Option<&mut TileSwapPicker> {
+        if let ActiveOverlay::TileSwapPicker(p) = &mut self.active_overlay {
             Some(p)
         } else {
             None
@@ -5941,6 +6086,175 @@ impl YaldaGpuiView {
 
         div()
             .id("workspace-picker")
+            .absolute()
+            .top(px(34.0))
+            .left(px(40.0))
+            .right(px(40.0))
+            .max_h(px(400.0))
+            .bg(menu_bg)
+            .border_1()
+            .border_color(popup_border)
+            .rounded_md()
+            .shadow_lg()
+            .overflow_y_scroll()
+            .child(header_row)
+            .child(entries_col)
+            .child(hints_row)
+    }
+
+    fn handle_tile_swap_picker_key(
+        &mut self,
+        ev: &KeyDownEvent,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let press = keystroke_to_keypress(&ev.keystroke);
+        let (selected, count) = match self.tile_swap_picker_ref() {
+            Some(p) => (p.selected, p.targets.len()),
+            None => return,
+        };
+        match press.key {
+            Key::Esc | Key::Char('q') => {
+                self.clear_overlay();
+            }
+            Key::Char('j') | Key::Down if count > 0 => {
+                if let Some(p) = self.tile_swap_picker_mut() {
+                    p.selected = (p.selected + 1) % count;
+                }
+            }
+            Key::Char('k') | Key::Up if count > 0 => {
+                if let Some(p) = self.tile_swap_picker_mut() {
+                    p.selected = if p.selected == 0 {
+                        count - 1
+                    } else {
+                        p.selected - 1
+                    };
+                }
+            }
+            Key::Char('g') => {
+                if let Some(p) = self.tile_swap_picker_mut() {
+                    p.selected = 0;
+                }
+            }
+            Key::Char('G') if count > 0 => {
+                if let Some(p) = self.tile_swap_picker_mut() {
+                    p.selected = count - 1;
+                }
+            }
+            Key::Enter | Key::Char('l') if count > 0 => {
+                self.commit_tile_swap_picker(selected, cx);
+                return;
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    fn commit_tile_swap_picker(&mut self, selected: usize, cx: &mut Context<Self>) {
+        let Some((workspace_index, source, target)) = self.tile_swap_picker_ref().and_then(|p| {
+            p.targets
+                .get(selected)
+                .copied()
+                .map(|target| (p.workspace_index, p.source, target))
+        }) else {
+            self.clear_overlay();
+            cx.notify();
+            return;
+        };
+
+        let changed = if self.workspace.active_workspace == workspace_index {
+            self.workspace
+                .active_workspace_mut()
+                .filter(|wsp| wsp.focused == source)
+                .is_some_and(|wsp| wsp.swap_focused_with(target))
+        } else {
+            false
+        };
+        self.clear_overlay();
+        if changed {
+            self.save_workspace_state();
+        }
+        cx.notify();
+    }
+
+    fn render_tile_swap_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let picker = self.tile_swap_picker_ref().expect("tile swap picker open");
+        let ov = &self.theme.overlay;
+        let menu_bg: Hsla = nc(ov.bg);
+        let label_fg: Hsla = nc(ov.label);
+        let selected_bg: Hsla = nc(ov.selected_bg);
+        let normal_fg: Hsla = nc(ov.fg);
+        let popup_border: Hsla = nc(ov.border);
+
+        let header_row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .px_4()
+            .py_1()
+            .h(px(28.0))
+            .text_color(label_fg)
+            .font_weight(FontWeight::BOLD)
+            .child("SWAP TILE WITH");
+
+        let mut entries_col = div()
+            .flex()
+            .flex_col()
+            .px_4()
+            .py_2()
+            .text_size(px(14.0))
+            .font_family(self.code_font.clone());
+
+        if let Some(wsp) = self.workspace.workspaces.get(picker.workspace_index) {
+            for (idx, &id) in picker.targets.iter().enumerate() {
+                let Some(window) = wsp.layout.find_leaf(id) else {
+                    continue;
+                };
+                let title = Self::desktop_tile_title(&self.sessions, &window.content, cx);
+                let mark = self
+                    .workspace
+                    .marks
+                    .mark_for_window(id)
+                    .map(|ch| format!(" [{ch}]"))
+                    .unwrap_or_default();
+                let marker = if idx == picker.selected { "▸ " } else { "  " };
+                let mut row = div()
+                    .id(SharedString::from(format!("tile-swap-row-{id}")))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .px_2()
+                    .py_0p5();
+                if idx == picker.selected {
+                    row = row.bg(selected_bg);
+                }
+                entries_col = entries_col.child(
+                    row.child(
+                        div()
+                            .text_color(label_fg)
+                            .child(SharedString::from(marker.to_string())),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_color(normal_fg)
+                            .child(SharedString::from(format!("{title}{mark}"))),
+                    ),
+                );
+            }
+        }
+
+        let hints_row = div()
+            .px_4()
+            .py_1()
+            .text_size(px(11.0))
+            .text_color(label_fg)
+            .child("j/k move · enter select · q/esc cancel");
+
+        div()
+            .id("tile-swap-picker")
             .absolute()
             .top(px(34.0))
             .left(px(40.0))
@@ -8168,6 +8482,22 @@ impl Render for YaldaGpuiView {
                 }))
                 .child(screen_view)
                 .child(self.render_workspace_picker(cx))
+                .into_any_element();
+        }
+
+        // Active-workspace tile swap picker (UXI-Workspace-15).
+        if self.overlay_is_tile_swap() {
+            return div()
+                .track_focus(&self.focus_handle)
+                .key_context("TileSwapPickerView")
+                .size_full()
+                .bg(editor_bg)
+                .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
+                    this.handle_tile_swap_picker_key(ev, w, cx);
+                    cx.stop_propagation();
+                }))
+                .child(screen_view)
+                .child(self.render_tile_swap_picker(cx))
                 .into_any_element();
         }
 
