@@ -192,6 +192,18 @@ pub(crate) enum EffStatus {
     Abandoned,
 }
 
+/// Map a stored status string to an [`EffStatus`] for colouring (a transition
+/// target has no edge context, so `open` shows as `Blocked`).
+pub(crate) fn parse_eff_status(s: &str) -> EffStatus {
+    match s {
+        "done" => EffStatus::Done,
+        "claimed" => EffStatus::Claimed,
+        "failed" => EffStatus::Failed,
+        "abandoned" => EffStatus::Abandoned,
+        _ => EffStatus::Blocked,
+    }
+}
+
 impl EffStatus {
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -313,34 +325,27 @@ pub(crate) fn load_graph(id: &str) -> Result<CogBundle, String> {
 
 // ── Small helpers ────────────────────────────────────────────────────────────
 
-/// Render free-form JSON as readable prose. A string is returned bare; an
-/// object of scalars becomes `key: value` lines; anything else is pretty JSON.
+/// Render free-form JSON as text. A bare string is returned as-is (prose); any
+/// structure (object / array) is pretty-printed with 2-space indentation; other
+/// scalars use their JSON form. `null` → empty.
 pub(crate) fn json_prose(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::Null => String::new(),
         serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Object(map) => map
-            .iter()
-            .map(|(k, val)| format!("{k}: {}", scalar_str(val)))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
-    }
-}
-
-fn scalar_str(v: &serde_json::Value) -> String {
-    match v {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Array(a) => a
-            .iter()
-            .map(scalar_str)
-            .collect::<Vec<_>>()
-            .join(", "),
-        serde_json::Value::Object(_) => {
+        serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
             serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
         }
         other => other.to_string(),
     }
+}
+
+/// Is this JSON a structure (object/array) that should render as a pretty-printed
+/// code block rather than bare prose?
+pub(crate) fn json_is_structured(v: &serde_json::Value) -> bool {
+    matches!(
+        v,
+        serde_json::Value::Object(_) | serde_json::Value::Array(_)
+    )
 }
 
 /// Format an epoch-nanoseconds timestamp as `YYYY-MM-DD HH:MM` (UTC). Cog log

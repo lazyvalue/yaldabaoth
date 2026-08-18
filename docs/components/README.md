@@ -42,7 +42,7 @@ holds the detail for a slice. The UXI ids stay owned by the component, not the f
   session **tag/untag** command is `-33`).
 - [buffer.md](buffer.md) — `Buffer` (Picking / Viewing / Editing).
 - [linear.md](linear.md) — `Linear`.
-- [cog.md](cog.md) — `Cog` (read-only Cog graph explorer tile). `UXI-Cog-1..3`.
+- [cog.md](cog.md) — `Cog` (read-only Cog graph explorer tile). `UXI-Cog-1..4`.
 - [jump-panel.md](jump-panel.md) — `JumpPanel`. `UXI-JumpPanel-1..21` (the
   sidebar navigator, its `Cmd-P` fuzzy palette `UXI-JumpPanel-9`, and per-project
   session **tag folders** `UXI-JumpPanel-20/-21`).
