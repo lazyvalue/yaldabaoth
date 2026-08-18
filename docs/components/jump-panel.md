@@ -1323,3 +1323,47 @@ fires). Preference round-trip is covered by
 `tests.rs::preferences_round_trip_with_text_scale` (the `jump_tag_order` +
 `jump_folded_tags` fields). The GPUI mouse-drag gesture itself is harness gap #2
 (no headless drag-dispatch seam).
+
+### UXI-JumpPanel-22 — Every session row identifies its owning agent provider
+
+**Statement.** Every agent-session row carries a compact, fixed-width provider
+mark at its right edge: **`✳` for Claude** and **`⌬` for Codex**. The two shapes
+are deliberately distinct because both provider names begin with `C`; a single
+initial would be ambiguous. The mark uses the panel's cool supporting-text color
+and never an operational state hue.
+
+Provider identity and operational state remain independent signals. The existing
+leading `◆` / `✦` status mark and orange / green / dim state treatment continue
+to answer *what the agent is doing* (`UXI-JumpPanel-10`); the trailing provider
+mark answers *which agent owns the ACP session*. Active-row selection, archive
+membership, tag folders, ordering, and click/drag behavior are unchanged.
+
+The mark is present for every row source. Roster-backed rows use
+`SessionInfo::provider`, which is server-authoritative. Local-only rows use the
+opened `AgentState::provider`, including the mid-create window before the roster
+catches up. A row never infers provider identity from its editable label.
+
+**Applies to.** `jump_panel_view.rs`: `AgentRow::provider`,
+`jump_panel_agent_rows` (roster and local-only projections), the pure
+`agent_provider_mark`, and `jump_session_row_el` (right-edge painted mark).
+
+**Why.** Mixed Claude and Codex rosters can contain renamed sessions whose labels
+carry no provider clue. The jump panel is the universal session navigator, so it
+must expose the durable provider identity without requiring the user to open the
+conversation and inspect a turn header.
+
+**Status.** `implemented` — provider projection and real-row paint are headless-
+guarded. Exact glyph rasterization and subjective visual balance remain harness
+gap #1.
+
+**Enforcement.** A mixed-provider `verify_harness.rs` guard must drive the real
+`jump_panel_agent_rows` projection for roster-backed Claude and Codex sessions,
+cover a local-only provider row, and use layout probes to prove that the matching
+provider marks paint on the real jump-panel rows while the leading status marks
+remain intact. Exact glyph rasterization and subjective visual balance are
+harness gap #1.
+
+**Negative control observed.** With provider identity present in `AgentRow` but
+before `jump_session_row_el` painted it, the mixed-provider guard failed on the
+first roster row: `alpha claude must paint its Claude ownership mark`. Adding
+the trailing mark returned the guard to green.

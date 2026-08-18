@@ -74,6 +74,10 @@ pub(crate) enum JumpTarget {
 pub(crate) struct AgentRow {
     pub(crate) target: JumpTarget,
     pub(crate) label: String,
+    /// Backend that owns the ACP session. This is projected from server truth
+    /// for roster rows and from the local AgentState for pre-roster rows; it is
+    /// never inferred from the user-editable label (UXI-JumpPanel-22).
+    pub(crate) provider: AgentProvider,
     /// The session's working directory. Rows are grouped under a per-cwd
     /// subheader in `render_jump_panel` (spec-agent-cwd.md; the cwd is the
     /// natural project axis for organizing sessions).
@@ -218,6 +222,16 @@ pub(crate) fn agent_row_marks(status: AgentDotStatus) -> (&'static str, Option<&
     }
 }
 
+/// Compact provider identity carried at the trailing edge of every agent row
+/// (UXI-JumpPanel-22). Both provider names start with C, so distinct shapes are
+/// more legible than an ambiguous initial.
+pub(crate) fn agent_provider_mark(provider: AgentProvider) -> &'static str {
+    match provider {
+        AgentProvider::Claude => "✳",
+        AgentProvider::Codex => "⌬",
+    }
+}
+
 /// The operational status palette is deliberately small and literal.
 pub(crate) fn jump_agent_status_color(
     theme: &yalda::theme::AgentTheme,
@@ -347,6 +361,7 @@ impl YaldaGpuiView {
             rows.push(AgentRow {
                 target: JumpTarget::Roster(info.session_id.clone()),
                 label,
+                provider: info.provider,
                 summary,
                 summary_pending,
                 archived: self.jump_archived_sessions.contains(&info.session_id),
@@ -372,6 +387,7 @@ impl YaldaGpuiView {
             rows.push(AgentRow {
                 target: JumpTarget::Local(id),
                 label: ent.read(cx).label.clone(),
+                provider: ent.read(cx).state.provider,
                 // bug-0020: same sidecar fallback as the roster rows above, for a
                 // session whose sid the roster hasn't listed yet.
                 summary: ent
@@ -1705,11 +1721,16 @@ fn jump_session_row_el(
         &row.label,
         Some(badge_glyph),
         Some(badge_color),
+        Some(format!("jump-session-status-mark-{i}{id_suffix}")),
         // UXI-JumpPanel-10: tabs + All-group headers already name activity.
         // Repeating "working" / "your turn" on every row is redundant noise.
-        None,
-        None,
-        Some(format!("jump-session-status-word-{i}{id_suffix}")),
+        // UXI-JumpPanel-22: the trailing mark is provider identity, not state.
+        Some(agent_provider_mark(row.provider)),
+        Some(supporting_text),
+        Some(format!(
+            "jump-session-provider-{i}{id_suffix}-{}",
+            row.provider.label()
+        )),
         st,
         sel_bg,
         active.then_some(selection_mark),
@@ -1851,18 +1872,22 @@ fn jump_nav_row(
     sel_bg: Hsla,
     active: Option<Hsla>,
 ) -> gpui::Stateful<gpui::Div> {
-    jump_nav_row_hinted(id, label, badge, badge_color, hint, None, None, st, sel_bg, active)
+    jump_nav_row_hinted(
+        id, label, badge, badge_color, None, hint, None, None, st, sel_bg, active,
+    )
 }
 
-/// [`jump_nav_row`] with an explicit color and optional paint probe for the
-/// right-edge hint. Workspace `ctrl-<n>` digits stay dim; Jump Panel session
-/// rows deliberately pass no hint (`UXI-JumpPanel-10`).
+/// [`jump_nav_row`] with explicit colors and optional paint probes for the
+/// leading badge and right-edge hint. Workspace `ctrl-<n>` digits stay dim;
+/// Jump Panel session rows use the hint cell for provider identity while still
+/// omitting redundant status words (`UXI-JumpPanel-10/-22`).
 #[allow(clippy::too_many_arguments)]
 fn jump_nav_row_hinted(
     id: impl Into<ElementId>,
     label: &str,
     badge: Option<&str>,
     badge_color: Option<Hsla>,
+    badge_probe: Option<String>,
     hint: Option<&str>,
     hint_color: Option<Hsla>,
     hint_probe: Option<String>,
@@ -1875,6 +1900,16 @@ fn jump_nav_row_hinted(
         "(untitled)".to_string()
     } else {
         label.to_string()
+    };
+    let badge_el = div()
+        .w(px(16.0))
+        .flex_none()
+        .text_color(badge_color.unwrap_or(st.dim))
+        .child(SharedString::from(badge.unwrap_or("").to_string()));
+    let badge_el = if let Some(probe) = badge_probe {
+        probe_bounds_dyn(probe, badge_el.into_any_element())
+    } else {
+        badge_el.into_any_element()
     };
     let mut row = div()
         .id(id)
@@ -1894,13 +1929,7 @@ fn jump_nav_row_hinted(
         .border_color(active.unwrap_or(transparent))
         .bg(if active.is_some() { sel_bg } else { transparent })
         .hover(|s| s.bg(sel_bg))
-        .child(
-            div()
-                .w(px(16.0))
-                .flex_none()
-                .text_color(badge_color.unwrap_or(st.dim))
-                .child(SharedString::from(badge.unwrap_or("").to_string())),
-        )
+        .child(badge_el)
         .child(
             div()
                 .flex_1()
