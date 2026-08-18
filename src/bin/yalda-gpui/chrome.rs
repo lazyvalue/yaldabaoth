@@ -183,7 +183,16 @@ impl YaldaGpuiView {
             // Wire the arrangement toggle on the container (the common ancestor
             // of the focused tile in this view) so `Ctrl-W a` / the menu can flip
             // back to the plane.
-            .on_action(cx.listener(Self::toggle_workspace_columns));
+            .on_action(cx.listener(Self::toggle_workspace_columns))
+            .on_action(cx.listener(Self::swap_tile_left))
+            .on_action(cx.listener(Self::swap_tile_down))
+            .on_action(cx.listener(Self::swap_tile_up))
+            .on_action(cx.listener(Self::swap_tile_right))
+            .on_action(cx.listener(Self::promote_tile))
+            .on_action(cx.listener(Self::open_swap_tile_picker))
+            .on_action(cx.listener(Self::rotate_tiles_forward))
+            .on_action(cx.listener(Self::rotate_tiles_backward))
+            .on_action(cx.listener(Self::undo_arrangement));
 
         for id in order {
             let is_focused = id == focused_id;
@@ -422,6 +431,18 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::reset_workspace_view))
             // Arrangement toggle (UXI-Workspace-14): flip the plane to columns.
             .on_action(cx.listener(Self::toggle_workspace_columns))
+            // Dwm-style placement mutations (UXI-Workspace-15). These live on
+            // the arrangement root so every App kind—and Card/Minimap, where
+            // no live tile body exists—has the handlers in its focus ancestry.
+            .on_action(cx.listener(Self::swap_tile_left))
+            .on_action(cx.listener(Self::swap_tile_down))
+            .on_action(cx.listener(Self::swap_tile_up))
+            .on_action(cx.listener(Self::swap_tile_right))
+            .on_action(cx.listener(Self::promote_tile))
+            .on_action(cx.listener(Self::open_swap_tile_picker))
+            .on_action(cx.listener(Self::rotate_tiles_forward))
+            .on_action(cx.listener(Self::rotate_tiles_backward))
+            .on_action(cx.listener(Self::undo_arrangement))
             // Wheel/trackpad routing (Stage C, spec Behavior 5). This handler
             // fires in the BUBBLE phase, so at Full a scroll a live tile's inner
             // list already consumed still reaches here — `desktop_scroll` guards
@@ -794,7 +815,7 @@ impl YaldaGpuiView {
     /// holds a live `&mut App` (`content_ptr`) into the layout tree, and
     /// reborrowing all of `&self` here would alias it (UB under Stacked
     /// Borrows). `sessions` is field-disjoint from the layout tree.
-    fn desktop_tile_title(sessions: &AgentSessions, content: &App, cx: &GpuiApp) -> String {
+    pub(crate) fn desktop_tile_title(sessions: &AgentSessions, content: &App, cx: &GpuiApp) -> String {
         match content {
             App::Buffer(BufferApp::Viewing(d)) => d.file_label.to_string(),
             App::Buffer(BufferApp::Editing(e)) => e.file_label.to_string(),

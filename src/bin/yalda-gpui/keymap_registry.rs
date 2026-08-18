@@ -125,6 +125,15 @@ const DEFAULT_BINDINGS: &[DefaultBinding] = &[
     b!("ctrl-w j",          "FocusDown",       GLOBAL, "Splits & focus", "Focus tile down"),
     b!("ctrl-w w",          "FocusNext",       GLOBAL, "Splits & focus", "Focus next tile"),
     b!("ctrl-w shift-w",    "FocusPrev",       GLOBAL, "Splits & focus", "Focus previous tile"),
+    b!("ctrl-w shift-h",    "SwapTileLeft",    GLOBAL, "Tile placement", "Swap tile left"),
+    b!("ctrl-w shift-j",    "SwapTileDown",    GLOBAL, "Tile placement", "Swap tile down"),
+    b!("ctrl-w shift-k",    "SwapTileUp",      GLOBAL, "Tile placement", "Swap tile up"),
+    b!("ctrl-w shift-l",    "SwapTileRight",   GLOBAL, "Tile placement", "Swap tile right"),
+    b!("ctrl-w enter",      "PromoteTile",      GLOBAL, "Tile placement", "Promote tile to first position"),
+    b!("ctrl-w x",          "SwapTilePicker",  GLOBAL, "Tile placement", "Swap tile with…"),
+    b!("ctrl-w r",          "RotateTilesForward",  GLOBAL, "Tile placement", "Rotate tiles forward"),
+    b!("ctrl-w shift-r",    "RotateTilesBackward", GLOBAL, "Tile placement", "Rotate tiles backward"),
+    b!("ctrl-w u",          "UndoArrangement", GLOBAL, "Tile placement", "Undo tile arrangement"),
     // Plane camera (spec-infinite-plane-workspace.md). `Ctrl-W`+plain-key
     // SEQUENCES (reliable on macOS; a bare `Ctrl`+digit is not). `Ctrl-W -/=` are
     // reclaimed from the retired ResizeShrink/Equalize; `Ctrl-W 0` is new.

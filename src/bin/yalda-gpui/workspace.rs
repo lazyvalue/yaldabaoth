@@ -649,6 +649,17 @@ pub struct DesktopPan {
     pub start_pan: (f32, f32),
 }
 
+/// One undo point for the dwm-style placement command family
+/// (`UXI-Workspace-15`). Camera and transient pointer state are deliberately
+/// absent: arrangement undo restores only stable tile footprints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlacementSnapshot {
+    slots: Vec<(WindowId, Slot)>,
+    spans: HashMap<WindowId, Span>,
+}
+
+const ARRANGEMENT_HISTORY_LIMIT: usize = 32;
+
 /// Per-workspace desktop-mode geometry (spec-desktop-mode.md). The layout tree
 /// remains the content owner; this owns ONLY placement. Invariant
 /// (Behavior 2): exactly one entry per tree leaf, no two entries share a
@@ -678,9 +689,117 @@ pub struct DesktopState {
     /// focused tile only when focus CHANGED since the last frame, so a
     /// manual pan away from the focused tile isn't fought every frame.
     pub last_reveal: Option<WindowId>,
+    /// Bounded, non-persisted undo stack for successful keyboard placement
+    /// commands. Structural edits, drag, and edge-resize invalidate it.
+    arrangement_history: Vec<PlacementSnapshot>,
 }
 
 impl DesktopState {
+    /// Rehydrate persisted stable placement + camera while resetting every
+    /// transient field and the non-persisted arrangement undo history.
+    pub fn restored(
+        mut slots: Vec<(WindowId, Slot)>,
+        spans: HashMap<WindowId, Span>,
+        camera: Camera,
+    ) -> Self {
+        slots.sort_by_key(|&(_, slot)| slot);
+        Self {
+            slots,
+            spans,
+            camera,
+            ..Self::default()
+        }
+    }
+
+    fn placement_snapshot(&self) -> PlacementSnapshot {
+        PlacementSnapshot {
+            slots: self.slots.clone(),
+            spans: self.spans.clone(),
+        }
+    }
+
+    fn push_arrangement_undo(&mut self, snapshot: PlacementSnapshot) {
+        if self.arrangement_history.len() == ARRANGEMENT_HISTORY_LIMIT {
+            self.arrangement_history.remove(0);
+        }
+        self.arrangement_history.push(snapshot);
+    }
+
+    fn invalidate_arrangement_history(&mut self) {
+        self.arrangement_history.clear();
+    }
+
+    /// Exchange two complete placement footprints (`Slot` + `Span`). The Apps,
+    /// stable ids, focus, camera, and transient state are untouched. Returns
+    /// `false` without recording history when either tile is unplaced or both
+    /// ids are the same.
+    pub fn swap_placements(&mut self, a: WindowId, b: WindowId) -> bool {
+        if a == b {
+            return false;
+        }
+        let (Some((a_slot, a_span)), Some((b_slot, b_span))) = (self.rect_of(a), self.rect_of(b))
+        else {
+            return false;
+        };
+        let before = self.placement_snapshot();
+
+        for (id, slot) in &mut self.slots {
+            if *id == a {
+                *slot = b_slot;
+            } else if *id == b {
+                *slot = a_slot;
+            }
+        }
+        self.set_span_raw(a, b_span);
+        self.set_span_raw(b, a_span);
+        self.sort();
+        self.push_arrangement_undo(before);
+        true
+    }
+
+    /// Rotate tile ids forward/backward through the current signed reading-order
+    /// footprints. Forward moves each tile to the next footprint and wraps the
+    /// last tile to the first; backward is the inverse.
+    pub fn rotate_placements(&mut self, forward: bool) -> bool {
+        if self.slots.len() < 2 {
+            return false;
+        }
+        let before = self.placement_snapshot();
+        let ids: Vec<_> = self.slots.iter().map(|&(id, _)| id).collect();
+        let footprints: Vec<_> = ids.iter().filter_map(|&id| self.rect_of(id)).collect();
+        if footprints.len() != ids.len() {
+            return false;
+        }
+
+        self.slots.clear();
+        self.spans.clear();
+        let n = ids.len();
+        for (idx, id) in ids.into_iter().enumerate() {
+            let footprint_idx = if forward {
+                (idx + 1) % n
+            } else {
+                (idx + n - 1) % n
+            };
+            let (slot, span) = footprints[footprint_idx];
+            self.slots.push((id, slot));
+            self.set_span_raw(id, span);
+        }
+        self.sort();
+        self.push_arrangement_undo(before);
+        true
+    }
+
+    /// Restore the last keyboard-placement snapshot. Undo itself does not push
+    /// another entry; repeated calls walk backward through successful commands.
+    pub fn undo_arrangement(&mut self) -> bool {
+        let Some(snapshot) = self.arrangement_history.pop() else {
+            return false;
+        };
+        self.slots = snapshot.slots;
+        self.spans = snapshot.spans;
+        self.sort();
+        true
+    }
     pub fn slot_of(&self, id: WindowId) -> Option<Slot> {
         self.slots.iter().find(|(w, _)| *w == id).map(|&(_, s)| s)
     }
@@ -710,6 +829,13 @@ impl DesktopState {
 
     /// Commit a tile's span, keeping the map sparse (1 × 1 stores nothing).
     pub fn set_span(&mut self, id: WindowId, span: Span) {
+        if self.span_of(id) != span {
+            self.invalidate_arrangement_history();
+        }
+        self.set_span_raw(id, span);
+    }
+
+    fn set_span_raw(&mut self, id: WindowId, span: Span) {
         if span == Span::ONE {
             self.spans.remove(&id);
         } else {
@@ -824,6 +950,9 @@ impl DesktopState {
     /// free, so neighbors must not move.
     pub fn set_anchor(&mut self, id: WindowId, slot: Slot) {
         if let Some(entry) = self.slots.iter_mut().find(|(w, _)| *w == id) {
+            if entry.1 != slot {
+                self.arrangement_history.clear();
+            }
             entry.1 = slot;
             self.sort();
         }
@@ -945,6 +1074,9 @@ impl DesktopState {
             self.sort();
             changed = true;
         }
+        if changed {
+            self.invalidate_arrangement_history();
+        }
         changed
     }
 
@@ -1003,6 +1135,19 @@ impl DesktopState {
             (idx + n - 1) % n
         };
         Some(self.slots[next].0)
+    }
+
+    /// Non-wrapping signed reading-order neighbor. This is the visible
+    /// left/right adjacency used by the equal-width Columns arrangement.
+    pub fn sequence_adjacent(&self, from: WindowId, forward: bool) -> Option<WindowId> {
+        let idx = self.slots.iter().position(|&(id, _)| id == from)?;
+        if forward {
+            self.slots.get(idx + 1).map(|&(id, _)| id)
+        } else {
+            idx.checked_sub(1)
+                .and_then(|prev| self.slots.get(prev))
+                .map(|&(id, _)| id)
+        }
     }
 
     /// Signed bounding box of occupied slots (`spec-infinite-plane-workspace.md`
@@ -1231,6 +1376,63 @@ impl<C> Workspace<C> {
             WorkspaceView::Plane => WorkspaceView::Columns,
             WorkspaceView::Columns => WorkspaceView::Plane,
         };
+    }
+
+    /// Resolve the visible placement target for a directional swap
+    /// (`UXI-Workspace-15`). Plane uses the same spatial resolver as lower-case
+    /// focus motion. Columns has only visible left/right adjacency; up/down is
+    /// deliberately a no-op rather than consulting hidden plane geometry.
+    pub fn placement_target(&self, dir: FocusDir) -> Option<WindowId> {
+        match (self.view, dir) {
+            (WorkspaceView::Columns, FocusDir::Left) => {
+                self.desktop.sequence_adjacent(self.focused, false)
+            }
+            (WorkspaceView::Columns, FocusDir::Right) => {
+                self.desktop.sequence_adjacent(self.focused, true)
+            }
+            (WorkspaceView::Columns, FocusDir::Up | FocusDir::Down) => None,
+            (WorkspaceView::Plane, dir) => {
+                let spatial = match dir {
+                    FocusDir::Left => SpatialDir::Left,
+                    FocusDir::Right => SpatialDir::Right,
+                    FocusDir::Up => SpatialDir::Up,
+                    FocusDir::Down => SpatialDir::Down,
+                };
+                self.desktop.spatial_neighbor(self.focused, spatial)
+            }
+        }
+    }
+
+    /// Swap the focused tile with its visible directional neighbor.
+    pub fn swap_focused_direction(&mut self, dir: FocusDir) -> bool {
+        let Some(target) = self.placement_target(dir) else {
+            return false;
+        };
+        self.desktop.swap_placements(self.focused, target)
+    }
+
+    /// Swap the focused tile with an explicitly chosen tile in this workspace.
+    pub fn swap_focused_with(&mut self, target: WindowId) -> bool {
+        if self.layout.find_leaf(target).is_none() {
+            return false;
+        }
+        self.desktop.swap_placements(self.focused, target)
+    }
+
+    /// Promote the focused tile into the first signed reading-order footprint.
+    pub fn promote_focused(&mut self) -> bool {
+        let Some(&(first, _)) = self.desktop.slots.first() else {
+            return false;
+        };
+        self.desktop.swap_placements(self.focused, first)
+    }
+
+    pub fn rotate_placements(&mut self, forward: bool) -> bool {
+        self.desktop.rotate_placements(forward)
+    }
+
+    pub fn undo_arrangement(&mut self) -> bool {
+        self.desktop.undo_arrangement()
     }
 
     pub fn display_label(&self) -> &str {
@@ -2508,6 +2710,133 @@ mod desktop_tests {
             v
         };
         assert_eq!(before, after, "rejected drop moved nothing");
+    }
+
+    /// UXI-Workspace-15: swap exchanges complete footprints, not just anchors,
+    /// and undo restores the byte-identical placement snapshot. Different spans
+    /// prove the operation cannot accidentally create an overlap.
+    #[test]
+    fn placement_swap_exchanges_footprints_and_undo_restores() {
+        let mut d = DesktopState::default();
+        put(&mut d, 1, 0, 0);
+        put(&mut d, 2, 3, 5);
+        d.set_span(1, Span::new(2, 3));
+        d.set_span(2, Span::new(4, 1));
+        let before = d.placement_snapshot();
+
+        assert!(d.swap_placements(1, 2));
+        assert_eq!(d.rect_of(1), Some((Slot::new(3, 5), Span::new(4, 1))));
+        assert_eq!(d.rect_of(2), Some((Slot::new(0, 0), Span::new(2, 3))));
+        assert!(d.rect_free(Slot::new(3, 5), Span::new(4, 1), Some(1)));
+        assert!(d.rect_free(Slot::new(0, 0), Span::new(2, 3), Some(2)));
+
+        assert!(d.undo_arrangement());
+        assert_eq!(d.placement_snapshot(), before);
+        assert!(
+            !d.undo_arrangement(),
+            "one successful command creates one undo point"
+        );
+
+        assert!(!d.swap_placements(1, 1), "self-swap is a no-op");
+        assert!(!d.swap_placements(1, 99), "unplaced target is a no-op");
+        assert!(!d.undo_arrangement(), "no-op swaps create no history");
+    }
+
+    /// UXI-Workspace-15: rotation follows signed reading order and a later
+    /// non-command move invalidates history rather than letting undo erase it.
+    #[test]
+    fn placement_rotation_direction_and_history_invalidation() {
+        let mut d = DesktopState::default();
+        put(&mut d, 1, 0, 0);
+        put(&mut d, 2, 0, 2);
+        put(&mut d, 3, 1, 0);
+        let original = d.placement_snapshot();
+
+        assert!(d.rotate_placements(true));
+        assert_eq!(d.slot_of(1), Some(Slot::new(0, 2)));
+        assert_eq!(d.slot_of(2), Some(Slot::new(1, 0)));
+        assert_eq!(d.slot_of(3), Some(Slot::new(0, 0)));
+        assert!(d.undo_arrangement());
+        assert_eq!(d.placement_snapshot(), original);
+
+        assert!(d.rotate_placements(false));
+        assert_eq!(d.slot_of(1), Some(Slot::new(1, 0)));
+        assert_eq!(d.slot_of(2), Some(Slot::new(0, 0)));
+        assert_eq!(d.slot_of(3), Some(Slot::new(0, 2)));
+        assert!(
+            d.free_drop(1, Slot::new(4, 4)),
+            "unrelated drag-style move commits"
+        );
+        assert!(
+            !d.undo_arrangement(),
+            "non-command placement invalidates command history"
+        );
+
+        let mut one = DesktopState::default();
+        put(&mut one, 1, 0, 0);
+        assert!(!one.rotate_placements(true));
+        assert!(!one.undo_arrangement());
+
+        let mut two = DesktopState::default();
+        put(&mut two, 1, 0, 0);
+        put(&mut two, 2, 0, 3);
+        assert!(two.rotate_placements(true), "two tiles form a valid cycle");
+        assert_eq!(two.slot_of(1), Some(Slot::new(0, 3)));
+        assert_eq!(two.slot_of(2), Some(Slot::new(0, 0)));
+    }
+
+    /// UXI-Workspace-15: restoring persisted placement retains every stable
+    /// field, sorts slots, and starts with an empty non-persisted undo history.
+    #[test]
+    fn placement_restore_retains_stable_fields_and_resets_history() {
+        let slots = vec![(2, Slot::new(3, 4)), (1, Slot::new(-1, 2))];
+        let spans = HashMap::from([(2, Span::new(3, 2))]);
+        let camera = Camera {
+            pan: (7.5, -2.0),
+            zoom: Detail::Card,
+        };
+        let d = DesktopState::restored(slots, spans.clone(), camera);
+
+        assert_eq!(
+            d.slots,
+            vec![(1, Slot::new(-1, 2)), (2, Slot::new(3, 4))]
+        );
+        assert_eq!(d.spans, spans);
+        assert_eq!(d.camera, camera);
+        assert!(d.drag.is_none() && d.resize.is_none() && d.pan_drag.is_none());
+        assert!(d.arrangement_history.is_empty());
+    }
+
+    /// UXI-Workspace-15: Columns resolves only visible horizontal adjacency;
+    /// Plane resolves all four directions through the existing spatial model.
+    #[test]
+    fn placement_target_is_view_aware_and_promotion_keeps_focus() {
+        let mut wsp = Workspace::with_layout(
+            "workspace-1".into(),
+            Layout::Leaf(Window { id: 2, content: () }),
+            2,
+            ProjectId(1),
+        );
+        put(&mut wsp.desktop, 1, 0, 0);
+        put(&mut wsp.desktop, 2, 0, 4);
+        put(&mut wsp.desktop, 3, 4, 4);
+
+        wsp.view = WorkspaceView::Columns;
+        assert_eq!(wsp.placement_target(FocusDir::Left), Some(1));
+        assert_eq!(wsp.placement_target(FocusDir::Right), Some(3));
+        assert_eq!(wsp.placement_target(FocusDir::Up), None);
+        assert_eq!(wsp.placement_target(FocusDir::Down), None);
+
+        wsp.view = WorkspaceView::Plane;
+        assert_eq!(wsp.placement_target(FocusDir::Left), Some(1));
+        assert_eq!(wsp.placement_target(FocusDir::Down), Some(3));
+        assert!(wsp.promote_focused());
+        assert_eq!(
+            wsp.focused, 2,
+            "stable focused id travels with the footprint"
+        );
+        assert_eq!(wsp.desktop.slot_of(2), Some(Slot::new(0, 0)));
+        assert!(!wsp.promote_focused(), "already first is a no-op");
     }
 
     /// Old-binary safety (spec Behavior 7): the multi-mode surface is retired,
