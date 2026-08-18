@@ -2,8 +2,7 @@
 
 **Date:** 2026-08-18
 **Branches touched:** `codex/workspace-placement-commands` (`0cc2bff` —
-feature/spec/tests), then `main` (merge commit follows; worklog commit is
-separate)
+feature/spec/tests), then `main` (`08cd88e` — merge; this worklog update follows)
 
 ## Cog execution evidence
 
@@ -37,8 +36,9 @@ frontier 6: omega [open] (omega)
   production-path negative controls.
 - `9uiq` `document-and-log`: claimed → closed; output records the README command
   reference, implemented UX invariant, this worklog, and its validation.
-- `yrh0` `integrate-verify`: claimed → closed; output records the feature and
-  merge commits plus focused verification on `main`.
+- `yrh0` `integrate-verify`: claimed → closed; output records feature commit
+  `0cc2bff`, worklog commit `5797831`, merge commit `08cd88e`, and focused
+  verification on `main`.
 - `sog1` `omega`: claimed → closed with output aggregating the shipped UX,
   implementation, verification, documentation, and integration evidence.
 
