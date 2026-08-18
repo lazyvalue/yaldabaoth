@@ -20236,3 +20236,125 @@ fn cog_click_graph_row_opens(cx: &mut TestAppContext) {
         "clicking a graph row opens it (tile enters loading)"
     );
 }
+
+#[cfg(test)]
+fn cog_tile_watch_gen(view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext) -> u64 {
+    view.update(vcx, |v, _| match v.workspace.focused_content() {
+        Some(crate::App::Cog(tile)) => tile.watch_gen,
+        _ => panic!("expected a Cog tile"),
+    })
+}
+
+/// UXI-Cog-6: live `cog graph watch` events fold into the events pane via the
+/// REAL reducer (`cog_push_event`) — newest first, generation-guarded, invalid
+/// JSON dropped. (The live subprocess itself is runtime gap #2 and is not spawned
+/// under test.) The newest-first insert is the negative-control target.
+#[gpui::test]
+fn cog_events_stream_into_pane(cx: &mut TestAppContext) {
+    let (view, vcx, cv, wid) = boot_with_cog(cx);
+    let req = cog_tile_req(&view, vcx);
+    view.update(vcx, |v, cx| {
+        v.cog_apply(
+            wid,
+            req,
+            Ok(crate::CogFetch::Graph(Box::new(cog_test_bundle(vec![cog_test_node(
+                "n1",
+                "only",
+                "done",
+                serde_json::json!({"purpose": "a"}),
+            )])))),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    assert_eq!(cv.update(vcx, |c, _| c.events_len()), 0, "no events yet");
+
+    let generation = cog_tile_watch_gen(&view, vcx);
+    view.update(vcx, |v, cx| {
+        v.cog_push_event(wid, generation, r#"{"kind":"claimed","node":"n1"}"#.into(), cx);
+        v.cog_push_event(wid, generation, r#"{"ready":["n1"],"status":{"status":"open"}}"#.into(), cx);
+    });
+    vcx.run_until_parked();
+    assert_eq!(cv.update(vcx, |c, _| c.events_len()), 2, "two events streamed in");
+    assert_eq!(
+        cv.update(vcx, |c, _| c.newest_event_seq()),
+        Some(2),
+        "newest event (seq 2) renders first"
+    );
+
+    // A stale generation (a killed prior watcher) is dropped.
+    view.update(vcx, |v, cx| {
+        v.cog_push_event(wid, generation.wrapping_sub(1), r#"{"stale":true}"#.into(), cx);
+    });
+    vcx.run_until_parked();
+    assert_eq!(cv.update(vcx, |c, _| c.events_len()), 2, "stale-generation event dropped");
+
+    // Non-JSON is dropped, not panicked.
+    view.update(vcx, |v, cx| {
+        v.cog_push_event(wid, generation, "not json".into(), cx);
+    });
+    vcx.run_until_parked();
+    assert_eq!(cv.update(vcx, |c, _| c.events_len()), 2, "invalid JSON dropped");
+}
+
+/// UXI-Cog-6: the events pane is the third column, present only in a graph, and
+/// paints. Tab cycles focus Selector → Detail → Events → Selector.
+#[gpui::test]
+fn cog_events_pane_paints_and_focus_cycles(cx: &mut TestAppContext) {
+    use crate::{KMods, Key, KeyPress};
+    let tab = || KeyPress::new(Key::Tab, KMods::NONE);
+
+    let (view, vcx, cv, wid) = boot_with_cog(cx);
+    let req = cog_tile_req(&view, vcx);
+
+    // Explorer: no events pane.
+    view.update(vcx, |v, cx| {
+        v.cog_apply(
+            wid,
+            req,
+            Ok(crate::CogFetch::Graphs(vec![cog_test_graph("a", "Alpha")])),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let explorer_events = crate::layout_probe_get("cog-events");
+    crate::layout_probe_end();
+    assert!(explorer_events.is_none(), "explorer has no events pane");
+
+    // Load a graph → events pane paints as a real third column.
+    let req = cog_tile_req(&view, vcx);
+    crate::layout_probe_begin();
+    view.update(vcx, |v, cx| {
+        v.cog_apply(
+            wid,
+            req,
+            Ok(crate::CogFetch::Graph(Box::new(cog_test_bundle(vec![cog_test_node(
+                "n1",
+                "only",
+                "done",
+                serde_json::json!({"purpose": "a"}),
+            )])))),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    let events = crate::layout_probe_get("cog-events");
+    crate::layout_probe_end();
+    let (_, _, w, h) = events.expect("events pane paints in a loaded graph");
+    assert!(w > 0.0 && h > 0.0, "events pane has real size ({w}x{h})");
+
+    // Focus starts on the selector; Tab cycles selector → detail → events → selector.
+    assert!(cv.update(vcx, |c, _| c.focused_selector()), "focus starts on selector");
+    view.update(vcx, |v, cx| v.handle_cog_press(tab(), cx));
+    vcx.run_until_parked();
+    assert!(cv.update(vcx, |c, _| c.focused_right()), "tab → detail");
+    view.update(vcx, |v, cx| v.handle_cog_press(tab(), cx));
+    vcx.run_until_parked();
+    assert!(cv.update(vcx, |c, _| c.focused_events()), "tab → events");
+    view.update(vcx, |v, cx| v.handle_cog_press(tab(), cx));
+    vcx.run_until_parked();
+    assert!(cv.update(vcx, |c, _| c.focused_selector()), "tab → selector");
+}

@@ -2501,7 +2501,7 @@ impl YaldaGpuiView {
                     .pl_2()
                     .text_color(dim)
                     .child(SharedString::new_static(
-                        "j/k select · ⏎/l/→ detail · esc/h back · tab switch · d/u scroll · r refresh",
+                        "j/k select · ⏎/l detail · tab cycles panes (detail · events) · d/u scroll · esc back · r refresh",
                     )),
             );
 
