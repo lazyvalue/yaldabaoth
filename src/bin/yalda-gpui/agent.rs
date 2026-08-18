@@ -456,23 +456,23 @@ pub(crate) fn tool_inline_detail(tc: &yalda::acp_channel::ToolCall) -> Option<St
     // Execute/Bash: show truncated command.
     if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
         let first_line = cmd.lines().next().unwrap_or(cmd);
-        let truncated = if first_line.len() > 60 {
-            format!("{}…", &first_line[..60])
-        } else {
-            first_line.to_string()
-        };
-        return Some(truncated);
+        return Some(truncate_inline_detail(first_line, 60));
     }
     // Search (Grep/Glob): show pattern.
     if let Some(pat) = input.get("pattern").and_then(|v| v.as_str()) {
-        let truncated = if pat.len() > 40 {
-            format!("{}…", &pat[..40])
-        } else {
-            pat.to_string()
-        };
-        return Some(truncated);
+        return Some(truncate_inline_detail(pat, 40));
     }
     None
+}
+
+/// Clamp inline tool details by Unicode scalar values, never by UTF-8 bytes.
+/// ACP inputs are arbitrary user/tool text, so a display limit can land inside
+/// a multi-byte character even when the string itself is valid UTF-8.
+fn truncate_inline_detail(value: &str, max_chars: usize) -> String {
+    match value.char_indices().nth(max_chars) {
+        Some((byte, _)) => format!("{}…", &value[..byte]),
+        None => value.to_string(),
+    }
 }
 
 /// Short type label for a tool call used in collapsed group headers

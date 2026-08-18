@@ -333,6 +333,34 @@ fn fold_header_line_is_single_short_line() {
     assert_eq!(fold_header_line(""), "");
 }
 
+/// bug-0041: inline tool details are bounded by characters, not UTF-8 bytes.
+/// The reported Bash command places a four-byte emoji across the old byte-60
+/// slice, which panicked while building the folded tool-group header.
+#[test]
+fn tool_inline_detail_truncates_unicode_without_splitting_a_character() {
+    use yalda::acp_channel::{ToolCall, ToolCallId};
+
+    let mut command = ToolCall::new(ToolCallId::from("unicode-command"), "Bash".to_string());
+    command.raw_input = Some(serde_json::json!({
+        "command": "cd /Users/scott/ws/yaldabaoth; grep -rn \"pending_images\\|🖼\\|pending_image\\|chip\" src/bin/yalda-gpui/screens.rs src/bin/yalda-gpui/agent.rs src/bin/yalda-gpui/transcript_view.rs | head -30"
+    }));
+    let detail = tool_inline_detail(&command).expect("command detail");
+    assert_eq!(detail.chars().count(), 61, "60 characters plus the ellipsis");
+    assert!(detail.contains('🖼'), "the boundary-crossing emoji remains intact: {detail:?}");
+    assert!(detail.ends_with('…'));
+
+    let mut search = ToolCall::new(ToolCallId::from("unicode-pattern"), "Grep".to_string());
+    search.raw_input = Some(serde_json::json!({
+        "pattern": format!("{}🖼tail", "a".repeat(39))
+    }));
+    let expected_pattern = format!("{}🖼…", "a".repeat(39));
+    assert_eq!(
+        tool_inline_detail(&search).as_deref(),
+        Some(expected_pattern.as_str()),
+        "the search-pattern branch uses the same character-safe boundary"
+    );
+}
+
 /// REGRESSION ("/clear then can't type"): the `/clear` server path builds a fresh
 /// session then `settle_input_focus()`s it. A fresh (empty) worksheet opens a VISIBLE
 /// tail You-block that is immediately TYPEABLE (focus=Compose, Insert) — you just
