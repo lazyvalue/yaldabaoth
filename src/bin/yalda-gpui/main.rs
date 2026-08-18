@@ -219,7 +219,6 @@ actions!(
         OpenKeymap,
         OpenMenu,
         OpenLocalMenu,
-        OpenGlobalMenu,
         Quit,
         Restart,
         // Buffer cycling
@@ -1542,22 +1541,36 @@ struct TagInputOverlay {
 /// (search, claude-attach via socket, save-quit, …) that have no GPUI
 /// counterpart yet.
 fn gpui_menu() -> Vec<MenuNode> {
-    // Workspace-scoped command menu (`.` leader). Per untitled.md
-    // "Workspace › Commands (12 jun)": only these commands belong in the
-    // workspace scope. Tile-scoped commands live in the <space> local menus;
-    // window/workspace/layout management lives on its Ctrl-W / Cmd chords;
-    // quit is Cmd-Q.
+    // The SHELL menu (`.` leader) — verbs whose object is the shell: tiles,
+    // workspaces, appearance, system (ADR-0032, UXI-Menu-6). This is the sole
+    // non-`space` leader; it absorbed the retired `?` global menu (workspace
+    // list/ops, new-project, system console, jump-panel toggle). Verbs on the
+    // FOCUSED App live in the `<space>` local menus instead; motions are direct
+    // keys; workspace jump stays on its ctrl-1..0 chords (never a menu item).
     vec![
         MenuNode::entry("c", "set cwd", "workspace-set-cwd"),
         MenuNode::submenu(
             "n",
-            "new",
+            "new tile",
             vec![
                 MenuNode::entry("a", "agent", "new-agent-tile"),
                 MenuNode::entry("b", "buffer", "new-buffer-tile"),
                 MenuNode::entry("l", "linear", "new-linear-tile"),
                 MenuNode::entry("c", "cog", "new-cog-tile"),
                 MenuNode::entry("k", "keybindings", "new-keymap-tile"),
+            ],
+        ),
+        // Workspace + project ops — formerly the `?` global menu. (The numbered
+        // workspace list stays on ctrl-1..0; it must work while typing, so it is
+        // a direct chord, not a menu entry — UXI-Menu-6.)
+        MenuNode::submenu(
+            "w",
+            "workspace",
+            vec![
+                MenuNode::entry("n", "new workspace", "new-workspace"),
+                MenuNode::entry("r", "rename workspace", "rename-workspace"),
+                MenuNode::entry("x", "close workspace", "close-workspace"),
+                MenuNode::entry("p", "new project", "new-project"),
             ],
         ),
         MenuNode::submenu(
@@ -1577,29 +1590,39 @@ fn gpui_menu() -> Vec<MenuNode> {
                 MenuNode::entry("0", "reset to origin", "plane-reset-view"),
             ],
         ),
+        // System / dev — formerly split between `.` (rebuild) and `?` (console).
+        MenuNode::submenu(
+            "s",
+            "system",
+            vec![
+                MenuNode::entry("r", "rebuild and restart gui", "dev-restart-gui"),
+                MenuNode::entry("R", "rebuild and restart all", "dev-restart-all"),
+                MenuNode::entry("`", "system console", "open-system-console"),
+            ],
+        ),
         MenuNode::entry("a", "toggle plane / columns", "workspace-toggle-columns"),
-        MenuNode::entry("r", "rebuild and restart gui", "dev-restart-gui"),
-        MenuNode::entry("R", "rebuild and restart all", "dev-restart-all"),
+        MenuNode::entry("j", "toggle jump panel", "toggle-jump-panel"),
         MenuNode::entry("m", "mark tile", "mark-tile"),
         MenuNode::entry("x", "close tile", "close-window"),
-        MenuNode::entry("X", "close workspace", "close-workspace"),
     ]
 }
 
 // ---- Local menus (spec-menu-scopes.md Behavior 2) --------------------------
 //
-// One static tree per content kind, opened with the <space> local leader. Same
-// overlay machinery as the global menu — only the tree (and header) differ.
-// v1 contains only entries with existing GPUI backing; the spec's nav-*
-// (links/headings/list-items/code-blocks) and browser-open-* entries are
-// deferred until those features exist.
+// One static tree per content kind (App), opened with the <space> local leader
+// — verbs whose object is the focused App (ADR-0032, UXI-Menu-6). Same overlay
+// machinery as the `.` shell menu; only the tree (and header) differ. The nav-*
+// motions (links/headings/list-items/code-blocks) have real dispatch handlers
+// and leave for direct nav keys in T2.
 
 fn doc_local_menu() -> Vec<MenuNode> {
+    // Verbs on the focused document. (`b` file-browser dropped — Cmd-O already
+    // opens it. The `n`/`g` submenus are motions; they stay only until T2 gives
+    // them direct nav keys — ADR-0032.)
     vec![
         MenuNode::entry("e", "edit (raw markdown)", "enter-edit"),
         MenuNode::entry("w", "edit (word processor)", "enter-wp"),
         MenuNode::entry("r", "reload from disk", "reload-file"),
-        MenuNode::entry("b", "file browser", "open-browser"),
         MenuNode::entry("o", "outline", "rail-outline"),
         MenuNode::separator(),
         MenuNode::submenu(
@@ -1618,7 +1641,8 @@ fn doc_local_menu() -> Vec<MenuNode> {
             vec![
                 MenuNode::entry("g", "top", "doc-goto-top"),
                 MenuNode::entry("e", "bottom", "doc-goto-bottom"),
-                MenuNode::entry("h", "next heading", "goto-heading"),
+                // `h` next-heading removed — it duplicated `n h` (same
+                // `nav-headings`/`goto-heading` handler, same label).
             ],
         ),
     ]
@@ -1629,7 +1653,7 @@ fn edit_local_menu() -> Vec<MenuNode> {
         MenuNode::entry("v", "back to doc view", "back-to-doc"),
         MenuNode::entry("w", "toggle code/word-processor", "wp-toggle"),
         MenuNode::entry("r", "reload from disk", "reload-file"),
-        MenuNode::entry("b", "file browser", "open-browser"),
+        // `b` file-browser dropped — Cmd-O already opens it (ADR-0032).
         MenuNode::separator(),
         MenuNode::entry("a", "select all", "select-all"),
         MenuNode::entry("y", "yank selection", "yank-selection"),
@@ -1648,25 +1672,43 @@ fn edit_local_menu() -> Vec<MenuNode> {
 }
 
 fn agent_local_menu() -> Vec<MenuNode> {
+    // ADR-0032 (UXI-Menu-6): flat = verbs on the LIVE conversation; the `s`
+    // submenu = verbs on the session as an ENTITY (lifecycle); the `v` submenu is
+    // the interim home for focus/jump motions + the heading-markers display
+    // toggle (they leave for direct nav keys / the `:` palette in T2/T3, but must
+    // stay reachable until then). `.` stop is gone — Esc interrupts an in-flight
+    // turn (esc_interrupts_in_flight_turn).
     vec![
-        // The four core agent commands (spec-agent-session-ownership.md).
         MenuNode::entry("c", "select session", "claude-session-picker"),
         MenuNode::entry("e", "send message", "claude-send"),
-        MenuNode::entry(".", "stop", "claude-stop"),
         MenuNode::entry("w", "switch worksheet ⇄ message box", "agent-input-toggle"),
-        MenuNode::separator(),
-        MenuNode::entry("n", "new Claude session", "claude-new"),
-        MenuNode::entry("N", "new Codex session", "codex-new"),
-        MenuNode::entry("x", "close session", "claude-close"),
-        MenuNode::entry("C", "clear session", "claude-clear"),
-        MenuNode::entry("r", "rename session", "claude-rename"),
-        MenuNode::entry("t", "tag session…", "claude-tag"),
-        MenuNode::entry("f", "focus transcript ⇄ compose", "agent-focus-toggle"),
-        MenuNode::entry("S", "send selection", "claude-send-selection"),
         MenuNode::entry("m", "cycle permission mode", "claude-mode-cycle"),
-        MenuNode::entry("h", "toggle heading markers", "agent-toggle-heading-markers"),
-        MenuNode::entry("j", "jump between user turns (j/k)", "agent-toggle-jump-mode"),
-        MenuNode::entry("R", "recap this session", "recap-session"),
+        MenuNode::entry("S", "send selection", "claude-send-selection"),
+        MenuNode::entry("C", "clear session", "claude-clear"),
+        MenuNode::separator(),
+        // Session lifecycle. Archive/unarchive is grafted in dynamically (its
+        // label flips on archived state) — see `agent_local_menu_dynamic`.
+        MenuNode::submenu(
+            "s",
+            "session",
+            vec![
+                MenuNode::entry("n", "new Claude session", "claude-new"),
+                MenuNode::entry("N", "new Codex session", "codex-new"),
+                MenuNode::entry("r", "rename session", "claude-rename"),
+                MenuNode::entry("t", "tag session…", "claude-tag"),
+                MenuNode::entry("x", "close session", "claude-close"),
+                MenuNode::entry("R", "recap this session", "recap-session"),
+            ],
+        ),
+        MenuNode::submenu(
+            "v",
+            "view",
+            vec![
+                MenuNode::entry("f", "focus transcript ⇄ compose", "agent-focus-toggle"),
+                MenuNode::entry("j", "jump between user turns (j/k)", "agent-toggle-jump-mode"),
+                MenuNode::entry("h", "toggle heading markers", "agent-toggle-heading-markers"),
+            ],
+        ),
     ]
 }
 
@@ -4767,12 +4809,19 @@ impl YaldaGpuiView {
         let archived = self
             .active_server_session_id()
             .is_some_and(|sid| self.jump_archived_sessions.contains(&sid));
-        menu.push(MenuNode::separator());
-        menu.push(if archived {
+        let archive_entry = if archived {
             MenuNode::entry("a", "unarchive session", "unarchive-session")
         } else {
             MenuNode::entry("a", "archive session", "archive-session")
-        });
+        };
+        // Graft archive into the `s` (session lifecycle) submenu.
+        if let Some(MenuAction::Submenu(children)) = menu
+            .iter_mut()
+            .find(|n| n.label == "session")
+            .map(|n| &mut n.action)
+        {
+            children.push(archive_entry);
+        }
         let (models, current) = self
             .focused_bound_session()
             .and_then(|id| {
@@ -4851,82 +4900,6 @@ impl YaldaGpuiView {
 
     fn open_local_menu(&mut self, _: &OpenLocalMenu, _w: &mut Window, cx: &mut Context<Self>) {
         self.open_local_menu_inner(cx);
-    }
-
-    /// `?` — open the global (Yaldabaoth) scope menu (untitled.md "Yalda aka
-    /// Global Scope › Commands"). Yalda owns the set of workspaces, so the global
-    /// commands manage them: jump to a workspace by number, name the current
-    /// one, or make a new one. Built dynamically from the live workspace list.
-    fn global_menu(&self) -> Vec<MenuNode> {
-        let mut items = Vec::new();
-        // Workspaces by number — 1..=9 then `0` for a tenth. Every workspace
-        // holds ≥1 tile (so it's "inhabited"); a named-but-empty one would show
-        // too. The active workspace is marked. Ephemeral virtual workspaces
-        // (ADR-0021) are excluded — they're transient and always last, so the
-        // surviving `i` values stay contiguous and match the real workspace indices.
-        for (i, wsp) in self
-            .workspace
-            .workspaces
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| !t.ephemeral)
-            .take(10)
-        {
-            let digit = if i == 9 { '0' } else { (b'1' + i as u8) as char };
-            let marker = if i == self.workspace.active_workspace { "● " } else { "  " };
-            items.push(MenuNode::entry(
-                &digit.to_string(),
-                &format!("{marker}{}: {}", i + 1, wsp.display_label()),
-                &format!("goto-workspace-{i}"),
-            ));
-        }
-        items.push(MenuNode::separator());
-        items.push(MenuNode::entry("n", "name workspace", "rename-workspace"));
-        items.push(MenuNode::entry("c", "new workspace", "new-workspace"));
-        // New project lives here now that the jump panel dropped its top-level
-        // ＋ row (UXI-JumpPanel-7); the per-project create/delete actions moved to
-        // the project name's context menu (UXI-JumpPanel-8).
-        items.push(MenuNode::entry("p", "new project", "new-project"));
-        // (Agent sessions are now created only inside a project — the jump panel's
-        // per-project context menu, not a global cwd overlay; UXI-Project-7.)
-        items.push(MenuNode::entry(
-            "`",
-            "system console",
-            "open-system-console",
-        ));
-        let jp_label = if self.jump_panel_visible {
-            "hide jump panel"
-        } else {
-            "show jump panel"
-        };
-        items.push(MenuNode::entry("j", jp_label, "toggle-jump-panel"));
-        items
-    }
-
-    fn open_global_menu_inner(&mut self, cx: &mut Context<Self>) {
-        if self.overlay_is_menu() {
-            return;
-        }
-        let Some(opened_from) = self.workspace.focused_window_id() else {
-            return;
-        };
-        self.transient_status = None;
-        let mut state = MenuState::new();
-        state.open();
-        let menu = self.global_menu();
-        self.open_overlay(ActiveOverlay::Menu(MenuOverlay {
-            state,
-            menu,
-            header: "GLOBAL",
-            leader: '?',
-            opened_from,
-            disabled: HashSet::new(),
-        }));
-        cx.notify();
-    }
-
-    fn open_global_menu(&mut self, _: &OpenGlobalMenu, _w: &mut Window, cx: &mut Context<Self>) {
-        self.open_global_menu_inner(cx);
     }
 
     /// Does the focused tile currently want raw text input? This is a property
@@ -5017,11 +4990,11 @@ impl YaldaGpuiView {
             return false;
         }
         match press.key {
-            // space → per-tile / per-app (content-kind) menu;
-            // `.` → per-workspace menu; `?` → global (Yaldabaoth) menu.
+            // Two leaders (ADR-0032, UXI-Menu-6): space → verbs on the focused
+            // App (per-content-kind menu); `.` → verbs on the shell. `?` is
+            // retired — it no longer opens a menu.
             Key::Char(' ') => self.open_local_menu_inner(cx),
             Key::Char('.') => self.open_menu_inner(cx),
-            Key::Char('?') => self.open_global_menu_inner(cx),
             _ => return false,
         }
         true

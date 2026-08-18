@@ -1170,6 +1170,147 @@ fn jump_panel_renders_with_sessions(cx: &mut TestAppContext) {
     );
 }
 
+/// Every command name reachable in the `.` shell menu (`gpui_menu`), descending
+/// into submenus. `gpui_menu` absorbed the retired `?` global menu (ADR-0032).
+fn shell_menu_commands() -> Vec<String> {
+    fn walk(nodes: &[crate::MenuNode], out: &mut Vec<String>) {
+        for n in nodes {
+            match &n.action {
+                crate::MenuAction::Command(c) => out.push(c.clone()),
+                crate::MenuAction::Submenu(children) => walk(children, out),
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&crate::gpui_menu(), &mut out);
+    out
+}
+
+/// True when `cmd` is dispatchable anywhere in a menu tree, descending submenus.
+fn menu_tree_has_command(nodes: &[crate::MenuNode], cmd: &str) -> bool {
+    nodes.iter().any(|n| match &n.action {
+        crate::MenuAction::Command(c) => c == cmd,
+        crate::MenuAction::Submenu(children) => menu_tree_has_command(children, cmd),
+        _ => false,
+    })
+}
+
+/// True when a label appears anywhere in the `.` shell menu tree (root or a
+/// submenu heading/leaf).
+fn shell_menu_has_label(label: &str) -> bool {
+    fn walk(nodes: &[crate::MenuNode], label: &str) -> bool {
+        nodes.iter().any(|n| {
+            n.label == label
+                || matches!(&n.action, crate::MenuAction::Submenu(c) if walk(c, label))
+        })
+    }
+    walk(&crate::gpui_menu(), label)
+}
+
+/// UXI-Menu-6: the `?` leader is RETIRED. `leader_intercept` — the exact method
+/// every tile's `on_key_down` calls — does NOT consume `?` (returns false, opens
+/// nothing), while it still consumes `.` (opens the shell menu). Every command
+/// the old `?` global menu held is now reachable in the `.` shell menu.
+///
+/// Negative control: restore `Key::Char('?') => self.open_global_menu_inner(cx)`
+/// in `leader_intercept` ⇒ the `?`-returns-false assert goes RED.
+#[gpui::test]
+fn question_mark_leader_is_inert_former_global_commands_live_under_dot(
+    cx: &mut TestAppContext,
+) {
+    use crate::{Key, KMods, KeyPress};
+    let (view, vcx) = boot_browser(cx);
+    vcx.run_until_parked();
+
+    // `?` in a navigation state is NOT a leader — nothing consumed, no menu.
+    let consumed_q = view.update(vcx, |v, cx| {
+        let c = v.leader_intercept(&KeyPress::new(Key::Char('?'), KMods::NONE), cx);
+        (c, v.overlay_is_menu())
+    });
+    assert_eq!(
+        consumed_q,
+        (false, false),
+        "the retired `?` leader consumes nothing and opens no menu"
+    );
+
+    // Control: `.` IS a leader — consumed, and the shell menu opens. Proves the
+    // routing path is live here (the `?` no-op above is not vacuous).
+    let consumed_dot = view.update(vcx, |v, cx| {
+        let c = v.leader_intercept(&KeyPress::new(Key::Char('.'), KMods::NONE), cx);
+        (c, v.overlay_is_menu())
+    });
+    assert_eq!(consumed_dot, (true, true), "the `.` shell leader still opens a menu");
+    view.update(vcx, |v, _| v.clear_overlay());
+
+    // Every former `?`-menu command now lives in the `.` shell menu.
+    for cmd in [
+        "new-workspace",
+        "rename-workspace",
+        "new-project",
+        "open-system-console",
+        "toggle-jump-panel",
+    ] {
+        assert!(
+            shell_menu_commands().contains(&cmd.to_string()),
+            "former ? command {cmd} must live under the . shell menu"
+        );
+    }
+}
+
+/// UXI-Menu-7 for the DYNAMIC agent menu: the grafted archive entry (in the `s`
+/// submenu) and the advertised-model `M` submenu must not collide with any
+/// sibling key. Covers what the pure-fn `local_menus_have_no_duplicate_keys_per_level`
+/// can't (it needs a live view for the graft).
+#[gpui::test]
+fn agent_dynamic_menu_has_no_duplicate_keys(cx: &mut TestAppContext) {
+    use yalda::acp_channel::{ModelOption, ReplyEvent};
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let (view, vcx) = boot_browser(cx);
+    vcx.run_until_parked();
+    install_agent_slot(&view, &mut *vcx, Some("S1"));
+    // Advertise models so the `M` submenu is populated (not just the placeholder).
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![ServerNotification::ReplyEvent {
+                session_id: "S1".into(),
+                event: ReplyEvent::ModelsAvailable {
+                    current: "sonnet".into(),
+                    options: vec![
+                        ModelOption { id: "default".into(), label: "Default".into() },
+                        ModelOption { id: "sonnet".into(), label: "Sonnet".into() },
+                    ],
+                },
+            }],
+            cx,
+        );
+    });
+
+    fn check_level(nodes: &[crate::MenuNode], path: &str) {
+        let mut seen: Vec<&[crate::KeyPress]> = Vec::new();
+        for n in nodes {
+            if matches!(
+                &n.action,
+                crate::MenuAction::Command(_) | crate::MenuAction::Submenu(_)
+            ) {
+                assert!(
+                    !seen.contains(&n.key.as_slice()),
+                    "duplicate key {:?} at {path}",
+                    n.key
+                );
+                seen.push(&n.key);
+            }
+            if let crate::MenuAction::Submenu(children) = &n.action {
+                check_level(children, &format!("{path}/{}", n.label));
+            }
+        }
+    }
+    view.update(vcx, |v, cx| {
+        check_level(&v.agent_local_menu_dynamic(cx), "agent-dynamic");
+    });
+}
+
 /// UXI-SystemConsole-1/-2 plus the yux render-count contract: both requested
 /// entry points summon the SAME overlay without moving focus; its `r` / `R`
 /// keys reach the real rebuild dispatcher; and an unrelated root repaint reuses
@@ -1186,18 +1327,11 @@ fn system_console_opens_from_global_menu_and_jump_panel(cx: &mut TestAppContext)
     let (view, vcx) = boot_browser(cx);
     let focused_before = view.read_with(vcx, |v, _| v.workspace.focused_window_id());
 
-    let has_menu_entry = view.read_with(vcx, |v, _| {
-        v.global_menu().iter().any(|node| {
-            node.label == "system console"
-                && matches!(
-                    &node.action,
-                    crate::MenuAction::Command(command) if command == "open-system-console"
-                )
-        })
-    });
+    // ADR-0032: the `?` global menu was folded into the `.` shell menu; system
+    // console now lives in the `s` (system) submenu.
     assert!(
-        has_menu_entry,
-        "the ? global menu must offer system console"
+        shell_menu_commands().contains(&"open-system-console".to_string()),
+        "the . shell menu must offer system console"
     );
 
     view.update(vcx, |v, cx| {
@@ -7063,11 +7197,13 @@ fn focused_in_insert_mode_tracks_compose_not_transcript(cx: &mut TestAppContext)
     );
 }
 
-/// The global (Yaldabaoth) menu lists every workspace by number with a
-/// `goto-workspace-N` command, plus name/new entries; dispatching one switches
-/// the active workspace. Covers untitled.md "Global Scope › Commands".
+/// ADR-0032 (UXI-Menu-6): the numbered workspace list is NO LONGER a menu entry
+/// — it must work while typing, so it lives on the `ctrl-1..0` direct chords, not
+/// a leader menu. The `.` shell menu keeps the workspace *ops* (`new`/`rename`)
+/// under its `w` submenu, and the `goto-workspace-N` DISPATCH still switches the
+/// active workspace when invoked directly.
 #[gpui::test]
-fn global_menu_lists_and_switches_workspaces(cx: &mut TestAppContext) {
+fn shell_menu_offers_workspace_ops_and_goto_still_switches(cx: &mut TestAppContext) {
     let (view, vcx) = cx.add_window_view(|window, cx| {
         let fh = cx.focus_handle();
         fh.focus(window);
@@ -7087,27 +7223,18 @@ fn global_menu_lists_and_switches_workspaces(cx: &mut TestAppContext) {
             .push_workspace_inheriting(crate::App::Linear(crate::LinearTile::new()));
     });
 
-    // The menu enumerates each workspace + the name/new commands.
-    let cmds: Vec<String> = view.update(vcx, |v, _| {
-        v.global_menu()
-            .iter()
-            .filter_map(|n| match &n.action {
-                crate::MenuAction::Command(c) => Some(c.clone()),
-                _ => None,
-            })
-            .collect()
-    });
-    for expect in [
-        "goto-workspace-0",
-        "goto-workspace-1",
-        "goto-workspace-2",
-        "rename-workspace",
-        "new-workspace",
-    ] {
-        assert!(cmds.contains(&expect.to_string()), "global menu missing {expect}: {cmds:?}");
+    // The shell menu carries the workspace OPS (under `w`), but NOT the numbered
+    // goto list (that is ctrl-1..0, a direct chord — UXI-Menu-6).
+    let cmds = shell_menu_commands();
+    for expect in ["rename-workspace", "new-workspace"] {
+        assert!(cmds.contains(&expect.to_string()), "shell menu missing {expect}: {cmds:?}");
     }
+    assert!(
+        !cmds.iter().any(|c| c.starts_with("goto-workspace-")),
+        "the numbered workspace list is a direct chord, not a menu entry: {cmds:?}"
+    );
 
-    // Dispatching a goto command switches the active workspace.
+    // Dispatching a goto command directly still switches the active workspace.
     view.update(vcx, |v, cx| v.dispatch_menu_command("goto-workspace-2", cx));
     let active = view.update(vcx, |v, _| v.workspace.active_workspace);
     assert_eq!(active, 2, "goto-workspace-2 activated the third workspace");
@@ -7280,12 +7407,12 @@ fn free_agent_session_no_server_is_graceful_noop(cx: &mut TestAppContext) {
 fn global_cwd_session_overlay_is_gone(cx: &mut TestAppContext) {
     let (view, vcx) = boot_browser(cx);
     view.update(vcx, |v, cx| {
-        let has = v.global_menu().into_iter().any(|n| {
-            matches!(&n.action, crate::MenuAction::Command(c) if c == "new-free-agent-session")
-        });
+        let has = shell_menu_commands()
+            .iter()
+            .any(|c| c == "new-free-agent-session");
         assert!(
             !has,
-            "the ? menu no longer offers the global 'new agent session' cwd flow"
+            "the shell menu no longer offers the global 'new agent session' cwd flow"
         );
         v.dispatch_menu_command("new-free-agent-session", cx);
         assert!(!v.has_overlay(), "the retired command opens no overlay");
@@ -8245,12 +8372,10 @@ fn project_menu_item_click_runs_the_action(cx: &mut TestAppContext) {
 #[gpui::test]
 fn new_project_relocated_to_global_menu(cx: &mut TestAppContext) {
     let (view, vcx) = boot_browser(cx);
-    view.read_with(vcx, |v, _| {
-        assert!(
-            v.global_menu().iter().any(|n| n.label == "new project"),
-            "the global menu offers a New project entry"
-        );
-    });
+    assert!(
+        shell_menu_has_label("new project"),
+        "the shell menu offers a New project entry"
+    );
     view.update(vcx, |v, cx| v.dispatch_menu_command("new-project", cx));
     view.read_with(vcx, |v, _| {
         assert!(v.overlay_is_new_project(), "dispatching new-project opens the New Project overlay");
@@ -9395,10 +9520,11 @@ fn jump_session_archive_controls_toggle_the_same_durable_flag(cx: &mut TestAppCo
     // set_session_archived seam as the right-click menu.
     view.update(vcx, |v, cx| v.open_local_menu_inner(cx));
     view.read_with(vcx, |v, _| {
-        assert!(v.menu_ref().expect("space menu").menu.iter().any(|node| {
-            node.label == "archive session"
-                && matches!(&node.action, crate::MenuAction::Command(command) if command == "archive-session")
-        }));
+        // ADR-0032: archive lives in the agent menu's `s` (session) submenu now.
+        assert!(menu_tree_has_command(
+            &v.menu_ref().expect("space menu").menu,
+            "archive-session"
+        ));
     });
     view.update(vcx, |v, cx| {
         v.clear_overlay();
@@ -9417,10 +9543,10 @@ fn jump_session_archive_controls_toggle_the_same_durable_flag(cx: &mut TestAppCo
     });
     view.update(vcx, |v, cx| v.open_local_menu_inner(cx));
     view.read_with(vcx, |v, _| {
-        assert!(v.menu_ref().expect("space menu").menu.iter().any(|node| {
-            node.label == "unarchive session"
-                && matches!(&node.action, crate::MenuAction::Command(command) if command == "unarchive-session")
-        }));
+        assert!(menu_tree_has_command(
+            &v.menu_ref().expect("space menu").menu,
+            "unarchive-session"
+        ));
     });
     view.update(vcx, |v, cx| {
         v.clear_overlay();
@@ -9999,16 +10125,15 @@ fn jump_panel_toggle_hides_and_summons(cx: &mut TestAppContext) {
     });
     vcx.run_until_parked();
 
-    // Defaults visible, renders, and the menu offers to hide it.
+    // Defaults visible, renders, and the shell menu offers the toggle (ADR-0032:
+    // the entry moved from the `?` menu to the `.` shell menu and is now a static
+    // "toggle jump panel" label — gpui_menu is a pure builder with no live state).
     assert!(view.update(vcx, |v, _| v.jump_panel_visible), "defaults visible");
     let rendered = crate::perf_render_count("jump_panel");
     assert!(rendered >= 1, "visible panel renders at least once");
-    let menu_has = |v: &mut YaldaGpuiView, label: &str| {
-        v.global_menu().iter().any(|n| n.label == label)
-    };
-    assert!(view.update(vcx, |v, _| menu_has(v, "hide jump panel")));
+    assert!(shell_menu_has_label("toggle jump panel"));
 
-    // Hide it (via the menu command). It stops rendering; menu now offers show.
+    // Hide it (via the menu command). It stops rendering.
     view.update(vcx, |v, cx| v.dispatch_menu_command("toggle-jump-panel", cx));
     assert!(!view.update(vcx, |v, _| v.jump_panel_visible), "now hidden");
     let base = crate::perf_render_count("jump_panel");
@@ -10019,8 +10144,6 @@ fn jump_panel_toggle_hides_and_summons(cx: &mut TestAppContext) {
         base,
         "a hidden jump panel is not rendered"
     );
-    assert!(view.update(vcx, |v, _| menu_has(v, "show jump panel")));
-
     // Summon it again — it renders once more.
     view.update(vcx, |v, cx| v.dispatch_menu_command("toggle-jump-panel", cx));
     assert!(view.update(vcx, |v, _| v.jump_panel_visible), "visible again");

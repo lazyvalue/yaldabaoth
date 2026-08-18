@@ -1,6 +1,15 @@
 # Menu Scopes — Global Leader and Local Leader
 
-**Status:** DRAFT
+> **SUPERSEDED (2026-08-18) by `docs/decisions/0032-two-leader-menus-shape-object-model.md`
+> and the `UXI-Menu-*` invariants in `docs/components/common/menu.md`.** This
+> DRAFT documents an early three-scope model whose leader assignment (`Space` =
+> global, `.` = local) also **inverted** before shipping — the app shipped
+> `space` = per-App local, `.` = workspace, `?` = global. ADR-0032 then collapsed
+> those three to **two** (`space` = focused-App verbs, `.` = shell verbs) on the
+> shape+object test. Read this file for historical background only; the ADR +
+> component spec are authoritative.
+
+**Status:** DRAFT (historical — superseded by ADR-0032)
 **Last updated:** 2026-06-06
 **Builds on:** `spec-workspaces-and-splits.md` (workspace / screens), `spec-layout-patterns.md` (tags, marks, layouts), `spec-rail.md` (per-tab chrome)
 
