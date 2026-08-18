@@ -139,3 +139,28 @@ exact glyphs/colours need a human eye); the structural pieces are unit-guarded b
 the pretty-print branch of `json_prose` and the existing
 `cog_detail_paints_and_overflows` (the detail column, now cards + code block, still
 paints and overflows its viewport).
+
+### UXI-Cog-5 — The tile is mouse-clickable
+
+**Statement.** Clicking a graph row in the explorer opens that graph (the
+keyboard-Enter equivalent). Clicking a node row selects it (its detail fills the
+right pane) and returns keyboard focus to the selector. Clicking the right detail
+pane moves keyboard focus there so `j`/`k` scroll it. Mouse-wheel scrolling of the
+detail pane works natively (`overflow_y_scroll`).
+
+**Applies to.** `CogView::click_graph` / `click_node` / `click_focus_right`, the
+`.on_click(cx.listener(…))` wiring on graph/node rows and the right pane
+(`cog_view.rs`); `cog_open_graph_for` / `cog_fetch_graph` (`cog_ui.rs`). The
+click handler sets its own loading state and hands id/label to the root so the
+root never re-updates the still-borrowed `CogView` (a reentrant-borrow panic).
+
+**Why.** The `/new-ux` refinement: "Should be able to click on things." Keyboard-only
+navigation is not discoverable.
+
+**Status.** implemented
+
+**Enforcement.** `verify_harness.rs::cog_click_node_selects` (real `click_node`:
+selects row 2, returns focus to the selector — negative-control verified RED),
+`cog_click_right_pane_focuses_it` (real `click_focus_right`), and
+`cog_click_graph_row_opens` (real `click_graph` routes through `cog_open_graph_for`
+→ the tile enters loading; the live `cog` fetch is runtime gap #2, not pumped).

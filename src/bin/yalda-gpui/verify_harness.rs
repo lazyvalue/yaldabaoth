@@ -20038,3 +20038,98 @@ fn cog_right_focus_scrolls_with_jk(cx: &mut TestAppContext) {
         "selector-focused j moves the selection"
     );
 }
+
+/// UXI-Cog-5: clicking a node row selects that node (its detail fills the right
+/// pane) and puts keyboard focus on the selector. The `click_node` selection is
+/// the negative-control target (revert `*selected = i` → click selects nothing).
+#[gpui::test]
+fn cog_click_node_selects(cx: &mut TestAppContext) {
+    let (view, vcx, cv, wid) = boot_with_cog(cx);
+    let req = cog_tile_req(&view, vcx);
+    view.update(vcx, |v, cx| {
+        v.cog_apply(
+            wid,
+            req,
+            Ok(crate::CogFetch::Graph(Box::new(cog_test_bundle(vec![
+                cog_test_node("n1", "first", "done", serde_json::json!({"purpose": "a"})),
+                cog_test_node("n2", "second", "open", serde_json::json!({"purpose": "b"})),
+                cog_test_node("n3", "third", "open", serde_json::json!({"purpose": "c"})),
+            ])))),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    // Focus the detail pane first, so we can prove the click both selects AND
+    // returns focus to the selector.
+    view.update(vcx, |v, cx| v.cog_set_focus(true, cx));
+    vcx.run_until_parked();
+
+    cv.update(vcx, |c, cx| c.click_node(2, cx));
+    vcx.run_until_parked();
+    let (sel, focused_right) = cv.update(vcx, |c, _| (c.selected_index(), c.focused_right()));
+    assert_eq!(sel, 2, "clicking node row 2 selects it");
+    assert!(!focused_right, "clicking a node row returns focus to the selector");
+}
+
+/// UXI-Cog-5: clicking the right detail pane moves keyboard focus there so j/k
+/// scroll it.
+#[gpui::test]
+fn cog_click_right_pane_focuses_it(cx: &mut TestAppContext) {
+    let (view, vcx, cv, wid) = boot_with_cog(cx);
+    let req = cog_tile_req(&view, vcx);
+    view.update(vcx, |v, cx| {
+        v.cog_apply(
+            wid,
+            req,
+            Ok(crate::CogFetch::Graph(Box::new(cog_test_bundle(vec![cog_tall_node(
+                "n1", "only", "done",
+            )])))),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    assert!(
+        !cv.update(vcx, |c, _| c.focused_right()),
+        "focus starts on the selector"
+    );
+
+    cv.update(vcx, |c, cx| c.click_focus_right(cx));
+    vcx.run_until_parked();
+    assert!(
+        cv.update(vcx, |c, _| c.focused_right()),
+        "clicking the detail pane focuses it"
+    );
+}
+
+/// UXI-Cog-5: clicking a graph row in the explorer opens that graph — it routes
+/// through the real `cog_open_graph` path (the tile enters the loading state).
+/// The live `cog` fetch itself is runtime gap #2, so we assert the open fired
+/// WITHOUT pumping the detached subprocess task.
+#[gpui::test]
+fn cog_click_graph_row_opens(cx: &mut TestAppContext) {
+    let (view, vcx, cv, wid) = boot_with_cog(cx);
+    let req = cog_tile_req(&view, vcx);
+    view.update(vcx, |v, cx| {
+        v.cog_apply(
+            wid,
+            req,
+            Ok(crate::CogFetch::Graphs(vec![
+                cog_test_graph("a", "Alpha"),
+                cog_test_graph("b", "Beta"),
+            ])),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    assert!(cv.update(vcx, |c, _| c.in_graphs()), "starts on the explorer");
+
+    // Click the second graph row. click_graph selects it then routes to the root
+    // open path, which sets the tile to Loading synchronously (before the async
+    // fetch). Do NOT run_until_parked — that would run the live `cog` subprocess.
+    cv.update(vcx, |c, cx| c.click_graph(1, cx));
+    assert!(
+        cv.update(vcx, |c, _| c.is_loading()),
+        "clicking a graph row opens it (tile enters loading)"
+    );
+}

@@ -171,6 +171,56 @@ impl CogView {
         }
     }
 
+    // ── Mouse clicks ─────────────────────────────────────────────────────────
+
+    /// Click a graph row in the explorer: select it and open it (like Enter).
+    /// Opening needs the root (async fetch), reached via the weak handle. We read
+    /// the id/label HERE (we hold `&mut self`) and hand them to the root, so the
+    /// root never re-reads this entity while it is mutably borrowed.
+    pub(crate) fn click_graph(&mut self, i: usize, cx: &mut Context<Self>) {
+        let (id, label) = match &self.state {
+            CogViewState::Graphs { graphs, .. } => {
+                let Some(g) = graphs.get(i) else {
+                    return;
+                };
+                (g.id.clone(), Some(g.label()))
+            }
+            _ => return,
+        };
+        // Set our OWN loading state here (we hold `&mut self`); the root only
+        // bumps the request id + spawns the fetch, so it never re-updates this
+        // entity while it is mutably borrowed by the click handler.
+        self.set_state(CogViewState::Loading(format!("loading {id}…")));
+        cx.notify();
+        let view = cx.entity();
+        if let Some(root) = self.root.upgrade() {
+            root.update(cx, |r, rcx| r.cog_open_graph_for(view, id, label, rcx));
+        }
+    }
+
+    /// Click a node row: select it (its detail fills the right pane) and put
+    /// keyboard focus on the selector.
+    pub(crate) fn click_node(&mut self, i: usize, cx: &mut Context<Self>) {
+        let mut changed = false;
+        if let CogViewState::Graph { bundle, selected } = &mut self.state
+            && i < bundle.nodes.len()
+        {
+            *selected = i;
+            changed = true;
+        }
+        if changed {
+            self.right_scroll.set_offset(gpui::point(px(0.0), px(0.0)));
+            self.focus = CogFocus::Left;
+            cx.notify();
+        }
+    }
+
+    /// Click the right detail pane: move keyboard focus there (so j/k scroll it).
+    pub(crate) fn click_focus_right(&mut self, cx: &mut Context<Self>) {
+        self.focus_right();
+        cx.notify();
+    }
+
     /// Scroll the right detail pane by `down` px (negative scrolls up), clamped
     /// at the top.
     pub(crate) fn scroll_right(&mut self, down: f32) {
@@ -203,6 +253,11 @@ impl CogView {
     /// Is the body a loaded graph (vs the explorer / loading / error)?
     pub(crate) fn in_graph(&self) -> bool {
         matches!(self.state, CogViewState::Graph { .. })
+    }
+
+    /// Is the body in the loading state (a fetch is in flight)?
+    pub(crate) fn is_loading(&self) -> bool {
+        matches!(self.state, CogViewState::Loading(_))
     }
 }
 
@@ -243,8 +298,8 @@ impl Render for CogView {
         }
 
         let right_focused = self.focused_right();
-        let left = self.left_pane(&st, border, !right_focused);
-        let right = self.right_pane(&st, right_focused);
+        let left = self.left_pane(&st, border, !right_focused, cx);
+        let right = self.right_pane(&st, right_focused, cx);
 
         div()
             .flex()
@@ -268,8 +323,15 @@ fn focus_tint(st: &DetailStyle) -> Hsla {
 
 impl CogView {
     /// The left selector pane (graph explorer or node list), scrollable and
-    /// following the selection. `focused` gets a faint accent wash.
-    fn left_pane(&self, st: &DetailStyle, border: Hsla, focused: bool) -> impl IntoElement {
+    /// following the selection. `focused` gets a faint accent wash. Rows are
+    /// clickable: a graph row opens that graph, a node row selects it.
+    fn left_pane(
+        &self,
+        st: &DetailStyle,
+        border: Hsla,
+        focused: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let transparent: Hsla = rgba(0x00000000).into();
         let mut list = div()
             .id("cog-left")
@@ -291,7 +353,14 @@ impl CogView {
             CogViewState::Graphs { graphs, selected } => {
                 list = list.child(left_header(&format!("Graphs ({})", graphs.len()), st));
                 for (i, g) in graphs.iter().enumerate() {
-                    list = list.child(graph_row(g, i == *selected, st));
+                    list = list.child(
+                        graph_row(g, i == *selected, st)
+                            .id(SharedString::from(format!("cog-graph-{i}")))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |view, _ev, _w, cx| {
+                                view.click_graph(i, cx);
+                            })),
+                    );
                 }
                 self.left_scroll.scroll_to_item(*selected + 1);
             }
@@ -306,18 +375,26 @@ impl CogView {
                 list = list.child(left_header(&hdr, st));
                 for (i, n) in bundle.nodes.iter().enumerate() {
                     let eff = bundle.effective_status(n);
-                    list = list.child(node_row(n, eff, i == *selected, st));
+                    list = list.child(
+                        node_row(n, eff, i == *selected, st)
+                            .id(SharedString::from(format!("cog-node-{i}")))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |view, _ev, _w, cx| {
+                                view.click_node(i, cx);
+                            })),
+                    );
                 }
                 self.left_scroll.scroll_to_item(*selected + 1);
             }
             _ => {}
         }
-        list
+        list.into_any_element()
     }
 
     /// The right detail pane (graph preview or node detail), scrollable.
-    /// `focused` gets a faint accent wash (keyboard scrolls it).
-    fn right_pane(&self, st: &DetailStyle, focused: bool) -> impl IntoElement {
+    /// `focused` gets a faint accent wash (keyboard scrolls it); clicking it
+    /// moves keyboard focus here.
+    fn right_pane(&self, st: &DetailStyle, focused: bool, cx: &mut Context<Self>) -> AnyElement {
         let transparent: Hsla = rgba(0x00000000).into();
         let body: AnyElement = match &self.state {
             CogViewState::Graphs { graphs, selected } => match graphs.get(*selected) {
@@ -345,6 +422,7 @@ impl CogView {
             .overflow_y_scroll()
             .track_scroll(&self.right_scroll)
             .bg(if focused { focus_tint(st) } else { transparent })
+            .on_click(cx.listener(|view, _ev, _w, cx| view.click_focus_right(cx)))
             .px_4()
             .py_3()
             .child(probe_bounds("cog-right-content", body));

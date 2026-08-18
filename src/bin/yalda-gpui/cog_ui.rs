@@ -83,6 +83,36 @@ impl YaldaGpuiView {
         let Some((id, label)) = sel else {
             return;
         };
+        self.cog_open_graph(target, id, label, cx);
+    }
+
+    /// Open a specific graph into the tile at `target` (the shared open path for
+    /// keyboard Enter and a graph-row click): bump the request id, set the title
+    /// + loading, and load the bundle off the paint thread.
+    pub(crate) fn cog_open_graph(
+        &mut self,
+        target: workspace::WindowId,
+        id: String,
+        label: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        // Keyboard path: set the loading view state here (we're not inside a
+        // CogView borrow), then bump req + spawn.
+        self.cog_set_view(target, CogViewState::Loading(format!("loading {id}…")), cx);
+        self.cog_fetch_graph(target, id, label, cx);
+    }
+
+    /// Bump the tile's request id, denormalize the title, and load the graph
+    /// bundle off the paint thread — WITHOUT touching the view state (the caller
+    /// owns the loading state, so this is safe to call from inside a CogView
+    /// click handler, where re-updating the view would double-borrow it).
+    pub(crate) fn cog_fetch_graph(
+        &mut self,
+        target: workspace::WindowId,
+        id: String,
+        label: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         let req = {
             let Some(tile) = self.cog_tile_by_id_mut(target) else {
                 return;
@@ -93,24 +123,50 @@ impl YaldaGpuiView {
             }
             tile.req
         };
-        self.cog_set_view(
-            target,
-            CogViewState::Loading(format!("loading {id}…")),
-            cx,
-        );
-
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move {
-                    cog::load_graph(&id).map(|b| CogFetch::Graph(Box::new(b)))
-                })
+                .spawn(async move { cog::load_graph(&id).map(|b| CogFetch::Graph(Box::new(b))) })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.cog_apply(target, req, result, cx);
             });
         })
         .detach();
+    }
+
+    /// Open a graph (`id`/`label` already resolved by the clicked [`CogView`])
+    /// into the tile that owns `view` — the graph-row click path. A click doesn't
+    /// route through focus, so we resolve the target tile by matching the view
+    /// entity (id comparison only — we never read `view`, which is still mutably
+    /// borrowed by the click handler).
+    pub(crate) fn cog_open_graph_for(
+        &mut self,
+        view: Entity<CogView>,
+        id: String,
+        label: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let vid = view.entity_id();
+        let mut target = None;
+        for wsp in self.workspace.workspaces.iter() {
+            wsp.layout.for_each_leaf(&mut |w| {
+                if let App::Cog(tile) = &w.content
+                    && tile.view.as_ref().map(|v| v.entity_id()) == Some(vid)
+                {
+                    target = Some(w.id);
+                }
+            });
+            if target.is_some() {
+                break;
+            }
+        }
+        let Some(target) = target else {
+            return;
+        };
+        // The clicked view already set its own Loading state — only fetch here,
+        // so we never re-update the still-borrowed CogView.
+        self.cog_fetch_graph(target, id, label, cx);
     }
 
     /// Fold a completed fetch into the tile that requested it (by stable
