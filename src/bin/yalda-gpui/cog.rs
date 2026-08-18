@@ -235,6 +235,12 @@ pub(crate) struct CogTile {
     pub(crate) title: String,
     pub(crate) req: u64,
     pub(crate) view: Option<Entity<CogView>>,
+    /// The live `cog graph watch` child, if a graph is open. Killed on graph
+    /// change and on tile drop (see `Drop`) so the subprocess never leaks.
+    pub(crate) watch: Option<std::process::Child>,
+    /// Monotonic generation for the watcher; the drain task tags events with it
+    /// and stale events (from a killed prior watcher) are dropped.
+    pub(crate) watch_gen: u64,
 }
 
 impl CogTile {
@@ -243,12 +249,31 @@ impl CogTile {
             title: "Cog".into(),
             req: 0,
             view: None,
+            watch: None,
+            watch_gen: 0,
         }
     }
 
     pub(crate) fn title(&self) -> String {
         self.title.clone()
     }
+}
+
+impl Drop for CogTile {
+    fn drop(&mut self) {
+        // A std `Child` does NOT kill on drop — do it explicitly so a closed /
+        // replaced Cog tile never leaves an orphaned `cog graph watch` running.
+        if let Some(mut child) = self.watch.take() {
+            let _ = child.kill();
+        }
+    }
+}
+
+/// One live event from `cog graph watch` — the parsed JSON plus a monotonic
+/// sequence for a stable render key / display index.
+pub(crate) struct CogEvent {
+    pub(crate) seq: u64,
+    pub(crate) raw: serde_json::Value,
 }
 
 // ── Subprocess client ────────────────────────────────────────────────────────
@@ -321,6 +346,50 @@ pub(crate) fn load_graph(id: &str) -> Result<CogBundle, String> {
         logs,
         notes,
     })
+}
+
+/// Start `cog graph watch <id>` and stream its newline-delimited JSON events.
+/// Returns the child (a kill handle) and an unbounded receiver fed by a
+/// dedicated reader thread (blocking stdout reads can't run on the UI executor,
+/// and `cog` has no tokio reactor here — so we bridge with a plain thread +
+/// `futures` channel the UI task can await). The thread exits when the child is
+/// killed (stdout hits EOF) or the receiver is dropped.
+pub(crate) fn spawn_watch(
+    id: &str,
+) -> Result<
+    (
+        std::process::Child,
+        futures::channel::mpsc::UnboundedReceiver<String>,
+    ),
+    String,
+> {
+    let mut child = std::process::Command::new("cog")
+        .args(["graph", "watch", id])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to start `cog graph watch`: {e}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "cog graph watch produced no stdout".to_string())?;
+    let (tx, rx) = futures::channel::mpsc::unbounded();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let reader = std::io::BufReader::new(stdout);
+        for line in reader.lines() {
+            match line {
+                Ok(l) if !l.trim().is_empty() => {
+                    if tx.unbounded_send(l).is_err() {
+                        break; // receiver gone — stop reading
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    });
+    Ok((child, rx))
 }
 
 // ── Small helpers ────────────────────────────────────────────────────────────

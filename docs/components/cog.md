@@ -164,3 +164,55 @@ selects row 2, returns focus to the selector — negative-control verified RED),
 `cog_click_right_pane_focuses_it` (real `click_focus_right`), and
 `cog_click_graph_row_opens` (real `click_graph` routes through `cog_open_graph_for`
 → the tile enters loading; the live `cog` fetch is runtime gap #2, not pumped).
+
+### UXI-Cog-6 — A live-events pane streams the graph's event feed
+
+**Statement.** While a graph is open, a third (rightmost) pane streams the graph's
+live event feed from `cog graph watch <id>`. Each event is an aesthetically
+formatted, syntax-highlighted, pretty-printed JSON card, newest first (bounded to
+the last 300). The watcher starts when a graph loads, restarts when a different
+graph loads, and is killed when leaving the graph or closing the tile (no orphaned
+subprocess). Keyboard focus reaches the pane via `Tab` (Selector → Detail → Events →
+Selector); `j`/`k`/`d`/`u`/PageUp/Down scroll the focused pane; clicking it focuses
+it. The pane exists only in a loaded graph, not the explorer.
+
+**Applies to.** `CogView::events` / `push_event` / `events_pane` / `event_card` /
+`scroll_events` / `focus_events` / `toggle_focus`, `CogFocus::Events` (`cog_view.rs`);
+`cog::spawn_watch`, `CogTile::{watch, watch_gen}` + `Drop` (`cog.rs`);
+`cog_start_watch` / `cog_stop_watch` / `cog_push_event` / `cog_scroll_events`,
+the `cog_apply` watch hooks, `handle_cog_press` focus/scroll routing (`cog_ui.rs`).
+
+**Why.** The `/new-ux` requirement: "When I am reviewing a graph I should be able to
+see the live (sse) events streaming."
+
+**Status.** implemented
+
+**Enforcement.** `verify_harness.rs::cog_events_stream_into_pane` (real
+`cog_push_event`: events fold in newest-first, generation-guarded, invalid JSON
+dropped — negative-control verified RED on the newest-first insert);
+`cog_events_pane_paints_and_focus_cycles` (layout-probe: no `cog-events` pane in the
+explorer, a real-sized one in a graph; `Tab` cycles Selector → Detail → Events →
+Selector via real `handle_cog_press`). The live `cog graph watch` subprocess ↔ pane
+loop is runtime gap #2 (`cfg(test)` skips the spawn); confirm against `cogd` at
+runtime.
+
+### UXI-Cog-7 — JSON is syntax-highlighted everywhere in the tile
+
+**Statement.** Every JSON surface in the tile — node content, node output, and each
+live-event card — renders pretty-printed with syntect syntax highlighting (keys,
+strings, numbers, literals, punctuation each coloured), theme-aware (the theme's
+syntect theme), in a monospace code block.
+
+**Applies to.** `highlighted_json` / `json_highlighter` (cached per syntect theme) /
+`json_block` / `event_card` (`cog_view.rs`), built on
+`yalda::highlight::Highlighter` with the `"json"` syntax.
+
+**Why.** The `/new-ux` requirement: "add syntax highlighting to JSON everywhere in
+this tile. All JSON pretty printed."
+
+**Status.** implemented
+
+**Enforcement.** Exact token colours are paint-only (runtime gap #1 — a human eye);
+the highlighter path is exercised structurally by
+`cog_detail_paints_and_overflows` (content renders through `json_block` →
+`highlighted_json`) and `cog_events_pane_paints_and_focus_cycles`.

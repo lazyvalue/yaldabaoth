@@ -183,12 +183,104 @@ impl YaldaGpuiView {
             Some(tile) if tile.req == req => {}
             _ => return,
         }
-        let state = match result {
-            Ok(CogFetch::Graphs(graphs)) => CogViewState::Graphs { graphs, selected: 0 },
-            Ok(CogFetch::Graph(bundle)) => CogViewState::Graph { bundle, selected: 0 },
-            Err(e) => CogViewState::Error(e),
+        match result {
+            Ok(CogFetch::Graph(bundle)) => {
+                // Set the view (clears any prior events), then start watching this
+                // graph's live event stream into the fresh events pane.
+                let id = bundle.graph.id.clone();
+                self.cog_set_view(target, CogViewState::Graph { bundle, selected: 0 }, cx);
+                self.cog_start_watch(target, id, cx);
+            }
+            Ok(CogFetch::Graphs(graphs)) => {
+                self.cog_stop_watch(target);
+                self.cog_set_view(target, CogViewState::Graphs { graphs, selected: 0 }, cx);
+            }
+            Err(e) => {
+                self.cog_stop_watch(target);
+                self.cog_set_view(target, CogViewState::Error(e), cx);
+            }
+        }
+    }
+
+    /// Start (or restart) the live `cog graph watch` stream for `target`'s graph.
+    /// Kills any prior watcher first; events are folded in via `cog_push_event`,
+    /// tagged with a generation so a killed watcher's late events are dropped.
+    pub(crate) fn cog_start_watch(
+        &mut self,
+        target: workspace::WindowId,
+        id: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.cog_stop_watch(target);
+        let generation = {
+            let Some(tile) = self.cog_tile_by_id_mut(target) else {
+                return;
+            };
+            tile.watch_gen += 1;
+            tile.watch_gen
         };
-        self.cog_set_view(target, state, cx);
+        // Never spawn the live subprocess under test (hermetic — gap #2).
+        if cfg!(test) {
+            return;
+        }
+        match cog::spawn_watch(&id) {
+            Ok((child, mut rx)) => {
+                if let Some(tile) = self.cog_tile_by_id_mut(target) {
+                    tile.watch = Some(child);
+                }
+                cx.spawn(async move |this, cx| {
+                    use futures::StreamExt;
+                    while let Some(line) = rx.next().await {
+                        if this
+                            .update(cx, |v, cx| v.cog_push_event(target, generation, line, cx))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+            }
+            Err(_) => {} // no stream — the events pane just shows "waiting"
+        }
+    }
+
+    /// Stop the live watcher for `target` (kill the child, bump the generation so
+    /// in-flight events are dropped).
+    pub(crate) fn cog_stop_watch(&mut self, target: workspace::WindowId) {
+        if let Some(tile) = self.cog_tile_by_id_mut(target) {
+            tile.watch_gen += 1;
+            if let Some(mut child) = tile.watch.take() {
+                let _ = child.kill();
+            }
+        }
+    }
+
+    /// Fold one live event line into the tile's events pane (generation-guarded).
+    pub(crate) fn cog_push_event(
+        &mut self,
+        target: workspace::WindowId,
+        generation: u64,
+        line: String,
+        cx: &mut Context<Self>,
+    ) {
+        let fresh = self
+            .cog_tile_by_id_mut(target)
+            .map(|t| t.watch_gen == generation)
+            .unwrap_or(false);
+        if !fresh {
+            return;
+        }
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else {
+            return;
+        };
+        let view = self.cog_tile_by_id_mut(target).and_then(|t| t.view.clone());
+        if let Some(v) = view {
+            v.update(cx, |cv, vcx| {
+                cv.push_event(val);
+                vcx.notify();
+            });
+        }
     }
 
     /// Push a new body state onto the tile's cached view (mutation-site notify),
@@ -226,6 +318,26 @@ impl YaldaGpuiView {
                 cv.scroll_right(down);
                 vcx.notify();
             });
+        }
+    }
+
+    /// Scroll the focused Cog tile's live-events pane.
+    pub(crate) fn cog_scroll_events(&mut self, down: f32, cx: &mut Context<Self>) {
+        if let Some(v) = self.cog_focused_tile_view() {
+            v.update(cx, |cv, vcx| {
+                cv.scroll_events(down);
+                vcx.notify();
+            });
+        }
+    }
+
+    /// Scroll whichever scroll pane is focused — the events pane when
+    /// `to_events`, else the detail pane.
+    fn cog_scroll_active(&mut self, down: f32, to_events: bool, cx: &mut Context<Self>) {
+        if to_events {
+            self.cog_scroll_events(down, cx);
+        } else {
+            self.cog_scroll(down, cx);
         }
     }
 
@@ -349,15 +461,16 @@ impl YaldaGpuiView {
     ///
     /// `r` reloads in both states.
     pub(crate) fn handle_cog_press(&mut self, press: KeyPress, cx: &mut Context<Self>) {
-        let (in_graphs, focused_right) = self
+        let (in_graphs, focused_right, focused_events) = self
             .cog_focused_tile_view()
             .map(|v| {
                 let cv = v.read(cx);
-                (cv.in_graphs(), cv.focused_right())
+                (cv.in_graphs(), cv.focused_right(), cv.focused_events())
             })
-            .unwrap_or((false, false));
+            .unwrap_or((false, false, false));
 
         match press.key {
+            // Tab cycles selector → detail → events → selector.
             Key::Tab => self.cog_toggle_focus(cx),
 
             // Dive into / advance to the detail pane.
@@ -369,38 +482,42 @@ impl YaldaGpuiView {
                 }
             }
 
-            // Back out: right→left, then left→graph list.
+            // Back out: a focused scroll pane → selector, then selector → graph list.
             Key::Esc | Key::Char('h') | Key::Left => {
                 if in_graphs {
                     // nothing above the explorer
-                } else if focused_right {
+                } else if focused_right || focused_events {
                     self.cog_set_focus(false, cx);
                 } else {
                     self.cog_load_graphs(cx);
                 }
             }
 
-            // j/k/arrows: scroll the detail pane when it's focused, else select.
+            // j/k/arrows: scroll the focused scroll pane (events/detail), else select.
             Key::Char('j') | Key::Down => {
-                if focused_right {
+                if focused_events {
+                    self.cog_scroll_events(60.0, cx);
+                } else if focused_right {
                     self.cog_scroll(60.0, cx);
                 } else {
                     self.cog_select(1, cx);
                 }
             }
             Key::Char('k') | Key::Up => {
-                if focused_right {
+                if focused_events {
+                    self.cog_scroll_events(-60.0, cx);
+                } else if focused_right {
                     self.cog_scroll(-60.0, cx);
                 } else {
                     self.cog_select(-1, cx);
                 }
             }
 
-            // Detail-pane scrolling always works (independent of focus).
-            Key::Char('d') => self.cog_scroll(220.0, cx),
-            Key::Char('u') => self.cog_scroll(-220.0, cx),
-            Key::PageDown => self.cog_scroll(440.0, cx),
-            Key::PageUp => self.cog_scroll(-440.0, cx),
+            // d/u/PageUp/Down scroll the focused scroll pane (events or detail).
+            Key::Char('d') => self.cog_scroll_active(220.0, focused_events, cx),
+            Key::Char('u') => self.cog_scroll_active(-220.0, focused_events, cx),
+            Key::PageDown => self.cog_scroll_active(440.0, focused_events, cx),
+            Key::PageUp => self.cog_scroll_active(-440.0, focused_events, cx),
 
             Key::Char('r') => {
                 if in_graphs {

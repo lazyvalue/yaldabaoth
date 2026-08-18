@@ -32,13 +32,14 @@ pub(crate) enum CogViewState {
     },
 }
 
-/// Which pane the keyboard drives. `Left` selects rows; `Right` scrolls the
-/// detail pane with the same j/k/arrow keys. Only meaningful in the `Graph`
-/// state (the explorer has no scrollable detail to focus).
+/// Which pane the keyboard drives. `Selector` selects rows; `Detail` and
+/// `Events` scroll their pane with the same j/k/arrow keys. `Events` is only
+/// reachable in the `Graph` state (the explorer has no live-events pane).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CogFocus {
-    Left,
-    Right,
+    Selector,
+    Detail,
+    Events,
 }
 
 /// The cached body view. One per Cog tile (owned by the tile via
@@ -49,7 +50,14 @@ pub(crate) struct CogView {
     left_scroll: ScrollHandle,
     /// Right detail scroll (`u`/`d`/PageUp/PageDown, reset on selection change).
     right_scroll: ScrollHandle,
-    /// Which pane the keyboard drives (reset to `Left` on every state change).
+    /// Live `cog graph watch` events, newest first (bounded). Fed by the root's
+    /// drain task via `push_event`; cleared on every state change.
+    events: Vec<CogEvent>,
+    /// Live-events pane scroll.
+    events_scroll: ScrollHandle,
+    /// Monotonic event sequence (stable render key / display index).
+    event_seq: u64,
+    /// Which pane the keyboard drives (reset to `Selector` on state change).
     focus: CogFocus,
     root: WeakEntity<YaldaGpuiView>,
     perf_label: &'static str,
@@ -61,7 +69,10 @@ impl CogView {
             state: CogViewState::Loading("loading graphs…".into()),
             left_scroll: ScrollHandle::new(),
             right_scroll: ScrollHandle::new(),
-            focus: CogFocus::Left,
+            events: Vec::new(),
+            events_scroll: ScrollHandle::new(),
+            event_seq: 0,
+            focus: CogFocus::Selector,
             root,
             perf_label: "cog",
         }
@@ -76,37 +87,73 @@ impl CogView {
     pub(crate) fn set_state(&mut self, state: CogViewState) {
         self.state = state;
         self.reset_scrolls();
-        self.focus = CogFocus::Left;
+        self.events.clear();
+        self.events_scroll.set_offset(gpui::point(px(0.0), px(0.0)));
+        self.focus = CogFocus::Selector;
+    }
+
+    // ── Live events ──────────────────────────────────────────────────────────
+
+    /// Append a live event (newest first), bounded to the most recent 300.
+    pub(crate) fn push_event(&mut self, raw: serde_json::Value) {
+        self.event_seq += 1;
+        self.events.insert(0, CogEvent { seq: self.event_seq, raw });
+        self.events.truncate(300);
+    }
+
+    /// Number of buffered live events (test accessor).
+    pub(crate) fn events_len(&self) -> usize {
+        self.events.len()
+    }
+
+    /// The sequence of the newest (first-rendered) event (test accessor).
+    pub(crate) fn newest_event_seq(&self) -> Option<u64> {
+        self.events.first().map(|e| e.seq)
     }
 
     // ── Keyboard focus (which pane j/k drives) ───────────────────────────────
 
-    /// Is the RIGHT detail pane focused (so j/k scroll it)? Only ever true in
-    /// the `Graph` state.
+    /// Is the selector (left) pane focused?
+    pub(crate) fn focused_selector(&self) -> bool {
+        self.focus == CogFocus::Selector
+    }
+
+    /// Is the detail (middle) pane focused (so j/k scroll it)?
     pub(crate) fn focused_right(&self) -> bool {
-        self.focus == CogFocus::Right && self.in_graph()
+        self.focus == CogFocus::Detail
     }
 
-    /// Move keyboard focus to the right detail pane (no-op outside a graph).
+    /// Is the live-events (right) pane focused? Only ever true in a loaded graph.
+    pub(crate) fn focused_events(&self) -> bool {
+        self.focus == CogFocus::Events && self.in_graph()
+    }
+
+    /// Move keyboard focus to the detail pane.
     pub(crate) fn focus_right(&mut self) {
-        if self.in_graph() {
-            self.focus = CogFocus::Right;
-        }
+        self.focus = CogFocus::Detail;
     }
 
-    /// Move keyboard focus back to the left selector.
+    /// Move keyboard focus back to the selector.
     pub(crate) fn focus_left(&mut self) {
-        self.focus = CogFocus::Left;
+        self.focus = CogFocus::Selector;
     }
 
-    /// Toggle focus between the panes (no-op outside a graph).
-    pub(crate) fn toggle_focus(&mut self) {
+    /// Move keyboard focus to the live-events pane (no-op outside a graph).
+    pub(crate) fn focus_events(&mut self) {
         if self.in_graph() {
-            self.focus = match self.focus {
-                CogFocus::Left => CogFocus::Right,
-                CogFocus::Right => CogFocus::Left,
-            };
+            self.focus = CogFocus::Events;
         }
+    }
+
+    /// Cycle focus Selector → Detail → Events → Selector (Events only in a
+    /// graph). Bound to Tab.
+    pub(crate) fn toggle_focus(&mut self) {
+        self.focus = match self.focus {
+            CogFocus::Selector => CogFocus::Detail,
+            CogFocus::Detail if self.in_graph() => CogFocus::Events,
+            CogFocus::Detail => CogFocus::Selector,
+            CogFocus::Events => CogFocus::Selector,
+        };
     }
 
     fn reset_scrolls(&mut self) {
@@ -210,7 +257,7 @@ impl CogView {
         }
         if changed {
             self.right_scroll.set_offset(gpui::point(px(0.0), px(0.0)));
-            self.focus = CogFocus::Left;
+            self.focus = CogFocus::Selector;
             cx.notify();
         }
     }
@@ -221,12 +268,25 @@ impl CogView {
         cx.notify();
     }
 
+    /// Click the live-events pane: move keyboard focus there.
+    pub(crate) fn click_focus_events(&mut self, cx: &mut Context<Self>) {
+        self.focus_events();
+        cx.notify();
+    }
+
     /// Scroll the right detail pane by `down` px (negative scrolls up), clamped
     /// at the top.
     pub(crate) fn scroll_right(&mut self, down: f32) {
         let cur = self.right_scroll.offset();
         let y = (cur.y - px(down)).min(px(0.0));
         self.right_scroll.set_offset(gpui::point(cur.x, y));
+    }
+
+    /// Scroll the live-events pane by `down` px (negative scrolls up), clamped.
+    pub(crate) fn scroll_events(&mut self, down: f32) {
+        let cur = self.events_scroll.offset();
+        let y = (cur.y - px(down)).min(px(0.0));
+        self.events_scroll.set_offset(gpui::point(cur.x, y));
     }
 
     // ── Test-facing accessors ────────────────────────────────────────────────
@@ -267,7 +327,7 @@ impl Render for CogView {
         let Some(root_ent) = self.root.upgrade() else {
             return div().size_full().into_any_element();
         };
-        let (st, editor_bg, border) = {
+        let (st, editor_bg, border, syntect) = {
             let r = root_ent.read(cx);
             let scale = r.text_scale;
             (
@@ -283,8 +343,10 @@ impl Render for CogView {
                 },
                 r.editor_bg(),
                 nc(r.theme.agent.dim),
+                r.theme.name.syntect_theme(),
             )
         };
+        let hl = json_highlighter(syntect);
 
         // Loading / error states fill the whole tile — no panes.
         match &self.state {
@@ -297,11 +359,10 @@ impl Render for CogView {
             _ => {}
         }
 
-        let right_focused = self.focused_right();
-        let left = self.left_pane(&st, border, !right_focused, cx);
-        let right = self.right_pane(&st, right_focused, cx);
+        let left = self.left_pane(&st, border, self.focused_selector(), cx);
+        let right = self.right_pane(&st, self.focused_right(), &hl, cx);
 
-        div()
+        let mut row = div()
             .flex()
             .flex_row()
             .size_full()
@@ -309,8 +370,13 @@ impl Render for CogView {
             .bg(editor_bg)
             .text_color(st.fg)
             .child(left)
-            .child(right)
-            .into_any_element()
+            .child(right);
+        // The live-events pane is the third column, present only while a graph
+        // is open (the explorer has nothing to watch).
+        if self.in_graph() {
+            row = row.child(self.events_pane(&st, border, self.focused_events(), &hl, cx));
+        }
+        row.into_any_element()
     }
 }
 
@@ -394,7 +460,13 @@ impl CogView {
     /// The right detail pane (graph preview or node detail), scrollable.
     /// `focused` gets a faint accent wash (keyboard scrolls it); clicking it
     /// moves keyboard focus here.
-    fn right_pane(&self, st: &DetailStyle, focused: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn right_pane(
+        &self,
+        st: &DetailStyle,
+        focused: bool,
+        hl: &yalda::highlight::Highlighter,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let transparent: Hsla = rgba(0x00000000).into();
         let body: AnyElement = match &self.state {
             CogViewState::Graphs { graphs, selected } => match graphs.get(*selected) {
@@ -402,7 +474,7 @@ impl CogView {
                 None => single_inner("Select a graph on the left.", st.dim, st).into_any_element(),
             },
             CogViewState::Graph { bundle, selected } => match bundle.nodes.get(*selected) {
-                Some(n) => node_detail(bundle, n, st).into_any_element(),
+                Some(n) => node_detail(bundle, n, hl, st).into_any_element(),
                 None => single_inner("Select a node on the left.", st.dim, st).into_any_element(),
             },
             _ => single_inner("", st.dim, st).into_any_element(),
@@ -428,6 +500,62 @@ impl CogView {
             .child(probe_bounds("cog-right-content", body));
         probe_bounds("cog-right", scroll.into_any_element())
     }
+
+    /// The live-events pane: a scrollable, newest-first feed of `cog graph watch`
+    /// events, each an aesthetically-formatted, syntax-highlighted JSON card.
+    /// `focused` gets a faint accent wash; clicking it moves keyboard focus here.
+    fn events_pane(
+        &self,
+        st: &DetailStyle,
+        border: Hsla,
+        focused: bool,
+        hl: &yalda::highlight::Highlighter,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let transparent: Hsla = rgba(0x00000000).into();
+        let mut list = div()
+            .id("cog-events")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&self.events_scroll)
+            .border_l_1()
+            .border_color(border)
+            .bg(if focused { focus_tint(st) } else { transparent })
+            .on_click(cx.listener(|v, _ev, _w, cx| v.click_focus_events(cx)))
+            .px_3()
+            .py_3()
+            .gap_2()
+            .child(left_header(&format!("Live events ({})", self.events.len()), st));
+
+        if self.events.is_empty() {
+            list = list.child(dim_line("Waiting for live events…", st));
+        } else {
+            for ev in &self.events {
+                list = list.child(event_card(ev, hl, st));
+            }
+        }
+        probe_bounds("cog-events", list.into_any_element())
+    }
+}
+
+/// One live-event card: a small `#seq` header above the event's pretty-printed,
+/// syntax-highlighted JSON.
+fn event_card(ev: &CogEvent, hl: &yalda::highlight::Highlighter, st: &DetailStyle) -> gpui::Div {
+    card(st)
+        .child(
+            div()
+                .w_full()
+                .text_color(st.dim)
+                .font_family(st.mono.clone())
+                .text_size(px(st.pt * 0.8))
+                .child(SharedString::from(format!("#{}", ev.seq))),
+        )
+        .child(highlighted_json(&json_prose(&ev.raw), hl, st))
 }
 
 // ── Status colour ────────────────────────────────────────────────────────────
@@ -505,10 +633,71 @@ fn card(st: &DetailStyle) -> gpui::Div {
         .bg(card_bg(st))
 }
 
-/// Render JSON: a bare string as prose; any structure as a pretty-printed
-/// monospace code block (rounded, tinted). Pretty-printing is the `/new-ux`
-/// requirement — content/output are shown indented, not as one run-on line.
-fn json_block(v: &serde_json::Value, st: &DetailStyle) -> gpui::Div {
+/// A syntect JSON highlighter, cached per syntect-theme name for the whole
+/// tile — `Highlighter::with_syntect_theme` loads the full default `SyntaxSet`,
+/// which is far too expensive to rebuild every render / every JSON block.
+fn json_highlighter(syntect_theme: &'static str) -> std::rc::Rc<yalda::highlight::Highlighter> {
+    thread_local! {
+        static CACHE: std::cell::RefCell<
+            Option<(&'static str, std::rc::Rc<yalda::highlight::Highlighter>)>,
+        > = const { std::cell::RefCell::new(None) };
+    }
+    CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if let Some((name, hl)) = c.as_ref()
+            && *name == syntect_theme
+        {
+            return hl.clone();
+        }
+        let hl = std::rc::Rc::new(yalda::highlight::Highlighter::with_syntect_theme(syntect_theme));
+        *c = Some((syntect_theme, hl.clone()));
+        hl
+    })
+}
+
+/// Render pretty-printed JSON with syntect syntax highlighting — one flex row
+/// per line, one coloured monospace span per token (keys, strings, numbers,
+/// literals, punctuation each get syntect's theme colour). Falls back to plain
+/// monospace text if the highlighter can't parse it.
+fn highlighted_json(pretty: &str, hl: &yalda::highlight::Highlighter, st: &DetailStyle) -> gpui::Div {
+    let size = px(st.pt * 0.92);
+    let mut col = div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .font_family(st.mono.clone())
+        .text_size(size);
+    match hl.highlight("json", pretty, yalda::style::Style::default()) {
+        Some(lines) => {
+            for line in lines {
+                let mut row = div().flex().flex_row().flex_wrap().w_full();
+                for span in &line.spans {
+                    let color = span
+                        .style
+                        .fg
+                        .map(|c| ncolor_to_hsla(c, 0xcccccc))
+                        .unwrap_or(st.fg);
+                    row = row.child(
+                        div()
+                            .text_color(color)
+                            .child(SharedString::from(span.text.clone())),
+                    );
+                }
+                col = col.child(row);
+            }
+        }
+        None => {
+            col = col.child(multiline_text(pretty, st.fg, &st.mono, size));
+        }
+    }
+    col
+}
+
+/// Render JSON: a bare string as prose; any structure as a pretty-printed,
+/// syntax-highlighted monospace code block (rounded, tinted). Pretty-printing +
+/// highlighting are the `/new-ux` requirement — content/output are shown
+/// indented and coloured, not as one run-on line.
+fn json_block(v: &serde_json::Value, hl: &yalda::highlight::Highlighter, st: &DetailStyle) -> gpui::Div {
     if json_is_structured(v) {
         div()
             .w_full()
@@ -517,12 +706,7 @@ fn json_block(v: &serde_json::Value, st: &DetailStyle) -> gpui::Div {
             .border_1()
             .border_color(card_border(st))
             .bg(code_bg(st))
-            .child(multiline_text(
-                &json_prose(v),
-                st.fg,
-                &st.mono,
-                px(st.pt * 0.92),
-            ))
+            .child(highlighted_json(&json_prose(v), hl, st))
     } else {
         // Bare string / scalar → prose.
         div()
@@ -674,7 +858,12 @@ fn graph_preview(g: &CogGraph, st: &DetailStyle) -> gpui::Div {
     col
 }
 
-fn node_detail(bundle: &CogBundle, n: &CogNode, st: &DetailStyle) -> gpui::Div {
+fn node_detail(
+    bundle: &CogBundle,
+    n: &CogNode,
+    hl: &yalda::highlight::Highlighter,
+    st: &DetailStyle,
+) -> gpui::Div {
     let eff = bundle.effective_status(n);
     let mut col = div().flex().flex_col().w_full().gap_2();
 
@@ -711,14 +900,14 @@ fn node_detail(bundle: &CogBundle, n: &CogNode, st: &DetailStyle) -> gpui::Div {
             .child(SharedString::from(n.id.clone())),
     );
 
-    // Content (pretty-printed JSON when structured).
+    // Content (pretty-printed, syntax-highlighted JSON when structured).
     col = col.child(section_heading("Content", st));
-    col = col.child(json_block(&n.content, st));
+    col = col.child(json_block(&n.content, hl, st));
 
     // Output (if any).
     if let Some(out) = n.output.as_ref().filter(|v| !v.is_null()) {
         col = col.child(section_heading("Output", st));
-        col = col.child(json_block(out, st));
+        col = col.child(json_block(out, hl, st));
     }
 
     // Status transitions (from the node log).
