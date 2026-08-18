@@ -234,10 +234,34 @@ impl YaldaGpuiView {
         None
     }
 
+    /// Move keyboard focus in the focused Cog tile's view. `to_right = true`
+    /// focuses the detail pane; `false` the selector.
+    pub(crate) fn cog_set_focus(&mut self, to_right: bool, cx: &mut Context<Self>) {
+        if let Some(v) = self.cog_focused_tile_view() {
+            v.update(cx, |cv, vcx| {
+                if to_right {
+                    cv.focus_right();
+                } else {
+                    cv.focus_left();
+                }
+                vcx.notify();
+            });
+        }
+    }
+
+    /// Toggle keyboard focus between the two panes (Tab).
+    pub(crate) fn cog_toggle_focus(&mut self, cx: &mut Context<Self>) {
+        if let Some(v) = self.cog_focused_tile_view() {
+            v.update(cx, |cv, vcx| {
+                cv.toggle_focus();
+                vcx.notify();
+            });
+        }
+    }
+
     /// Key handler for a focused Cog tile. The tile is navigation-only (no text
-    /// entry): `j`/`k` move the left selection, `Enter`/`o` opens the highlighted
-    /// graph, `Esc`/`h` returns to the graph list, `d`/`u`/PageDown/PageUp scroll
-    /// the right pane, `r` reloads. Leaders (`space`/`.`/`?`) are handled first.
+    /// entry). Leaders (`space`/`.`/`?`) are handled first, then the press is
+    /// routed to [`handle_cog_press`](Self::handle_cog_press).
     pub(crate) fn handle_cog_key(
         &mut self,
         ev: &KeyDownEvent,
@@ -255,29 +279,73 @@ impl YaldaGpuiView {
         if self.leader_intercept(&press, cx) {
             return;
         }
+        self.handle_cog_press(press, cx);
+    }
 
-        let in_graphs = self
+    /// The Cog tile's navigation model, at the [`KeyPress`] level (so tests can
+    /// drive it directly). Focus decides what `j`/`k`/arrows do:
+    ///
+    /// - Explorer (graph list): `j`/`k` select a graph; `Enter`/`o`/`l`/`→` open it.
+    /// - Graph, LEFT focus: `j`/`k` select a node; `Enter`/`o`/`l`/`→`/`Tab` move
+    ///   focus to the detail pane; `Esc`/`h`/`←` go back to the graph list.
+    /// - Graph, RIGHT focus: `j`/`k`/arrows and `d`/`u`/PageUp/Down scroll the
+    ///   detail pane; `Esc`/`h`/`←`/`Tab` return focus to the node list.
+    ///
+    /// `r` reloads in both states.
+    pub(crate) fn handle_cog_press(&mut self, press: KeyPress, cx: &mut Context<Self>) {
+        let (in_graphs, focused_right) = self
             .cog_focused_tile_view()
-            .map(|v| v.read(cx).in_graphs())
-            .unwrap_or(false);
+            .map(|v| {
+                let cv = v.read(cx);
+                (cv.in_graphs(), cv.focused_right())
+            })
+            .unwrap_or((false, false));
 
         match press.key {
-            Key::Char('j') | Key::Down => self.cog_select(1, cx),
-            Key::Char('k') | Key::Up => self.cog_select(-1, cx),
-            Key::Enter | Key::Char('o') | Key::Char('l') => {
+            Key::Tab => self.cog_toggle_focus(cx),
+
+            // Dive into / advance to the detail pane.
+            Key::Enter | Key::Char('o') | Key::Char('l') | Key::Right => {
                 if in_graphs {
                     self.cog_open_selected_graph(cx);
+                } else {
+                    self.cog_set_focus(true, cx);
                 }
             }
-            Key::Esc | Key::Char('h') => {
-                if !in_graphs {
+
+            // Back out: right→left, then left→graph list.
+            Key::Esc | Key::Char('h') | Key::Left => {
+                if in_graphs {
+                    // nothing above the explorer
+                } else if focused_right {
+                    self.cog_set_focus(false, cx);
+                } else {
                     self.cog_load_graphs(cx);
                 }
             }
+
+            // j/k/arrows: scroll the detail pane when it's focused, else select.
+            Key::Char('j') | Key::Down => {
+                if focused_right {
+                    self.cog_scroll(60.0, cx);
+                } else {
+                    self.cog_select(1, cx);
+                }
+            }
+            Key::Char('k') | Key::Up => {
+                if focused_right {
+                    self.cog_scroll(-60.0, cx);
+                } else {
+                    self.cog_select(-1, cx);
+                }
+            }
+
+            // Detail-pane scrolling always works (independent of focus).
             Key::Char('d') => self.cog_scroll(220.0, cx),
             Key::Char('u') => self.cog_scroll(-220.0, cx),
             Key::PageDown => self.cog_scroll(440.0, cx),
             Key::PageUp => self.cog_scroll(-440.0, cx),
+
             Key::Char('r') => {
                 if in_graphs {
                     self.cog_load_graphs(cx);

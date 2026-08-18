@@ -88,22 +88,54 @@ reducer `cog_apply` + `cog_select`: selection advances and the right pane resets
 top — negative-control verified RED) and `cog_detail_paints_and_overflows`
 (layout-probe: the right-pane content paints taller than its viewport — non-vacuous).
 
-### UXI-Cog-3 — The right detail pane is scrollable and independent of selection
+### UXI-Cog-3 — The right detail pane is scrollable, keyboard-focusable, and independent of selection
 
 **Statement.** The right detail pane scrolls (`d`/`u`, PageUp/PageDown) independently
-of the left selection; changing the selected node resets the right pane to the top.
-The left selector also keeps the selection in view.
+of the left selection; changing the selected node resets it to the top; the left
+selector keeps its selection in view. Keyboard **focus** can move to the detail pane
+(`Enter`/`o`/`l`/`→`/`Tab`) so `j`/`k`/arrows scroll it instead of moving the left
+selection; `Esc`/`h`/`←`/`Tab` returns focus to the selector. The focused pane shows
+a faint accent wash. Focus resets to the selector on every state change.
 
-**Applies to.** `CogView::scroll_right`, the `right_scroll` reset in
-`CogView::select_move`, `left_scroll.scroll_to_item` (`cog_view.rs`). `cog_scroll`
-(`cog_ui.rs`).
+**Applies to.** `CogView::scroll_right`, `CogFocus` + `focus_right`/`focus_left`/
+`toggle_focus`/`focused_right`, the `right_scroll` reset in `CogView::select_move`,
+`left_scroll.scroll_to_item`, `focus_tint` (`cog_view.rs`). `handle_cog_press`,
+`cog_scroll`, `cog_set_focus`, `cog_toggle_focus` (`cog_ui.rs`).
 
-**Why.** The requirement: "Right pane should be scrollable." A node's detail
+**Why.** The requirement: "Right pane should be scrollable" and "Need to be able to
+move focus to the right pane so I can scroll with keyboard." A node's detail
 (content + output + transitions + notes) routinely exceeds the viewport.
 
 **Status.** implemented
 
 **Enforcement.** `verify_harness.rs::cog_right_pane_scrolls_and_clamps` (the right
-scroll offset moves on `d` and clamps at the top on `u`) + the render-count guard
-`cog_body_is_cached` (a root-only notify leaves `CogView`'s render count flat; a
-payload change busts it once — negative-control verified RED).
+scroll offset moves on `d` and clamps at the top on `u`);
+`cog_right_focus_scrolls_with_jk` (real `handle_cog_press`: `l` focuses the detail
+pane, then `j` scrolls it and does NOT move selection; `h` returns focus and `j`
+selects again — negative-control verified RED); and the render-count guard
+`cog_body_is_cached`.
+
+### UXI-Cog-4 — Detail is presented as cards + pretty-printed JSON
+
+**Statement.** In the node detail pane, each status transition and each note renders
+as its own rounded, hairline-bordered card (visually separated for scanning).
+Structured `content` / `output` JSON is pretty-printed (2-space indent) in a
+monospace code block; a bare-string content renders as prose. The left selector
+uses a smaller font and truncates long graph / node names with an ellipsis rather
+than wrapping.
+
+**Applies to.** `card` / `note_card` / `transition_card` / `json_block` /
+`truncating_label` (`cog_view.rs`); `json_prose` / `json_is_structured`
+(`cog.rs`).
+
+**Why.** The `/new-ux` refinement: "Each update should have a small very stylish
+bounding box (like a card)"; "JSON needs to be pretty printed"; "Left pane is
+actually too narrow. Long graph names word wrap awkwardly … make font a bit smaller."
+
+**Status.** implemented
+
+**Enforcement.** Card/JSON/ellipsis styling is paint-only (genuine runtime gap #1 —
+exact glyphs/colours need a human eye); the structural pieces are unit-guarded by
+the pretty-print branch of `json_prose` and the existing
+`cog_detail_paints_and_overflows` (the detail column, now cards + code block, still
+paints and overflows its viewport).

@@ -19981,3 +19981,60 @@ fn cog_detail_paints_and_overflows(cx: &mut TestAppContext) {
          non-vacuous scroll (200-line node)"
     );
 }
+
+/// UXI-Cog-3 (keyboard focus): moving focus to the right detail pane makes j/k
+/// scroll it instead of moving the left selection; moving focus back restores
+/// selection. The focus-aware routing in `handle_cog_press` is the negative-
+/// control target (revert it → j selects while focused right → both asserts fail).
+#[gpui::test]
+fn cog_right_focus_scrolls_with_jk(cx: &mut TestAppContext) {
+    use crate::{KMods, Key, KeyPress};
+    let kp = |c: char| KeyPress::new(Key::Char(c), KMods::NONE);
+
+    let (view, vcx, cv, wid) = boot_with_cog(cx);
+    let req = cog_tile_req(&view, vcx);
+    view.update(vcx, |v, cx| {
+        v.cog_apply(
+            wid,
+            req,
+            Ok(crate::CogFetch::Graph(Box::new(cog_test_bundle(vec![
+                cog_tall_node("n1", "first", "done"),
+                cog_tall_node("n2", "second", "open"),
+            ])))),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    // `l` moves focus into the detail pane.
+    view.update(vcx, |v, cx| v.handle_cog_press(kp('l'), cx));
+    vcx.run_until_parked();
+    assert!(
+        cv.update(vcx, |c, _| c.focused_right()),
+        "l moves keyboard focus to the detail pane"
+    );
+
+    // With the detail pane focused, j scrolls it and does NOT move the selection.
+    for _ in 0..3 {
+        view.update(vcx, |v, cx| v.handle_cog_press(kp('j'), cx));
+        vcx.run_until_parked();
+    }
+    let (sel, y) = cv.update(vcx, |c, _| (c.selected_index(), c.right_scroll_y()));
+    assert_eq!(sel, 0, "detail-focused j must NOT move the left selection");
+    assert!(y < 0.0, "detail-focused j scrolls the detail pane (y={y})");
+
+    // `h` returns focus to the selector; j then moves the selection again.
+    view.update(vcx, |v, cx| v.handle_cog_press(kp('h'), cx));
+    vcx.run_until_parked();
+    assert!(
+        !cv.update(vcx, |c, _| c.focused_right()),
+        "h returns focus to the selector"
+    );
+    view.update(vcx, |v, cx| v.handle_cog_press(kp('j'), cx));
+    vcx.run_until_parked();
+    assert_eq!(
+        cv.update(vcx, |c, _| c.selected_index()),
+        1,
+        "selector-focused j moves the selection"
+    );
+}

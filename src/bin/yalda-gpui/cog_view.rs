@@ -32,6 +32,15 @@ pub(crate) enum CogViewState {
     },
 }
 
+/// Which pane the keyboard drives. `Left` selects rows; `Right` scrolls the
+/// detail pane with the same j/k/arrow keys. Only meaningful in the `Graph`
+/// state (the explorer has no scrollable detail to focus).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CogFocus {
+    Left,
+    Right,
+}
+
 /// The cached body view. One per Cog tile (owned by the tile via
 /// `Entity<CogView>`, dropped when the tile closes — no registry).
 pub(crate) struct CogView {
@@ -40,6 +49,8 @@ pub(crate) struct CogView {
     left_scroll: ScrollHandle,
     /// Right detail scroll (`u`/`d`/PageUp/PageDown, reset on selection change).
     right_scroll: ScrollHandle,
+    /// Which pane the keyboard drives (reset to `Left` on every state change).
+    focus: CogFocus,
     root: WeakEntity<YaldaGpuiView>,
     perf_label: &'static str,
 }
@@ -50,6 +61,7 @@ impl CogView {
             state: CogViewState::Loading("loading graphs…".into()),
             left_scroll: ScrollHandle::new(),
             right_scroll: ScrollHandle::new(),
+            focus: CogFocus::Left,
             root,
             perf_label: "cog",
         }
@@ -64,6 +76,37 @@ impl CogView {
     pub(crate) fn set_state(&mut self, state: CogViewState) {
         self.state = state;
         self.reset_scrolls();
+        self.focus = CogFocus::Left;
+    }
+
+    // ── Keyboard focus (which pane j/k drives) ───────────────────────────────
+
+    /// Is the RIGHT detail pane focused (so j/k scroll it)? Only ever true in
+    /// the `Graph` state.
+    pub(crate) fn focused_right(&self) -> bool {
+        self.focus == CogFocus::Right && self.in_graph()
+    }
+
+    /// Move keyboard focus to the right detail pane (no-op outside a graph).
+    pub(crate) fn focus_right(&mut self) {
+        if self.in_graph() {
+            self.focus = CogFocus::Right;
+        }
+    }
+
+    /// Move keyboard focus back to the left selector.
+    pub(crate) fn focus_left(&mut self) {
+        self.focus = CogFocus::Left;
+    }
+
+    /// Toggle focus between the panes (no-op outside a graph).
+    pub(crate) fn toggle_focus(&mut self) {
+        if self.in_graph() {
+            self.focus = match self.focus {
+                CogFocus::Left => CogFocus::Right,
+                CogFocus::Right => CogFocus::Left,
+            };
+        }
     }
 
     fn reset_scrolls(&mut self) {
@@ -199,8 +242,9 @@ impl Render for CogView {
             _ => {}
         }
 
-        let left = self.left_pane(&st, border);
-        let right = self.right_pane(&st);
+        let right_focused = self.focused_right();
+        let left = self.left_pane(&st, border, !right_focused);
+        let right = self.right_pane(&st, right_focused);
 
         div()
             .flex()
@@ -215,15 +259,23 @@ impl Render for CogView {
     }
 }
 
+/// A faint accent wash marking the pane that currently has keyboard focus.
+fn focus_tint(st: &DetailStyle) -> Hsla {
+    let mut c = st.accent;
+    c.a = 0.06;
+    c
+}
+
 impl CogView {
     /// The left selector pane (graph explorer or node list), scrollable and
-    /// following the selection.
-    fn left_pane(&self, st: &DetailStyle, border: Hsla) -> impl IntoElement {
+    /// following the selection. `focused` gets a faint accent wash.
+    fn left_pane(&self, st: &DetailStyle, border: Hsla, focused: bool) -> impl IntoElement {
+        let transparent: Hsla = rgba(0x00000000).into();
         let mut list = div()
             .id("cog-left")
             .flex()
             .flex_col()
-            .w(px(300.0))
+            .w(px(360.0))
             .flex_none()
             .h_full()
             .min_h_0()
@@ -231,6 +283,7 @@ impl CogView {
             .track_scroll(&self.left_scroll)
             .border_r_1()
             .border_color(border)
+            .bg(if focused { focus_tint(st) } else { transparent })
             .px_2()
             .py_2();
 
@@ -263,7 +316,9 @@ impl CogView {
     }
 
     /// The right detail pane (graph preview or node detail), scrollable.
-    fn right_pane(&self, st: &DetailStyle) -> impl IntoElement {
+    /// `focused` gets a faint accent wash (keyboard scrolls it).
+    fn right_pane(&self, st: &DetailStyle, focused: bool) -> impl IntoElement {
+        let transparent: Hsla = rgba(0x00000000).into();
         let body: AnyElement = match &self.state {
             CogViewState::Graphs { graphs, selected } => match graphs.get(*selected) {
                 Some(g) => graph_preview(g, st).into_any_element(),
@@ -289,6 +344,7 @@ impl CogView {
             .min_h_0()
             .overflow_y_scroll()
             .track_scroll(&self.right_scroll)
+            .bg(if focused { focus_tint(st) } else { transparent })
             .px_4()
             .py_3()
             .child(probe_bounds("cog-right-content", body));
@@ -334,12 +390,87 @@ fn left_header(text: &str, st: &DetailStyle) -> gpui::Div {
         .px_1()
         .text_color(st.dim)
         .font_family(st.mono.clone())
-        .text_size(px(st.pt * 0.85))
+        .text_size(px(st.pt * 0.8))
         .child(SharedString::from(text.to_string()))
+}
+
+// ── Cards (each "update" — a note or a transition — is its own boxed card) ────
+
+/// A faint fill for a card's interior.
+fn card_bg(st: &DetailStyle) -> Hsla {
+    let mut c = st.accent;
+    c.a = 0.05;
+    c
+}
+
+/// A subtle hairline border for a card / code block.
+fn card_border(st: &DetailStyle) -> Hsla {
+    st.dim.opacity(0.35)
+}
+
+/// A stronger fill for a monospace JSON code block.
+fn code_bg(st: &DetailStyle) -> Hsla {
+    st.dim.opacity(0.12)
+}
+
+/// An empty stylish card container: rounded, hairline border, faint fill.
+fn card(st: &DetailStyle) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .gap_1()
+        .p_2()
+        .rounded_md()
+        .border_1()
+        .border_color(card_border(st))
+        .bg(card_bg(st))
+}
+
+/// Render JSON: a bare string as prose; any structure as a pretty-printed
+/// monospace code block (rounded, tinted). Pretty-printing is the `/new-ux`
+/// requirement — content/output are shown indented, not as one run-on line.
+fn json_block(v: &serde_json::Value, st: &DetailStyle) -> gpui::Div {
+    if json_is_structured(v) {
+        div()
+            .w_full()
+            .p_2()
+            .rounded_md()
+            .border_1()
+            .border_color(card_border(st))
+            .bg(code_bg(st))
+            .child(multiline_text(
+                &json_prose(v),
+                st.fg,
+                &st.mono,
+                px(st.pt * 0.92),
+            ))
+    } else {
+        // Bare string / scalar → prose.
+        div()
+            .w_full()
+            .child(multiline_text(&json_prose(v), st.fg, &st.prose, st.base))
+    }
+}
+
+/// A single-line label that truncates with an ellipsis rather than wrapping —
+/// keeps the narrow left list tidy for long graph/node names.
+fn truncating_label(text: String, color: Hsla, size: gpui::Pixels, st: &DetailStyle) -> gpui::Div {
+    div()
+        .flex_1()
+        .min_w_0()
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_ellipsis()
+        .text_size(size)
+        .text_color(color)
+        .font_family(st.mono.clone())
+        .child(SharedString::from(text))
 }
 
 fn graph_row(g: &CogGraph, is_sel: bool, st: &DetailStyle) -> gpui::Div {
     let transparent: Hsla = rgba(0x00000000).into();
+    let name_size = px(st.pt * 0.88);
     let mut marks = String::new();
     if g.sealed {
         marks.push('🔒');
@@ -354,8 +485,6 @@ fn graph_row(g: &CogGraph, is_sel: bool, st: &DetailStyle) -> gpui::Div {
         .px_2()
         .py_1()
         .bg(if is_sel { nav_sel_bg(st) } else { transparent })
-        .font_family(st.mono.clone())
-        .text_size(st.base)
         .child(
             div()
                 .flex()
@@ -363,16 +492,16 @@ fn graph_row(g: &CogGraph, is_sel: bool, st: &DetailStyle) -> gpui::Div {
                 .gap_2()
                 .items_center()
                 .w_full()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_color(if is_sel { st.accent } else { st.fg })
-                        .child(SharedString::from(g.label())),
-                )
+                .child(truncating_label(
+                    g.label(),
+                    if is_sel { st.accent } else { st.fg },
+                    name_size,
+                    st,
+                ))
                 .child(
                     div()
                         .flex_none()
+                        .font_family(st.mono.clone())
                         .text_color(st.dim)
                         .child(SharedString::from(marks)),
                 ),
@@ -380,8 +509,12 @@ fn graph_row(g: &CogGraph, is_sel: bool, st: &DetailStyle) -> gpui::Div {
         .child(
             div()
                 .w_full()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .font_family(st.mono.clone())
                 .text_color(st.dim)
-                .text_size(px(st.pt * 0.8))
+                .text_size(px(st.pt * 0.76))
                 .child(SharedString::from(g.id.clone())),
         )
 }
@@ -402,15 +535,12 @@ fn node_row(n: &CogNode, eff: EffStatus, is_sel: bool, st: &DetailStyle) -> gpui
         .px_2()
         .py_1()
         .bg(if is_sel { nav_sel_bg(st) } else { transparent })
-        .font_family(st.mono.clone())
-        .text_size(st.base)
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .text_color(if is_sel { st.accent } else { st.fg })
-                .child(SharedString::from(name)),
-        )
+        .child(truncating_label(
+            name,
+            if is_sel { st.accent } else { st.fg },
+            px(st.pt * 0.88),
+            st,
+        ))
         .child(status_badge(eff, st))
 }
 
@@ -503,19 +633,14 @@ fn node_detail(bundle: &CogBundle, n: &CogNode, st: &DetailStyle) -> gpui::Div {
             .child(SharedString::from(n.id.clone())),
     );
 
-    // Content.
+    // Content (pretty-printed JSON when structured).
     col = col.child(section_heading("Content", st));
-    col = col.child(multiline_text(
-        &json_prose(&n.content),
-        st.fg,
-        &st.prose,
-        st.base,
-    ));
+    col = col.child(json_block(&n.content, st));
 
     // Output (if any).
     if let Some(out) = n.output.as_ref().filter(|v| !v.is_null()) {
         col = col.child(section_heading("Output", st));
-        col = col.child(multiline_text(&json_prose(out), st.fg, &st.prose, st.base));
+        col = col.child(json_block(out, st));
     }
 
     // Status transitions (from the node log).
@@ -538,7 +663,7 @@ fn node_detail(bundle: &CogBundle, n: &CogNode, st: &DetailStyle) -> gpui::Div {
                 .and_then(|v| v.as_str())
                 .unwrap_or("?")
                 .to_string();
-            col = col.child(transition_row(&to, &e.actor, fmt_epoch_ns(e.at), st));
+            col = col.child(transition_card(&to, &e.actor, fmt_epoch_ns(e.at), st));
         }
     }
 
@@ -554,61 +679,90 @@ fn node_detail(bundle: &CogBundle, n: &CogNode, st: &DetailStyle) -> gpui::Div {
         col = col.child(dim_line("No notes.", st));
     } else {
         for note in notes {
-            let author = if note.actor.trim().is_empty() {
-                "—".to_string()
-            } else {
-                note.actor.clone()
-            };
-            let when = fmt_epoch_ns(note.at);
-            let topic = note
-                .topic
-                .clone()
-                .filter(|t| !t.is_empty())
-                .map(|t| format!("[{t}] "))
-                .unwrap_or_default();
-            col = col.child(note_block(
-                author,
-                when,
-                &format!("{topic}{}", note.summary()),
-                st,
-            ));
+            col = col.child(note_card(note, st));
         }
     }
     col
 }
 
-/// One status-transition row: `→ done   actor   2026-08-17 12:34`.
-fn transition_row(to: &str, actor: &str, when: String, st: &DetailStyle) -> gpui::Div {
-    div()
+/// A status transition as a stylish card: `→ done` (in the status colour), the
+/// actor, and the timestamp.
+fn transition_card(to: &str, actor: &str, when: String, st: &DetailStyle) -> gpui::Div {
+    let eff = crate::parse_eff_status(to);
+    card(st).child(
+        div()
+            .flex()
+            .flex_row()
+            .gap_2()
+            .items_baseline()
+            .w_full()
+            .font_family(st.mono.clone())
+            .text_size(st.base)
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(110.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(status_color(eff, st))
+                    .child(SharedString::from(format!("→ {to}"))),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_color(st.fg)
+                    .child(SharedString::from(actor.to_string())),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(st.dim)
+                    .text_size(px(st.pt * 0.82))
+                    .child(SharedString::from(when)),
+            ),
+    )
+}
+
+/// One note as a stylish card: a header row (topic badge · author, then the
+/// timestamp) above the note prose.
+fn note_card(note: &CogNote, st: &DetailStyle) -> gpui::Div {
+    let author = if note.actor.trim().is_empty() {
+        "—".to_string()
+    } else {
+        note.actor.clone()
+    };
+    let when = fmt_epoch_ns(note.at);
+    let topic = note.topic.clone().filter(|t| !t.is_empty());
+
+    let mut head = div()
         .flex()
         .flex_row()
-        .gap_2()
-        .items_baseline()
+        .items_center()
+        .justify_between()
         .w_full()
-        .px_1()
         .font_family(st.mono.clone())
-        .text_size(st.base)
-        .child(
+        .text_size(px(st.pt * 0.82));
+    let mut left = div().flex().flex_row().items_center().gap_2().min_w_0();
+    if let Some(t) = topic {
+        left = left.child(
             div()
                 .flex_none()
-                .w(px(120.0))
+                .px_1()
+                .rounded_md()
+                .bg(st.accent.opacity(0.16))
                 .text_color(st.accent)
-                .child(SharedString::from(format!("→ {to}"))),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .text_color(st.fg)
-                .child(SharedString::from(actor.to_string())),
-        )
-        .child(
-            div()
-                .flex_none()
-                .text_color(st.dim)
-                .text_size(px(st.pt * 0.85))
-                .child(SharedString::from(when)),
-        )
+                .font_weight(FontWeight::BOLD)
+                .child(SharedString::from(t)),
+        );
+    }
+    left = left.child(div().flex_none().text_color(st.dim).child(SharedString::from(author)));
+    head = head
+        .child(left)
+        .child(div().flex_none().text_color(st.dim).child(SharedString::from(when)));
+
+    card(st)
+        .child(head)
+        .child(multiline_text(&note.summary(), st.fg, &st.prose, st.base))
 }
 
 // ── Full-tile message bodies ─────────────────────────────────────────────────
