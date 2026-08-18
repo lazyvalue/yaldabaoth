@@ -8,14 +8,17 @@
 The **command panel** is the overlay that opens on a leader key when the focused
 tile is NOT in text entry — the progressive-disclosure surface for leader-key
 commands (which-key-style, but the *primary* binding surface, not a viewer over an
-existing keymap; see `spec-menu-scopes.md`). Three leaders open it:
+existing keymap). **Two** leaders open it (ADR-0032 — the former three-scope model,
+`space`/`.`/`?`, collapsed to two, organized by the *object* of the verb):
 
-- **`space`** — tile/app-local menu (entries depend on the focused content kind:
-  Doc / Edit / Agent / Browser / Linear / Keys).
-- **`.`** — workspace menu (new tile, theme, plane view, marks, restart, …).
-- **`?`** — global menu (workspace list + workspace/project ops + system console).
+- **`space`** — verbs whose object is the **focused tile's App**. Polymorphic over
+  App type — one mechanism, per-App vocabulary (Doc / Edit / Agent / Browser /
+  Linear / Cog / Keys).
+- **`.`** — verbs whose object is the **shell**: tiles, workspaces, appearance,
+  system. Absorbed the retired `?` global menu (workspace list + workspace/project
+  ops + system console).
 
-All three share one mechanism: `ActiveOverlay::Menu(MenuOverlay)` on
+Both share one mechanism: `ActiveOverlay::Menu(MenuOverlay)` on
 `YaldaGpuiView`, a `MenuState` (descent `path: Vec<usize>` over a static
 `Vec<MenuNode>` tree) shared with the TUI, and one renderer — `render_menu_overlay`
 (`src/bin/yalda-gpui/main.rs`). A keypress at the current depth either **descends**
@@ -42,12 +45,15 @@ level — a menu whose goal is its own obsolescence.
 
 ## References
 
+- `docs/decisions/0032-two-leader-menus-shape-object-model.md` — the ADR that
+  collapsed three leaders to two and states the shape+object placement test. **This
+  is the current authority on the leader model** (`UXI-Menu-6`, `UXI-Menu-7`).
 - `docs/decisions/0029-command-panel-is-a-floating-elevated-sigil-card.md` — the ADR
   recording *why* each of these visual decisions was made (placement, elevation,
   scope hues, the keystroke trail, keyboard-only) and the alternatives rejected.
-- `docs/specs/spec-menu-scopes.md` — the leader model + behavior (global `.` /
-  local `space` / global `?`, breadcrumb, Esc, disabled entries, scopes). This spec
-  renders that state machine; it does not alter it.
+- `docs/specs/spec-menu-scopes.md` — **historical DRAFT**, superseded by ADR-0032.
+  It documents an early (and since-inverted) Space=global / `.`=local model; read
+  it for background only.
 - `docs/components/jump-panel.md` — the permanent left sidebar the panel floats to
   the right of (`JUMP_PANEL_WIDTH`).
 - `render_project_menu` (`main.rs`) — the aesthetic donor (rounded popup, shadow,
@@ -107,8 +113,11 @@ Exact chip colors/tints are the documented paint/pixel gap (`NEEDS-RUNTIME`).
 
 ### UXI-Menu-3 — the header shows the keystroke trail that reached this level
 
+> **Amended by ADR-0032.** Only two leaders remain (`␣`, `.`); the `?` glyph is
+> retired.
+
 **Statement.** The panel header renders the **literal chord** taken to reach the
-current depth as a sequence of key crumbs: the leader glyph (`␣` / `.` / `?`) followed
+current depth as a sequence of key crumbs: the leader glyph (`␣` / `.`) followed
 by each descended submenu key, ending in the current level's name. At root the trail
 is just the leader glyph + scope name; each descent appends its key. The trail is
 derived from `MenuState::path` over the menu tree (no new state).
@@ -129,8 +138,11 @@ appends that submenu's key and its label. Negative control: return only
 
 ### UXI-Menu-4 — the scope-hued left accent bar and stable top edge
 
+> **Amended by ADR-0032.** The `?` leader is retired; only the `space` and `.`
+> scope hues remain.
+
 **Statement.** The card carries a 2px full-height **left accent bar** in the leader's
-scope hue (`space`→`agent.frozen_bar`, `.`→`overlay.key`, `?`→`agent.jump_header`),
+scope hue (`space`→`agent.frozen_bar`, `.`→`overlay.key`),
 and the card's **top edge and left edge are invariant across submenu descent** —
 descending into or escaping out of a submenu never moves the card's top or left
 anchor (only its height/width may change, growing down/right).
@@ -177,6 +189,65 @@ jump bar sunk, tiles level, command card raised.
 hue/sat/alpha. Negative control: return `editor` unchanged ⇒ RED. The shared-surface
 half is pinned by `jump_panel_surface_matches_the_command_menu`. The exact resulting
 color per theme is the documented pixel gap.
+
+### UXI-Menu-6 — two leaders, split by the object of the verb
+
+**Statement.** Exactly **two** leaders open the command panel, and each owns one
+object class (ADR-0032):
+
+- **`space`** opens the menu whose verbs act on the **focused tile's App**. The
+  tree is selected by the focused content kind (`open_local_menu_inner` matches
+  `App::{Buffer(Viewing/Editing/Picking), Agent, Linear, Cog, Keymap}`). The
+  mechanism is uniform; the vocabulary is per-App.
+- **`.`** opens the single **shell** menu (`gpui_menu`) — verbs on tiles,
+  workspaces, appearance, and system. It is the same tree regardless of focused
+  tile. It contains everything the retired `?` global menu held.
+
+`?` **does not open a menu.** A bare `?` in a navigation state is inert (or a
+literal character where text is captured). Actions that must work *while typing*
+(workspace jump, jump-panel toggle) are direct chords, never leader-menu items.
+
+**The placement test (shape+object).** A candidate action is placed by shape,
+then object: a **motion** (repeatable, reversible, no state change) is a direct
+key, never a menu entry; a **verb** (discrete named state change) is a menu entry,
+under `space` if its object is the focused App and under `.` if its object is the
+shell; an **escape hatch** (invoked by name — rare or destructive) goes to the `:`
+command line (deferred until that surface exists). Frequency is not a criterion.
+
+**Applies to.** `leader_intercept` (`main.rs`) — only `' '` and `.` route to a
+menu; `open_local_menu_inner`, `open_menu_inner`, `gpui_menu`.
+
+**Why.** The old tile/workspace/global split described where a handler lived, not
+how the operator decides; it leaked (workspace ops split across `.` and `?`).
+Object is the distinction the operator feels, and it maps to exactly two menus.
+
+**Status.** `implemented`
+
+**Enforcement.** `verify_harness.rs` — a `?` press in a navigation state opens no
+menu overlay; former `?` command names (`new-workspace`, `rename-workspace`,
+`new-project`, `open-system-console`, `toggle-jump-panel`) dispatch and are
+reachable under `.`. Negative control: restore the `?` route ⇒ the "no overlay"
+assert goes RED.
+
+### UXI-Menu-7 — no duplicate key at any one menu level
+
+**Statement.** Within any single level of any menu tree (root or a submenu), no
+two dispatchable entries share a trigger key. Descent keys and leaf keys at the
+same level are one namespace. Reusing a key across *different* levels or across
+the two menus is allowed (that is what submenus and the two objects are for).
+
+**Applies to.** Every `*_local_menu()` builder, `agent_local_menu_dynamic`,
+`gpui_menu`, and their submenu children (`main.rs`).
+
+**Why.** `MenuState::process_key` dispatches the *first* entry whose key matches;
+a duplicate key at one level makes the second entry unreachable — a silent
+dead entry, which is exactly the kind of noise this restructure removes.
+
+**Status.** `implemented`
+
+**Enforcement.** `tests.rs::local_menus_have_no_duplicate_keys_per_level` — walks
+every menu builder including the new `s`/`M`/`w`/system submenus and asserts each
+level's keys are unique.
 
 ## Deviations from the design brief (Fable, "The Sigil Card")
 

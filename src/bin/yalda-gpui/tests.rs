@@ -3106,11 +3106,12 @@ fn gpui_menu_has_required_entries() {
     let mut leaf_actions: Vec<&str> = Vec::new();
     collect_leaves(&menu, &mut leaf_actions);
     // The expected leaf actions — change here if gpui_menu changes.
-    // Workspace menu holds: set cwd, new agent/buffer/linear, theme
-    // nightfox/folio, plane view zoom-in/zoom-out/reset (the retired
-    // manual/master-stack/monocle/columns/desktop mode leaves are gone —
-    // infinite-plane Stage D), rebuild+restart, mark tile, close tile, and
-    // close workspace.
+    // The `.` SHELL menu (ADR-0032) holds shell-scoped verbs: set cwd, new
+    // tile (agent/buffer/linear), theme nightfox/folio, plane view
+    // zoom-in/zoom-out/reset, toggle plane/columns, toggle jump panel, mark
+    // tile, close tile; a `w` (workspace) submenu with new/rename/close
+    // workspace + new project; and an `s` (system) submenu with rebuild-gui,
+    // rebuild-all, system console. It absorbed the retired `?` global menu.
     let expected = [
         "workspace-set-cwd",
         "new-agent-tile",
@@ -3121,11 +3122,18 @@ fn gpui_menu_has_required_entries() {
         "plane-zoom-in",
         "plane-zoom-out",
         "plane-reset-view",
+        "workspace-toggle-columns",
+        "toggle-jump-panel",
         "dev-restart-gui",
         "dev-restart-all",
+        "open-system-console",
         "mark-tile",
         "close-window",
+        // workspace submenu (formerly the `?` global menu)
+        "new-workspace",
+        "rename-workspace",
         "close-workspace",
+        "new-project",
     ];
     for e in expected {
         assert!(
@@ -3135,14 +3143,14 @@ fn gpui_menu_has_required_entries() {
             leaf_actions
         );
     }
-    // Everything else moved out of the workspace scope: tile commands to
-    // the `.` local menus, window/workspace/layout management to chords,
-    // quit to Cmd-Q.
+    // Everything else is out of the shell scope: focused-App verbs live in the
+    // `<space>` local menus, window/layout management on chords, quit on Cmd-Q.
+    // (`goto-workspace-N` is a direct chord, ctrl-1..0, never a menu entry.)
     for gone in [
         "open-browser",
         "buffer-list",
         "split-h",
-        "new-workspace",
+        "goto-workspace-0",
         "move-tile",
         "cycle-layout",
         "tag-add",
@@ -3169,23 +3177,40 @@ fn menu_state_round_trip_picks_command() {
 }
 
 #[test]
-fn workspace_menu_uppercase_x_selects_close_workspace() {
+fn shell_menu_close_tile_at_root_close_workspace_under_w() {
+    // ADR-0032: root `x` closes the focused TILE; closing the WORKSPACE moved
+    // into the `w` (workspace) submenu at `w x` (the former root `X` is gone).
     let menu = gpui_menu();
-
-    let mut upper = MenuState::new();
-    upper.open();
-    assert_eq!(
-        upper.process_key(KeyPress::new(Key::Char('X'), KMods::NONE), &menu),
-        Some("close-workspace".to_string()),
-        "uppercase X closes the workspace"
-    );
 
     let mut lower = MenuState::new();
     lower.open();
     assert_eq!(
         lower.process_key(KeyPress::new(Key::Char('x'), KMods::NONE), &menu),
         Some("close-window".to_string()),
-        "lowercase x remains close tile"
+        "root x closes the focused tile"
+    );
+
+    // `X` is no longer bound at root.
+    let mut upper = MenuState::new();
+    upper.open();
+    assert_eq!(
+        upper.process_key(KeyPress::new(Key::Char('X'), KMods::NONE), &menu),
+        None,
+        "uppercase X at root is unbound now"
+    );
+
+    // Descend into the workspace submenu, then `x` closes the workspace.
+    let mut ws = MenuState::new();
+    ws.open();
+    assert_eq!(
+        ws.process_key(KeyPress::new(Key::Char('w'), KMods::NONE), &menu),
+        None,
+        "w opens the workspace submenu"
+    );
+    assert_eq!(
+        ws.process_key(KeyPress::new(Key::Char('x'), KMods::NONE), &menu),
+        Some("close-workspace".to_string()),
+        "w x closes the workspace"
     );
 }
 
@@ -3222,8 +3247,9 @@ fn menu_trail_crumbs_tracks_descent() {
 
 #[test]
 fn local_menus_have_no_duplicate_keys_per_level() {
-    // spec-menu-scopes.md: every local menu must be unambiguous — one
-    // key, one entry, at each depth.
+    // UXI-Menu-7: every menu (the `.` shell menu and every `<space>` App menu)
+    // must be unambiguous — one key, one entry, at each depth, INCLUDING the new
+    // shell `w`/`s` submenus and the agent `s`/`v` submenus.
     fn check_level(nodes: &[MenuNode], path: &str) {
         let mut seen: Vec<&[KeyPress]> = Vec::new();
         for n in nodes {
@@ -3243,10 +3269,16 @@ fn local_menus_have_no_duplicate_keys_per_level() {
             }
         }
     }
+    check_level(&gpui_menu(), "shell");
     check_level(&doc_local_menu(), "doc");
     check_level(&edit_local_menu(), "edit");
     check_level(&agent_local_menu(), "agent");
     check_level(&browser_local_menu(), "browser");
+    check_level(&linear_local_menu(), "linear");
+    check_level(&cog_local_menu(), "cog");
+    check_level(&keymap_local_menu(), "keymap");
+    // (The DYNAMIC agent menu — grafted archive + model submenu — is covered by
+    // verify_harness::agent_dynamic_menu_has_no_duplicate_keys, which needs a view.)
 }
 
 #[test]
@@ -3282,20 +3314,24 @@ fn edit_local_menu_e_v_resolves_extend_mode() {
 }
 
 #[test]
-fn agent_local_n_resolves_to_claude_new() {
-    // Claude session management lives in the Agent local menu now.
+fn agent_local_s_n_resolves_to_claude_new() {
+    // ADR-0032: session lifecycle (new/rename/tag/close/recap) moved under the
+    // `s` (session) submenu; `s n` creates a new Claude session.
     let mut state = MenuState::new();
     state.open();
     let menu = agent_local_menu();
+    let after_s = state.process_key(KeyPress::new(Key::Char('s'), KMods::NONE), &menu);
+    assert_eq!(after_s, None, "s opens the session submenu");
     let cmd = state.process_key(KeyPress::new(Key::Char('n'), KMods::NONE), &menu);
     assert_eq!(cmd, Some("claude-new".to_string()));
 }
 
 #[test]
-fn agent_local_upper_n_resolves_to_codex_new() {
+fn agent_local_s_upper_n_resolves_to_codex_new() {
     let mut state = MenuState::new();
     state.open();
     let menu = agent_local_menu();
+    state.process_key(KeyPress::new(Key::Char('s'), KMods::NONE), &menu);
     let cmd = state.process_key(KeyPress::new(Key::Char('N'), KMods::NONE), &menu);
     assert_eq!(cmd, Some("codex-new".to_string()));
 }
