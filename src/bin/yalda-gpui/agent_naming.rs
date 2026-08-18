@@ -83,10 +83,14 @@ pub(crate) fn trim_opening(transcript: &str) -> String {
     if transcript.len() <= NAMING_TRANSCRIPT_BUDGET {
         return transcript.to_string();
     }
-    // Back off to the previous line boundary so we don't cut mid-line.
-    let end = transcript[..NAMING_TRANSCRIPT_BUDGET]
-        .rfind('\n')
-        .unwrap_or(NAMING_TRANSCRIPT_BUDGET);
+    // Back off to a char boundary first (the budget can land mid-codepoint,
+    // e.g. inside an em dash), then to the previous line boundary so we don't
+    // cut mid-line.
+    let mut budget = NAMING_TRANSCRIPT_BUDGET;
+    while budget > 0 && !transcript.is_char_boundary(budget) {
+        budget -= 1;
+    }
+    let end = transcript[..budget].rfind('\n').unwrap_or(budget);
     format!("{}\n…(rest of conversation elided)…", &transcript[..end])
 }
 
@@ -351,4 +355,25 @@ pub(crate) fn request_session_name(api_key: &str, transcript: &str) -> Result<Se
         return Err("naming reply was unusable".into());
     }
     Ok(naming)
+}
+
+#[cfg(test)]
+mod trim_opening_tests {
+    use super::*;
+
+    #[test]
+    fn trim_opening_slices_multibyte_at_budget_without_panic() {
+        // Regression: the budget landed inside a 3-byte em dash, and slicing at
+        // the raw byte index panicked "not a char boundary".
+        let mut s = "a".repeat(NAMING_TRANSCRIPT_BUDGET - 2);
+        s.push('—'); // 3-byte char straddling the budget (bytes N-2..N+1)
+        s.push_str(&"b".repeat(100));
+        let out = trim_opening(&s); // must not panic
+        assert!(out.contains("elided"));
+    }
+
+    #[test]
+    fn trim_opening_returns_short_input_verbatim() {
+        assert_eq!(trim_opening("short"), "short");
+    }
 }
