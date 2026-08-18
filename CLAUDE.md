@@ -32,8 +32,8 @@ the work happens inside them:
   there is no nested `underlying` buffer, and no "leave agent" gesture — an
   agent tile stays an agent tile; you close it or open a Buffer tile normally).
   Agent commands (space / tile menu): select session · stop · send message · switch
-  Worksheet⇄Message Box. (Leaders: space → tile/app menu, `.` → workspace menu,
-  `?` → global menu.)
+  Worksheet⇄Message Box. (Two leaders — ADR-0032: space → verbs on the focused
+  App; `.` → verbs on the shell. `?` is retired.)
 
 ## Dev system (read this for how we work)
 
