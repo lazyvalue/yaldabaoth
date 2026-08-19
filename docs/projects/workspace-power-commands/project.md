@@ -32,7 +32,7 @@ XMonad on top of ADR-0033's stable bound/Unbound ownership:
 | Core state + persistence | `core` / `kzef` | complete |
 | Commands + Columns geometry | `commands` / `reaf` | complete |
 | Real-path verification | `verify` / `jo7t` | complete |
-| Documentation + integration | `integrate` / `r08q` | in progress |
+| Documentation + integration | `integrate` / `r08q` | complete |
 
 ## Acceptance
 
