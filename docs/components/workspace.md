@@ -1039,3 +1039,64 @@ nested split-tree layout model.
 key paths and uses layout probes to prove ratio changes painted master/stack
 widths and all-master count divides the full width evenly. Negative controls:
 hard-coding either the rendered ratio or count made the geometry guard RED.
+
+### UXI-Workspace-21 — Close Tile closes a directly focused Unbound tile
+
+**Statement.** The shell's **Close Tile** command has the same object regardless
+of placement: it removes the focused stable tile when that tile is bound or
+Unbound. For a directly focused Unbound tile, closing removes it from Unbound,
+removes any scratchpad reference to its id, clears direct focus, and reveals the
+still-active workspace. This applies to every App state, including a Buffer file
+picker and an Agent tile with no selected session.
+
+Closing an Unbound tile does not close a workspace, kill the app, or reinterpret
+an empty Agent picker as a session-lifecycle command. The sole-workspace floor
+continues to apply only when closing the last bound leaf.
+
+**Applies to.** `workspace.rs::Frame::close_focused`; `main.rs::close_window`
+and the `close-window` menu dispatcher.
+
+**Why.** Unbound is an ownership domain, not a special preview. Once the jump
+panel directly focuses one of its tiles, shell verbs must act on that tile just
+as they do on a workspace leaf.
+
+**Status.** `implemented`.
+
+**Enforcement.** `verify_harness.rs::close_tile_removes_unbound_buffer_and_agent_picker`
+drives the real `close-window` menu dispatcher against a directly focused
+Buffer picker and empty Agent picker, and proves both stable ids leave Unbound
+while the workspace floor survives.
+
+### UXI-Workspace-22 — Ctrl-W is owned once by the shell, never by an App
+
+**Statement.** The complete `Ctrl-W` command family is registered on one common
+shell ancestor that wraps every focused tile surface. App renderers own only
+App-specific actions; they do not opt into, duplicate, intercept, or omit shell
+workspace actions. Consequently every `Ctrl-W` binding has the same dispatch
+availability for every bound and directly focused Unbound App state, including
+Buffer Picking/Viewing/Editing, Agent picker/session/unavailable, Linear, Cog,
+and Keymap.
+
+The central handler list and the `GLOBAL_BINDINGS` entries beginning with
+`ctrl-w` have one declarative source/coverage contract: adding a binding without
+central shell wiring is a test failure. Overlay focus remains an intentional
+boundary; an active modal overlay owns its own keyboard surface and is not a
+tile App silently consuming the prefix.
+
+**Applies to.** `main.rs`: the central Ctrl-W action-wiring extension and
+coverage vocabulary; `chrome.rs::render_focused_window`: the sole tile-shell
+wiring point; `screens.rs`: App-local action wiring only;
+`keymap_registry.rs::GLOBAL_BINDINGS`.
+
+**Why.** GPUI resolves a binding to an action before an App's key listener, but
+the action is silently dropped when no listener exists in the focused element's
+ancestry. Duplicating shell listeners across each screen made every new picker
+or App mode a regression opportunity and made the failure look like tile key
+capture.
+
+**Status.** `implemented`.
+
+**Enforcement.** `verify_harness.rs::ctrl_w_shell_commands_reach_every_tile_app`
+uses the production keymap and real `Ctrl-W` keystrokes across the App-state
+matrix. A registry coverage guard compares every configured `ctrl-w` action to
+the central declarative handler vocabulary.

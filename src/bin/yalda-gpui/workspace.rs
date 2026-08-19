@@ -2516,14 +2516,24 @@ impl<C> Frame<C> {
     }
 
     /// Close the focused window. Returns:
-    /// - `Ok(Some(new_focus))` — close succeeded, focus moved to a sibling.
+    /// - `Ok(Some(new_focus))` — close succeeded, focus moved to a sibling; for
+    ///   direct Unbound focus, the tile was removed and the workspace is revealed.
     /// - `Ok(None)` — the focused window was the last in the workspace; the caller
     ///   should close the workspace (or replace it with a placeholder per spec
     ///   Behavior 2).
     /// - `Err(())` — no active workspace / no focused window.
     pub fn close_focused(&mut self) -> Result<Option<WindowId>, ()> {
-        if self.direct_unbound.is_some() {
-            return Err(());
+        if let Some(focused) = self.direct_unbound {
+            let reveal = self.active_workspace().map(|wsp| wsp.focused).ok_or(())?;
+            let pos = self
+                .unbound_tiles
+                .iter()
+                .position(|tile| tile.window.id == focused)
+                .ok_or(())?;
+            self.unbound_tiles.remove(pos);
+            self.scratchpad.retain(|candidate| *candidate != focused);
+            self.direct_unbound = None;
+            return Ok(Some(reveal));
         }
         let wsp = self.active_workspace_mut().ok_or(())?;
         let focused = wsp.focused;
@@ -3701,6 +3711,21 @@ mod tests {
         let mut ws = ws_with_layout(leaf(1, "a"), 1);
         let result = ws.close_focused().unwrap();
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn close_focused_removes_direct_unbound_and_reveals_workspace() {
+        let mut frame = Frame::with_initial(TestContent("bound"), ProjectId(0));
+        let unbound = frame.push_unbound(TestContent("picker"), ProjectId(0));
+        frame.scratchpad.extend([unbound, unbound]);
+        assert!(frame.focus_unbound(unbound));
+
+        assert_eq!(frame.close_focused(), Ok(Some(1)));
+        assert!(frame.tile(unbound).is_none());
+        assert_eq!(frame.directly_focused_unbound(), None);
+        assert!(frame.scratchpad.is_empty());
+        assert_eq!(frame.focused_window_id(), Some(1));
+        assert_eq!(frame.workspaces.len(), 1);
     }
 
     #[test]

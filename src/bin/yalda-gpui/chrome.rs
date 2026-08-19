@@ -110,16 +110,7 @@ impl YaldaGpuiView {
             );
             return div()
                 .size_full()
-                .on_action(cx.listener(Self::bind_focused_tile))
-                .on_action(cx.listener(Self::unbind_focused_tile))
-                .on_action(cx.listener(Self::move_tile_and_follow))
-                .on_action(cx.listener(Self::stash_scratchpad))
-                .on_action(cx.listener(Self::summon_scratchpad))
-                .on_action(cx.listener(Self::workspace_back_and_forth))
-                .on_action(cx.listener(Self::grow_master_area))
-                .on_action(cx.listener(Self::shrink_master_area))
-                .on_action(cx.listener(Self::increase_master_count))
-                .on_action(cx.listener(Self::decrease_master_count))
+                .ctrl_w_shell_actions(cx)
                 .child(content)
                 .into_any_element();
         }
@@ -153,16 +144,7 @@ impl YaldaGpuiView {
         };
         div()
             .size_full()
-            .on_action(cx.listener(Self::bind_focused_tile))
-            .on_action(cx.listener(Self::unbind_focused_tile))
-            .on_action(cx.listener(Self::move_tile_and_follow))
-            .on_action(cx.listener(Self::stash_scratchpad))
-            .on_action(cx.listener(Self::summon_scratchpad))
-            .on_action(cx.listener(Self::workspace_back_and_forth))
-            .on_action(cx.listener(Self::grow_master_area))
-            .on_action(cx.listener(Self::shrink_master_area))
-            .on_action(cx.listener(Self::increase_master_count))
-            .on_action(cx.listener(Self::decrease_master_count))
+            .ctrl_w_shell_actions(cx)
             .child(content)
             .into_any_element()
     }
@@ -229,20 +211,7 @@ impl YaldaGpuiView {
             .gap(px(DESKTOP_GUTTER))
             .p(px(DESKTOP_GUTTER))
             .bg(base_bg)
-            .overflow_hidden()
-            // Wire the arrangement toggle on the container (the common ancestor
-            // of the focused tile in this view) so `Ctrl-W a` / the menu can flip
-            // back to the plane.
-            .on_action(cx.listener(Self::toggle_workspace_columns))
-            .on_action(cx.listener(Self::swap_tile_left))
-            .on_action(cx.listener(Self::swap_tile_down))
-            .on_action(cx.listener(Self::swap_tile_up))
-            .on_action(cx.listener(Self::swap_tile_right))
-            .on_action(cx.listener(Self::promote_tile))
-            .on_action(cx.listener(Self::open_swap_tile_picker))
-            .on_action(cx.listener(Self::rotate_tiles_forward))
-            .on_action(cx.listener(Self::rotate_tiles_backward))
-            .on_action(cx.listener(Self::undo_arrangement));
+            .overflow_hidden();
 
         let tile_count = order.len();
         let master_count = wsp.master_count.clamp(1, tile_count.max(1));
@@ -503,30 +472,6 @@ impl YaldaGpuiView {
             .size_full()
             .overflow_hidden()
             .bg(base_bg)
-            // Plane-camera keymap actions (Ctrl-W -/=/0) live on the CANVAS root,
-            // not the per-screen leaf roots — the canvas is the common ancestor
-            // of every tile AND the ONLY thing that renders at Card/Minimap (where
-            // tiles are placeholders with no per-screen `on_action` wiring). Wiring
-            // here is what lets you zoom back IN from Minimap; the focused tile /
-            // placeholder carries the focus handle inside this subtree so the
-            // action always has a handler in its ancestry (spec Behavior 3, C5).
-            .on_action(cx.listener(Self::zoom_out_workspace))
-            .on_action(cx.listener(Self::zoom_in_workspace))
-            .on_action(cx.listener(Self::reset_workspace_view))
-            // Arrangement toggle (UXI-Workspace-14): flip the plane to columns.
-            .on_action(cx.listener(Self::toggle_workspace_columns))
-            // Dwm-style placement mutations (UXI-Workspace-15). These live on
-            // the arrangement root so every App kind—and Card/Minimap, where
-            // no live tile body exists—has the handlers in its focus ancestry.
-            .on_action(cx.listener(Self::swap_tile_left))
-            .on_action(cx.listener(Self::swap_tile_down))
-            .on_action(cx.listener(Self::swap_tile_up))
-            .on_action(cx.listener(Self::swap_tile_right))
-            .on_action(cx.listener(Self::promote_tile))
-            .on_action(cx.listener(Self::open_swap_tile_picker))
-            .on_action(cx.listener(Self::rotate_tiles_forward))
-            .on_action(cx.listener(Self::rotate_tiles_backward))
-            .on_action(cx.listener(Self::undo_arrangement))
             // Wheel/trackpad routing (Stage C, spec Behavior 5). This handler
             // fires in the BUBBLE phase, so at Full a scroll a live tile's inner
             // list already consumed still reaches here — `desktop_scroll` guards
@@ -1701,21 +1646,12 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::paste_from_clipboard))
             .on_action(cx.listener(Self::rename_workspace))
-            .on_action(cx.listener(Self::move_tile))
             .on_action(cx.listener(Self::also_show_tile))
             .on_action(cx.listener(Self::toggle_file_browser_rail))
             .on_action(cx.listener(Self::toggle_jump_panel))
             .on_action(cx.listener(Self::open_jump_palette))
             .on_action(cx.listener(Self::toggle_outline_rail))
-            .on_action(cx.listener(Self::flip_rail_side))
-            // Tile focus motion — without these the ctrl-w h/j/k/l chords
-            // are swallowed when the rail holds `track_focus`.
-            .on_action(cx.listener(Self::focus_left))
-            .on_action(cx.listener(Self::focus_right))
-            .on_action(cx.listener(Self::focus_up))
-            .on_action(cx.listener(Self::focus_down))
-            .on_action(cx.listener(Self::focus_next))
-            .on_action(cx.listener(Self::focus_prev));
+            .on_action(cx.listener(Self::flip_rail_side));
 
         match &rail.content {
             workspace::RailContent::FileBrowser(fb) => {

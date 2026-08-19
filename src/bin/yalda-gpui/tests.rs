@@ -5,6 +5,28 @@ use crate::chrome::{
     DESKTOP_CELL_H, DESKTOP_CELL_W, DESKTOP_GUTTER,
 };
 
+/// UXI-Workspace-22: every shipped `Ctrl-W …` command is shell-owned and is
+/// wired at the common tile ancestor. This exact-set assertion is the change
+/// detector: adding a registry row without adding its central listener fails
+/// here instead of failing only in whichever App happens not to forward it.
+#[test]
+fn ctrl_w_registry_exactly_matches_central_shell_actions() {
+    use std::collections::BTreeSet;
+
+    let registered: BTreeSet<&str> = KeymapRegistry::defaults()
+        .entries
+        .iter()
+        .filter(|entry| entry.default_keystrokes.starts_with("ctrl-w "))
+        .map(|entry| entry.action)
+        .collect();
+    let centrally_wired: BTreeSet<&str> = CTRL_W_SHELL_ACTION_NAMES.iter().copied().collect();
+
+    assert_eq!(
+        centrally_wired, registered,
+        "the Ctrl-W keymap and the shell's common-ancestor listeners must evolve together"
+    );
+}
+
 /// UXI-JumpPanel-7: the jump-panel accent colors are theme-owned, not fixed
 /// constants. Nightfox art-directs its own palette-native jump colors (explicit
 /// recessed panel bg + muted-rose header + soft-blue subheader + warm-orange

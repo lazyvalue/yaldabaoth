@@ -1684,6 +1684,9 @@ impl YaldaGpuiView {
                     .py_1()
                     .cursor_pointer()
                     .text_color(electric)
+                    .font_family(st.mono.clone())
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_size(px(st.pt * 0.82))
                     .child(SharedString::from(format!(
                         "{} 🏷 {}  {}",
                         if folder_folded { "▸" } else { "▾" },

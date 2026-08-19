@@ -1416,3 +1416,28 @@ drives production paint and click targets and proves exclusivity, folding, tag
 grouping, direct focus, and Agent metadata. Cmd-P has a real keystroke/activation
 guard. Inverting the Unbound project predicate was observed RED; 15 targeted
 ownership/Cmd-P/jump-panel mutants were caught (Cog graph `9k2`).
+
+### UXI-JumpPanel-24 — Tagged navigation keeps fixed chrome typography
+
+**Statement.** Tag folders and the tile rows nested beneath them use explicit,
+fixed jump-panel typography. A tag-folder header uses the panel's compact
+monospace subheader size; tagged tile rows use the same 13px monospace navigation
+row as untagged tiles. Neither surface may inherit the document font, a GPUI
+default size, or document zoom. A tag folder therefore never becomes taller than
+an ordinary navigation row merely because the tile carries a tag.
+
+**Applies to.** `jump_panel_view.rs`: the production Unbound tag-folder header
+inside `render_jump_panel`, and `jump_tile_row_el` / `jump_nav_row` for its child
+rows.
+
+**Why.** The tile-native Unbound renderer introduced a new tag-folder element
+without an explicit font family or size. It fell back to GPUI's larger default,
+so tagged groups intermittently looked oversized beside explicitly styled jump
+rows.
+
+**Status.** `implemented`.
+
+**Enforcement.** `verify_harness.rs::jump_panel_tagged_items_keep_fixed_chrome_size`
+drives the production tagged and untagged Unbound paint paths, compares their
+real bounds to the standard jump navigation row, then changes document zoom and
+proves all of those chrome heights remain fixed.
