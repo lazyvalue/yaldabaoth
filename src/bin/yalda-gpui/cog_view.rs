@@ -581,6 +581,15 @@ fn focus_tint(st: &DetailStyle) -> Hsla {
     c
 }
 
+/// A true-neutral grey at the given alpha. The Folio/linen theme's `dim` and
+/// `accent` are *warm* (brownish / orange), so any wash built from them keeps a
+/// tan cast no matter how faint. Zeroing saturation kills the hue entirely,
+/// leaving a clean grey that adapts to light/dark by lightness. Use this for
+/// every structural fill/border in the tile so the pane reads light and clean.
+fn neutral(lightness: f32, alpha: f32) -> Hsla {
+    Hsla { h: 0.0, s: 0.0, l: lightness, a: alpha }
+}
+
 impl CogView {
     /// The left selector pane (graph explorer or node list), scrollable and
     /// following the selection. `focused` gets a faint accent wash. Rows are
@@ -716,7 +725,7 @@ impl CogView {
                                 .cursor_pointer()
                                 .px_2()
                                 .rounded_md()
-                                .bg(st.dim.opacity(0.12))
+                                .bg(neutral(0.5, 0.12))
                                 .text_color(st.fg)
                                 .font_family(st.mono.clone())
                                 .text_size(px(st.pt * 0.82))
@@ -932,15 +941,15 @@ impl CogView {
     ) -> gpui::AnyElement {
         let p = path.to_string();
         let caret = if folded { "▸" } else { "▾" };
-        let hov = st.dim.opacity(0.12);
+        let hov = neutral(0.5, 0.13);
         json_row(depth, st)
             .id(SharedString::from(format!("cog-json{path}")))
             .cursor_pointer()
             .rounded_sm()
-            .bg(st.dim.opacity(0.06))
+            .bg(neutral(0.5, 0.07))
             .hover(move |s| s.bg(hov))
             .on_click(cx.listener(move |v, _ev, _w, cx| v.toggle_json_fold(p.clone(), cx)))
-            .child(caret_col(caret, st.dim))
+            .child(caret_col(caret, neutral(0.45, 0.9)))
             .child(
                 div()
                     .flex_1()
@@ -1052,10 +1061,8 @@ fn status_badge(eff: EffStatus, st: &DetailStyle) -> gpui::Div {
         .child(SharedString::from(format!("[{}]", eff.label())))
 }
 
-fn nav_sel_bg(st: &DetailStyle) -> Hsla {
-    let mut bg = st.accent;
-    bg.a = 0.16;
-    bg
+fn nav_sel_bg(_st: &DetailStyle) -> Hsla {
+    neutral(0.5, 0.14)
 }
 
 // ── Left-list rows ───────────────────────────────────────────────────────────
@@ -1074,18 +1081,18 @@ fn left_header(text: &str, st: &DetailStyle) -> gpui::Div {
 // ── Cards (each "update" — a note or a transition — is its own boxed card) ────
 
 /// A faint neutral fill for a card's interior (no warm-accent tint).
-fn card_bg(st: &DetailStyle) -> Hsla {
-    st.dim.opacity(0.05)
+fn card_bg(_st: &DetailStyle) -> Hsla {
+    neutral(0.5, 0.05)
 }
 
 /// A subtle hairline border for a card / code block.
-fn card_border(st: &DetailStyle) -> Hsla {
-    st.dim.opacity(0.35)
+fn card_border(_st: &DetailStyle) -> Hsla {
+    neutral(0.5, 0.28)
 }
 
 /// A stronger fill for a monospace JSON code block.
-fn code_bg(st: &DetailStyle) -> Hsla {
-    st.dim.opacity(0.12)
+fn code_bg(_st: &DetailStyle) -> Hsla {
+    neutral(0.5, 0.07)
 }
 
 /// An empty stylish card container: rounded, hairline border, faint fill.
@@ -1143,7 +1150,7 @@ fn graph_row(g: &CogGraph, is_sel: bool, st: &DetailStyle) -> gpui::Div {
                 .w_full()
                 .child(truncating_label(
                     g.label(),
-                    if is_sel { st.accent } else { st.fg },
+                    st.fg,
                     name_size,
                     st,
                 ))
@@ -1186,7 +1193,7 @@ fn node_row(n: &CogNode, eff: EffStatus, is_sel: bool, st: &DetailStyle) -> gpui
         .bg(if is_sel { nav_sel_bg(st) } else { transparent })
         .child(truncating_label(
             name,
-            if is_sel { st.accent } else { st.fg },
+            st.fg,
             px(st.pt * 0.88),
             st,
         ))
@@ -1213,7 +1220,7 @@ fn overview_row(is_sel: bool, st: &DetailStyle) -> gpui::Div {
             div()
                 .flex_1()
                 .min_w_0()
-                .text_color(if is_sel { st.accent } else { st.fg })
+                .text_color(st.fg)
                 .child(SharedString::new_static("▤ Overview")),
         )
 }
@@ -1552,7 +1559,7 @@ fn note_card(note: &CogNote, st: &DetailStyle) -> gpui::Div {
                 .flex_none()
                 .px_1()
                 .rounded_md()
-                .bg(st.dim.opacity(0.14))
+                .bg(neutral(0.5, 0.14))
                 .text_color(st.fg)
                 .font_weight(FontWeight::BOLD)
                 .child(SharedString::from(t)),
