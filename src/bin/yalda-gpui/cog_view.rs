@@ -842,7 +842,7 @@ impl CogView {
             serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
                 self.json_children(prefix, value, 0, st, cx, &mut rows);
             }
-            other => rows.push(json_leaf(0, None, other, st).into_any_element()),
+            other => rows.push(json_kv_row(0, "", other, st).into_any_element()),
         }
         let mut col = div()
             .flex()
@@ -887,8 +887,8 @@ impl CogView {
         }
     }
 
-    /// Emit the row(s) for one keyed value: a leaf, or a foldable header + (if
-    /// unfolded) its children.
+    /// Emit the row(s) for one keyed value: a leaf key/value row, or a foldable
+    /// sub-table header + (if unfolded) its child rows.
     fn json_node(
         &self,
         path: &str,
@@ -902,30 +902,29 @@ impl CogView {
         match value {
             serde_json::Value::Object(map) => {
                 let folded = self.collapsed.contains(path);
-                out.push(self.json_fold_row(path, key, folded, '{', map.len(), depth, st, cx));
+                out.push(self.json_header_row(path, key, folded, map.len(), depth, st, cx));
                 if !folded {
                     self.json_children(path, value, depth + 1, st, cx, out);
                 }
             }
             serde_json::Value::Array(a) => {
                 let folded = self.collapsed.contains(path);
-                out.push(self.json_fold_row(path, key, folded, '[', a.len(), depth, st, cx));
+                out.push(self.json_header_row(path, key, folded, a.len(), depth, st, cx));
                 if !folded {
                     self.json_children(path, value, depth + 1, st, cx, out);
                 }
             }
-            other => out.push(json_leaf(depth, Some(key), other, st).into_any_element()),
+            other => out.push(json_kv_row(depth, key, other, st).into_any_element()),
         }
     }
 
-    /// A foldable object/array header row: caret + key + a dim `{…} N` summary,
-    /// clickable to toggle.
-    fn json_fold_row(
+    /// A foldable sub-table HEADER row for a dict/array key: caret + bold key +
+    /// a dim item count. No `{}`/`[]` braces — the key IS the sub-table's title.
+    fn json_header_row(
         &self,
         path: &str,
         key: &str,
         folded: bool,
-        open: char,
         count: usize,
         depth: usize,
         st: &DetailStyle,
@@ -933,87 +932,98 @@ impl CogView {
     ) -> gpui::AnyElement {
         let p = path.to_string();
         let caret = if folded { "▸" } else { "▾" };
-        let close = if open == '{' { '}' } else { ']' };
-        let summary = if folded {
-            format!("{open} … {close}  {count}")
-        } else {
-            open.to_string()
-        };
-        let hov = st.accent.opacity(0.06);
+        let hov = st.accent.opacity(0.16);
         json_row(depth, st)
             .id(SharedString::from(format!("cog-json{path}")))
             .cursor_pointer()
+            .rounded_sm()
+            .bg(st.accent.opacity(0.08))
             .hover(move |s| s.bg(hov))
             .on_click(cx.listener(move |v, _ev, _w, cx| v.toggle_json_fold(p.clone(), cx)))
-            .child(caret_span(caret, st))
-            .child(json_key_span(key, st))
+            .child(caret_col(caret, st.accent))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_color(st.fg)
+                    .font_weight(FontWeight::BOLD)
+                    .child(SharedString::from(key.to_string())),
+            )
             .child(
                 div()
                     .flex_none()
                     .text_color(st.dim)
-                    .child(SharedString::from(summary)),
+                    .text_size(px(st.pt * 0.78))
+                    .child(SharedString::from(count.to_string())),
             )
             .into_any_element()
     }
 }
 
-/// A JSON tree row container: monospace, indented by `depth`.
+/// A JSON table row: monospace, indented by `depth`. `items_start` keeps a
+/// wrapped value column aligned to the top of its key.
 fn json_row(depth: usize, st: &DetailStyle) -> gpui::Div {
     div()
         .flex()
         .flex_row()
-        .items_baseline()
-        .gap_1()
+        .items_start()
+        .gap_2()
         .w_full()
         .min_w_0()
         .pl(px(6.0 + depth as f32 * 14.0))
-        .pr_1()
-        .py(px(1.0))
+        .pr_2()
+        .py(px(2.0))
         .font_family(st.mono.clone())
         .text_size(px(st.pt * 0.9))
 }
 
-/// The fixed-width caret column (or a blank spacer for leaves).
-fn caret_span(caret: &'static str, st: &DetailStyle) -> gpui::Div {
+/// The fixed-width caret column (▸/▾ for a header, blank for a leaf).
+fn caret_col(caret: &'static str, color: Hsla) -> gpui::Div {
     div()
         .flex_none()
         .w(px(14.0))
-        .text_color(st.dim)
+        .text_color(color)
+        .font_weight(FontWeight::BOLD)
         .child(SharedString::new_static(caret))
 }
 
-/// A JSON key label (accent-coloured).
-fn json_key_span(key: &str, st: &DetailStyle) -> gpui::Div {
-    div()
-        .flex_none()
-        .text_color(st.accent)
-        .child(SharedString::from(key.to_string()))
-}
-
-/// A JSON scalar's display text + colour by type.
+/// A JSON scalar's display text + a HIGH-CONTRAST colour — the editor foreground
+/// for strings, the theme accent for numbers/bools, muted for null. (No washed
+/// mid-tone greens/purples, which read as low-contrast on light themes.)
 fn json_scalar(value: &serde_json::Value, st: &DetailStyle) -> (String, Hsla) {
     match value {
-        serde_json::Value::String(s) => (s.replace('\n', " "), rgb(0x8fbf6f).into()),
-        serde_json::Value::Number(n) => (n.to_string(), rgb(0xd7a44a).into()),
-        serde_json::Value::Bool(b) => (b.to_string(), rgb(0x9b8aa8).into()),
+        serde_json::Value::String(s) => (s.replace('\n', " "), st.fg),
+        serde_json::Value::Number(n) => (n.to_string(), st.accent),
+        serde_json::Value::Bool(b) => (b.to_string(), st.accent),
         serde_json::Value::Null => ("null".to_string(), st.dim),
         other => (other.to_string(), st.fg),
     }
 }
 
-/// A leaf JSON row: caret spacer + optional `key:` + the coloured scalar value.
-fn json_leaf(depth: usize, key: Option<&str>, value: &serde_json::Value, st: &DetailStyle) -> gpui::Div {
+/// A leaf key/value TABLE row: blank caret column, the bold key column, then the
+/// value column (no colon, no braces). An empty key (a root scalar) omits the
+/// key column.
+fn json_kv_row(depth: usize, key: &str, value: &serde_json::Value, st: &DetailStyle) -> gpui::Div {
     let (text, color) = json_scalar(value, st);
     let mut row = json_row(depth, st).child(div().flex_none().w(px(14.0)));
-    if let Some(k) = key {
-        row = row.child(json_key_span(k, st)).child(
+    if !key.is_empty() {
+        row = row.child(
             div()
                 .flex_none()
-                .text_color(st.dim)
-                .child(SharedString::new_static(":")),
+                .min_w(px(96.0))
+                .pr_2()
+                .text_color(st.fg)
+                .font_weight(FontWeight::BOLD)
+                .child(SharedString::from(key.to_string())),
         );
     }
-    row.child(div().min_w_0().text_color(color).child(SharedString::from(text)))
+    row.child(
+        div()
+            .flex_1()
+            .min_w_0()
+            .text_color(color)
+            .child(SharedString::from(text)),
+    )
 }
 
 // ── Status colour ────────────────────────────────────────────────────────────
