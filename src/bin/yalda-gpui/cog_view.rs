@@ -716,8 +716,8 @@ impl CogView {
                                 .cursor_pointer()
                                 .px_2()
                                 .rounded_md()
-                                .bg(st.accent.opacity(0.12))
-                                .text_color(st.accent)
+                                .bg(st.dim.opacity(0.12))
+                                .text_color(st.fg)
                                 .font_family(st.mono.clone())
                                 .text_size(px(st.pt * 0.82))
                                 .child(SharedString::from(label))
@@ -1073,11 +1073,9 @@ fn left_header(text: &str, st: &DetailStyle) -> gpui::Div {
 
 // ── Cards (each "update" — a note or a transition — is its own boxed card) ────
 
-/// A faint fill for a card's interior.
+/// A faint neutral fill for a card's interior (no warm-accent tint).
 fn card_bg(st: &DetailStyle) -> Hsla {
-    let mut c = st.accent;
-    c.a = 0.05;
-    c
+    st.dim.opacity(0.05)
 }
 
 /// A subtle hairline border for a card / code block.
@@ -1554,8 +1552,8 @@ fn note_card(note: &CogNote, st: &DetailStyle) -> gpui::Div {
                 .flex_none()
                 .px_1()
                 .rounded_md()
-                .bg(st.accent.opacity(0.16))
-                .text_color(st.accent)
+                .bg(st.dim.opacity(0.14))
+                .text_color(st.fg)
                 .font_weight(FontWeight::BOLD)
                 .child(SharedString::from(t)),
         );
