@@ -531,6 +531,7 @@ fn preferences_round_trip_with_text_scale() {
         jump_session_order: Some(vec!["sid-2".into(), "sid-1".into()]),
         jump_archived_sessions: Some(vec!["sid-old".into()]),
         jump_folded_projects: Some(vec!["Fulcrum".into(), "Yaldabaoth".into()]),
+        jump_folded_workspaces: Some(vec!["Yaldabaoth\u{1f}workspace-1".into()]),
         jump_tag_order: Some(std::collections::HashMap::from([(
             "Yaldabaoth".to_string(),
             vec!["urgent".to_string(), "frontend".to_string()],
@@ -553,6 +554,10 @@ fn preferences_round_trip_with_text_scale() {
     assert_eq!(
         back.jump_folded_projects.as_deref(),
         Some(&["Fulcrum".into(), "Yaldabaoth".into()][..])
+    );
+    assert_eq!(
+        back.jump_folded_workspaces.as_deref(),
+        Some(&["Yaldabaoth\u{1f}workspace-1".into()][..])
     );
     // UXI-JumpPanel-21: per-project tag order + folded-tag keys round-trip.
     assert_eq!(
@@ -4098,11 +4103,11 @@ fn agent_tile_persists_session_identity_not_index() {
         children: vec![
             (
                 1.0,
-                workspace::Layout::Leaf(workspace::Window { id: 10, content: App::Agent(t1) }),
+                workspace::Layout::Leaf(workspace::Window::new(10, App::Agent(t1))),
             ),
             (
                 1.0,
-                workspace::Layout::Leaf(workspace::Window { id: 20, content: App::Agent(t2) }),
+                workspace::Layout::Leaf(workspace::Window::new(20, App::Agent(t2))),
             ),
         ],
     };
@@ -4133,6 +4138,129 @@ fn agent_tile_persists_session_identity_not_index() {
     );
 }
 
+#[test]
+fn bound_and_unbound_tiles_snapshot_with_identity_tags_direct_focus_and_next_id() {
+    let mut projects = Projects::new();
+    let cwd = std::env::temp_dir();
+    let project = projects.ensure_at_cwd(cwd.clone(), "tmp");
+    let mut frame = workspace::Frame::with_initial(
+        App::Agent(AgentTile::Bound {
+            session: SessionId(1),
+            reopening: None,
+        }),
+        project,
+    );
+    frame
+        .tile_mut(1)
+        .unwrap()
+        .tags
+        .insert("bound-tag".into());
+    let unbound = frame.push_unbound(
+        App::Agent(AgentTile::Bound {
+            session: SessionId(2),
+            reopening: None,
+        }),
+        project,
+    );
+    frame
+        .tile_mut(unbound)
+        .unwrap()
+        .tags
+        .extend(["alpha".to_string(), "beta".to_string()]);
+    assert!(frame.focus_unbound(unbound));
+
+    let resolve = |id: SessionId| match id {
+        SessionId(1) => Some(ServerSid::new("SID-A")),
+        SessionId(2) => Some(ServerSid::new("SID-B")),
+        _ => None,
+    };
+    let snap = snapshot_workspace(&frame, &projects, &resolve);
+    assert!(snap.tile_tags_migrated);
+    assert_eq!(snap.direct_unbound, Some(unbound));
+    assert_eq!(snap.unbound_tiles.len(), 1);
+    assert_eq!(snap.unbound_tiles[0].tile.id, unbound);
+    assert_eq!(
+        snap.unbound_tiles[0].tile.tags,
+        workspace::TagSet::from(["alpha".to_string(), "beta".to_string()])
+    );
+    match &snap.unbound_tiles[0].tile.kind {
+        PersistedKind::Agent { session_id } => {
+            assert_eq!(session_id.as_ref().map(ServerSid::as_str), Some("SID-B"));
+        }
+        _ => panic!("unbound Agent kind must persist"),
+    }
+    match &snap.workspaces[0].layout {
+        PersistedLayout::Leaf(leaf) => {
+            assert!(leaf.tags.contains("bound-tag"));
+        }
+        _ => panic!("initial workspace is one leaf"),
+    }
+
+    let json = serde_json::to_string(&snap).expect("serialize frame");
+    let mut back: PersistedFrame = serde_json::from_str(&json).expect("deserialize frame");
+    let mut restored = workspace::Frame::new(project);
+    let (layout, max_bound, bound_agents) =
+        restore_layout(&mut restored, &Theme::default(), back.workspaces.remove(0).layout);
+    restored.workspaces.push(workspace::Workspace::with_layout(
+        "workspace-1".into(),
+        layout,
+        1,
+        project,
+    ));
+    restored.next_window_id = max_bound + 1;
+    let persisted_unbound = back.unbound_tiles.remove(0);
+    let (window, unbound_agent) =
+        restore_leaf(&mut restored, &Theme::default(), persisted_unbound.tile);
+    restored.next_window_id = restored.next_window_id.max(window.id + 1);
+    restored.unbound_tiles.push(workspace::UnboundTile { project, window });
+    restored.focus_unbound(back.direct_unbound.unwrap());
+
+    assert_eq!(
+        bound_agents,
+        vec![(1, Some(ServerSid::new("SID-A")))],
+        "bound Agent identity survives"
+    );
+    assert_eq!(
+        unbound_agent,
+        Some(Some(ServerSid::new("SID-B"))),
+        "unbound Agent identity survives"
+    );
+    assert_eq!(restored.directly_focused_unbound(), Some(unbound));
+    assert!(restored.tile(1).unwrap().tags.contains("bound-tag"));
+    assert!(restored.tile(unbound).unwrap().tags.contains("beta"));
+    assert!(
+        restored.alloc_window_id() > unbound,
+        "allocator advances beyond both ownership domains"
+    );
+}
+
+#[test]
+fn unbound_restore_rejects_duplicate_window_and_agent_identity() {
+    let mut ids = std::collections::HashSet::from([10]);
+    let mut sids = std::collections::HashSet::from(["SID-A".to_string()]);
+    assert!(!accept_unbound_restore(
+        10,
+        Some(&ServerSid::new("SID-B")),
+        &mut ids,
+        &mut sids,
+    ));
+    assert!(!accept_unbound_restore(
+        20,
+        Some(&ServerSid::new("SID-A")),
+        &mut ids,
+        &mut sids,
+    ));
+    assert!(
+        accept_unbound_restore(
+            20,
+            Some(&ServerSid::new("SID-B")),
+            &mut ids,
+            &mut sids,
+        ),
+        "sid rejection rolls back the id reservation"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Infinite-plane persistence (spec-infinite-plane-workspace.md Behavior 7 / D4)
 // ---------------------------------------------------------------------------
@@ -4148,6 +4276,7 @@ fn plane_persist_test_workspace() -> PersistedWorkspace {
         focused_window: 1,
         layout: PersistedLayout::Leaf(PersistedLeaf {
             id: 1,
+            tags: Default::default(),
             kind: PersistedKind::Agent { session_id: None },
         }),
         rail: None,
@@ -4337,6 +4466,12 @@ fn old_workspace_json_frame_loads_with_pre_rename_keys() {
     assert_eq!(
         frame.active_workspace, 0,
         "the `active_tab` on-disk key maps to the renamed `active_workspace` field"
+    );
+    assert!(frame.unbound_tiles.is_empty(), "legacy snapshots start with no unbound tiles");
+    assert_eq!(frame.direct_unbound, None);
+    assert!(
+        !frame.tile_tags_migrated,
+        "missing migration flag triggers one-time legacy tag import"
     );
     assert_eq!(
         frame.workspaces[0].desktop_slots,

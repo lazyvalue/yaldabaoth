@@ -9,11 +9,11 @@ An always-visible root-level **navigator sidebar** (fixed `JUMP_PANEL_WIDTH`,
 currently 320px),
 laid out outside the workspace content so it stays put across workspace switches
 (INV-JP1). Toggle: `toggle_jump_panel` (`cmd-j`). Rendered inline (cheap,
-O(workspaces + sessions)), not cached. Primary code home:
+O(workspaces + tiles)), not cached. Primary code home:
 `jump_panel_view.rs`.
 
 **Palette.** Two header tiers, distinct hues: top-level section headers
-("SYSTEM CONSOLE" / "WORKSPACES" / "AGENT SESSIONS") are **red** (`DetailStyle.err`,
+("SYSTEM CONSOLE" / "WORKSPACES" / "UNBOUND") are **red** (`DetailStyle.err`,
 `0xff6b6b`, bold uppercase); per-cwd subheaders are **electric blue** (`0x3b9eff`,
 real path casing). Operational state uses two literal hues: **orange = working**
 and **green = ready for input**. The "you are here" active mark and selected tabs
@@ -34,40 +34,39 @@ Sections:
 - **System console** — a single global row that summons the system-console
   overlay (`UXI-SystemConsole-1`). It replaces the former empty Pinned
   placeholder.
-- **Workspaces** — one row per non-ephemeral tab, active marked (accent label +
-  left accent bar, `UXI-JumpPanel-5`).
-  - Each row's badge shows the **1-based workspace number** (`idx + 1`) — the
-    digit `ctrl-<n>` jumps to (INV-UX-11).
-  - Click → `select_tab`.
-- **Agent sessions** — a **＋ New agent session** create-affordance
-  (`UXI-JumpPanel-3`) followed by the universal roster (every server session) ∪
-  local-only mid-create sessions (`jump_panel_agent_rows`).
-  - **＋ New agent session** → asks for a cwd (UXI-JumpPanel-4) then
-    `spawn_free_agent_session_at`: creates a session bound to no tile and no
-    workspace; it appears in the rows below as a new unbound (○) row, never
-    auto-bound.
+- **Workspaces** — one collapsible folder per durable workspace, containing one
+  row per bound tile (`UXI-JumpPanel-23`).
+  - The folder badge shows the **1-based workspace number** — the digit
+    `ctrl-<n>` jumps to (INV-UX-11).
+  - Folder click folds/unfolds. Bound-tile click selects its workspace and
+    focuses that tile.
+- **Unbound** — only tiles outside every workspace, retaining the existing
+  activity tabs, tag folders, status, provider, ordering, and archive signals
+  where the tile is an Agent.
+  - **＋ New agent session** creates an unbound Agent tile and session.
   - **Status dot** = what the AGENT is doing (INV-UX-10, UXI-JumpPanel-6) — the
     shape + color are one signal, not binding:
     - **● orange** — working (a reply is in flight).
     - **● green** — connected and idle → **ready for input / your turn**.
     - **○ dim** — disconnected or connecting. The whole row is also dimmed.
-  - Click → every session opens in a detached ephemeral view (torn down on
-    switch-away); an existing workspace placement remains where it is
-    (`UXI-JumpPanel-19`).
+  - Click → directly focuses the unbound tile without binding it.
   - The row bound to the **focused tile** carries a left accent bar
     (`UXI-JumpPanel-5`) — "this is where you are."
 
 ## References
 
-- `docs/components/README.md` § Terminology — **free** (a session with no durable
-  workspace-tile reference) and
-  **bare agent view** (the ephemeral workspace a direct session visit opens).
-  The panel's agent list is where free sessions live.
+- `docs/components/README.md` § Terminology — bound/unbound tile ownership and
+  direct unbound focus.
 - `docs/specs/spec-jump-panel.md` — deeper design doc.
-- ADR-0021 — the ephemeral virtual-workspace decision that shaped free-session
-  jump.
+- ADR-0033 — optional workspace ownership; supersedes ADR-0021's ephemeral
+  virtual-workspace navigation.
 - Migrated from `docs/ux-invariants.md` INV-UX-10, INV-UX-18. Those entries are
   now `→ migrated here`.
+
+**Terminology migration.** Older implemented-invariant evidence below may name
+“free sessions,” “bare views,” or ephemeral workspaces. Those are historical
+descriptions of the code being replaced, not current product terms or behavior;
+ADR-0033 and `UXI-JumpPanel-23` override them.
 
 ## UX invariants
 
@@ -315,16 +314,14 @@ Selection is intentionally neutral so orange and green are reserved for
 operational state. Two independent marks,
 0/1/2 marks total:
 
-1. **The active workspace row** — the row whose tab index equals
-   `workspace.active_tab` — is always boxed **when that tab is listed** (i.e. it
-   is non-ephemeral). If the active tab is an **ephemeral virtual workspace** (a
-   direct session visit opened via ADR-0021), it isn't in the Workspaces list, so **no
-   workspace row is marked**. The mark is a neutral left bar over the gray
-   selected background.
+1. **The active workspace row** — the row whose index equals
+   `workspace.active_workspace` — is boxed while workspace content is active.
+   During direct-unbound focus, **no workspace row is marked**. The mark is a
+   neutral left bar over the gray selected background.
 2. **The focused viewed-session row** — the agent-session row shown by the
    **focused tile** (`AgentTile::session()`) — is marked, including a detached
-   direct visit (`UXI-JumpPanel-19`). When the focused tile
-   is a **buffer**, or an **unbound** agent tile (selector, no session), there is
+   direct visit (`UXI-JumpPanel-23`). When the focused tile
+   is a **buffer**, or an **empty** Agent tile (selector, no session), there is
    **no session mark**. A roster-only / unopened session is never the focused
    session, so it is never marked. A disconnected-but-focused session **still** gets
    its mark (it means "active," orthogonal to the status-dot color / row dim).
@@ -358,7 +355,7 @@ orange and green retain their single operational meanings.
 
 **Deviation from plan.** `jump_active_session()` does NOT call
 `focused_bound_session()` (which `.expect`s a focused window) — the jump panel can
-render with no focused window (the `workspace_number_skips_ephemeral` path), so it
+render with no focused window (the `workspace_number_ignores_direct_unbound_focus` path), so it
 matches `workspace.focused_content()` directly and returns `(None, None)` when
 absent, rather than panicking. The mark is a 2px left `border_l_2` neutral bar
 (every row reserves the same-width transparent bar when inactive) so it never
@@ -502,8 +499,8 @@ RED). The removed rows' absence + the literal glyphs/colors are gap #1.
 
 1. **⊞ New workspace** → `new_workspace_in(pid)` (a workspace in that project, cwd
    = the project's, no prompt).
-2. **✦ New agent session** → `new_agent_session_in(pid)` (a free session rooted at
-   the project's cwd).
+2. **✦ New agent session** → `new_agent_session_in(pid)` (an unbound Agent tile
+   and session rooted at the project's cwd).
 3. **✕ Delete project** → `request_delete_project(pid)` (confirm-then-cascade for a
    non-empty project, direct delete for an empty one — `UXI-Project-5`).
 
@@ -665,7 +662,7 @@ own reverted-fix mutation:
 
 **Statement.** The panel's live status (`UXI-JumpPanel-1`'s glyph and `-10`'s
 wash) applies to **every listed session**, including ones
-this GUI has never opened — free sessions, jump-panel-created ones, and sessions
+this GUI has never opened — unbound Agent tiles, jump-panel-created ones, and sessions
 another GUI instance is driving.
 
 The derivation is **local-then-server**:
@@ -1161,7 +1158,12 @@ until the next launch. `append_system_console` pushes into the live
 `SystemConsoleView` and persists, which is what "write a log message to the
 system console" actually requires.
 
-### UXI-JumpPanel-19 — Direct session visits are detached from workspace placement
+### UXI-JumpPanel-19 — SUPERSEDED: direct session visits use ephemeral views
+
+**Superseded by `UXI-JumpPanel-23` / ADR-0033.** Direct navigation now focuses
+an existing unbound tile; it neither duplicates the tile nor fabricates an
+ephemeral workspace. Historical behavior remains below until the code is
+replaced.
 
 **Statement.** Activating an agent session directly from either the jump panel
 or `Cmd-P` opens it in a bare ephemeral agent view, even when that session is
@@ -1191,7 +1193,7 @@ visit.
 
 **Status.** `implemented` (headless).
 
-**Enforcement.** `verify_harness.rs::direct_session_visits_add_a_reference_and_keep_workspace_placement`
+**Enforcement.** `verify_harness.rs::bound_session_jumps_focus_single_owner_workspace`
 drives the shared jump-panel dispatcher and the real `Cmd-P` key/activation path
 against a session already bound in a real workspace. It proves both entries open
 an ephemeral tile holding the same `SessionId`, the original durable placement
@@ -1200,7 +1202,11 @@ proves an ephemeral reference does not count as placement. Negative control:
 restoring the former focus-existing-workspace branch fails on the missing
 ephemeral view.
 
-### UXI-JumpPanel-20 — Sessions group under collapsible tag folders within each project tab
+### UXI-JumpPanel-20 — SUPERSEDED: sessions group under tag folders
+
+**Superseded by `UXI-JumpPanel-23` / ADR-0033.** The folder behavior survives,
+but groups unbound **tiles** by tile-local tags rather than grouping all
+sessions by session-sidecar metadata.
 
 **Statement.** A session carries a set of user-assigned **tags** (`UXI-AgentTile-33`),
 keyed by server sid in the id-keyed `session_tags.json` sidecar. Within a project's
@@ -1274,7 +1280,10 @@ to treat every row as untagged → the folder header never paints; disabling the
 separator render → the "separator paints" assert fires). The literal
 folder glyph/indent is harness gap #1.
 
-### UXI-JumpPanel-21 — Tag folders reorder by drag and fold, per project, persisted
+### UXI-JumpPanel-21 — SUPERSEDED: session-tag folders reorder and fold
+
+**Superseded by `UXI-JumpPanel-23` / ADR-0033.** Order and fold persistence
+carry forward for the Unbound tile tag folders.
 
 **Statement.** Tag folders are user-curated like the project sections
 (`UXI-JumpPanel-2`, `-13`):
@@ -1367,3 +1376,41 @@ harness gap #1.
 before `jump_session_row_el` painted it, the mixed-provider guard failed on the
 first roster row: `alpha claude must paint its Claude ownership mark`. Adding
 the trailing mark returned the guard to green.
+
+### UXI-JumpPanel-23 — Workspaces are tile folders; Unbound is the out-of-workspace list
+
+**Statement.** The jump panel and Cmd-P project the frame's exclusive tile
+ownership:
+
+1. Every workspace is an independently collapsible folder. Its children are
+   exactly its bound tiles, in workspace reading order.
+2. **Unbound** contains exactly the frame's unbound tiles. No bound tile appears
+   there, and no unbound tile appears under a workspace.
+3. Unbound tiles are organized by their tile tags using the existing
+   project-scoped tag folder order and fold behavior. Untagged tiles remain flat.
+4. Selecting a bound tile selects its workspace and focuses it. Selecting an
+   unbound tile directly focuses it and leaves it unbound.
+5. Cmd-P (“Jump to…”) flattens the same destinations and dispatches the same
+   bound/unbound activation paths. The period shell menu is not a tile picker.
+6. Agent tiles retain the existing activity, provider, summary, archive, and
+   ordering signals. A roster session without a bound tile materializes as one
+   unbound Agent tile instead of a session-only navigation row.
+7. Workspace-folder folds persist independently by stable workspace identity;
+   tile membership changes update both projections immediately.
+
+**Applies to.** `jump_panel_view.rs`: project/workspace/tile view models and
+renderer; `jump_palette.rs`: flattened entries and activation;
+`agent_ui.rs`: roster-to-unbound materialization; `persist.rs`: folder folds
+and tile ownership.
+
+**Why.** The navigation tree should reveal where durable tile state lives.
+Workspace folders make placement visible, while Unbound is the one predictable
+place for state that is not currently laid out.
+
+**Status.** `implemented (headless)`.
+
+**Enforcement.** `jump_panel_workspace_folders_and_unbound_rows_are_tile_native`
+drives production paint and click targets and proves exclusivity, folding, tag
+grouping, direct focus, and Agent metadata. Cmd-P has a real keystroke/activation
+guard. Inverting the Unbound project predicate was observed RED; 15 targeted
+ownership/Cmd-P/jump-panel mutants were caught (Cog graph `9k2`).

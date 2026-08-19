@@ -3,6 +3,14 @@
 Status: DRAFT (supersedes the binding/lifecycle parts of `spec-multi-session.md`
 and the multi-subscriber/lease parts of `spec-session-server-actor.md`).
 
+> **Placement superseded by ADR-0033 (2026-08-18).** The normalized,
+> project-owned session store and one-session-entity rules below remain
+> authoritative. The “free session,” ephemeral viewport, and durable-reference
+> placement model does not. Every navigable session is represented by a stable
+> Agent tile whose workspace membership is **bound** or **unbound**; an Agent
+> tile with no selected session is **empty**. Direct navigation focuses an
+> unbound tile without creating another viewport.
+
 > **Extended by ADR-0028 / `docs/components/project.md` (Projects primitive):** a
 > session now also has a **project membership** — `Assigned` (a stored
 > `ProjectId`) or `Inferred` (`Projects::by_cwd(session.cwd)`) or `Unfiled`. The
@@ -134,7 +142,11 @@ A tile shows **exactly one** session at a time. There is no in-tile session
 ring. The same `SessionId` may be referenced by a durable workspace tile and a
 direct ephemeral viewport at once; both render the one shared session entity.
 
-## Placement, free sessions, and rebind
+## Placement, free sessions, and rebind — superseded by ADR-0033
+
+The remainder of this section is retained as design history. Its current
+replacement is ADR-0033 plus `UXI-Workspace-16`,
+`UXI-JumpPanel-23`, and `UXI-AgentTile-34`.
 
 Sessions exist in the project/session domain independently of tiles — a session
 can run with no viewport displaying it. Placement is the dynamic map from

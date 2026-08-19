@@ -1,7 +1,12 @@
 # ADR-0021: Ephemeral virtual workspace for direct agent-session visits
 
-Status: Accepted (2026-06-18)
+Status: Superseded by ADR-0033 (2026-08-18)
 Related: spec-jump-panel.md, spec-agent-session-ownership.md, ADR-0019.
+
+This ADR is retained as implementation history while the ephemeral-workspace
+code is removed. New behavior must follow ADR-0033: stable tiles have optional
+workspace ownership, and direct unbound focus does not create a workspace or
+duplicate viewport.
 
 ## Context
 

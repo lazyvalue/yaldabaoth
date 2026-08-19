@@ -6,7 +6,7 @@
 ## Description
 
 A **Workspace** (`Workspace<App>`, formerly `Tab<App>` — the `tab` vocabulary was
-eradicated in ADR-0028 §5 / T007) is a plane of tiles: it owns an n-ary **layout
+eradicated in ADR-0028 §5 / T007) is a plane of **bound** tiles: it owns an n-ary **layout
 tree**, a focused-tile pointer, and a required-private **`project: ProjectId`**
 foreign key into the `Projects` store. Interior nodes of the tree are **Splits**
 (`Layout::Split`) — a direction (`H` = stacked, `V` = side-by-side) plus weighted
@@ -19,17 +19,19 @@ directory is the project's, resolved at the point of use (`projects.cwd_of(
 workspace.project())`) and **never cached** (`UXI-Project-2`, ADR-0028 §3). A new
 workspace inherits the active one's project.
 
-The container that owns the list of workspaces (one per OS-level **Frame**) is
+The container that owns the list of workspaces and the **unbound tile**
+collection (one per OS-level **Frame**) is
 **`Frame<App>`** (formerly the code's `Workspace<App>` — renamed in T007 so the
 type name matches the user-facing "workspace" = the plane). The frame carries the
 workspace strip (per-workspace label, active marker, click-to-select, rename,
 next/prev, new/close, `ctrl-<n>` jump by number) and the buffer pool; the tag bar
-drives tile tags. Non-ephemeral workspaces are numbered `1..N` in the jump panel
+drives tile tags. Durable workspaces are numbered `1..N` in the jump panel
 (globally, across all projects), and those numbers are the jump targets.
 
-The full hierarchy: **`Frame` → `Project`s → `Workspace`s → `Window` tiles**, with
-`Project` the ownership axis over workspaces and agent sessions
-(`docs/components/project.md`).
+The full hierarchy is **`Frame` → `Project` → (`Workspace` → bound tiles) +
+unbound tiles**. Every stable tile is in exactly one of those two placement
+domains; direct unbound focus is not a third owner (ADR-0033,
+`UXI-Workspace-16`).
 
 ## References
 
@@ -37,6 +39,8 @@ The full hierarchy: **`Frame` → `Project`s → `Workspace`s → `Window` tiles
   belongs to; the `ProjectId` FK + derived-cwd contract (`UXI-Project-2`).
 - ADR-0028 — Projects as the top-level primitive + the `Tab`→`Workspace`,
   container→`Frame` rename (§5) this Description now reflects.
+- ADR-0033 — optional workspace ownership, tile-local tags, direct unbound
+  focus, and removal of ephemeral virtual workspaces.
 - `docs/specs/spec-workspaces-and-splits.md` — the n-ary split/layout tree +
   persistence (retroactive spec of shipped behavior; workspace/frame vocabulary).
 - `docs/specs/spec-layout-patterns.md` — tile tags + automatic layout modes.
@@ -55,11 +59,12 @@ The full hierarchy: **`Frame` → `Project`s → `Workspace`s → `Window` tiles
 
 ### UXI-Workspace-1 — `ctrl-<n>` jumps to the n-th workspace (the number the panel shows)
 
-**Statement.** The jump panel numbers **non-ephemeral** workspaces `1..N` (the
+**Statement.** The jump panel numbers durable workspaces `1..N` (the
 `idx + 1` badge), and `ctrl-1`…`ctrl-9` / `ctrl-0` (the 10th) jump straight to
 that workspace. The displayed digit and the keystroke target always agree because
-both skip ephemeral virtual workspaces (ADR-0021) — `goto_workspace_number(n)`
-selects the n-th non-ephemeral tab. A digit past the last workspace is a no-op.
+direct-unbound view has no workspace number — `goto_workspace_number(n)`
+selects the n-th workspace and clears direct-unbound focus. A digit past the
+last workspace is a no-op.
 
 **Applies to.** `main.rs`: the `GotoWorkspace1..10` actions + `ctrl-<n>`
 bindings (app-global, `None` context), `goto_workspace_number`, and the
@@ -78,7 +83,8 @@ specific to this binding.
 
 **Enforcement.** `verify_harness.rs`: `ctrl_digit_switches_workspace` (full
 keymap→action→handler dispatch: `ctrl-3` then `ctrl-1`, plus past-the-end no-op)
-and `workspace_number_skips_ephemeral` (numbering skips the ephemeral tab).
+and `workspace_number_ignores_direct_unbound_focus` (direct focus does not
+enter workspace numbering).
 
 ---
 
@@ -470,7 +476,10 @@ directly), so they actually exercise `capture_any_mouse_down` + `stop_propagatio
 unimplemented — clicking a card/pip still does nothing. If that is wanted, it belongs
 with the plane-zoom work, not here.
 
-### UXI-Workspace-8 — "New agent" is contextual: a new tile in a workspace, in place in the bare agent view
+### UXI-Workspace-8 — SUPERSEDED: contextual new Agent in an ephemeral view
+
+**Superseded by `UXI-Workspace-16` / ADR-0033.** Retained as implementation
+history until the ephemeral-workspace code and its guards are removed.
 
 **Statement.** The workspace `.` menu's **new → agent** (command `new-agent-tile`)
 places the new agent tile according to what you are looking at. Both branches land
@@ -523,7 +532,11 @@ direct-spawn branch and binds. The **placement** — the thing this invariant ch
 is what the guard pins. The ephemeral branch is unconditional (`AgentTile::new()` is
 always `Selecting`), so its unbound-picker assert is exact.
 
-### UXI-Workspace-9 — Closing the session in a bare agent view dismisses the view
+### UXI-Workspace-9 — SUPERSEDED: closing a session dismisses its ephemeral view
+
+**Superseded by `UXI-Workspace-16` / ADR-0033.** A directly focused unbound
+tile is no longer an ephemeral workspace, and session lifetime is independent
+of tile ownership.
 
 **Statement.** When the confirmed close (`UXI-AgentTile-22`'s typed `yes`) kills the
 session shown by an **ephemeral virtual workspace**, the workspace itself is torn
@@ -673,7 +686,11 @@ validation. `verify_harness.rs`:
 window-resize observer, reads the written preferences, and feeds them through
 the production startup-size helper.
 
-### UXI-Workspace-13 — Closing a workspace removes its tiles, not its sessions or the app
+### UXI-Workspace-13 — SUPERSEDED: closing a workspace removes its tiles
+
+**Superseded by `UXI-Workspace-16` / ADR-0033.** The new contract moves every
+tile owned by the closing workspace into Unbound instead of deleting it. The
+historical behavior and guards remain below until implementation is replaced.
 
 **Statement.** The workspace `.` menu exposes uppercase `X` as **close
 workspace**; lowercase `x` remains **close tile**. Closing the active workspace
@@ -845,3 +862,39 @@ action → handler paths and assert persistable placement plus stable focus. The
 were observed RED by temporarily disabling directional swap, undo, promotion,
 each rotation direction, and picker commit; every mutation failed at its
 command-specific assertion before the production implementation was restored.
+
+### UXI-Workspace-16 — Every tile is bound to one workspace or unbound
+
+**Statement.** A stable tile has exactly one optional workspace owner:
+
+1. A **bound** tile is a leaf in exactly one workspace layout.
+2. An **unbound** tile is owned by the frame's Unbound collection and is in no
+   workspace layout.
+3. Binding and unbinding move the same tile. `WindowId`, App state, project,
+   and tile tags are unchanged.
+4. Directly viewing an unbound tile only sets the frame's direct-focus pointer;
+   it does not bind the tile or create a workspace. Selecting any workspace
+   clears direct focus.
+5. Closing a non-sole workspace moves all its tiles to Unbound. It never kills
+   Agent sessions or quits the app.
+6. A tile may bind only to a workspace in the same project.
+
+There are no ephemeral workspaces in this model. An Agent tile whose picker has
+no selected session is **empty**, not “unbound”; workspace membership and
+session binding are independent axes.
+
+**Applies to.** `workspace.rs`: `Window`, `Frame`, bind/unbind/direct-focus
+and close-workspace operations; `main.rs` / `chrome.rs`: content selection,
+rendering, and commands; `persist.rs`: both ownership domains.
+
+**Why.** A workspace is a placement folder, not the lifetime boundary for the
+stateful tile. Optional ownership provides the minimize-like state without fake
+workspaces or duplicate viewports.
+
+**Status.** `implemented (headless)`.
+
+**Enforcement.** `workspace.rs` ownership tests cover stable-id/state/tag
+round trips, uniqueness, same-project binding, direct focus, and workspace
+close. `jump_palette_opens_unbound_tile_then_binds_same_identity` drives the
+real Cmd-P and `Ctrl-W b` paths. The complete GUI and library suites pass, and
+targeted ownership mutants are caught (Cog graph `9k2`).

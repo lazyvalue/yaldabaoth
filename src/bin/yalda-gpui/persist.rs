@@ -655,6 +655,9 @@ pub(crate) struct Preferences {
     /// runtime-local). Absent means every project starts expanded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) jump_folded_projects: Option<Vec<String>>,
+    /// Folded workspace folders, keyed by a durable project/auto-name pair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) jump_folded_workspaces: Option<Vec<String>>,
     /// User's drag-reordered order of jump-panel tag folders, per project
     /// (UXI-JumpPanel-21). `project name → [tag]`; folders render in this order,
     /// any tag not listed sorts after alphabetically. Tags are project-scoped, so
@@ -911,8 +914,40 @@ pub(crate) enum PersistedBufferMode {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PersistedLeaf {
     pub(crate) id: workspace::WindowId,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub(crate) tags: workspace::TagSet,
     #[serde(flatten)]
     pub(crate) kind: PersistedKind,
+}
+
+/// One tile outside every workspace (ADR-0033). Project is persisted by cwd,
+/// matching workspace membership's self-healing project migration.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PersistedUnboundTile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) project_cwd: Option<String>,
+    pub(crate) tile: PersistedLeaf,
+}
+
+/// Reserve one restored unbound tile's stable identities. Rejects duplicate
+/// WindowIds and duplicate durable Agent sids, rolling back the id reservation
+/// when the sid conflicts.
+pub(crate) fn accept_unbound_restore(
+    id: workspace::WindowId,
+    agent_sid: Option<&ServerSid>,
+    placed_ids: &mut std::collections::HashSet<workspace::WindowId>,
+    placed_agent_sids: &mut std::collections::HashSet<String>,
+) -> bool {
+    if !placed_ids.insert(id) {
+        return false;
+    }
+    if let Some(sid) = agent_sid
+        && !placed_agent_sids.insert(sid.to_string())
+    {
+        placed_ids.remove(&id);
+        return false;
+    }
+    true
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1048,6 +1083,16 @@ pub(crate) struct PersistedFrame {
     pub(crate) workspaces: Vec<PersistedWorkspace>,
     #[serde(rename = "active_tab")]
     pub(crate) active_workspace: usize,
+    /// Stable tiles outside every workspace. Absent in legacy snapshots.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) unbound_tiles: Vec<PersistedUnboundTile>,
+    /// Restore the direct view only when it still names an unbound tile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) direct_unbound: Option<workspace::WindowId>,
+    /// False/missing means import the legacy session/buffer tag sidecars into
+    /// tile-local tags once. New snapshots always write true.
+    #[serde(default)]
+    pub(crate) tile_tags_migrated: bool,
     // Layout patterns: workspace-global marks
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub(crate) marks: HashMap<char, workspace::WindowId>,
@@ -1108,6 +1153,7 @@ pub(crate) fn snapshot_layout(
     match layout {
         workspace::Layout::Empty => PersistedLayout::Leaf(PersistedLeaf {
             id: 0,
+            tags: workspace::TagSet::new(),
             kind: PersistedKind::Buffer {
                 mode: PersistedBufferMode::Picking {
                     dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -1116,6 +1162,7 @@ pub(crate) fn snapshot_layout(
         }),
         workspace::Layout::Leaf(win) => PersistedLayout::Leaf(PersistedLeaf {
             id: win.id,
+            tags: win.tags.clone(),
             kind: snapshot_content(&win.content, resolve),
         }),
         workspace::Layout::Split { dir, children } => PersistedLayout::Split {
@@ -1199,18 +1246,11 @@ pub(crate) fn restore_layout(
 ) {
     match layout {
         PersistedLayout::Leaf(leaf) => {
-            let id = leaf.id;
-            let agent_sid = match &leaf.kind {
-                PersistedKind::Agent { session_id } => Some(session_id.clone()),
-                _ => None,
-            };
-            let content = restore_content(ws, theme, leaf.kind);
-            let agents = match agent_sid {
-                Some(sid) => vec![(id, sid)],
-                None => vec![],
-            };
+            let (window, agent_sid) = restore_leaf(ws, theme, leaf);
+            let id = window.id;
+            let agents = agent_sid.map(|sid| vec![(id, sid)]).unwrap_or_default();
             (
-                workspace::Layout::Leaf(workspace::Window { id, content }),
+                workspace::Layout::Leaf(window),
                 id,
                 agents,
             )
@@ -1237,6 +1277,23 @@ pub(crate) fn restore_layout(
             )
         }
     }
+}
+
+/// Restore one persisted tile while preserving its stable id and tile-local
+/// tags. Shared by workspace layouts and the Unbound collection.
+pub(crate) fn restore_leaf(
+    ws: &mut workspace::Frame<App>,
+    theme: &Theme,
+    leaf: PersistedLeaf,
+) -> (workspace::Window<App>, Option<Option<ServerSid>>) {
+    let id = leaf.id;
+    let tags = leaf.tags;
+    let agent_sid = match &leaf.kind {
+        PersistedKind::Agent { session_id } => Some(session_id.clone()),
+        _ => None,
+    };
+    let content = restore_content(ws, theme, leaf.kind);
+    (workspace::Window { id, content, tags }, agent_sid)
 }
 
 pub(crate) fn restore_content(
@@ -1369,6 +1426,22 @@ pub(crate) fn snapshot_workspace(
             })
             .collect(),
         active_workspace: ws.active_workspace.min(non_ephemeral.saturating_sub(1)),
+        unbound_tiles: ws
+            .unbound_tiles
+            .iter()
+            .map(|tile| PersistedUnboundTile {
+                project_cwd: projects
+                    .cwd_of(tile.project)
+                    .map(|path| path.display().to_string()),
+                tile: PersistedLeaf {
+                    id: tile.window.id,
+                    tags: tile.window.tags.clone(),
+                    kind: snapshot_content(&tile.window.content, resolve),
+                },
+            })
+            .collect(),
+        direct_unbound: ws.directly_focused_unbound(),
+        tile_tags_migrated: true,
         marks: ws.marks.all_marks().into_iter().collect(),
         tag_shortcuts: ws.tag_shortcuts.clone(),
         buffer_tags: {

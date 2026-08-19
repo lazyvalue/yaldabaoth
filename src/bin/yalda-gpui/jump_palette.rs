@@ -1,13 +1,10 @@
 //! The **jump palette** (`UXI-JumpPanel-9`) — `Cmd-P`'s type-to-filter dialog
-//! over the jump panel's ordinary navigable set: every non-ephemeral workspace
-//! and every non-archived agent session (`Local` ∪ `Roster`).
+//! over the jump panel's ordinary navigable set: durable workspaces and the
+//! stable tiles they own, followed by the **Unbound** tile collection.
 //!
 //! The palette is a pure alternate *input* onto that list. It builds its
-//! candidates by walking the sidebar's `All` projection, independent of which
-//! filtered tab is currently visible, and activates through the sidebar's
-//! existing dispatchers (`select_workspace` / `jump_to_agent`), so 1:1 binding,
-//! ephemeral-workspace teardown (ADR-0021) and read-marking stay owned where
-//! they already are. No new jump semantics live here.
+//! candidates directly from the ownership model, independent of which filtered
+//! tab is visible, and activates through the shared stable-tile dispatcher.
 //!
 //! The ranking is deliberately pure (`fuzzy_score` / `rank_palette_items` are
 //! free functions over plain data) so "the top row is the best match" is a
@@ -15,16 +12,14 @@
 
 use super::*;
 
-/// What a palette row jumps to. Mirrors the two things the sidebar can navigate
-/// to; **projects are absent by design** — a project is a container, not a view
-/// target (clicking one opens a menu, `UXI-JumpPanel-8`).
+/// What a palette row jumps to. Projects remain containers rather than targets;
+/// a tile id names the exact stateful shell object in either ownership domain.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PaletteTarget {
     /// GLOBAL index into `workspace.workspaces` (the same index
     /// `select_workspace` takes). Only non-ephemeral workspaces become items.
     Workspace(usize),
-    /// An agent session, keyed exactly as the sidebar keys it.
-    Agent(JumpTarget),
+    Tile(workspace::WindowId),
 }
 
 /// One palette candidate: what it points at, what you read, and what you type
@@ -131,51 +126,138 @@ pub(crate) fn rank_palette_items(items: &[PaletteItem], query: &str) -> Vec<usiz
 }
 
 impl YaldaGpuiView {
-    /// Every ordinary-navigation candidate, in the **All tab's presentation
-    /// order**: each project section's workspaces, then Working / Waiting /
-    /// Unavailable sessions, then the trailing unfiled groups. A selected
-    /// filtered tab never changes `Cmd-P` candidates.
-    pub(crate) fn jump_palette_items(&self, cx: &gpui::App) -> Vec<PaletteItem> {
-        // Cmd-P is always the ordinary navigation roster, independent of which
-        // filtered tab happens to be visible in each project. Archived rows are
-        // excluded by the forced All projection.
-        let (sections, unfiled) =
-            self.jump_panel_sections_with_tab(cx, Some(crate::JumpAgentTab::All));
-        let (active_local, active_sid) = self.jump_active_session();
-        let mut items = Vec::new();
-        let push_session = |items: &mut Vec<PaletteItem>, row: &AgentRow, detail: &str| {
-            items.push(PaletteItem {
-                target: PaletteTarget::Agent(row.target.clone()),
-                label: row.label.clone(),
-                detail: detail.to_string(),
-                is_agent: true,
-                status: Some(row.dot_status()),
-                active: jump_target_is_active(&row.target, active_local, active_sid.as_deref()),
-            });
+    fn palette_tile_item(
+        &self,
+        window: &workspace::Window<App>,
+        detail: String,
+        cx: &gpui::App,
+    ) -> Option<PaletteItem> {
+        let (label, is_agent, status, archived) = match &window.content {
+            App::Agent(tile) => {
+                let local = tile.session();
+                let remembered = tile.remembered_sid(|id| self.sessions.sid_of(id).cloned());
+                let roster = remembered
+                    .as_ref()
+                    .and_then(|sid| self.agent_roster.get(sid.as_str()));
+                let label = local
+                    .and_then(|id| self.sessions.get(id))
+                    .map(|session| session.read(cx).label.clone())
+                    .or_else(|| roster.map(|info| info.label.clone()))
+                    .unwrap_or_else(|| "Claude".to_string());
+                let status = local
+                    .and_then(|id| self.sessions.get(id))
+                    .map(|session| {
+                        if session.read(cx).state.turn_phase.is_awaiting() {
+                            AgentDotStatus::Working
+                        } else {
+                            AgentDotStatus::WaitingForYou
+                        }
+                    })
+                    .or_else(|| {
+                        roster.map(|info| {
+                            if !info.connected {
+                                AgentDotStatus::Neutral
+                            } else if info.busy {
+                                AgentDotStatus::Working
+                            } else {
+                                AgentDotStatus::WaitingForYou
+                            }
+                        })
+                    })
+                    .unwrap_or(AgentDotStatus::Neutral);
+                let archived = remembered
+                    .as_ref()
+                    .is_some_and(|sid| self.jump_archived_sessions.contains(sid.as_str()));
+                (label, true, Some(status), archived)
+            }
+            content => (
+                Self::desktop_tile_title(&self.sessions, content, cx),
+                false,
+                None,
+                false,
+            ),
         };
-        for s in sections {
-            for (idx, label, is_active) in s.workspaces {
-                items.push(PaletteItem {
-                    target: PaletteTarget::Workspace(idx),
-                    label,
-                    detail: s.name.clone(),
-                    is_agent: false,
-                    status: None,
-                    active: is_active,
-                });
-            }
-            for (_, rows) in agent_row_groups_for_tab(s.sessions, JumpAgentTab::All) {
-                for (_, row) in rows {
-                    push_session(&mut items, &row, &s.name);
+        (!archived).then(|| PaletteItem {
+            target: PaletteTarget::Tile(window.id),
+            label,
+            detail,
+            is_agent,
+            status,
+            active: self.workspace.focused_window_id() == Some(window.id),
+        })
+    }
+
+    /// Every ordinary-navigation candidate in ownership order: each workspace
+    /// folder followed by its tiles, then every unbound tile. A selected jump
+    /// panel activity tab never changes `Cmd-P` candidates.
+    pub(crate) fn jump_palette_items(&self, cx: &gpui::App) -> Vec<PaletteItem> {
+        let mut items = Vec::new();
+        for (idx, wsp) in self.workspace.workspaces.iter().enumerate() {
+            let project = self.projects.name_of(wsp.project()).to_string();
+            let workspace_label = wsp.display_label().to_string();
+            items.push(PaletteItem {
+                target: PaletteTarget::Workspace(idx),
+                label: workspace_label.clone(),
+                detail: project.clone(),
+                is_agent: false,
+                status: None,
+                active: self.workspace.directly_focused_unbound().is_none()
+                    && self.workspace.active_workspace == idx,
+            });
+            wsp.layout.for_each_leaf(&mut |window| {
+                if let Some(item) = self.palette_tile_item(
+                    window,
+                    format!("{project} · {workspace_label}"),
+                    cx,
+                ) {
+                    items.push(item);
                 }
-            }
+            });
         }
-        for (cwd_label, group) in &unfiled {
-            for (_, row) in group {
-                push_session(&mut items, row, cwd_label);
+        for tile in &self.workspace.unbound_tiles {
+            let project = self.projects.name_of(tile.project);
+            if let Some(item) =
+                self.palette_tile_item(&tile.window, format!("{project} · Unbound"), cx)
+            {
+                items.push(item);
             }
         }
         items
+    }
+
+    /// The production dispatcher shared by Cmd-P and the jump panel. Agent
+    /// tiles retain their attach/read semantics; every other tile is a direct
+    /// stable-id focus. No branch changes membership.
+    pub(crate) fn jump_to_tile(&mut self, id: workspace::WindowId, cx: &mut Context<Self>) {
+        enum AgentDestination {
+            Local(SessionId),
+            Roster(String),
+            Plain,
+        }
+        let destination = self
+            .workspace
+            .tile(id)
+            .and_then(|window| match &window.content {
+                App::Agent(tile) => Some(
+                    tile.session()
+                        .map(AgentDestination::Local)
+                        .or_else(|| {
+                            tile.remembered_sid(|local| self.sessions.sid_of(local).cloned())
+                                .map(|sid| AgentDestination::Roster(sid.to_string()))
+                        })
+                        .unwrap_or(AgentDestination::Plain),
+                ),
+                _ => None,
+            });
+        match destination {
+            Some(AgentDestination::Local(session)) => self.jump_to_session(session, cx),
+            Some(AgentDestination::Roster(sid)) => self.jump_to_roster_session(sid, cx),
+            _ => {
+                self.workspace.focus_tile(id);
+                cx.notify();
+            }
+        }
+        self.save_workspace_state();
     }
 
     /// The palette's current ranked candidates, as `(item, is_selected)` pairs in
@@ -287,7 +369,7 @@ impl YaldaGpuiView {
         self.clear_overlay();
         match target {
             PaletteTarget::Workspace(i) => self.select_workspace(i, cx),
-            PaletteTarget::Agent(t) => self.jump_to_agent(t, cx),
+            PaletteTarget::Tile(id) => self.jump_to_tile(id, cx),
         }
         cx.notify();
     }
@@ -413,7 +495,7 @@ impl YaldaGpuiView {
                             this.clear_overlay();
                             match target.clone() {
                                 PaletteTarget::Workspace(i) => this.select_workspace(i, cx),
-                                PaletteTarget::Agent(t) => this.jump_to_agent(t, cx),
+                                PaletteTarget::Tile(id) => this.jump_to_tile(id, cx),
                             }
                             cx.notify();
                         }

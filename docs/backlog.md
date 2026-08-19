@@ -118,22 +118,16 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
   glyph/indent **pixels** (gap #1) and the mouse-drag folder-reorder **gesture**
   (gap #2).
 
-- **Direct session visits are detached from workspace placement** — `DONE`
+- **Direct session visits are detached from workspace placement** — `SUPERSEDED`
   (2026-08-02 via `/new-ux`; `UXI-JumpPanel-19`). Captured verbatim: *"Visiting
   a session directly (via the jump panel or the p-menu) should be different from
   visiting it in a workspace. Going directly to it should show it detatched from
   a workspace. However, it hsould still present in workspace when visited."*
-  Both entry surfaces now open a bare ephemeral workspace whose ordinary
-  `AgentTile::Bound` tile references the project session. The original tile
-  remains the unique durable placement, switch-away removes only the direct
-  reference, and placement/free/persistence projections exclude ephemeral
-  workspaces. Detachment is derived from the viewport's containing workspace;
-  it is not duplicated as tile state.
-  Close and `/clear` from the bare view preserve valid workspace placement.
-  `direct_session_visits_add_a_reference_and_keep_workspace_placement` drives the
-  jump-panel dispatcher plus real `Cmd-P` activation; restoring the former
-  focus-owner branch produced the expected RED. GPUI harness (518 passed, 1
-  ignored) and the non-test binary check are green.
+  ADR-0033 replaces the ephemeral-reference model: a tile is now exclusively
+  bound to one workspace or owned by Unbound, and direct navigation focuses the
+  stable tile without creating another reference. Bound destinations focus
+  their owning workspace; unbound destinations remain unbound. See project
+  `docs/projects/unbound-tiles/` and Cog graph `9k2`.
 
 - **Archiving a session tore down the whole GUI connection** — `NEEDS-RUNTIME`
   (2026-08-04 via `/bug`; `bug-0028`). Reported as *"when I unarchive a session

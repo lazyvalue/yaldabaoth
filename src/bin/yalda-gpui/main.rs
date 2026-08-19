@@ -238,6 +238,11 @@ actions!(
         // creates a second view onto the same file there, leaving the
         // original in place. Agent/Browser tiles are single-home (rejected).
         AlsoShowTile,
+        // Move the same tile object across the workspace ownership boundary.
+        // Bind targets the active same-project workspace; unbind leaves the
+        // tile directly focused with all of its state intact.
+        BindFocusedTile,
+        UnbindFocusedTile,
         // Splits (Ctrl-W chord prefix per spec-workspaces-and-splits.md §12)
         SplitH,
         SplitV,
@@ -1932,6 +1937,9 @@ struct YaldaGpuiView {
     /// Project names whose jump-panel children are hidden. Names, rather than
     /// runtime-local ProjectIds, make the preference durable across restart.
     jump_folded_projects: std::collections::HashSet<String>,
+    /// Independently folded workspace folders, keyed by durable project name
+    /// plus the workspace's immutable auto-name.
+    jump_folded_workspaces: std::collections::HashSet<String>,
     /// User's drag-reordered order of jump-panel tag folders, per project
     /// (`Preferences::jump_tag_order`, UXI-JumpPanel-21). `project name → [tag]`;
     /// unlisted tags sort after alphabetically. Keyed by durable project name
@@ -2039,6 +2047,7 @@ impl YaldaGpuiView {
             jump_archived_sessions: std::collections::HashSet::new(),
             jump_agent_tabs: HashMap::new(),
             jump_folded_projects: std::collections::HashSet::new(),
+            jump_folded_workspaces: std::collections::HashSet::new(),
             jump_tag_order: HashMap::new(),
             jump_folded_tags: std::collections::HashSet::new(),
             jump_order_succession: HashMap::new(),
@@ -2102,6 +2111,7 @@ impl YaldaGpuiView {
             jump_archived_sessions: std::collections::HashSet::new(),
             jump_agent_tabs: HashMap::new(),
             jump_folded_projects: std::collections::HashSet::new(),
+            jump_folded_workspaces: std::collections::HashSet::new(),
             jump_tag_order: HashMap::new(),
             jump_folded_tags: std::collections::HashSet::new(),
             jump_order_succession: HashMap::new(),
@@ -2157,6 +2167,8 @@ impl YaldaGpuiView {
         // (migration guarantees ≥1 exists).
         let default_project = self.projects.first().unwrap_or(ProjectId(0));
         let mut ws: workspace::Frame<App> = workspace::Frame::new(default_project);
+        let requested_direct_unbound = snap.direct_unbound;
+        let migrate_legacy_tile_tags = !snap.tile_tags_migrated;
         // Each agent leaf carries its persisted session id (identity), so restore
         // rebinds it to ITS OWN session (UXI-AgentTile-18), not by index.
         let mut agent_leaf_ids: Vec<(workspace::WindowId, Option<ServerSid>)> = Vec::new();
@@ -2233,6 +2245,46 @@ impl YaldaGpuiView {
             ws.workspaces.push(wsp);
             ws.next_workspace_index += 1;
         }
+        // Restore the second ownership domain. Duplicate ids and duplicate
+        // Agent session identities are skipped defensively so a corrupt or
+        // transitional snapshot cannot place one tile/session twice.
+        let mut placed_agent_sids: std::collections::HashSet<String> = agent_leaf_ids
+            .iter()
+            .filter_map(|(_, sid)| sid.as_ref().map(ToString::to_string))
+            .collect();
+        let mut placed_ids = ws.all_window_ids();
+        for persisted in snap.unbound_tiles {
+            let leaf = persisted.tile;
+            let agent_sid = match &leaf.kind {
+                PersistedKind::Agent { session_id: Some(sid) } => Some(sid.clone()),
+                _ => None,
+            };
+            if !accept_unbound_restore(
+                leaf.id,
+                agent_sid.as_ref(),
+                &mut placed_ids,
+                &mut placed_agent_sids,
+            ) {
+                continue;
+            }
+            let project_cwd = persisted
+                .project_cwd
+                .map(PathBuf::from)
+                .unwrap_or_else(process_cwd);
+            let project = self
+                .projects
+                .ensure_at_cwd(project_cwd.clone(), &project_name_for_cwd(&project_cwd));
+            let id = leaf.id;
+            let (window, _) = restore_leaf(&mut ws, &self.theme, leaf);
+            ws.next_window_id = ws.next_window_id.max(id + 1);
+            ws.unbound_tiles.push(workspace::UnboundTile {
+                project,
+                window,
+            });
+            if let Some(sid) = agent_sid {
+                agent_leaf_ids.push((id, Some(sid)));
+            }
+        }
         if !ws.workspaces.is_empty() {
             ws.active_workspace = snap.active_workspace.min(ws.workspaces.len() - 1);
         }
@@ -2255,6 +2307,44 @@ impl YaldaGpuiView {
                 buf.tags = tags.iter().cloned().collect();
             }
         }
+        // One-time migration from content-owned sidecars to tile-local tags.
+        // The snapshot flag prevents an intentionally emptied tile tag set from
+        // being repopulated on every restart.
+        if migrate_legacy_tile_tags {
+            let agent_tags: HashMap<workspace::WindowId, workspace::TagSet> =
+                agent_leaf_ids
+                    .iter()
+                    .filter_map(|(id, sid)| {
+                        let sid = sid.as_ref()?;
+                        let tags = self.session_tags.get(sid.as_str())?;
+                        Some((*id, tags.iter().cloned().collect()))
+                    })
+                    .collect();
+            let buffer_tags: HashMap<workspace::FileBufferId, workspace::TagSet> = ws
+                .file_buffers
+                .iter()
+                .map(|(&id, buffer)| (id, buffer.tags.clone()))
+                .collect();
+            let ids: Vec<_> = ws.all_window_ids().into_iter().collect();
+            for id in ids {
+                let inherited = agent_tags.get(&id).cloned().or_else(|| {
+                    let buffer_id = match &ws.tile(id)?.content {
+                        App::Buffer(BufferApp::Viewing(doc)) => {
+                            doc.source.as_ref().map(|source| source.buffer_id)
+                        }
+                        App::Buffer(BufferApp::Editing(edit)) => Some(edit.editor.buffer_id),
+                        _ => None,
+                    }?;
+                    buffer_tags.get(&buffer_id).cloned()
+                });
+                if let Some(tags) = inherited
+                    && let Some(tile) = ws.tile_mut(id)
+                    && tile.tags.is_empty()
+                {
+                    tile.tags = tags;
+                }
+            }
+        }
         // No retile-on-restore (infinite-plane, Stage D): every workspace is a Plane
         // (Behavior 1/7). The `Layout<C>` tree restored above is the CONTENT
         // owner verbatim; geometry comes from the restored `desktop` slot map (a
@@ -2264,6 +2354,9 @@ impl YaldaGpuiView {
         // origin ring-spiral (chrome.rs `render_desktop` → `reconcile`). Content
         // is preserved; only geometry reflows once.
         self.workspace = ws;
+        if let Some(id) = requested_direct_unbound {
+            self.workspace.focus_unbound(id);
+        }
 
         // Post-pass: replace Browser stubs with live agent sessions.
         if !agent_leaf_ids.is_empty() {
@@ -2524,24 +2617,15 @@ impl YaldaGpuiView {
 
     /// Replace the content at `leaf_id` (any workspace) with `tile`.
     fn install_agent_tile(&mut self, leaf_id: workspace::WindowId, tile: AgentTile) {
-        for wsp in &mut self.workspace.workspaces {
-            if let Some(win) = wsp.layout.find_leaf_mut(leaf_id) {
-                win.content = App::Agent(tile);
-                return;
-            }
+        if let Some(win) = self.workspace.tile_mut(leaf_id) {
+            win.content = App::Agent(tile);
         }
     }
 
     /// Point the workspace focus at `leaf_id` so the bind-choke methods (which
     /// act on the FOCUSED tile) target the leaf being restored.
     fn focus_window_for_restore(&mut self, leaf_id: workspace::WindowId) {
-        for (i, wsp) in self.workspace.workspaces.iter_mut().enumerate() {
-            if wsp.layout.find_leaf(leaf_id).is_some() {
-                wsp.focused = leaf_id;
-                self.workspace.active_workspace = i;
-                return;
-            }
-        }
+        self.workspace.focus_tile(leaf_id);
     }
 
     /// `Some(doc)` if currently viewing a document, else `None`.
@@ -2859,7 +2943,10 @@ impl YaldaGpuiView {
     /// Switch the workspace to the workspace at `idx`. Used by the buffer-list
     /// picker. No-op if idx is out of range.
     fn switch_to_buffer(&mut self, idx: usize) {
-        if idx >= self.workspace.workspaces.len() || idx == self.workspace.active_workspace {
+        if idx >= self.workspace.workspaces.len()
+            || (idx == self.workspace.active_workspace
+                && self.workspace.directly_focused_unbound().is_none())
+        {
             return;
         }
         self.workspace.set_active_workspace(idx);
@@ -3489,6 +3576,11 @@ impl YaldaGpuiView {
                 names.sort();
                 names
             }),
+            jump_folded_workspaces: (!self.jump_folded_workspaces.is_empty()).then(|| {
+                let mut keys: Vec<_> = self.jump_folded_workspaces.iter().cloned().collect();
+                keys.sort();
+                keys
+            }),
             jump_tag_order: (!self.jump_tag_order.is_empty()).then(|| self.jump_tag_order.clone()),
             jump_folded_tags: (!self.jump_folded_tags.is_empty()).then(|| {
                 let mut keys: Vec<_> = self.jump_folded_tags.iter().cloned().collect();
@@ -3934,9 +4026,13 @@ impl YaldaGpuiView {
     }
 
     /// Activate the workspace at `idx`. Mouse-click entry point from the workspace
-    /// strip — no-ops if the index is out of range or already active.
+    /// strip — no-ops if the index is out of range or already active, unless
+    /// the current view is directly focused Unbound content that must be left.
     fn select_workspace(&mut self, idx: usize, cx: &mut Context<Self>) {
-        if idx >= self.workspace.workspaces.len() || idx == self.workspace.active_workspace {
+        if idx >= self.workspace.workspaces.len()
+            || (idx == self.workspace.active_workspace
+                && self.workspace.directly_focused_unbound().is_none())
+        {
             return;
         }
         self.workspace.set_active_workspace(idx);
@@ -4022,6 +4118,51 @@ impl YaldaGpuiView {
     /// `Ctrl-W M` — open the workspace picker to ALSO-SHOW the focused tile.
     fn also_show_tile(&mut self, _: &AlsoShowTile, _w: &mut Window, cx: &mut Context<Self>) {
         self.open_workspace_picker(WorkspacePickerMode::AlsoShow, cx);
+    }
+
+    fn bind_focused_tile(
+        &mut self,
+        _: &BindFocusedTile,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self.workspace.directly_focused_unbound() else {
+            self.transient_status = Some("focused tile is already in a workspace".into());
+            cx.notify();
+            return;
+        };
+        let target = self.workspace.active_workspace;
+        if self.workspace.bind_unbound(id, target).is_err() {
+            self.transient_status =
+                Some("tile and active workspace belong to different projects".into());
+        } else {
+            self.transient_status = Some("tile added to active workspace".into());
+            self.save_workspace_state();
+        }
+        cx.notify();
+    }
+
+    fn unbind_focused_tile(
+        &mut self,
+        _: &UnbindFocusedTile,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace.directly_focused_unbound().is_some() {
+            self.transient_status = Some("focused tile is already unbound".into());
+            cx.notify();
+            return;
+        }
+        let Some(id) = self.workspace.focused_window_id() else {
+            return;
+        };
+        if self.workspace.unbind_window(id).is_err() {
+            self.transient_status = Some("the sole workspace must keep one tile".into());
+        } else {
+            self.transient_status = Some("tile moved to Unbound".into());
+            self.save_workspace_state();
+        }
+        cx.notify();
     }
 
     /// `Ctrl-W s` — horizontal split: new tile below the focused one.
@@ -5474,11 +5615,21 @@ impl YaldaGpuiView {
                 cx.notify();
             }
             "new-agent-tile" => {
-                // UXI-Workspace-8: contextual placement. In a BARE AGENT VIEW (an
-                // ephemeral virtual workspace) there is nothing to split beside —
-                // swap that single tile in place for a fresh picker instead.
-                if self.workspace.active_is_ephemeral() {
-                    self.open_new_agent_selector_in_place(cx);
+                // Direct-unbound content has no workspace layout to split. Make
+                // another unbound tile and focus it, leaving the viewed tile and
+                // its state intact.
+                if self.workspace.directly_focused_unbound().is_some() {
+                    let project = self.workspace.inherited_project();
+                    let id = self
+                        .workspace
+                        .push_unbound(App::Agent(AgentTile::new()), project);
+                    self.workspace.focus_unbound(id);
+                    if self.session_server.is_some() {
+                        self.start_server_pump(cx);
+                        self.refresh_roster(cx);
+                    }
+                    self.save_workspace_state();
+                    cx.notify();
                     return;
                 }
                 // Split with a placeholder browser (focus lands on the new
@@ -5959,7 +6110,7 @@ impl YaldaGpuiView {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let content = self.clone_focused_for_split(&cwd);
         let id = self.workspace.alloc_window_id();
-        let window = workspace::Window { id, content };
+        let window = workspace::Window::new(id, content);
         let _ = self.workspace.insert_leaf_into_workspace(target, window);
         self.workspace.active_workspace = target.min(self.workspace.workspaces.len() - 1);
     }
@@ -6631,18 +6782,19 @@ impl YaldaGpuiView {
         }
         // 2. Workspaces: close this project's workspaces (descending so indices stay
         // valid), then guarantee ≥1 workspace survives under a surviving project.
-        let mut idxs: Vec<usize> = self
+        // Explicit project deletion is the one operation that destroys tiles:
+        // the ordinary workspace-close path moves them to Unbound, which would
+        // otherwise leave unbound tiles carrying a now-dead ProjectId here.
+        self.workspace.workspaces.retain(|workspace| workspace.project() != pid);
+        self.workspace.unbound_tiles.retain(|tile| tile.project != pid);
+        self.workspace.direct_unbound = self
             .workspace
-            .workspaces
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| t.project() == pid)
-            .map(|(i, _)| i)
-            .collect();
-        idxs.sort_unstable_by(|a, b| b.cmp(a));
-        for i in idxs {
-            self.workspace.close_workspace(i);
-        }
+            .direct_unbound
+            .filter(|id| self.workspace.unbound_tiles.iter().any(|tile| tile.window.id == *id));
+        self.workspace.active_workspace = self
+            .workspace
+            .active_workspace
+            .min(self.workspace.workspaces.len().saturating_sub(1));
         // 3. Drop the project FIRST, so the survivor is derived from what REMAINS
         // (deleting the last project must not seed a workspace under the id we're
         // about to remove — bug caught in review).
@@ -9122,6 +9274,9 @@ fn main() {
                         }
                         if let Some(names) = prefs.jump_folded_projects {
                             view.jump_folded_projects = names.into_iter().collect();
+                        }
+                        if let Some(keys) = prefs.jump_folded_workspaces {
+                            view.jump_folded_workspaces = keys.into_iter().collect();
                         }
                         // Per-project tag-folder order + fold state (UXI-JumpPanel-21).
                         if let Some(o) = prefs.jump_tag_order {

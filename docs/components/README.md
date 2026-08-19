@@ -38,19 +38,18 @@ holds the detail for a slice. The UXI ids stay owned by the component, not the f
 ## Index of components
 
 - [agent-tile/](agent-tile/README.md) — `AgentTile` (decomposed): sidepanel,
-  transcript, compose, recap, model, picker. `UXI-AgentTile-1..33` (the
-  session **tag/untag** command is `-33`).
+  transcript, compose, recap, model, picker. `UXI-AgentTile-1..34` (tile-local
+  session tags are `-33`; independent session/workspace state is `-34`).
 - [buffer.md](buffer.md) — `Buffer` (Picking / Viewing / Editing).
 - [linear.md](linear.md) — `Linear`.
 - [cog.md](cog.md) — `Cog` (read-only Cog graph explorer tile). `UXI-Cog-1..10`.
-- [jump-panel.md](jump-panel.md) — `JumpPanel`. `UXI-JumpPanel-1..21` (the
-  sidebar navigator, its `Cmd-P` fuzzy palette `UXI-JumpPanel-9`, and per-project
-  session **tag folders** `UXI-JumpPanel-20/-21`).
+- [jump-panel.md](jump-panel.md) — `JumpPanel`. `UXI-JumpPanel-1..23` (the
+  sidebar navigator, its `Cmd-P` fuzzy palette `UXI-JumpPanel-9`, and the
+  bound-workspace / tag-grouped Unbound tree in `UXI-JumpPanel-23`).
 - [workspace.md](workspace.md) — `Workspace` (the infinite-plane model: signed
   all-directions slot grid + pan/semantic-zoom camera + reset-to-origin;
-  layout-mode/split surface retired; contextual new-agent placement + ephemeral
-  dismissal on close; workspace close frees sessions and never quits).
-  `UXI-Workspace-1..13`.
+  layout-mode/split surface retired; optional tile ownership; workspace close
+  unbinds tiles and never quits). `UXI-Workspace-1..16`.
 - [project.md](project.md) — `Project` (top-level org primitive: name+cwd-keyed
   store, workspaces/sessions hold a `ProjectId` FK, `Frame → Project → Workspace →
   Window`). `UXI-Project-1..8` — all implemented (ADR-0028).
@@ -67,21 +66,19 @@ holds the detail for a slice. The UXI ids stay owned by the component, not the f
 The vocabulary component specs are written in. These are the user's words — prefer
 them in specs, code comments, and UI copy over ad-hoc synonyms.
 
-- **free** — a session that has **no durable workspace-tile reference**: it still
-  belongs to its project, runs on its own, and is placeable at any time. "Free"
-  is the standing term for this
-  (not "unbound session", "orphan", "detached", or "loose"). A free session shows
-  in the jump panel's agent list and in any tile selector. The normalized session
-  store is the single owner of identity and runtime state; workspace tiles hold
-  references, so "free" is exactly "referenced by zero durable workspace tiles"
-  (`spec-agent-session-ownership.md`).
-  - **bare agent view** — the **ephemeral virtual workspace** any session opens
-    in when you visit it directly from the jump panel or `Cmd-P` (ADR-0021): one
-    agent, fullscreen, torn down on switch-away. Its tile is an ordinary reference
-    to the project-owned session; because its containing workspace is ephemeral,
-    it does not count as durable placement.
-  - *Note:* **unbound** stays the right word for a **tile** with no session (it
-    renders the selector). Sessions are free; tiles are unbound.
+- **bound tile** — a durable tile owned by exactly one workspace layout.
+- **unbound tile** — a durable tile outside every workspace. It keeps its
+  `WindowId`, App state, project, and tags; it is directly reachable from the
+  jump panel and Cmd-P and can later be bound without recreation. “Unbound”
+  describes workspace membership only (ADR-0033).
+- **empty Agent tile** — an Agent tile with no session selected (the picker).
+  This replaces the old overloaded phrase “unbound Agent tile.”
+- **direct unbound view** — focusing an unbound tile in the content area without
+  binding it. It is ordinary focus state, not an ephemeral workspace.
+
+The old terms **free session** and **bare agent view** are retired. Agent
+sessions remain project-owned runtime entities, but every navigable roster
+session is represented by either a bound or unbound Agent tile.
 
 ## Format of a component spec
 
