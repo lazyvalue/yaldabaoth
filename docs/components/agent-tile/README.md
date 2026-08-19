@@ -28,7 +28,7 @@ strip**, the **transcript** (a cached child, `TranscriptView`), the **compose** 
 
 - [sidepanel.md](sidepanel.md) — `UXI-AgentTile-1..3`, `-17`, `-20`: the segmented
   right sidepanel (Plan + Subagents), its keyboard focus model, and `Cmd-B` hide.
-- [transcript.md](transcript.md) — `UXI-AgentTile-4..8`: the transcript reading
+- [transcript.md](transcript.md) — `UXI-AgentTile-4..8`, `-40`: the transcript reading
   surface (background, turn headers, subagent swap, render freshness, token splits).
 - [compose.md](compose.md) — `UXI-AgentTile-9..14`, `-21`: the compose input (word-wrap,
   worksheet vs chatbox, paint-on-route, immediate submit, image paste, reply-with-quote).
@@ -81,3 +81,4 @@ strip**, the **transcript** (a cached child, `TranscriptView`), the **compose** 
 | UXI-AgentTile-32 | picker | Archived sessions never appear in the session picker | implemented |
 | UXI-AgentTile-33 | session-binding | Tagging a session opens a two-column add/remove dialog | implemented |
 | UXI-AgentTile-34 | session-binding | Session selection and workspace ownership are independent | implemented |
+| UXI-AgentTile-40 | transcript | `J`/`K` move directly between user turns | implemented |

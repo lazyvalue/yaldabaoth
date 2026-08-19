@@ -27,6 +27,29 @@ highlight, and a thinking indicator while awaiting. Append-only / ordered
 
 ## UX invariants
 
+### UXI-AgentTile-40 — `J`/`K` move directly between user turns
+
+**Statement.** In normal transcript navigation, bare uppercase `J` moves to the
+next/newer user turn and bare uppercase `K` moves to the previous/older user turn.
+They are direct, repeatable movement keys: there is no menu command to enter a
+turn-jump mode and lowercase `j`/`k` retain their ordinary navigation behavior.
+The movement clamps at the available turns; moving forward once more from the
+newest turn reveals the page end.
+
+**Applies to.** `agent_ui.rs::handle_claude_key` and
+`main.rs::jump_user_turn`.
+
+**Why.** Turn navigation is frequent, reversible motion. Requiring a leader-menu
+toggle before every navigation sequence made it modal, harder to remember, and
+inconsistent with the command-panel placement rule.
+
+**Status.** `implemented`
+
+**Enforcement.** `verify_harness.rs::uppercase_jk_move_directly_between_user_turns`
+feeds multiple user turns through the real reducer, drives the real Agent key
+listener with `Shift-J`/`Shift-K`, and asserts the jump ordinal moves without
+enabling the legacy mode.
+
 ### UXI-AgentTile-4 — Agent text uses the normal tile/desktop background
 
 **Statement.** **Agent** transcript text (`TurnId::Llm`) sits on the SAME

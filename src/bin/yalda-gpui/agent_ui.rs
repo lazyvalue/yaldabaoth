@@ -4379,6 +4379,33 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
+    /// Select the Agents sidepanel view from the Agent command menu. Unlike
+    /// Cmd-1/Cmd-2 (independent low-level toggles), the menu reads as a view
+    /// selector, so its two choices are mutually exclusive and always unhide
+    /// the selected view.
+    pub(crate) fn show_agent_sidepanel_agents(&mut self, cx: &mut Context<Self>) {
+        if let Some(mut state) = self.agent_mut(cx) {
+            state.sidepanel_hidden = false;
+            state.subagents_open = true;
+            state.tasklist_open = false;
+            state.panel_col = PanelColumn::Subagents;
+            state.reseat_panel_focus();
+        }
+        cx.notify();
+    }
+
+    /// Select the Tasks (Plan) sidepanel view from the Agent command menu.
+    pub(crate) fn show_agent_sidepanel_tasks(&mut self, cx: &mut Context<Self>) {
+        if let Some(mut state) = self.agent_mut(cx) {
+            state.sidepanel_hidden = false;
+            state.subagents_open = false;
+            state.tasklist_open = true;
+            state.panel_col = PanelColumn::Tasklist;
+            state.reseat_panel_focus();
+        }
+        cx.notify();
+    }
+
     /// Force-hide or show the whole right sidepanel (UXI-AgentTile-20, Cmd-B).
     /// Orthogonal to the per-segment `Cmd-1`/`Cmd-2` toggles: the open segments
     /// are preserved and return unchanged when shown again. Hiding while the
@@ -6039,7 +6066,19 @@ impl YaldaGpuiView {
             return;
         }
 
-        // User-turn jump mode (agent (space) menu → "jump between user turns"): when
+        // UXI-AgentTile-40: uppercase J/K are direct user-turn motions in
+        // transcript navigation. They do not require (or change) a mode flag;
+        // lowercase j/k retain ordinary transcript/editor movement.
+        if transcript_nav
+            && press.modifiers.is_empty()
+            && matches!(press.key, Key::Char('J') | Key::Char('K'))
+        {
+            let delta = if press.key == Key::Char('J') { 1 } else { -1 };
+            self.jump_user_turn(delta, false, cx);
+            return;
+        }
+
+        // Legacy user-turn jump mode command: when
         // on, bare `j`/`k` in Normal mode move the viewport between the user's
         // input turns (`k` = older/up, `j` = newer/down) instead of the editor
         // cursor. Normal-mode only, so Insert typing of j/k is untouched.
