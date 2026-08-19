@@ -54,6 +54,19 @@ pub enum FocusDir {
 pub struct Window<C> {
     pub id: WindowId,
     pub content: C,
+    /// User-assigned tile tags (ADR-0033). These move with the complete tile
+    /// across bind/unbind operations and are independent from App state.
+    pub tags: TagSet,
+}
+
+impl<C> Window<C> {
+    pub fn new(id: WindowId, content: C) -> Self {
+        Self {
+            id,
+            content,
+            tags: TagSet::new(),
+        }
+    }
 }
 
 /// An n-ary split tree. A `Split` node holds `>= 2` children; pruning to one
@@ -192,6 +205,18 @@ impl<C> Layout<C> {
         out
     }
 
+    /// Consume a layout into its leaves in tree order.
+    fn into_leaves(self, out: &mut Vec<Window<C>>) {
+        match self {
+            Layout::Empty => {}
+            Layout::Leaf(window) => out.push(window),
+            Layout::Split { children, .. } => {
+                for (_, child) in children {
+                    child.into_leaves(out);
+                }
+            }
+        }
+    }
 }
 
 /// Normalize a vector of weights so they sum to 1.0. If the sum is zero or
@@ -1281,6 +1306,20 @@ pub fn slot_at(point: (f32, f32), tile: (f32, f32), gutter: f32) -> Slot {
 /// A set of user-assigned tag names.
 pub type TagSet = BTreeSet<String>;
 
+/// A tile outside every workspace. The tile keeps its project while unbound so
+/// binding can enforce the existing intra-project ownership rule.
+pub struct UnboundTile<C> {
+    pub project: ProjectId,
+    pub window: Window<C>,
+}
+
+/// The exclusive placement classification for a live tile (ADR-0033).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TileMembership {
+    Bound { workspace: usize },
+    Unbound,
+}
+
 /// One **Workspace** in the frame's workspace strip.
 ///
 /// The product presents each `Workspace` as a named, swappable desktop (its own
@@ -1483,6 +1522,11 @@ pub struct FileBuffer {
 pub struct Frame<C> {
     pub workspaces: Vec<Workspace<C>>,
     pub active_workspace: usize,
+    /// Stable tiles outside every workspace, in user-visible Unbound order.
+    pub unbound_tiles: Vec<UnboundTile<C>>,
+    /// A non-owning focus pointer into `unbound_tiles`. Direct viewing never
+    /// changes membership or creates a workspace.
+    pub direct_unbound: Option<WindowId>,
     pub file_buffers: HashMap<FileBufferId, FileBuffer>,
     /// Canonical path → buffer id, for pool lookups during open.
     pub path_index: HashMap<PathBuf, FileBufferId>,
@@ -1524,6 +1568,8 @@ impl<C> Frame<C> {
         Self {
             workspaces: Vec::new(),
             active_workspace: 0,
+            unbound_tiles: Vec::new(),
+            direct_unbound: None,
             file_buffers: HashMap::new(),
             path_index: HashMap::new(),
             next_buffer_id: 1,
@@ -1539,6 +1585,11 @@ impl<C> Frame<C> {
     /// The project a new workspace should inherit: the active workspace's, else
     /// `default_project`.
     pub fn inherited_project(&self) -> ProjectId {
+        if let Some(id) = self.direct_unbound
+            && let Some(tile) = self.unbound_tiles.iter().find(|t| t.window.id == id)
+        {
+            return tile.project;
+        }
         self.active_workspace()
             .map(|t| t.project())
             .unwrap_or(self.default_project)
@@ -1555,12 +1606,26 @@ impl<C> Frame<C> {
     /// Borrow the focused window's content (None if no wsp, or the workspace's
     /// focused id is missing from the layout — invariant violation).
     pub fn focused_content(&self) -> Option<&C> {
+        if let Some(id) = self.direct_unbound {
+            return self
+                .unbound_tiles
+                .iter()
+                .find(|t| t.window.id == id)
+                .map(|t| &t.window.content);
+        }
         let wsp = self.active_workspace()?;
         wsp.layout.find_leaf(wsp.focused).map(|w| &w.content)
     }
 
     /// Mutably borrow the focused window's content.
     pub fn focused_content_mut(&mut self) -> Option<&mut C> {
+        if let Some(id) = self.direct_unbound {
+            return self
+                .unbound_tiles
+                .iter_mut()
+                .find(|t| t.window.id == id)
+                .map(|t| &mut t.window.content);
+        }
         let wsp = self.active_workspace_mut()?;
         let focused = wsp.focused;
         wsp.layout.find_leaf_mut(focused).map(|w| &mut w.content)
@@ -1569,6 +1634,13 @@ impl<C> Frame<C> {
     /// Replace the focused window's content in place. Returns the old value
     /// (or None if there's no focused window).
     pub fn replace_focused_content(&mut self, content: C) -> Option<C> {
+        if let Some(id) = self.direct_unbound {
+            let tile = self
+                .unbound_tiles
+                .iter_mut()
+                .find(|t| t.window.id == id)?;
+            return Some(std::mem::replace(&mut tile.window.content, content));
+        }
         let wsp = self.active_workspace_mut()?;
         let focused = wsp.focused;
         let win = wsp.layout.find_leaf_mut(focused)?;
@@ -1577,6 +1649,9 @@ impl<C> Frame<C> {
 
     /// The id of the focused window (or None if the workspace has no workspaces).
     pub fn focused_window_id(&self) -> Option<WindowId> {
+        if self.direct_unbound.is_some() {
+            return self.direct_unbound;
+        }
         self.active_workspace().map(|t| t.focused)
     }
 
@@ -1599,8 +1674,9 @@ impl<C> Frame<C> {
         let name = auto_workspace_name(self.next_workspace_index);
         self.next_workspace_index += 1;
         self.workspaces
-            .push(Workspace::with_layout(name, Layout::Leaf(Window { id, content }), id, project));
+            .push(Workspace::with_layout(name, Layout::Leaf(Window::new(id, content)), id, project));
         self.active_workspace = self.workspaces.len() - 1;
+        self.direct_unbound = None;
         id
     }
 
@@ -1613,20 +1689,22 @@ impl<C> Frame<C> {
         self.push_initial_workspace(content, project)
     }
 
-    /// Close the workspace at index `idx`. The active-workspace pointer adjusts to stay
-    /// in range; closing the last workspace leaves the workspace with zero workspaces
-    /// (caller is responsible for the spec Behavior 2 placeholder).
-    ///
-    /// Agent tiles in the closed workspace hold only a `SessionId` key — the session
-    /// STATE lives in `YaldaGpuiView::sessions`. So closing a workspace/window FREES
-    /// (does not KILL) any agent session it showed: the session stays in the
-    /// store, still running, re-bindable from another tile's selector. An
-    /// explicit close (`claude-close`) is the only path that kills a session.
+    /// Close the workspace at `idx`, moving every tile it owned into Unbound
+    /// without recreating it (ADR-0033). The sole durable workspace is a floor
+    /// and cannot be closed.
     pub fn close_workspace(&mut self, idx: usize) {
-        if idx >= self.workspaces.len() {
+        if idx >= self.workspaces.len() || self.workspaces.len() <= 1 {
             return;
         }
-        self.workspaces.remove(idx);
+        let removed = self.workspaces.remove(idx);
+        let project = removed.project();
+        let mut windows = Vec::new();
+        removed.layout.into_leaves(&mut windows);
+        self.unbound_tiles.extend(
+            windows
+                .into_iter()
+                .map(|window| UnboundTile { project, window }),
+        );
         if self.active_workspace >= self.workspaces.len() {
             self.active_workspace = self.workspaces.len().saturating_sub(1);
         } else if idx < self.active_workspace {
@@ -1657,6 +1735,7 @@ impl<C> Frame<C> {
         if idx >= self.workspaces.len() {
             return;
         }
+        self.direct_unbound = None;
         let cur = self.active_workspace;
         if cur != idx && self.is_ephemeral(cur) {
             self.workspaces.remove(cur);
@@ -1705,11 +1784,199 @@ impl<C> Frame<C> {
         let id = self.alloc_window_id();
         let name = auto_workspace_name(self.next_workspace_index);
         self.next_workspace_index += 1;
-        let mut wsp = Workspace::with_layout(name, Layout::Leaf(Window { id, content }), id, project);
+        let mut wsp =
+            Workspace::with_layout(name, Layout::Leaf(Window::new(id, content)), id, project);
         wsp.ephemeral = true;
         self.workspaces.push(wsp);
         self.active_workspace = self.workspaces.len() - 1;
         id
+    }
+
+    /// Create a stable tile outside every workspace and return its id.
+    pub fn push_unbound(&mut self, content: C, project: ProjectId) -> WindowId {
+        let id = self.alloc_window_id();
+        self.unbound_tiles.push(UnboundTile {
+            project,
+            window: Window::new(id, content),
+        });
+        id
+    }
+
+    /// Classify a tile by its exclusive placement owner.
+    pub fn tile_membership(&self, id: WindowId) -> Option<TileMembership> {
+        if let Some(workspace) = self.workspace_index_of_window(id) {
+            debug_assert!(
+                !self.unbound_tiles.iter().any(|t| t.window.id == id),
+                "tile {id} cannot be both bound and unbound"
+            );
+            return Some(TileMembership::Bound { workspace });
+        }
+        self.unbound_tiles
+            .iter()
+            .any(|t| t.window.id == id)
+            .then_some(TileMembership::Unbound)
+    }
+
+    /// Find a tile across both ownership domains.
+    pub fn tile(&self, id: WindowId) -> Option<&Window<C>> {
+        self.workspaces
+            .iter()
+            .find_map(|wsp| wsp.layout.find_leaf(id))
+            .or_else(|| {
+                self.unbound_tiles
+                    .iter()
+                    .find(|tile| tile.window.id == id)
+                    .map(|tile| &tile.window)
+            })
+    }
+
+    /// Mutably find a tile across both ownership domains.
+    pub fn tile_mut(&mut self, id: WindowId) -> Option<&mut Window<C>> {
+        if let Some(workspace) = self.workspace_index_of_window(id) {
+            return self.workspaces[workspace].layout.find_leaf_mut(id);
+        }
+        self.unbound_tiles
+            .iter_mut()
+            .find(|tile| tile.window.id == id)
+            .map(|tile| &mut tile.window)
+    }
+
+    /// Project of a tile, derived from its workspace while bound and retained
+    /// explicitly while unbound.
+    pub fn tile_project(&self, id: WindowId) -> Option<ProjectId> {
+        if let Some(workspace) = self.workspace_index_of_window(id) {
+            return self.workspaces.get(workspace).map(Workspace::project);
+        }
+        self.unbound_tiles
+            .iter()
+            .find(|tile| tile.window.id == id)
+            .map(|tile| tile.project)
+    }
+
+    /// Directly focus an unbound tile without changing ownership.
+    pub fn focus_unbound(&mut self, id: WindowId) -> bool {
+        if !matches!(self.tile_membership(id), Some(TileMembership::Unbound)) {
+            return false;
+        }
+        self.direct_unbound = Some(id);
+        true
+    }
+
+    /// Focus a tile in whichever ownership domain contains it.
+    pub fn focus_tile(&mut self, id: WindowId) -> bool {
+        match self.tile_membership(id) {
+            Some(TileMembership::Bound { workspace }) => {
+                self.workspaces[workspace].focused = id;
+                self.set_active_workspace(workspace);
+                true
+            }
+            Some(TileMembership::Unbound) => self.focus_unbound(id),
+            None => false,
+        }
+    }
+
+    pub fn clear_direct_unbound(&mut self) {
+        self.direct_unbound = None;
+    }
+
+    pub fn directly_focused_unbound(&self) -> Option<WindowId> {
+        self.direct_unbound
+            .filter(|&id| matches!(self.tile_membership(id), Some(TileMembership::Unbound)))
+    }
+
+    /// Move a bound tile into Unbound. A sole tile in the sole workspace cannot
+    /// be removed because the frame must retain one durable workspace.
+    pub fn unbind_window(&mut self, id: WindowId) -> Result<(), ()> {
+        let source = self.workspace_index_of_window(id).ok_or(())?;
+        let source_is_root = self.workspaces[source].layout.path_to(id) == Some(Vec::new());
+        if source_is_root && self.workspaces.len() == 1 {
+            return Err(());
+        }
+        let project = self.workspaces[source].project();
+        let old_active = self.active_workspace;
+        self.direct_unbound = None;
+        self.active_workspace = source;
+        self.workspaces[source].focused = id;
+        let (window, source_empty) = self.detach_focused()?;
+        if source_empty {
+            self.workspaces.remove(source);
+            self.active_workspace = if old_active == source {
+                source.min(self.workspaces.len().saturating_sub(1))
+            } else if source < old_active {
+                old_active - 1
+            } else {
+                old_active
+            };
+        } else {
+            let leaves = self.workspaces[source].layout.leaf_ids();
+            self.workspaces[source].desktop.reconcile(&leaves);
+            self.active_workspace = old_active;
+        }
+        debug_assert!(self.tile_membership(id).is_none());
+        self.unbound_tiles.push(UnboundTile { project, window });
+        self.direct_unbound = Some(id);
+        debug_assert_eq!(self.tile_membership(id), Some(TileMembership::Unbound));
+        Ok(())
+    }
+
+    /// Unbind `id`, seeding a replacement when it is the sole tile in the sole
+    /// workspace. Lifecycle transitions such as archive need to preserve the
+    /// stateful tile in Unbound without violating the frame's workspace floor.
+    pub fn unbind_window_with_replacement(
+        &mut self,
+        id: WindowId,
+        replacement: C,
+    ) -> Result<(), ()> {
+        let sole_root = self.workspaces.len() == 1
+            && self.workspaces[0].layout.path_to(id) == Some(Vec::new());
+        if !sole_root {
+            return self.unbind_window(id);
+        }
+        let project = self.workspaces[0].project();
+        let replacement_id = self.alloc_window_id();
+        let old = std::mem::replace(
+            &mut self.workspaces[0].layout,
+            Layout::Leaf(Window::new(replacement_id, replacement)),
+        );
+        let Layout::Leaf(window) = old else {
+            unreachable!("root path in a sole workspace must name its leaf")
+        };
+        self.workspaces[0].focused = replacement_id;
+        self.workspaces[0].desktop.reconcile(&[replacement_id]);
+        self.unbound_tiles.push(UnboundTile { project, window });
+        self.direct_unbound = None;
+        Ok(())
+    }
+
+    /// Move an unbound tile into a same-project workspace, preserving its
+    /// complete identity, content, and tags.
+    pub fn bind_unbound(&mut self, id: WindowId, workspace: usize) -> Result<(), ()> {
+        let target_project = self.workspaces.get(workspace).ok_or(())?.project();
+        let pos = self
+            .unbound_tiles
+            .iter()
+            .position(|tile| tile.window.id == id)
+            .ok_or(())?;
+        if self.unbound_tiles[pos].project != target_project {
+            return Err(());
+        }
+        debug_assert!(self.workspace_index_of_window(id).is_none());
+        let tile = self.unbound_tiles.remove(pos);
+        // The target index was validated above and no structural mutation can
+        // invalidate it between these lines.
+        self.insert_leaf_into_workspace(workspace, tile.window)
+            .expect("validated workspace index must remain present");
+        let leaves = self.workspaces[workspace].layout.leaf_ids();
+        self.workspaces[workspace].desktop.reconcile(&leaves);
+        self.active_workspace = workspace;
+        if self.direct_unbound == Some(id) {
+            self.direct_unbound = None;
+        }
+        debug_assert_eq!(
+            self.tile_membership(id),
+            Some(TileMembership::Bound { workspace })
+        );
+        Ok(())
     }
 
     /// The index of the workspace whose layout contains `id`. `None` if no workspace
@@ -1980,11 +2247,11 @@ impl<C> Frame<C> {
     /// new window. Returns the new window's id (or `None` if the workspace
     /// has no active workspace).
     pub fn split_focused(&mut self, dir: SplitDir, content: C) -> Option<WindowId> {
+        if self.direct_unbound.is_some() {
+            return None;
+        }
         let new_id = self.alloc_window_id();
-        let new_window = Window {
-            id: new_id,
-            content,
-        };
+        let new_window = Window::new(new_id, content);
         let wsp = self.active_workspace_mut()?;
         let focused = wsp.focused;
         let path = wsp.layout.path_to(focused)?;
@@ -2040,6 +2307,9 @@ impl<C> Frame<C> {
     ///   Behavior 2).
     /// - `Err(())` — no active workspace / no focused window.
     pub fn close_focused(&mut self) -> Result<Option<WindowId>, ()> {
+        if self.direct_unbound.is_some() {
+            return Err(());
+        }
         let wsp = self.active_workspace_mut().ok_or(())?;
         let focused = wsp.focused;
         let path = wsp.layout.path_to(focused).ok_or(())?;
@@ -2102,6 +2372,9 @@ impl<C> Frame<C> {
     ///
     /// `Err(())` — no active workspace / no focused window.
     pub fn detach_focused(&mut self) -> Result<(Window<C>, bool), ()> {
+        if self.direct_unbound.is_some() {
+            return Err(());
+        }
         let wsp = self.active_workspace_mut().ok_or(())?;
         let focused = wsp.focused;
         let path = wsp.layout.path_to(focused).ok_or(())?;
@@ -2197,6 +2470,9 @@ impl<C> Frame<C> {
     /// focused leaf becomes the workspace's root. Returns `Err(())` if there is no
     /// focused window.
     pub fn only(&mut self) -> Result<(), ()> {
+        if self.direct_unbound.is_some() {
+            return Err(());
+        }
         let wsp = self.active_workspace_mut().ok_or(())?;
         let focused = wsp.focused;
         let path = wsp.layout.path_to(focused).ok_or(())?;
@@ -2222,6 +2498,9 @@ impl<C> Frame<C> {
     /// (spec-infinite-plane-workspace.md Behavior 5). No-op if the active workspace
     /// has fewer than 2 tiles.
     pub fn focus_next(&mut self) -> Result<(), ()> {
+        if self.direct_unbound.is_some() {
+            return Err(());
+        }
         let wsp = self.active_workspace_mut().ok_or(())?;
         if let Some(next) = wsp.desktop.sequence_neighbor(wsp.focused, true) {
             wsp.focused = next;
@@ -2231,6 +2510,9 @@ impl<C> Frame<C> {
 
     /// Cycle focus to the previous tile in the plane's row-major slot order.
     pub fn focus_prev(&mut self) -> Result<(), ()> {
+        if self.direct_unbound.is_some() {
+            return Err(());
+        }
         let wsp = self.active_workspace_mut().ok_or(())?;
         if let Some(prev) = wsp.desktop.sequence_neighbor(wsp.focused, false) {
             wsp.focused = prev;
@@ -2253,6 +2535,9 @@ impl<C> Frame<C> {
     ///
     /// No-op when there's no sibling in the requested direction.
     pub fn focus_motion(&mut self, dir: FocusDir) -> Result<(), ()> {
+        if self.direct_unbound.is_some() {
+            return Err(());
+        }
         let wsp = self.active_workspace_mut().ok_or(())?;
         // Spatial navigation over plane slots (spec-infinite-plane-workspace.md
         // Behavior 5). No candidate = no-op.
@@ -2285,6 +2570,7 @@ impl<C> Frame<C> {
                 out.insert(w.id);
             });
         }
+        out.extend(self.unbound_tiles.iter().map(|tile| tile.window.id));
         out
     }
 
@@ -2813,7 +3099,7 @@ mod desktop_tests {
     fn placement_target_is_view_aware_and_promotion_keeps_focus() {
         let mut wsp = Workspace::with_layout(
             "workspace-1".into(),
-            Layout::Leaf(Window { id: 2, content: () }),
+            Layout::Leaf(Window::new(2, ())),
             2,
             ProjectId(1),
         );
@@ -2875,10 +3161,7 @@ mod tests {
     struct TestContent(&'static str);
 
     fn leaf(id: WindowId, c: &'static str) -> Layout<TestContent> {
-        Layout::Leaf(Window {
-            id,
-            content: TestContent(c),
-        })
+        Layout::Leaf(Window::new(id, TestContent(c)))
     }
 
     // Edge resize (Behavior 4b). West/North move the anchor (pull-to-enlarge)
@@ -3385,10 +3668,7 @@ mod tests {
             view: WorkspaceView::default(),
             project: ProjectId(0),
         });
-        let w = Window {
-            id: 9,
-            content: TestContent("moved"),
-        };
+        let w = Window::new(9, TestContent("moved"));
         ws.insert_leaf_into_workspace(1, w).unwrap();
         match &ws.workspaces[1].layout {
             Layout::Leaf(w) => assert_eq!(w.id, 9),
@@ -3415,10 +3695,7 @@ mod tests {
             view: WorkspaceView::default(),
             project: ProjectId(0),
         });
-        let w = Window {
-            id: 9,
-            content: TestContent("moved"),
-        };
+        let w = Window::new(9, TestContent("moved"));
         ws.insert_leaf_into_workspace(1, w).unwrap();
         match &ws.workspaces[1].layout {
             Layout::Split { children, .. } => {
@@ -3462,5 +3739,110 @@ mod tests {
         // Target now holds the moved leaf.
         assert_eq!(ws.workspaces[1].layout.leaf_ids(), vec![2]);
         assert_eq!(ws.workspaces[1].focused, 2);
+    }
+
+    // --- Optional workspace ownership (ADR-0033 / UXI-Workspace-16) -------
+
+    #[test]
+    fn bound_unbound_bound_roundtrip_preserves_identity_state_project_and_tags() {
+        let layout = Layout::Split {
+            dir: SplitDir::V,
+            children: vec![(0.5, leaf(1, "a")), (0.5, leaf(2, "stateful"))],
+        };
+        let mut frame = ws_with_layout(layout, 2);
+        frame
+            .tile_mut(2)
+            .expect("bound tile")
+            .tags
+            .extend(["review".to_string(), "urgent".to_string()]);
+
+        frame.unbind_window(2).expect("tile can leave split");
+        assert_eq!(frame.tile_membership(2), Some(TileMembership::Unbound));
+        assert_eq!(frame.directly_focused_unbound(), Some(2));
+        assert_eq!(frame.focused_content(), Some(&TestContent("stateful")));
+        assert_eq!(frame.tile_project(2), Some(ProjectId(0)));
+        assert_eq!(
+            frame.tile(2).expect("unbound tile").tags,
+            TagSet::from(["review".to_string(), "urgent".to_string()])
+        );
+        assert_eq!(frame.workspaces[0].layout.leaf_ids(), vec![1]);
+        assert_eq!(frame.all_window_ids(), HashSet::from([1, 2]));
+
+        frame.bind_unbound(2, 0).expect("same-project bind");
+        assert_eq!(
+            frame.tile_membership(2),
+            Some(TileMembership::Bound { workspace: 0 })
+        );
+        assert_eq!(frame.directly_focused_unbound(), None);
+        let rebound = frame.tile(2).expect("rebound tile");
+        assert_eq!(rebound.id, 2);
+        assert_eq!(rebound.content, TestContent("stateful"));
+        assert_eq!(
+            rebound.tags,
+            TagSet::from(["review".to_string(), "urgent".to_string()])
+        );
+        assert_eq!(frame.workspaces[0].layout.leaf_ids(), vec![1, 2]);
+        assert!(frame.unbound_tiles.is_empty());
+    }
+
+    #[test]
+    fn direct_unbound_focus_never_changes_membership_and_workspace_switch_clears_it() {
+        let mut frame = Frame::with_initial(TestContent("bound"), ProjectId(0));
+        let id = frame.push_unbound(TestContent("unbound"), ProjectId(0));
+
+        assert!(frame.focus_unbound(id));
+        assert_eq!(frame.focused_window_id(), Some(id));
+        assert_eq!(frame.focused_content(), Some(&TestContent("unbound")));
+        assert_eq!(frame.tile_membership(id), Some(TileMembership::Unbound));
+        assert_eq!(frame.workspaces[0].layout.leaf_ids(), vec![1]);
+
+        frame.set_active_workspace(0);
+        assert_eq!(frame.directly_focused_unbound(), None);
+        assert_eq!(frame.focused_window_id(), Some(1));
+        assert_eq!(frame.tile_membership(id), Some(TileMembership::Unbound));
+    }
+
+    #[test]
+    fn binding_is_project_local_and_failure_leaves_the_tile_unbound() {
+        let mut frame = Frame::with_initial(TestContent("p0"), ProjectId(0));
+        frame.push_initial_workspace(TestContent("p1"), ProjectId(1));
+        let id = frame.push_unbound(TestContent("owned-by-p0"), ProjectId(0));
+
+        assert_eq!(frame.bind_unbound(id, 1), Err(()));
+        assert_eq!(frame.tile_membership(id), Some(TileMembership::Unbound));
+        assert_eq!(frame.tile_project(id), Some(ProjectId(0)));
+        assert_eq!(frame.tile(id).unwrap().content, TestContent("owned-by-p0"));
+    }
+
+    #[test]
+    fn closing_workspace_unbinds_its_tiles_and_keeps_the_workspace_floor() {
+        let mut frame = Frame::with_initial(TestContent("keep"), ProjectId(0));
+        let moved = frame.push_initial_workspace(TestContent("survive"), ProjectId(0));
+        frame
+            .tile_mut(moved)
+            .unwrap()
+            .tags
+            .insert("later".to_string());
+
+        frame.close_workspace(1);
+        assert_eq!(frame.workspaces.len(), 1);
+        assert_eq!(frame.tile_membership(moved), Some(TileMembership::Unbound));
+        assert_eq!(frame.tile(moved).unwrap().content, TestContent("survive"));
+        assert!(frame.tile(moved).unwrap().tags.contains("later"));
+
+        frame.close_workspace(0);
+        assert_eq!(frame.workspaces.len(), 1, "sole workspace is retained");
+        assert_eq!(frame.workspaces[0].layout.leaf_ids(), vec![1]);
+    }
+
+    #[test]
+    fn sole_workspace_cannot_be_emptied_by_unbind() {
+        let mut frame = Frame::with_initial(TestContent("anchor"), ProjectId(0));
+        assert_eq!(frame.unbind_window(1), Err(()));
+        assert_eq!(
+            frame.tile_membership(1),
+            Some(TileMembership::Bound { workspace: 0 })
+        );
+        assert!(frame.unbound_tiles.is_empty());
     }
 }

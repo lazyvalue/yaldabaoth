@@ -145,6 +145,8 @@ const DEFAULT_BINDINGS: &[DefaultBinding] = &[
     b!("ctrl-w t",          "TagViewChord",    GLOBAL, "Layout", "Tag: view by tag"),
     b!("ctrl-w ctrl-t",     "TagToggleChord",  GLOBAL, "Layout", "Tag: toggle tag on tile"),
     b!("ctrl-w shift-t",    "ClearTagView",    GLOBAL, "Layout", "Tag: clear tag view"),
+    b!("ctrl-w b",          "BindFocusedTile", GLOBAL, "Workspaces", "Bind tile to active workspace"),
+    b!("ctrl-w shift-b",    "UnbindFocusedTile", GLOBAL, "Workspaces", "Move tile to Unbound"),
     b!("cmd-=",             "ZoomIn",          GLOBAL, "Zoom", "Zoom in"),
     b!("cmd-+",             "ZoomIn",          GLOBAL, "Zoom", "Zoom in"),
     b!("cmd--",             "ZoomOut",         GLOBAL, "Zoom", "Zoom out"),

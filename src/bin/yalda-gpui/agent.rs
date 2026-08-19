@@ -5179,6 +5179,7 @@ impl SessionPicker {
 /// states unrepresentable). It is EXACTLY ONE of:
 /// - `Selecting` — no session bound; renders the free-session selector.
 /// - `Bound` — showing one session (the common case), optionally mid-reopen.
+/// - `Dormant` — roster-known durable session identity not attached locally.
 /// - `Unavailable` — a remembered session that couldn't be resumed on restart.
 ///
 /// The old `bound`/`picker`/`unavailable`/`resume_sid`/`pending_open_token`
@@ -5199,6 +5200,10 @@ pub(crate) enum AgentTile {
         session: SessionId,
         reopening: Option<u64>,
     },
+    /// A roster-known session materialized as an unbound tile but not yet
+    /// attached in this GUI. Activating it replaces this state with `Bound`
+    /// through the ordinary attach choke.
+    Dormant { remembered: ServerSid },
     /// A REMEMBERED session (`remembered` = its server id) could not be resumed on
     /// restart — the daemon GC'd it / `session/load` failed. The tile shows an
     /// inline "session unavailable — start fresh" notice (UXI-AgentTile-19), never
@@ -5273,6 +5278,10 @@ impl AgentTile {
         *self = AgentTile::Unavailable { remembered, lost };
     }
 
+    pub(crate) fn dormant(remembered: ServerSid) -> Self {
+        AgentTile::Dormant { remembered }
+    }
+
     /// The durable server id this tile remembers, for persistence into the layout
     /// leaf. `Bound` resolves it from the store (SINGLE source of truth — pass
     /// `sid_of`); `Unavailable` carries it; `Selecting` has none. No cached copy —
@@ -5283,6 +5292,7 @@ impl AgentTile {
     ) -> Option<ServerSid> {
         match self {
             AgentTile::Bound { session, .. } => resolve(*session),
+            AgentTile::Dormant { remembered } => Some(remembered.clone()),
             AgentTile::Unavailable { remembered, .. } => Some(remembered.clone()),
             AgentTile::Selecting(_) => None,
         }

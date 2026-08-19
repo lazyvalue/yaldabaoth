@@ -7,14 +7,19 @@ Facet of the [Agent Tile](README.md) component. Owns `UXI-AgentTile-18..19`, `-2
 How a tile remembers, persists, and re-acquires the session it holds across a
 restart. The binding (`AgentTile.bound: Option<SessionId>`) is the live 1:1 link
 (`spec-agent-session-ownership.md`); this facet covers its **durable identity**: the
-bound session's server id is cached on the tile as `resume_sid` and written into the
+selected session's server id is cached on the tile as `resume_sid` and written into the
 persisted layout leaf, so restore rebinds each tile to its OWN session.
+
+“Bound” in this facet historically meant the Agent tile's optional session
+selection. ADR-0033 reserves **bound/unbound** for workspace membership; the
+session axis is now **selected/empty**, independent of whether the tile is in a
+workspace.
 
 ## References
 
-- `docs/components/README.md` § Terminology — a session with no durable
-  workspace-tile reference is **free**
-  (the standing term); a *tile* with no session is **unbound**.
+- `docs/components/README.md` § Terminology — bound/unbound workspace
+  membership and an **empty Agent tile** with no selected session.
+- ADR-0033 — optional workspace ownership and tile-local tags.
 - ADR-0025 — identity-based binding + auto-resume (the decision).
 - `spec-agent-session-ownership.md` — the live 1:1 store invariant.
 - `spec-workspaces-and-splits.md` Behavior 23–24 — workspace persistence.
@@ -33,7 +38,7 @@ session's durable server id in the layout leaf, and restore binds each tile to i
 own id (session details — mode / draft / cwd — resolved from the id-keyed
 side-channel). Order of the session list, cwd drift, and layout changes do not
 misbind or fall back to the picker. (The picker remains only for a genuinely
-*unbound* tile the user opens manually.) An old pre-identity `workspace.json`
+*empty* tile the user opens manually.) An old pre-identity `workspace.json`
 (no per-leaf ids) falls back to positional binding once, then re-saves with ids.
 
 **Applies to.** `agent.rs::AgentTile.resume_sid`; `agent_ui.rs::save_agent_ring`
@@ -180,7 +185,8 @@ makes for text entry, per surface:
 This **amends `UXI-AgentTile-22` rule 1** ("arming changes nothing else… reaching a
 place where `yes` can be typed is the user's job"), which is now true only of the
 draft case (clause 4). The rest of rule 1 stands: no compose clear, ever, on either
-path. It applies on every surface — a workspace tile and the bare agent view alike.
+path. It applies on every surface — a bound workspace tile and a directly focused
+unbound tile alike.
 
 **Applies to.** `agent_ui.rs::arm_close_confirm`; `agent.rs`
 (`AgentState::open_you_block_at_cursor`, `InputSurface::is_chatbox`,
@@ -287,3 +293,35 @@ used tags" is sourced from `all_known_tags` (the union of every session's tags i
 the sidecar) — there is no separate "history" store, so a tag becomes reusable
 once it's been applied anywhere. The ADD column hides tags already on the session
 (they live in the right column instead of showing as disabled).
+
+### UXI-AgentTile-34 — Session selection and workspace ownership are independent
+
+**Statement.** An Agent tile has two orthogonal classifications:
+
+- workspace membership: **bound** or **unbound** (ADR-0033);
+- session selection: **selected** or **empty**.
+
+Unbinding a selected Agent tile preserves its `SessionId`, transcript, draft,
+provider, project, and tile tags. Binding it later moves that same tile into a
+same-project workspace. Killing the selected session is a separate explicit
+command and leaves an empty Agent tile; it does not bind, unbind, or destroy the
+tile.
+
+Roster sessions without a tile are migrated/materialized into unbound selected
+Agent tiles. Existing `session_tags.json` values seed tile-local tags once; tag
+edits thereafter address the tile, so membership changes cannot lose them.
+
+**Applies to.** `agent.rs`: Agent tile selected/empty state; `agent_ui.rs`:
+roster materialization and session lifecycle; `workspace.rs`: generic tile
+ownership/tags; `session_tag_editor.rs`: tile tag editing.
+
+**Why.** “Unbound” must answer one question consistently: is this tile in a
+workspace? Reusing it for “has no session” makes navigation and lifecycle
+commands ambiguous.
+
+**Status.** `implemented (headless)`.
+
+**Enforcement.** Ownership/session-state tests cover selected and dormant Agent
+tiles across both domains, tag migration, archive-to-Unbound, and duplicate-sid
+restore rejection. Real Cmd-P, bind, unbind, archive-menu, and jump-row paths
+exercise the production handlers (Cog graph `9k2`).

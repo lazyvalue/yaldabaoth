@@ -87,6 +87,34 @@ impl YaldaGpuiView {
         rail_focusable: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if let Some(id) = self.workspace.directly_focused_unbound() {
+            let tile_ptr: *mut workspace::Window<App> = self
+                .workspace
+                .unbound_tiles
+                .iter_mut()
+                .find(|tile| tile.window.id == id)
+                .map(|tile| &mut tile.window as *mut _)
+                .expect("direct-unbound focus must point at an unbound tile");
+            // SAFETY: render does not structurally mutate the Unbound collection;
+            // the pointer only releases the field borrow so per-App renderers can
+            // borrow the rest of `self`.
+            let tile = unsafe { &mut *tile_ptr };
+            let content = self.render_tile_content(
+                id,
+                &mut tile.content,
+                true,
+                attach_focus,
+                self.editor_bg(),
+                self.editor_fg(),
+                cx,
+            );
+            return div()
+                .size_full()
+                .on_action(cx.listener(Self::bind_focused_tile))
+                .on_action(cx.listener(Self::unbind_focused_tile))
+                .child(content)
+                .into_any_element();
+        }
         let workspace_idx = self.workspace.active_workspace;
         let focused_id = self.workspace.workspaces[workspace_idx].focused;
         // Re-derive the outline rail (if any) once before rendering the tree,
@@ -107,14 +135,20 @@ impl YaldaGpuiView {
         // infinite plane (the default) or as equal-width columns. The plane is
         // the workspace interior (infinite-plane, Stage D); columns is a pure
         // view over the same content tree, leaving the plane slots untouched.
-        match self.workspace.workspaces[workspace_idx].view {
+        let content = match self.workspace.workspaces[workspace_idx].view {
             workspace::WorkspaceView::Columns => {
                 self.render_columns(root, layout, focused_id, attach_focus, rail_focusable, cx)
             }
             workspace::WorkspaceView::Plane => {
                 self.render_desktop(root, layout, focused_id, attach_focus, rail_focusable, cx)
             }
-        }
+        };
+        div()
+            .size_full()
+            .on_action(cx.listener(Self::bind_focused_tile))
+            .on_action(cx.listener(Self::unbind_focused_tile))
+            .child(content)
+            .into_any_element()
     }
 
     /// Columns arrangement (`UXI-Workspace-14`): every tile is an equal-width,

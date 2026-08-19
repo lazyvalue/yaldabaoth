@@ -1,5 +1,5 @@
 //! The **session tag editor** (`UXI-AgentTile-33`) — a two-column modal dialog
-//! for adding/removing a session's tags (`UXI-JumpPanel-20`), replacing the
+//! for adding/removing a tile's tags (`UXI-JumpPanel-20`), replacing the
 //! earlier in-tile add/remove prompt.
 //!
 //! Left column = **ADD**: a type-to-filter/create list of every tag in use
@@ -33,8 +33,8 @@ pub(crate) enum TagEditorMode {
 /// Overlay state: the target session, the typed filter/new-tag text, the focused
 /// column + highlighted row, and the modal editing mode.
 pub(crate) struct TagEditorOverlay {
-    #[allow(dead_code)] // reserved: re-resolve the tile if focus moves while open
     pub(crate) session: SessionId,
+    pub(crate) tile: workspace::WindowId,
     pub(crate) sid: String,
     pub(crate) input: String,
     pub(crate) column: TagEditorColumn,
@@ -65,10 +65,18 @@ pub(crate) struct TagEditorModel {
 }
 
 impl YaldaGpuiView {
-    /// Every tag ever used across all sessions (the union of the sidecar's
-    /// values), sorted + unique — the pool the ADD column filters.
+    /// Every tag used by a stable tile, sorted + unique. Legacy session tags
+    /// join the pool during the one-release migration window.
     pub(crate) fn all_known_tags(&self) -> Vec<String> {
         let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for workspace in &self.workspace.workspaces {
+            workspace.layout.for_each_leaf(&mut |window| {
+                set.extend(window.tags.iter().cloned());
+            });
+        }
+        for tile in &self.workspace.unbound_tiles {
+            set.extend(tile.window.tags.iter().cloned());
+        }
         for tags in self.session_tags.values() {
             for t in tags {
                 set.insert(t.clone());
@@ -81,7 +89,11 @@ impl YaldaGpuiView {
     /// store, so the model is headlessly testable.
     pub(crate) fn tag_editor_model(&self, ov: &TagEditorOverlay) -> TagEditorModel {
         let current: Vec<String> = {
-            let mut c = self.session_tags.get(&ov.sid).cloned().unwrap_or_default();
+            let mut c: Vec<_> = self
+                .workspace
+                .tile(ov.tile)
+                .map(|tile| tile.tags.iter().cloned().collect())
+                .unwrap_or_default();
             c.sort();
             c.dedup();
             c
@@ -139,6 +151,9 @@ impl YaldaGpuiView {
         let Some(id) = self.focused_bound_session() else {
             return;
         };
+        let Some(tile) = self.workspace.focused_window_id() else {
+            return;
+        };
         let Some(sid) = self.sessions.sid_of(id).map(|s| s.as_str().to_string()) else {
             self.transient_status = Some("session not ready to tag".into());
             cx.notify();
@@ -147,6 +162,7 @@ impl YaldaGpuiView {
         self.transient_status = None;
         self.open_overlay(ActiveOverlay::TagEditor(TagEditorOverlay {
             session: id,
+            tile,
             sid,
             input: String::new(),
             column: TagEditorColumn::Available,
@@ -159,10 +175,21 @@ impl YaldaGpuiView {
     /// Add `tag` to the editor's session and reset the filter (so the list
     /// refreshes and the just-added tag hops to the right column).
     pub(crate) fn tag_editor_add(&mut self, tag: &str, cx: &mut Context<Self>) {
-        let Some(sid) = self.tag_editor_ref().map(|o| o.sid.clone()) else {
+        let Some((tile, sid)) = self
+            .tag_editor_ref()
+            .map(|o| (o.tile, o.sid.clone()))
+        else {
             return;
         };
-        self.add_session_tag(&sid, tag);
+        let tag = tag.trim();
+        if !tag.is_empty()
+            && let Some(window) = self.workspace.tile_mut(tile)
+            && window.tags.insert(tag.to_string())
+        {
+            // Keep the legacy sidecar warm only as a downgrade/migration aid.
+            self.add_session_tag(&sid, tag);
+            self.save_workspace_state();
+        }
         if let Some(o) = self.tag_editor_mut() {
             o.input.clear();
             o.selected = 0;
@@ -172,10 +199,18 @@ impl YaldaGpuiView {
 
     /// Remove `tag` from the editor's session, clamping the Current highlight.
     pub(crate) fn tag_editor_remove(&mut self, tag: &str, cx: &mut Context<Self>) {
-        let Some(sid) = self.tag_editor_ref().map(|o| o.sid.clone()) else {
+        let Some((tile, sid)) = self
+            .tag_editor_ref()
+            .map(|o| (o.tile, o.sid.clone()))
+        else {
             return;
         };
-        self.remove_session_tag(&sid, tag);
+        if let Some(window) = self.workspace.tile_mut(tile)
+            && window.tags.remove(tag.trim())
+        {
+            self.remove_session_tag(&sid, tag);
+            self.save_workspace_state();
+        }
         if let Some(o) = self.tag_editor_mut() {
             o.selected = o.selected.saturating_sub(1);
         }

@@ -9,7 +9,7 @@ An `App::Agent` tile: a **viewport** bound to (at most) one ACP session. The enu
 tag `App::Agent` splits into `AgentTile` (the viewport/UX, holds
 `bound: Option<SessionId>` in the layout tree) vs `AgentSession` (the conversation —
 transcript, channel, tools — owned by the `AgentSessions` store). The store enforces
-strict **1:1**: a session is bound by at most one tile; an unbound tile
+strict **1:1**: a session is selected by at most one Agent tile; an empty tile
 (`bound: None`) renders the **selector**. The tile's surfaces: a top **status
 strip**, the **transcript** (a cached child, `TranscriptView`), the **compose** input
 (worksheet inline or chatbox pinned), an optional **recap panel**, and the right
@@ -80,3 +80,4 @@ strip**, the **transcript** (a cached child, `TranscriptView`), the **compose** 
 | UXI-AgentTile-31 | transcript | Narrow tiles wrap header chrome; usage owns a line | implemented |
 | UXI-AgentTile-32 | picker | Archived sessions never appear in the session picker | implemented |
 | UXI-AgentTile-33 | session-binding | Tagging a session opens a two-column add/remove dialog | implemented |
+| UXI-AgentTile-34 | session-binding | Session selection and workspace ownership are independent | not implemented |

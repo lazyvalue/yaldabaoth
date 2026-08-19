@@ -7,7 +7,7 @@ a Claude Code MCP channel for piping buffers and inline replies into a running
 ## Claude and Codex agents
 
 The GPUI app can run Claude and Codex sessions side by side through ACP. Open an
-unbound Agent tile and choose **New Claude session** or **New Codex session**;
+empty Agent tile and choose **New Claude session** or **New Codex session**;
 existing sessions show their provider in the selector and the bound tile shows it
 in the status strip. Provider ownership is durable, so clear, restart, resume, and
 working-directory changes keep using the same backend.
@@ -109,6 +109,12 @@ Workspace commands use the `Ctrl-W` prefix. Placement commands move a tile's
 complete footprint—position and size—while the focused tile, its app, and its
 session identity stay together.
 
+A tile may also be **unbound**: it keeps its state, identity, project, and tags
+without occupying a workspace. `Cmd-P` (“Jump to…”) opens bound tiles in their
+workspace and opens unbound tiles directly without binding them. The jump panel
+shows bound tiles under collapsible workspace folders and groups the Unbound
+list by tile tags.
+
 | Key | Action |
 | --- | --- |
 | `Ctrl-W H/J/K/L` | swap the focused tile with its left/down/up/right neighbor |
@@ -116,6 +122,8 @@ session identity stay together.
 | `Ctrl-W x` | choose any other tile to swap with (`j`/`k`, `Enter`, `Esc`) |
 | `Ctrl-W r` / `Ctrl-W R` | rotate all tile placements forward / backward |
 | `Ctrl-W u` | undo the most recent successful placement command |
+| `Ctrl-W b` | bind the directly viewed unbound tile to the active workspace |
+| `Ctrl-W Shift-B` | move the focused workspace tile to Unbound |
 
 In Columns, `H` and `L` swap adjacent columns; `J` and `K` are no-ops. The same
 placements survive a lossless Plane/Columns toggle.
