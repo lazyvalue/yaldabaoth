@@ -2460,16 +2460,9 @@ impl YaldaGpuiView {
             .get_or_insert_with(|| cx.new(|_| CogView::new(weak)))
             .clone();
 
-        // A tile restored from disk never ran `open_cog_inner`, so kick the
-        // graph-list load on first render (else it sits frozen). Deferred so we
-        // never spawn/notify inside the render path.
-        if tile.needs_load {
-            tile.needs_load = false;
-            cx.spawn(async move |this, cx| {
-                let _ = this.update(cx, |v, cx| v.cog_load_graphs(cx));
-            })
-            .detach();
-        }
+        // A tile restored from disk never ran `open_cog_inner`; the graph-list
+        // load is kicked reliably from the root per-frame reconcile
+        // (`cog_reconcile_loads`, main.rs), not from this cached render path.
 
         let scale = self.text_scale;
         let base = px(14.0 * scale);

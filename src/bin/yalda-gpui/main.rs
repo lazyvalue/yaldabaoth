@@ -8545,6 +8545,12 @@ impl Render for YaldaGpuiView {
         // never this pass), so it is safe to run every frame here.
         self.reconcile_diagrams(cx);
 
+        // A Cog tile restored from disk (or otherwise never opened via
+        // `open_cog_inner`) needs its graph list kicked once. Same reconcile
+        // discipline as diagrams: mutation-only, dedup by `needs_load`, spawns
+        // off-thread — safe to run every frame.
+        self.cog_reconcile_loads(cx);
+
         // Behavior 9 (spec-menu-scopes.md): if the focused window changed
         // while a menu was open, dismiss it — stale entries must not
         // dispatch against the wrong content.
@@ -9310,6 +9316,44 @@ fn register_keymap(app: &mut GpuiApp) {
     KeymapRegistry::load().apply(app);
 }
 
+/// Hide the three macOS "traffic light" window buttons (close / minimize / zoom).
+/// GPUI 0.2.2 exposes no option for this, so we reach the NSWindow behind the
+/// gpui `Window` via `HasWindowHandle` and `setHidden:YES` each button. `setHidden`
+/// survives AppKit relayout + gpui's `move_traffic_light`, unlike moving the frame.
+#[cfg(target_os = "macos")]
+fn hide_traffic_lights(window: &Window) {
+    use cocoa::base::id;
+    use cocoa::foundation::NSUInteger;
+    use objc::{msg_send, sel, sel_impl};
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    // Trait method, not gpui's inherent `Window::window_handle` (which shadows it
+    // and returns an `AnyWindowHandle`).
+    let Ok(handle) = HasWindowHandle::window_handle(window) else {
+        return;
+    };
+    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+        return;
+    };
+    unsafe {
+        let ns_view = appkit.ns_view.as_ptr() as id;
+        if ns_view.is_null() {
+            return;
+        }
+        let ns_window: id = msg_send![ns_view, window];
+        if ns_window.is_null() {
+            return;
+        }
+        // NSWindowButton: 0 = Close, 1 = Miniaturize, 2 = Zoom.
+        for kind in 0u64..=2 {
+            let btn: id = msg_send![ns_window, standardWindowButton: kind as NSUInteger];
+            if !btn.is_null() {
+                let _: () = msg_send![btn, setHidden: true];
+            }
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     // Reap ACP adapters orphaned by a previously crashed/killed yalda (parent
@@ -9395,17 +9439,27 @@ fn main() {
             .open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    // Titled window so the standard system title bar (with
-                    // close/minimize/maximize buttons AND the resize affordance
-                    // that comes with it) is rendered. Previously `None` →
-                    // chromeless window that couldn't be resized.
+                    // Titled window (so it stays resizable via the window edges)
+                    // with a TRANSPARENT titlebar: `appears_transparent: true`
+                    // drops the ugly grey system bar and lets our chrome draw to
+                    // the top edge. GPUI 0.2.2 has no flag to HIDE the close /
+                    // minimize / maximize "traffic light" dots, so we reach the
+                    // NSWindow after creation and `setHidden:YES` each button (see
+                    // `hide_traffic_lights` below). Close/minimize/zoom are then
+                    // keyboard-only (Cmd-W / Cmd-M / Cmd-Q).
                     titlebar: Some(TitlebarOptions {
                         title: Some("Yaldabaoth".into()),
+                        appears_transparent: true,
                         ..Default::default()
                     }),
                     ..Default::default()
                 },
                 move |window, app| {
+                    // Kill the macOS traffic-light dots. Must run after the
+                    // NSWindow exists (it does by now) so `standardWindowButton`
+                    // returns real buttons; `setHidden` sticks across relayouts.
+                    #[cfg(target_os = "macos")]
+                    hide_traffic_lights(window);
                     app.new(|cx| {
                         let focus_handle = cx.focus_handle();
                         focus_handle.focus(window);

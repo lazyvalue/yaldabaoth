@@ -35,11 +35,50 @@ impl YaldaGpuiView {
         true
     }
 
+    /// Kick a graph-list load for any Cog tile that still needs one (restored
+    /// from disk, never opened). Run every frame from the root reconcile; the
+    /// `needs_load` flag dedups so each tile loads exactly once.
+    pub(crate) fn cog_reconcile_loads(&mut self, cx: &mut Context<Self>) {
+        let mut targets: Vec<workspace::WindowId> = Vec::new();
+        for wsp in self.workspace.workspaces.iter() {
+            wsp.layout.for_each_leaf(&mut |w| {
+                if let App::Cog(tile) = &w.content
+                    && tile.needs_load
+                {
+                    targets.push(w.id);
+                }
+            });
+        }
+        // Runs during the root render, so do NOT load (and notify) inline — clear
+        // the flag (mutation only) and spawn the load, whose notifies then land
+        // outside the draw. Mirrors `reconcile_diagrams`' discipline.
+        for target in targets {
+            if let Some(tile) = self.cog_tile_by_id_mut(target) {
+                tile.needs_load = false;
+            }
+            cx.spawn(async move |this, cx| {
+                let _ = this.update(cx, |v, cx| v.cog_load_graphs_into(target, cx));
+            })
+            .detach();
+        }
+    }
+
     /// Fetch the graph explorer list into the focused Cog tile.
     pub(crate) fn cog_load_graphs(&mut self, cx: &mut Context<Self>) {
         let Some(target) = self.workspace.focused_window_id() else {
             return;
         };
+        self.cog_load_graphs_into(target, cx);
+    }
+
+    /// Fetch the graph explorer list into a SPECIFIC Cog tile (by window id) —
+    /// used by the reconcile kick, which must target the restored tile, not
+    /// whatever is focused.
+    pub(crate) fn cog_load_graphs_into(
+        &mut self,
+        target: workspace::WindowId,
+        cx: &mut Context<Self>,
+    ) {
         let view = self.ensure_cog_view(target, cx);
         let req = {
             let Some(tile) = self.cog_tile_by_id_mut(target) else {
