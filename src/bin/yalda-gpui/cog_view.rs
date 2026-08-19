@@ -64,6 +64,9 @@ pub(crate) struct CogView {
     /// Graph-explorer search filter (the `/` pattern) + whether it's capturing.
     graph_filter: String,
     filtering: bool,
+    /// Collapsed JSON tree paths (folded rows). Keyed by a stable path id
+    /// (`surface/key/idx…`); absent = expanded. Cleared on graph change.
+    collapsed: std::collections::HashSet<String>,
     root: WeakEntity<YaldaGpuiView>,
     perf_label: &'static str,
 }
@@ -89,6 +92,7 @@ impl CogView {
             focus: CogFocus::Selector,
             graph_filter: String::new(),
             filtering: false,
+            collapsed: std::collections::HashSet::new(),
             root,
             perf_label: "cog",
         }
@@ -108,6 +112,22 @@ impl CogView {
         self.focus = CogFocus::Selector;
         self.graph_filter.clear();
         self.filtering = false;
+        self.collapsed.clear();
+    }
+
+    // ── JSON tree folding ────────────────────────────────────────────────────
+
+    /// Toggle a JSON tree row (fold ⇄ unfold) by its stable path id.
+    pub(crate) fn toggle_json_fold(&mut self, path: String, cx: &mut Context<Self>) {
+        if !self.collapsed.remove(&path) {
+            self.collapsed.insert(path);
+        }
+        cx.notify();
+    }
+
+    /// Is the JSON tree row at `path` folded? (Test accessor.)
+    pub(crate) fn json_folded(&self, path: &str) -> bool {
+        self.collapsed.contains(path)
     }
 
     // ── Graph-explorer search (`/`) ──────────────────────────────────────────
@@ -490,7 +510,7 @@ impl Render for CogView {
         let Some(root_ent) = self.root.upgrade() else {
             return div().size_full().into_any_element();
         };
-        let (st, editor_bg, border, syntect) = {
+        let (st, editor_bg, border) = {
             let r = root_ent.read(cx);
             let scale = r.text_scale;
             (
@@ -506,10 +526,8 @@ impl Render for CogView {
                 },
                 r.editor_bg(),
                 nc(r.theme.agent.dim),
-                r.theme.name.syntect_theme(),
             )
         };
-        let hl = json_highlighter(syntect);
 
         // Loading / error states fill the whole tile — no panes.
         match &self.state {
@@ -523,7 +541,7 @@ impl Render for CogView {
         }
 
         let left = self.left_pane(&st, border, self.focused_selector(), cx);
-        let right = self.right_pane(&st, self.focused_right(), &hl, cx);
+        let right = self.right_pane(&st, self.focused_right(), cx);
 
         // Top: selector | detail. Bottom (in a loaded graph): a full-width live
         // events strip across the bottom. `min_w_0` on both the column and the
@@ -550,7 +568,7 @@ impl Render for CogView {
             .text_color(st.fg)
             .child(top);
         if self.in_graph() {
-            col = col.child(self.events_pane(&st, border, self.focused_events(), &hl, cx));
+            col = col.child(self.events_pane(&st, border, self.focused_events(), cx));
         }
         col.into_any_element()
     }
@@ -658,13 +676,7 @@ impl CogView {
     /// The right detail pane (graph preview or node detail), scrollable.
     /// `focused` gets a faint accent wash (keyboard scrolls it); clicking it
     /// moves keyboard focus here.
-    fn right_pane(
-        &self,
-        st: &DetailStyle,
-        focused: bool,
-        hl: &yalda::highlight::Highlighter,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn right_pane(&self, st: &DetailStyle, focused: bool, cx: &mut Context<Self>) -> AnyElement {
         let transparent: Hsla = rgba(0x00000000).into();
         let mut scroll = div()
             .id("cog-right")
@@ -692,7 +704,7 @@ impl CogView {
             } => match bundle.nodes.get(*selected) {
                 Some(n) => {
                     scroll = scroll.child(node_header(bundle, n, st));
-                    let sections = node_sections(bundle, n, hl, st);
+                    let sections = self.node_sections(bundle, n, st, cx);
                     // Table of Contents: a chip per section (jumps on click).
                     let mut toc = div().flex().flex_row().flex_wrap().w_full().gap_1().pb_1();
                     for (i, (title, _)) in sections.iter().enumerate() {
@@ -757,7 +769,6 @@ impl CogView {
         st: &DetailStyle,
         border: Hsla,
         focused: bool,
-        hl: &yalda::highlight::Highlighter,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let transparent: Hsla = rgba(0x00000000).into();
@@ -776,7 +787,7 @@ impl CogView {
             feed = feed.child(dim_line("Waiting for live events…", st));
         } else {
             for ev in &self.events {
-                feed = feed.child(event_card(ev, hl, st));
+                feed = feed.child(self.event_card(ev, st, cx));
             }
         }
 
@@ -800,19 +811,209 @@ impl CogView {
     }
 }
 
-/// One live-event card: a small `#seq` header above the event's pretty-printed,
-/// syntax-highlighted JSON.
-fn event_card(ev: &CogEvent, hl: &yalda::highlight::Highlighter, st: &DetailStyle) -> gpui::Div {
-    card(st)
-        .child(
+impl CogView {
+    /// One live-event card: a `#seq` header above the event's JSON, rendered as a
+    /// foldable tree-table.
+    fn event_card(&self, ev: &CogEvent, st: &DetailStyle, cx: &mut Context<Self>) -> gpui::Div {
+        card(st)
+            .child(
+                div()
+                    .w_full()
+                    .text_color(st.dim)
+                    .font_family(st.mono.clone())
+                    .text_size(px(st.pt * 0.8))
+                    .child(SharedString::from(format!("#{}", ev.seq))),
+            )
+            .child(self.json_tree(&format!("ev:{}", ev.seq), &ev.raw, st, cx))
+    }
+
+    /// Render a JSON value as a foldable tree-table: one row per key, nested
+    /// objects/arrays are foldable (▸/▾) so a big payload can be collapsed. Fold
+    /// state lives in `self.collapsed`, keyed by `prefix` + json path.
+    fn json_tree(
+        &self,
+        prefix: &str,
+        value: &serde_json::Value,
+        st: &DetailStyle,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let mut rows: Vec<gpui::AnyElement> = Vec::new();
+        match value {
+            serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+                self.json_children(prefix, value, 0, st, cx, &mut rows);
+            }
+            other => rows.push(json_leaf(0, None, other, st).into_any_element()),
+        }
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .min_w_0()
+            .rounded_md()
+            .border_1()
+            .border_color(card_border(st))
+            .bg(code_bg(st))
+            .py_1();
+        for r in rows {
+            col = col.child(r);
+        }
+        col
+    }
+
+    /// Emit rows for each child of an object/array (skips the container's own
+    /// row — the caller emitted it, or it's the tree root).
+    fn json_children(
+        &self,
+        prefix: &str,
+        value: &serde_json::Value,
+        depth: usize,
+        st: &DetailStyle,
+        cx: &mut Context<Self>,
+        out: &mut Vec<gpui::AnyElement>,
+    ) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (k, v) in map {
+                    self.json_node(&format!("{prefix}/{k}"), k, v, depth, st, cx, out);
+                }
+            }
+            serde_json::Value::Array(a) => {
+                for (i, v) in a.iter().enumerate() {
+                    let label = format!("[{i}]");
+                    self.json_node(&format!("{prefix}/{i}"), &label, v, depth, st, cx, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Emit the row(s) for one keyed value: a leaf, or a foldable header + (if
+    /// unfolded) its children.
+    fn json_node(
+        &self,
+        path: &str,
+        key: &str,
+        value: &serde_json::Value,
+        depth: usize,
+        st: &DetailStyle,
+        cx: &mut Context<Self>,
+        out: &mut Vec<gpui::AnyElement>,
+    ) {
+        match value {
+            serde_json::Value::Object(map) => {
+                let folded = self.collapsed.contains(path);
+                out.push(self.json_fold_row(path, key, folded, '{', map.len(), depth, st, cx));
+                if !folded {
+                    self.json_children(path, value, depth + 1, st, cx, out);
+                }
+            }
+            serde_json::Value::Array(a) => {
+                let folded = self.collapsed.contains(path);
+                out.push(self.json_fold_row(path, key, folded, '[', a.len(), depth, st, cx));
+                if !folded {
+                    self.json_children(path, value, depth + 1, st, cx, out);
+                }
+            }
+            other => out.push(json_leaf(depth, Some(key), other, st).into_any_element()),
+        }
+    }
+
+    /// A foldable object/array header row: caret + key + a dim `{…} N` summary,
+    /// clickable to toggle.
+    fn json_fold_row(
+        &self,
+        path: &str,
+        key: &str,
+        folded: bool,
+        open: char,
+        count: usize,
+        depth: usize,
+        st: &DetailStyle,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let p = path.to_string();
+        let caret = if folded { "▸" } else { "▾" };
+        let close = if open == '{' { '}' } else { ']' };
+        let summary = if folded {
+            format!("{open} … {close}  {count}")
+        } else {
+            open.to_string()
+        };
+        let hov = st.accent.opacity(0.06);
+        json_row(depth, st)
+            .id(SharedString::from(format!("cog-json{path}")))
+            .cursor_pointer()
+            .hover(move |s| s.bg(hov))
+            .on_click(cx.listener(move |v, _ev, _w, cx| v.toggle_json_fold(p.clone(), cx)))
+            .child(caret_span(caret, st))
+            .child(json_key_span(key, st))
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(st.dim)
+                    .child(SharedString::from(summary)),
+            )
+            .into_any_element()
+    }
+}
+
+/// A JSON tree row container: monospace, indented by `depth`.
+fn json_row(depth: usize, st: &DetailStyle) -> gpui::Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_baseline()
+        .gap_1()
+        .w_full()
+        .min_w_0()
+        .pl(px(6.0 + depth as f32 * 14.0))
+        .pr_1()
+        .py(px(1.0))
+        .font_family(st.mono.clone())
+        .text_size(px(st.pt * 0.9))
+}
+
+/// The fixed-width caret column (or a blank spacer for leaves).
+fn caret_span(caret: &'static str, st: &DetailStyle) -> gpui::Div {
+    div()
+        .flex_none()
+        .w(px(14.0))
+        .text_color(st.dim)
+        .child(SharedString::new_static(caret))
+}
+
+/// A JSON key label (accent-coloured).
+fn json_key_span(key: &str, st: &DetailStyle) -> gpui::Div {
+    div()
+        .flex_none()
+        .text_color(st.accent)
+        .child(SharedString::from(key.to_string()))
+}
+
+/// A JSON scalar's display text + colour by type.
+fn json_scalar(value: &serde_json::Value, st: &DetailStyle) -> (String, Hsla) {
+    match value {
+        serde_json::Value::String(s) => (s.replace('\n', " "), rgb(0x8fbf6f).into()),
+        serde_json::Value::Number(n) => (n.to_string(), rgb(0xd7a44a).into()),
+        serde_json::Value::Bool(b) => (b.to_string(), rgb(0x9b8aa8).into()),
+        serde_json::Value::Null => ("null".to_string(), st.dim),
+        other => (other.to_string(), st.fg),
+    }
+}
+
+/// A leaf JSON row: caret spacer + optional `key:` + the coloured scalar value.
+fn json_leaf(depth: usize, key: Option<&str>, value: &serde_json::Value, st: &DetailStyle) -> gpui::Div {
+    let (text, color) = json_scalar(value, st);
+    let mut row = json_row(depth, st).child(div().flex_none().w(px(14.0)));
+    if let Some(k) = key {
+        row = row.child(json_key_span(k, st)).child(
             div()
-                .w_full()
+                .flex_none()
                 .text_color(st.dim)
-                .font_family(st.mono.clone())
-                .text_size(px(st.pt * 0.8))
-                .child(SharedString::from(format!("#{}", ev.seq))),
-        )
-        .child(highlighted_json(&json_prose(&ev.raw), hl, st))
+                .child(SharedString::new_static(":")),
+        );
+    }
+    row.child(div().min_w_0().text_color(color).child(SharedString::from(text)))
 }
 
 // ── Status colour ────────────────────────────────────────────────────────────
@@ -888,88 +1089,6 @@ fn card(st: &DetailStyle) -> gpui::Div {
         .border_1()
         .border_color(card_border(st))
         .bg(card_bg(st))
-}
-
-/// A syntect JSON highlighter, cached per syntect-theme name for the whole
-/// tile — `Highlighter::with_syntect_theme` loads the full default `SyntaxSet`,
-/// which is far too expensive to rebuild every render / every JSON block.
-fn json_highlighter(syntect_theme: &'static str) -> std::rc::Rc<yalda::highlight::Highlighter> {
-    thread_local! {
-        static CACHE: std::cell::RefCell<
-            Option<(&'static str, std::rc::Rc<yalda::highlight::Highlighter>)>,
-        > = const { std::cell::RefCell::new(None) };
-    }
-    CACHE.with(|c| {
-        let mut c = c.borrow_mut();
-        if let Some((name, hl)) = c.as_ref()
-            && *name == syntect_theme
-        {
-            return hl.clone();
-        }
-        let hl = std::rc::Rc::new(yalda::highlight::Highlighter::with_syntect_theme(syntect_theme));
-        *c = Some((syntect_theme, hl.clone()));
-        hl
-    })
-}
-
-/// Render pretty-printed JSON with syntect syntax highlighting — one flex row
-/// per line, one coloured monospace span per token (keys, strings, numbers,
-/// literals, punctuation each get syntect's theme colour). Falls back to plain
-/// monospace text if the highlighter can't parse it.
-fn highlighted_json(pretty: &str, hl: &yalda::highlight::Highlighter, st: &DetailStyle) -> gpui::Div {
-    let size = px(st.pt * 0.92);
-    let mut col = div()
-        .flex()
-        .flex_col()
-        .w_full()
-        .font_family(st.mono.clone())
-        .text_size(size);
-    match hl.highlight("json", pretty, yalda::style::Style::default()) {
-        Some(lines) => {
-            for line in lines {
-                let mut row = div().flex().flex_row().flex_wrap().w_full();
-                for span in &line.spans {
-                    let color = span
-                        .style
-                        .fg
-                        .map(|c| ncolor_to_hsla(c, 0xcccccc))
-                        .unwrap_or(st.fg);
-                    row = row.child(
-                        div()
-                            .text_color(color)
-                            .child(SharedString::from(span.text.clone())),
-                    );
-                }
-                col = col.child(row);
-            }
-        }
-        None => {
-            col = col.child(multiline_text(pretty, st.fg, &st.mono, size));
-        }
-    }
-    col
-}
-
-/// Render JSON: a bare string as prose; any structure as a pretty-printed,
-/// syntax-highlighted monospace code block (rounded, tinted). Pretty-printing +
-/// highlighting are the `/new-ux` requirement — content/output are shown
-/// indented and coloured, not as one run-on line.
-fn json_block(v: &serde_json::Value, hl: &yalda::highlight::Highlighter, st: &DetailStyle) -> gpui::Div {
-    if json_is_structured(v) {
-        div()
-            .w_full()
-            .p_2()
-            .rounded_md()
-            .border_1()
-            .border_color(card_border(st))
-            .bg(code_bg(st))
-            .child(highlighted_json(&json_prose(v), hl, st))
-    } else {
-        // Bare string / scalar → prose.
-        div()
-            .w_full()
-            .child(multiline_text(&json_prose(v), st.fg, &st.prose, st.base))
-    }
 }
 
 /// A single-line label that truncates with an ellipsis rather than wrapping —
@@ -1246,75 +1365,116 @@ fn node_header(bundle: &CogBundle, n: &CogNode, st: &DetailStyle) -> gpui::Div {
 /// first**, then Content, Output (when present), Notes. Each carries its title
 /// (for the Table of Contents) and a self-contained heading + body block so a
 /// TOC jump reveals the heading.
-pub(crate) fn node_sections(
-    bundle: &CogBundle,
-    n: &CogNode,
-    hl: &yalda::highlight::Highlighter,
-    st: &DetailStyle,
-) -> Vec<(String, gpui::Div)> {
-    let section = |title: &str, body: gpui::Div| {
-        div()
-            .flex()
-            .flex_col()
-            .w_full()
-            .gap_2()
-            .child(section_heading(title, st))
-            .child(body)
-    };
-    let mut out: Vec<(String, gpui::Div)> = Vec::new();
+/// The ordered node-detail section kinds — **State transitions first**, then
+/// Content, Output (when present), Notes. The single source of truth for section
+/// order (guarded by a test); `CogView::node_sections` renders in this order.
+pub(crate) fn node_section_titles(n: &CogNode) -> Vec<&'static str> {
+    let mut v = vec!["Status transitions", "Content"];
+    if n.output.as_ref().filter(|o| !o.is_null()).is_some() {
+        v.push("Output");
+    }
+    v.push("Notes");
+    v
+}
 
-    // 1. Status transitions FIRST (always).
-    let empty: &[CogLogEntry] = &[];
-    let log = bundle.logs.get(&n.id).map(|l| l.as_slice()).unwrap_or(empty);
-    let mut transitions: Vec<&CogLogEntry> =
-        log.iter().filter(|e| e.kind == "status_changed").collect();
-    transitions.sort_by_key(|e| e.seq);
-    let title = format!("Status transitions ({})", transitions.len());
-    let body = if transitions.is_empty() {
-        div().child(dim_line("No transitions.", st))
-    } else {
-        let mut b = div().flex().flex_col().w_full().gap_2();
-        for e in transitions {
-            let to = e
-                .data
-                .get("to")
-                .and_then(|v| v.as_str())
-                .unwrap_or("?")
-                .to_string();
-            b = b.child(transition_card(&to, &e.actor, fmt_epoch_ns(e.at), st));
+impl CogView {
+    /// The node-detail sections in [`node_section_titles`] order, each with its
+    /// display title (for the Table of Contents) + a heading + body block. JSON
+    /// bodies (Content / Output) are foldable tree-tables.
+    fn node_sections(
+        &self,
+        bundle: &CogBundle,
+        n: &CogNode,
+        st: &DetailStyle,
+        cx: &mut Context<Self>,
+    ) -> Vec<(String, gpui::Div)> {
+        let section = |title: &str, body: gpui::Div| {
+            div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .gap_2()
+                .child(section_heading(title, st))
+                .child(body)
+        };
+        let mut out: Vec<(String, gpui::Div)> = Vec::new();
+        for kind in node_section_titles(n) {
+            match kind {
+                "Status transitions" => {
+                    let empty: &[CogLogEntry] = &[];
+                    let log = bundle.logs.get(&n.id).map(|l| l.as_slice()).unwrap_or(empty);
+                    let mut transitions: Vec<&CogLogEntry> =
+                        log.iter().filter(|e| e.kind == "status_changed").collect();
+                    transitions.sort_by_key(|e| e.seq);
+                    let title = format!("Status transitions ({})", transitions.len());
+                    let body = if transitions.is_empty() {
+                        div().child(dim_line("No transitions.", st))
+                    } else {
+                        let mut b = div().flex().flex_col().w_full().gap_2();
+                        for e in transitions {
+                            let to = e
+                                .data
+                                .get("to")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("?")
+                                .to_string();
+                            b = b.child(transition_card(&to, &e.actor, fmt_epoch_ns(e.at), st));
+                        }
+                        b
+                    };
+                    out.push((title.clone(), section(&title, body)));
+                }
+                "Content" => {
+                    let body = self.json_body(&format!("n:{}/content", n.id), &n.content, st, cx);
+                    out.push(("Content".into(), section("Content", body)));
+                }
+                "Output" => {
+                    if let Some(o) = n.output.as_ref().filter(|v| !v.is_null()) {
+                        let body = self.json_body(&format!("n:{}/output", n.id), o, st, cx);
+                        out.push(("Output".into(), section("Output", body)));
+                    }
+                }
+                _ => {
+                    // Notes.
+                    let empty_notes: &[CogNote] = &[];
+                    let notes = bundle
+                        .notes
+                        .get(&n.id)
+                        .map(|v| v.as_slice())
+                        .unwrap_or(empty_notes);
+                    let title = format!("Notes ({})", notes.len());
+                    let body = if notes.is_empty() {
+                        div().child(dim_line("No notes.", st))
+                    } else {
+                        let mut b = div().flex().flex_col().w_full().gap_2();
+                        for note in notes {
+                            b = b.child(note_card(note, st));
+                        }
+                        b
+                    };
+                    out.push((title.clone(), section(&title, body)));
+                }
+            }
         }
-        b
-    };
-    out.push((title.clone(), section(&title, body)));
-
-    // 2. Content.
-    out.push(("Content".into(), section("Content", json_block(&n.content, hl, st))));
-
-    // 3. Output (if any).
-    if let Some(o) = n.output.as_ref().filter(|v| !v.is_null()) {
-        out.push(("Output".into(), section("Output", json_block(o, hl, st))));
+        out
     }
 
-    // 4. Notes.
-    let empty_notes: &[CogNote] = &[];
-    let notes = bundle
-        .notes
-        .get(&n.id)
-        .map(|v| v.as_slice())
-        .unwrap_or(empty_notes);
-    let title = format!("Notes ({})", notes.len());
-    let body = if notes.is_empty() {
-        div().child(dim_line("No notes.", st))
-    } else {
-        let mut b = div().flex().flex_col().w_full().gap_2();
-        for note in notes {
-            b = b.child(note_card(note, st));
+    /// A JSON body: a foldable tree-table when structured, else bare prose.
+    fn json_body(
+        &self,
+        prefix: &str,
+        v: &serde_json::Value,
+        st: &DetailStyle,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        if json_is_structured(v) {
+            div().w_full().child(self.json_tree(prefix, v, st, cx))
+        } else {
+            div()
+                .w_full()
+                .child(multiline_text(&json_prose(v), st.fg, &st.prose, st.base))
         }
-        b
-    };
-    out.push((title.clone(), section(&title, body)));
-
-    out
+    }
 }
 
 /// A status transition as a stylish card: `→ done` (in the status colour), the

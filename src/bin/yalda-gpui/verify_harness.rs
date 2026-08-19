@@ -21979,44 +21979,76 @@ fn cog_event_auto_refreshes_and_preserves_events(cx: &mut TestAppContext) {
     );
 }
 
-#[cfg(test)]
-fn cog_test_detail_style() -> crate::DetailStyle {
-    crate::DetailStyle {
-        fg: gpui::rgb(0xffffff).into(),
-        dim: gpui::rgb(0x888888).into(),
-        accent: gpui::rgb(0xffaa55).into(),
-        err: gpui::rgb(0xff6b6b).into(),
-        mono: "mono".into(),
-        prose: "prose".into(),
-        base: gpui::px(14.0),
-        pt: 14.0,
-    }
-}
-
 /// UXI-Cog-9: node detail sections are ordered with **State transitions first**
-/// (then Content, Output when present, Notes). Reordering it is the negative
-/// control. Drives the real `node_sections` builder.
+/// (then Content, Output when present, Notes) — the single order source
+/// `node_section_titles` that `node_sections` renders from. Reordering it is the
+/// negative control.
 #[gpui::test]
 fn cog_node_sections_state_transitions_first(_cx: &mut TestAppContext) {
-    let hl = yalda::highlight::Highlighter::with_syntect_theme("base16-ocean.dark");
-    let st = cog_test_detail_style();
-
-    // A node WITH output → sections are [transitions, Content, Output, Notes].
+    // A node WITH output → [transitions, Content, Output, Notes].
     let mut node = cog_test_node("n1", "x", "done", serde_json::json!({"purpose": "p"}));
     node.output = Some(serde_json::json!({"result": "ok"}));
-    let bundle = cog_test_bundle(vec![node]);
-    let titles: Vec<String> = crate::node_sections(&bundle, &bundle.nodes[0], &hl, &st)
-        .into_iter()
-        .map(|(t, _)| t)
-        .collect();
-
-    assert!(
-        titles[0].starts_with("Status transitions"),
-        "State transitions must be the FIRST section, got {titles:?}"
+    assert_eq!(
+        crate::node_section_titles(&node),
+        vec!["Status transitions", "Content", "Output", "Notes"],
     );
-    assert_eq!(titles[1], "Content");
-    assert_eq!(titles[2], "Output");
-    assert!(titles[3].starts_with("Notes"));
+
+    // Without output → Output is omitted, transitions still first.
+    let node2 = cog_test_node("n2", "y", "open", serde_json::json!({"purpose": "p"}));
+    let titles = crate::node_section_titles(&node2);
+    assert_eq!(titles[0], "Status transitions", "State transitions must be first");
+    assert!(!titles.contains(&"Output"), "no Output section without output");
+}
+
+/// UXI-Cog-11: node JSON (content/output/events) renders as a foldable tree-table
+/// — folding a nested key collapses its child rows. Drives the real
+/// `toggle_json_fold`; the fold hiding children is asserted by PAINT (the Content
+/// section gets shorter). The toggle is the negative control.
+#[gpui::test]
+fn cog_json_tree_fold_collapses(cx: &mut TestAppContext) {
+    let (view, vcx, cv, wid) = boot_with_cog(cx);
+    let req = cog_tile_req(&view, vcx);
+    // Content: a nested object with several children under "outer".
+    let content = serde_json::json!({
+        "outer": {"a": 1, "b": 2, "c": 3, "d": 4, "e": 5, "f": 6, "g": 7, "h": 8}
+    });
+    view.update(vcx, |v, cx| {
+        v.cog_apply(
+            wid,
+            req,
+            Ok(crate::CogFetch::Graph(Box::new(cog_test_bundle(vec![cog_test_node(
+                "n1", "node", "done", content,
+            )])))),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    // Opens on Overview → move to the node so its Content tree renders.
+    view.update(vcx, |v, cx| v.cog_select(1, cx));
+    vcx.run_until_parked();
+
+    // Expanded: measure the Content section (cog-sec-1) height.
+    crate::layout_probe_begin();
+    cv.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let expanded = crate::layout_probe_get("cog-sec-1");
+    crate::layout_probe_end();
+    let (_, _, _, h_expanded) = expanded.expect("content tree paints expanded");
+
+    // Fold "outer" (the real toggle the fold-row click invokes).
+    assert!(!cv.update(vcx, |c, _| c.json_folded("n:n1/content/outer")), "starts expanded");
+    crate::layout_probe_begin();
+    cv.update(vcx, |c, cx| c.toggle_json_fold("n:n1/content/outer".into(), cx));
+    vcx.run_until_parked();
+    let folded = crate::layout_probe_get("cog-sec-1");
+    crate::layout_probe_end();
+    let (_, _, _, h_folded) = folded.expect("content tree paints folded");
+
+    assert!(cv.update(vcx, |c, _| c.json_folded("n:n1/content/outer")), "outer is now folded");
+    assert!(
+        h_folded < h_expanded,
+        "folding a nested key must hide its child rows (folded {h_folded}px < expanded {h_expanded}px)"
+    );
 }
 
 /// UXI-Cog-8: `bundle.stats()` computes node counts + claimed→done completion

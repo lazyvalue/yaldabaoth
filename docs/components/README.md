@@ -42,7 +42,7 @@ holds the detail for a slice. The UXI ids stay owned by the component, not the f
   session tags are `-33`; independent session/workspace state is `-34`).
 - [buffer.md](buffer.md) — `Buffer` (Picking / Viewing / Editing).
 - [linear.md](linear.md) — `Linear`.
-- [cog.md](cog.md) — `Cog` (read-only Cog graph explorer tile). `UXI-Cog-1..10`.
+- [cog.md](cog.md) — `Cog` (read-only Cog graph explorer tile). `UXI-Cog-1..11`.
 - [jump-panel.md](jump-panel.md) — `JumpPanel`. `UXI-JumpPanel-1..23` (the
   sidebar navigator, its `Cmd-P` fuzzy palette `UXI-JumpPanel-9`, and the
   bound-workspace / tag-grouped Unbound tree in `UXI-JumpPanel-23`).

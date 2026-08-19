@@ -305,3 +305,26 @@ none selected, `Esc` restores — negative-control verified RED by disabling the
   flex-sized ancestor (columns workspace arrangement) from collapsing the detail
   pane to ~1 char (`cog_detail_pane_fills_width`); the exact columns-mode repro is a
   runtime confirm (couldn't be reproduced at the harness window size).
+
+### UXI-Cog-11 — JSON renders as a foldable tree-table
+
+**Statement.** JSON in the tile — node content, node output, and each live-event
+card — renders as a tree-table: one row per key (indented by depth, key in accent,
+value coloured by type), and nested objects/arrays are **foldable** (▸/▾) so a large
+payload can be collapsed. Fold state is per JSON path and persists while navigating;
+it resets on a graph change.
+
+**Applies to.** `CogView::{collapsed, toggle_json_fold, json_folded, json_tree,
+json_children, json_node, json_fold_row, json_body, event_card}`, the `json_row` /
+`json_leaf` / `json_scalar` helpers (`cog_view.rs`). Supersedes the flat syntect
+code-block of UXI-Cog-7 for these surfaces.
+
+**Why.** The `/new-ux` request: "Present the JSON in various Cog locations as sort of
+tables with rows that can be folded closed."
+
+**Status.** implemented
+
+**Enforcement.** `verify_harness.rs::cog_json_tree_fold_collapses` (real
+`toggle_json_fold`: folding a nested key marks it folded AND the Content section
+paints shorter — layout-probe, negative-control verified RED). Exact colours/glyphs
+are runtime gap #1.
