@@ -1,8 +1,8 @@
 # Worklog: Jump panel and shell routing regressions
 
 **Date:** 2026-08-19
-**Branches touched:** `codex/fix-jump-tag-row-sizing` (pending), then `main`
-(pending)
+**Branches touched:** `codex/fix-jump-tag-row-sizing` (`f3face0`), then `main`
+(`75fffa5` merge)
 
 ## Cog execution evidence
 
@@ -20,22 +20,24 @@ frontier 3: omega [open] (omega)
 
 ### Node execution
 
-- `4wi4` `reproduce-tag-sizing`: closed with the real painted RED result:
+- `4wi4` `reproduce-tag-sizing`: claimed → closed; output: real painted RED:
   Unbound tag-folder height 34px versus a standard jump row at 29px.
-- `6v2p` `reproduce-unbound-close`: closed with a real `close-window` command
+- `6v2p` `reproduce-unbound-close`: claimed → closed; output: a real `close-window` command
   failure proving directly focused Unbound Buffer/Agent picker tiles remained.
-- `2u35` `audit-ctrl-w-routing`: closed after localizing silent action loss to
+- `2u35` `audit-ctrl-w-routing`: claimed → closed; output: silent action loss localized to
   manually incomplete ancestry listeners spread across App roots.
-- `soh8` `centralize-ctrl-w-routing`: closed after adding one generated shell
+- `soh8` `centralize-ctrl-w-routing`: claimed → closed; output: one generated shell
   router, deleting App/rail/arrangement duplicates, and passing the real
   `Ctrl-W h/j/k/l` App-state matrix plus registry exact-set guard.
-- `6ekb` `fix-unbound-close`: closed after the model and real command guards
+- `6ekb` `fix-unbound-close`: claimed → closed; output: model and real command guards
   proved exact Unbound removal, scratchpad pruning, focus clearing, and workspace
   reveal for Buffer and Agent pickers.
-- `vzpr` `fix-tag-sizing`: closed after the production folder was pinned to
+- `vzpr` `fix-tag-sizing`: claimed → closed; output: the production folder was pinned to
   compact fixed monospace typography and the painted zoom-invariance guard passed.
-- `nu49` `verify-integrate`: claimed; integration results pending.
-- `6nhn` `omega`: pending.
+- `nu49` `verify-integrate`: claimed → closed; output: full feature/main tests, targeted
+  mutation testing, release builds, commit `f3face0`, and merge `75fffa5` passed
+  while unrelated main edits remained intact.
+- `6nhn` `omega`: claimed → closed; output: aggregate shipped/verified result.
 
 ### Notes
 
@@ -49,14 +51,14 @@ frontier 3: omega [open] (omega)
 
 ### Final status
 
-- Status: `open` (integration in progress)
+- Status: `complete`
 
 ```text
 graph fix-jump-tag-row-sizing (frontiers)
 frontier 0: audit-ctrl-w-routing [done], reproduce-tag-sizing [done], reproduce-unbound-close [done]
 frontier 1: fix-unbound-close [done], centralize-ctrl-w-routing [done], fix-tag-sizing [done]
-frontier 2: verify-integrate [claimed]
-frontier 3: omega [open] (omega)
+frontier 2: verify-integrate [done]
+frontier 3: omega [done] (omega)
 ```
 
 ## Built (with status)
@@ -72,7 +74,8 @@ frontier 3: omega [open] (omega)
 
 ## Open / unresolved
 
-- None in product scope; integration verification is still running.
+- None for the reported regressions. Existing compiler warnings and ignored
+  environment/runtime tests predate this change.
 
 ## Decisions
 
@@ -95,9 +98,15 @@ frontier 3: omega [open] (omega)
   the feature branch.
 - Targeted `cargo mutants --in-diff`: 7 mutants tested, 6 caught and 1 unviable,
   with no survivors.
-- `git diff --check`: passed. Merged-main and final worklog validation remain.
+- On merged `main`, `cargo test --bin yalda-gpui` again passed 639 tests with 2
+  ignored, and `cargo test --lib` again passed 173 with 2 ignored.
+- On merged `main`, both release binaries rebuilt successfully.
+- `git diff --check`: passed before commit. Repository-wide `cargo fmt --check`
+  still reports broad pre-existing formatting drift, so no unrelated rewrite was
+  retained.
+- `scripts/check-cog-worklog.sh
+  docs/worklog/2026-08-19-jump-panel-shell-routing-regressions.md`: passes.
 
 ## Next
 
-- Finish full verification, merge to `main`, rebuild release artifacts, and
-  close Cog integration and omega.
+- Restart the GUI to load the rebuilt release executable.
