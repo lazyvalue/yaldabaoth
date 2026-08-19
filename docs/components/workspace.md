@@ -898,3 +898,144 @@ round trips, uniqueness, same-project binding, direct focus, and workspace
 close. `jump_palette_opens_unbound_tile_then_binds_same_identity` drives the
 real Cmd-P and `Ctrl-W b` paths. The complete GUI and library suites pass, and
 targeted ownership mutants are caught (Cog graph `9k2`).
+
+### UXI-Workspace-17 — Send a tile without following or send and follow
+
+**Statement.** A bound tile can move to another workspace in the same project
+through the existing workspace picker:
+
+- `Ctrl-W m` opens **SEND TILE TO WORKSPACE** and moves the complete stable tile
+  while keeping the source workspace active.
+- `Ctrl-W M` opens **SEND TILE AND FOLLOW** and activates the destination after
+  moving the tile.
+- The shell menu exposes both operations and retains **also show document** as a
+  menu-only operation.
+
+The picker contains only same-project workspaces plus **+ new workspace**. A
+new destination belongs to the tile's project. Selecting the source is a no-op.
+If sending the source's last tile removes that workspace, both variants must
+land on the destination because there is no source left to remain on. Every
+successful move preserves `WindowId`, App state, tags, marks, and Agent session
+selection; the destination records the moved tile as its focused tile.
+Directly focused Unbound tiles continue to use `Ctrl-W b`; send is a
+workspace-to-workspace operation.
+
+**Applies to.** `workspace.rs`: cross-workspace relocation and project checks;
+`main.rs`: `WorkspacePicker`, send handlers, and shell menu;
+`keymap_registry.rs`: `Ctrl-W m/M`.
+
+**Why.** Spatial organization needs both background filing and the familiar
+i3 “move container and follow” workflow without cloning or recreating state.
+
+**Status.** `implemented (headless)`.
+
+**Enforcement.** `workspace.rs` model tests prove stable identity/state/tag
+preservation, both follow policies, same-project rejection, and last-tile
+source removal in both index orders. `verify_harness.rs`:
+`ctrl_w_send_and_send_follow_use_the_same_project_picker` drives the production
+keymap → action → picker → Enter path for both commands and proves the picker
+excludes another project's workspace. Negative control: disabling follow on
+the uppercase handler made the guard RED at the active-workspace assertion.
+
+### UXI-Workspace-18 — Scratchpad is an MRU subset of Unbound
+
+**Statement.** Scratchpad tiles are ordinary stable Unbound tiles with an
+additional persisted MRU membership list:
+
+- `Ctrl-W d` stashes the focused bound tile: it is moved to Unbound, added to
+  the front of the scratchpad order, and direct focus is cleared so the user
+  remains on the source workspace (or its surviving fallback).
+- `Ctrl-W D` summons the newest scratchpad tile by directly focusing it without
+  binding it. Repeating walks older scratchpad tiles; after the oldest it
+  returns to the underlying workspace.
+
+Stashing the sole tile in the sole workspace is a no-op because the durable
+workspace floor still applies. Normal unbind/archive/workspace-close operations
+do not implicitly add tiles to the scratchpad. Binding a scratchpad tile removes
+its scratchpad membership. Restore accepts only live Unbound ids, deduplicates
+them, and preserves their MRU order. A tile's existing title is its scratchpad
+name; no second naming system is introduced.
+
+`Ctrl-W s` remains the Vim-compatible horizontal split command, so scratchpad
+uses `d/D` (“detach/drawer”) rather than replacing it.
+
+**Applies to.** `workspace.rs`: scratchpad membership, stash, cycle, prune;
+`persist.rs`: additive scratchpad id list; `main.rs` / `chrome.rs`: actions,
+handlers, and shell menu; `keymap_registry.rs`: `Ctrl-W d/D`.
+
+**Why.** Unbound already supplies the correct durable ownership state for an
+i3-style scratchpad. A small MRU index adds fast hide/summon behavior without a
+parallel tile store or special window type.
+
+**Status.** `implemented (headless)`.
+
+**Enforcement.** Model and snapshot tests cover MRU cycling, final hide, the
+workspace floor, bind pruning, invalid-id pruning, and persistence round-trip.
+`ctrl_w_scratchpad_and_workspace_back_and_forth_are_global` drives the real
+`Ctrl-W d/D` routes, checks stable identity, walks the MRU past its oldest tile,
+and returns to the workspace. Negative control: wrapping instead of hiding
+after the oldest tile made the guard RED.
+
+### UXI-Workspace-19 — Back-and-forth toggles stable workspace identity
+
+**Statement.** `Ctrl-W Backspace` and the shell workspace menu's
+**back and forth** command toggle between the current and previously activated
+workspace. History stores the previous workspace's immutable `auto_name`, not
+its mutable vector index, so workspace insertion/removal cannot redirect the
+command. Every real workspace activation updates the history; selecting the
+already-active workspace or merely leaving a direct Unbound view does not.
+
+Each workspace already owns its focused `WindowId`, so arriving restores the
+tile that was focused there. With no live previous workspace, the command is a
+strict no-op. Closing the remembered workspace makes the next invocation a
+no-op rather than selecting an unrelated index. History is runtime navigation
+state and is not persisted across application restarts.
+
+**Applies to.** `workspace.rs`: activation chokepoint and stable previous key;
+`main.rs`: action/menu handler; `keymap_registry.rs`: `Ctrl-W Backspace`.
+
+**Why.** Workspace switching often alternates between two contexts; preserving
+each folder's tile focus makes that alternation a single reliable command.
+
+**Status.** `implemented (headless)`.
+
+**Enforcement.** Model tests cover stable-name toggling, per-workspace focus,
+same-index behavior, and deletion of the remembered workspace.
+`ctrl_w_scratchpad_and_workspace_back_and_forth_are_global` drives the global
+`Ctrl-W Backspace` action from direct Unbound focus and asserts the remembered
+workspace and its focused tile are restored. Negative control: making the
+model command a no-op made the guard RED.
+
+### UXI-Workspace-20 — Columns has a controllable master area
+
+**Statement.** Columns divides its reading-order tiles into two horizontal
+areas. The first `master_count` tiles share `master_ratio` of the available
+width equally; remaining tiles share the stack area equally. If every tile is
+in the master area, all tiles divide the full width evenly.
+
+- `Ctrl-W f` / `Ctrl-W F` grow/shrink the master ratio by `0.05`, clamped to
+  `[0.20, 0.80]`.
+- `Ctrl-W n` / `Ctrl-W N` increase/decrease master count, clamped to
+  `[1, tile_count]`.
+
+The commands mutate only a Columns workspace; in Plane they are no-ops. They
+never alter the plane slots, tile order, ownership, or focus. The existing
+`master_ratio` and `master_count` snapshot fields become active again, so old
+snapshots retain their values and missing fields still default to `0.60` / `1`.
+The shell workspace menu exposes all four adjustments.
+
+**Applies to.** `workspace.rs`: clamped master mutators; `chrome.rs`:
+`render_columns` width allocation; `main.rs`: handlers/menu;
+`keymap_registry.rs`: `Ctrl-W f/F/n/N`; `persist.rs`: existing fields.
+
+**Why.** Dwm's master area keeps the primary work visibly dominant while
+allowing several secondary tiles to remain available, without introducing a
+nested split-tree layout model.
+
+**Status.** `implemented (headless)`.
+
+**Enforcement.** Pure tests prove ratio/count clamps and Plane no-ops.
+`ctrl_w_master_commands_change_columns_state_and_geometry` drives all four real
+key paths and uses layout probes to prove ratio changes painted master/stack
+widths and all-master count divides the full width evenly. Negative controls:
+hard-coding either the rendered ratio or count made the geometry guard RED.

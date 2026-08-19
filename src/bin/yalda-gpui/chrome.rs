@@ -112,6 +112,14 @@ impl YaldaGpuiView {
                 .size_full()
                 .on_action(cx.listener(Self::bind_focused_tile))
                 .on_action(cx.listener(Self::unbind_focused_tile))
+                .on_action(cx.listener(Self::move_tile_and_follow))
+                .on_action(cx.listener(Self::stash_scratchpad))
+                .on_action(cx.listener(Self::summon_scratchpad))
+                .on_action(cx.listener(Self::workspace_back_and_forth))
+                .on_action(cx.listener(Self::grow_master_area))
+                .on_action(cx.listener(Self::shrink_master_area))
+                .on_action(cx.listener(Self::increase_master_count))
+                .on_action(cx.listener(Self::decrease_master_count))
                 .child(content)
                 .into_any_element();
         }
@@ -147,6 +155,14 @@ impl YaldaGpuiView {
             .size_full()
             .on_action(cx.listener(Self::bind_focused_tile))
             .on_action(cx.listener(Self::unbind_focused_tile))
+            .on_action(cx.listener(Self::move_tile_and_follow))
+            .on_action(cx.listener(Self::stash_scratchpad))
+            .on_action(cx.listener(Self::summon_scratchpad))
+            .on_action(cx.listener(Self::workspace_back_and_forth))
+            .on_action(cx.listener(Self::grow_master_area))
+            .on_action(cx.listener(Self::shrink_master_area))
+            .on_action(cx.listener(Self::increase_master_count))
+            .on_action(cx.listener(Self::decrease_master_count))
             .child(content)
             .into_any_element()
     }
@@ -228,7 +244,14 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::rotate_tiles_backward))
             .on_action(cx.listener(Self::undo_arrangement));
 
-        for id in order {
+        let tile_count = order.len();
+        let master_count = wsp.master_count.clamp(1, tile_count.max(1));
+        let master_ratio = wsp.master_ratio.clamp(0.20, 0.80);
+        let has_stack = master_count < tile_count;
+        let mut master_columns = Vec::with_capacity(master_count);
+        let mut stack_columns = Vec::with_capacity(tile_count.saturating_sub(master_count));
+
+        for (position, id) in order.into_iter().enumerate() {
             let is_focused = id == focused_id;
             let Some(window) = layout.find_leaf_mut(id) else {
                 continue; // stale entry; reconcile drops it next frame
@@ -303,10 +326,37 @@ impl YaldaGpuiView {
                 .child(tile_body);
             // Tag the column frame so the layout probe can assert the tiles paint
             // side by side (increasing x, equal width, full height).
-            container = container.child(probe_bounds_dyn(
+            let column = probe_bounds_dyn(
                 format!("columns-tile-{id}"),
                 column.into_any_element(),
-            ));
+            );
+            if position < master_count {
+                master_columns.push(column);
+            } else {
+                stack_columns.push(column);
+            }
+        }
+
+        if has_stack {
+            let master = div()
+                .w(gpui::relative(master_ratio))
+                .h_full()
+                .flex()
+                .flex_row()
+                .gap(px(DESKTOP_GUTTER))
+                .flex_none()
+                .children(master_columns);
+            let stack = div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .flex()
+                .flex_row()
+                .gap(px(DESKTOP_GUTTER))
+                .children(stack_columns);
+            container = container.child(master).child(stack);
+        } else {
+            container = container.children(master_columns);
         }
 
         self.wrap_leaf_with_rail(container.into_any_element(), rail_focusable, cx)

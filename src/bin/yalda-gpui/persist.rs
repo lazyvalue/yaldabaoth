@@ -1089,6 +1089,10 @@ pub(crate) struct PersistedFrame {
     /// Restore the direct view only when it still names an unbound tile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) direct_unbound: Option<workspace::WindowId>,
+    /// Most-recent-first ids of scratchpad members. Membership is validated
+    /// against restored Unbound tiles before the frame becomes live.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) scratchpad: Vec<workspace::WindowId>,
     /// False/missing means import the legacy session/buffer tag sidecars into
     /// tile-local tags once. New snapshots always write true.
     #[serde(default)]
@@ -1441,6 +1445,7 @@ pub(crate) fn snapshot_workspace(
             })
             .collect(),
         direct_unbound: ws.directly_focused_unbound(),
+        scratchpad: ws.scratchpad.clone(),
         tile_tags_migrated: true,
         marks: ws.marks.all_marks().into_iter().collect(),
         tag_shortcuts: ws.tag_shortcuts.clone(),
