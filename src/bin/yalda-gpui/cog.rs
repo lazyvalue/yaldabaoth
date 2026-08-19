@@ -196,19 +196,34 @@ impl CogBundle {
             .map(|n| n.status.as_str())
     }
 
-    /// The claimed→done duration (ns) of a node from its log, if it has both a
-    /// `claimed` and a later `done` status transition.
+    /// A node's completion duration (ns), computed from its EXISTING log — the
+    /// span from when work started to when it finished. Start = the first
+    /// `claimed` transition if present, else the node's earliest log entry (many
+    /// cog nodes are closed straight to `done` after edits/notes, with no
+    /// `claimed`). End = the `done` transition. `None` unless the node reached
+    /// `done` with a positive span.
     pub(crate) fn completion_ns(&self, id: &str) -> Option<i64> {
         let log = self.logs.get(id)?;
-        let at_of = |to: &str| {
+        let status_at = |to: &str| -> Option<i64> {
             log.iter()
-                .filter(|e| e.kind == "status_changed" && e.data.get("to").and_then(|v| v.as_str()) == Some(to))
+                .filter(|e| {
+                    e.kind == "status_changed"
+                        && e.data.get("to").and_then(|v| v.as_str()) == Some(to)
+                })
                 .map(|e| e.at)
-                .next()
+                .max()
         };
-        let claimed = at_of("claimed")?;
-        let done = at_of("done")?;
-        let d = done - claimed;
+        let done = status_at("done")?;
+        let start = log
+            .iter()
+            .filter(|e| {
+                e.kind == "status_changed"
+                    && e.data.get("to").and_then(|v| v.as_str()) == Some("claimed")
+            })
+            .map(|e| e.at)
+            .min()
+            .or_else(|| log.iter().map(|e| e.at).filter(|&a| a > 0).min())?;
+        let d = done - start;
         if d > 0 { Some(d) } else { None }
     }
 
@@ -328,6 +343,10 @@ pub(crate) struct CogTile {
     /// An event arrived while a refresh was in flight — refresh once more when it
     /// completes so the final state isn't missed.
     pub(crate) refresh_pending: bool,
+    /// True until the graph list has been kicked. A tile restored from disk never
+    /// runs `open_cog_inner`, so its first render kicks the load (else it sits
+    /// frozen on "loading graphs…"). Cleared by `cog_load_graphs`.
+    pub(crate) needs_load: bool,
 }
 
 impl CogTile {
@@ -340,6 +359,7 @@ impl CogTile {
             watch_gen: 0,
             refreshing: false,
             refresh_pending: false,
+            needs_load: true,
         }
     }
 

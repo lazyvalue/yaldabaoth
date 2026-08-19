@@ -5114,9 +5114,13 @@ impl YaldaGpuiView {
                     .unwrap_or(false);
                 !picker && tile.mode == LinearMode::Insert
             }
-            // The Cog explorer never captures text — it is navigation-only, so
-            // leaders are always live.
-            Some(App::Cog(_)) => false,
+            // The Cog explorer is navigation-only EXCEPT while its `/` graph
+            // search is capturing — then keys must reach the filter, not leaders.
+            Some(App::Cog(tile)) => tile
+                .view
+                .as_ref()
+                .map(|v| v.read(cx).is_filtering())
+                .unwrap_or(false),
             // The keymap tile captures text while filtering or rebinding — the
             // leaders must be suppressed then so keys reach the box.
             Some(App::Keymap(_)) => self.keymap_captures_text(cx),

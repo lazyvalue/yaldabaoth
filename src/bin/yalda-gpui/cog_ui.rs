@@ -47,6 +47,7 @@ impl YaldaGpuiView {
             };
             tile.req += 1;
             tile.title = "Cog".into();
+            tile.needs_load = false;
             tile.req
         };
         if let Some(v) = &view {
@@ -57,6 +58,11 @@ impl YaldaGpuiView {
         }
         cx.notify();
 
+        // Never spawn the live subprocess under test (hermetic — gap #2); the
+        // reducer `cog_apply` is driven directly by tests.
+        if cfg!(test) {
+            return;
+        }
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -190,7 +196,8 @@ impl YaldaGpuiView {
                 let id = bundle.graph.id.clone();
                 self.cog_set_view(
                     target,
-                    CogViewState::Graph { bundle, selected: 0, overview: false },
+                    // Open a graph on its Overview (graph render + stats).
+                    CogViewState::Graph { bundle, selected: 0, overview: true },
                     cx,
                 );
                 self.cog_start_watch(target, id, cx);
@@ -386,6 +393,16 @@ impl YaldaGpuiView {
         }
     }
 
+    /// Run a graph-explorer search (`/`) mutation on the focused view.
+    pub(crate) fn cog_filter_op(&mut self, cx: &mut Context<Self>, op: impl FnOnce(&mut CogView)) {
+        if let Some(v) = self.cog_focused_tile_view() {
+            v.update(cx, |cv, vcx| {
+                op(cv);
+                vcx.notify();
+            });
+        }
+    }
+
     /// Scroll the focused Cog tile's right detail pane.
     pub(crate) fn cog_scroll(&mut self, down: f32, cx: &mut Context<Self>) {
         if let Some(v) = self.cog_focused_tile_view() {
@@ -536,15 +553,33 @@ impl YaldaGpuiView {
     ///
     /// `r` reloads in both states.
     pub(crate) fn handle_cog_press(&mut self, press: KeyPress, cx: &mut Context<Self>) {
-        let (in_graphs, focused_right, focused_events) = self
+        let (in_graphs, focused_right, focused_events, filtering) = self
             .cog_focused_tile_view()
             .map(|v| {
                 let cv = v.read(cx);
-                (cv.in_graphs(), cv.focused_right(), cv.focused_events())
+                (cv.in_graphs(), cv.focused_right(), cv.focused_events(), cv.is_filtering())
             })
-            .unwrap_or((false, false, false));
+            .unwrap_or((false, false, false, false));
+
+        // Graph-explorer search sub-mode: printable keys type into the filter;
+        // arrows move within matches; Enter opens; Esc exits.
+        if filtering {
+            match press.key {
+                Key::Esc => self.cog_filter_op(cx, |cv| cv.filter_clear()),
+                Key::Enter => self.cog_open_selected_graph(cx),
+                Key::Backspace => self.cog_filter_op(cx, |cv| cv.filter_backspace()),
+                Key::Down => self.cog_select(1, cx),
+                Key::Up => self.cog_select(-1, cx),
+                Key::Char(c) => self.cog_filter_op(cx, |cv| cv.filter_push(c)),
+                _ => {}
+            }
+            return;
+        }
 
         match press.key {
+            // `/` starts the graph-explorer search.
+            Key::Char('/') if in_graphs => self.cog_filter_op(cx, |cv| cv.start_filter()),
+
             // Tab cycles selector → detail → events → selector.
             Key::Tab => self.cog_toggle_focus(cx),
 

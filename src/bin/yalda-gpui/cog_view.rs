@@ -61,8 +61,20 @@ pub(crate) struct CogView {
     event_seq: u64,
     /// Which pane the keyboard drives (reset to `Selector` on state change).
     focus: CogFocus,
+    /// Graph-explorer search filter (the `/` pattern) + whether it's capturing.
+    graph_filter: String,
+    filtering: bool,
     root: WeakEntity<YaldaGpuiView>,
     perf_label: &'static str,
+}
+
+/// Case-insensitive substring match of a graph's label + id against a filter.
+fn graph_matches(g: &CogGraph, filter: &str) -> bool {
+    if filter.is_empty() {
+        return true;
+    }
+    let f = filter.to_lowercase();
+    g.label().to_lowercase().contains(&f) || g.id.to_lowercase().contains(&f)
 }
 
 impl CogView {
@@ -75,6 +87,8 @@ impl CogView {
             events_scroll: ScrollHandle::new(),
             event_seq: 0,
             focus: CogFocus::Selector,
+            graph_filter: String::new(),
+            filtering: false,
             root,
             perf_label: "cog",
         }
@@ -92,6 +106,71 @@ impl CogView {
         self.events.clear();
         self.events_scroll.set_offset(gpui::point(px(0.0), px(0.0)));
         self.focus = CogFocus::Selector;
+        self.graph_filter.clear();
+        self.filtering = false;
+    }
+
+    // ── Graph-explorer search (`/`) ──────────────────────────────────────────
+
+    /// Is the graph-explorer search actively capturing text?
+    pub(crate) fn is_filtering(&self) -> bool {
+        self.filtering && self.in_graphs()
+    }
+
+    /// The current search filter text.
+    pub(crate) fn filter_text(&self) -> &str {
+        &self.graph_filter
+    }
+
+    /// Begin capturing a search filter (the `/` key), in the explorer only.
+    pub(crate) fn start_filter(&mut self) {
+        if self.in_graphs() {
+            self.filtering = true;
+        }
+    }
+
+    /// Append a char to the filter and reset the selection to the first match.
+    pub(crate) fn filter_push(&mut self, c: char) {
+        self.graph_filter.push(c);
+        self.clamp_graph_selection();
+    }
+
+    /// Delete the last filter char (reset selection).
+    pub(crate) fn filter_backspace(&mut self) {
+        self.graph_filter.pop();
+        self.clamp_graph_selection();
+    }
+
+    /// Exit search, clearing the filter.
+    pub(crate) fn filter_clear(&mut self) {
+        self.graph_filter.clear();
+        self.filtering = false;
+        self.clamp_graph_selection();
+    }
+
+    /// The full-list indices of graphs matching the current filter, in order.
+    fn filtered_graph_indices(&self) -> Vec<usize> {
+        match &self.state {
+            CogViewState::Graphs { graphs, .. } => graphs
+                .iter()
+                .enumerate()
+                .filter(|(_, g)| graph_matches(g, &self.graph_filter))
+                .map(|(i, _)| i)
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Keep the explorer selection within the filtered list.
+    fn clamp_graph_selection(&mut self) {
+        let n = self.filtered_graph_indices().len();
+        if let CogViewState::Graphs { selected, .. } = &mut self.state {
+            if n == 0 {
+                *selected = 0;
+            } else if *selected >= n {
+                *selected = n - 1;
+            }
+        }
     }
 
     /// Replace the loaded graph's bundle IN PLACE (an auto-refresh / manual `r`
@@ -196,14 +275,19 @@ impl CogView {
     /// Move the left selection by `delta` rows, wrapping. Changing the selected
     /// node resets the right pane to the top (a fresh node starts at its header).
     pub(crate) fn select_move(&mut self, delta: i32) {
-        match &mut self.state {
-            CogViewState::Graphs { graphs, selected } => {
-                let n = graphs.len() as i32;
+        // Explorer selection ranges over the FILTERED list.
+        if matches!(self.state, CogViewState::Graphs { .. }) {
+            let n = self.filtered_graph_indices().len() as i32;
+            if let CogViewState::Graphs { selected, .. } = &mut self.state {
                 if n == 0 {
                     return;
                 }
                 *selected = (*selected as i32 + delta).rem_euclid(n) as usize;
             }
+            return;
+        }
+        match &mut self.state {
+            CogViewState::Graphs { .. } => {}
             CogViewState::Graph {
                 bundle,
                 selected,
@@ -230,11 +314,20 @@ impl CogView {
         matches!(self.state, CogViewState::Graphs { .. })
     }
 
-    /// The id of the highlighted graph in the explorer, if any.
+    /// The id of the highlighted graph in the (filtered) explorer, if any.
     pub(crate) fn selected_graph_id(&self) -> Option<String> {
+        let idx = *self.filtered_graph_indices().get(self.graph_sel())?;
         match &self.state {
-            CogViewState::Graphs { graphs, selected } => graphs.get(*selected).map(|g| g.id.clone()),
+            CogViewState::Graphs { graphs, .. } => graphs.get(idx).map(|g| g.id.clone()),
             _ => None,
+        }
+    }
+
+    /// The explorer's selection index (into the filtered list).
+    fn graph_sel(&self) -> usize {
+        match &self.state {
+            CogViewState::Graphs { selected, .. } => *selected,
+            _ => 0,
         }
     }
 
@@ -248,8 +341,9 @@ impl CogView {
 
     /// The label of the highlighted graph (for the tile title on open).
     pub(crate) fn selected_graph_label(&self) -> Option<String> {
+        let idx = *self.filtered_graph_indices().get(self.graph_sel())?;
         match &self.state {
-            CogViewState::Graphs { graphs, selected } => graphs.get(*selected).map(|g| g.label()),
+            CogViewState::Graphs { graphs, .. } => graphs.get(idx).map(|g| g.label()),
             _ => None,
         }
     }
@@ -432,12 +526,16 @@ impl Render for CogView {
         let right = self.right_pane(&st, self.focused_right(), &hl, cx);
 
         // Top: selector | detail. Bottom (in a loaded graph): a full-width live
-        // events strip across the bottom.
+        // events strip across the bottom. `min_w_0` on both the column and the
+        // row keeps a flex-sized ancestor (e.g. the columns workspace
+        // arrangement, whose tile width is not a resolvable percentage) from
+        // collapsing the detail pane to min-content (~1 char per line).
         let top = div()
             .flex()
             .flex_row()
             .flex_1()
             .min_h_0()
+            .min_w_0()
             .w_full()
             .child(left)
             .child(right);
@@ -447,6 +545,7 @@ impl Render for CogView {
             .flex_col()
             .size_full()
             .min_h_0()
+            .min_w_0()
             .bg(editor_bg)
             .text_color(st.fg)
             .child(top);
@@ -492,12 +591,20 @@ impl CogView {
             .px_2()
             .py_2();
 
+        let fidx = self.filtered_graph_indices();
         match &self.state {
             CogViewState::Graphs { graphs, selected } => {
-                list = list.child(left_header(&format!("Graphs ({})", graphs.len()), st));
-                for (i, g) in graphs.iter().enumerate() {
+                // Header shows the search filter (the `/` pattern) when active.
+                let hdr = if self.filtering || !self.graph_filter.is_empty() {
+                    format!("/ {}\u{2588}  ({} match)", self.graph_filter, fidx.len())
+                } else {
+                    format!("Graphs ({}) · / to search", graphs.len())
+                };
+                list = list.child(left_header(&hdr, st));
+                for (pos, &i) in fidx.iter().enumerate() {
+                    let g = &graphs[i];
                     list = list.child(
-                        graph_row(g, i == *selected, st)
+                        graph_row(g, pos == *selected, st)
                             .id(SharedString::from(format!("cog-graph-{i}")))
                             .cursor_pointer()
                             .on_click(cx.listener(move |view, _ev, _w, cx| {
@@ -678,7 +785,7 @@ impl CogView {
             .flex()
             .flex_col()
             .w_full()
-            .h(px(240.0))
+            .h(px(360.0))
             .flex_none()
             .border_t_1()
             .border_color(border)
