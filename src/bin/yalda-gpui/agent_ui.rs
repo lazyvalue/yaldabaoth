@@ -637,6 +637,44 @@ impl YaldaGpuiView {
             self.transient_status = Some("session belongs to another project".into());
             return;
         }
+
+        // The roster owns one stable tile for this session even while that tile
+        // is Unbound. Selecting it from a temporary Agent picker inside a
+        // workspace is a placement operation, not a request to mint a second
+        // tile. Move the stable tile into the picker's exact layout slot before
+        // attaching so mouse and keyboard activation share the same identity-
+        // preserving result.
+        let current = self.workspace.focused_window_id();
+        let stable = self.agent_tile_id_for_server_sid(&sid);
+        if let (Some(current), Some(stable)) = (current, stable)
+            && current != stable
+            && matches!(
+                self.workspace.tile_membership(current),
+                Some(workspace::TileMembership::Bound { .. })
+            )
+            && self.workspace.tile_membership(stable)
+                == Some(workspace::TileMembership::Unbound)
+            && self
+                .workspace
+                .replace_bound_with_unbound(current, stable)
+                .is_ok()
+        {
+            self.save_workspace_state();
+
+            // A session may already be attached locally while its stable tile
+            // is Unbound. In that case placement is complete: bind/focus that
+            // existing owner and do not create a duplicate placeholder.
+            if let Some(owner) = self.sessions.locate(&ServerSid::new(sid.clone())) {
+                if let Some(tile) = self.agent_tile_mut() {
+                    tile.bind(owner);
+                    tile.set_pending(None);
+                }
+                self.mark_session_read(owner, cx);
+                self.save_agent_ring(cx);
+                cx.notify();
+                return;
+            }
+        }
         let open_token = alloc_open_token();
         if self.agent_tile_mut().is_none() {
             return;

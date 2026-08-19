@@ -4995,6 +4995,241 @@ fn session_picker_navigation_wraps(cx: &mut TestAppContext) {
 /// Activating a listed row binds the tile to the chosen session and clears the
 /// picker; the bound session SURVIVES the attach round-trip (hermetic — no
 /// server, so the attach early-returns rather than dropping the session).
+fn assert_existing_agent_picker_activation_stays_in_workspace(
+    cx: &mut TestAppContext,
+    by_mouse: bool,
+) {
+    use crate::workspace::{SplitDir, TileMembership};
+    use crate::{AgentTile, App};
+    use gpui::{Modifiers, point, px};
+    use yalda::session_proto::SessionInfo;
+
+    let (view, vcx) = boot_browser(cx);
+    let server_sid = "picker-existing-agent";
+    let (workspace_idx, picker_tile, old_unbound_tile) = view.update(vcx, |v, cx| {
+        let workspace_idx = v.workspace.active_workspace;
+        let project = v.workspace.workspaces[workspace_idx].project();
+        let cwd = v.projects.cwd_of(project).expect("project cwd").to_path_buf();
+        v.agent_roster.upsert(SessionInfo {
+            session_id: server_sid.into(),
+            acp_session_id: None,
+            label: "existing-agent".into(),
+            cwd,
+            provider: yalda::acp_channel::AgentProvider::Claude,
+            turns: 2,
+            connected: true,
+            permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+            busy: false,
+            archived: false,
+        });
+        assert!(v.materialize_roster_unbound_tiles());
+        let old_unbound_tile = v
+            .agent_tile_id_for_server_sid(server_sid)
+            .expect("roster session materialized as an unbound tile");
+        let picker_tile = v
+            .workspace
+            .split_focused(SplitDir::H, App::Agent(AgentTile::new()))
+            .expect("add empty Agent tile to workspace");
+        cx.notify();
+        (workspace_idx, picker_tile, old_unbound_tile)
+    });
+    vcx.run_until_parked();
+
+    view.read_with(vcx, |v, _| {
+        assert_eq!(v.workspace.focused_window_id(), Some(picker_tile));
+        assert_eq!(
+            v.workspace.tile_membership(old_unbound_tile),
+            Some(TileMembership::Unbound)
+        );
+        let (free, _) = v.picker_projection(&v.agent_base_cwd());
+        assert_eq!(free.first().map(|row| row.sid.as_str()), Some(server_sid));
+    });
+
+    if by_mouse {
+        crate::layout_probe_begin();
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+        let (x, y, w, h) = crate::layout_probe_get("agent-picker-row-2")
+            .expect("existing-agent picker row paints");
+        crate::layout_probe_end();
+        let at = point(px(x + w / 2.0), px(y + h / 2.0));
+        vcx.simulate_mouse_move(at, None, Modifiers::default());
+        vcx.simulate_click(at, Modifiers::default());
+    } else {
+        view.update(vcx, |v, cx| {
+            v.agent_tile_mut()
+                .and_then(|tile| tile.picker_mut())
+                .expect("focused Agent tile has picker")
+                .selected = 2;
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("enter");
+    }
+    vcx.run_until_parked();
+
+    view.read_with(vcx, |v, _| {
+        assert_eq!(
+            v.workspace.active_workspace, workspace_idx,
+            "activation must stay in the workspace"
+        );
+        assert_eq!(
+            v.workspace.directly_focused_unbound(),
+            None,
+            "activation must not bounce to the old unbound Agent tile"
+        );
+        assert_eq!(
+            v.workspace.focused_window_id(),
+            Some(old_unbound_tile),
+            "the existing stable Agent tile moves into the workspace and stays focused"
+        );
+        assert_eq!(
+            v.workspace.tile_membership(old_unbound_tile),
+            Some(TileMembership::Bound {
+                workspace: workspace_idx
+            }),
+            "picker activation binds the existing stable Agent tile"
+        );
+        assert_eq!(
+            v.workspace.tile_membership(picker_tile),
+            None,
+            "the temporary empty picker tile is retired"
+        );
+        let session = v
+            .agent_tile()
+            .and_then(AgentTile::session)
+            .expect("existing session bound into the workspace Agent tile");
+        assert_eq!(
+            v.sessions.sid_of(session).map(|sid| sid.as_str()),
+            Some(server_sid)
+        );
+    });
+}
+
+/// Clicking a painted existing-agent row must have the same placement result as
+/// selecting it with Enter: stay in the workspace and bind the new Agent tile.
+#[gpui::test]
+fn session_picker_click_stays_in_workspace(cx: &mut TestAppContext) {
+    assert_existing_agent_picker_activation_stays_in_workspace(cx, true);
+}
+
+/// Keyboard control for the mouse-only picker placement regression.
+#[gpui::test]
+fn session_picker_enter_stays_in_workspace(cx: &mut TestAppContext) {
+    assert_existing_agent_picker_activation_stays_in_workspace(cx, false);
+}
+
+/// The intermittent variant: the roster session is already attached locally,
+/// but its stable Agent tile is Unbound. Placement must move that tile without
+/// minting a duplicate local session or navigating away.
+#[gpui::test]
+fn session_picker_places_already_local_unbound_agent_without_duplicate(
+    cx: &mut TestAppContext,
+) {
+    use crate::workspace::{SplitDir, TileMembership};
+    use crate::{AgentTile, App};
+    use yalda::session_proto::SessionInfo;
+
+    let (view, vcx) = boot_browser(cx);
+    let server_sid = "picker-local-unbound-agent";
+    let (stable, picker, workspace, session) = view.update(vcx, |v, cx| {
+        let workspace = v.workspace.active_workspace;
+        let project = v.workspace.workspaces[workspace].project();
+        let cwd = v.projects.cwd_of(project).expect("project cwd").to_path_buf();
+        let session = v.show_local_session(
+            crate::AgentSession {
+                state: crate::AgentState::new_server_managed(None),
+                label: "local-unbound".into(),
+                cwd: cwd.clone(),
+                resume_id: None,
+            },
+            cx,
+        );
+        v.sessions
+            .bind_sid(session, crate::ServerSid::new(server_sid))
+            .expect("local session gets durable sid");
+        v.agent_roster.upsert(SessionInfo {
+            session_id: server_sid.into(),
+            acp_session_id: None,
+            label: "local-unbound".into(),
+            cwd,
+            provider: yalda::acp_channel::AgentProvider::Claude,
+            turns: 2,
+            connected: true,
+            permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+            busy: false,
+            archived: false,
+        });
+        let mut tile = AgentTile::new();
+        tile.bind(session);
+        let stable = v.workspace.push_unbound(App::Agent(tile), project);
+        let picker = v
+            .workspace
+            .split_focused(SplitDir::H, App::Agent(AgentTile::new()))
+            .expect("workspace picker tile");
+        (stable, picker, workspace, session)
+    });
+
+    view.update(vcx, |v, cx| v.agent_picker_activate(2, cx));
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert_eq!(v.sessions.len(), 1, "placement must not mint a duplicate");
+        assert_eq!(v.workspace.focused_window_id(), Some(stable));
+        assert_eq!(v.workspace.tile_membership(picker), None);
+        assert_eq!(
+            v.workspace.tile_membership(stable),
+            Some(TileMembership::Bound { workspace })
+        );
+        assert_eq!(v.agent_tile().and_then(AgentTile::session), Some(session));
+    });
+}
+
+/// The Agent-local command is the discoverable placement path for an Agent
+/// tile outside every workspace. It opens the real workspace picker and moves
+/// the same stable tile into the chosen same-project workspace.
+#[gpui::test]
+fn agent_send_to_workspace_command_binds_an_unbound_agent(cx: &mut TestAppContext) {
+    use crate::workspace::TileMembership;
+    use crate::{AgentTile, App, LinearTile};
+
+    let (view, vcx) = boot_browser(cx);
+    let (agent, target) = view.update(vcx, |v, _| {
+        let project = v.workspace.inherited_project();
+        v.workspace
+            .push_workspace_inheriting(App::Linear(LinearTile::new()));
+        let target = v.workspace.active_workspace;
+        v.workspace.set_active_workspace(0);
+        let agent = v.workspace.push_unbound(
+            App::Agent(AgentTile::dormant(crate::ServerSid::new(
+                "send-agent-to-workspace",
+            ))),
+            project,
+        );
+        assert!(v.workspace.focus_unbound(agent));
+        (agent, target)
+    });
+
+    view.update(vcx, |v, cx| v.dispatch_menu_command("agent-send-workspace", cx));
+    view.read_with(vcx, |v, _| {
+        let picker = v
+            .workspace_picker_ref()
+            .expect("Agent command opens workspace picker");
+        assert_eq!(picker.mode, crate::WorkspacePickerMode::Move { follow: true });
+        assert_eq!(picker.targets, vec![0, target]);
+        assert_eq!(picker.selected, 1);
+    });
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert_eq!(
+            v.workspace.tile_membership(agent),
+            Some(TileMembership::Bound { workspace: target })
+        );
+        assert_eq!(v.workspace.active_workspace, target);
+        assert_eq!(v.workspace.focused_window_id(), Some(agent));
+    });
+}
+
 #[gpui::test]
 fn session_picker_activation_binds_slot(cx: &mut TestAppContext) {
     let (view, vcx) = cx.add_window_view(hermetic_browser_view);
@@ -7612,6 +7847,16 @@ fn jump_panel_workspace_folders_and_unbound_rows_are_tile_native(cx: &mut TestAp
     let bound_probe = format!("jump-tile-row-{bound}-ws{workspace_idx}");
     let unbound_probe = format!("jump-tile-row-{unbound}-tg0");
     assert!(crate::layout_probe_get(&bound_probe).is_some());
+    let (_, _, _, workspace_row_h) =
+        crate::layout_probe_get(&format!("jump-workspace-row-{workspace_idx}"))
+            .expect("workspace folder header paints");
+    let (_, _, _, standard_row_h) = crate::layout_probe_get("jump-system-console")
+        .expect("standard 13px jump navigation row paints");
+    assert!(
+        (workspace_row_h - standard_row_h).abs() < 0.5,
+        "workspace folder header must use the standard jump-row font size: \
+         folder={workspace_row_h}px standard={standard_row_h}px"
+    );
     let (x, y, w, h) = crate::layout_probe_get(&unbound_probe)
         .expect("tagged unbound row paints under its folder");
     crate::layout_probe_end();

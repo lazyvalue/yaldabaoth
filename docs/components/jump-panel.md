@@ -1397,6 +1397,8 @@ ownership:
    unbound Agent tile instead of a session-only navigation row.
 7. Workspace-folder folds persist independently by stable workspace identity;
    tile membership changes update both projections immediately.
+8. Workspace folder headers use the same base typography as ordinary jump
+   navigation rows; folder hierarchy must not enlarge the workspace label.
 
 **Applies to.** `jump_panel_view.rs`: project/workspace/tile view models and
 renderer; `jump_palette.rs`: flattened entries and activation;

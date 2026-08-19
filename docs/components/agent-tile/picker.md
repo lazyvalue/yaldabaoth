@@ -11,6 +11,11 @@ free sessions are selectable, while sessions already bound to another tile are
 shown read-only as in use. Free sessions are organized into tag folders using the
 same sid-keyed tag data the jump panel shows (`UXI-AgentTile-39`).
 
+The Agent local menu exposes **send to workspace**. It opens the workspace
+destination picker for the focused Agent tile whether that tile is currently
+bound or unbound; choosing a same-project workspace moves the stable tile and
+follows it.
+
 ## References
 
 - `docs/components/README.md` § Terminology — a session with no durable

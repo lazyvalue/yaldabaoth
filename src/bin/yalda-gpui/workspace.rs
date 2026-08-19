@@ -2064,6 +2064,49 @@ impl<C> Frame<C> {
         Ok(())
     }
 
+    /// Replace one bound layout leaf with an existing unbound tile. This is the
+    /// placement primitive for choosing a durable unbound tile from a temporary
+    /// in-workspace picker: the durable tile keeps its id, state, and tags while
+    /// taking the picker's exact layout slot, and the temporary leaf is retired.
+    pub fn replace_bound_with_unbound(
+        &mut self,
+        bound: WindowId,
+        unbound: WindowId,
+    ) -> Result<(), ()> {
+        let workspace = self.workspace_index_of_window(bound).ok_or(())?;
+        let target_project = self.workspaces.get(workspace).ok_or(())?.project();
+        let pos = self
+            .unbound_tiles
+            .iter()
+            .position(|tile| tile.window.id == unbound)
+            .ok_or(())?;
+        if self.unbound_tiles[pos].project != target_project
+            || self.workspaces[workspace].layout.path_to(bound).is_none()
+        {
+            return Err(());
+        }
+
+        let replacement = self.unbound_tiles.remove(pos).window;
+        let leaf = self.workspaces[workspace]
+            .layout
+            .find_leaf_mut(bound)
+            .expect("validated bound leaf must remain present");
+        *leaf = replacement;
+        self.workspaces[workspace].focused = unbound;
+        let leaves = self.workspaces[workspace].layout.leaf_ids();
+        self.workspaces[workspace].desktop.reconcile(&leaves);
+        self.scratchpad.retain(|candidate| *candidate != unbound);
+        self.direct_unbound = None;
+        self.set_active_workspace(workspace);
+
+        debug_assert!(self.tile_membership(bound).is_none());
+        debug_assert_eq!(
+            self.tile_membership(unbound),
+            Some(TileMembership::Bound { workspace })
+        );
+        Ok(())
+    }
+
     /// Move a complete bound tile between same-project workspaces. When the
     /// source's last tile moves, its workspace is removed and the destination
     /// necessarily becomes active even for a no-follow send.
@@ -3954,6 +3997,32 @@ mod tests {
             TagSet::from(["review".to_string(), "urgent".to_string()])
         );
         assert_eq!(frame.workspaces[0].layout.leaf_ids(), vec![1, 2]);
+        assert!(frame.unbound_tiles.is_empty());
+    }
+
+    #[test]
+    fn replacing_picker_leaf_with_unbound_tile_preserves_slot_identity_state_and_tags() {
+        let layout = Layout::Split {
+            dir: SplitDir::V,
+            children: vec![(0.5, leaf(1, "keep")), (0.5, leaf(2, "picker"))],
+        };
+        let mut frame = ws_with_layout(layout, 2);
+        let stable = frame.push_unbound(TestContent("agent-state"), ProjectId(0));
+        frame.tile_mut(stable).unwrap().tags.insert("urgent".into());
+
+        frame
+            .replace_bound_with_unbound(2, stable)
+            .expect("same-project stable tile replaces picker leaf");
+
+        assert_eq!(frame.workspaces[0].layout.leaf_ids(), vec![1, stable]);
+        assert_eq!(frame.focused_window_id(), Some(stable));
+        assert_eq!(frame.tile_membership(2), None);
+        assert_eq!(
+            frame.tile_membership(stable),
+            Some(TileMembership::Bound { workspace: 0 })
+        );
+        assert_eq!(frame.tile(stable).unwrap().content, TestContent("agent-state"));
+        assert!(frame.tile(stable).unwrap().tags.contains("urgent"));
         assert!(frame.unbound_tiles.is_empty());
     }
 

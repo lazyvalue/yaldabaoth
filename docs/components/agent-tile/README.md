@@ -36,7 +36,7 @@ strip**, the **transcript** (a cached child, `TranscriptView`), the **compose** 
   session from its first exchange; an explicit rename latches and wins.
 - [recap.md](recap.md) — `UXI-AgentTile-15`: the pinned, isolated session recap.
 - [model.md](model.md) — `UXI-AgentTile-16`: the per-session model selector.
-- [session-binding.md](session-binding.md) — `UXI-AgentTile-18..19`, `-22..23`: durable
+- [session-binding.md](session-binding.md) — `UXI-AgentTile-18..19`, `-22..23`, `-34`: durable
   tile↔session identity + auto-resume on restart (the unresumable-session notice,
   and the typed-`yes` close confirmation + its auto-insert).
 - [providers.md](providers.md) — `UXI-AgentTile-30`: explicit Claude/Codex choice
@@ -80,4 +80,4 @@ strip**, the **transcript** (a cached child, `TranscriptView`), the **compose** 
 | UXI-AgentTile-31 | transcript | Narrow tiles wrap header chrome; usage owns a line | implemented |
 | UXI-AgentTile-32 | picker | Archived sessions never appear in the session picker | implemented |
 | UXI-AgentTile-33 | session-binding | Tagging a session opens a two-column add/remove dialog | implemented |
-| UXI-AgentTile-34 | session-binding | Session selection and workspace ownership are independent | not implemented |
+| UXI-AgentTile-34 | session-binding | Session selection and workspace ownership are independent | implemented |
