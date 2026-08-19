@@ -1,7 +1,8 @@
 # Worklog: Two-menu command surface and direct turn navigation
 
 **Date:** 2026-08-19
-**Branches touched:** `codex/simplify-two-menus`, then `main`
+**Branches touched:** `codex/simplify-two-menus` (`3f4a6f9`), then `main`
+(`7429feb` merge)
 
 ## Cog execution evidence
 
@@ -91,12 +92,14 @@ frontier 3: omega [done] (omega)
   and lacked root-level send; the Agent menu exposed extra lifecycle,
   permission, send, and turn-jump commands; uppercase `J` did not move turns.
 - `cargo test --bin yalda-gpui`: 634 passed, 0 failed, 2 ignored on the feature
-  branch.
-- `cargo test --lib`: 173 passed, 0 failed, 2 ignored on the feature branch.
+  branch and again on merged `main`.
+- `cargo test --lib`: 173 passed, 0 failed, 2 ignored on the feature branch and
+  again on merged `main`.
 - Targeted `cargo mutants`: 18 tested; 15 caught and 3 unviable, with every
   viable mutation caught.
 - `cargo build --release --bin yalda-gpui --bin yalda-session-server`: passed on
-  the feature branch.
+  the feature branch and merged `main`; both main release executables are
+  rebuilt.
 - `git diff --check`: passed before commit.
 - `scripts/check-cog-worklog.sh
   docs/worklog/2026-08-19-two-menu-agent-navigation.md`: passes.
