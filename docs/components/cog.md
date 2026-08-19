@@ -266,3 +266,42 @@ this tile. All JSON pretty printed."
 the highlighter path is exercised structurally by
 `cog_detail_paints_and_overflows` (content renders through `json_block` →
 `highlighted_json`) and `cog_events_pane_paints_and_focus_cycles`.
+
+### UXI-Cog-10 — The graph picker supports `/` search
+
+**Statement.** In the graph explorer, pressing `/` starts a search: typed characters
+filter the graph list (case-insensitive substring over name + id), the selection
+tracks the first match, `Enter` opens the highlighted match, and `Esc` clears the
+search. While searching, the tile captures text (leaders are suppressed).
+
+**Applies to.** `CogView::{graph_filter, filtering, is_filtering, start_filter,
+filter_push, filter_backspace, filter_clear, filtered_graph_indices}`, `graph_matches`
+(`cog_view.rs`); the filtering sub-mode + `/` in `handle_cog_press`, the
+`App::Cog` arm of `focused_in_insert_mode` (`cog_ui.rs` / `main.rs`).
+
+**Why.** The `/new-ux` request: "There needs to be a way to search graphs in the
+picker. Use standard `/` pattern."
+
+**Status.** implemented
+
+**Enforcement.** `verify_harness.rs::cog_graph_picker_search_filters` (real
+`handle_cog_press`: `/` then typed keys narrow the selection to the match, no match →
+none selected, `Esc` restores — negative-control verified RED by disabling the match).
+
+### Notes on later refinements
+
+- **Opens on Overview.** `cog_apply` sets `overview: true` so a freshly opened graph
+  lands on its Overview (guarded by `cog_overview_reachable_and_toc_jumps`).
+- **No frozen restart.** A tile restored from disk never runs `open_cog_inner`; its
+  first render kicks the graph-list load (`CogTile::needs_load` + the `render_cog`
+  spawn), guarded by `cog_restored_tile_kicks_load` (NC verified RED).
+- **Completion stats from existing info.** `CogBundle::completion_ns` spans the
+  node's log (earliest entry, or first `claimed`, → `done`), so nodes closed
+  straight to `done` without a `claimed` transition still count
+  (`cog_completion_without_claimed_counts`, NC verified RED).
+- **Live-events strip** is a taller full-width bottom panel (task: "take up more
+  space below").
+- **Detail-pane collapse fix.** `min_w_0` on the CogView column + top row prevents a
+  flex-sized ancestor (columns workspace arrangement) from collapsing the detail
+  pane to ~1 char (`cog_detail_pane_fills_width`); the exact columns-mode repro is a
+  runtime confirm (couldn't be reproduced at the harness window size).

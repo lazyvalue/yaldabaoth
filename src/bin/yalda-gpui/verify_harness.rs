@@ -20263,7 +20263,9 @@ fn cog_node_selection_resets_right_scroll(cx: &mut TestAppContext) {
     });
     vcx.run_until_parked();
 
-    // Scroll the right pane down, then select the next node.
+    // Opens on Overview → move onto the first node, then scroll its (tall) detail.
+    view.update(vcx, |v, cx| v.cog_select(1, cx));
+    vcx.run_until_parked();
     view.update(vcx, |v, cx| v.cog_scroll(300.0, cx));
     vcx.run_until_parked();
     let scrolled = cv.update(vcx, |c, _| c.right_scroll_y());
@@ -20291,6 +20293,9 @@ fn cog_right_pane_scrolls_and_clamps(cx: &mut TestAppContext) {
             cx,
         );
     });
+    vcx.run_until_parked();
+    // Opens on Overview → move onto the (tall) node before scrolling its detail.
+    view.update(vcx, |v, cx| v.cog_select(1, cx));
     vcx.run_until_parked();
 
     view.update(vcx, |v, cx| v.cog_scroll(200.0, cx));
@@ -20368,6 +20373,9 @@ fn cog_detail_paints_and_overflows(cx: &mut TestAppContext) {
         );
     });
     vcx.run_until_parked();
+    // Opens on Overview → move to the node so its detail sections render.
+    view.update(vcx, |v, cx| v.cog_select(1, cx));
+    vcx.run_until_parked();
     let viewport = crate::layout_probe_get("cog-right");
     // Node detail lays sections out directly: [transitions(0), Content(1), Notes(2)].
     let content = crate::layout_probe_get("cog-sec-1");
@@ -20380,6 +20388,60 @@ fn cog_detail_paints_and_overflows(cx: &mut TestAppContext) {
         ct_h > vp_h,
         "content ({ct_h}px) must overflow the viewport ({vp_h}px) — a genuine, \
          non-vacuous scroll (200-line node)"
+    );
+}
+
+/// REGRESSION: the detail pane must NOT collapse to ~1 char wide (every glyph
+/// wrapping to its own line) when the events strip moved to the bottom. The
+/// detail section width must fill most of the detail pane's width.
+#[gpui::test]
+fn cog_detail_pane_fills_width(cx: &mut TestAppContext) {
+    let (view, vcx, _cv, wid) = boot_with_cog(cx);
+    vcx.simulate_resize(gpui::size(px(1200.0), px(800.0)));
+    vcx.run_until_parked();
+    let req = cog_tile_req(&view, vcx);
+
+    crate::layout_probe_begin();
+    view.update(vcx, |v, cx| {
+        v.cog_apply(
+            wid,
+            req,
+            Ok(crate::CogFetch::Graph(Box::new(cog_test_bundle(vec![cog_test_node(
+                "omega",
+                "omega",
+                "open",
+                serde_json::json!({"purpose": "confirm the seam"}),
+            )])))),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    // Open on Overview by default → move to the node to view its detail sections.
+    view.update(vcx, |v, cx| v.cog_select(1, cx));
+    vcx.run_until_parked();
+    // Mirror the real app: the bottom strip has streamed a wide-JSON event whose
+    // long unbreakable line can force a min-content collapse up the flex tree.
+    let generation = cog_tile_watch_gen(&view, vcx);
+    view.update(vcx, |v, cx| {
+        v.cog_push_event(
+            wid,
+            generation,
+            r#"{"ready":["t-01-entity-value-seam","t-02-review-entity-value-seam","t-03-signal-mediated-human-edits"],"status":{"islands":"none","sealed":false,"status":"open"}}"#.into(),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    let pane = crate::layout_probe_get("cog-right");
+    let sec = crate::layout_probe_get("cog-sec-1"); // Content section
+    crate::layout_probe_end();
+
+    let (_, _, pane_w, _) = pane.expect("detail pane did not paint");
+    let (_, _, sec_w, _) = sec.expect("content section did not paint");
+    assert!(pane_w > 100.0, "detail pane should be wide ({pane_w})");
+    assert!(
+        sec_w > pane_w * 0.6,
+        "detail content ({sec_w}px) must fill most of the pane ({pane_w}px) — a \
+         collapse to ~1 char (the bottom-strip layout bug) fails here"
     );
 }
 
@@ -20405,6 +20467,9 @@ fn cog_right_focus_scrolls_with_jk(cx: &mut TestAppContext) {
             cx,
         );
     });
+    vcx.run_until_parked();
+    // Opens on Overview → `j` moves the selector onto the first (tall) node.
+    view.update(vcx, |v, cx| v.handle_cog_press(kp('j'), cx));
     vcx.run_until_parked();
 
     // `l` moves focus into the detail pane.
@@ -20658,6 +20723,28 @@ fn cog_events_pane_paints_and_focus_cycles(cx: &mut TestAppContext) {
 }
 
 #[cfg(test)]
+fn cog_tile_needs_load(view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext) -> bool {
+    view.update(vcx, |v, _| match v.workspace.focused_content() {
+        Some(crate::App::Cog(tile)) => tile.needs_load,
+        _ => panic!("expected a Cog tile"),
+    })
+}
+
+/// UXI-Cog-1 (regression): a Cog tile whose first render runs WITHOUT an explicit
+/// open (the disk-restore path) kicks the graph-list load itself — else it sits
+/// frozen. `boot_with_cog` installs the tile without calling `open_cog_inner`, so
+/// the first render's kick must have cleared `needs_load`. Removing the render
+/// kick is the negative control.
+#[gpui::test]
+fn cog_restored_tile_kicks_load(cx: &mut TestAppContext) {
+    let (view, vcx, _cv, _wid) = boot_with_cog(cx);
+    assert!(
+        !cog_tile_needs_load(&view, vcx),
+        "a restored tile's first render must kick the graph-list load (not stay frozen)"
+    );
+}
+
+#[cfg(test)]
 fn cog_tile_refreshing(view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext) -> bool {
     view.update(vcx, |v, _| match v.workspace.focused_content() {
         Some(crate::App::Cog(tile)) => tile.refreshing,
@@ -20815,18 +20902,23 @@ fn cog_overview_reachable_and_toc_jumps(cx: &mut TestAppContext) {
         );
     });
     vcx.run_until_parked();
-    assert!(!cv.update(vcx, |c, _| c.showing_overview()), "opens on a node, not overview");
-
-    // Keyboard `k` up from the first node reaches the Overview row (done inside
-    // the probe window so the cached view re-renders + the overview body paints).
+    // A graph opens on its Overview, and the Overview body paints.
     crate::layout_probe_begin();
-    view.update(vcx, |v, cx| v.cog_select(-1, cx));
+    cv.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
     let ov = crate::layout_probe_get("cog-right-content");
     crate::layout_probe_end();
-    assert!(cv.update(vcx, |c, _| c.showing_overview()), "k up from node 0 reaches Overview");
+    assert!(cv.update(vcx, |c, _| c.showing_overview()), "a graph opens on its Overview");
     let (_, _, w, h) = ov.expect("overview body paints");
     assert!(w > 0.0 && h > 0.0, "overview body has real size ({w}x{h})");
+
+    // `j` down leaves Overview for a node; `k` up returns to it.
+    view.update(vcx, |v, cx| v.cog_select(1, cx));
+    vcx.run_until_parked();
+    assert!(!cv.update(vcx, |c, _| c.showing_overview()), "j down leaves the Overview");
+    view.update(vcx, |v, cx| v.cog_select(-1, cx));
+    vcx.run_until_parked();
+    assert!(cv.update(vcx, |c, _| c.showing_overview()), "k up returns to the Overview");
 
     // Back to a node; a TOC click (section 2) scrolls the detail pane down.
     view.update(vcx, |v, cx| v.cog_select(1, cx)); // overview → node 0
@@ -20837,5 +20929,109 @@ fn cog_overview_reachable_and_toc_jumps(cx: &mut TestAppContext) {
     assert!(
         cv.update(vcx, |c, _| c.right_scroll_y()) < 0.0,
         "a TOC jump to a later section scrolls the detail pane"
+    );
+}
+
+/// UXI-Cog-8 (regression): completion time is computed even for nodes that were
+/// closed straight to `done` WITHOUT a `claimed` transition (the real cog case) —
+/// the span falls back to the node's earliest log entry. The fallback is the
+/// negative-control target.
+#[gpui::test]
+fn cog_completion_without_claimed_counts(_cx: &mut TestAppContext) {
+    let sec = 1_000_000_000i64;
+    let mut logs = std::collections::BTreeMap::new();
+    // No `claimed` — an edit at 1s, then `done` at 3s. Span = 2s.
+    logs.insert(
+        "n1".to_string(),
+        vec![
+            crate::CogLogEntry {
+                seq: 0,
+                at: sec,
+                actor: "a".into(),
+                kind: "content_edited".into(),
+                data: serde_json::json!({}),
+            },
+            crate::CogLogEntry {
+                seq: 1,
+                at: 3 * sec,
+                actor: "a".into(),
+                kind: "status_changed".into(),
+                data: serde_json::json!({"to": "done"}),
+            },
+        ],
+    );
+    let bundle = crate::CogBundle {
+        graph: cog_test_graph("g", "G"),
+        status: Default::default(),
+        nodes: vec![cog_test_node("n1", "a", "done", serde_json::json!({}))],
+        edges: vec![],
+        logs,
+        notes: std::collections::BTreeMap::new(),
+        render: String::new(),
+    };
+    let s = bundle.stats();
+    assert_eq!(s.completed, 1, "a claimed-less done node still counts as completed");
+    assert_eq!(s.quickest_ns, Some(2 * sec), "span = done − earliest log entry");
+}
+
+/// UXI-Cog-10: the graph picker supports `/` search — typing filters the list and
+/// Enter opens the highlighted match. The filter match is the negative control.
+#[gpui::test]
+fn cog_graph_picker_search_filters(cx: &mut TestAppContext) {
+    use crate::{KMods, Key, KeyPress};
+    let kp = |c: char| KeyPress::new(Key::Char(c), KMods::NONE);
+
+    let (view, vcx, cv, wid) = boot_with_cog(cx);
+    let req = cog_tile_req(&view, vcx);
+    view.update(vcx, |v, cx| {
+        v.cog_apply(
+            wid,
+            req,
+            Ok(crate::CogFetch::Graphs(vec![
+                cog_test_graph("aid", "alpha"),
+                cog_test_graph("bid", "beta"),
+                cog_test_graph("gid", "gamma"),
+            ])),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        cv.update(vcx, |c, _| c.selected_graph_id()),
+        Some("aid".to_string()),
+        "first graph selected initially"
+    );
+
+    // `/` then "be" filters to "beta"; it becomes the selected (only) match.
+    view.update(vcx, |v, cx| v.handle_cog_press(kp('/'), cx));
+    vcx.run_until_parked();
+    assert!(cv.update(vcx, |c, _| c.is_filtering()), "/ starts search");
+    view.update(vcx, |v, cx| v.handle_cog_press(kp('b'), cx));
+    view.update(vcx, |v, cx| v.handle_cog_press(kp('e'), cx));
+    vcx.run_until_parked();
+    assert_eq!(
+        cv.update(vcx, |c, _| c.filter_text().to_string()),
+        "be",
+        "typed keys build the filter"
+    );
+    assert_eq!(
+        cv.update(vcx, |c, _| c.selected_graph_id()),
+        Some("bid".to_string()),
+        "the filter narrows the selection to the matching graph"
+    );
+
+    // Esc clears the search back to the full list.
+    view.update(vcx, |v, cx| v.handle_cog_press(kp('x'), cx)); // "bex" → no match
+    vcx.run_until_parked();
+    assert_eq!(cv.update(vcx, |c, _| c.selected_graph_id()), None, "no matches → nothing selected");
+    view.update(vcx, |v, cx| {
+        v.handle_cog_press(KeyPress::new(Key::Esc, KMods::NONE), cx)
+    });
+    vcx.run_until_parked();
+    assert!(!cv.update(vcx, |c, _| c.is_filtering()), "esc exits search");
+    assert_eq!(
+        cv.update(vcx, |c, _| c.selected_graph_id()),
+        Some("aid".to_string()),
+        "clearing the filter restores the full list"
     );
 }
