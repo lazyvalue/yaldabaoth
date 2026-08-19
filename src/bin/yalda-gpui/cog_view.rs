@@ -932,15 +932,15 @@ impl CogView {
     ) -> gpui::AnyElement {
         let p = path.to_string();
         let caret = if folded { "▸" } else { "▾" };
-        let hov = st.accent.opacity(0.16);
+        let hov = st.dim.opacity(0.12);
         json_row(depth, st)
             .id(SharedString::from(format!("cog-json{path}")))
             .cursor_pointer()
             .rounded_sm()
-            .bg(st.accent.opacity(0.08))
+            .bg(st.dim.opacity(0.06))
             .hover(move |s| s.bg(hov))
             .on_click(cx.listener(move |v, _ev, _w, cx| v.toggle_json_fold(p.clone(), cx)))
-            .child(caret_col(caret, st.accent))
+            .child(caret_col(caret, st.dim))
             .child(
                 div()
                     .flex_1()
@@ -991,10 +991,13 @@ fn caret_col(caret: &'static str, color: Hsla) -> gpui::Div {
 /// for strings, the theme accent for numbers/bools, muted for null. (No washed
 /// mid-tone greens/purples, which read as low-contrast on light themes.)
 fn json_scalar(value: &serde_json::Value, st: &DetailStyle) -> (String, Hsla) {
+    // A calm slate blue for numbers/bools — a light, clean accent that reads on
+    // both the warm-linen light theme and dark themes (no brown accent tint).
+    let numeric: Hsla = rgb(0x4a7a9e).into();
     match value {
         serde_json::Value::String(s) => (s.replace('\n', " "), st.fg),
-        serde_json::Value::Number(n) => (n.to_string(), st.accent),
-        serde_json::Value::Bool(b) => (b.to_string(), st.accent),
+        serde_json::Value::Number(n) => (n.to_string(), numeric),
+        serde_json::Value::Bool(b) => (b.to_string(), numeric),
         serde_json::Value::Null => ("null".to_string(), st.dim),
         other => (other.to_string(), st.fg),
     }
