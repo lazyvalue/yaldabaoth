@@ -92,7 +92,7 @@ impl YaldaGpuiView {
                 .workspace
                 .unbound_tiles
                 .iter_mut()
-                .find(|tile| tile.window.id == id)
+                .find(|tile| tile.window.id() == id)
                 .map(|tile| &mut tile.window as *mut _)
                 .expect("direct-unbound focus must point at an unbound tile");
             // SAFETY: render does not structurally mutate the Unbound collection;

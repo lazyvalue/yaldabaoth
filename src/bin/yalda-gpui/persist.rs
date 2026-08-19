@@ -1107,6 +1107,193 @@ pub(crate) struct PersistedFrame {
     pub(crate) buffer_tags: HashMap<String, Vec<String>>,
 }
 
+/// Typed account of corruption removed before a persisted frame can become a
+/// live ownership graph.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PersistedAgentOwnershipRepair {
+    pub(crate) cleared_bound_duplicates: usize,
+    pub(crate) removed_unbound_duplicates: usize,
+}
+
+impl PersistedAgentOwnershipRepair {
+    pub(crate) fn changed(self) -> bool {
+        self.cleared_bound_duplicates != 0 || self.removed_unbound_duplicates != 0
+    }
+}
+
+#[derive(Debug)]
+struct PersistedAgentCandidate {
+    sid: String,
+    id: workspace::WindowId,
+    project_cwd: PathBuf,
+    bound: bool,
+    order: usize,
+}
+
+fn collect_persisted_agent_candidates(
+    layout: &PersistedLayout,
+    project_cwd: &std::path::Path,
+    order: &mut usize,
+    out: &mut Vec<PersistedAgentCandidate>,
+) {
+    match layout {
+        PersistedLayout::Leaf(PersistedLeaf {
+            id,
+            kind: PersistedKind::Agent {
+                session_id: Some(sid),
+            },
+            ..
+        }) if !sid.as_str().is_empty() => {
+            out.push(PersistedAgentCandidate {
+                sid: sid.to_string(),
+                id: *id,
+                project_cwd: project_cwd.to_path_buf(),
+                bound: true,
+                order: *order,
+            });
+            *order += 1;
+        }
+        PersistedLayout::Leaf(_) => *order += 1,
+        PersistedLayout::Split { children, .. } => {
+            for (_, child) in children {
+                collect_persisted_agent_candidates(child, project_cwd, order, out);
+            }
+        }
+    }
+}
+
+fn clear_noncanonical_bound_agent_sids(
+    layout: &mut PersistedLayout,
+    canonical: &HashMap<String, usize>,
+    order: &mut usize,
+) -> usize {
+    match layout {
+        PersistedLayout::Leaf(PersistedLeaf {
+            kind: PersistedKind::Agent { session_id },
+            ..
+        }) => {
+            let candidate_order = *order;
+            *order += 1;
+            let duplicate = session_id.as_ref().is_some_and(|sid| {
+                canonical
+                    .get(sid.as_str())
+                    .is_some_and(|canonical_order| *canonical_order != candidate_order)
+            });
+            if duplicate {
+                *session_id = None;
+                1
+            } else {
+                0
+            }
+        }
+        PersistedLayout::Leaf(_) => {
+            *order += 1;
+            0
+        }
+        PersistedLayout::Split { children, .. } => children
+            .iter_mut()
+            .map(|(_, child)| clear_noncanonical_bound_agent_sids(child, canonical, order))
+            .sum(),
+    }
+}
+
+/// Heal duplicate durable Agent identities before constructing live tiles.
+/// Session cwd is authoritative for project membership; within that project a
+/// bound tile wins over an Unbound tile, then stable id/order break ties.
+pub(crate) fn heal_persisted_agent_ownership(
+    frame: &mut PersistedFrame,
+    authoritative_cwds: &HashMap<String, PathBuf>,
+    fallback_cwd: &std::path::Path,
+) -> PersistedAgentOwnershipRepair {
+    let mut candidates = Vec::new();
+    let mut order = 0;
+    for persisted in &frame.workspaces {
+        let project_cwd = persisted
+            .cwd
+            .as_deref()
+            .map(PathBuf::from)
+            .or_else(|| persisted.legacy_kv.get("cwd").map(PathBuf::from))
+            .unwrap_or_else(|| fallback_cwd.to_path_buf());
+        collect_persisted_agent_candidates(
+            &persisted.layout,
+            &project_cwd,
+            &mut order,
+            &mut candidates,
+        );
+    }
+    for persisted in &frame.unbound_tiles {
+        let PersistedKind::Agent {
+            session_id: Some(sid),
+        } = &persisted.tile.kind
+        else {
+            order += 1;
+            continue;
+        };
+        if !sid.as_str().is_empty() {
+            candidates.push(PersistedAgentCandidate {
+                sid: sid.to_string(),
+                id: persisted.tile.id,
+                project_cwd: persisted
+                    .project_cwd
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| fallback_cwd.to_path_buf()),
+                bound: false,
+                order,
+            });
+        }
+        order += 1;
+    }
+
+    let mut canonical: HashMap<String, usize> = HashMap::new();
+    let mut rank: HashMap<String, (u8, u8, workspace::WindowId, usize)> = HashMap::new();
+    for candidate in candidates {
+        let correct_project = authoritative_cwds
+            .get(&candidate.sid)
+            .is_some_and(|cwd| cwd_match_key(cwd) == cwd_match_key(&candidate.project_cwd));
+        let candidate_rank = (
+            u8::from(!correct_project),
+            u8::from(!candidate.bound),
+            candidate.id,
+            candidate.order,
+        );
+        if rank
+            .get(&candidate.sid)
+            .is_none_or(|current| candidate_rank < *current)
+        {
+            rank.insert(candidate.sid.clone(), candidate_rank);
+            canonical.insert(candidate.sid, candidate.order);
+        }
+    }
+
+    let mut repair = PersistedAgentOwnershipRepair::default();
+    let mut repair_order = 0;
+    for persisted in &mut frame.workspaces {
+        repair.cleared_bound_duplicates += clear_noncanonical_bound_agent_sids(
+            &mut persisted.layout,
+            &canonical,
+            &mut repair_order,
+        );
+    }
+    frame.unbound_tiles.retain(|persisted| {
+        let candidate_order = repair_order;
+        repair_order += 1;
+        let keep = match &persisted.tile.kind {
+            PersistedKind::Agent {
+                session_id: Some(sid),
+            } if !sid.as_str().is_empty() => canonical
+                .get(sid.as_str())
+                .is_none_or(|canonical_order| *canonical_order == candidate_order),
+            _ => true,
+        };
+        if !keep {
+            repair.removed_unbound_duplicates += 1;
+        }
+        keep
+    });
+    repair
+}
+
 /// Resolve a bound tile's local `SessionId` to its durable server id — the store's
 /// `sid_of`, passed in so the (cx-free) snapshot has the SINGLE source of truth for
 /// which session occupies a tile (ADR-0026: no `resume_sid` cache to drift).
@@ -1165,7 +1352,7 @@ pub(crate) fn snapshot_layout(
             },
         }),
         workspace::Layout::Leaf(win) => PersistedLayout::Leaf(PersistedLeaf {
-            id: win.id,
+            id: win.id(),
             tags: win.tags.clone(),
             kind: snapshot_content(&win.content, resolve),
         }),
@@ -1243,6 +1430,7 @@ pub(crate) fn restore_layout(
     ws: &mut workspace::Frame<App>,
     theme: &Theme,
     layout: PersistedLayout,
+    project: ProjectId,
 ) -> (
     workspace::Layout<App>,
     workspace::WindowId,
@@ -1250,8 +1438,8 @@ pub(crate) fn restore_layout(
 ) {
     match layout {
         PersistedLayout::Leaf(leaf) => {
-            let (window, agent_sid) = restore_leaf(ws, theme, leaf);
-            let id = window.id;
+            let (window, agent_sid) = restore_leaf(ws, theme, leaf, project);
+            let id = window.id();
             let agents = agent_sid.map(|sid| vec![(id, sid)]).unwrap_or_default();
             (
                 workspace::Layout::Leaf(window),
@@ -1264,7 +1452,7 @@ pub(crate) fn restore_layout(
             let mut agents = Vec::new();
             let mut restored_children = Vec::with_capacity(children.len());
             for (w, child) in children {
-                let (sub, sub_max, sub_agents) = restore_layout(ws, theme, child);
+                let (sub, sub_max, sub_agents) = restore_layout(ws, theme, child, project);
                 if sub_max > max_id {
                     max_id = sub_max;
                 }
@@ -1289,6 +1477,7 @@ pub(crate) fn restore_leaf(
     ws: &mut workspace::Frame<App>,
     theme: &Theme,
     leaf: PersistedLeaf,
+    project: ProjectId,
 ) -> (workspace::Window<App>, Option<Option<ServerSid>>) {
     let id = leaf.id;
     let tags = leaf.tags;
@@ -1297,7 +1486,9 @@ pub(crate) fn restore_leaf(
         _ => None,
     };
     let content = restore_content(ws, theme, leaf.kind);
-    (workspace::Window { id, content, tags }, agent_sid)
+    let mut window = workspace::Window::new(id, project, content);
+    window.tags = tags;
+    (window, agent_sid)
 }
 
 pub(crate) fn restore_content(
@@ -1435,10 +1626,10 @@ pub(crate) fn snapshot_workspace(
             .iter()
             .map(|tile| PersistedUnboundTile {
                 project_cwd: projects
-                    .cwd_of(tile.project)
+                    .cwd_of(tile.project())
                     .map(|path| path.display().to_string()),
                 tile: PersistedLeaf {
-                    id: tile.window.id,
+                    id: tile.window.id(),
                     tags: tile.window.tags.clone(),
                     kind: snapshot_content(&tile.window.content, resolve),
                 },

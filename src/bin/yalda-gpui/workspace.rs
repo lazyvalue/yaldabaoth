@@ -52,7 +52,8 @@ pub enum FocusDir {
 /// the main binary because some fields reference GPUI-specific types
 /// (`ScrollHandle`, etc.).
 pub struct Window<C> {
-    pub id: WindowId,
+    id: WindowId,
+    project: ProjectId,
     pub content: C,
     /// User-assigned tile tags (ADR-0033). These move with the complete tile
     /// across bind/unbind operations and are independent from App state.
@@ -60,12 +61,25 @@ pub struct Window<C> {
 }
 
 impl<C> Window<C> {
-    pub fn new(id: WindowId, content: C) -> Self {
+    pub(crate) fn new(id: WindowId, project: ProjectId, content: C) -> Self {
         Self {
             id,
+            project,
             content,
             tags: TagSet::new(),
         }
+    }
+
+    /// Immutable project identity travels with the stable tile through every
+    /// placement transition. Placement can change; project cannot.
+    pub fn project(&self) -> ProjectId {
+        self.project
+    }
+
+    /// Stable identity is immutable outside the ownership module. A tile can
+    /// move between placement domains, but callers cannot rewrite its key.
+    pub fn id(&self) -> WindowId {
+        self.id
     }
 }
 
@@ -122,6 +136,18 @@ impl<C> Layout<C> {
             Layout::Split { children, .. } => {
                 for (_, c) in children {
                     c.for_each_leaf(f);
+                }
+            }
+        }
+    }
+
+    fn for_each_leaf_mut<F: FnMut(&mut Window<C>)>(&mut self, f: &mut F) {
+        match self {
+            Layout::Empty => {}
+            Layout::Leaf(window) => f(window),
+            Layout::Split { children, .. } => {
+                for (_, child) in children {
+                    child.for_each_leaf_mut(f);
                 }
             }
         }
@@ -1309,8 +1335,17 @@ pub type TagSet = BTreeSet<String>;
 /// A tile outside every workspace. The tile keeps its project while unbound so
 /// binding can enforce the existing intra-project ownership rule.
 pub struct UnboundTile<C> {
-    pub project: ProjectId,
     pub window: Window<C>,
+}
+
+impl<C> UnboundTile<C> {
+    fn new(window: Window<C>) -> Self {
+        Self { window }
+    }
+
+    pub fn project(&self) -> ProjectId {
+        self.window.project()
+    }
 }
 
 /// The exclusive placement classification for a live tile (ADR-0033).
@@ -1318,6 +1353,27 @@ pub struct UnboundTile<C> {
 pub enum TileMembership {
     Bound { workspace: usize },
     Unbound,
+}
+
+/// Rejection from a placement boundary. Callers cannot insert a second owner
+/// for an already-live stable tile id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaceWindowError {
+    DuplicateWindowId(WindowId),
+}
+
+/// A broken exclusive-ownership invariant. This is checked before persistence
+/// and by operation-sequence tests; normal mutation APIs cannot construct one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnershipViolation {
+    DuplicateWindowId(WindowId),
+    WorkspaceProjectMismatch {
+        window: WindowId,
+        tile_project: ProjectId,
+        workspace_project: ProjectId,
+    },
+    DirectFocusIsNotUnbound(WindowId),
+    ScratchpadEntryIsNotUnbound(WindowId),
 }
 
 /// One **Workspace** in the frame's workspace strip.
@@ -1390,6 +1446,12 @@ impl<C> Workspace<C> {
         focused: WindowId,
         project: ProjectId,
     ) -> Self {
+        layout.for_each_leaf(&mut |tile| {
+            assert_eq!(
+                tile.project(), project,
+                "a workspace cannot own a tile from another project"
+            );
+        });
         Self {
             auto_name,
             display_name: None,
@@ -1529,8 +1591,10 @@ impl<C> Workspace<C> {
 
     /// Reassign this workspace to another project ("Set project" / move). Caller
     /// is responsible for `cx.notify()` + persist.
+    #[cfg(test)]
     pub fn set_project(&mut self, project: ProjectId) {
         self.project = project;
+        self.layout.for_each_leaf_mut(&mut |tile| tile.project = project);
     }
 }
 
@@ -1638,7 +1702,7 @@ impl<C> Frame<C> {
         if let Some(id) = self.direct_unbound
             && let Some(tile) = self.unbound_tiles.iter().find(|t| t.window.id == id)
         {
-            return tile.project;
+            return tile.project();
         }
         self.active_workspace()
             .map(|t| t.project())
@@ -1727,8 +1791,12 @@ impl<C> Frame<C> {
         let id = self.alloc_window_id();
         let name = auto_workspace_name(self.next_workspace_index);
         self.next_workspace_index += 1;
-        self.workspaces
-            .push(Workspace::with_layout(name, Layout::Leaf(Window::new(id, content)), id, project));
+        self.workspaces.push(Workspace::with_layout(
+            name,
+            Layout::Leaf(Window::new(id, project, content)),
+            id,
+            project,
+        ));
         self.active_workspace = self.workspaces.len() - 1;
         self.direct_unbound = None;
         self.previous_workspace = previous;
@@ -1755,11 +1823,10 @@ impl<C> Frame<C> {
         let project = removed.project();
         let mut windows = Vec::new();
         removed.layout.into_leaves(&mut windows);
-        self.unbound_tiles.extend(
-            windows
-                .into_iter()
-                .map(|window| UnboundTile { project, window }),
-        );
+        self.unbound_tiles.extend(windows.into_iter().map(|window| {
+            assert_eq!(window.project(), project);
+            UnboundTile::new(window)
+        }));
         if self.active_workspace >= self.workspaces.len() {
             self.active_workspace = self.workspaces.len().saturating_sub(1);
         } else if idx < self.active_workspace {
@@ -1872,7 +1939,7 @@ impl<C> Frame<C> {
         let name = auto_workspace_name(self.next_workspace_index);
         self.next_workspace_index += 1;
         let mut wsp =
-            Workspace::with_layout(name, Layout::Leaf(Window::new(id, content)), id, project);
+            Workspace::with_layout(name, Layout::Leaf(Window::new(id, project, content)), id, project);
         wsp.ephemeral = true;
         self.workspaces.push(wsp);
         self.active_workspace = self.workspaces.len() - 1;
@@ -1882,11 +1949,24 @@ impl<C> Frame<C> {
     /// Create a stable tile outside every workspace and return its id.
     pub fn push_unbound(&mut self, content: C, project: ProjectId) -> WindowId {
         let id = self.alloc_window_id();
-        self.unbound_tiles.push(UnboundTile {
-            project,
-            window: Window::new(id, content),
-        });
+        self.unbound_tiles
+            .push(UnboundTile::new(Window::new(id, project, content)));
         id
+    }
+
+    /// Restore a fully-formed stable tile into the Unbound ownership domain.
+    /// This is the only restore insertion boundary and refuses duplicate ids.
+    pub(crate) fn insert_restored_unbound(
+        &mut self,
+        window: Window<C>,
+    ) -> Result<(), PlaceWindowError> {
+        let id = window.id;
+        if self.tile_membership(id).is_some() {
+            return Err(PlaceWindowError::DuplicateWindowId(id));
+        }
+        self.next_window_id = self.next_window_id.max(id.saturating_add(1));
+        self.unbound_tiles.push(UnboundTile::new(window));
+        Ok(())
     }
 
     /// Classify a tile by its exclusive placement owner.
@@ -1902,6 +1982,54 @@ impl<C> Frame<C> {
             .iter()
             .any(|t| t.window.id == id)
             .then_some(TileMembership::Unbound)
+    }
+
+    /// Validate the complete exclusive-placement graph without relying on
+    /// `tile_membership` (which assumes uniqueness). Safe on corrupt restored
+    /// or test-constructed state and deterministic about the first violation.
+    pub fn validate_ownership(&self) -> Result<(), OwnershipViolation> {
+        let mut ids = std::collections::HashSet::new();
+        for workspace in &self.workspaces {
+            let mut violation = None;
+            workspace.layout.for_each_leaf(&mut |tile| {
+                if violation.is_some() {
+                    return;
+                }
+                if !ids.insert(tile.id) {
+                    violation = Some(OwnershipViolation::DuplicateWindowId(tile.id));
+                } else if tile.project() != workspace.project() {
+                    violation = Some(OwnershipViolation::WorkspaceProjectMismatch {
+                        window: tile.id,
+                        tile_project: tile.project(),
+                        workspace_project: workspace.project(),
+                    });
+                }
+            });
+            if let Some(violation) = violation {
+                return Err(violation);
+            }
+        }
+        let mut unbound_ids = std::collections::HashSet::new();
+        for tile in &self.unbound_tiles {
+            if !ids.insert(tile.window.id) {
+                return Err(OwnershipViolation::DuplicateWindowId(tile.window.id));
+            }
+            unbound_ids.insert(tile.window.id);
+        }
+        if let Some(id) = self.direct_unbound
+            && !unbound_ids.contains(&id)
+        {
+            return Err(OwnershipViolation::DirectFocusIsNotUnbound(id));
+        }
+        if let Some(id) = self
+            .scratchpad
+            .iter()
+            .copied()
+            .find(|id| !unbound_ids.contains(id))
+        {
+            return Err(OwnershipViolation::ScratchpadEntryIsNotUnbound(id));
+        }
+        Ok(())
     }
 
     /// Find a tile across both ownership domains.
@@ -1937,7 +2065,7 @@ impl<C> Frame<C> {
         self.unbound_tiles
             .iter()
             .find(|tile| tile.window.id == id)
-            .map(|tile| tile.project)
+            .map(UnboundTile::project)
     }
 
     /// Directly focus an unbound tile without changing ownership.
@@ -1960,6 +2088,22 @@ impl<C> Frame<C> {
             Some(TileMembership::Unbound) => self.focus_unbound(id),
             None => false,
         }
+    }
+
+    /// Retire one Unbound tile through the ownership boundary. This updates
+    /// every auxiliary index atomically, so callers cannot leave stale direct
+    /// focus or scratchpad entries behind.
+    pub(crate) fn remove_unbound_window(&mut self, id: WindowId) -> Option<Window<C>> {
+        let position = self
+            .unbound_tiles
+            .iter()
+            .position(|tile| tile.window.id == id)?;
+        let removed = self.unbound_tiles.remove(position).window;
+        self.scratchpad.retain(|candidate| *candidate != id);
+        if self.direct_unbound == Some(id) {
+            self.direct_unbound = None;
+        }
+        Some(removed)
     }
 
     pub fn clear_direct_unbound(&mut self) {
@@ -2000,7 +2144,8 @@ impl<C> Frame<C> {
             self.active_workspace = old_active;
         }
         debug_assert!(self.tile_membership(id).is_none());
-        self.unbound_tiles.push(UnboundTile { project, window });
+        debug_assert_eq!(window.project(), project);
+        self.unbound_tiles.push(UnboundTile::new(window));
         self.direct_unbound = Some(id);
         debug_assert_eq!(self.tile_membership(id), Some(TileMembership::Unbound));
         Ok(())
@@ -2023,14 +2168,15 @@ impl<C> Frame<C> {
         let replacement_id = self.alloc_window_id();
         let old = std::mem::replace(
             &mut self.workspaces[0].layout,
-            Layout::Leaf(Window::new(replacement_id, replacement)),
+            Layout::Leaf(Window::new(replacement_id, project, replacement)),
         );
         let Layout::Leaf(window) = old else {
             unreachable!("root path in a sole workspace must name its leaf")
         };
         self.workspaces[0].focused = replacement_id;
         self.workspaces[0].desktop.reconcile(&[replacement_id]);
-        self.unbound_tiles.push(UnboundTile { project, window });
+        debug_assert_eq!(window.project(), project);
+        self.unbound_tiles.push(UnboundTile::new(window));
         self.direct_unbound = None;
         Ok(())
     }
@@ -2044,10 +2190,12 @@ impl<C> Frame<C> {
             .iter()
             .position(|tile| tile.window.id == id)
             .ok_or(())?;
-        if self.unbound_tiles[pos].project != target_project {
+        if self.unbound_tiles[pos].project() != target_project {
             return Err(());
         }
-        debug_assert!(self.workspace_index_of_window(id).is_none());
+        if self.workspace_index_of_window(id).is_some() {
+            return Err(());
+        }
         let tile = self.unbound_tiles.remove(pos);
         self.scratchpad.retain(|candidate| *candidate != id);
         // The target index was validated above and no structural mutation can
@@ -2080,7 +2228,8 @@ impl<C> Frame<C> {
             .iter()
             .position(|tile| tile.window.id == unbound)
             .ok_or(())?;
-        if self.unbound_tiles[pos].project != target_project
+        if self.workspace_index_of_window(unbound).is_some()
+            || self.unbound_tiles[pos].project() != target_project
             || self.workspaces[workspace].layout.path_to(bound).is_none()
         {
             return Err(());
@@ -2160,10 +2309,27 @@ impl<C> Frame<C> {
     /// scratchpad MRU. Unlike ordinary unbind, stash leaves direct focus clear.
     pub fn stash_window(&mut self, id: WindowId) -> Result<(), ()> {
         self.unbind_window(id)?;
+        self.record_scratchpad_stash(id);
+        Ok(())
+    }
+
+    /// Stash a bound tile while preserving the durable-workspace floor. When
+    /// `id` is the sole tile in the sole workspace, `replacement` becomes the
+    /// workspace root and the original stable tile still moves to Unbound.
+    pub fn stash_window_with_replacement(
+        &mut self,
+        id: WindowId,
+        replacement: C,
+    ) -> Result<(), ()> {
+        self.unbind_window_with_replacement(id, replacement)?;
+        self.record_scratchpad_stash(id);
+        Ok(())
+    }
+
+    fn record_scratchpad_stash(&mut self, id: WindowId) {
         self.scratchpad.retain(|candidate| *candidate != id);
         self.scratchpad.insert(0, id);
         self.direct_unbound = None;
-        Ok(())
     }
 
     /// Summon the next scratchpad tile, or hide after the oldest. Returns false
@@ -2466,7 +2632,8 @@ impl<C> Frame<C> {
             return None;
         }
         let new_id = self.alloc_window_id();
-        let new_window = Window::new(new_id, content);
+        let project = self.active_workspace()?.project();
+        let new_window = Window::new(new_id, project, content);
         let wsp = self.active_workspace_mut()?;
         let focused = wsp.focused;
         let path = wsp.layout.path_to(focused)?;
@@ -2525,14 +2692,7 @@ impl<C> Frame<C> {
     pub fn close_focused(&mut self) -> Result<Option<WindowId>, ()> {
         if let Some(focused) = self.direct_unbound {
             let reveal = self.active_workspace().map(|wsp| wsp.focused).ok_or(())?;
-            let pos = self
-                .unbound_tiles
-                .iter()
-                .position(|tile| tile.window.id == focused)
-                .ok_or(())?;
-            self.unbound_tiles.remove(pos);
-            self.scratchpad.retain(|candidate| *candidate != focused);
-            self.direct_unbound = None;
+            self.remove_unbound_window(focused).ok_or(())?;
             return Ok(Some(reveal));
         }
         let wsp = self.active_workspace_mut().ok_or(())?;
@@ -2666,9 +2826,19 @@ impl<C> Frame<C> {
     /// tile was just moved away) simply adopts the leaf as its root.
     ///
     /// Returns `Err(())` if `workspace_idx` is out of range.
-    pub fn insert_leaf_into_workspace(&mut self, workspace_idx: usize, window: Window<C>) -> Result<(), ()> {
+    pub fn insert_leaf_into_workspace(
+        &mut self,
+        workspace_idx: usize,
+        window: Window<C>,
+    ) -> Result<(), ()> {
         let id = window.id;
+        if self.tile_membership(id).is_some() {
+            return Err(());
+        }
         let wsp = self.workspaces.get_mut(workspace_idx).ok_or(())?;
+        if window.project() != wsp.project() {
+            return Err(());
+        }
         let root = std::mem::take(&mut wsp.layout);
         wsp.layout = match root {
             Layout::Empty => Layout::Leaf(window),
@@ -3324,7 +3494,7 @@ mod desktop_tests {
     fn placement_target_is_view_aware_and_promotion_keeps_focus() {
         let mut wsp = Workspace::with_layout(
             "workspace-1".into(),
-            Layout::Leaf(Window::new(2, ())),
+            Layout::Leaf(Window::new(2, ProjectId(1), ())),
             2,
             ProjectId(1),
         );
@@ -3386,7 +3556,7 @@ mod tests {
     struct TestContent(&'static str);
 
     fn leaf(id: WindowId, c: &'static str) -> Layout<TestContent> {
-        Layout::Leaf(Window::new(id, TestContent(c)))
+        Layout::Leaf(Window::new(id, ProjectId(0), TestContent(c)))
     }
 
     // Edge resize (Behavior 4b). West/North move the anchor (pull-to-enlarge)
@@ -3908,7 +4078,7 @@ mod tests {
             view: WorkspaceView::default(),
             project: ProjectId(0),
         });
-        let w = Window::new(9, TestContent("moved"));
+        let w = Window::new(9, ProjectId(0), TestContent("moved"));
         ws.insert_leaf_into_workspace(1, w).unwrap();
         match &ws.workspaces[1].layout {
             Layout::Leaf(w) => assert_eq!(w.id, 9),
@@ -3935,7 +4105,7 @@ mod tests {
             view: WorkspaceView::default(),
             project: ProjectId(0),
         });
-        let w = Window::new(9, TestContent("moved"));
+        let w = Window::new(9, ProjectId(0), TestContent("moved"));
         ws.insert_leaf_into_workspace(1, w).unwrap();
         match &ws.workspaces[1].layout {
             Layout::Split { children, .. } => {
@@ -4200,6 +4370,75 @@ mod tests {
         assert_eq!(frame.directly_focused_unbound(), Some(older));
         assert!(frame.cycle_scratchpad());
         assert_eq!(frame.directly_focused_unbound(), None);
+    }
+
+    #[test]
+    fn ownership_invariants_hold_across_placement_operation_sequence() {
+        let mut frame = Frame::with_initial(TestContent("anchor"), ProjectId(0));
+        let moving = frame
+            .split_focused(SplitDir::V, TestContent("moving"))
+            .unwrap();
+        assert_eq!(frame.validate_ownership(), Ok(()));
+
+        frame.stash_window(moving).unwrap();
+        assert_eq!(frame.validate_ownership(), Ok(()));
+        assert!(frame.cycle_scratchpad());
+        assert_eq!(frame.validate_ownership(), Ok(()));
+        frame.bind_unbound(moving, 0).unwrap();
+        assert_eq!(frame.validate_ownership(), Ok(()));
+
+        frame.push_initial_workspace(TestContent("target"), ProjectId(0));
+        frame.set_active_workspace(0);
+        frame.move_bound_to_workspace(moving, 1, false).unwrap();
+        assert_eq!(frame.validate_ownership(), Ok(()));
+        frame.close_workspace(1);
+        assert_eq!(frame.validate_ownership(), Ok(()));
+        assert_eq!(frame.tile_membership(moving), Some(TileMembership::Unbound));
+
+        frame.bind_unbound(moving, 0).unwrap();
+        assert_eq!(frame.validate_ownership(), Ok(()));
+    }
+
+    #[test]
+    fn ownership_guard_rejects_each_illegal_domain_state() {
+        let mut frame = Frame::with_initial(TestContent("anchor"), ProjectId(0));
+        frame.unbound_tiles.push(UnboundTile::new(Window::new(
+            1,
+            ProjectId(0),
+            TestContent("duplicate"),
+        )));
+        assert_eq!(
+            frame.validate_ownership(),
+            Err(OwnershipViolation::DuplicateWindowId(1))
+        );
+        frame.unbound_tiles.clear();
+
+        frame.workspaces[0]
+            .layout
+            .find_leaf_mut(1)
+            .unwrap()
+            .project = ProjectId(1);
+        assert!(matches!(
+            frame.validate_ownership(),
+            Err(OwnershipViolation::WorkspaceProjectMismatch { window: 1, .. })
+        ));
+        frame.workspaces[0]
+            .layout
+            .find_leaf_mut(1)
+            .unwrap()
+            .project = ProjectId(0);
+
+        frame.direct_unbound = Some(1);
+        assert_eq!(
+            frame.validate_ownership(),
+            Err(OwnershipViolation::DirectFocusIsNotUnbound(1))
+        );
+        frame.direct_unbound = None;
+        frame.scratchpad.push(1);
+        assert_eq!(
+            frame.validate_ownership(),
+            Err(OwnershipViolation::ScratchpadEntryIsNotUnbound(1))
+        );
     }
 
     #[test]

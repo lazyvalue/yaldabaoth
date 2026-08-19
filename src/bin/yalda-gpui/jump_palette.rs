@@ -178,12 +178,12 @@ impl YaldaGpuiView {
             ),
         };
         (!archived).then(|| PaletteItem {
-            target: PaletteTarget::Tile(window.id),
+            target: PaletteTarget::Tile(window.id()),
             label,
             detail,
             is_agent,
             status,
-            active: self.workspace.focused_window_id() == Some(window.id),
+            active: self.workspace.focused_window_id() == Some(window.id()),
         })
     }
 
@@ -215,7 +215,7 @@ impl YaldaGpuiView {
             });
         }
         for tile in &self.workspace.unbound_tiles {
-            let project = self.projects.name_of(tile.project);
+            let project = self.projects.name_of(tile.project());
             if let Some(item) =
                 self.palette_tile_item(&tile.window, format!("{project} · Unbound"), cx)
             {

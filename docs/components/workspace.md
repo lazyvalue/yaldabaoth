@@ -1100,3 +1100,38 @@ capture.
 uses the production keymap and real `Ctrl-W` keystrokes across the App-state
 matrix. A registry coverage guard compares every configured `ctrl-w` action to
 the central declarative handler vocabulary.
+
+### UXI-Workspace-23 — Closing a bound Agent tile stashes it
+
+**Statement.** **Close Tile** on a bound Agent tile is a placement transition,
+not destruction. It performs the same ownership move as **Stash**: the complete
+stable tile moves from its workspace to Unbound, retains its `WindowId`, App
+state, selected session, tags, and project, and enters the scratchpad MRU. The
+session remains alive and the tile appears in the jump panel and Cmd-P Unbound
+projection on the same state change.
+
+This is intentionally asymmetric with Close Tile on an already-Unbound empty
+Agent picker, which removes that empty tile under `UXI-Workspace-21`. Session
+termination remains an explicit Agent lifecycle command and is never implied by
+shell placement commands.
+
+**Applies to.** The shared Close Tile command handler and the typed
+bound-to-Unbound transition in `workspace.rs`.
+
+**Why.** An Agent tile is the durable shell for a live conversation. Removing
+its workspace placement must never make the conversation disappear from the
+navigation model.
+
+**Status.** `implemented`.
+
+**Enforcement.** `close_bound_agent_tile_stashes_same_tile_and_session` drives
+the production `close-window` menu command and asserts stable identity, session
+liveness, Unbound projection, and scratchpad membership.
+`close_sole_bound_agent_stashes_and_seeds_workspace_floor` covers the
+one-workspace replacement branch. `ownership_invariants_hold_across_placement_operation_sequence`
+and `ownership_guard_rejects_each_illegal_domain_state` enforce exclusive
+WindowId ownership, immutable stable identity and tile project membership, and
+valid direct-focus / scratchpad indices after every placement transition and
+before persistence. `Window` keeps both `id` and `project` private and exposes
+read-only accessors; placement APIs move the complete value instead of allowing
+callers to rewrite either identity field.

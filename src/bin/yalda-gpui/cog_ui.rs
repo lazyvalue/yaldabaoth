@@ -45,7 +45,7 @@ impl YaldaGpuiView {
                 if let App::Cog(tile) = &w.content
                     && tile.needs_load
                 {
-                    targets.push(w.id);
+                    targets.push(w.id());
                 }
             });
         }
@@ -199,7 +199,7 @@ impl YaldaGpuiView {
                 if let App::Cog(tile) = &w.content
                     && tile.view.as_ref().map(|v| v.entity_id()) == Some(vid)
                 {
-                    target = Some(w.id);
+                    target = Some(w.id());
                 }
             });
             if target.is_some() {

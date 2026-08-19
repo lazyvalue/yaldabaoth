@@ -67,6 +67,8 @@ and a **timestamped log** of every actual attempt.
 | bug-0043 | jump-tag-items-oversized | FIXED | 2026-08-19 | 1 | tile-native Unbound tag folders inherited a larger fallback; production headers now pin the compact monospace subheader typography and a painted geometry guard proves tagged/loose rows remain fixed through document zoom |
 | bug-0044 | unbound-picker-tiles-cannot-close | FIXED | 2026-08-19 | 1 | `Frame::close_focused` rejected every direct-Unbound focus; Close Tile now removes the exact stable Unbound tile, prunes scratchpad references, clears direct focus, and reveals the active workspace, with real Buffer/Agent picker command coverage |
 | bug-0045 | ctrl-w-missing-by-tile-state | FIXED | 2026-08-19 | 1 | `Ctrl-W h/j/k/l` focus actions disappeared by tile state because shell listeners were manually duplicated; one generated shell router now wraps every tile surface, with exact registry coverage and a real four-direction App-state matrix |
+| bug-0046 | close-bound-agent-drops-unbound-entry | FIXED | 2026-08-19 | 1 | Close Tile now routes keyboard/menu through one exhaustive transition; bound Agents move intact to Unbound + scratchpad, including the sole-workspace floor case |
+| bug-0047 | agent-session-duplicated-across-projects | FIXED | 2026-08-19 | 1 | the bind choke retires racing roster duplicates; restore chooses the canonical tile by authoritative session cwd/project and rewrites healed state; persistence rejects duplicate identity graphs |
 <!-- Example row once populated:
 | bug-0001 | chatbox-caret-offscreen | RECURRED | 2026-05-02 | 16 | caret + text scroll out of the visible chatbox; no single owner of caret-in-viewport |
 -->
