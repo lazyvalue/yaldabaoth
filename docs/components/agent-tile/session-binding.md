@@ -311,6 +311,12 @@ Roster sessions without a tile are migrated/materialized into unbound selected
 Agent tiles. Existing `session_tags.json` values seed tile-local tags once; tag
 edits thereafter address the tile, so membership changes cannot lose them.
 
+Selecting an existing session from an empty Agent tile in a workspace is a
+placement operation. If that session already has a stable unbound Agent tile,
+mouse and keyboard activation move that same tile into the workspace and retire
+the temporary empty picker tile. They never navigate away to the old direct
+view, duplicate the session, or recreate its state.
+
 **Applies to.** `agent.rs`: Agent tile selected/empty state; `agent_ui.rs`:
 roster materialization and session lifecycle; `workspace.rs`: generic tile
 ownership/tags; `session_tag_editor.rs`: tile tag editing.

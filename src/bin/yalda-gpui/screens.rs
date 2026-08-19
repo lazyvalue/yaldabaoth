@@ -2958,7 +2958,7 @@ impl YaldaGpuiView {
         subtitle: Option<SharedString>,
         ov: &OverlayTheme,
         cx: &mut Context<Self>,
-    ) -> gpui::Div {
+    ) -> AnyElement {
         let row_bg = if is_sel { nc(ov.selected_bg) } else { nc(ov.bg) };
         let name_color = if is_sel { nc(ov.accent) } else { nc(ov.fg) };
         let mut r = div()
@@ -3000,7 +3000,7 @@ impl YaldaGpuiView {
                     .child(sub),
             );
         }
-        r
+        probe_bounds_dyn(format!("agent-picker-row-{row}"), r.into_any_element())
     }
 
     /// A non-interactive tag-folder header in the session picker

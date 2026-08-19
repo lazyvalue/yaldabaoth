@@ -1490,6 +1490,7 @@ impl YaldaGpuiView {
                     .w_full()
                     .px_3()
                     .py_1()
+                    .text_size(st.base)
                     .hover(|s| s.bg(sel_bg))
                     .child(
                         div()

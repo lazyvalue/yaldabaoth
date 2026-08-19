@@ -3363,6 +3363,15 @@ fn agent_local_c_resolves_to_session_picker() {
 }
 
 #[test]
+fn agent_local_p_resolves_to_send_workspace() {
+    let mut state = MenuState::new();
+    state.open();
+    let menu = agent_local_menu();
+    let cmd = state.process_key(KeyPress::new(Key::Char('p'), KMods::NONE), &menu);
+    assert_eq!(cmd, Some("agent-send-workspace".to_string()));
+}
+
+#[test]
 fn theme_toggle_alternates_nightfox_and_folio() {
     // From Folio → Nightfox; from anything else (Nightfox or any other theme)
     // → Folio, so the toggle always lands on one of the pair and alternates.

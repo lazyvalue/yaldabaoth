@@ -1732,6 +1732,7 @@ fn agent_local_menu() -> Vec<MenuNode> {
     // turn (esc_interrupts_in_flight_turn).
     vec![
         MenuNode::entry("c", "select session", "claude-session-picker"),
+        MenuNode::entry("p", "send to workspace", "agent-send-workspace"),
         MenuNode::entry("e", "send message", "claude-send"),
         MenuNode::entry("w", "switch worksheet ⇄ message box", "agent-input-toggle"),
         MenuNode::entry("m", "cycle permission mode", "claude-mode-cycle"),
@@ -5694,6 +5695,9 @@ impl YaldaGpuiView {
             "send-tile-follow" => {
                 self.open_workspace_picker(WorkspacePickerMode::Move { follow: true }, cx)
             }
+            "agent-send-workspace" => {
+                self.open_workspace_picker(WorkspacePickerMode::Move { follow: true }, cx)
+            }
             "also-show-tile" => self.open_workspace_picker(WorkspacePickerMode::AlsoShow, cx),
             "scratchpad-stash" => self.stash_scratchpad_inner(cx),
             "scratchpad-summon" => self.summon_scratchpad_inner(cx),
@@ -6102,16 +6106,6 @@ impl YaldaGpuiView {
         let Some(focused) = self.workspace.focused_window_id() else {
             return;
         };
-        if matches!(mode, WorkspacePickerMode::Move { .. })
-            && !matches!(
-                self.workspace.tile_membership(focused),
-                Some(workspace::TileMembership::Bound { .. })
-            )
-        {
-            self.transient_status = Some("bind an Unbound tile before sending it".into());
-            cx.notify();
-            return;
-        }
         if mode == WorkspacePickerMode::AlsoShow && !self.focused_is_file_backed() {
             self.transient_status =
                 Some("Only documents can be shown in multiple workspaces (yet)".into());
@@ -6236,8 +6230,20 @@ impl YaldaGpuiView {
             targets[entry]
         };
 
-        // Selecting the active workspace is a no-op (the tile is already here).
-        if !make_new && target == active {
+        // Selecting the active workspace is a no-op only for a tile already
+        // bound there. For an Unbound tile, the active workspace is a valid
+        // destination and must bind it.
+        let focused_membership = self
+            .workspace
+            .focused_window_id()
+            .and_then(|id| self.workspace.tile_membership(id));
+        if !make_new
+            && target == active
+            && matches!(
+                focused_membership,
+                Some(workspace::TileMembership::Bound { workspace }) if workspace == active
+            )
+        {
             self.close_workspace_picker();
             cx.notify();
             return;
@@ -6279,7 +6285,17 @@ impl YaldaGpuiView {
         let Some(id) = self.workspace.focused_window_id() else {
             return;
         };
-        let _ = self.workspace.move_bound_to_workspace(id, target, follow);
+        match self.workspace.tile_membership(id) {
+            Some(workspace::TileMembership::Bound { .. }) => {
+                let _ = self.workspace.move_bound_to_workspace(id, target, follow);
+            }
+            Some(workspace::TileMembership::Unbound) => {
+                // Unbound has no source workspace to remain in, so binding
+                // necessarily follows the tile into its chosen destination.
+                let _ = self.workspace.bind_unbound(id, target);
+            }
+            None => {}
+        }
     }
 
     /// ALSO-SHOW: open a second view onto the focused file-backed tile's file
