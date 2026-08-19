@@ -249,6 +249,40 @@ dead entry, which is exactly the kind of noise this restructure removes.
 every menu builder including the new `s`/`M`/`w`/system submenus and asserts each
 level's keys are unique.
 
+### UXI-Menu-8 — the Agent and shell roots are deliberately small
+
+**Statement.** The Agent tile menu (`space`) contains exactly five root entries,
+in this order: `w` switch worksheet/chatbox, `m` switch model, `s` select session,
+`c` clear, and `v` view. The View submenu contains only `a` Agents and `t` Tasks;
+choosing one shows that sidepanel view and marks the currently visible choice.
+Advertised model choices use `1..9,0` so changing provider model names cannot
+create key collisions.
+
+The shell menu (`.`) contains exactly seven root entries, in this order: `n` New
+Tile, `X` Close Tile, `m` Send Tile to Workspace, `t` Theme, `j` Toggle Jump
+Panel, `s` System, and `w` Workspace. Send Tile always opens the same destination
+picker for a bound or unbound focused tile. Commands removed from these roots are
+not deleted; they may remain available through direct keys or another explicit
+surface.
+
+Buffer and other App-specific tile menus are unchanged until their vocabularies
+are separately specified.
+
+**Applies to.** `agent_local_menu`, `agent_local_menu_dynamic`, `gpui_menu`,
+`dispatch_menu_command`, and `open_workspace_picker` (`main.rs`).
+
+**Why.** A leader menu is useful only when its choices are predictable enough to
+learn. The previous roots mixed motions, session lifecycle, layout tuning, and
+one-off commands, obscuring the small set of operations used in normal work.
+
+**Status.** `implemented`
+
+**Enforcement.** `tests.rs::shell_menu_root_is_the_approved_seven_items` and
+`tests.rs::agent_menu_root_and_view_are_the_approved_items` assert exact trees and
+keys; `verify_harness.rs::agent_menu_lists_advertised_models_and_marks_current`
+checks the live model submenu; workspace-picker harness tests exercise the real
+bound and unbound send path.
+
 ## Deviations from the design brief (Fable, "The Sigil Card")
 
 What shipped vs. what was designed in step 4, and why:

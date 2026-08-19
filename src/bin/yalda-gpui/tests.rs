@@ -3110,13 +3110,8 @@ fn gpui_menu_has_required_entries() {
     let menu = gpui_menu();
     let mut leaf_actions: Vec<&str> = Vec::new();
     collect_leaves(&menu, &mut leaf_actions);
-    // The expected leaf actions — change here if gpui_menu changes.
-    // The `.` SHELL menu (ADR-0032) holds shell-scoped verbs: set cwd, new
-    // tile (agent/buffer/linear), theme nightfox/folio, plane view
-    // zoom-in/zoom-out/reset, toggle plane/columns, toggle jump panel, mark
-    // tile, close tile; a `w` (workspace) submenu with new/rename/close
-    // workspace + new project; and an `s` (system) submenu with rebuild-gui,
-    // rebuild-all, system console. It absorbed the retired `?` global menu.
+    // UXI-Menu-8 keeps seven exact roots while their approved submenus retain
+    // the deeper tile/workspace/system vocabulary.
     let expected = [
         "workspace-set-cwd",
         "new-agent-tile",
@@ -3132,7 +3127,6 @@ fn gpui_menu_has_required_entries() {
         "dev-restart-gui",
         "dev-restart-all",
         "open-system-console",
-        "mark-tile",
         "close-window",
         // workspace submenu (formerly the `?` global menu)
         "new-workspace",
@@ -3140,7 +3134,6 @@ fn gpui_menu_has_required_entries() {
         "close-workspace",
         "new-project",
         "workspace-back-and-forth",
-        "send-tile",
         "send-tile-follow",
         "also-show-tile",
         "scratchpad-stash",
@@ -3181,37 +3174,109 @@ fn gpui_menu_has_required_entries() {
 }
 
 #[test]
+fn shell_menu_root_is_the_approved_seven_items() {
+    let menu = gpui_menu();
+    let actual: Vec<(String, &str)> = menu
+        .iter()
+        .map(|node| (format_menu_key(&node.key), node.label.as_str()))
+        .collect();
+    assert_eq!(
+        actual,
+        vec![
+            ("n".into(), "new tile"),
+            ("X".into(), "close tile"),
+            ("m".into(), "send tile to workspace"),
+            ("t".into(), "theme"),
+            ("j".into(), "toggle jump panel"),
+            ("s".into(), "system"),
+            ("w".into(), "workspace"),
+        ],
+        "the shell root is an exact contract; extra commands belong elsewhere"
+    );
+    for (key, expected) in [('X', "close-window"), ('m', "send-tile-follow")] {
+        let mut state = MenuState::new();
+        state.open();
+        assert_eq!(
+            state.process_key(KeyPress::new(Key::Char(key), KMods::NONE), &menu),
+            Some(expected.to_string()),
+            "root {key} must dispatch {expected}"
+        );
+    }
+}
+
+#[test]
+fn agent_menu_root_and_view_are_the_approved_items() {
+    let menu = agent_local_menu();
+    let actual: Vec<(String, &str)> = menu
+        .iter()
+        .map(|node| (format_menu_key(&node.key), node.label.as_str()))
+        .collect();
+    assert_eq!(
+        actual,
+        vec![
+            ("w".into(), "switch worksheet ⇄ message box"),
+            ("m".into(), "switch model"),
+            ("s".into(), "select session"),
+            ("c".into(), "clear"),
+            ("v".into(), "view"),
+        ]
+    );
+    let view = menu.iter().find(|node| node.label == "view").expect("view submenu");
+    let MenuAction::Submenu(children) = &view.action else {
+        panic!("view must be a submenu");
+    };
+    let children: Vec<(String, &str)> = children
+        .iter()
+        .map(|node| (format_menu_key(&node.key), node.label.as_str()))
+        .collect();
+    assert_eq!(children, vec![("a".into(), "agents"), ("t".into(), "tasks")]);
+
+    for (key, expected) in [
+        ('w', "agent-input-toggle"),
+        ('s', "claude-session-picker"),
+        ('c', "claude-clear"),
+    ] {
+        let mut state = MenuState::new();
+        state.open();
+        assert_eq!(
+            state.process_key(KeyPress::new(Key::Char(key), KMods::NONE), &menu),
+            Some(expected.to_string()),
+            "Agent root {key} must dispatch {expected}"
+        );
+    }
+}
+
+#[test]
 fn menu_state_round_trip_picks_command() {
-    // Pressing 'c' at root closes the menu and returns "workspace-set-cwd".
+    // Pressing root `m` closes the menu and opens the universal send picker.
     let mut state = MenuState::new();
     state.open();
     let menu = gpui_menu();
-    let cmd = state.process_key(KeyPress::new(Key::Char('c'), KMods::NONE), &menu);
-    assert_eq!(cmd, Some("workspace-set-cwd".to_string()));
+    let cmd = state.process_key(KeyPress::new(Key::Char('m'), KMods::NONE), &menu);
+    assert_eq!(cmd, Some("send-tile-follow".to_string()));
     assert!(!state.is_active(), "menu should close after a leaf select");
 }
 
 #[test]
 fn shell_menu_close_tile_at_root_close_workspace_under_w() {
-    // ADR-0032: root `x` closes the focused TILE; closing the WORKSPACE moved
-    // into the `w` (workspace) submenu at `w x` (the former root `X` is gone).
+    // UXI-Menu-8: destructive tile close is uppercase `X`; workspace close
+    // remains lowercase `w x` one level down.
     let menu = gpui_menu();
+
+    let mut upper = MenuState::new();
+    upper.open();
+    assert_eq!(
+        upper.process_key(KeyPress::new(Key::Char('X'), KMods::NONE), &menu),
+        Some("close-window".to_string()),
+        "root X closes the focused tile"
+    );
 
     let mut lower = MenuState::new();
     lower.open();
     assert_eq!(
         lower.process_key(KeyPress::new(Key::Char('x'), KMods::NONE), &menu),
-        Some("close-window".to_string()),
-        "root x closes the focused tile"
-    );
-
-    // `X` is no longer bound at root.
-    let mut upper = MenuState::new();
-    upper.open();
-    assert_eq!(
-        upper.process_key(KeyPress::new(Key::Char('X'), KMods::NONE), &menu),
         None,
-        "uppercase X at root is unbound now"
+        "lowercase x is intentionally unbound at root"
     );
 
     // Descend into the workspace submenu, then `x` closes the workspace.
@@ -3329,46 +3394,41 @@ fn edit_local_menu_e_v_resolves_extend_mode() {
 }
 
 #[test]
-fn agent_local_s_n_resolves_to_claude_new() {
-    // ADR-0032: session lifecycle (new/rename/tag/close/recap) moved under the
-    // `s` (session) submenu; `s n` creates a new Claude session.
+fn agent_local_s_resolves_to_session_picker() {
     let mut state = MenuState::new();
     state.open();
     let menu = agent_local_menu();
-    let after_s = state.process_key(KeyPress::new(Key::Char('s'), KMods::NONE), &menu);
-    assert_eq!(after_s, None, "s opens the session submenu");
-    let cmd = state.process_key(KeyPress::new(Key::Char('n'), KMods::NONE), &menu);
-    assert_eq!(cmd, Some("claude-new".to_string()));
-}
-
-#[test]
-fn agent_local_s_upper_n_resolves_to_codex_new() {
-    let mut state = MenuState::new();
-    state.open();
-    let menu = agent_local_menu();
-    state.process_key(KeyPress::new(Key::Char('s'), KMods::NONE), &menu);
-    let cmd = state.process_key(KeyPress::new(Key::Char('N'), KMods::NONE), &menu);
-    assert_eq!(cmd, Some("codex-new".to_string()));
-}
-
-#[test]
-fn agent_local_c_resolves_to_session_picker() {
-    // The session selector (free-session picker / rebind) lives at `c` in the
-    // Agent local menu (spec-agent-session-ownership.md).
-    let mut state = MenuState::new();
-    state.open();
-    let menu = agent_local_menu();
-    let cmd = state.process_key(KeyPress::new(Key::Char('c'), KMods::NONE), &menu);
+    let cmd = state.process_key(KeyPress::new(Key::Char('s'), KMods::NONE), &menu);
     assert_eq!(cmd, Some("claude-session-picker".to_string()));
 }
 
 #[test]
-fn agent_local_p_resolves_to_send_workspace() {
+fn agent_local_m_opens_model_submenu() {
+    let mut state = MenuState::new();
+    state.open();
+    let menu = agent_local_menu();
+    let cmd = state.process_key(KeyPress::new(Key::Char('m'), KMods::NONE), &menu);
+    assert_eq!(cmd, None);
+    assert!(state.is_active(), "model submenu remains open on its placeholder");
+}
+
+#[test]
+fn agent_local_c_resolves_to_clear() {
+    let mut state = MenuState::new();
+    state.open();
+    let menu = agent_local_menu();
+    let cmd = state.process_key(KeyPress::new(Key::Char('c'), KMods::NONE), &menu);
+    assert_eq!(cmd, Some("claude-clear".to_string()));
+}
+
+#[test]
+fn agent_local_p_is_absent_send_lives_in_shell_menu() {
     let mut state = MenuState::new();
     state.open();
     let menu = agent_local_menu();
     let cmd = state.process_key(KeyPress::new(Key::Char('p'), KMods::NONE), &menu);
-    assert_eq!(cmd, Some("agent-send-workspace".to_string()));
+    assert_eq!(cmd, None);
+    assert!(state.is_active());
 }
 
 #[test]
@@ -3385,10 +3445,7 @@ fn theme_toggle_alternates_nightfox_and_folio() {
 }
 
 #[test]
-fn agent_local_shift_c_resolves_to_claude_clear() {
-    // `/clear` is reachable from the Agent local menu at `C` (capital, distinct
-    // from lowercase `c` = select session). Regression guard for the original
-    // bug: clear_agent_session existed but had no entry point.
+fn agent_local_shift_c_is_absent_clear_is_lowercase() {
     let mut state = MenuState::new();
     state.open();
     let menu = agent_local_menu();
@@ -3396,7 +3453,8 @@ fn agent_local_shift_c_resolves_to_claude_clear() {
         KeyPress::new(Key::Char('C'), KMods::NONE),
         &menu,
     );
-    assert_eq!(cmd, Some("claude-clear".to_string()));
+    assert_eq!(cmd, None);
+    assert!(state.is_active());
 }
 
 #[test]

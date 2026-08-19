@@ -1584,7 +1584,6 @@ fn gpui_menu() -> Vec<MenuNode> {
     // FOCUSED App live in the `<space>` local menus instead; motions are direct
     // keys; workspace jump stays on its ctrl-1..0 chords (never a menu item).
     vec![
-        MenuNode::entry("c", "set cwd", "workspace-set-cwd"),
         MenuNode::submenu(
             "n",
             "new tile",
@@ -1596,35 +1595,11 @@ fn gpui_menu() -> Vec<MenuNode> {
                 MenuNode::entry("k", "keybindings", "new-keymap-tile"),
             ],
         ),
-        // Workspace + project ops — formerly the `?` global menu. (The numbered
-        // workspace list stays on ctrl-1..0; it must work while typing, so it is
-        // a direct chord, not a menu entry — UXI-Menu-6.)
-        MenuNode::submenu(
-            "w",
-            "workspace",
-            vec![
-                MenuNode::entry("n", "new workspace", "new-workspace"),
-                MenuNode::entry("r", "rename workspace", "rename-workspace"),
-                MenuNode::entry("x", "close workspace", "close-workspace"),
-                MenuNode::entry("p", "new project", "new-project"),
-                MenuNode::entry("b", "back and forth", "workspace-back-and-forth"),
-                MenuNode::entry("m", "send tile", "send-tile"),
-                MenuNode::entry("M", "send tile and follow", "send-tile-follow"),
-                MenuNode::entry("o", "also show document", "also-show-tile"),
-                MenuNode::entry("d", "stash in scratchpad", "scratchpad-stash"),
-                MenuNode::entry("D", "summon scratchpad", "scratchpad-summon"),
-                MenuNode::submenu(
-                    "c",
-                    "columns master area",
-                    vec![
-                        MenuNode::entry("f", "grow master area", "master-grow"),
-                        MenuNode::entry("F", "shrink master area", "master-shrink"),
-                        MenuNode::entry("n", "increase master count", "master-count-increase"),
-                        MenuNode::entry("N", "decrease master count", "master-count-decrease"),
-                    ],
-                ),
-            ],
-        ),
+        MenuNode::entry("X", "close tile", "close-window"),
+        // One placement command for every tile membership state. `follow: true`
+        // is important for an unbound tile: once bound it leaves the unbound
+        // surface, so following keeps the result visible.
+        MenuNode::entry("m", "send tile to workspace", "send-tile-follow"),
         MenuNode::submenu(
             "t",
             "theme",
@@ -1633,15 +1608,7 @@ fn gpui_menu() -> Vec<MenuNode> {
                 MenuNode::entry("f", "folio", "theme-folio"),
             ],
         ),
-        MenuNode::submenu(
-            "l",
-            "plane view",
-            vec![
-                MenuNode::entry("=", "zoom in", "plane-zoom-in"),
-                MenuNode::entry("-", "zoom out", "plane-zoom-out"),
-                MenuNode::entry("0", "reset to origin", "plane-reset-view"),
-            ],
-        ),
+        MenuNode::entry("j", "toggle jump panel", "toggle-jump-panel"),
         // System / dev — formerly split between `.` (rebuild) and `?` (console).
         MenuNode::submenu(
             "s",
@@ -1652,10 +1619,44 @@ fn gpui_menu() -> Vec<MenuNode> {
                 MenuNode::entry("`", "system console", "open-system-console"),
             ],
         ),
-        MenuNode::entry("a", "toggle plane / columns", "workspace-toggle-columns"),
-        MenuNode::entry("j", "toggle jump panel", "toggle-jump-panel"),
-        MenuNode::entry("m", "mark tile", "mark-tile"),
-        MenuNode::entry("x", "close tile", "close-window"),
+        // Workspace + project ops — formerly scattered across the shell root.
+        // The root stays learnably small; deeper workspace vocabulary remains
+        // reachable here without deleting its existing command handlers.
+        MenuNode::submenu(
+            "w",
+            "workspace",
+            vec![
+                MenuNode::entry("n", "new workspace", "new-workspace"),
+                MenuNode::entry("r", "rename workspace", "rename-workspace"),
+                MenuNode::entry("x", "close workspace", "close-workspace"),
+                MenuNode::entry("c", "set cwd", "workspace-set-cwd"),
+                MenuNode::entry("p", "new project", "new-project"),
+                MenuNode::entry("b", "back and forth", "workspace-back-and-forth"),
+                MenuNode::entry("o", "also show document", "also-show-tile"),
+                MenuNode::entry("d", "stash in scratchpad", "scratchpad-stash"),
+                MenuNode::entry("D", "summon scratchpad", "scratchpad-summon"),
+                MenuNode::entry("a", "toggle plane / columns", "workspace-toggle-columns"),
+                MenuNode::submenu(
+                    "l",
+                    "plane view",
+                    vec![
+                        MenuNode::entry("=", "zoom in", "plane-zoom-in"),
+                        MenuNode::entry("-", "zoom out", "plane-zoom-out"),
+                        MenuNode::entry("0", "reset to origin", "plane-reset-view"),
+                    ],
+                ),
+                MenuNode::submenu(
+                    "m",
+                    "columns master area",
+                    vec![
+                        MenuNode::entry("f", "grow master area", "master-grow"),
+                        MenuNode::entry("F", "shrink master area", "master-shrink"),
+                        MenuNode::entry("n", "increase master count", "master-count-increase"),
+                        MenuNode::entry("N", "decrease master count", "master-count-decrease"),
+                    ],
+                ),
+            ],
+        ),
     ]
 }
 
@@ -1724,42 +1725,24 @@ fn edit_local_menu() -> Vec<MenuNode> {
 }
 
 fn agent_local_menu() -> Vec<MenuNode> {
-    // ADR-0032 (UXI-Menu-6): flat = verbs on the LIVE conversation; the `s`
-    // submenu = verbs on the session as an ENTITY (lifecycle); the `v` submenu is
-    // the interim home for focus/jump motions + the heading-markers display
-    // toggle (they leave for direct nav keys / the `:` palette in T2/T3, but must
-    // stay reachable until then). `.` stop is gone — Esc interrupts an in-flight
-    // turn (esc_interrupts_in_flight_turn).
+    // UXI-Menu-8: the Agent root is deliberately exact and small. Commands
+    // removed from this tree retain their handlers; they are simply not part of
+    // the normal Agent command surface.
     vec![
-        MenuNode::entry("c", "select session", "claude-session-picker"),
-        MenuNode::entry("p", "send to workspace", "agent-send-workspace"),
-        MenuNode::entry("e", "send message", "claude-send"),
         MenuNode::entry("w", "switch worksheet ⇄ message box", "agent-input-toggle"),
-        MenuNode::entry("m", "cycle permission mode", "claude-mode-cycle"),
-        MenuNode::entry("S", "send selection", "claude-send-selection"),
-        MenuNode::entry("C", "clear session", "claude-clear"),
-        MenuNode::separator(),
-        // Session lifecycle. Archive/unarchive is grafted in dynamically (its
-        // label flips on archived state) — see `agent_local_menu_dynamic`.
         MenuNode::submenu(
-            "s",
-            "session",
-            vec![
-                MenuNode::entry("n", "new Claude session", "claude-new"),
-                MenuNode::entry("N", "new Codex session", "codex-new"),
-                MenuNode::entry("r", "rename session", "claude-rename"),
-                MenuNode::entry("t", "tag session…", "claude-tag"),
-                MenuNode::entry("x", "close session", "claude-close"),
-                MenuNode::entry("R", "recap this session", "recap-session"),
-            ],
+            "m",
+            "switch model",
+            vec![MenuNode::label("(models not available yet)")],
         ),
+        MenuNode::entry("s", "select session", "claude-session-picker"),
+        MenuNode::entry("c", "clear", "claude-clear"),
         MenuNode::submenu(
             "v",
             "view",
             vec![
-                MenuNode::entry("f", "focus transcript ⇄ compose", "agent-focus-toggle"),
-                MenuNode::entry("j", "jump between user turns (j/k)", "agent-toggle-jump-mode"),
-                MenuNode::entry("h", "toggle heading markers", "agent-toggle-heading-markers"),
+                MenuNode::entry("a", "agents", "agent-view-agents"),
+                MenuNode::entry("t", "tasks", "agent-view-tasks"),
             ],
         ),
     ]
@@ -5233,8 +5216,7 @@ impl YaldaGpuiView {
     /// <space> — open the content-kind-specific local menu (spec-menu-scopes.md
     /// Behavior 2). Same overlay machinery as the global menu; only the tree
     /// and header differ.
-    /// The agent tile's local menu with contextual archive/unarchive and a live
-    /// "switch model" submenu grafted on. The base entries are static
+    /// The agent tile's local menu with a live "switch model" submenu. The base entries are static
     /// (`agent_local_menu`); model children are built from the focused session's
     /// advertised list so the picker reflects exactly what the agent offers
     /// (UXI-AgentTile-16). Each child dispatches `set-model:<id>`; the active
@@ -5244,22 +5226,6 @@ impl YaldaGpuiView {
     /// "(models not available yet)" label rather than vanishing.
     fn agent_local_menu_dynamic(&self, cx: &mut Context<Self>) -> Vec<MenuNode> {
         let mut menu = agent_local_menu();
-        let archived = self
-            .active_server_session_id()
-            .is_some_and(|sid| self.jump_archived_sessions.contains(&sid));
-        let archive_entry = if archived {
-            MenuNode::entry("a", "unarchive session", "unarchive-session")
-        } else {
-            MenuNode::entry("a", "archive session", "archive-session")
-        };
-        // Graft archive into the `s` (session lifecycle) submenu.
-        if let Some(MenuAction::Submenu(children)) = menu
-            .iter_mut()
-            .find(|n| n.label == "session")
-            .map(|n| &mut n.action)
-        {
-            children.push(archive_entry);
-        }
         let (models, current) = self
             .focused_bound_session()
             .and_then(|id| {
@@ -5289,7 +5255,25 @@ impl YaldaGpuiView {
                 })
                 .collect()
         };
-        menu.push(MenuNode::submenu("M", "switch model", children));
+        if let Some(model) = menu.iter_mut().find(|node| node.label == "switch model") {
+            model.action = MenuAction::Submenu(children);
+        }
+
+        let (agents_open, tasks_open) = self
+            .agent_read(cx, |state| (state.subagents_open, state.tasklist_open))
+            .unwrap_or((false, false));
+        if let Some(MenuAction::Submenu(children)) = menu
+            .iter_mut()
+            .find(|node| node.label == "view")
+            .map(|node| &mut node.action)
+        {
+            if agents_open {
+                children[0].label = "agents ✓".into();
+            }
+            if tasks_open {
+                children[1].label = "tasks ✓".into();
+            }
+        }
         menu
     }
 
@@ -5556,6 +5540,8 @@ impl YaldaGpuiView {
             "rail-flip" => self.flip_rail_side_impl(cx),
             "agent-toggle-heading-markers" => self.toggle_agent_heading_markers(cx),
             "agent-toggle-jump-mode" => self.toggle_agent_jump_mode(cx),
+            "agent-view-agents" => self.show_agent_sidepanel_agents(cx),
+            "agent-view-tasks" => self.show_agent_sidepanel_tasks(cx),
             "recap-session" => self.summon_recap(cx),
             "recap-dismiss" => self.dismiss_recap(cx),
             "compose-toggle" | "agent-input-toggle" => {

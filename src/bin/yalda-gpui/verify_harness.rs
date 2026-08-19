@@ -1311,6 +1311,43 @@ fn agent_dynamic_menu_has_no_duplicate_keys(cx: &mut TestAppContext) {
     });
 }
 
+/// UXI-Menu-8: View → Agents/Tasks is a stateful, mutually-exclusive selector.
+/// Drive the real menu dispatcher and verify both the panel state and live check
+/// mark, including unhiding the sidepanel.
+#[gpui::test]
+fn agent_view_menu_selects_and_marks_agents_or_tasks(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_browser(cx);
+    install_agent_slot(&view, &mut *vcx, Some("S1"));
+
+    view.update(vcx, |v, cx| {
+        if let Some(mut state) = v.agent_mut(cx) {
+            state.sidepanel_hidden = true;
+            state.subagents_open = true;
+            state.tasklist_open = false;
+        }
+        v.dispatch_menu_command("agent-view-tasks", cx);
+        assert_eq!(
+            v.agent_read(cx, |state| {
+                (state.subagents_open, state.tasklist_open, state.sidepanel_hidden)
+            }),
+            Some((false, true, false))
+        );
+        let menu = v.agent_local_menu_dynamic(cx);
+        let view_menu = menu.iter().find(|node| node.label == "view").expect("view");
+        let crate::MenuAction::Submenu(children) = &view_menu.action else {
+            panic!("view is a submenu");
+        };
+        assert_eq!(children[0].label, "agents");
+        assert_eq!(children[1].label, "tasks ✓");
+
+        v.dispatch_menu_command("agent-view-agents", cx);
+        assert_eq!(
+            v.agent_read(cx, |state| (state.subagents_open, state.tasklist_open)),
+            Some((true, false))
+        );
+    });
+}
+
 /// UXI-SystemConsole-1/-2 plus the yux render-count contract: both requested
 /// entry points summon the SAME overlay without moving focus; its `r` / `R`
 /// keys reach the real rebuild dispatcher; and an unrelated root repaint reuses
@@ -5274,11 +5311,11 @@ fn session_picker_places_already_local_unbound_agent_without_duplicate(
     });
 }
 
-/// The Agent-local command is the discoverable placement path for an Agent
-/// tile outside every workspace. It opens the real workspace picker and moves
-/// the same stable tile into the chosen same-project workspace.
+/// The shell command is the discoverable placement path for an Agent tile
+/// outside every workspace. It opens the same real workspace picker used for
+/// bound tiles and moves the same stable tile into the chosen workspace.
 #[gpui::test]
-fn agent_send_to_workspace_command_binds_an_unbound_agent(cx: &mut TestAppContext) {
+fn shell_send_to_workspace_command_binds_an_unbound_agent(cx: &mut TestAppContext) {
     use crate::workspace::TileMembership;
     use crate::{AgentTile, App, LinearTile};
 
@@ -5299,11 +5336,11 @@ fn agent_send_to_workspace_command_binds_an_unbound_agent(cx: &mut TestAppContex
         (agent, target)
     });
 
-    view.update(vcx, |v, cx| v.dispatch_menu_command("agent-send-workspace", cx));
+    view.update(vcx, |v, cx| v.dispatch_menu_command("send-tile-follow", cx));
     view.read_with(vcx, |v, _| {
         let picker = v
             .workspace_picker_ref()
-            .expect("Agent command opens workspace picker");
+            .expect("shell command opens workspace picker");
         assert_eq!(picker.mode, crate::WorkspacePickerMode::Move { follow: true });
         assert_eq!(picker.targets, vec![0, target]);
         assert_eq!(picker.selected, 1);
@@ -7041,6 +7078,60 @@ fn transcript_021_user_turn_jump_toggle(cx: &mut TestAppContext) {
     let after = session.read_with(vcx, |s, _| crate::TranscriptSeqs::of(&s.state).pending_jump);
     assert!(!before, "no jump queued ⇒ pending_jump seq is false");
     assert!(after, "a queued jump ⇒ pending_jump seq flips true (busts the cache)");
+}
+
+/// UXI-AgentTile-40: uppercase J/K are direct user-turn motions. This drives
+/// the real reducer to create two turns, then the real AgentView key listener;
+/// the legacy jump-mode flag stays off throughout.
+#[gpui::test]
+fn uppercase_jk_move_directly_between_user_turns(cx: &mut TestAppContext) {
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let (view, vcx, id, _session) = boot_with_transcript(cx);
+    let event = |event| ServerNotification::ReplyEvent {
+        session_id: "S1".into(),
+        event,
+    };
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                event(ReplyEvent::UserMessage("first turn".into())),
+                event(ReplyEvent::Chunk("first answer".into())),
+                event(ReplyEvent::UserMessage("second turn".into())),
+            ],
+            cx,
+        );
+        v.with_session(id, cx, |state| {
+            state.focus = crate::AgentFocus::Transcript;
+            state.user_turn_jump_mode = false;
+            state.user_turn_jump_ord = 0;
+        });
+    });
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, cx| {
+        assert_eq!(
+            v.read_session(id, cx, |state| {
+                crate::user_turn_item_indices(&state.view_model.flat_items_cache).len()
+            }),
+            Some(2),
+            "the real reducer produced two user-turn destinations"
+        );
+    });
+
+    vcx.simulate_keystrokes("shift-j");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, cx| {
+        assert_eq!(v.read_session(id, cx, |state| state.user_turn_jump_ord), Some(1));
+        assert_eq!(v.read_session(id, cx, |state| state.user_turn_jump_mode), Some(false));
+    });
+
+    vcx.simulate_keystrokes("shift-k");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, cx| {
+        assert_eq!(v.read_session(id, cx, |state| state.user_turn_jump_ord), Some(0));
+        assert_eq!(v.read_session(id, cx, |state| state.user_turn_jump_mode), Some(false));
+    });
 }
 
 /// (e) Follow-tail still reveals grown content: after a streaming append while
@@ -9889,8 +9980,8 @@ fn jump_session_archive_filters_tabs_palette_and_persists(cx: &mut TestAppContex
 
 /// UXI-JumpPanel-16 controls: a real right-click on a painted session row opens
 /// the cursor menu, whose real painted item toggles the durable flag in both
-/// directions. The active agent's dynamic Space menu exposes the same toggle and
-/// flips its copy after each action.
+/// directions. The underlying archive dispatcher remains callable after
+/// UXI-Menu-8 removes archive from the intentionally small Agent menu.
 #[gpui::test]
 fn jump_session_archive_controls_toggle_the_same_durable_flag(cx: &mut TestAppContext) {
     use crate::{JumpAgentTab, JumpTarget};
@@ -9976,12 +10067,11 @@ fn jump_session_archive_controls_toggle_the_same_durable_flag(cx: &mut TestAppCo
         v.jump_to_agent(JumpTarget::Local(id), cx);
     });
 
-    // Space menu copy is contextual in both directions and dispatches the same
-    // set_session_archived seam as the right-click menu.
+    // UXI-Menu-8 removes archive from the Space tree without deleting its
+    // underlying dispatcher.
     view.update(vcx, |v, cx| v.open_local_menu_inner(cx));
     view.read_with(vcx, |v, _| {
-        // ADR-0032: archive lives in the agent menu's `s` (session) submenu now.
-        assert!(menu_tree_has_command(
+        assert!(!menu_tree_has_command(
             &v.menu_ref().expect("space menu").menu,
             "archive-session"
         ));
@@ -10003,7 +10093,7 @@ fn jump_session_archive_controls_toggle_the_same_durable_flag(cx: &mut TestAppCo
     });
     view.update(vcx, |v, cx| v.open_local_menu_inner(cx));
     view.read_with(vcx, |v, _| {
-        assert!(menu_tree_has_command(
+        assert!(!menu_tree_has_command(
             &v.menu_ref().expect("space menu").menu,
             "unarchive-session"
         ));
@@ -11562,6 +11652,11 @@ fn agent_menu_lists_advertised_models_and_marks_current(cx: &mut TestAppContext)
             cmds.contains(&"set-model:sonnet") && cmds.contains(&"set-model:default"),
             "each child dispatches set-model:<id>: {cmds:?}"
         );
+        let keys: Vec<String> = children
+            .iter()
+            .map(|child| crate::format_menu_key(&child.key))
+            .collect();
+        assert_eq!(keys, vec!["1", "2"], "model choices use stable numbered keys");
     });
 }
 
