@@ -188,7 +188,11 @@ impl YaldaGpuiView {
                 // Set the view (clears any prior events), then start watching this
                 // graph's live event stream into the fresh events pane.
                 let id = bundle.graph.id.clone();
-                self.cog_set_view(target, CogViewState::Graph { bundle, selected: 0 }, cx);
+                self.cog_set_view(
+                    target,
+                    CogViewState::Graph { bundle, selected: 0, overview: false },
+                    cx,
+                );
                 self.cog_start_watch(target, id, cx);
             }
             Ok(CogFetch::Graphs(graphs)) => {
@@ -280,6 +284,77 @@ impl YaldaGpuiView {
                 cv.push_event(val);
                 vcx.notify();
             });
+        }
+        // A live event means the graph moved — auto-refresh its data (coalesced).
+        self.cog_refresh_bundle(target, cx);
+    }
+
+    /// Refresh the open graph's bundle IN PLACE (keeping the events feed) — the
+    /// auto-refresh path fired by a live event and by manual `r`. Coalesces a
+    /// burst into one in-flight reload plus one queued (`refresh_pending`), and
+    /// leaves the live watcher untouched.
+    pub(crate) fn cog_refresh_bundle(&mut self, target: workspace::WindowId, cx: &mut Context<Self>) {
+        let Some(id) = self
+            .cog_tile_by_id_mut(target)
+            .and_then(|t| t.view.clone())
+            .and_then(|v| v.read(cx).current_graph_id())
+        else {
+            return;
+        };
+        {
+            let Some(tile) = self.cog_tile_by_id_mut(target) else {
+                return;
+            };
+            if tile.refreshing {
+                tile.refresh_pending = true;
+                return;
+            }
+            tile.refreshing = true;
+        }
+        // Don't spawn the live subprocess reload under test — the `refreshing`
+        // flag is set (testable) and `cog_apply_refresh` is driven directly.
+        if cfg!(test) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { cog::load_graph(&id) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.cog_apply_refresh(target, result, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Fold a refresh reload into the tile IN PLACE (via `update_bundle`, so the
+    /// events feed + selection survive), then fire a queued refresh if one landed
+    /// while this was in flight.
+    pub(crate) fn cog_apply_refresh(
+        &mut self,
+        target: workspace::WindowId,
+        result: Result<CogBundle, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let pending = {
+            let Some(tile) = self.cog_tile_by_id_mut(target) else {
+                return;
+            };
+            tile.refreshing = false;
+            std::mem::take(&mut tile.refresh_pending)
+        };
+        if let Ok(bundle) = result {
+            let view = self.cog_tile_by_id_mut(target).and_then(|t| t.view.clone());
+            if let Some(v) = view {
+                v.update(cx, |cv, vcx| {
+                    cv.update_bundle(Box::new(bundle));
+                    vcx.notify();
+                });
+            }
+        }
+        if pending {
+            self.cog_refresh_bundle(target, cx);
         }
     }
 
@@ -544,36 +619,13 @@ impl YaldaGpuiView {
         }
     }
 
-    /// Reload the currently-open graph bundle (the `r` refresh in a graph).
+    /// Reload the currently-open graph bundle (the `r` refresh in a graph). Uses
+    /// the in-place refresh path so the live-events feed is preserved (not the
+    /// graph-change path, which would clear it and restart the watcher).
     fn cog_reload_current(&mut self, cx: &mut Context<Self>) {
         let Some(target) = self.workspace.focused_window_id() else {
             return;
         };
-        let Some(id) = self
-            .cog_focused_tile_view()
-            .and_then(|v| v.read(cx).current_graph_id())
-        else {
-            return;
-        };
-        let req = {
-            let Some(tile) = self.cog_tile_by_id_mut(target) else {
-                return;
-            };
-            tile.req += 1;
-            tile.req
-        };
-        self.cog_set_view(target, CogViewState::Loading(format!("reloading {id}…")), cx);
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    cog::load_graph(&id).map(|b| CogFetch::Graph(Box::new(b)))
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.cog_apply(target, req, result, cx);
-            });
-        })
-        .detach();
+        self.cog_refresh_bundle(target, cx);
     }
 }

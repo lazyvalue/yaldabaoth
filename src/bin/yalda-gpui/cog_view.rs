@@ -24,11 +24,13 @@ pub(crate) enum CogViewState {
         graphs: Vec<CogGraph>,
         selected: usize,
     },
-    /// A loaded graph — left node list, right node detail. `selected` indexes
-    /// into `bundle.nodes`.
+    /// A loaded graph — left is `[Overview, nodes…]`, right is the Overview
+    /// (graph render + stats) or the selected node's detail. `selected` indexes
+    /// into `bundle.nodes`; `overview` (top row) overrides it when set.
     Graph {
         bundle: Box<CogBundle>,
         selected: usize,
+        overview: bool,
     },
 }
 
@@ -90,6 +92,27 @@ impl CogView {
         self.events.clear();
         self.events_scroll.set_offset(gpui::point(px(0.0), px(0.0)));
         self.focus = CogFocus::Selector;
+    }
+
+    /// Replace the loaded graph's bundle IN PLACE (an auto-refresh / manual `r`
+    /// while watching), KEEPING the events feed, selection (clamped), scroll, and
+    /// focus — unlike [`set_state`], which resets everything for a graph change.
+    /// No-op if we've since left the graph.
+    pub(crate) fn update_bundle(&mut self, bundle: Box<CogBundle>) {
+        if let CogViewState::Graph {
+            bundle: current,
+            selected,
+            ..
+        } = &mut self.state
+        {
+            let n = bundle.nodes.len();
+            *current = bundle;
+            if n == 0 {
+                *selected = 0;
+            } else if *selected >= n {
+                *selected = n - 1;
+            }
+        }
     }
 
     // ── Live events ──────────────────────────────────────────────────────────
@@ -173,16 +196,29 @@ impl CogView {
     /// Move the left selection by `delta` rows, wrapping. Changing the selected
     /// node resets the right pane to the top (a fresh node starts at its header).
     pub(crate) fn select_move(&mut self, delta: i32) {
-        let n = self.len() as i32;
-        if n == 0 {
-            return;
-        }
         match &mut self.state {
-            CogViewState::Graphs { selected, .. } => {
+            CogViewState::Graphs { graphs, selected } => {
+                let n = graphs.len() as i32;
+                if n == 0 {
+                    return;
+                }
                 *selected = (*selected as i32 + delta).rem_euclid(n) as usize;
             }
-            CogViewState::Graph { selected, .. } => {
-                *selected = (*selected as i32 + delta).rem_euclid(n) as usize;
+            CogViewState::Graph {
+                bundle,
+                selected,
+                overview,
+            } => {
+                // Linear index over [Overview(0), node0(1), …]; total = n + 1.
+                let total = bundle.nodes.len() as i32 + 1;
+                let cur = if *overview { 0 } else { *selected as i32 + 1 };
+                let next = (cur + delta).rem_euclid(total);
+                if next == 0 {
+                    *overview = true;
+                } else {
+                    *overview = false;
+                    *selected = (next - 1) as usize;
+                }
                 self.right_scroll.set_offset(gpui::point(px(0.0), px(0.0)));
             }
             _ => {}
@@ -249,13 +285,28 @@ impl CogView {
     /// keyboard focus on the selector.
     pub(crate) fn click_node(&mut self, i: usize, cx: &mut Context<Self>) {
         let mut changed = false;
-        if let CogViewState::Graph { bundle, selected } = &mut self.state
+        if let CogViewState::Graph {
+            bundle,
+            selected,
+            overview,
+        } = &mut self.state
             && i < bundle.nodes.len()
         {
             *selected = i;
+            *overview = false;
             changed = true;
         }
         if changed {
+            self.right_scroll.set_offset(gpui::point(px(0.0), px(0.0)));
+            self.focus = CogFocus::Selector;
+            cx.notify();
+        }
+    }
+
+    /// Click the Overview row: show the graph render + stats in the detail pane.
+    pub(crate) fn click_overview(&mut self, cx: &mut Context<Self>) {
+        if let CogViewState::Graph { overview, .. } = &mut self.state {
+            *overview = true;
             self.right_scroll.set_offset(gpui::point(px(0.0), px(0.0)));
             self.focus = CogFocus::Selector;
             cx.notify();
@@ -287,6 +338,24 @@ impl CogView {
         let cur = self.events_scroll.offset();
         let y = (cur.y - px(down)).min(px(0.0));
         self.events_scroll.set_offset(gpui::point(cur.x, y));
+    }
+
+    /// Jump the node-detail pane to section `i` (a Table-of-Contents click). The
+    /// scroll container's children are `[header, toc, section0, section1, …]`, so
+    /// section `i` is child `2 + i`.
+    pub(crate) fn scroll_node_section(&mut self, i: usize) {
+        self.right_scroll.scroll_to_item(2 + i);
+    }
+
+    /// A TOC chip click: jump to section `i` and repaint.
+    pub(crate) fn click_node_section(&mut self, i: usize, cx: &mut Context<Self>) {
+        self.scroll_node_section(i);
+        cx.notify();
+    }
+
+    /// Is the detail pane showing the Overview (vs a node)?
+    pub(crate) fn showing_overview(&self) -> bool {
+        matches!(self.state, CogViewState::Graph { overview: true, .. })
     }
 
     // ── Test-facing accessors ────────────────────────────────────────────────
@@ -362,21 +431,29 @@ impl Render for CogView {
         let left = self.left_pane(&st, border, self.focused_selector(), cx);
         let right = self.right_pane(&st, self.focused_right(), &hl, cx);
 
-        let mut row = div()
+        // Top: selector | detail. Bottom (in a loaded graph): a full-width live
+        // events strip across the bottom.
+        let top = div()
             .flex()
             .flex_row()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .child(left)
+            .child(right);
+
+        let mut col = div()
+            .flex()
+            .flex_col()
             .size_full()
             .min_h_0()
             .bg(editor_bg)
             .text_color(st.fg)
-            .child(left)
-            .child(right);
-        // The live-events pane is the third column, present only while a graph
-        // is open (the explorer has nothing to watch).
+            .child(top);
         if self.in_graph() {
-            row = row.child(self.events_pane(&st, border, self.focused_events(), &hl, cx));
+            col = col.child(self.events_pane(&st, border, self.focused_events(), &hl, cx));
         }
-        row.into_any_element()
+        col.into_any_element()
     }
 }
 
@@ -430,7 +507,11 @@ impl CogView {
                 }
                 self.left_scroll.scroll_to_item(*selected + 1);
             }
-            CogViewState::Graph { bundle, selected } => {
+            CogViewState::Graph {
+                bundle,
+                selected,
+                overview,
+            } => {
                 let mut hdr = format!("{} · {} nodes", bundle.graph.label(), bundle.nodes.len());
                 if !bundle.status.status.trim().is_empty() {
                     hdr.push_str(&format!(" · {}", bundle.status.status));
@@ -439,10 +520,18 @@ impl CogView {
                     hdr.push_str(" · ⚠ islands");
                 }
                 list = list.child(left_header(&hdr, st));
+                // The Overview row sits at the top of the list.
+                list = list.child(
+                    overview_row(*overview, st)
+                        .id(SharedString::new_static("cog-overview-row"))
+                        .cursor_pointer()
+                        .on_click(cx.listener(|view, _ev, _w, cx| view.click_overview(cx))),
+                );
                 for (i, n) in bundle.nodes.iter().enumerate() {
                     let eff = bundle.effective_status(n);
+                    let sel = !*overview && i == *selected;
                     list = list.child(
-                        node_row(n, eff, i == *selected, st)
+                        node_row(n, eff, sel, st)
                             .id(SharedString::from(format!("cog-node-{i}")))
                             .cursor_pointer()
                             .on_click(cx.listener(move |view, _ev, _w, cx| {
@@ -450,7 +539,9 @@ impl CogView {
                             })),
                     );
                 }
-                self.left_scroll.scroll_to_item(*selected + 1);
+                // Children: [header, overview, node0, …]; reveal the active item.
+                let active = if *overview { 1 } else { 2 + *selected };
+                self.left_scroll.scroll_to_item(active);
             }
             _ => {}
         }
@@ -468,22 +559,7 @@ impl CogView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let transparent: Hsla = rgba(0x00000000).into();
-        let body: AnyElement = match &self.state {
-            CogViewState::Graphs { graphs, selected } => match graphs.get(*selected) {
-                Some(g) => graph_preview(g, st).into_any_element(),
-                None => single_inner("Select a graph on the left.", st.dim, st).into_any_element(),
-            },
-            CogViewState::Graph { bundle, selected } => match bundle.nodes.get(*selected) {
-                Some(n) => node_detail(bundle, n, hl, st).into_any_element(),
-                None => single_inner("Select a node on the left.", st.dim, st).into_any_element(),
-            },
-            _ => single_inner("", st.dim, st).into_any_element(),
-        };
-
-        // Probe the viewport container and the inner content separately so a
-        // test can assert the content overflows the viewport (genuinely
-        // scrollable, non-vacuous — see `cog_detail_paints_and_overflows`).
-        let scroll = div()
+        let mut scroll = div()
             .id("cog-right")
             .flex()
             .flex_col()
@@ -491,18 +567,83 @@ impl CogView {
             .min_w_0()
             .h_full()
             .min_h_0()
+            .gap_2()
             .overflow_y_scroll()
             .track_scroll(&self.right_scroll)
             .bg(if focused { focus_tint(st) } else { transparent })
             .on_click(cx.listener(|view, _ev, _w, cx| view.click_focus_right(cx)))
             .px_4()
-            .py_3()
-            .child(probe_bounds("cog-right-content", body));
+            .py_3();
+
+        match &self.state {
+            // A selected node: header + Table of Contents + ordered sections as
+            // DIRECT children so a TOC click's `scroll_to_item` lines up.
+            CogViewState::Graph {
+                bundle,
+                selected,
+                overview: false,
+            } => match bundle.nodes.get(*selected) {
+                Some(n) => {
+                    scroll = scroll.child(node_header(bundle, n, st));
+                    let sections = node_sections(bundle, n, hl, st);
+                    // Table of Contents: a chip per section (jumps on click).
+                    let mut toc = div().flex().flex_row().flex_wrap().w_full().gap_1().pb_1();
+                    for (i, (title, _)) in sections.iter().enumerate() {
+                        let label = title.clone();
+                        toc = toc.child(
+                            div()
+                                .id(SharedString::from(format!("cog-toc-{i}")))
+                                .flex_none()
+                                .cursor_pointer()
+                                .px_2()
+                                .rounded_md()
+                                .bg(st.accent.opacity(0.12))
+                                .text_color(st.accent)
+                                .font_family(st.mono.clone())
+                                .text_size(px(st.pt * 0.82))
+                                .child(SharedString::from(label))
+                                .on_click(cx.listener(move |v, _ev, _w, cx| {
+                                    v.click_node_section(i, cx);
+                                })),
+                        );
+                    }
+                    scroll = scroll.child(toc);
+                    for (i, (_, el)) in sections.into_iter().enumerate() {
+                        scroll = scroll.child(probe_bounds_dyn(
+                            format!("cog-sec-{i}"),
+                            el.into_any_element(),
+                        ));
+                    }
+                }
+                None => {
+                    scroll =
+                        scroll.child(single_inner("Select a node on the left.", st.dim, st));
+                }
+            },
+            // The Overview: graph render + stats.
+            CogViewState::Graph { bundle, .. } => {
+                scroll = scroll.child(probe_bounds(
+                    "cog-right-content",
+                    overview_body(bundle, st).into_any_element(),
+                ));
+            }
+            CogViewState::Graphs { graphs, selected } => {
+                let body = match graphs.get(*selected) {
+                    Some(g) => graph_preview(g, st).into_any_element(),
+                    None => {
+                        single_inner("Select a graph on the left.", st.dim, st).into_any_element()
+                    }
+                };
+                scroll = scroll.child(probe_bounds("cog-right-content", body));
+            }
+            _ => scroll = scroll.child(single_inner("", st.dim, st)),
+        }
         probe_bounds("cog-right", scroll.into_any_element())
     }
 
-    /// The live-events pane: a scrollable, newest-first feed of `cog graph watch`
-    /// events, each an aesthetically-formatted, syntax-highlighted JSON card.
+    /// The live-events strip: a full-width panel ACROSS THE BOTTOM of the tile, a
+    /// scrollable newest-first feed of `cog graph watch` events, each an
+    /// aesthetically-formatted, syntax-highlighted JSON card laid out left→right.
     /// `focused` gets a faint accent wash; clicking it moves keyboard focus here.
     fn events_pane(
         &self,
@@ -513,33 +654,42 @@ impl CogView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let transparent: Hsla = rgba(0x00000000).into();
-        let mut list = div()
-            .id("cog-events")
+        // Newest-first vertical feed of full-width cards, scrolling within the strip.
+        let mut feed = div()
+            .id("cog-events-feed")
             .flex()
             .flex_col()
             .flex_1()
-            .min_w_0()
-            .h_full()
             .min_h_0()
+            .w_full()
             .overflow_y_scroll()
             .track_scroll(&self.events_scroll)
-            .border_l_1()
+            .gap_2();
+        if self.events.is_empty() {
+            feed = feed.child(dim_line("Waiting for live events…", st));
+        } else {
+            for ev in &self.events {
+                feed = feed.child(event_card(ev, hl, st));
+            }
+        }
+
+        let strip = div()
+            .id("cog-events")
+            .flex()
+            .flex_col()
+            .w_full()
+            .h(px(240.0))
+            .flex_none()
+            .border_t_1()
             .border_color(border)
             .bg(if focused { focus_tint(st) } else { transparent })
             .on_click(cx.listener(|v, _ev, _w, cx| v.click_focus_events(cx)))
             .px_3()
-            .py_3()
-            .gap_2()
-            .child(left_header(&format!("Live events ({})", self.events.len()), st));
-
-        if self.events.is_empty() {
-            list = list.child(dim_line("Waiting for live events…", st));
-        } else {
-            for ev in &self.events {
-                list = list.child(event_card(ev, hl, st));
-            }
-        }
-        probe_bounds("cog-events", list.into_any_element())
+            .py_2()
+            .gap_1()
+            .child(left_header(&format!("Live events ({})", self.events.len()), st))
+            .child(feed);
+        probe_bounds("cog-events", strip.into_any_element())
     }
 }
 
@@ -808,6 +958,91 @@ fn node_row(n: &CogNode, eff: EffStatus, is_sel: bool, st: &DetailStyle) -> gpui
 
 // ── Right-pane bodies ────────────────────────────────────────────────────────
 
+/// The "Overview" row at the top of the node list (selected ⇒ accent wash).
+fn overview_row(is_sel: bool, st: &DetailStyle) -> gpui::Div {
+    let transparent: Hsla = rgba(0x00000000).into();
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .w_full()
+        .px_2()
+        .py_1()
+        .bg(if is_sel { nav_sel_bg(st) } else { transparent })
+        .font_family(st.mono.clone())
+        .text_size(px(st.pt * 0.88))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_color(if is_sel { st.accent } else { st.fg })
+                .child(SharedString::new_static("▤ Overview")),
+        )
+}
+
+/// The Overview detail: the graph's ASCII DAG render plus aggregate stats
+/// (node counts by status + claimed→done completion min/max/avg).
+fn overview_body(bundle: &CogBundle, st: &DetailStyle) -> gpui::Div {
+    let s = bundle.stats();
+    let mut col = div().flex().flex_col().w_full().gap_2();
+
+    col = col.child(
+        div()
+            .w_full()
+            .text_color(st.fg)
+            .font_family(st.prose.clone())
+            .font_weight(FontWeight::BOLD)
+            .text_size(px(st.pt * 1.45))
+            .child(SharedString::from(bundle.graph.label())),
+    );
+
+    // Stats.
+    col = col.child(section_heading("Stats", st));
+    let mut meta = div().flex().flex_col().gap_1().w_full();
+    meta = meta.child(kv_row("Nodes", s.total.to_string(), st));
+    meta = meta.child(kv_row(
+        "By status",
+        format!(
+            "{} done · {} claimed · {} open · {} failed",
+            s.done, s.claimed, s.open, s.failed
+        ),
+        st,
+    ));
+    let dur = |v: Option<i64>| v.map(fmt_duration_ns).unwrap_or_else(|| "—".into());
+    meta = meta.child(kv_row(
+        "Completion",
+        format!(
+            "{} completed · quickest {} · longest {} · avg {}",
+            s.completed,
+            dur(s.quickest_ns),
+            dur(s.longest_ns),
+            dur(s.average_ns)
+        ),
+        st,
+    ));
+    col = col.child(meta);
+
+    // Graph render (ASCII DAG).
+    col = col.child(section_heading("Graph", st));
+    let render = if bundle.render.trim().is_empty() {
+        "(no render)".to_string()
+    } else {
+        bundle.render.clone()
+    };
+    col = col.child(
+        div()
+            .w_full()
+            .p_2()
+            .rounded_md()
+            .border_1()
+            .border_color(card_border(st))
+            .bg(code_bg(st))
+            .child(multiline_text(&render, st.fg, &st.mono, px(st.pt * 0.9))),
+    );
+    col
+}
+
 fn graph_preview(g: &CogGraph, st: &DetailStyle) -> gpui::Div {
     let mut col = div().flex().flex_col().w_full().gap_2();
     col = col.child(
@@ -858,71 +1093,80 @@ fn graph_preview(g: &CogGraph, st: &DetailStyle) -> gpui::Div {
     col
 }
 
-fn node_detail(
-    bundle: &CogBundle,
-    n: &CogNode,
-    hl: &yalda::highlight::Highlighter,
-    st: &DetailStyle,
-) -> gpui::Div {
+/// The node detail header: name (bold) + id + status badge.
+fn node_header(bundle: &CogBundle, n: &CogNode, st: &DetailStyle) -> gpui::Div {
     let eff = bundle.effective_status(n);
-    let mut col = div().flex().flex_col().w_full().gap_2();
-
-    // Header: name (bold) + id + status badge.
     let name = if n.name.trim().is_empty() {
         n.id.clone()
     } else {
         n.name.clone()
     };
-    col = col.child(
+    div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .gap_1()
+        .pb_1()
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_3()
+                .w_full()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_color(st.fg)
+                        .font_family(st.prose.clone())
+                        .font_weight(FontWeight::BOLD)
+                        .text_size(px(st.pt * 1.45))
+                        .child(SharedString::from(name)),
+                )
+                .child(status_badge(eff, st)),
+        )
+        .child(
+            div()
+                .text_color(st.dim)
+                .font_family(st.mono.clone())
+                .text_size(px(st.pt * 0.9))
+                .child(SharedString::from(n.id.clone())),
+        )
+}
+
+/// The node detail sections, in TOC order — **State transitions is always
+/// first**, then Content, Output (when present), Notes. Each carries its title
+/// (for the Table of Contents) and a self-contained heading + body block so a
+/// TOC jump reveals the heading.
+pub(crate) fn node_sections(
+    bundle: &CogBundle,
+    n: &CogNode,
+    hl: &yalda::highlight::Highlighter,
+    st: &DetailStyle,
+) -> Vec<(String, gpui::Div)> {
+    let section = |title: &str, body: gpui::Div| {
         div()
             .flex()
-            .flex_row()
-            .items_center()
-            .gap_3()
+            .flex_col()
             .w_full()
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_color(st.fg)
-                    .font_family(st.prose.clone())
-                    .font_weight(FontWeight::BOLD)
-                    .text_size(px(st.pt * 1.45))
-                    .child(SharedString::from(name)),
-            )
-            .child(status_badge(eff, st)),
-    );
-    col = col.child(
-        div()
-            .text_color(st.dim)
-            .font_family(st.mono.clone())
-            .text_size(px(st.pt * 0.9))
-            .child(SharedString::from(n.id.clone())),
-    );
+            .gap_2()
+            .child(section_heading(title, st))
+            .child(body)
+    };
+    let mut out: Vec<(String, gpui::Div)> = Vec::new();
 
-    // Content (pretty-printed, syntax-highlighted JSON when structured).
-    col = col.child(section_heading("Content", st));
-    col = col.child(json_block(&n.content, hl, st));
-
-    // Output (if any).
-    if let Some(out) = n.output.as_ref().filter(|v| !v.is_null()) {
-        col = col.child(section_heading("Output", st));
-        col = col.child(json_block(out, hl, st));
-    }
-
-    // Status transitions (from the node log).
+    // 1. Status transitions FIRST (always).
     let empty: &[CogLogEntry] = &[];
     let log = bundle.logs.get(&n.id).map(|l| l.as_slice()).unwrap_or(empty);
     let mut transitions: Vec<&CogLogEntry> =
         log.iter().filter(|e| e.kind == "status_changed").collect();
     transitions.sort_by_key(|e| e.seq);
-    col = col.child(section_heading(
-        &format!("Status transitions ({})", transitions.len()),
-        st,
-    ));
-    if transitions.is_empty() {
-        col = col.child(dim_line("No transitions.", st));
+    let title = format!("Status transitions ({})", transitions.len());
+    let body = if transitions.is_empty() {
+        div().child(dim_line("No transitions.", st))
     } else {
+        let mut b = div().flex().flex_col().w_full().gap_2();
         for e in transitions {
             let to = e
                 .data
@@ -930,26 +1174,40 @@ fn node_detail(
                 .and_then(|v| v.as_str())
                 .unwrap_or("?")
                 .to_string();
-            col = col.child(transition_card(&to, &e.actor, fmt_epoch_ns(e.at), st));
+            b = b.child(transition_card(&to, &e.actor, fmt_epoch_ns(e.at), st));
         }
+        b
+    };
+    out.push((title.clone(), section(&title, body)));
+
+    // 2. Content.
+    out.push(("Content".into(), section("Content", json_block(&n.content, hl, st))));
+
+    // 3. Output (if any).
+    if let Some(o) = n.output.as_ref().filter(|v| !v.is_null()) {
+        out.push(("Output".into(), section("Output", json_block(o, hl, st))));
     }
 
-    // Notes.
+    // 4. Notes.
     let empty_notes: &[CogNote] = &[];
     let notes = bundle
         .notes
         .get(&n.id)
         .map(|v| v.as_slice())
         .unwrap_or(empty_notes);
-    col = col.child(section_heading(&format!("Notes ({})", notes.len()), st));
-    if notes.is_empty() {
-        col = col.child(dim_line("No notes.", st));
+    let title = format!("Notes ({})", notes.len());
+    let body = if notes.is_empty() {
+        div().child(dim_line("No notes.", st))
     } else {
+        let mut b = div().flex().flex_col().w_full().gap_2();
         for note in notes {
-            col = col.child(note_card(note, st));
+            b = b.child(note_card(note, st));
         }
-    }
-    col
+        b
+    };
+    out.push((title.clone(), section(&title, body)));
+
+    out
 }
 
 /// A status transition as a stylish card: `→ done` (in the status colour), the
