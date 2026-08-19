@@ -3139,6 +3139,16 @@ fn gpui_menu_has_required_entries() {
         "rename-workspace",
         "close-workspace",
         "new-project",
+        "workspace-back-and-forth",
+        "send-tile",
+        "send-tile-follow",
+        "also-show-tile",
+        "scratchpad-stash",
+        "scratchpad-summon",
+        "master-grow",
+        "master-shrink",
+        "master-count-increase",
+        "master-count-decrease",
     ];
     for e in expected {
         assert!(
@@ -4167,6 +4177,7 @@ fn bound_and_unbound_tiles_snapshot_with_identity_tags_direct_focus_and_next_id(
         .unwrap()
         .tags
         .extend(["alpha".to_string(), "beta".to_string()]);
+    frame.scratchpad = vec![unbound];
     assert!(frame.focus_unbound(unbound));
 
     let resolve = |id: SessionId| match id {
@@ -4177,6 +4188,7 @@ fn bound_and_unbound_tiles_snapshot_with_identity_tags_direct_focus_and_next_id(
     let snap = snapshot_workspace(&frame, &projects, &resolve);
     assert!(snap.tile_tags_migrated);
     assert_eq!(snap.direct_unbound, Some(unbound));
+    assert_eq!(snap.scratchpad, vec![unbound]);
     assert_eq!(snap.unbound_tiles.len(), 1);
     assert_eq!(snap.unbound_tiles[0].tile.id, unbound);
     assert_eq!(
@@ -4213,6 +4225,8 @@ fn bound_and_unbound_tiles_snapshot_with_identity_tags_direct_focus_and_next_id(
         restore_leaf(&mut restored, &Theme::default(), persisted_unbound.tile);
     restored.next_window_id = restored.next_window_id.max(window.id + 1);
     restored.unbound_tiles.push(workspace::UnboundTile { project, window });
+    restored.scratchpad = back.scratchpad;
+    restored.prune_scratchpad();
     restored.focus_unbound(back.direct_unbound.unwrap());
 
     assert_eq!(
@@ -4226,6 +4240,7 @@ fn bound_and_unbound_tiles_snapshot_with_identity_tags_direct_focus_and_next_id(
         "unbound Agent identity survives"
     );
     assert_eq!(restored.directly_focused_unbound(), Some(unbound));
+    assert_eq!(restored.scratchpad, vec![unbound]);
     assert!(restored.tile(1).unwrap().tags.contains("bound-tag"));
     assert!(restored.tile(unbound).unwrap().tags.contains("beta"));
     assert!(

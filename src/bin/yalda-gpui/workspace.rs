@@ -1348,9 +1348,9 @@ pub struct Workspace<C> {
     /// The workspace interior. Always [`LayoutMode::Plane`] (infinite-plane, Stage D);
     /// persisted for snapshot-format stability but ignored on load (Behavior 7).
     pub layout_mode: LayoutMode,
-    /// Inert persisted fields from the retired MasterStack mode. No longer read
-    /// by any layout logic (the plane never re-tiles); kept only so the on-disk
-    /// snapshot shape (`PersistedWorkspace`) stays stable and old snapshots round-trip.
+    /// Dwm-style Columns master-area parameters (`UXI-Workspace-20`). Plane
+    /// ignores them, while Columns gives the first `master_count` tiles
+    /// `master_ratio` of the available width.
     pub master_ratio: f32,
     pub master_count: usize,
     /// Tag-view filter. When non-empty, the workspace shows only windows whose
@@ -1415,6 +1415,48 @@ impl<C> Workspace<C> {
             WorkspaceView::Plane => WorkspaceView::Columns,
             WorkspaceView::Columns => WorkspaceView::Plane,
         };
+    }
+
+    /// Adjust the Columns master-area ratio, clamped to the product bounds.
+    /// Returns whether persisted state changed; Plane is a strict no-op.
+    pub fn adjust_master_ratio(&mut self, delta: f32) -> bool {
+        if self.view != WorkspaceView::Columns {
+            return false;
+        }
+        let next = (self.master_ratio.clamp(0.20, 0.80) + delta).clamp(0.20, 0.80);
+        if next == self.master_ratio {
+            return false;
+        }
+        self.master_ratio = next;
+        true
+    }
+
+    /// Add one tile to the Columns master area, bounded by the live tile count.
+    pub fn increase_master_count(&mut self) -> bool {
+        if self.view != WorkspaceView::Columns {
+            return false;
+        }
+        let tile_count = self.layout.leaf_ids().len().max(1);
+        let next = self.master_count.clamp(1, tile_count).saturating_add(1).min(tile_count);
+        if next == self.master_count {
+            return false;
+        }
+        self.master_count = next;
+        true
+    }
+
+    /// Remove one tile from the Columns master area, retaining at least one.
+    pub fn decrease_master_count(&mut self) -> bool {
+        if self.view != WorkspaceView::Columns {
+            return false;
+        }
+        let tile_count = self.layout.leaf_ids().len().max(1);
+        let next = self.master_count.clamp(1, tile_count).saturating_sub(1).max(1);
+        if next == self.master_count {
+            return false;
+        }
+        self.master_count = next;
+        true
     }
 
     /// Resolve the visible placement target for a directional swap
@@ -1527,6 +1569,9 @@ pub struct Frame<C> {
     /// A non-owning focus pointer into `unbound_tiles`. Direct viewing never
     /// changes membership or creates a workspace.
     pub direct_unbound: Option<WindowId>,
+    /// Persisted most-recent-first subset of Unbound tile ids. This is an
+    /// index over `unbound_tiles`, never a second owner (`UXI-Workspace-18`).
+    pub scratchpad: Vec<WindowId>,
     pub file_buffers: HashMap<FileBufferId, FileBuffer>,
     /// Canonical path → buffer id, for pool lookups during open.
     pub path_index: HashMap<PathBuf, FileBufferId>,
@@ -1555,6 +1600,9 @@ pub struct Frame<C> {
     /// view exists to show returns the user where they jumped from — not merely to
     /// the last workspace in the list.
     ephemeral_origin: Option<WindowId>,
+    /// Immutable `Workspace::auto_name` of the previously activated durable
+    /// workspace. Runtime navigation history is deliberately not persisted.
+    previous_workspace: Option<String>,
 }
 
 impl<C> Frame<C> {
@@ -1570,6 +1618,7 @@ impl<C> Frame<C> {
             active_workspace: 0,
             unbound_tiles: Vec::new(),
             direct_unbound: None,
+            scratchpad: Vec::new(),
             file_buffers: HashMap::new(),
             path_index: HashMap::new(),
             next_buffer_id: 1,
@@ -1579,6 +1628,7 @@ impl<C> Frame<C> {
             tag_shortcuts: HashMap::new(),
             default_project,
             ephemeral_origin: None,
+            previous_workspace: None,
         }
     }
 
@@ -1670,6 +1720,10 @@ impl<C> Frame<C> {
     /// wanting "inherit the current workspace's project" pass
     /// [`Frame::inherited_project`].)
     pub fn push_initial_workspace(&mut self, content: C, project: ProjectId) -> WindowId {
+        let previous = self
+            .active_workspace()
+            .filter(|workspace| !workspace.ephemeral)
+            .map(|workspace| workspace.auto_name.clone());
         let id = self.alloc_window_id();
         let name = auto_workspace_name(self.next_workspace_index);
         self.next_workspace_index += 1;
@@ -1677,6 +1731,7 @@ impl<C> Frame<C> {
             .push(Workspace::with_layout(name, Layout::Leaf(Window::new(id, content)), id, project));
         self.active_workspace = self.workspaces.len() - 1;
         self.direct_unbound = None;
+        self.previous_workspace = previous;
         id
     }
 
@@ -1735,6 +1790,12 @@ impl<C> Frame<C> {
         if idx >= self.workspaces.len() {
             return;
         }
+        let old_name = self
+            .active_workspace()
+            .filter(|workspace| !workspace.ephemeral)
+            .map(|workspace| workspace.auto_name.clone());
+        let target_name = self.workspaces[idx].auto_name.clone();
+        let changes_workspace = old_name.as_deref() != Some(target_name.as_str());
         self.direct_unbound = None;
         let cur = self.active_workspace;
         if cur != idx && self.is_ephemeral(cur) {
@@ -1749,6 +1810,32 @@ impl<C> Frame<C> {
         } else {
             self.active_workspace = idx;
         }
+        if changes_workspace
+            && !self.workspaces[self.active_workspace].ephemeral
+            && let Some(old_name) = old_name
+        {
+            self.previous_workspace = Some(old_name);
+        }
+    }
+
+    /// Toggle to the previously activated durable workspace by immutable name.
+    /// `set_active_workspace` records the departure, so repeated calls toggle.
+    pub fn workspace_back_and_forth(&mut self) -> bool {
+        let Some(previous) = self.previous_workspace.as_deref() else {
+            return false;
+        };
+        let Some(target) = self
+            .workspaces
+            .iter()
+            .position(|workspace| !workspace.ephemeral && workspace.auto_name == previous)
+        else {
+            return false;
+        };
+        if target == self.active_workspace {
+            return false;
+        }
+        self.set_active_workspace(target);
+        true
     }
 
     /// Open an **ephemeral virtual workspace** (ADR-0021): a transient,
@@ -1962,21 +2049,106 @@ impl<C> Frame<C> {
         }
         debug_assert!(self.workspace_index_of_window(id).is_none());
         let tile = self.unbound_tiles.remove(pos);
+        self.scratchpad.retain(|candidate| *candidate != id);
         // The target index was validated above and no structural mutation can
         // invalidate it between these lines.
         self.insert_leaf_into_workspace(workspace, tile.window)
             .expect("validated workspace index must remain present");
         let leaves = self.workspaces[workspace].layout.leaf_ids();
         self.workspaces[workspace].desktop.reconcile(&leaves);
-        self.active_workspace = workspace;
-        if self.direct_unbound == Some(id) {
-            self.direct_unbound = None;
-        }
+        self.set_active_workspace(workspace);
         debug_assert_eq!(
             self.tile_membership(id),
             Some(TileMembership::Bound { workspace })
         );
         Ok(())
+    }
+
+    /// Move a complete bound tile between same-project workspaces. When the
+    /// source's last tile moves, its workspace is removed and the destination
+    /// necessarily becomes active even for a no-follow send.
+    pub fn move_bound_to_workspace(
+        &mut self,
+        id: WindowId,
+        target: usize,
+        follow: bool,
+    ) -> Result<(), ()> {
+        let source = self.workspace_index_of_window(id).ok_or(())?;
+        let target_project = self.workspaces.get(target).ok_or(())?.project();
+        if source == target || self.workspaces[source].project() != target_project {
+            return Err(());
+        }
+
+        let old_active = self.active_workspace;
+        let source_name = self.workspaces[source].auto_name.clone();
+        self.direct_unbound = None;
+        self.active_workspace = source;
+        self.workspaces[source].focused = id;
+        let (window, source_empty) = self.detach_focused()?;
+
+        let target = if source_empty {
+            self.workspaces.remove(source);
+            if source < target { target - 1 } else { target }
+        } else {
+            let leaves = self.workspaces[source].layout.leaf_ids();
+            self.workspaces[source].desktop.reconcile(&leaves);
+            target
+        };
+        self.insert_leaf_into_workspace(target, window)?;
+        let leaves = self.workspaces[target].layout.leaf_ids();
+        self.workspaces[target].desktop.reconcile(&leaves);
+
+        if follow || source_empty {
+            self.active_workspace = target;
+            self.previous_workspace = Some(source_name);
+        } else {
+            // The no-follow branch necessarily retained the source workspace,
+            // so its index is unchanged.
+            self.active_workspace = old_active;
+        }
+        debug_assert_eq!(
+            self.tile_membership(id),
+            Some(TileMembership::Bound { workspace: target })
+        );
+        Ok(())
+    }
+
+    /// Detach a bound tile into Unbound and remember it at the front of the
+    /// scratchpad MRU. Unlike ordinary unbind, stash leaves direct focus clear.
+    pub fn stash_window(&mut self, id: WindowId) -> Result<(), ()> {
+        self.unbind_window(id)?;
+        self.scratchpad.retain(|candidate| *candidate != id);
+        self.scratchpad.insert(0, id);
+        self.direct_unbound = None;
+        Ok(())
+    }
+
+    /// Summon the next scratchpad tile, or hide after the oldest. Returns false
+    /// only when no live scratchpad tile exists.
+    pub fn cycle_scratchpad(&mut self) -> bool {
+        self.prune_scratchpad();
+        if self.scratchpad.is_empty() {
+            return false;
+        }
+        let next = self
+            .directly_focused_unbound()
+            .and_then(|id| self.scratchpad.iter().position(|candidate| *candidate == id))
+            .map(|position| position + 1)
+            .unwrap_or(0);
+        if let Some(&id) = self.scratchpad.get(next) {
+            self.direct_unbound = Some(id);
+        } else {
+            self.direct_unbound = None;
+        }
+        true
+    }
+
+    /// Keep only unique, live Unbound ids while preserving stored MRU order.
+    pub fn prune_scratchpad(&mut self) {
+        let live: HashSet<_> = self.unbound_tiles.iter().map(|tile| tile.window.id).collect();
+        let mut seen = HashSet::new();
+        self.scratchpad
+            .retain(|id| live.contains(id) && seen.insert(*id));
     }
 
     /// The index of the workspace whose layout contains `id`. `None` if no workspace
@@ -3844,5 +4016,162 @@ mod tests {
             Some(TileMembership::Bound { workspace: 0 })
         );
         assert!(frame.unbound_tiles.is_empty());
+    }
+
+    #[test]
+    fn send_tile_preserves_identity_and_honors_follow_policy() {
+        let mut frame = Frame::with_initial(TestContent("source"), ProjectId(0));
+        let moved = frame
+            .split_focused(SplitDir::V, TestContent("stateful"))
+            .unwrap();
+        frame.tile_mut(moved).unwrap().tags.insert("keep".into());
+        frame.push_initial_workspace(TestContent("target"), ProjectId(0));
+        frame.set_active_workspace(0);
+
+        frame
+            .move_bound_to_workspace(moved, 1, false)
+            .expect("same-project send");
+        assert_eq!(frame.active_workspace, 0, "send does not follow");
+        assert_eq!(frame.workspace_index_of_window(moved), Some(1));
+        assert_eq!(frame.workspaces[1].focused, moved);
+        assert_eq!(frame.tile(moved).unwrap().content, TestContent("stateful"));
+        assert!(frame.tile(moved).unwrap().tags.contains("keep"));
+
+        frame
+            .move_bound_to_workspace(moved, 0, true)
+            .expect("send and follow");
+        assert_eq!(frame.active_workspace, 0);
+        assert_eq!(frame.workspace_index_of_window(moved), Some(0));
+        assert_eq!(frame.workspaces[0].focused, moved);
+    }
+
+    #[test]
+    fn send_last_tile_removes_source_and_follows_adjusted_destination() {
+        let mut frame = Frame::with_initial(TestContent("target"), ProjectId(0));
+        let moved = frame.push_initial_workspace(TestContent("only"), ProjectId(0));
+
+        frame
+            .move_bound_to_workspace(moved, 0, false)
+            .expect("last tile can move when another workspace survives");
+        assert_eq!(frame.workspaces.len(), 1);
+        assert_eq!(frame.active_workspace, 0);
+        assert_eq!(frame.workspace_index_of_window(moved), Some(0));
+        assert_eq!(frame.workspaces[0].focused, moved);
+
+        // Exercise the opposite index ordering: removing a source before its
+        // destination must shift the destination left by exactly one.
+        let mut frame = Frame::with_initial(TestContent("only"), ProjectId(0));
+        let moved = frame.workspaces[0].focused;
+        frame.push_initial_workspace(TestContent("target"), ProjectId(0));
+        frame.set_active_workspace(0);
+
+        frame
+            .move_bound_to_workspace(moved, 1, false)
+            .expect("earlier last-tile source can move to later destination");
+        assert_eq!(frame.workspaces.len(), 1);
+        assert_eq!(frame.active_workspace, 0);
+        assert_eq!(frame.workspace_index_of_window(moved), Some(0));
+        assert_eq!(frame.workspaces[0].focused, moved);
+    }
+
+    #[test]
+    fn send_rejects_source_and_cross_project_destinations() {
+        let mut frame = Frame::with_initial(TestContent("p0"), ProjectId(0));
+        frame.push_initial_workspace(TestContent("p1"), ProjectId(1));
+        frame.set_active_workspace(0);
+
+        assert_eq!(frame.move_bound_to_workspace(1, 0, false), Err(()));
+        assert_eq!(frame.move_bound_to_workspace(1, 1, false), Err(()));
+        assert_eq!(frame.workspace_index_of_window(1), Some(0));
+    }
+
+    #[test]
+    fn scratchpad_stash_cycles_mru_then_returns_to_workspace() {
+        let mut frame = Frame::with_initial(TestContent("anchor"), ProjectId(0));
+        let older = frame
+            .split_focused(SplitDir::V, TestContent("older"))
+            .unwrap();
+        let newer = frame
+            .split_focused(SplitDir::V, TestContent("newer"))
+            .unwrap();
+
+        frame.stash_window(older).unwrap();
+        frame.stash_window(newer).unwrap();
+        assert_eq!(frame.scratchpad, vec![newer, older]);
+        assert_eq!(frame.directly_focused_unbound(), None);
+
+        assert!(frame.cycle_scratchpad());
+        assert_eq!(frame.directly_focused_unbound(), Some(newer));
+        assert!(frame.cycle_scratchpad());
+        assert_eq!(frame.directly_focused_unbound(), Some(older));
+        assert!(frame.cycle_scratchpad());
+        assert_eq!(frame.directly_focused_unbound(), None);
+    }
+
+    #[test]
+    fn scratchpad_floor_bind_pruning_and_restore_pruning() {
+        let mut frame = Frame::with_initial(TestContent("anchor"), ProjectId(0));
+        assert_eq!(frame.stash_window(1), Err(()));
+
+        let scratch = frame
+            .split_focused(SplitDir::V, TestContent("scratch"))
+            .unwrap();
+        frame.stash_window(scratch).unwrap();
+        frame.scratchpad.extend([999, scratch]);
+        frame.prune_scratchpad();
+        assert_eq!(frame.scratchpad, vec![scratch]);
+
+        frame.bind_unbound(scratch, 0).unwrap();
+        assert!(frame.scratchpad.is_empty());
+    }
+
+    #[test]
+    fn workspace_back_and_forth_uses_stable_names_and_restores_focus() {
+        let mut frame = Frame::with_initial(TestContent("one-a"), ProjectId(0));
+        let one_b = frame
+            .split_focused(SplitDir::V, TestContent("one-b"))
+            .unwrap();
+        let two = frame.push_initial_workspace(TestContent("two"), ProjectId(0));
+        frame.set_active_workspace(0);
+        frame.workspaces[0].focused = one_b;
+        frame.set_active_workspace(1);
+        assert_eq!(frame.focused_window_id(), Some(two));
+
+        assert!(frame.workspace_back_and_forth());
+        assert_eq!(frame.focused_window_id(), Some(one_b));
+        assert!(frame.workspace_back_and_forth());
+        assert_eq!(frame.focused_window_id(), Some(two));
+
+        frame.set_active_workspace(0);
+        frame.close_workspace(0);
+        assert!(!frame.workspace_back_and_forth(), "deleted stable name is a no-op");
+    }
+
+    #[test]
+    fn columns_master_controls_clamp_and_plane_is_unchanged() {
+        let mut frame = Frame::with_initial(TestContent("a"), ProjectId(0));
+        frame.split_focused(SplitDir::V, TestContent("b")).unwrap();
+        frame.split_focused(SplitDir::V, TestContent("c")).unwrap();
+        let wsp = frame.active_workspace_mut().unwrap();
+        wsp.view = WorkspaceView::Columns;
+
+        for _ in 0..20 {
+            wsp.adjust_master_ratio(0.05);
+            wsp.increase_master_count();
+        }
+        assert_eq!(wsp.master_ratio, 0.8);
+        assert_eq!(wsp.master_count, 3);
+        for _ in 0..20 {
+            wsp.adjust_master_ratio(-0.05);
+            wsp.decrease_master_count();
+        }
+        assert_eq!(wsp.master_ratio, 0.2);
+        assert_eq!(wsp.master_count, 1);
+
+        wsp.view = WorkspaceView::Plane;
+        let before = (wsp.master_ratio, wsp.master_count);
+        assert!(!wsp.adjust_master_ratio(0.05));
+        assert!(!wsp.increase_master_count());
+        assert_eq!((wsp.master_ratio, wsp.master_count), before);
     }
 }

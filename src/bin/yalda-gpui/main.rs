@@ -233,6 +233,7 @@ actions!(
         // workspace picker; selecting a target relocates the focused leaf
         // (content travels with it). See spec-workspaces-tagging.md Phase 1.
         MoveTile,
+        MoveTileAndFollow,
         // Also-show the focused (file-backed) tile in another workspace
         // (Ctrl-W M / shift). Opens the same picker; selecting a target
         // creates a second view onto the same file there, leaving the
@@ -243,6 +244,13 @@ actions!(
         // tile directly focused with all of its state intact.
         BindFocusedTile,
         UnbindFocusedTile,
+        StashScratchpad,
+        SummonScratchpad,
+        WorkspaceBackAndForth,
+        GrowMasterArea,
+        ShrinkMasterArea,
+        IncreaseMasterCount,
+        DecreaseMasterCount,
         // Splits (Ctrl-W chord prefix per spec-workspaces-and-splits.md §12)
         SplitH,
         SplitV,
@@ -1400,11 +1408,11 @@ struct BufferSwitcher {
 /// What the workspace picker will do with the chosen target. Drives the
 /// header copy and the commit branch so one picker overlay serves both
 /// "move tile" (Ctrl-W m) and "also-show tile" (Ctrl-W M).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkspacePickerMode {
     /// Relocate the focused leaf into the target workspace (content travels;
     /// works for every tile kind). Spec-workspaces-tagging.md Phase 1.
-    Move,
+    Move { follow: bool },
     /// Open a second view onto the focused file-backed tile's file in the
     /// target workspace (file-backed tiles only). The original stays put.
     AlsoShow,
@@ -1417,8 +1425,9 @@ enum WorkspacePickerMode {
 /// (you can't move a tile to where it already lives).
 struct WorkspacePicker {
     mode: WorkspacePickerMode,
-    /// Index into the entry list: `0..workspaces.len()` are existing workspaces,
-    /// `workspaces.len()` is the "+ new workspace" entry.
+    /// Same-project workspace indices captured when the picker opens.
+    targets: Vec<usize>,
+    /// Index into `targets`, with `targets.len()` naming "+ new workspace".
     selected: usize,
 }
 
@@ -1598,6 +1607,22 @@ fn gpui_menu() -> Vec<MenuNode> {
                 MenuNode::entry("r", "rename workspace", "rename-workspace"),
                 MenuNode::entry("x", "close workspace", "close-workspace"),
                 MenuNode::entry("p", "new project", "new-project"),
+                MenuNode::entry("b", "back and forth", "workspace-back-and-forth"),
+                MenuNode::entry("m", "send tile", "send-tile"),
+                MenuNode::entry("M", "send tile and follow", "send-tile-follow"),
+                MenuNode::entry("o", "also show document", "also-show-tile"),
+                MenuNode::entry("d", "stash in scratchpad", "scratchpad-stash"),
+                MenuNode::entry("D", "summon scratchpad", "scratchpad-summon"),
+                MenuNode::submenu(
+                    "c",
+                    "columns master area",
+                    vec![
+                        MenuNode::entry("f", "grow master area", "master-grow"),
+                        MenuNode::entry("F", "shrink master area", "master-shrink"),
+                        MenuNode::entry("n", "increase master count", "master-count-increase"),
+                        MenuNode::entry("N", "decrease master count", "master-count-decrease"),
+                    ],
+                ),
             ],
         ),
         MenuNode::submenu(
@@ -2168,6 +2193,7 @@ impl YaldaGpuiView {
         let default_project = self.projects.first().unwrap_or(ProjectId(0));
         let mut ws: workspace::Frame<App> = workspace::Frame::new(default_project);
         let requested_direct_unbound = snap.direct_unbound;
+        let requested_scratchpad = snap.scratchpad.clone();
         let migrate_legacy_tile_tags = !snap.tile_tags_migrated;
         // Each agent leaf carries its persisted session id (identity), so restore
         // rebinds it to ITS OWN session (UXI-AgentTile-18), not by index.
@@ -2291,6 +2317,8 @@ impl YaldaGpuiView {
         if ws.workspaces.is_empty() {
             return false;
         }
+        ws.scratchpad = requested_scratchpad;
+        ws.prune_scratchpad();
         // Restore marks — load from snapshot, then GC stale window ids.
         for (ch, wid) in snap.marks {
             ws.marks.set(ch, wid);
@@ -4112,10 +4140,19 @@ impl YaldaGpuiView {
 
     /// `Ctrl-W m` — open the workspace picker to MOVE the focused tile.
     fn move_tile(&mut self, _: &MoveTile, _w: &mut Window, cx: &mut Context<Self>) {
-        self.open_workspace_picker(WorkspacePickerMode::Move, cx);
+        self.open_workspace_picker(WorkspacePickerMode::Move { follow: false }, cx);
     }
 
-    /// `Ctrl-W M` — open the workspace picker to ALSO-SHOW the focused tile.
+    fn move_tile_and_follow(
+        &mut self,
+        _: &MoveTileAndFollow,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_workspace_picker(WorkspacePickerMode::Move { follow: true }, cx);
+    }
+
+    /// Menu-only legacy command: also show the focused tile in another workspace.
     fn also_show_tile(&mut self, _: &AlsoShowTile, _w: &mut Window, cx: &mut Context<Self>) {
         self.open_workspace_picker(WorkspacePickerMode::AlsoShow, cx);
     }
@@ -4163,6 +4200,120 @@ impl YaldaGpuiView {
             self.save_workspace_state();
         }
         cx.notify();
+    }
+
+    fn stash_scratchpad(
+        &mut self,
+        _: &StashScratchpad,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.stash_scratchpad_inner(cx);
+    }
+
+    fn stash_scratchpad_inner(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.workspace.focused_window_id() else {
+            return;
+        };
+        if self.workspace.directly_focused_unbound().is_some() {
+            self.transient_status = Some("scratchpad stash requires a bound tile".into());
+        } else if self.workspace.stash_window(id).is_err() {
+            self.transient_status = Some("the sole workspace must keep one tile".into());
+        } else {
+            self.transient_status = Some("tile stashed in scratchpad".into());
+            self.save_workspace_state();
+        }
+        cx.notify();
+    }
+
+    fn summon_scratchpad(
+        &mut self,
+        _: &SummonScratchpad,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.summon_scratchpad_inner(cx);
+    }
+
+    fn summon_scratchpad_inner(&mut self, cx: &mut Context<Self>) {
+        if self.workspace.cycle_scratchpad() {
+            self.save_workspace_state();
+        } else {
+            self.transient_status = Some("scratchpad is empty".into());
+        }
+        cx.notify();
+    }
+
+    fn workspace_back_and_forth(
+        &mut self,
+        _: &WorkspaceBackAndForth,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.workspace_back_and_forth_inner(cx);
+    }
+
+    fn workspace_back_and_forth_inner(&mut self, cx: &mut Context<Self>) {
+        if self.workspace.workspace_back_and_forth() {
+            self.save_workspace_state();
+            cx.notify();
+        }
+    }
+
+    fn adjust_master_area(&mut self, delta: f32, cx: &mut Context<Self>) {
+        if self
+            .workspace
+            .active_workspace_mut()
+            .is_some_and(|workspace| workspace.adjust_master_ratio(delta))
+        {
+            self.save_workspace_state();
+            cx.notify();
+        }
+    }
+
+    fn grow_master_area(&mut self, _: &GrowMasterArea, _w: &mut Window, cx: &mut Context<Self>) {
+        self.adjust_master_area(0.05, cx);
+    }
+
+    fn shrink_master_area(
+        &mut self,
+        _: &ShrinkMasterArea,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.adjust_master_area(-0.05, cx);
+    }
+
+    fn increase_master_count(
+        &mut self,
+        _: &IncreaseMasterCount,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .workspace
+            .active_workspace_mut()
+            .is_some_and(workspace::Workspace::increase_master_count)
+        {
+            self.save_workspace_state();
+            cx.notify();
+        }
+    }
+
+    fn decrease_master_count(
+        &mut self,
+        _: &DecreaseMasterCount,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .workspace
+            .active_workspace_mut()
+            .is_some_and(workspace::Workspace::decrease_master_count)
+        {
+            self.save_workspace_state();
+            cx.notify();
+        }
     }
 
     /// `Ctrl-W s` — horizontal split: new tile below the focused one.
@@ -5537,8 +5688,38 @@ impl YaldaGpuiView {
                     cx.notify();
                 }
             }
-            "move-tile" => self.open_workspace_picker(WorkspacePickerMode::Move, cx),
+            "move-tile" | "send-tile" => {
+                self.open_workspace_picker(WorkspacePickerMode::Move { follow: false }, cx)
+            }
+            "send-tile-follow" => {
+                self.open_workspace_picker(WorkspacePickerMode::Move { follow: true }, cx)
+            }
             "also-show-tile" => self.open_workspace_picker(WorkspacePickerMode::AlsoShow, cx),
+            "scratchpad-stash" => self.stash_scratchpad_inner(cx),
+            "scratchpad-summon" => self.summon_scratchpad_inner(cx),
+            "workspace-back-and-forth" => self.workspace_back_and_forth_inner(cx),
+            "master-grow" => self.adjust_master_area(0.05, cx),
+            "master-shrink" => self.adjust_master_area(-0.05, cx),
+            "master-count-increase" => {
+                if self
+                    .workspace
+                    .active_workspace_mut()
+                    .is_some_and(workspace::Workspace::increase_master_count)
+                {
+                    self.save_workspace_state();
+                    cx.notify();
+                }
+            }
+            "master-count-decrease" => {
+                if self
+                    .workspace
+                    .active_workspace_mut()
+                    .is_some_and(workspace::Workspace::decrease_master_count)
+                {
+                    self.save_workspace_state();
+                    cx.notify();
+                }
+            }
             // Plane view (spec-infinite-plane-workspace.md). Routed through the
             // same camera ops as the `Ctrl-W -/=/0` bindings.
             "plane-zoom-in" => {
@@ -5918,7 +6099,17 @@ impl YaldaGpuiView {
         }
         // A fresh picker attempt clears any prior toast.
         self.transient_status = None;
-        if self.workspace.focused_window_id().is_none() {
+        let Some(focused) = self.workspace.focused_window_id() else {
+            return;
+        };
+        if matches!(mode, WorkspacePickerMode::Move { .. })
+            && !matches!(
+                self.workspace.tile_membership(focused),
+                Some(workspace::TileMembership::Bound { .. })
+            )
+        {
+            self.transient_status = Some("bind an Unbound tile before sending it".into());
+            cx.notify();
             return;
         }
         if mode == WorkspacePickerMode::AlsoShow && !self.focused_is_file_backed() {
@@ -5931,11 +6122,25 @@ impl YaldaGpuiView {
         // move/also-show into the workspace the tile already lives in); fall
         // back to the "+ new workspace" entry when there's only one.
         let active = self.workspace.active_workspace;
-        let selected = (0..self.workspace.workspaces.len())
-            .find(|&i| i != active)
-            .unwrap_or(self.workspace.workspaces.len());
+        let project = self.workspace.tile_project(focused).unwrap_or_else(|| {
+            self.workspace.workspaces[active].project()
+        });
+        let targets: Vec<usize> = self
+            .workspace
+            .workspaces
+            .iter()
+            .enumerate()
+            .filter_map(|(index, workspace)| {
+                (!workspace.ephemeral && workspace.project() == project).then_some(index)
+            })
+            .collect();
+        let selected = targets
+            .iter()
+            .position(|target| *target != active)
+            .unwrap_or(targets.len());
         self.open_overlay(ActiveOverlay::WorkspacePicker(WorkspacePicker {
             mode,
+            targets,
             selected,
         }));
         cx.notify();
@@ -5948,7 +6153,9 @@ impl YaldaGpuiView {
     /// Number of selectable entries in the picker: every workspace plus the
     /// trailing "+ new workspace" entry.
     fn workspace_picker_entry_count(&self) -> usize {
-        self.workspace.workspaces.len() + 1
+        self.workspace_picker_ref()
+            .map(|picker| picker.targets.len() + 1)
+            .unwrap_or(0)
     }
 
     fn handle_workspace_picker_key(
@@ -6012,18 +6219,21 @@ impl YaldaGpuiView {
             Some(p) => p.mode,
             None => return,
         };
-        let n_workspaces = self.workspace.workspaces.len();
         let active = self.workspace.active_workspace;
+        let targets = match self.workspace_picker_ref() {
+            Some(picker) => picker.targets.clone(),
+            None => return,
+        };
 
         // Resolve the target workspace index, creating a new workspace if "+ new"
         // was chosen. A new workspace starts Empty; the relocated/also-shown
         // leaf becomes its first tile.
-        let make_new = entry >= n_workspaces;
+        let make_new = entry >= targets.len();
         let target = if make_new {
             self.push_empty_workspace();
             self.workspace.workspaces.len() - 1
         } else {
-            entry
+            targets[entry]
         };
 
         // Selecting the active workspace is a no-op (the tile is already here).
@@ -6034,8 +6244,8 @@ impl YaldaGpuiView {
         }
 
         match mode {
-            WorkspacePickerMode::Move => {
-                self.move_focused_to_workspace(target);
+            WorkspacePickerMode::Move { follow } => {
+                self.move_focused_to_workspace(target, follow);
             }
             WorkspacePickerMode::AlsoShow => {
                 self.also_show_focused_in_workspace(target);
@@ -6063,37 +6273,13 @@ impl YaldaGpuiView {
     }
 
     /// MOVE: relocate the focused leaf out of the active workspace into
-    /// `target`. If the source workspace is left empty, remove it (unless it's
-    /// the only workspace, which we leave empty). Focus follows the tile to
-    /// the target workspace.
-    fn move_focused_to_workspace(&mut self, target: usize) {
-        let (window, source_empty) = match self.workspace.detach_focused() {
-            Ok(v) => v,
-            Err(()) => return,
+    /// `target`, preserving the complete stable tile. The model owns the index
+    /// correction and source-empty exception; this layer supplies the focused id.
+    fn move_focused_to_workspace(&mut self, target: usize, follow: bool) {
+        let Some(id) = self.workspace.focused_window_id() else {
+            return;
         };
-        // `detach_focused` may shift nothing, but if it removed the active
-        // workspace's only tile the target index could still be valid (target was
-        // resolved before detach and detach never removes workspaces). Insert first,
-        // then prune the empty source so indices stay stable during insert.
-        let _ = self.workspace.insert_leaf_into_workspace(target, window);
-
-        let source = self.workspace.active_workspace;
-        if source_empty {
-            if self.workspace.workspaces.len() > 1 {
-                // Removing the source shifts indices; recompute the target's
-                // position so we can land focus there.
-                let target_after = if target > source { target - 1 } else { target };
-                self.workspace.close_workspace(source);
-                self.workspace.active_workspace = target_after.min(self.workspace.workspaces.len() - 1);
-            } else {
-                // Only workspace: leave it empty and stay on it (matches the
-                // existing single-workspace close behavior — we don't quit here).
-                self.workspace.active_workspace = target.min(self.workspace.workspaces.len() - 1);
-            }
-        } else {
-            // Source still has tiles; follow the moved tile to the target.
-            self.workspace.active_workspace = target.min(self.workspace.workspaces.len() - 1);
-        }
+        let _ = self.workspace.move_bound_to_workspace(id, target, follow);
     }
 
     /// ALSO-SHOW: open a second view onto the focused file-backed tile's file
@@ -6112,7 +6298,8 @@ impl YaldaGpuiView {
         let id = self.workspace.alloc_window_id();
         let window = workspace::Window::new(id, content);
         let _ = self.workspace.insert_leaf_into_workspace(target, window);
-        self.workspace.active_workspace = target.min(self.workspace.workspaces.len() - 1);
+        self.workspace
+            .set_active_workspace(target.min(self.workspace.workspaces.len() - 1));
     }
 
     // ---- Session switcher overlay -----------------------------------------
@@ -6154,7 +6341,8 @@ impl YaldaGpuiView {
         let popup_border: Hsla = nc(ov.border);
 
         let verb = match picker.mode {
-            WorkspacePickerMode::Move => "MOVE TILE TO WORKSPACE",
+            WorkspacePickerMode::Move { follow: false } => "SEND TILE TO WORKSPACE",
+            WorkspacePickerMode::Move { follow: true } => "SEND TILE AND FOLLOW",
             WorkspacePickerMode::AlsoShow => "ALSO-SHOW TILE IN WORKSPACE",
         };
         let header_row = div()
@@ -6177,9 +6365,10 @@ impl YaldaGpuiView {
             .font_family(self.code_font.clone());
 
         let active = self.workspace.active_workspace;
-        let n_workspaces = self.workspace.workspaces.len();
-        for (i, wsp) in self.workspace.workspaces.iter().enumerate() {
-            let is_selected = i == picker.selected;
+        let n_targets = picker.targets.len();
+        for (entry, &i) in picker.targets.iter().enumerate() {
+            let wsp = &self.workspace.workspaces[i];
+            let is_selected = entry == picker.selected;
             let is_active = i == active;
             let marker = if is_selected { "\u{25b8} " } else { "  " };
             let here = if is_active { " (here)" } else { "" };
@@ -6209,7 +6398,7 @@ impl YaldaGpuiView {
 
         // "+ new workspace" entry.
         {
-            let is_selected = picker.selected == n_workspaces;
+            let is_selected = picker.selected == n_targets;
             let marker = if is_selected { "\u{25b8} " } else { "  " };
             let mut row = div().flex().flex_row().items_center().px_2().py_0p5();
             if is_selected {
@@ -6787,6 +6976,7 @@ impl YaldaGpuiView {
         // otherwise leave unbound tiles carrying a now-dead ProjectId here.
         self.workspace.workspaces.retain(|workspace| workspace.project() != pid);
         self.workspace.unbound_tiles.retain(|tile| tile.project != pid);
+        self.workspace.prune_scratchpad();
         self.workspace.direct_unbound = self
             .workspace
             .direct_unbound

@@ -3155,7 +3155,8 @@ fn active_overlay_open_replaces_and_clears(cx: &mut TestAppContext) {
         // open REPLACES, never stacks: opening a different overlay drops the
         // previous one (the workspace-double-click-behind-menu case can't strand).
         v.open_overlay(ActiveOverlay::WorkspacePicker(WorkspacePicker {
-            mode: WorkspacePickerMode::Move,
+            mode: WorkspacePickerMode::Move { follow: false },
+            targets: vec![0],
             selected: 0,
         }));
         assert!(v.overlay_is_workspace());
@@ -16428,7 +16429,7 @@ fn plane_focused_tile_renders_when_off_viewport(cx: &mut TestAppContext) {
 }
 
 /// UXI-Workspace-14: the columns arrangement lays EVERY tile out as an
-/// equal-width, full-height column, side by side — including a tile the plane
+/// full-height master/stack column, side by side — including a tile the plane
 /// would cull off-viewport. Drives the REAL toggle handler (`Ctrl-W a` / the `.`
 /// menu both call `toggle_workspace_columns` → `Workspace::toggle_view`). The
 /// fixture explicitly starts in `Plane` so this toggle guard remains independent
@@ -16437,7 +16438,7 @@ fn plane_focused_tile_renders_when_off_viewport(cx: &mut TestAppContext) {
 /// The fixture (`boot_desktop_two_tiles`) parks B at slot (0,100) — far off the
 /// 800×600 viewport — so on the PLANE only A paints (proven first, for
 /// non-vacuity). After the toggle BOTH tiles paint as columns: B is now on
-/// screen, to the RIGHT of A, at roughly equal width and full height.
+/// screen, to the RIGHT of A, with the default 60/40 master split.
 ///
 /// NEGATIVE CONTROL (observed RED): in `render_focused_window`, drop the
 /// `WorkspaceView::Columns` arm (always call `render_desktop`). Re-run: after the
@@ -16504,10 +16505,11 @@ fn columns_view_arranges_tiles_side_by_side(cx: &mut TestAppContext) {
         "columns must be side by side (A at x={ax} w={aw}, B at x={bx}) — B must be \
          to the RIGHT of A with no overlap"
     );
-    // Equal width (flex_1) and full height, within a small tolerance.
+    // Default master ratio is 60/40: A is the one-tile master area and B the
+    // one-tile stack. Allow a small tolerance for gutters and borders.
     assert!(
-        (aw - bw).abs() <= 2.0,
-        "columns must be equal width (A={aw}, B={bw})"
+        aw > bw && (aw / (aw + bw) - 0.60).abs() <= 0.03,
+        "columns must honor the default 60/40 master ratio (A={aw}, B={bw})"
     );
     assert!(
         ah > 1.0 && (ah - bh).abs() <= 2.0,
@@ -16517,6 +16519,174 @@ fn columns_view_arranges_tiles_side_by_side(cx: &mut TestAppContext) {
     assert!(
         aw > 50.0 && ay >= 0.0,
         "column A painted with no real area (x={ax}, y={ay}, w={aw})"
+    );
+}
+
+/// UXI-Workspace-17: the registered lowercase command sends without following;
+/// uppercase sends and follows. Both traverse keymap → action → existing picker
+/// → Enter → stable relocation, rather than calling the model directly.
+#[gpui::test]
+fn ctrl_w_send_and_send_follow_use_the_same_project_picker(cx: &mut TestAppContext) {
+    use crate::{App, LinearTile};
+    use crate::workspace::{SplitDir, TileMembership};
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_browser(cx);
+    let moved = view.update(vcx, |v, _| {
+        let moved = v
+            .workspace
+            .split_focused(SplitDir::V, App::Linear(LinearTile::new()))
+            .unwrap();
+        v.workspace
+            .push_workspace_inheriting(App::Linear(LinearTile::new()));
+        v.workspace
+            .push_initial_workspace(App::Linear(LinearTile::new()), crate::project::ProjectId(999));
+        v.workspace.set_active_workspace(0);
+        v.workspace.workspaces[0].focused = moved;
+        moved
+    });
+
+    vcx.simulate_keystrokes("ctrl-w m");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        let picker = v.workspace_picker_ref().expect("send picker opened");
+        assert_eq!(picker.targets, vec![0, 1]);
+        assert_eq!(picker.mode, crate::WorkspacePickerMode::Move { follow: false });
+    });
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert_eq!(v.workspace.active_workspace, 0, "lowercase send stays at source");
+        assert_eq!(v.workspace.tile_membership(moved), Some(TileMembership::Bound { workspace: 1 }));
+    });
+
+    view.update(vcx, |v, _| {
+        v.workspace.set_active_workspace(1);
+        v.workspace.workspaces[1].focused = moved;
+    });
+    vcx.simulate_keystrokes("ctrl-w shift-m");
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert_eq!(v.workspace.active_workspace, 0, "uppercase send follows destination");
+        assert_eq!(v.workspace.tile_membership(moved), Some(TileMembership::Bound { workspace: 0 }));
+    });
+}
+
+/// UXI-Workspace-18/19: scratchpad and back-and-forth actions are wired at the
+/// shared tile wrapper, so the real chords work regardless of focused App kind.
+#[gpui::test]
+fn ctrl_w_scratchpad_and_workspace_back_and_forth_are_global(cx: &mut TestAppContext) {
+    use crate::{App, LinearTile};
+    use crate::workspace::{SplitDir, TileMembership};
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_browser(cx);
+    let (scratch, previous_focus) = view.update(vcx, |v, _| {
+        let id = v
+            .workspace
+            .split_focused(SplitDir::V, App::Linear(LinearTile::new()))
+            .unwrap();
+        let previous_focus = v.workspace
+            .push_workspace_inheriting(App::Linear(LinearTile::new()));
+        v.workspace.set_active_workspace(0);
+        v.workspace.workspaces[0].focused = id;
+        (id, previous_focus)
+    });
+
+    vcx.simulate_keystrokes("ctrl-w d");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert_eq!(v.workspace.tile_membership(scratch), Some(TileMembership::Unbound));
+        assert_eq!(v.workspace.scratchpad, vec![scratch]);
+        assert_eq!(v.workspace.directly_focused_unbound(), None);
+    });
+    vcx.simulate_keystrokes("ctrl-w shift-d");
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(vcx, |v, _| v.workspace.directly_focused_unbound()),
+        Some(scratch)
+    );
+    vcx.simulate_keystrokes("ctrl-w shift-d");
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(vcx, |v, _| v.workspace.directly_focused_unbound()),
+        None,
+        "cycling past the oldest scratchpad tile returns to the workspace"
+    );
+    vcx.simulate_keystrokes("ctrl-w shift-d");
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("ctrl-w backspace");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert_eq!(v.workspace.active_workspace, 1);
+        assert_eq!(v.workspace.focused_window_id(), Some(previous_focus));
+    });
+}
+
+/// UXI-Workspace-20: all four registered master commands mutate Columns and
+/// the ratio command changes painted geometry without touching plane slots.
+#[gpui::test]
+fn ctrl_w_master_commands_change_columns_state_and_geometry(cx: &mut TestAppContext) {
+    use crate::workspace::WorkspaceView;
+    cx.update(crate::register_keymap);
+    let (view, vcx, master_id, stack_id) = boot_desktop_two_tiles(cx);
+    view.update(vcx, |v, cx| {
+        v.workspace.active_workspace_mut().unwrap().view = WorkspaceView::Columns;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let before_master = crate::layout_probe_get(&format!("columns-tile-{master_id}"))
+        .expect("master paints before adjustment");
+    let before_stack = crate::layout_probe_get(&format!("columns-tile-{stack_id}"))
+        .expect("stack paints before adjustment");
+    crate::layout_probe_end();
+
+    vcx.simulate_keystrokes("ctrl-w f");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert!((v.workspace.active_workspace().unwrap().master_ratio - 0.65).abs() < 0.001);
+    });
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let after_master = crate::layout_probe_get(&format!("columns-tile-{master_id}"))
+        .expect("master paints after adjustment");
+    let after_stack = crate::layout_probe_get(&format!("columns-tile-{stack_id}"))
+        .expect("stack paints after adjustment");
+    crate::layout_probe_end();
+    assert!(after_master.2 > before_master.2, "grow makes master wider");
+    assert!(after_stack.2 < before_stack.2, "grow makes stack narrower");
+
+    vcx.simulate_keystrokes("ctrl-w shift-f");
+    vcx.simulate_keystrokes("ctrl-w n");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        let wsp = v.workspace.active_workspace().unwrap();
+        assert!((wsp.master_ratio - 0.60).abs() < 0.001);
+        assert_eq!(wsp.master_count, 2);
+    });
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let all_master_a = crate::layout_probe_get(&format!("columns-tile-{master_id}"))
+        .expect("first all-master tile paints");
+    let all_master_b = crate::layout_probe_get(&format!("columns-tile-{stack_id}"))
+        .expect("second all-master tile paints");
+    crate::layout_probe_end();
+    assert!(
+        (all_master_a.2 - all_master_b.2).abs() <= 2.0,
+        "when master_count covers every tile, the full width is shared equally"
+    );
+    vcx.simulate_keystrokes("ctrl-w shift-n");
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(vcx, |v, _| v.workspace.active_workspace().unwrap().master_count),
+        1
     );
 }
 
@@ -19714,7 +19884,8 @@ fn jump_palette_does_not_open_over_another_overlay(cx: &mut TestAppContext) {
 
     view.update(vcx, |v, cx| {
         v.open_overlay(ActiveOverlay::WorkspacePicker(WorkspacePicker {
-            mode: WorkspacePickerMode::Move,
+            mode: WorkspacePickerMode::Move { follow: false },
+            targets: vec![0, 1],
             selected: 0,
         }));
         v.open_jump_palette_impl(cx);

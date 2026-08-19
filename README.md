@@ -127,9 +127,16 @@ list by tile tags.
 | `Ctrl-W u` | undo the most recent successful placement command |
 | `Ctrl-W b` | bind the directly viewed unbound tile to the active workspace |
 | `Ctrl-W Shift-B` | move the focused workspace tile to Unbound |
+| `Ctrl-W m` / `Ctrl-W M` | send the focused tile to another same-project workspace, without / with following |
+| `Ctrl-W d` / `Ctrl-W D` | stash the focused tile in the Unbound-backed scratchpad / cycle scratchpad tiles |
+| `Ctrl-W Backspace` | toggle to the previously active workspace, restoring its focused tile |
+| `Ctrl-W f` / `Ctrl-W F` | grow / shrink the Columns master area |
+| `Ctrl-W n` / `Ctrl-W N` | increase / decrease the Columns master tile count |
 
-In Columns, `H` and `L` swap adjacent columns; `J` and `K` are no-ops. The same
-placements survive a lossless Plane/Columns toggle.
+In Columns, `H` and `L` swap adjacent columns; `J` and `K` are no-ops. The first
+master tile gets 60% of the width by default; the `f/F/n/N` controls adjust the
+master split without changing the plane placements. The same placements survive
+a lossless Plane/Columns toggle.
 
 ## Browsers
 
