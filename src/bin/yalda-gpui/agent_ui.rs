@@ -470,7 +470,11 @@ impl YaldaGpuiView {
         let n = (2 + self.picker_projection(&cwd).0.len()) as isize;
         if let Some(picker) = self.agent_tile_mut().and_then(|t| t.picker_mut()) {
             if n > 0 {
-                picker.selected = (picker.selected as isize + delta).rem_euclid(n) as usize;
+                // The roster is live and may have shrunk since the last frame.
+                // Start from the same clamped row the renderer highlights, not
+                // from an invisible stale index.
+                let selected = picker.selected.min(n as usize - 1) as isize;
+                picker.selected = (selected + delta).rem_euclid(n) as usize;
             }
             cx.notify();
         }
@@ -731,11 +735,18 @@ impl YaldaGpuiView {
             Key::Up | Key::Char('k') => self.agent_picker_move(-1, cx),
             Key::Down | Key::Char('j') => self.agent_picker_move(1, cx),
             Key::Enter => {
-                if let Some(row) = self
+                let selected = self
                     .agent_tile()
                     .and_then(|t| t.picker())
-                    .map(|p| p.selected)
-                {
+                    .map(|p| p.selected);
+                let row_count = 2 + self.picker_projection(&self.agent_base_cwd()).0.len();
+                if let Some(row) = selected.map(|row| row.min(row_count.saturating_sub(1))) {
+                    // Persist the rendered clamp before activation so the
+                    // keyboard model and visible highlight cannot disagree
+                    // after a live roster/archive/tag update.
+                    if let Some(picker) = self.agent_tile_mut().and_then(|t| t.picker_mut()) {
+                        picker.selected = row;
+                    }
                     self.agent_picker_activate(row, cx);
                 }
             }

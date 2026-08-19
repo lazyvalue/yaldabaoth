@@ -1,6 +1,6 @@
 # bug-0042: agent-picker-loses-workspace-placement
 
-**Status:** FIXED
+**Status:** RECURRENT→FIXED
 **First seen:** 2026-08-19
 **Component:** Agent Tile picker / workspace ownership
 
@@ -47,3 +47,21 @@ set the base jump font size explicitly.
 - Observed RED before the font fix: workspace row 33.5px vs standard row 29px.
 - Guards cover click, Enter, already-local/no-duplicate placement, the command,
   stable replacement semantics, and exact jump-row typography.
+
+## Recurrence: live-roster Enter no-op
+
+The first fix proved real Enter only when the roster stayed unchanged. The
+already-local case was mistakenly guarded by calling `agent_picker_activate`
+directly, so the handoff overclaimed keyboard consistency.
+
+The remaining intermittent failure occurred when the live picker projection
+shrunk while open. Rendering clamped the visible highlight to the final valid
+row, but `SessionPicker.selected` retained its old larger index. Enter submitted
+that stale index; `agent_picker_activate` found no row and silently did nothing.
+Mouse activation was unaffected because the painted row carries its current
+index.
+
+Keyboard movement and Enter now normalize the stored cursor against the current
+projection before moving or activating. The recurrence guard uses real Down and
+Enter events with a tagged roster row removed between them. Its negative control
+failed with focus still on picker tile 4 instead of stable Agent tile 3.

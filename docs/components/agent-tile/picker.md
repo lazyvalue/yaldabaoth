@@ -90,6 +90,12 @@ activation and navigation indices (`2..=N+1`) continue to map to the free-sessio
 list in its rendered order, so grouping reorders that list but preserves the
 one-to-one row↔session mapping every interaction path depends on.
 
+The roster remains live while the picker is open. If archiving, closing,
+binding, retagging, or another roster update shrinks/reorders the selectable
+rows, keyboard navigation and Enter normalize the stored cursor to the same
+valid row the current frame highlights. Enter must never submit an invisible
+stale index and silently do nothing.
+
 **Applies to.** The shared free-list ordering in
 `agent_ui.rs::picker_projection` (which now returns free sessions in grouped
 order); the header emission in `screens.rs::render_agent_picker`; the index math
@@ -112,6 +118,12 @@ projected free order is grouped by tag (alphabetical, untagged last) so that
 `agent_picker_activate` row indices still resolve to the intended session.
 Negative control observed RED with the grouping sort removed: the free order fell
 back to plain label order and the grouped-order assertion failed.
+
+`verify_harness.rs::session_picker_enter_uses_visually_clamped_row_after_roster_shrink`
+drives real Down keys, removes a tagged roster row while the picker remains
+focused, repaints, and presses real Enter. It asserts the visibly highlighted
+stable Agent tile is placed. Before cursor normalization, the stale index was
+out of range and focus remained on the empty picker tile (observed RED).
 
 **Deviation from plan.** Sessions with multiple tags are filed under a single
 group (their alphabetically-first tag), not duplicated under every tag as the
