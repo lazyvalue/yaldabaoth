@@ -5119,6 +5119,88 @@ fn session_picker_enter_stays_in_workspace(cx: &mut TestAppContext) {
     assert_existing_agent_picker_activation_stays_in_workspace(cx, false);
 }
 
+/// The roster is live while the picker is open. If the highlighted session
+/// shifts to an earlier row, Enter must activate the row the user still sees
+/// highlighted rather than submitting the now-stale stored index and doing
+/// nothing.
+#[gpui::test]
+fn session_picker_enter_uses_visually_clamped_row_after_roster_shrink(
+    cx: &mut TestAppContext,
+) {
+    use crate::workspace::{SplitDir, TileMembership};
+    use crate::{AgentTile, App};
+    use yalda::session_proto::SessionInfo;
+
+    let (view, vcx) = boot_browser(cx);
+    let (workspace, picker, beta_tile) = view.update(vcx, |v, cx| {
+        let workspace = v.workspace.active_workspace;
+        let project = v.workspace.workspaces[workspace].project();
+        let cwd = v.projects.cwd_of(project).expect("project cwd").to_path_buf();
+        for (sid, label) in [("picker-alpha", "alpha"), ("picker-beta", "beta")] {
+            v.agent_roster.upsert(SessionInfo {
+                session_id: sid.into(),
+                acp_session_id: None,
+                label: label.into(),
+                cwd: cwd.clone(),
+                provider: yalda::acp_channel::AgentProvider::Claude,
+                turns: 1,
+                connected: true,
+                permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+                busy: false,
+                archived: false,
+            });
+        }
+        v.session_tags.insert(
+            "picker-alpha".into(),
+            vec!["first-group".into()],
+        );
+        assert!(v.materialize_roster_unbound_tiles());
+        let beta_tile = v
+            .agent_tile_id_for_server_sid("picker-beta")
+            .expect("beta stable tile");
+        let picker = v
+            .workspace
+            .split_focused(SplitDir::H, App::Agent(AgentTile::new()))
+            .expect("workspace picker tile");
+        cx.notify();
+        (workspace, picker, beta_tile)
+    });
+    vcx.run_until_parked();
+
+    // Real keyboard navigation: row 3 is beta while both sessions are present.
+    vcx.simulate_keystrokes("down down down");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert_eq!(v.agent_tile().and_then(AgentTile::picker).unwrap().selected, 3);
+    });
+
+    // Alpha disappears from the live roster. Beta is now row 2 and the render
+    // highlights it by clamping, but the pre-fix model still stores row 3.
+    view.update(vcx, |v, cx| {
+        assert!(v.agent_roster.remove("picker-alpha"));
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+
+    view.read_with(vcx, |v, _| {
+        assert_eq!(v.workspace.focused_window_id(), Some(beta_tile));
+        assert_eq!(v.workspace.tile_membership(picker), None);
+        assert_eq!(
+            v.workspace.tile_membership(beta_tile),
+            Some(TileMembership::Bound { workspace })
+        );
+        assert_eq!(
+            v.agent_tile()
+                .and_then(AgentTile::session)
+                .and_then(|id| v.sessions.sid_of(id))
+                .map(|sid| sid.as_str()),
+            Some("picker-beta")
+        );
+    });
+}
+
 /// The intermittent variant: the roster session is already attached locally,
 /// but its stable Agent tile is Unbound. Placement must move that tile without
 /// minting a duplicate local session or navigating away.
@@ -5170,7 +5252,15 @@ fn session_picker_places_already_local_unbound_agent_without_duplicate(
         (stable, picker, workspace, session)
     });
 
-    view.update(vcx, |v, cx| v.agent_picker_activate(2, cx));
+    view.update(vcx, |v, cx| {
+        v.agent_tile_mut()
+            .and_then(|tile| tile.picker_mut())
+            .expect("focused Agent tile has picker")
+            .selected = 2;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("enter");
     vcx.run_until_parked();
     view.read_with(vcx, |v, _| {
         assert_eq!(v.sessions.len(), 1, "placement must not mint a duplicate");
