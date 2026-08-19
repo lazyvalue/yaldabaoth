@@ -53,6 +53,9 @@ Produces two binaries:
 - `target/release/yalda` — the editor
 - `target/release/yalda-channel` — the Claude Code MCP channel server (only
   needed if you want the Claude integration)
+- `target/release/yalda-mcp` — the MCP server for controlling Yalda from an
+  agent (see "Controlling Yalda from an agent" below; auto-injected into spawned
+  sessions)
 
 Optionally symlink them onto `$PATH`:
 
@@ -227,6 +230,44 @@ Constraints worth knowing:
 - **Meta keys must be alphanumeric or underscore** (a Claude Code constraint).
   `yalda-channel` silently drops anything else from the `meta` object before
   forwarding.
+
+## Controlling Yalda from an agent (`yalda-mcp`)
+
+`yalda-mcp` is a Model Context Protocol server that lets an agent drive Yalda.
+It speaks JSON-RPC over stdio and talks to the running `yalda-session-server`
+over its Unix socket.
+
+It exposes one tool:
+
+- **`create_session`** — start a brand-new Yalda agent session and send it an
+  initial prompt.
+  - `agent` — `"claude"` or `"codex"` (which agent backs the session).
+  - `prompt` — the first message to deliver once the session exists.
+  - `cwd` — optional working directory (defaults to the caller's cwd).
+  - `label` — optional human-readable session label.
+
+  Internally it connects to the already-running session server, issues
+  `create_session` with the chosen provider, then `admin_prompt` (headless, no
+  ownership) to deliver the initial prompt.
+
+**Auto-injection.** Every agent session Yalda spawns is registered with this MCP
+server automatically (via the ACP `mcpServers` field on `session/new` and
+`session/load` — see `acp_channel::yalda_mcp_servers`), for both Claude and
+Codex. So an agent running *inside* Yalda can recursively spin up more Yalda
+sessions with `create_session` — no manual `.mcp.json` needed.
+
+For an agent Yalda did **not** spawn, register it manually in `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "yalda": { "command": "/absolute/path/to/yalda-mcp" }
+  }
+}
+```
+
+Run `yalda-mcp --help` for the same guidance. `YALDA_MCP_LOG=/path` writes
+diagnostics (stdio is captured when spawned by an agent).
 
 ## Configuration
 

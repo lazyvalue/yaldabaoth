@@ -79,6 +79,10 @@ name = "yalda-channel"
 path = "src/bin/yalda-channel.rs"
 
 [[bin]]
+name = "yalda-mcp"
+path = "src/bin/yalda-mcp.rs"
+
+[[bin]]
 name = "yalda-gpui"
 path = "src/bin/yalda-gpui/main.rs"
 required-features = []

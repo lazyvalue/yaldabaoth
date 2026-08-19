@@ -59,8 +59,8 @@ use std::sync::mpsc as std_mpsc;
 use std::thread::{self, JoinHandle};
 
 use agent_client_protocol::schema::{
-    ContentBlock, ContentChunk, ImageContent, InitializeRequest, LoadSessionRequest,
-    NewSessionRequest, PermissionOptionKind, ProtocolVersion, RequestPermissionOutcome,
+    ContentBlock, ContentChunk, ImageContent, InitializeRequest, LoadSessionRequest, McpServer,
+    McpServerStdio, NewSessionRequest, PermissionOptionKind, ProtocolVersion, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
     SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionId,
     SessionNotification, SessionUpdate, TextContent,
@@ -156,6 +156,38 @@ pub fn configured_agent_command(provider: AgentProvider) -> String {
                 .filter(|v| !v.trim().is_empty())
         })
         .unwrap_or_default()
+}
+
+/// Resolve the absolute path to the `yalda-mcp` control binary. Prefers a
+/// sibling of the current executable (the normal layout — all yalda bins build
+/// into the same dir), falling back to the bare name `yalda-mcp` so a PATH
+/// lookup by the agent still has a chance. Returns `None` only if the current
+/// exe path can't be read AND we have no name to fall back to (never, in
+/// practice — the bare-name fallback is always available).
+fn yalda_mcp_binary_path() -> Option<PathBuf> {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let sibling = dir.join("yalda-mcp");
+        if sibling.exists() {
+            return Some(sibling);
+        }
+    }
+    // Fall back to the bare name; the spawned agent resolves it via PATH.
+    Some(PathBuf::from("yalda-mcp"))
+}
+
+/// The MCP servers to register on every agent session Yalda spawns. Injecting
+/// the `yalda-mcp` stdio server here (provider-agnostic — applied on both
+/// `session/new` and `session/load`) lets an agent running *inside* Yalda
+/// recursively control Yalda (e.g. spin up new sessions via the `create_session`
+/// tool). Returns an empty vec if the binary can't be resolved, so a missing
+/// control binary never breaks session creation.
+pub fn yalda_mcp_servers() -> Vec<McpServer> {
+    match yalda_mcp_binary_path() {
+        Some(path) => vec![McpServer::Stdio(McpServerStdio::new("yalda", path))],
+        None => Vec::new(),
+    }
 }
 
 /// Which yalda frontend is hosting this ACP session. Threaded into the
@@ -2365,6 +2397,7 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                             SessionId::new(id.clone()),
                             cwd.clone(),
                         )
+                        .mcp_servers(yalda_mcp_servers())
                         .meta(agent_meta());
                         // A stale / GC'd / otherwise unloadable resume id can make
                         // the agent HANG in `session/load` — it never errors and
@@ -2429,7 +2462,9 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                         } else {
                             match connection
                                 .send_request(
-                                    NewSessionRequest::new(cwd.clone()).meta(agent_meta()),
+                                    NewSessionRequest::new(cwd.clone())
+                                    .mcp_servers(yalda_mcp_servers())
+                                    .meta(agent_meta()),
                                 )
                                 .block_task()
                                 .await
@@ -2451,7 +2486,9 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                     } else {
                         match connection
                             .send_request(
-                                NewSessionRequest::new(cwd.clone()).meta(agent_meta()),
+                                NewSessionRequest::new(cwd.clone())
+                                    .mcp_servers(yalda_mcp_servers())
+                                    .meta(agent_meta()),
                             )
                             .block_task()
                             .await
@@ -2831,6 +2868,51 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::process::Stdio;
+
+    /// Every spawned agent session must carry exactly one `yalda` stdio MCP
+    /// server, so an agent running inside Yalda can recursively control it.
+    /// Negative control: return `Vec::new()` from `yalda_mcp_servers` (or drop
+    /// the `McpServer::Stdio(...)` element) and this fails — the count / name
+    /// assertions no longer hold.
+    #[test]
+    fn yalda_mcp_servers_yields_one_named_stdio_server() {
+        let servers = yalda_mcp_servers();
+        assert_eq!(servers.len(), 1, "exactly one injected MCP server");
+        match &servers[0] {
+            McpServer::Stdio(s) => {
+                assert_eq!(s.name, "yalda", "server name must be yalda");
+                assert!(
+                    s.command.as_os_str().to_string_lossy().contains("yalda-mcp"),
+                    "command should point at the yalda-mcp binary, got {:?}",
+                    s.command
+                );
+            }
+            other => panic!("expected a stdio MCP server, got {:?}", other),
+        }
+    }
+
+    /// The MCP server reaches the wire: a `NewSessionRequest` built the way the
+    /// spawn path builds it serializes to JSON that carries the `yalda` MCP
+    /// server under `mcpServers`. Negative control: drop
+    /// `.mcp_servers(yalda_mcp_servers())` at the construction sites (or make
+    /// the helper return empty) and `mcpServers` is `[]`, failing the assert.
+    #[test]
+    fn new_session_request_serializes_yalda_mcp_server() {
+        let req = NewSessionRequest::new(std::path::PathBuf::from("/tmp/x"))
+            .mcp_servers(yalda_mcp_servers());
+        let v = serde_json::to_value(&req).expect("serialize NewSessionRequest");
+        let servers = v["mcpServers"].as_array().expect("mcpServers array");
+        assert_eq!(servers.len(), 1, "one MCP server on the wire: {v}");
+        assert_eq!(servers[0]["name"], "yalda");
+        assert!(
+            servers[0]["command"]
+                .as_str()
+                .unwrap_or("")
+                .contains("yalda-mcp"),
+            "stdio command should be yalda-mcp: {}",
+            servers[0]
+        );
+    }
 
     /// A prompt carrying image attachments is turned into a mixed content-block
     /// vector: the text block first, then one `ContentBlock::Image` per
