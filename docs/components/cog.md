@@ -165,16 +165,19 @@ selects row 2, returns focus to the selector — negative-control verified RED),
 `cog_click_graph_row_opens` (real `click_graph` routes through `cog_open_graph_for`
 → the tile enters loading; the live `cog` fetch is runtime gap #2, not pumped).
 
-### UXI-Cog-6 — A live-events pane streams the graph's event feed
+### UXI-Cog-6 — A live-events strip streams the graph's event feed across the bottom
 
-**Statement.** While a graph is open, a third (rightmost) pane streams the graph's
-live event feed from `cog graph watch <id>`. Each event is an aesthetically
-formatted, syntax-highlighted, pretty-printed JSON card, newest first (bounded to
-the last 300). The watcher starts when a graph loads, restarts when a different
-graph loads, and is killed when leaving the graph or closing the tile (no orphaned
-subprocess). Keyboard focus reaches the pane via `Tab` (Selector → Detail → Events →
-Selector); `j`/`k`/`d`/`u`/PageUp/Down scroll the focused pane; clicking it focuses
-it. The pane exists only in a loaded graph, not the explorer.
+**Statement.** While a graph is open, a full-width strip ACROSS THE BOTTOM streams
+the graph's live event feed from `cog graph watch <id>`. Each event is an
+aesthetically formatted, syntax-highlighted, pretty-printed JSON card, newest first
+(bounded to the last 300). The watcher starts when a graph loads, restarts when a
+different graph loads, and is killed when leaving the graph or closing the tile (no
+orphaned subprocess). **Every live event auto-refreshes the graph** — the bundle
+reloads in place (coalesced: one reload in flight + one queued) so the node list /
+detail / stats track the change — and the **events feed persists across that refresh**
+(and manual `r`); only a graph change clears it. Keyboard focus reaches the strip via
+`Tab` (Selector → Detail → Events → Selector); `j`/`k`/`d`/`u`/PageUp/Down scroll the
+focused pane; clicking it focuses it. The strip exists only in a loaded graph.
 
 **Applies to.** `CogView::events` / `push_event` / `events_pane` / `event_card` /
 `scroll_events` / `focus_events` / `toggle_focus`, `CogFocus::Events` (`cog_view.rs`);
@@ -192,9 +195,56 @@ see the live (sse) events streaming."
 dropped — negative-control verified RED on the newest-first insert);
 `cog_events_pane_paints_and_focus_cycles` (layout-probe: no `cog-events` pane in the
 explorer, a real-sized one in a graph; `Tab` cycles Selector → Detail → Events →
-Selector via real `handle_cog_press`). The live `cog graph watch` subprocess ↔ pane
-loop is runtime gap #2 (`cfg(test)` skips the spawn); confirm against `cogd` at
-runtime.
+Selector via real `handle_cog_press`); `cog_event_auto_refreshes_and_preserves_events`
+(a live event sets the coalescing `refreshing` flag; `cog_apply_refresh` →
+`update_bundle` updates the node set while KEEPING the feed — negative-control
+verified RED by clearing events in `update_bundle`). The live `cog graph watch`
+subprocess ↔ strip loop is runtime gap #2 (`cfg(test)` skips the spawn); confirm
+against `cogd` at runtime.
+
+### UXI-Cog-8 — The left panel has an Overview tab (graph render + stats)
+
+**Statement.** In a loaded graph the left panel lists `[Overview, nodes…]` — an
+**Overview** row at the top. Selecting it (click, or `k`/↑ up from the first node)
+shows, in the detail pane, the graph's rendered structure (`cog graph render`) plus
+aggregate **stats**: node count, counts by status, and claimed→done completion
+times (count, quickest, longest, average).
+
+**Applies to.** `CogViewState::Graph { overview }`, `overview_row` / `overview_body`
+/ `click_overview` / `showing_overview`, `select_move` (Overview at linear index 0)
+(`cog_view.rs`); `CogBundle::stats` / `completion_ns` / `fmt_duration_ns`,
+`CogBundle.render` (`cog.rs`).
+
+**Why.** The `/new-ux` request: "on the left panel, create an Overview listing (tab)
+at the top … render the graph and give stats: number nodes, quickest / longest /
+average completion time."
+
+**Status.** implemented
+
+**Enforcement.** `verify_harness.rs::cog_stats_completion_times` (real
+`bundle.stats()` math: counts + quickest/longest/avg from node logs) and
+`cog_overview_reachable_and_toc_jumps` (real `cog_select`: `k` up from node 0 reaches
+the Overview and its body paints — layout-probe). Exact graph-render glyphs are
+runtime gap #1.
+
+### UXI-Cog-9 — Node detail has a Table of Contents, State transitions first
+
+**Statement.** The node detail pane opens with a **Table of Contents** of clickable
+section chips; clicking one jumps the pane to that section. The sections are ordered
+**State transitions first**, then Content, Output (when present), Notes.
+
+**Applies to.** `node_header` / `node_sections` (transitions pushed first) / the TOC
+chips + `scroll_node_section` / `click_node_section` in `right_pane` (`cog_view.rs`).
+
+**Why.** The `/new-ux` request: "On node detail put a Table of Contents at the top so
+I can jump down to different sections. Always make State transitions the first item."
+
+**Status.** implemented
+
+**Enforcement.** `verify_harness.rs::cog_node_sections_state_transitions_first` (real
+`node_sections`: section[0] is Status transitions, then Content/Output/Notes —
+negative-control verified RED by reordering) and the TOC-jump tail of
+`cog_overview_reachable_and_toc_jumps` (a chip click scrolls the detail pane).
 
 ### UXI-Cog-7 — JSON is syntax-highlighted everywhere in the tile
 

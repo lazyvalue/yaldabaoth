@@ -20215,6 +20215,7 @@ fn cog_test_bundle(nodes: Vec<crate::CogNode>) -> crate::CogBundle {
         edges: vec![],
         logs,
         notes,
+        render: "n1\n└─ n2".to_string(),
     }
 }
 
@@ -20368,11 +20369,12 @@ fn cog_detail_paints_and_overflows(cx: &mut TestAppContext) {
     });
     vcx.run_until_parked();
     let viewport = crate::layout_probe_get("cog-right");
-    let content = crate::layout_probe_get("cog-right-content");
+    // Node detail lays sections out directly: [transitions(0), Content(1), Notes(2)].
+    let content = crate::layout_probe_get("cog-sec-1");
     crate::layout_probe_end();
 
     let (_, _, _, vp_h) = viewport.expect("right pane viewport did not paint");
-    let (_, _, _, ct_h) = content.expect("right pane content did not paint");
+    let (_, _, _, ct_h) = content.expect("content section did not paint");
     assert!(vp_h > 0.0, "viewport has real height ({vp_h})");
     assert!(
         ct_h > vp_h,
@@ -20653,4 +20655,187 @@ fn cog_events_pane_paints_and_focus_cycles(cx: &mut TestAppContext) {
     view.update(vcx, |v, cx| v.handle_cog_press(tab(), cx));
     vcx.run_until_parked();
     assert!(cv.update(vcx, |c, _| c.focused_selector()), "tab → selector");
+}
+
+#[cfg(test)]
+fn cog_tile_refreshing(view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext) -> bool {
+    view.update(vcx, |v, _| match v.workspace.focused_content() {
+        Some(crate::App::Cog(tile)) => tile.refreshing,
+        _ => panic!("expected a Cog tile"),
+    })
+}
+
+/// UXI-Cog-6: a live event auto-refreshes the graph (real `cog_push_event` sets
+/// the coalescing `refreshing` flag), and the refresh reload (`cog_apply_refresh`
+/// → `update_bundle`) updates the node set IN PLACE while PRESERVING the events
+/// feed. The events-preserving `update_bundle` is the negative-control target.
+#[gpui::test]
+fn cog_event_auto_refreshes_and_preserves_events(cx: &mut TestAppContext) {
+    let (view, vcx, cv, wid) = boot_with_cog(cx);
+    let req = cog_tile_req(&view, vcx);
+    view.update(vcx, |v, cx| {
+        v.cog_apply(
+            wid,
+            req,
+            Ok(crate::CogFetch::Graph(Box::new(cog_test_bundle(vec![
+                cog_test_node("n1", "first", "done", serde_json::json!({"purpose": "a"})),
+                cog_test_node("n2", "second", "open", serde_json::json!({"purpose": "b"})),
+            ])))),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    assert!(!cog_tile_refreshing(&view, vcx), "no refresh before any event");
+
+    // A live event both buffers AND triggers an auto-refresh (coalesced flag set).
+    let generation = cog_tile_watch_gen(&view, vcx);
+    view.update(vcx, |v, cx| {
+        v.cog_push_event(wid, generation, r#"{"kind":"claimed","node":"n1"}"#.into(), cx);
+    });
+    vcx.run_until_parked();
+    assert_eq!(cv.update(vcx, |c, _| c.events_len()), 1, "event buffered");
+    assert!(cog_tile_refreshing(&view, vcx), "a live event auto-refreshes the graph");
+
+    // The refresh reload lands: a NEW 3-node bundle updates the node list in
+    // place, and the events feed SURVIVES (not cleared like a graph change).
+    view.update(vcx, |v, cx| {
+        v.cog_apply_refresh(
+            wid,
+            Ok(cog_test_bundle(vec![
+                cog_test_node("n1", "first", "done", serde_json::json!({"purpose": "a"})),
+                cog_test_node("n2", "second", "claimed", serde_json::json!({"purpose": "b"})),
+                cog_test_node("n3", "third", "open", serde_json::json!({"purpose": "c"})),
+            ])),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    assert_eq!(cv.update(vcx, |c, _| c.list_len()), 3, "refresh updated the node set");
+    assert_eq!(
+        cv.update(vcx, |c, _| c.events_len()),
+        1,
+        "the events feed persists across the refresh"
+    );
+}
+
+#[cfg(test)]
+fn cog_test_detail_style() -> crate::DetailStyle {
+    crate::DetailStyle {
+        fg: gpui::rgb(0xffffff).into(),
+        dim: gpui::rgb(0x888888).into(),
+        accent: gpui::rgb(0xffaa55).into(),
+        err: gpui::rgb(0xff6b6b).into(),
+        mono: "mono".into(),
+        prose: "prose".into(),
+        base: gpui::px(14.0),
+        pt: 14.0,
+    }
+}
+
+/// UXI-Cog-9: node detail sections are ordered with **State transitions first**
+/// (then Content, Output when present, Notes). Reordering it is the negative
+/// control. Drives the real `node_sections` builder.
+#[gpui::test]
+fn cog_node_sections_state_transitions_first(_cx: &mut TestAppContext) {
+    let hl = yalda::highlight::Highlighter::with_syntect_theme("base16-ocean.dark");
+    let st = cog_test_detail_style();
+
+    // A node WITH output → sections are [transitions, Content, Output, Notes].
+    let mut node = cog_test_node("n1", "x", "done", serde_json::json!({"purpose": "p"}));
+    node.output = Some(serde_json::json!({"result": "ok"}));
+    let bundle = cog_test_bundle(vec![node]);
+    let titles: Vec<String> = crate::node_sections(&bundle, &bundle.nodes[0], &hl, &st)
+        .into_iter()
+        .map(|(t, _)| t)
+        .collect();
+
+    assert!(
+        titles[0].starts_with("Status transitions"),
+        "State transitions must be the FIRST section, got {titles:?}"
+    );
+    assert_eq!(titles[1], "Content");
+    assert_eq!(titles[2], "Output");
+    assert!(titles[3].starts_with("Notes"));
+}
+
+/// UXI-Cog-8: `bundle.stats()` computes node counts + claimed→done completion
+/// min/max/avg from the node logs — the numbers shown in the Overview.
+#[gpui::test]
+fn cog_stats_completion_times(_cx: &mut TestAppContext) {
+    let sec = 1_000_000_000i64;
+    // n1: claimed@1s → done@3s (2s). n2: claimed@10s → done@15s (5s). n3: open.
+    let mut logs = std::collections::BTreeMap::new();
+    let tr = |to: &str, at: i64| crate::CogLogEntry {
+        seq: at,
+        at,
+        actor: "a".into(),
+        kind: "status_changed".into(),
+        data: serde_json::json!({"to": to}),
+    };
+    logs.insert("n1".to_string(), vec![tr("claimed", sec), tr("done", 3 * sec)]);
+    logs.insert("n2".to_string(), vec![tr("claimed", 10 * sec), tr("done", 15 * sec)]);
+    let bundle = crate::CogBundle {
+        graph: cog_test_graph("g", "G"),
+        status: Default::default(),
+        nodes: vec![
+            cog_test_node("n1", "a", "done", serde_json::json!({})),
+            cog_test_node("n2", "b", "done", serde_json::json!({})),
+            cog_test_node("n3", "c", "open", serde_json::json!({})),
+        ],
+        edges: vec![],
+        logs,
+        notes: std::collections::BTreeMap::new(),
+        render: String::new(),
+    };
+    let s = bundle.stats();
+    assert_eq!(s.total, 3);
+    assert_eq!(s.done, 2);
+    assert_eq!(s.open, 1);
+    assert_eq!(s.completed, 2, "two nodes have claimed→done durations");
+    assert_eq!(s.quickest_ns, Some(2 * sec));
+    assert_eq!(s.longest_ns, Some(5 * sec));
+    assert_eq!(s.average_ns, Some((7 * sec) / 2));
+}
+
+/// UXI-Cog-8: the Overview row is reachable (keyboard `k` up from the first node,
+/// and a click), and shows the Overview body; a TOC click jumps the detail pane.
+#[gpui::test]
+fn cog_overview_reachable_and_toc_jumps(cx: &mut TestAppContext) {
+    let (view, vcx, cv, wid) = boot_with_cog(cx);
+    let req = cog_tile_req(&view, vcx);
+    view.update(vcx, |v, cx| {
+        v.cog_apply(
+            wid,
+            req,
+            Ok(crate::CogFetch::Graph(Box::new(cog_test_bundle(vec![
+                cog_tall_node("n1", "first", "done"),
+                cog_tall_node("n2", "second", "open"),
+            ])))),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    assert!(!cv.update(vcx, |c, _| c.showing_overview()), "opens on a node, not overview");
+
+    // Keyboard `k` up from the first node reaches the Overview row (done inside
+    // the probe window so the cached view re-renders + the overview body paints).
+    crate::layout_probe_begin();
+    view.update(vcx, |v, cx| v.cog_select(-1, cx));
+    vcx.run_until_parked();
+    let ov = crate::layout_probe_get("cog-right-content");
+    crate::layout_probe_end();
+    assert!(cv.update(vcx, |c, _| c.showing_overview()), "k up from node 0 reaches Overview");
+    let (_, _, w, h) = ov.expect("overview body paints");
+    assert!(w > 0.0 && h > 0.0, "overview body has real size ({w}x{h})");
+
+    // Back to a node; a TOC click (section 2) scrolls the detail pane down.
+    view.update(vcx, |v, cx| v.cog_select(1, cx)); // overview → node 0
+    vcx.run_until_parked();
+    assert!(!cv.update(vcx, |c, _| c.showing_overview()));
+    cv.update(vcx, |c, cx| c.click_node_section(2, cx));
+    vcx.run_until_parked();
+    assert!(
+        cv.update(vcx, |c, _| c.right_scroll_y()) < 0.0,
+        "a TOC jump to a later section scrolls the detail pane"
+    );
 }

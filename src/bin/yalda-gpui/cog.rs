@@ -146,6 +146,22 @@ pub(crate) struct CogBundle {
     pub(crate) logs: BTreeMap<String, Vec<CogLogEntry>>,
     /// node id → its notes.
     pub(crate) notes: BTreeMap<String, Vec<CogNote>>,
+    /// The ASCII DAG render (`cog graph render`), shown in the Overview.
+    pub(crate) render: String,
+}
+
+/// Aggregate stats for a graph's Overview: node counts by status + node
+/// claimed→done completion durations (nanoseconds).
+pub(crate) struct CogStats {
+    pub(crate) total: usize,
+    pub(crate) done: usize,
+    pub(crate) claimed: usize,
+    pub(crate) open: usize,
+    pub(crate) failed: usize,
+    pub(crate) completed: usize,
+    pub(crate) quickest_ns: Option<i64>,
+    pub(crate) longest_ns: Option<i64>,
+    pub(crate) average_ns: Option<i64>,
 }
 
 impl CogBundle {
@@ -179,6 +195,71 @@ impl CogBundle {
             .find(|n| n.id == id)
             .map(|n| n.status.as_str())
     }
+
+    /// The claimed→done duration (ns) of a node from its log, if it has both a
+    /// `claimed` and a later `done` status transition.
+    pub(crate) fn completion_ns(&self, id: &str) -> Option<i64> {
+        let log = self.logs.get(id)?;
+        let at_of = |to: &str| {
+            log.iter()
+                .filter(|e| e.kind == "status_changed" && e.data.get("to").and_then(|v| v.as_str()) == Some(to))
+                .map(|e| e.at)
+                .next()
+        };
+        let claimed = at_of("claimed")?;
+        let done = at_of("done")?;
+        let d = done - claimed;
+        if d > 0 { Some(d) } else { None }
+    }
+
+    /// Aggregate Overview stats: status counts + completion-time min/max/avg.
+    pub(crate) fn stats(&self) -> CogStats {
+        let mut s = CogStats {
+            total: self.nodes.len(),
+            done: 0,
+            claimed: 0,
+            open: 0,
+            failed: 0,
+            completed: 0,
+            quickest_ns: None,
+            longest_ns: None,
+            average_ns: None,
+        };
+        let mut sum: i128 = 0;
+        for n in &self.nodes {
+            match n.status.as_str() {
+                "done" => s.done += 1,
+                "claimed" => s.claimed += 1,
+                "failed" | "abandoned" => s.failed += 1,
+                _ => s.open += 1,
+            }
+            if let Some(d) = self.completion_ns(&n.id) {
+                s.completed += 1;
+                sum += d as i128;
+                s.quickest_ns = Some(s.quickest_ns.map_or(d, |q| q.min(d)));
+                s.longest_ns = Some(s.longest_ns.map_or(d, |l| l.max(d)));
+            }
+        }
+        if s.completed > 0 {
+            s.average_ns = Some((sum / s.completed as i128) as i64);
+        }
+        s
+    }
+}
+
+/// Format a nanosecond duration compactly (e.g. `1.4s`, `2m 3s`, `1h 4m`).
+pub(crate) fn fmt_duration_ns(ns: i64) -> String {
+    let secs = ns / 1_000_000_000;
+    if secs < 60 {
+        let millis = ns / 1_000_000;
+        return format!("{:.1}s", millis as f64 / 1000.0);
+    }
+    let (m, s) = (secs / 60, secs % 60);
+    if m < 60 {
+        return format!("{m}m {s}s");
+    }
+    let (h, m) = (m / 60, m % 60);
+    format!("{h}h {m}m")
 }
 
 /// The display-facing status of a node (stored status + open→ready/blocked).
@@ -241,6 +322,12 @@ pub(crate) struct CogTile {
     /// Monotonic generation for the watcher; the drain task tags events with it
     /// and stale events (from a killed prior watcher) are dropped.
     pub(crate) watch_gen: u64,
+    /// A graph-refresh (triggered by a live event) is in flight — coalesces a
+    /// burst of events into at most one in-flight reload plus one queued.
+    pub(crate) refreshing: bool,
+    /// An event arrived while a refresh was in flight — refresh once more when it
+    /// completes so the final state isn't missed.
+    pub(crate) refresh_pending: bool,
 }
 
 impl CogTile {
@@ -251,6 +338,8 @@ impl CogTile {
             view: None,
             watch: None,
             watch_gen: 0,
+            refreshing: false,
+            refresh_pending: false,
         }
     }
 
@@ -323,6 +412,8 @@ pub(crate) fn load_graph(id: &str) -> Result<CogBundle, String> {
     let edges: Vec<CogEdge> = cog_json(&["graph", "edges", id]).unwrap_or_default();
     let node_notes: Vec<CogNodeNotes> =
         cog_json(&["graph", "read-node-notes", id]).unwrap_or_default();
+    // The ASCII DAG render for the Overview (raw text, not JSON).
+    let render = run_cog(&["graph", "render", id]).unwrap_or_default();
 
     let mut notes: BTreeMap<String, Vec<CogNote>> = BTreeMap::new();
     for nn in node_notes {
@@ -345,6 +436,7 @@ pub(crate) fn load_graph(id: &str) -> Result<CogBundle, String> {
         edges,
         logs,
         notes,
+        render,
     })
 }
 
