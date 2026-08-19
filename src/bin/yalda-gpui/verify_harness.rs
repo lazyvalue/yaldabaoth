@@ -8064,6 +8064,265 @@ fn jump_panel_workspace_folders_and_unbound_rows_are_tile_native(cx: &mut TestAp
     crate::layout_probe_end();
 }
 
+/// UXI-JumpPanel-24: tag-folder chrome is compact and fixed, while a tile row
+/// keeps exactly the standard navigation-row height whether it is tagged or
+/// loose. Document zoom must not affect any of these jump-panel measurements.
+#[gpui::test]
+fn jump_panel_tagged_items_keep_fixed_chrome_size(cx: &mut TestAppContext) {
+    use crate::{App, LinearTile};
+    let (view, vcx) = boot_browser(cx);
+    let (pid, tagged, loose) = view.update(vcx, |v, _| {
+        let pid = v.workspace.active_workspace().expect("workspace").project();
+        let mut tagged_tile = LinearTile::new();
+        tagged_tile.title = "tagged-linear".into();
+        let tagged = v.workspace.push_unbound(App::Linear(tagged_tile), pid);
+        v.workspace.tile_mut(tagged).unwrap().tags.insert("frontend".into());
+
+        let mut loose_tile = LinearTile::new();
+        loose_tile.title = "loose-linear".into();
+        let loose = v.workspace.push_unbound(App::Linear(loose_tile), pid);
+        (pid, tagged, loose)
+    });
+
+    let measure = |view: &gpui::Entity<YaldaGpuiView>,
+                   vcx: &mut gpui::VisualTestContext| {
+        crate::layout_probe_begin();
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+        let folder = crate::layout_probe_get(&format!("jump-tag-folder-{}-0", pid.0))
+            .expect("tag folder paints")
+            .3;
+        let tagged_row = crate::layout_probe_get(&format!("jump-tile-row-{tagged}-tg0"))
+            .expect("tagged tile row paints")
+            .3;
+        let loose_row = crate::layout_probe_get(&format!("jump-tile-row-{loose}"))
+            .expect("untagged tile row paints")
+            .3;
+        let standard = crate::layout_probe_get("jump-system-console")
+            .expect("standard jump navigation row paints")
+            .3;
+        crate::layout_probe_end();
+        (folder, tagged_row, loose_row, standard)
+    };
+
+    let initial = measure(&view, &mut *vcx);
+    assert!(
+        initial.0 <= initial.3,
+        "tag folder must stay compact, never taller than a normal jump row: folder={}px standard={}px",
+        initial.0,
+        initial.3
+    );
+    assert!(
+        (initial.1 - initial.3).abs() < 0.5 && (initial.2 - initial.3).abs() < 0.5,
+        "tagged and untagged tiles must share standard row height: tagged={}px loose={}px standard={}px",
+        initial.1,
+        initial.2,
+        initial.3
+    );
+
+    view.update(vcx, |v, cx| v.set_text_scale(2.0, cx));
+    let zoomed = measure(&view, &mut *vcx);
+    for (before, after, label) in [
+        (initial.0, zoomed.0, "tag folder"),
+        (initial.1, zoomed.1, "tagged tile"),
+        (initial.2, zoomed.2, "untagged tile"),
+        (initial.3, zoomed.3, "standard row"),
+    ] {
+        assert!(
+            (before - after).abs() < 0.5,
+            "{label} is chrome and must not scale with document zoom: before={before}px after={after}px"
+        );
+    }
+}
+
+/// UXI-Workspace-21: Close Tile acts on the directly focused stable tile even
+/// when it lives in Unbound. Exercise the exact two picker states from the bug
+/// report through the real system-menu command dispatcher.
+#[gpui::test]
+fn close_tile_removes_unbound_buffer_and_agent_picker(cx: &mut TestAppContext) {
+    use crate::{AgentTile, App, BrowserWindow, BufferApp};
+    let (view, vcx) = boot_browser(cx);
+    let (buffer, agent, workspace_count) = view.update(vcx, |v, _| {
+        let pid = v.workspace.active_workspace().expect("workspace").project();
+        let cwd = v.projects.cwd_of(pid).expect("project cwd").to_path_buf();
+        let buffer = v.workspace.push_unbound(
+            App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd))),
+            pid,
+        );
+        let agent = v.workspace.push_unbound(App::Agent(AgentTile::new()), pid);
+        (buffer, agent, v.workspace.workspaces.len())
+    });
+
+    view.update(vcx, |v, _| assert!(v.workspace.focus_unbound(buffer)));
+    view.update(vcx, |v, cx| v.dispatch_menu_command("close-window", cx));
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert!(v.workspace.tile(buffer).is_none(), "the unbound Buffer picker closes");
+        assert!(v.workspace.tile(agent).is_some(), "closing Buffer does not remove Agent");
+        assert_eq!(v.workspace.directly_focused_unbound(), None);
+        assert_eq!(v.workspace.workspaces.len(), workspace_count, "no workspace closes");
+    });
+
+    view.update(vcx, |v, _| assert!(v.workspace.focus_unbound(agent)));
+    view.update(vcx, |v, cx| v.dispatch_menu_command("close-window", cx));
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert!(v.workspace.tile(agent).is_none(), "the empty unbound Agent picker closes");
+        assert_eq!(v.workspace.directly_focused_unbound(), None);
+        assert_eq!(v.workspace.workspaces.len(), workspace_count, "workspace floor survives");
+        assert!(v.workspace.active_workspace().is_some(), "the active workspace is revealed");
+    });
+}
+
+/// UXI-Workspace-22: a tile App cannot opt out of directional workspace focus.
+/// Drive the real `Ctrl-W h/j/k/l` bindings through every rendered App state,
+/// from a center tile with a real spatial neighbor in each direction. This is
+/// deliberately a focus assertion, not a split-command proxy: the reported bug
+/// was specifically that the directional chord vanished in some tile states.
+#[gpui::test]
+fn ctrl_w_shell_commands_reach_every_tile_app(cx: &mut TestAppContext) {
+    use crate::{
+        workspace::{Slot, SplitDir, WorkspaceView}, AgentTile, App, BrowserWindow, BufferApp,
+        CogTile, KeymapTile, LinearTile,
+    };
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_browser(cx);
+
+    let (center, left, right, up, down, cwd) = view.update(vcx, |v, cx| {
+        let center = v.workspace.focused_window_id().expect("center tile");
+        let cwd = v.active_workspace_cwd().unwrap_or_else(crate::process_cwd);
+        let picker = || App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd.clone())));
+        let mut add_neighbor = || {
+            v.workspace.active_workspace_mut().unwrap().focused = center;
+            v.workspace
+                .split_focused(SplitDir::V, picker())
+                .expect("neighbor tile")
+        };
+        let left = add_neighbor();
+        let right = add_neighbor();
+        let up = add_neighbor();
+        let down = add_neighbor();
+
+        let wsp = v.workspace.active_workspace_mut().expect("workspace");
+        wsp.view = WorkspaceView::Plane;
+        let leaves = wsp.layout.leaf_ids();
+        wsp.desktop.reconcile(&leaves);
+        for (id, slot) in [
+            (center, Slot::new(0, 0)),
+            (left, Slot::new(0, -1)),
+            (right, Slot::new(0, 1)),
+            (up, Slot::new(-1, 0)),
+            (down, Slot::new(1, 0)),
+        ] {
+            wsp.desktop.set_anchor(id, slot);
+        }
+        wsp.focused = center;
+        cx.notify();
+        (center, left, right, up, down, cwd)
+    });
+    vcx.run_until_parked();
+
+    let assert_directions = |label: &str,
+                             view: &gpui::Entity<YaldaGpuiView>,
+                             vcx: &mut gpui::VisualTestContext| {
+        for (keys, expected) in [
+            ("ctrl-w h", left),
+            ("ctrl-w l", right),
+            ("ctrl-w k", up),
+            ("ctrl-w j", down),
+        ] {
+            view.update(vcx, |v, cx| {
+                v.workspace.active_workspace_mut().unwrap().focused = center;
+                cx.notify();
+            });
+            vcx.run_until_parked();
+            vcx.simulate_keystrokes(keys);
+            vcx.run_until_parked();
+            view.read_with(vcx, |v, _| {
+                assert_eq!(
+                    v.workspace.focused_window_id(),
+                    Some(expected),
+                    "{keys} must move workspace focus from the {label} tile"
+                );
+            });
+        }
+    };
+
+    let install = |label: &str,
+                   app: App,
+                   view: &gpui::Entity<YaldaGpuiView>,
+                   vcx: &mut gpui::VisualTestContext| {
+        view.update(vcx, |v, cx| {
+            v.workspace.active_workspace_mut().unwrap().focused = center;
+            v.set_screen(app);
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        assert_directions(label, view, vcx);
+    };
+
+    install(
+        "Buffer picker",
+        App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd.clone()))),
+        &view,
+        vcx,
+    );
+
+    view.update(vcx, |v, cx| {
+        v.workspace.active_workspace_mut().unwrap().focused = center;
+        v.test_open_doc("# focus routing");
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    assert_directions("Buffer viewer", &view, vcx);
+
+    view.update(vcx, |v, cx| {
+        v.workspace.active_workspace_mut().unwrap().focused = center;
+        v.test_open_edit("focus routing");
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    assert_directions("Buffer editor", &view, vcx);
+
+    install("Agent picker", App::Agent(AgentTile::new()), &view, vcx);
+    install(
+        "dormant Agent",
+        App::Agent(AgentTile::dormant(crate::ServerSid::new(
+            "focus-routing-dormant",
+        ))),
+        &view,
+        vcx,
+    );
+    install(
+        "unavailable Agent",
+        App::Agent(AgentTile::Unavailable {
+            remembered: crate::ServerSid::new("focus-routing-unavailable"),
+            lost: "focus-routing-unavailable".into(),
+        }),
+        &view,
+        vcx,
+    );
+
+    view.update(vcx, |v, cx| {
+        v.workspace.active_workspace_mut().unwrap().focused = center;
+        v.set_screen(App::Agent(AgentTile::new()));
+        let session = crate::AgentSession {
+            state: crate::AgentState::new_server_managed(None),
+            label: "focus-routing-agent".into(),
+            cwd: cwd.clone(),
+            resume_id: None,
+        };
+        v.show_local_session(session, cx);
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    assert_directions("bound Agent session", &view, vcx);
+
+    install("Linear", App::Linear(LinearTile::new()), &view, vcx);
+    install("Cog", App::Cog(CogTile::new()), &view, vcx);
+    install("Keymap", App::Keymap(KeymapTile::new()), &view, vcx);
+}
+
 // ── Session tags (UXI-JumpPanel-20/-21, UXI-AgentTile-33) ────────────────────
 
 /// UXI-JumpPanel-20: the pure tag partition. A row appears once per DISTINCT tag

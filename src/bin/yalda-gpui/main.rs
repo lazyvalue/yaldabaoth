@@ -404,6 +404,75 @@ impl<E: InteractiveElement> WorkspaceNavExt for E {
     }
 }
 
+// The Ctrl-W family is shell vocabulary, not App vocabulary. GPUI matches the
+// global binding first, then looks for an action listener in the focused
+// element's ancestry; a missing listener silently drops the action. Keep the
+// action names and their single common-ancestor wiring generated from this one
+// table so adding a command cannot require edits to every App renderer.
+macro_rules! define_ctrl_w_shell_actions {
+    ($( $action:ident => $handler:ident ),+ $(,)?) => {
+        #[cfg(test)]
+        pub(crate) const CTRL_W_SHELL_ACTION_NAMES: &[&str] = &[
+            $(stringify!($action)),+
+        ];
+
+        pub(crate) trait CtrlWShellActionsExt: Sized {
+            fn ctrl_w_shell_actions(self, cx: &mut Context<YaldaGpuiView>) -> Self;
+        }
+
+        impl<E: InteractiveElement> CtrlWShellActionsExt for E {
+            fn ctrl_w_shell_actions(self, cx: &mut Context<YaldaGpuiView>) -> Self {
+                let element = self;
+                $(let element = element.on_action(
+                    cx.listener(YaldaGpuiView::$handler)
+                );)+
+                element
+            }
+        }
+    };
+}
+
+define_ctrl_w_shell_actions! {
+    SplitH => split_h,
+    SplitV => split_v,
+    CloseWindow => close_window,
+    OnlyWindow => only_window,
+    MoveTile => move_tile,
+    MoveTileAndFollow => move_tile_and_follow,
+    FocusLeft => focus_left,
+    FocusRight => focus_right,
+    FocusUp => focus_up,
+    FocusDown => focus_down,
+    FocusNext => focus_next,
+    FocusPrev => focus_prev,
+    SwapTileLeft => swap_tile_left,
+    SwapTileDown => swap_tile_down,
+    SwapTileUp => swap_tile_up,
+    SwapTileRight => swap_tile_right,
+    PromoteTile => promote_tile,
+    SwapTilePicker => open_swap_tile_picker,
+    RotateTilesForward => rotate_tiles_forward,
+    RotateTilesBackward => rotate_tiles_backward,
+    UndoArrangement => undo_arrangement,
+    ZoomOutWorkspace => zoom_out_workspace,
+    ZoomInWorkspace => zoom_in_workspace,
+    ResetWorkspaceView => reset_workspace_view,
+    ToggleWorkspaceColumns => toggle_workspace_columns,
+    DesktopTileSize => desktop_tile_size_overlay,
+    TagViewChord => tag_view_chord,
+    TagToggleChord => tag_toggle_chord,
+    ClearTagView => clear_tag_view,
+    BindFocusedTile => bind_focused_tile,
+    UnbindFocusedTile => unbind_focused_tile,
+    StashScratchpad => stash_scratchpad,
+    SummonScratchpad => summon_scratchpad,
+    WorkspaceBackAndForth => workspace_back_and_forth,
+    GrowMasterArea => grow_master_area,
+    ShrinkMasterArea => shrink_master_area,
+    IncreaseMasterCount => increase_master_count,
+    DecreaseMasterCount => decrease_master_count,
+}
+
 // ----------------------------------------------------------------------------
 // gpui::Keystroke → yalda::keys::KeyPress bridge
 // ----------------------------------------------------------------------------
