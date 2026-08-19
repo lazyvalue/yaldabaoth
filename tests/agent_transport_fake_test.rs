@@ -22,8 +22,8 @@
 use std::sync::Arc;
 
 use yalda::acp_channel::{
-    AgentSpawner, AgentTransport, DEFAULT_PERMISSION_MODE, FakeAgentSpawner, FakeTransport,
-    PermissionMode, RealAgentSpawner, ReplyEvent, YaldaFrontend,
+    AgentProvider, AgentSpawner, AgentTransport, DEFAULT_PERMISSION_MODE, FakeAgentSpawner,
+    FakeTransport, PermissionMode, RealAgentSpawner, ReplyEvent, YaldaFrontend,
 };
 
 /// A faithful re-implementation of the session-server pump's CORE drain logic
@@ -167,6 +167,7 @@ fn fake_handle_shares_state_with_controls() {
 fn real_spawner_forwards_to_subprocess_path() {
     let spawner: Arc<dyn AgentSpawner> = Arc::new(RealAgentSpawner);
     let result = spawner.spawn(
+        AgentProvider::Claude,
         "definitely-not-an-agent-binary-xyzzy",
         None,
         None,
@@ -202,7 +203,13 @@ fn fake_spawner_yields_in_process_transport() {
     });
 
     let transport = spawner
-        .spawn("", None, None, YaldaFrontend::Gpui)
+        .spawn(
+            AgentProvider::Claude,
+            "",
+            None,
+            None,
+            YaldaFrontend::Gpui,
+        )
         .expect("fake spawn succeeds");
     assert!(transport.is_connected());
 
@@ -250,7 +257,13 @@ fn fake_spawner_can_fail_on_demand() {
         Err(std::io::Error::other("simulated spawn failure"))
     });
     let err = spawner
-        .spawn("", None, None, YaldaFrontend::Gpui)
+        .spawn(
+            AgentProvider::Claude,
+            "",
+            None,
+            None,
+            YaldaFrontend::Gpui,
+        )
         .map(|_| ())
         .expect_err("fake spawner returns the injected error");
     assert_eq!(err.kind(), std::io::ErrorKind::Other);

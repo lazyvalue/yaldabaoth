@@ -654,7 +654,7 @@ impl YaldaGpuiView {
                 .workspace
                 .unbound_tiles
                 .iter()
-                .filter(|tile| tile.project == id)
+                .filter(|tile| tile.project() == id)
                 .map(|tile| self.jump_tile_row(&tile.window, &tile_agent_rows, cx))
                 .filter(|tile| match (&tile.agent, agent_tab) {
                     (None, JumpAgentTab::All) => true,
@@ -731,7 +731,7 @@ impl YaldaGpuiView {
         let render_index = agent_match
             .as_ref()
             .map(|(index, _)| *index)
-            .unwrap_or(window.id as usize);
+            .unwrap_or(window.id() as usize);
         let mut agent = agent_match.take().map(|(_, row)| row);
         if let Some(row) = &mut agent {
             row.tags = tags.clone();
@@ -741,11 +741,11 @@ impl YaldaGpuiView {
             .map(|row| row.label.clone())
             .unwrap_or_else(|| Self::desktop_tile_title(&self.sessions, &window.content, cx));
         JumpTileRow {
-            id: window.id,
+            id: window.id(),
             render_index,
             label,
             tags,
-            active: self.workspace.focused_window_id() == Some(window.id),
+            active: self.workspace.focused_window_id() == Some(window.id()),
             agent,
         }
     }
@@ -1228,7 +1228,7 @@ impl YaldaGpuiView {
         let _ = cx;
         let mut present: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for tile in &self.workspace.unbound_tiles {
-            if self.projects.name_of(tile.project) == project {
+            if self.projects.name_of(tile.project()) == project {
                 present.extend(tile.window.tags.iter().cloned());
             }
         }

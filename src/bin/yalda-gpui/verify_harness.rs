@@ -8174,6 +8174,209 @@ fn close_tile_removes_unbound_buffer_and_agent_picker(cx: &mut TestAppContext) {
     });
 }
 
+/// UXI-Workspace-23: closing a bound Agent tile is a placement transition,
+/// equivalent to Stash. The complete stable tile moves to Unbound and enters
+/// the scratchpad MRU; its session remains selected and alive. Exercise the
+/// production system-menu dispatcher, not `Frame::stash_window` directly.
+#[gpui::test]
+fn close_bound_agent_tile_stashes_same_tile_and_session(cx: &mut TestAppContext) {
+    use crate::{workspace::TileMembership, AgentTile, App, BrowserWindow, BufferApp};
+
+    let (view, vcx, session, _) = boot_with_transcript(cx);
+    let agent = view.update(vcx, |v, _| {
+        let agent = v.workspace.focused_window_id().expect("bound Agent tile");
+        let cwd = v.agent_base_cwd();
+        v.workspace
+            .split_focused(
+                crate::workspace::SplitDir::V,
+                App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd))),
+            )
+            .expect("second tile keeps the workspace alive");
+        assert!(v.workspace.focus_tile(agent));
+        agent
+    });
+
+    view.update(vcx, |v, cx| v.dispatch_menu_command("close-window", cx));
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, cx| {
+        assert_eq!(
+            v.workspace.tile_membership(agent),
+            Some(TileMembership::Unbound),
+            "Close Tile must move the same Agent tile to Unbound"
+        );
+        assert_eq!(
+            v.workspace.tile(agent).and_then(|window| match &window.content {
+                App::Agent(AgentTile::Bound { session, .. }) => Some(*session),
+                _ => None,
+            }),
+            Some(session),
+            "the stashed tile must retain its selected live session"
+        );
+        assert!(v.sessions.contains(session), "Close Tile cannot kill the session");
+        assert_eq!(v.workspace.scratchpad.first(), Some(&agent));
+        let rows = v.jump_panel_sections(cx).0;
+        assert!(
+            rows.iter().flat_map(|section| &section.unbound).any(|row| row.id == agent),
+            "the same tile must appear in the jump-panel Unbound list immediately"
+        );
+    });
+}
+
+/// The durable workspace floor must not make Agent close destructive. Closing
+/// the sole tile seeds a Buffer picker and still stashes the exact Agent tile.
+#[gpui::test]
+fn close_sole_bound_agent_stashes_and_seeds_workspace_floor(cx: &mut TestAppContext) {
+    use crate::{workspace::TileMembership, AgentTile, App, BufferApp};
+
+    let (view, vcx, session, _) = boot_with_transcript(cx);
+    let (agent, project) = view.update(vcx, |v, _| {
+        let agent = v.workspace.focused_window_id().expect("sole Agent tile");
+        let project = v.workspace.tile(agent).expect("Agent tile").project();
+        v.workspace
+            .tile_mut(agent)
+            .expect("Agent tile")
+            .tags
+            .insert("preserved-tag".into());
+        (agent, project)
+    });
+
+    view.update(vcx, |v, cx| v.dispatch_menu_command("close-window", cx));
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert_eq!(v.workspace.workspaces.len(), 1);
+        assert_eq!(v.workspace.tile_membership(agent), Some(TileMembership::Unbound));
+        let tile = v.workspace.tile(agent).expect("same stashed Agent tile");
+        assert_eq!(tile.project(), project);
+        assert!(tile.tags.contains("preserved-tag"));
+        assert!(matches!(
+            &tile.content,
+            App::Agent(AgentTile::Bound { session: bound, .. }) if *bound == session
+        ));
+        assert!(matches!(
+            &v.workspace.active_workspace().expect("workspace floor").layout,
+            crate::workspace::Layout::Leaf(window)
+                if matches!(&window.content, App::Buffer(BufferApp::Picking(_)))
+        ));
+    });
+}
+
+/// bug-0047: the server can publish a newly-created session to the roster
+/// before the create reply binds that server sid to its provisional local
+/// session. Roster materialization must not leave a second stable Agent tile
+/// once the production bind choke resolves the provisional identity.
+#[gpui::test]
+fn provisional_bind_reconciles_racing_roster_tile(cx: &mut TestAppContext) {
+    use crate::{AgentSession, AgentState, AgentTile, App, ServerSid};
+    use yalda::session_proto::SessionInfo;
+
+    let (view, vcx) = boot_browser(cx);
+    view.update(vcx, |v, cx| {
+        v.set_screen(App::Agent(AgentTile::new()));
+        let cwd = v.agent_base_cwd();
+        let provisional = v.show_local_session(
+            AgentSession {
+                state: AgentState::new_server_managed(None),
+                label: "race-session".into(),
+                cwd: cwd.clone(),
+                resume_id: None,
+            },
+            cx,
+        );
+        let token = crate::alloc_open_token();
+        v.agent_tile_mut().expect("provisional Agent tile").set_pending(Some(token));
+        v.agent_roster.upsert(SessionInfo {
+            session_id: "RACE-SID".into(),
+            acp_session_id: None,
+            label: "race-session".into(),
+            cwd,
+            provider: yalda::acp_channel::AgentProvider::Claude,
+            turns: 0,
+            connected: true,
+            permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+            busy: false,
+            archived: false,
+        });
+        assert!(v.materialize_roster_unbound_tiles(), "roster wins the race");
+        v.apply_open_agent_resolution(
+            token,
+            crate::OpenResolution::Created {
+                sid: "RACE-SID".into(),
+                acp_id: None,
+                provider: yalda::acp_channel::AgentProvider::Claude,
+                permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+            },
+            cx,
+        );
+        assert_eq!(v.sessions.sid_of(provisional).map(|sid| sid.as_str()), Some("RACE-SID"));
+
+        let sid = ServerSid::new("RACE-SID");
+        let mut owners = Vec::new();
+        for workspace in &v.workspace.workspaces {
+            workspace.layout.for_each_leaf(&mut |window| {
+                if matches!(&window.content, App::Agent(tile)
+                    if tile.remembered_sid(|local| v.sessions.sid_of(local).cloned()).as_ref() == Some(&sid))
+                {
+                    owners.push((window.id(), workspace.project()));
+                }
+            });
+        }
+        for tile in &v.workspace.unbound_tiles {
+            if matches!(&tile.window.content, App::Agent(agent)
+                if agent.remembered_sid(|local| v.sessions.sid_of(local).cloned()).as_ref() == Some(&sid))
+            {
+                owners.push((tile.window.id(), tile.project()));
+            }
+        }
+        assert_eq!(owners.len(), 1, "one server session must have one stable tile: {owners:?}");
+    });
+}
+
+#[gpui::test]
+fn agent_identity_guard_rejects_duplicate_local_and_durable_owners(
+    cx: &mut TestAppContext,
+) {
+    use crate::{agent_ui::AgentIdentityViolation, AgentTile, App, ServerSid};
+
+    let (view, vcx, session, _) = boot_with_transcript(cx);
+    view.update(vcx, |v, _| {
+        let project = v.workspace.inherited_project();
+        let duplicate_local = v.workspace.push_unbound(
+            App::Agent(AgentTile::Bound {
+                session,
+                reopening: None,
+            }),
+            project,
+        );
+        assert!(matches!(
+            v.validate_agent_tile_identities(),
+            Err(AgentIdentityViolation::DuplicateLocalSession {
+                session: duplicate,
+                second,
+                ..
+            }) if duplicate == session && second == duplicate_local
+        ));
+        v.workspace
+            .remove_unbound_window(duplicate_local)
+            .expect("remove corrupt test tile");
+
+        let sid = ServerSid::new("DUPLICATE-DURABLE-SID");
+        v.sessions
+            .bind_sid(session, sid.clone())
+            .expect("bind durable identity");
+        let duplicate_durable = v
+            .workspace
+            .push_unbound(App::Agent(AgentTile::dormant(sid.clone())), project);
+        assert!(matches!(
+            v.validate_agent_tile_identities(),
+            Err(AgentIdentityViolation::DuplicateServerSession {
+                sid: duplicate,
+                second,
+                ..
+            }) if duplicate == sid && second == duplicate_durable
+        ));
+    });
+}
+
 /// UXI-Workspace-22: a tile App cannot opt out of directional workspace focus.
 /// Drive the real `Ctrl-W h/j/k/l` bindings through every rendered App state,
 /// from a center tile with a real spatial neighbor in each direction. This is
@@ -19358,7 +19561,10 @@ fn closing_session_keeps_same_unbound_tile_as_empty_picker(cx: &mut TestAppConte
             Some(App::Agent(agent)) if agent.session().is_none()
         ));
         assert!(
-            v.workspace.unbound_tiles.iter().any(|entry| entry.window.id == tile),
+            v.workspace
+                .unbound_tiles
+                .iter()
+                .any(|entry| entry.window.id() == tile),
             "the empty Agent tile remains unbound"
         );
         assert!(!v.sessions.contains(sid), "the session itself was closed");
@@ -20393,7 +20599,12 @@ fn jump_palette_opens_unbound_tile_then_binds_same_identity(cx: &mut TestAppCont
             Some(TileMembership::Bound { workspace: 0 })
         );
         assert_eq!(v.workspace.focused_window_id(), Some(id));
-        assert!(v.workspace.unbound_tiles.iter().all(|tile| tile.window.id != id));
+        assert!(
+            v.workspace
+                .unbound_tiles
+                .iter()
+                .all(|tile| tile.window.id() != id)
+        );
     });
 }
 

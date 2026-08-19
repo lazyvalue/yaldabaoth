@@ -1413,6 +1413,27 @@ enum App {
     Keymap(KeymapTile),
 }
 
+/// Exhaustive result of the one close-tile transition shared by every input
+/// surface. In particular, a bound Agent is moved intact to Unbound; it is
+/// never represented as a generic destructive close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseTileOutcome {
+    StashedAgent,
+    RemovedTile,
+    RemovedWorkspace,
+    PreservedWorkspaceFloor,
+    NoFocusedTile,
+}
+
+impl CloseTileOutcome {
+    fn changed(self) -> bool {
+        matches!(
+            self,
+            Self::StashedAgent | Self::RemovedTile | Self::RemovedWorkspace
+        )
+    }
+}
+
 impl App {
     /// Narrow an `App` into the `BufferApp` stash an Agent/picker can restore
     /// (D3/C4). A Buffer yields its mode; an Agent yields `None` — an Agent can
@@ -2214,6 +2235,14 @@ impl YaldaGpuiView {
     /// focus change, etc.). Best-effort — failures are silent so a
     /// read-only cache_dir or full disk doesn't break the editor.
     pub(crate) fn save_workspace_state(&mut self) {
+        if let Err(violation) = self.workspace.validate_ownership() {
+            eprintln!("[yalda-gpui] refusing to persist invalid tile ownership: {violation:?}");
+            return;
+        }
+        if let Err(violation) = self.validate_agent_tile_identities() {
+            eprintln!("[yalda-gpui] refusing to persist duplicate Agent identity: {violation:?}");
+            return;
+        }
         // Reap pooled buffers no window references anymore. This is the buffer
         // pool's liveness sweep — called after every structural mutation, so a
         // closed/relocated Edit tile's clean buffer is dropped promptly while
@@ -2236,9 +2265,24 @@ impl YaldaGpuiView {
     /// a post-pass. Returns `true` if a snapshot was loaded.
     pub(crate) fn restore_workspace_from_disk(&mut self, cx: &mut Context<Self>) -> bool {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let Some(snap) = load_persisted_workspace(&cwd) else {
+        let Some(mut snap) = load_persisted_workspace(&cwd) else {
             return false;
         };
+        let authoritative_agent_cwds: HashMap<String, PathBuf> =
+            load_persisted_acp_sessions(&cwd)
+                .into_iter()
+                .map(|slot| (slot.id.to_string(), slot.cwd.unwrap_or_else(|| cwd.clone())))
+                .collect();
+        let ownership_repair = heal_persisted_agent_ownership(
+            &mut snap,
+            &authoritative_agent_cwds,
+            &cwd,
+        );
+        if ownership_repair.changed() {
+            eprintln!(
+                "[yalda-gpui] healed persisted Agent ownership: {ownership_repair:?}"
+            );
+        }
         // Rebuild onto the already-migrated project registry; each restored
         // workspace re-points at the project rooting its persisted cwd
         // (ADR-0028 §7 self-healing load). `default_project` is the first project
@@ -2252,9 +2296,6 @@ impl YaldaGpuiView {
         // rebinds it to ITS OWN session (UXI-AgentTile-18), not by index.
         let mut agent_leaf_ids: Vec<(workspace::WindowId, Option<ServerSid>)> = Vec::new();
         for pws in snap.workspaces {
-            let (layout, max_id, agents) = restore_layout(&mut ws, &self.theme, pws.layout);
-            ws.next_window_id = ws.next_window_id.max(max_id + 1);
-            agent_leaf_ids.extend(agents);
             // Working directory → project: resolve the persisted cwd (typed field
             // if present, else the legacy `kv["cwd"]`, else the process dir) to a
             // project in the registry, creating one if the migration hasn't
@@ -2268,6 +2309,10 @@ impl YaldaGpuiView {
             let project = self
                 .projects
                 .ensure_at_cwd(workspace_cwd.clone(), &project_name_for_cwd(&workspace_cwd));
+            let (layout, max_id, agents) =
+                restore_layout(&mut ws, &self.theme, pws.layout, project);
+            ws.next_window_id = ws.next_window_id.max(max_id + 1);
+            agent_leaf_ids.extend(agents);
             let mut wsp = workspace::Workspace::with_layout(
                 pws.auto_name,
                 layout,
@@ -2354,12 +2399,10 @@ impl YaldaGpuiView {
                 .projects
                 .ensure_at_cwd(project_cwd.clone(), &project_name_for_cwd(&project_cwd));
             let id = leaf.id;
-            let (window, _) = restore_leaf(&mut ws, &self.theme, leaf);
+            let (window, _) = restore_leaf(&mut ws, &self.theme, leaf, project);
             ws.next_window_id = ws.next_window_id.max(id + 1);
-            ws.unbound_tiles.push(workspace::UnboundTile {
-                project,
-                window,
-            });
+            ws.insert_restored_unbound(window)
+                .expect("restore registry accepted a duplicate tile id");
             if let Some(sid) = agent_sid {
                 agent_leaf_ids.push((id, Some(sid)));
             }
@@ -2434,6 +2477,12 @@ impl YaldaGpuiView {
         // seed/reconcile — which bulk-seeds every tree leaf onto the plane by
         // origin ring-spiral (chrome.rs `render_desktop` → `reconcile`). Content
         // is preserved; only geometry reflows once.
+        if let Err(violation) = ws.validate_ownership() {
+            eprintln!(
+                "[yalda-gpui] refusing to restore invalid tile ownership: {violation:?}"
+            );
+            return false;
+        }
         self.workspace = ws;
         if let Some(id) = requested_direct_unbound {
             self.workspace.focus_unbound(id);
@@ -2442,6 +2491,9 @@ impl YaldaGpuiView {
         // Post-pass: replace Browser stubs with live agent sessions.
         if !agent_leaf_ids.is_empty() {
             self.restore_agent_leaves(&agent_leaf_ids, cx);
+        }
+        if ownership_repair.changed() {
+            self.save_workspace_state();
         }
         true
     }
@@ -4455,26 +4507,50 @@ impl YaldaGpuiView {
     /// `Ctrl-W c` — close the focused window. If it was the only window in
     /// the wsp, close the workspace instead.
     fn close_window(&mut self, _: &CloseWindow, _w: &mut Window, cx: &mut Context<Self>) {
+        if self.close_focused_tile().changed() {
+            self.workspace.retile_active();
+            self.save_workspace_state();
+            cx.notify();
+        }
+    }
+
+    /// The sole semantic close-tile boundary for keybindings and menus.
+    fn close_focused_tile(&mut self) -> CloseTileOutcome {
+        let Some(id) = self.workspace.focused_window_id() else {
+            return CloseTileOutcome::NoFocusedTile;
+        };
+        let bound_agent = matches!(
+            self.workspace.tile_membership(id),
+            Some(workspace::TileMembership::Bound { .. })
+        ) && matches!(
+            self.workspace.tile(id).map(|tile| &tile.content),
+            Some(App::Agent(_))
+        );
+        if bound_agent {
+            let cwd = self.active_workspace_cwd().unwrap_or_else(process_cwd);
+            let replacement = App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd)));
+            return if self
+                .workspace
+                .stash_window_with_replacement(id, replacement)
+                .is_ok()
+            {
+                CloseTileOutcome::StashedAgent
+            } else {
+                CloseTileOutcome::NoFocusedTile
+            };
+        }
+
         match self.workspace.close_focused() {
-            Ok(Some(_new_focus)) => {
-                self.workspace.retile_active();
-                self.save_workspace_state();
-                cx.notify();
+            Ok(Some(_)) => CloseTileOutcome::RemovedTile,
+            Ok(None) if self.workspace.workspaces.len() <= 1 => {
+                CloseTileOutcome::PreservedWorkspaceFloor
             }
             Ok(None) => {
-                // Focused leaf is the only one in its workspace. Close the workspace
-                // if there are other workspaces; otherwise no-op — closing the
-                // absolute last tile would leave the app with nothing to
-                // render. Cmd-Q is the only quit path now.
-                if self.workspace.workspaces.len() <= 1 {
-                    return;
-                }
                 let idx = self.workspace.active_workspace;
                 self.workspace.close_workspace(idx);
-                self.save_workspace_state();
-                cx.notify();
+                CloseTileOutcome::RemovedWorkspace
             }
-            Err(()) => {}
+            Err(()) => CloseTileOutcome::NoFocusedTile,
         }
     }
 
@@ -5657,22 +5733,10 @@ impl YaldaGpuiView {
                 cx.notify();
             }
             "close-window" => {
-                match self.workspace.close_focused() {
-                    Ok(Some(_)) => {
-                        self.save_workspace_state();
-                        cx.notify();
-                    }
-                    Ok(None) => {
-                        // Same no-quit-on-last rule as the keyboard action.
-                        if self.workspace.workspaces.len() <= 1 {
-                            return;
-                        }
-                        let idx = self.workspace.active_workspace;
-                        self.workspace.close_workspace(idx);
-                        self.save_workspace_state();
-                        cx.notify();
-                    }
-                    Err(()) => {}
+                if self.close_focused_tile().changed() {
+                    self.workspace.retile_active();
+                    self.save_workspace_state();
+                    cx.notify();
                 }
             }
             "only-window" => {
@@ -6367,7 +6431,15 @@ impl YaldaGpuiView {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let content = self.clone_focused_for_split(&cwd);
         let id = self.workspace.alloc_window_id();
-        let window = workspace::Window::new(id, content);
+        let Some(project) = self
+            .workspace
+            .workspaces
+            .get(target)
+            .map(workspace::Workspace::project)
+        else {
+            return;
+        };
+        let window = workspace::Window::new(id, project, content);
         let _ = self.workspace.insert_leaf_into_workspace(target, window);
         self.workspace
             .set_active_workspace(target.min(self.workspace.workspaces.len() - 1));
@@ -7046,12 +7118,17 @@ impl YaldaGpuiView {
         // the ordinary workspace-close path moves them to Unbound, which would
         // otherwise leave unbound tiles carrying a now-dead ProjectId here.
         self.workspace.workspaces.retain(|workspace| workspace.project() != pid);
-        self.workspace.unbound_tiles.retain(|tile| tile.project != pid);
+        self.workspace.unbound_tiles.retain(|tile| tile.project() != pid);
         self.workspace.prune_scratchpad();
         self.workspace.direct_unbound = self
             .workspace
             .direct_unbound
-            .filter(|id| self.workspace.unbound_tiles.iter().any(|tile| tile.window.id == *id));
+            .filter(|id| {
+                self.workspace
+                    .unbound_tiles
+                    .iter()
+                    .any(|tile| tile.window.id() == *id)
+            });
         self.workspace.active_workspace = self
             .workspace
             .active_workspace

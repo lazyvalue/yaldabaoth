@@ -4202,11 +4202,19 @@ fn agent_tile_persists_session_identity_not_index() {
         children: vec![
             (
                 1.0,
-                workspace::Layout::Leaf(workspace::Window::new(10, App::Agent(t1))),
+                workspace::Layout::Leaf(workspace::Window::new(
+                    10,
+                    ProjectId(0),
+                    App::Agent(t1),
+                )),
             ),
             (
                 1.0,
-                workspace::Layout::Leaf(workspace::Window::new(20, App::Agent(t2))),
+                workspace::Layout::Leaf(workspace::Window::new(
+                    20,
+                    ProjectId(0),
+                    App::Agent(t2),
+                )),
             ),
         ],
     };
@@ -4225,7 +4233,7 @@ fn agent_tile_persists_session_identity_not_index() {
     // travels with the leaf, independent of any session-list ordering.
     let mut ws = workspace::Frame::<App>::new(ProjectId(0));
     let theme = Theme::default();
-    let (_lay, _max, agents) = restore_layout(&mut ws, &theme, snap);
+    let (_lay, _max, agents) = restore_layout(&mut ws, &theme, snap, ProjectId(0));
 
     assert_eq!(
         agents,
@@ -4301,7 +4309,12 @@ fn bound_and_unbound_tiles_snapshot_with_identity_tags_direct_focus_and_next_id(
     let mut back: PersistedFrame = serde_json::from_str(&json).expect("deserialize frame");
     let mut restored = workspace::Frame::new(project);
     let (layout, max_bound, bound_agents) =
-        restore_layout(&mut restored, &Theme::default(), back.workspaces.remove(0).layout);
+        restore_layout(
+            &mut restored,
+            &Theme::default(),
+            back.workspaces.remove(0).layout,
+            project,
+        );
     restored.workspaces.push(workspace::Workspace::with_layout(
         "workspace-1".into(),
         layout,
@@ -4311,9 +4324,14 @@ fn bound_and_unbound_tiles_snapshot_with_identity_tags_direct_focus_and_next_id(
     restored.next_window_id = max_bound + 1;
     let persisted_unbound = back.unbound_tiles.remove(0);
     let (window, unbound_agent) =
-        restore_leaf(&mut restored, &Theme::default(), persisted_unbound.tile);
-    restored.next_window_id = restored.next_window_id.max(window.id + 1);
-    restored.unbound_tiles.push(workspace::UnboundTile { project, window });
+        restore_leaf(
+            &mut restored,
+            &Theme::default(),
+            persisted_unbound.tile,
+            project,
+        );
+    restored.next_window_id = restored.next_window_id.max(window.id() + 1);
+    restored.insert_restored_unbound(window).unwrap();
     restored.scratchpad = back.scratchpad;
     restored.prune_scratchpad();
     restored.focus_unbound(back.direct_unbound.unwrap());
@@ -4335,6 +4353,44 @@ fn bound_and_unbound_tiles_snapshot_with_identity_tags_direct_focus_and_next_id(
     assert!(
         restored.alloc_window_id() > unbound,
         "allocator advances beyond both ownership domains"
+    );
+}
+
+#[test]
+fn persisted_duplicate_agent_identity_keeps_session_cwd_project() {
+    let correct_cwd = PathBuf::from("/tmp/yalda-restore-correct-project");
+    let wrong_cwd = PathBuf::from("/tmp/yalda-restore-wrong-project");
+    let mut projects = Projects::new();
+    let correct_project = projects.ensure_at_cwd(correct_cwd.clone(), "correct");
+    let wrong_project = projects.ensure_at_cwd(wrong_cwd, "wrong");
+    let mut frame = workspace::Frame::with_initial(
+        App::Buffer(BufferApp::Picking(BrowserWindow::standalone(
+            correct_cwd.clone(),
+        ))),
+        correct_project,
+    );
+    let sid = ServerSid::new("SID-CROSS-PROJECT");
+    let wrong = frame.push_unbound(App::Agent(AgentTile::dormant(sid.clone())), wrong_project);
+    let correct = frame.push_unbound(App::Agent(AgentTile::dormant(sid.clone())), correct_project);
+    let mut persisted = snapshot_workspace(&frame, &projects, &|_| None);
+    // Corruption may duplicate both the durable session and the stable tile id.
+    // Canonicalization therefore keys the concrete persisted occurrence, not id.
+    persisted.unbound_tiles[0].tile.id = correct;
+    let authoritative = HashMap::from([(sid.to_string(), correct_cwd.clone())]);
+
+    let repair = heal_persisted_agent_ownership(
+        &mut persisted,
+        &authoritative,
+        &correct_cwd,
+    );
+
+    assert_eq!(repair.removed_unbound_duplicates, 1);
+    assert_eq!(persisted.unbound_tiles.len(), 1);
+    assert_eq!(persisted.unbound_tiles[0].tile.id, correct);
+    assert_ne!(persisted.unbound_tiles[0].tile.id, wrong);
+    assert_eq!(
+        persisted.unbound_tiles[0].project_cwd.as_deref(),
+        Some(correct_cwd.to_string_lossy().as_ref())
     );
 }
 

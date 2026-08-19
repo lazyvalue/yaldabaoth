@@ -52,7 +52,78 @@ enum BindOutcome {
     Focused(SessionId),
 }
 
+/// Result of enforcing the durable-session → stable-tile uniqueness rule.
+/// A duplicate roster tile is stale ownership state, not a second view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentIdentityRepair {
+    Unique,
+    RetiredUnboundDuplicates(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AgentIdentityViolation {
+    DuplicateLocalSession {
+        session: SessionId,
+        first: workspace::WindowId,
+        second: workspace::WindowId,
+    },
+    DuplicateServerSession {
+        sid: ServerSid,
+        first: workspace::WindowId,
+        second: workspace::WindowId,
+    },
+}
+
 impl YaldaGpuiView {
+    pub(crate) fn validate_agent_tile_identities(
+        &self,
+    ) -> Result<(), AgentIdentityViolation> {
+        let mut local = std::collections::HashMap::new();
+        let mut durable = std::collections::HashMap::new();
+        let mut visit = |window: &workspace::Window<App>| {
+            let App::Agent(tile) = &window.content else {
+                return Ok(());
+            };
+            if let Some(session) = tile.session()
+                && let Some(first) = local.insert(session, window.id())
+            {
+                return Err(AgentIdentityViolation::DuplicateLocalSession {
+                    session,
+                    first,
+                    second: window.id(),
+                });
+            }
+            if let Some(sid) = tile.remembered_sid(|id| self.sessions.sid_of(id).cloned())
+                && let Some(first) = durable.insert(sid.clone(), window.id())
+            {
+                return Err(AgentIdentityViolation::DuplicateServerSession {
+                    sid,
+                    first,
+                    second: window.id(),
+                });
+            }
+            Ok(())
+        };
+        for workspace in &self.workspace.workspaces {
+            if workspace.ephemeral {
+                continue;
+            }
+            let mut violation = None;
+            workspace.layout.for_each_leaf(&mut |window| {
+                if violation.is_none() {
+                    violation = visit(window).err();
+                }
+            });
+            if let Some(violation) = violation {
+                return Err(violation);
+            }
+        }
+        for tile in &self.workspace.unbound_tiles {
+            visit(&tile.window)?;
+        }
+        Ok(())
+    }
+
     /// Open the Agent screen and attempt to attach to an ACP agent. Bound
     /// to `Ctrl-K` in the Doc and Edit views. Replaces the focused tile with an
     /// Agent tile; the prior buffer stays in the pool (reachable via Cmd+O).
@@ -937,7 +1008,7 @@ impl YaldaGpuiView {
                 if let App::Agent(tile) = &w.content
                     && tile.session() == Some(sid)
                 {
-                    found = Some(w.id);
+                    found = Some(w.id());
                 }
             });
             if found.is_some() {
@@ -958,7 +1029,7 @@ impl YaldaGpuiView {
                     &tile.window.content,
                     App::Agent(agent) if agent.session() == Some(sid)
                 )
-                .then_some(tile.window.id)
+                .then_some(tile.window.id())
             })
         })
     }
@@ -979,7 +1050,7 @@ impl YaldaGpuiView {
                 if let App::Agent(tile) = &window.content
                     && remembers(tile)
                 {
-                    found = Some(window.id);
+                    found = Some(window.id());
                 }
             });
             if found.is_some() {
@@ -988,8 +1059,67 @@ impl YaldaGpuiView {
         }
         self.workspace.unbound_tiles.iter().find_map(|tile| {
             matches!(&tile.window.content, App::Agent(agent) if remembers(agent))
-                .then_some(tile.window.id)
+                .then_some(tile.window.id())
         })
+    }
+
+    fn agent_tile_ids_for_server_sid(&self, sid: &str) -> Vec<workspace::WindowId> {
+        let remembers = |tile: &AgentTile| {
+            tile.remembered_sid(|id| self.sessions.sid_of(id).cloned())
+                .is_some_and(|remembered| remembered.as_str() == sid)
+        };
+        let mut ids = Vec::new();
+        for workspace in &self.workspace.workspaces {
+            workspace.layout.for_each_leaf(&mut |window| {
+                if matches!(&window.content, App::Agent(tile) if remembers(tile)) {
+                    ids.push(window.id());
+                }
+            });
+        }
+        ids.extend(self.workspace.unbound_tiles.iter().filter_map(|tile| {
+            matches!(&tile.window.content, App::Agent(agent) if remembers(agent))
+                .then_some(tile.window.id())
+        }));
+        ids
+    }
+
+    /// Enforce one stable tile for a newly bound durable session. The tile
+    /// that owns the live local session is canonical; roster-created dormant
+    /// Unbound duplicates are retired and their tags are merged into it.
+    fn reconcile_bound_agent_identity(
+        &mut self,
+        owner: SessionId,
+        sid: &str,
+    ) -> AgentIdentityRepair {
+        let Some(canonical) = self.agent_tile_id_for_session(owner) else {
+            return AgentIdentityRepair::Unique;
+        };
+        let duplicates: Vec<_> = self
+            .agent_tile_ids_for_server_sid(sid)
+            .into_iter()
+            .filter(|id| *id != canonical)
+            .filter(|id| {
+                self.workspace.tile_membership(*id)
+                    == Some(workspace::TileMembership::Unbound)
+            })
+            .collect();
+        for duplicate in &duplicates {
+            let tags = self
+                .workspace
+                .tile(*duplicate)
+                .map(|tile| tile.tags.clone())
+                .unwrap_or_default();
+            if let Some(tile) = self.workspace.tile_mut(canonical) {
+                tile.tags.extend(tags);
+            }
+            self.workspace.remove_unbound_window(*duplicate);
+        }
+        if duplicates.is_empty() {
+            AgentIdentityRepair::Unique
+        } else {
+            self.save_workspace_state();
+            AgentIdentityRepair::RetiredUnboundDuplicates(duplicates.len())
+        }
     }
 
     /// Migrate every roster-only session into exactly one dormant unbound Agent
@@ -1265,6 +1395,7 @@ impl YaldaGpuiView {
         // resolution; type it for the store bind.
         match self.sessions.bind_sid(id, ServerSid::new(sid)) {
             Ok(()) => {
+                let _ = self.reconcile_bound_agent_identity(id, sid);
                 self.inherit_order_slot(id, sid);
                 BindOutcome::Bound
             }
