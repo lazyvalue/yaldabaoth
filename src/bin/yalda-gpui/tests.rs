@@ -5840,8 +5840,8 @@ fn jump_panel_state_palette_is_orange_green_and_gray() {
     );
     assert_eq!(
         crate::jump_selection_color(&folio),
-        Color::Rgb(0xdb, 0xe3, 0xec),
-        "Folio selection uses its cool blue-gray"
+        Color::Rgb(0xe3, 0xe3, 0xe0),
+        "Folio selection uses a neutral grey band"
     );
     assert_ne!(
         crate::jump_selection_color(&nightfox),
