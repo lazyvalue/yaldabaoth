@@ -1075,13 +1075,15 @@ pub(crate) struct PersistedWorkspace {
     /// Optional rail (spec-rail.md §14). Absent in old snapshots → no rail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) rail: Option<PersistedRail>,
-    // Layout patterns: per-workspace layout mode + master-stack params
+    // Layout patterns: per-workspace layout mode + primary-stack params
     #[serde(default)]
     pub(crate) layout_mode: workspace::LayoutMode,
-    #[serde(default = "default_master_ratio")]
-    pub(crate) master_ratio: f32,
-    #[serde(default = "default_master_count")]
-    pub(crate) master_count: usize,
+    // `alias` keeps pre-rename snapshots (which wrote `master_ratio`/
+    // `master_count`) loading after the master→primary rename.
+    #[serde(default = "default_primary_ratio", alias = "master_ratio")]
+    pub(crate) primary_ratio: f32,
+    #[serde(default = "default_primary_count", alias = "master_count")]
+    pub(crate) primary_count: usize,
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub(crate) tag_view: std::collections::BTreeSet<String>,
     /// Desktop-mode slot assignments (spec-desktop-mode.md Behavior 7),
@@ -1126,10 +1128,10 @@ pub(crate) struct PersistedWorkspace {
     pub(crate) legacy_kv: HashMap<String, String>,
 }
 
-pub(crate) fn default_master_ratio() -> f32 {
+pub(crate) fn default_primary_ratio() -> f32 {
     0.6
 }
-pub(crate) fn default_master_count() -> usize {
+pub(crate) fn default_primary_count() -> usize {
     1
 }
 
@@ -1711,8 +1713,8 @@ pub(crate) fn snapshot_workspace(
                 layout: snapshot_layout(&t.layout, resolve),
                 rail: t.rail.as_ref().map(snapshot_rail),
                 layout_mode: t.layout_mode,
-                master_ratio: t.master_ratio,
-                master_count: t.master_count,
+                primary_ratio: t.primary_ratio,
+                primary_count: t.primary_count,
                 tag_view: t.tag_view.clone(),
                 desktop_slots: t
                     .desktop

@@ -49,7 +49,7 @@ tile has exactly one owner; solo presentation is not a third owner (ADR-0034,
 - `docs/specs/spec-workspaces-and-splits.md` — the n-ary split/layout tree +
   persistence (retroactive spec of shipped behavior; workspace/frame vocabulary).
 - `docs/specs/spec-layout-patterns.md` — tile tags + automatic layout modes.
-- `docs/specs/spec-desktop-mode.md` — desktop tile sizing / master layout; the
+- `docs/specs/spec-desktop-mode.md` — desktop tile sizing / primary layout; the
   tile/slot geometry engine (`Slot`, `Span`, `DesktopState`, occupancy,
   Block-rule edge resize, culling) that the plane model below reuses.
 - `docs/specs/spec-infinite-plane-workspace.md` — DRAFT deep design for the
@@ -98,7 +98,7 @@ _The invariants below (`UXI-Workspace-2..7`) define the **infinite-plane** model
 guarded; the `Ctrl-W 0/-/=` chord firing is the one `NEEDS-RUNTIME` gap). They built
 on the desktop-mode geometry engine and **supersede** the split-tree / layout-mode
 behavior in this component's Description above — a workspace is now one infinite
-plane; the `LayoutMode` cycle, master-stack, split-resize, and equalize surface are
+plane; the `LayoutMode` cycle, primary-stack, split-resize, and equalize surface are
 retired (`SplitH`/`SplitV` remain only as the plane's new-tile mechanism). The
 Description prose is due a rewrite around the plane in a follow-up pass._
 
@@ -135,7 +135,7 @@ negative-control-verified RED-then-green.
 **Deviation from plan.** `LayoutMode` was **collapsed to a single `Plane` variant**,
 not deleted (≈100 call sites made a stub cleaner; its `Deserialize` maps any old
 mode string → `Plane`). `SplitH`/`SplitV`/`split_focused` were **kept** — they are
-load-bearing for new-tile creation on the plane; only the *mode / master-stack /
+load-bearing for new-tile creation on the plane; only the *mode / primary-stack /
 resize / equalize* surface + `Ctrl-W Space` cycling were retired (consistent with
 Behavior 1: "split ops retired from the *user surface*"). The `chrome.rs`
 `layout_mode==Desktop` gate is now unconditional and `render_layout` (the split-tree
@@ -1029,44 +1029,44 @@ same-index behavior, and deletion of the remembered workspace.
 workspace and its focused tile are restored. Negative control: making the
 model command a no-op made the guard RED.
 
-### UXI-Workspace-20 — Columns has a controllable master area
+### UXI-Workspace-20 — Columns has a controllable primary area
 
-> **Amended by `UXI-Workspace-26`.** The master area moved from `Columns` to the
+> **Amended by `UXI-Workspace-26`.** The primary area moved from `Columns` to the
 > new `Tiling` arrangement — `Columns` is now plain equal-width columns. The four
-> `Ctrl-W f/F/n/N` master mutators (and the layout submenu's grow/shrink/count
+> `Ctrl-W f/F/n/N` primary mutators (and the layout submenu's grow/shrink/count
 > entries) now act on `Tiling`; every non-Tiling view is a no-op. Everything else
 > below (clamps, no plane-slot mutation, persistence) is unchanged.
 
 **Statement.** Columns divides its reading-order tiles into two horizontal
-areas. The first `master_count` tiles share `master_ratio` of the available
+areas. The first `primary_count` tiles share `primary_ratio` of the available
 width equally; remaining tiles share the stack area equally. If every tile is
-in the master area, all tiles divide the full width evenly.
+in the primary area, all tiles divide the full width evenly.
 
-- `Ctrl-W f` / `Ctrl-W F` grow/shrink the master ratio by `0.05`, clamped to
+- `Ctrl-W f` / `Ctrl-W F` grow/shrink the primary ratio by `0.05`, clamped to
   `[0.20, 0.80]`.
-- `Ctrl-W n` / `Ctrl-W N` increase/decrease master count, clamped to
+- `Ctrl-W n` / `Ctrl-W N` increase/decrease primary count, clamped to
   `[1, tile_count]`.
 
 The commands mutate only a Columns workspace; in Plane they are no-ops. They
 never alter the plane slots, tile order, ownership, or focus. The existing
-`master_ratio` and `master_count` snapshot fields become active again, so old
+`primary_ratio` and `primary_count` snapshot fields become active again, so old
 snapshots retain their values and missing fields still default to `0.60` / `1`.
 The shell workspace menu exposes all four adjustments.
 
-**Applies to.** `workspace.rs`: clamped master mutators; `chrome.rs`:
+**Applies to.** `workspace.rs`: clamped primary mutators; `chrome.rs`:
 `render_columns` width allocation; `main.rs`: handlers/menu;
 `keymap_registry.rs`: `Ctrl-W f/F/n/N`; `persist.rs`: existing fields.
 
-**Why.** Dwm's master area keeps the primary work visibly dominant while
+**Why.** Dwm's primary area keeps the primary work visibly dominant while
 allowing several secondary tiles to remain available, without introducing a
 nested split-tree layout model.
 
 **Status.** `implemented (headless)`.
 
 **Enforcement.** Pure tests prove ratio/count clamps and Plane no-ops.
-`ctrl_w_master_commands_change_columns_state_and_geometry` drives all four real
-key paths and uses layout probes to prove ratio changes painted master/stack
-widths and all-master count divides the full width evenly. Negative controls:
+`ctrl_w_primary_commands_change_columns_state_and_geometry` drives all four real
+key paths and uses layout probes to prove ratio changes painted primary/stack
+widths and all-primary count divides the full width evenly. Negative controls:
 hard-coding either the rendered ratio or count made the geometry guard RED.
 
 ### UXI-Workspace-21 — Close Tile closes a directly focused Unbound tile
@@ -1274,12 +1274,13 @@ UI-selectable arrangements** over the SAME tiles, all lossless pure-view choices
 (no tile is moved, re-seeded, or closed):
 
 - **`Columns`** (the default) — every tile is an **equal-width, full-height
-  column**, side by side in signed reading order. No master area.
-- **`Tiling`** — dwm-style **master/stack**: the first `master_count` tiles fill
-  `master_ratio` of the width on the **left** (the master area); the remaining
-  tiles stack as equal columns on the **right**. The `Ctrl-W f/F/n/N` master
-  mutators and the layout submenu's grow/shrink/count entries act on this mode
-  only (`UXI-Workspace-20`, amended).
+  column**, side by side in signed reading order. No primary area.
+- **`Tiling`** — dwm-style **primary/stack**: the first `primary_count` tiles fill
+  `primary_ratio` of the width in a full-height column on the **left** (the primary
+  area, its tiles stacked vertically); the remaining (non-primary) tiles are
+  **stacked vertically** in a second full-height column on the **right**, NOT laid
+  side by side. The `Ctrl-W f/F/n/N` primary mutators and the layout submenu's
+  grow/shrink/count entries act on this mode only (`UXI-Workspace-20`, amended).
 - **`Monocle`** — only the **focused** tile paints, filling the whole content
   region; the others stay materialized (never moved/closed) but are not painted.
   Switching focus swaps which tile shows.
@@ -1292,23 +1293,23 @@ path are kept so the arrangement can be reinstated later without a data migratio
 Selection:
 - **`.` → layout submenu** picks a mode directly: `c` columns, `t` tiling, `m`
   monocle (`layout-columns` / `layout-tiling` / `layout-monocle`). The submenu
-  also carries the four master-area adjustments.
+  also carries the four primary-area adjustments.
 - **`Ctrl-W a`** *cycles* Columns → Tiling → Monocle → Columns.
 - The mode **persists** (`"columns" | "tiling" | "monocle"`; absent, `"plane"`,
   or any unknown value ⇒ `Columns`), so a fresh workspace starts in Columns.
 
 **Applies to.** `workspace.rs`: `WorkspaceView` (four variants, `next()`,
-`set_view`, hand-rolled serde: `plane`→`Columns`), master mutators gated on
+`set_view`, hand-rolled serde: `plane`→`Columns`), primary mutators gated on
 `Tiling`, `placement_target` (Columns/Tiling share left/right adjacency, Monocle
-none). `chrome.rs`: `render_focused_window` dispatch; `render_columns(use_master)`
-(false = equal Columns, true = Tiling master/stack); `render_monocle`. `main.rs`:
+none). `chrome.rs`: `render_focused_window` dispatch; `render_columns(use_primary)`
+(false = equal Columns, true = Tiling primary/stack); `render_monocle`. `main.rs`:
 `layout-columns/tiling/monocle` dispatch → `set_active_workspace_view`,
 `toggle_workspace_columns` (cycles), the `.` layout submenu. `keymap_registry.rs`:
 `ctrl-w a` label. `persist.rs`: `PersistedWorkspace.view` round-trip.
 
 **Why.** The infinite plane was powerful but demanded panning/zoom to see
 everything. Most sessions want a simple dense arrangement — equal columns, a
-dwm master/stack, or one maximized tile — chosen by name. Three explicit modes
+dwm primary/stack, or one maximized tile — chosen by name. Three explicit modes
 give that directly; retiring the plane (reversibly) removes the mode nobody
 selected by default without discarding its code or anyone's saved slots.
 
@@ -1316,14 +1317,17 @@ selected by default without discarding its code or anyone's saved slots.
 
 **Enforcement.** `verify_harness.rs::columns_view_arranges_tiles_side_by_side`
 (Columns = equal-width, both tiles paint side by side, negative-control RED),
-`ctrl_w_master_commands_change_columns_state_and_geometry` (Tiling master/stack
+`ctrl_w_primary_commands_change_columns_state_and_geometry` (Tiling primary/stack
 geometry via the real `Ctrl-W f/F/n/N` paths),
+`tiling_stacks_non_primary_tiles_vertically` (3 tiles: stack tiles share an x
+column and descend in y, right of the primary; negative control flips the stack
+pane to `flex_row` → RED),
 `monocle_view_paints_only_the_focused_tile` (only the focused tile paints;
 negative control routes Monocle to `render_columns` → RED),
 `layout_mode_commands_set_the_active_arrangement` (the `.` `layout-*` dispatch
 sets `view`). `tests.rs::workspace_view_round_trips_and_unknown_defaults_columns`
 (serde round-trip for the three modes + `plane`/unknown → Columns);
-`workspace.rs::tiling_master_controls_clamp_and_other_views_unchanged` (master
+`workspace.rs::tiling_primary_controls_clamp_and_other_views_unchanged` (primary
 mutators act on Tiling only). `tests.rs::shell_layout_submenu_selects_modes`
 (the `.` → layout submenu keys).
 
