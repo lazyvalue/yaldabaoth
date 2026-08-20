@@ -253,6 +253,94 @@ pub(crate) fn context_menu_item(
         )
 }
 
+/// One option in a compact picker card. The caller supplies the domain label,
+/// optional trailing badge, and interaction handler; this primitive owns the
+/// accent rail, selected/hover treatment, typography, and alignment shared by
+/// destination choosers and other keyboard-first option lists.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn picker_option_row(
+    id: impl Into<ElementId>,
+    glyph: &str,
+    label: &str,
+    badge: Option<(&str, Hsla)>,
+    selected: bool,
+    accent: Hsla,
+    label_color: Hsla,
+    selected_bg: Hsla,
+    body_font: &SharedString,
+    mono_font: &SharedString,
+) -> gpui::Stateful<gpui::Div> {
+    let transparent: Hsla = rgba(0x00000000).into();
+    let mut hover_bg = selected_bg;
+    hover_bg.a *= 0.62;
+    let mut row = div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(10.0))
+        .h(px(42.0))
+        .px(px(10.0))
+        .rounded(px(6.0))
+        .cursor_pointer()
+        .bg(if selected { selected_bg } else { transparent })
+        .hover(move |s| s.bg(hover_bg))
+        .child(
+            div()
+                .w(px(2.0))
+                .h(px(24.0))
+                .flex_none()
+                .rounded(px(1.0))
+                .bg(if selected { accent } else { transparent }),
+        )
+        .child(
+            div()
+                .w(px(18.0))
+                .flex_none()
+                .text_center()
+                .font_family(mono_font.clone())
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_size(px(13.0))
+                .text_color(accent)
+                .child(SharedString::from(glyph.to_string())),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .font_family(body_font.clone())
+                .font_weight(if selected {
+                    FontWeight::SEMIBOLD
+                } else {
+                    FontWeight::MEDIUM
+                })
+                .text_size(px(13.0))
+                .text_color(label_color)
+                .child(SharedString::from(label.to_string())),
+        );
+    if let Some((badge, badge_color)) = badge {
+        let mut badge_bg = badge_color;
+        badge_bg.a *= 0.10;
+        row = row.child(
+            div()
+                .flex_none()
+                .px(px(7.0))
+                .h(px(20.0))
+                .flex()
+                .items_center()
+                .rounded(px(10.0))
+                .bg(badge_bg)
+                .font_family(mono_font.clone())
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_size(px(10.0))
+                .text_color(badge_color)
+                .child(SharedString::from(badge.to_string())),
+        );
+    }
+    row
+}
+
 /// An author · timestamp header over a multiline body (comments, updates).
 pub(crate) fn note_block(author: String, when: String, body: &str, st: &DetailStyle) -> gpui::Div {
     let hdr = if when.is_empty() {

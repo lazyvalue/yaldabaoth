@@ -6509,7 +6509,7 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
-    fn render_workspace_picker(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_workspace_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let picker = match self.workspace_picker_ref() {
             Some(p) => p,
             None => unreachable!(),
@@ -6517,35 +6517,62 @@ impl YaldaGpuiView {
 
         let ov = &self.theme.overlay;
         let menu_bg: Hsla = nc(ov.bg);
-        let label_fg: Hsla = nc(ov.label);
-        let active_fg: Hsla = nc(ov.accent);
+        let dim_fg: Hsla = nc(ov.label);
+        let accent: Hsla = nc(ov.accent);
         let selected_bg: Hsla = nc(ov.selected_bg);
         let normal_fg: Hsla = nc(ov.fg);
         let popup_border: Hsla = nc(ov.border);
 
-        let verb = match picker.mode {
-            WorkspacePickerMode::Move { follow: false } => "SEND TILE TO WORKSPACE",
-            WorkspacePickerMode::Move { follow: true } => "SEND TILE AND FOLLOW",
-            WorkspacePickerMode::AlsoShow => "ALSO-SHOW TILE IN WORKSPACE",
+        let (title, subtitle, select_verb) = match picker.mode {
+            WorkspacePickerMode::Move { follow: false } => (
+                "Move tile",
+                "Choose a destination. You’ll stay in the current workspace.",
+                "Move",
+            ),
+            WorkspacePickerMode::Move { follow: true } => (
+                "Move tile and follow",
+                "Choose a destination. The view will follow the tile.",
+                "Move",
+            ),
+            WorkspacePickerMode::AlsoShow => (
+                "Show document in workspace",
+                "Choose another workspace for this document.",
+                "Show",
+            ),
         };
-        let header_row = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .px_4()
-            .py_1()
-            .h(px(28.0))
-            .text_color(label_fg)
-            .font_weight(FontWeight::BOLD)
-            .child(SharedString::from(verb.to_string()));
-
-        let mut entries_col = div()
+        let header = div()
             .flex()
             .flex_col()
-            .px_4()
-            .py_2()
-            .text_size(px(14.0))
-            .font_family(self.code_font.clone());
+            .gap(px(3.0))
+            .px(px(18.0))
+            .pt(px(15.0))
+            .pb(px(12.0))
+            .border_b_1()
+            .border_color(popup_border)
+            .font_family(self.body_font.clone())
+            .child(
+                div()
+                    .text_size(px(15.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(normal_fg)
+                    .child(SharedString::from(title)),
+            )
+            .child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(dim_fg)
+                    .child(SharedString::from(subtitle)),
+            );
+
+        let mut entries_col = div()
+            .id("workspace-picker-options-scroll")
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .px(px(8.0))
+            .py(px(8.0))
+            .max_h(px(294.0))
+            .overflow_y_scroll();
 
         let active = self.workspace.active_workspace;
         let n_targets = picker.targets.len();
@@ -6553,80 +6580,104 @@ impl YaldaGpuiView {
             let wsp = &self.workspace.workspaces[i];
             let is_selected = entry == picker.selected;
             let is_active = i == active;
-            let marker = if is_selected { "\u{25b8} " } else { "  " };
-            let here = if is_active { " (here)" } else { "" };
-            let label_text = format!("{}{}", workspace_picker_destination_label(wsp), here);
-            let name_color = if is_active { label_fg } else { normal_fg };
-
-            let mut row = div().flex().flex_row().items_center().px_2().py_0p5();
-            if is_selected {
-                row = row.bg(selected_bg);
-            }
-            row = row
-                .child(
-                    div()
-                        .text_color(label_fg)
-                        .child(SharedString::from(marker.to_string())),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .text_color(name_color)
-                        .child(SharedString::from(label_text)),
-                );
-            entries_col = entries_col.child(row);
+            let label = workspace_picker_destination_label(wsp);
+            let row = picker_option_row(
+                SharedString::from(format!("workspace-picker-option-{i}")),
+                "▦",
+                &label,
+                is_active.then_some(("Current", dim_fg)),
+                is_selected,
+                accent,
+                normal_fg,
+                selected_bg,
+                &self.body_font,
+                &self.code_font,
+            )
+            .on_click(
+                cx.listener(move |this, _ev, _w, cx| this.commit_workspace_picker(entry, cx)),
+            );
+            entries_col = entries_col.child(probe_bounds_dyn(
+                format!("workspace-picker-row-{entry}"),
+                row.into_any_element(),
+            ));
         }
 
-        // "+ new workspace" entry.
-        {
-            let is_selected = picker.selected == n_targets;
-            let marker = if is_selected { "\u{25b8} " } else { "  " };
-            let mut row = div().flex().flex_row().items_center().px_2().py_0p5();
-            if is_selected {
-                row = row.bg(selected_bg);
-            }
-            row = row
-                .child(
-                    div()
-                        .text_color(label_fg)
-                        .child(SharedString::from(marker.to_string())),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .text_color(active_fg)
-                        .child(SharedString::new_static("+ new workspace")),
-                );
-            entries_col = entries_col.child(row);
-        }
+        let new_row = picker_option_row(
+            "workspace-picker-option-new",
+            "+",
+            "New workspace",
+            Some(("Create", accent)),
+            picker.selected == n_targets,
+            accent,
+            accent,
+            selected_bg,
+            &self.body_font,
+            &self.code_font,
+        )
+        .on_click(cx.listener(move |this, _ev, _w, cx| {
+            this.commit_workspace_picker(n_targets, cx)
+        }));
+        let create_section = div()
+            .px(px(8.0))
+            .pt(px(7.0))
+            .pb(px(8.0))
+            .border_t_1()
+            .border_color(popup_border)
+            .child(probe_bounds(
+                "workspace-picker-new-row",
+                new_row.into_any_element(),
+            ));
 
-        let hints_row = div()
-            .px_4()
-            .py_1()
-            .text_size(px(11.0))
-            .text_color(label_fg)
-            .child("j/k move · enter select · q/esc cancel");
+        let hints = div()
+            .flex()
+            .flex_row()
+            .gap(px(16.0))
+            .px(px(18.0))
+            .py(px(9.0))
+            .border_t_1()
+            .border_color(popup_border)
+            .font_family(self.code_font.clone())
+            .text_size(px(10.5))
+            .text_color(dim_fg)
+            .child("↑↓  Navigate")
+            .child(SharedString::from(format!("↵  {select_verb}")))
+            .child("Esc  Cancel");
+
+        let card = div()
+            .occlude()
+            .w(px(480.0))
+            .max_w_full()
+            .bg(menu_bg)
+            .border_1()
+            .border_color(popup_border)
+            .rounded(px(9.0))
+            .shadow_lg()
+            .overflow_hidden()
+            .child(probe_bounds(
+                "workspace-picker-header",
+                header.into_any_element(),
+            ))
+            .child(probe_bounds(
+                "workspace-picker-options",
+                entries_col.into_any_element(),
+            ))
+            .child(create_section)
+            .child(hints);
 
         div()
             .id("workspace-picker")
             .absolute()
-            .top(px(34.0))
-            .left(px(40.0))
-            .right(px(40.0))
-            .max_h(px(400.0))
-            .bg(menu_bg)
-            .border_1()
-            .border_color(popup_border)
-            .rounded_md()
-            .shadow_lg()
-            .overflow_y_scroll()
-            .child(header_row)
-            .child(entries_col)
-            .child(hints_row)
+            .inset_0()
+            .flex()
+            .flex_row()
+            .items_start()
+            .justify_center()
+            .px(px(20.0))
+            .pt(px(64.0))
+            .child(probe_bounds(
+                "workspace-picker-card",
+                card.into_any_element(),
+            ))
     }
 
     fn handle_tile_swap_picker_key(
@@ -9413,37 +9464,10 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
 // Buffer helpers
 // ----------------------------------------------------------------------------
 
-/// Short display label for the workspace strip. Doc/Edit workspaces show the file's
-/// basename (`E ` prefix for Edit); Browser/Claude show their kind.
-fn workspace_strip_label(wsp: &workspace::Workspace<App>) -> String {
-    if let workspace::Layout::Leaf(w) = &wsp.layout {
-        match &w.content {
-            App::Buffer(BufferApp::Viewing(d)) => basename_or_full(d.file_label.as_ref()),
-            App::Buffer(BufferApp::Editing(e)) => {
-                format!("E {}", basename_or_full(e.file_label.as_ref()))
-            }
-            App::Buffer(BufferApp::Picking(_)) => format!("Browser ({})", wsp.display_label()),
-            App::Agent(_) => format!("Claude ({})", wsp.display_label()),
-            App::Linear(tile) => tile.title(),
-            App::Cog(tile) => tile.title(),
-            App::Keymap(_) => "Keybindings".to_string(),
-        }
-    } else {
-        wsp.display_label().to_string()
-    }
-}
-
-/// Workspace identity shown in destination pickers. Kept separate from the
-/// workspace strip's content summary so the picker can evolve independently.
+/// Stable workspace identity shown in destination pickers. This deliberately
+/// excludes content/provider summaries used by other navigation surfaces.
 fn workspace_picker_destination_label(wsp: &workspace::Workspace<App>) -> String {
-    workspace_strip_label(wsp)
-}
-
-fn basename_or_full(path: &str) -> String {
-    std::path::Path::new(path)
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_string())
+    wsp.display_label().to_string()
 }
 
 /// Extract the file label of a workspace's focused window, if Doc or Edit.
