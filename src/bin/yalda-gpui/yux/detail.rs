@@ -161,6 +161,47 @@ pub(crate) fn compact_count_indicator(
         .child(SharedString::from(count.to_string()))
 }
 
+/// A primary identity label for constrained navigation chrome. The containing
+/// row owns typography and width; this primitive owns the non-wrapping overflow
+/// contract so long names cannot silently change row geometry.
+pub(crate) fn single_line_ellipsis(label: &str) -> gpui::Div {
+    div()
+        .w_full()
+        .min_w_0()
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_ellipsis()
+        .child(SharedString::from(label.to_string()))
+}
+
+/// A quiet but explicit status mark for dense navigation rows. This is a
+/// semantic companion to [`compact_count_indicator`]: the caller chooses the
+/// label and tint while yux owns the compact pill geometry and typography.
+pub(crate) fn compact_status_mark(
+    id: impl Into<ElementId>,
+    label: &str,
+    tint: Hsla,
+    st: &DetailStyle,
+) -> gpui::Stateful<gpui::Div> {
+    let mut wash = tint;
+    wash.a *= 0.10;
+    div()
+        .id(id)
+        .flex_none()
+        .h(px(16.0))
+        .px(px(6.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(8.0))
+        .bg(wash)
+        .text_color(tint)
+        .font_family(st.mono.clone())
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_size(px(st.pt * 0.68))
+        .child(SharedString::from(label.to_string()))
+}
+
 /// A compact heading inside a dense list. The caller supplies the semantic
 /// glyph and tint; this primitive owns the shared uppercase label, count,
 /// trailing hairline, and spacing so repeated list groups read as one system.
@@ -305,10 +346,8 @@ pub(crate) fn picker_option_row(
                 .child(SharedString::from(glyph.to_string())),
         )
         .child(
-            div()
+            single_line_ellipsis(label)
                 .flex_1()
-                .min_w_0()
-                .overflow_hidden()
                 .font_family(body_font.clone())
                 .font_weight(if selected {
                     FontWeight::SEMIBOLD
@@ -316,8 +355,7 @@ pub(crate) fn picker_option_row(
                     FontWeight::MEDIUM
                 })
                 .text_size(px(13.0))
-                .text_color(label_color)
-                .child(SharedString::from(label.to_string())),
+                .text_color(label_color),
         );
     if let Some((badge, badge_color)) = badge {
         let mut badge_bg = badge_color;

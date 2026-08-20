@@ -8450,6 +8450,196 @@ fn jump_panel_tagged_items_keep_fixed_chrome_size(cx: &mut TestAppContext) {
         );
     }
 }
+
+/// UXI-JumpPanel-26: selection is structural chrome, never low-contrast label
+/// text. Folio is the reported failure because its overlay border is an
+/// intentionally pale divider that cannot serve as foreground copy.
+#[gpui::test]
+fn jump_panel_active_workspace_keeps_folio_foreground(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_browser(cx);
+    view.update(vcx, |v, cx| v.set_theme(crate::ThemeName::Folio, cx));
+    vcx.run_until_parked();
+
+    let (style, foreground, pale_divider) = view.read_with(vcx, |v, _| {
+        let foreground = v.editor_fg();
+        let pale_divider = crate::nc(v.theme.overlay.border);
+        let selected_bg = crate::nc(crate::jump_selection_color(&v.theme.overlay));
+        (
+            crate::jump_workspace_row_style(true, foreground, pale_divider, selected_bg),
+            foreground,
+            pale_divider,
+        )
+    });
+
+    assert_eq!(
+        style.label, foreground,
+        "an active workspace label must retain the normal foreground color"
+    );
+    assert_ne!(
+        style.label, pale_divider,
+        "Folio's pale structural divider must never become label text"
+    );
+    assert!(
+        style.background.a > 0.0 && style.rail.a > 0.0,
+        "active state must remain visible through a neutral background and accent rail"
+    );
+}
+
+/// UXI-JumpPanel-26: a primary tile name is one line of navigation chrome.
+/// A constrained real paint with an intentionally huge multi-word title must
+/// have exactly the same row height as an ordinary jump-panel row.
+#[gpui::test]
+fn jump_panel_long_tile_names_stay_single_line(cx: &mut TestAppContext) {
+    use crate::{App, LinearTile};
+
+    let (view, vcx) = boot_browser(cx);
+    let (tile, short_tile) = view.update(vcx, |v, _| {
+        let project = v.workspace.active_workspace().expect("workspace").project();
+        let mut linear = LinearTile::new();
+        linear.title = "a very long detached tile title that must end in an ellipsis rather than wrapping onto a second or third navigation line".into();
+        let tile = v.workspace.push_detached(App::Linear(linear), project);
+        let mut short = LinearTile::new();
+        short.title = "short".into();
+        let short_tile = v.workspace.push_detached(App::Linear(short), project);
+        (tile, short_tile)
+    });
+
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let long = crate::layout_probe_get(&format!("jump-tile-row-{tile}"))
+        .expect("long detached tile row paints")
+        .3;
+    let long_label = crate::layout_probe_get(&format!("jump-tile-label-{tile}"))
+        .expect("long tile identity label paints");
+    let short = crate::layout_probe_get(&format!("jump-tile-row-{short_tile}"))
+        .expect("short detached tile row paints")
+        .3;
+    let standard = crate::layout_probe_get("jump-system-console")
+        .expect("standard jump navigation row paints")
+        .3;
+    crate::layout_probe_end();
+
+    assert!(
+        (long - short).abs() <= 0.5 && (long - standard).abs() <= 0.5,
+        "long tile names must truncate without changing row height: long={long}px short={short}px standard={standard}px"
+    );
+    assert!(
+        long_label.2 > 40.0 && long_label.3 > 10.0,
+        "the truncated identity label itself must remain visibly painted: {long_label:?}"
+    );
+}
+
+/// UXI-JumpPanel-25/-26: hiddenness is ownership metadata users must be able to
+/// see before activating a row. Exercise the production hidden attachment and
+/// require its dedicated painted marker, not a model-only boolean.
+#[gpui::test]
+fn jump_panel_hidden_tiles_paint_indicator(cx: &mut TestAppContext) {
+    use crate::{AgentTile, App, LinearTile, ServerSid};
+
+    let (view, vcx) = boot_browser(cx);
+    let (tile, workspace, agent, detached) = view.update(vcx, |v, _| {
+        let mut linear = LinearTile::new();
+        linear.title = "hidden-linear".into();
+        let tile = v.workspace.push_workspace_inheriting(App::Linear(linear));
+        let workspace = v.workspace.active_workspace;
+        let project = v.workspace.workspaces[workspace].project();
+        let cwd = v.projects.cwd_of(project).unwrap().to_path_buf();
+        let sid = "S-hidden-indicator";
+        v.agent_roster.upsert(yalda::session_proto::SessionInfo {
+            session_id: sid.into(),
+            acp_session_id: None,
+            label: "hidden-agent".into(),
+            cwd,
+            provider: yalda::acp_channel::AgentProvider::Claude,
+            turns: 0,
+            connected: true,
+            permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+            busy: false,
+            archived: false,
+        });
+        let agent = v
+            .workspace
+            .split_focused(
+                crate::workspace::SplitDir::V,
+                App::Agent(AgentTile::dormant(ServerSid::new(sid))),
+            )
+            .expect("Agent tile joins the same workspace");
+        v.workspace.hide_window(tile).expect("tile hides");
+        v.workspace.hide_window(agent).expect("agent tile hides");
+        assert_eq!(
+            v.workspace.hidden_workspace_index_of_window(tile),
+            Some(workspace),
+            "hidden tile retains workspace ownership"
+        );
+        assert_eq!(
+            v.workspace.hidden_workspace_index_of_window(agent),
+            Some(workspace),
+            "hidden Agent retains workspace ownership"
+        );
+        let mut detached_linear = LinearTile::new();
+        detached_linear.title = "detached-visible".into();
+        let detached = v
+            .workspace
+            .push_detached(App::Linear(detached_linear), project);
+        (tile, workspace, agent, detached)
+    });
+
+    view.read_with(vcx, |v, cx| {
+        let placements: Vec<_> = v
+            .jump_panel_sections(cx)
+            .0
+            .into_iter()
+            .flat_map(|section| section.workspace_folders)
+            .flat_map(|folder| folder.tiles)
+            .chain(
+                v.jump_panel_sections(cx)
+                    .0
+                    .into_iter()
+                    .flat_map(|section| section.detached),
+            )
+            .filter(|row| row.id == tile || row.id == agent || row.id == detached)
+            .map(|row| (row.id, row.placement, row.agent.is_some()))
+            .collect();
+        assert_eq!(
+            placements,
+            vec![
+                (tile, crate::JumpTilePlacement::AttachedHidden, false),
+                (agent, crate::JumpTilePlacement::AttachedHidden, true),
+                (detached, crate::JumpTilePlacement::Detached, false),
+            ],
+            "hidden attachment state survives the typed row projection"
+        );
+    });
+
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    assert!(
+        crate::layout_probe_get(&format!("jump-tile-row-{tile}-ws{workspace}")).is_some(),
+        "hidden tile remains listed beneath its workspace"
+    );
+    let hidden_mark = crate::layout_probe_get(&format!("jump-tile-hidden-{tile}-ws{workspace}"));
+    assert!(
+        hidden_mark.is_some(),
+        "hidden non-Agent row paints a dedicated hidden-state indicator"
+    );
+    assert!(
+        crate::layout_probe_get(&format!("jump-tile-hidden-{agent}")).is_some(),
+        "hidden Agent row keeps its provider/status marks and also paints the hidden indicator"
+    );
+    assert!(
+        crate::layout_probe_get(&format!("jump-tile-row-{detached}")).is_some()
+            && crate::layout_probe_get(&format!("jump-tile-hidden-{detached}")).is_none(),
+        "Detached is a distinct placement and must never inherit the hidden marker"
+    );
+    let (_, _, mark_w, mark_h) = hidden_mark.unwrap();
+    assert!(
+        (28.0..=58.0).contains(&mark_w) && mark_h <= 16.5,
+        "the hidden mark remains a compact trailing pill: {mark_w}x{mark_h}px"
+    );
+    crate::layout_probe_end();
+}
 /// ADR-0034 / UXI-JumpPanel-25: hidden attachments remain under their owning
 /// workspace in both navigation surfaces. Selection presents them solo without
 /// changing membership; Unhide follows them back into the workspace.

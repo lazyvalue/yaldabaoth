@@ -247,6 +247,31 @@ pub(crate) fn jump_selection_color(theme: &yalda::theme::OverlayTheme) -> yalda:
     theme.selected_bg
 }
 
+/// The complete visual treatment for a workspace-folder row. Keeping these
+/// colors together gives tests and every renderer one production seam for the
+/// selected-state contract instead of independently choosing a text tint,
+/// background, and rail.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct JumpWorkspaceRowStyle {
+    pub(crate) label: Hsla,
+    pub(crate) background: Hsla,
+    pub(crate) rail: Hsla,
+}
+
+pub(crate) fn jump_workspace_row_style(
+    active: bool,
+    foreground: Hsla,
+    selection_mark: Hsla,
+    selected_bg: Hsla,
+) -> JumpWorkspaceRowStyle {
+    let transparent: Hsla = rgba(0x00000000).into();
+    JumpWorkspaceRowStyle {
+        label: foreground,
+        background: if active { selected_bg } else { transparent },
+        rail: if active { selection_mark } else { transparent },
+    }
+}
+
 impl AgentRow {
     pub(crate) fn activity(&self) -> AgentActivity {
         if !self.connected {
@@ -524,7 +549,24 @@ pub(crate) struct JumpTileRow {
     pub(crate) label: String,
     pub(crate) tags: Vec<String>,
     pub(crate) active: bool,
+    pub(crate) placement: JumpTilePlacement,
     pub(crate) agent: Option<AgentRow>,
+}
+
+/// Ownership and visibility reach the renderer as one closed state. In
+/// particular, a Detached tile cannot also be Hidden; that invalid combination
+/// is unrepresentable in the jump-panel projection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JumpTilePlacement {
+    AttachedVisible,
+    AttachedHidden,
+    Detached,
+}
+
+impl JumpTilePlacement {
+    fn is_hidden(self) -> bool {
+        matches!(self, Self::AttachedHidden)
+    }
 }
 
 /// A collapsible workspace folder and the tiles it exclusively owns.
@@ -644,10 +686,20 @@ impl YaldaGpuiView {
                 .map(|(index, wsp)| {
                     let mut tiles = Vec::new();
                     wsp.layout.for_each_leaf(&mut |window| {
-                        tiles.push(self.jump_tile_row(window, &tile_agent_rows, cx));
+                        tiles.push(self.jump_tile_row(
+                            window,
+                            &tile_agent_rows,
+                            JumpTilePlacement::AttachedVisible,
+                            cx,
+                        ));
                     });
                     for hidden in &wsp.hidden_tiles {
-                        tiles.push(self.jump_tile_row(&hidden.window, &tile_agent_rows, cx));
+                        tiles.push(self.jump_tile_row(
+                            &hidden.window,
+                            &tile_agent_rows,
+                            JumpTilePlacement::AttachedHidden,
+                            cx,
+                        ));
                     }
                     JumpWorkspaceFolder {
                         index,
@@ -664,7 +716,14 @@ impl YaldaGpuiView {
                 .detached_tiles
                 .iter()
                 .filter(|tile| tile.project() == id)
-                .map(|tile| self.jump_tile_row(&tile.window, &tile_agent_rows, cx))
+                .map(|tile| {
+                    self.jump_tile_row(
+                        &tile.window,
+                        &tile_agent_rows,
+                        JumpTilePlacement::Detached,
+                        cx,
+                    )
+                })
                 .filter(|tile| match (&tile.agent, agent_tab) {
                     (None, JumpAgentTab::All) => true,
                     (None, _) => false,
@@ -716,6 +775,7 @@ impl YaldaGpuiView {
         &self,
         window: &workspace::Window<App>,
         agent_rows: &[AgentRow],
+        placement: JumpTilePlacement,
         cx: &gpui::App,
     ) -> JumpTileRow {
         let mut agent_match = match &window.content {
@@ -754,6 +814,7 @@ impl YaldaGpuiView {
             label,
             tags,
             active: self.workspace.focused_window_id() == Some(window.id()),
+            placement,
             agent,
         }
     }
@@ -1518,6 +1579,12 @@ impl YaldaGpuiView {
                 let folder_folded = self.jump_folded_workspaces.contains(&key);
                 let num = format!("{}", idx + 1);
                 let label = folder.label.clone();
+                let row_style = jump_workspace_row_style(
+                    folder.active,
+                    st.fg,
+                    selection_mark,
+                    sel_bg,
+                );
                 let header = div()
                     .id(SharedString::from(format!("jump-ws-{idx}")))
                     .flex()
@@ -1527,6 +1594,9 @@ impl YaldaGpuiView {
                     .px_3()
                     .py_1()
                     .text_size(st.base)
+                    .border_l_2()
+                    .border_color(row_style.rail)
+                    .bg(row_style.background)
                     .hover(|s| s.bg(sel_bg))
                     .child(
                         div()
@@ -1550,10 +1620,12 @@ impl YaldaGpuiView {
                             .flex_1()
                             .min_w_0()
                             .cursor_pointer()
-                            .text_color(if folder.active { selection_mark } else { st.fg })
-                            .font_family(st.mono.clone())
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(SharedString::from(format!("⊞ {label}")))
+                            .child(
+                                single_line_ellipsis(&format!("⊞ {label}"))
+                                    .text_color(row_style.label)
+                                    .font_family(st.mono.clone())
+                                    .font_weight(FontWeight::SEMIBOLD),
+                            )
                             .on_click(cx.listener(move |this, _ev, _window, cx| {
                                 this.select_workspace(idx, cx)
                             })),
@@ -1811,6 +1883,7 @@ impl YaldaGpuiView {
                             drag_font.clone(),
                             allow_drag,
                             supporting_text,
+                            None,
                             cx,
                         ))
                     };
@@ -2041,6 +2114,7 @@ impl YaldaGpuiView {
                         drag_font.clone(),
                         true,
                         supporting_text,
+                        None,
                         cx,
                     ));
                 }
@@ -2064,6 +2138,16 @@ fn jump_tile_row_el(
     supporting_text: Hsla,
     cx: &mut Context<YaldaGpuiView>,
 ) -> AnyElement {
+    let hidden_indicator = || {
+        row.placement.is_hidden().then(|| {
+            let probe = format!("jump-tile-hidden-{}{suffix}", row.id);
+            probe_bounds_dyn(
+                probe.clone(),
+                compact_status_mark(SharedString::from(probe), "hidden", supporting_text, st)
+                    .into_any_element(),
+            )
+        })
+    };
     if let Some(agent) = &row.agent {
         return jump_session_row_el(
             row.render_index,
@@ -2079,6 +2163,7 @@ fn jump_tile_row_el(
             drag_font,
             false,
             supporting_text,
+            hidden_indicator(),
             cx,
         );
     }
@@ -2088,12 +2173,14 @@ fn jump_tile_row_el(
         jump_nav_row(
             SharedString::from(format!("jump-tile-{id}{suffix}")),
             &row.label,
+            Some(format!("jump-tile-label-{id}{suffix}")),
             Some("◇"),
             None,
             None,
             st,
             sel_bg,
             row.active.then_some(selection_mark),
+            hidden_indicator(),
         )
         .on_click(cx.listener(move |this, _ev, _window, cx| this.jump_to_tile(id, cx)))
         .into_any_element(),
@@ -2124,6 +2211,7 @@ fn jump_session_row_el(
     drag_font: SharedString,
     allow_drag: bool,
     supporting_text: Hsla,
+    hidden_indicator: Option<AnyElement>,
     cx: &mut Context<YaldaGpuiView>,
 ) -> gpui::AnyElement {
     // The agent-session icon is a `✦` whose COLOR carries the status (one glyph =
@@ -2142,6 +2230,7 @@ fn jump_session_row_el(
     let mut r = jump_nav_row_hinted(
         row_id,
         &row.label,
+        None,
         Some(badge_glyph),
         Some(badge_color),
         Some(format!("jump-session-status-mark-{i}{id_suffix}")),
@@ -2157,6 +2246,7 @@ fn jump_session_row_el(
         st,
         sel_bg,
         active.then_some(selection_mark),
+        hidden_indicator,
     );
     if let Some(hue) = match status {
         AgentDotStatus::Working => Some(working_orange),
@@ -2286,24 +2376,27 @@ fn jump_session_row_el(
 /// Row labels sit at `SEMIBOLD` (they read too thin at normal weight, and this
 /// stays a step under the `BOLD` project headers so the hierarchy holds).
 /// `active` marks "this is where you are" (UXI-JumpPanel-5): `Some(accent)` draws
-/// a left accent bar in that hue, tints the row background, and colors the label
-/// with the accent; `None` is a plain row (hover still tints). Every row reserves
+/// a left accent bar in that hue and tints the row background while the label
+/// retains normal foreground contrast; `None` is a plain row (hover still tints). Every row reserves
 /// the 2px left-bar gutter (transparent when inactive) so the mark never shifts
 /// row geometry.
 #[allow(clippy::too_many_arguments)]
 fn jump_nav_row(
     id: impl Into<ElementId>,
     label: &str,
+    label_probe: Option<String>,
     badge: Option<&str>,
     badge_color: Option<Hsla>,
     hint: Option<&str>,
     st: &DetailStyle,
     sel_bg: Hsla,
     active: Option<Hsla>,
+    status_mark: Option<AnyElement>,
 ) -> gpui::Stateful<gpui::Div> {
     jump_nav_row_hinted(
         id,
         label,
+        label_probe,
         badge,
         badge_color,
         None,
@@ -2313,6 +2406,7 @@ fn jump_nav_row(
         st,
         sel_bg,
         active,
+        status_mark,
     )
 }
 
@@ -2324,6 +2418,7 @@ fn jump_nav_row(
 fn jump_nav_row_hinted(
     id: impl Into<ElementId>,
     label: &str,
+    label_probe: Option<String>,
     badge: Option<&str>,
     badge_color: Option<Hsla>,
     badge_probe: Option<String>,
@@ -2333,6 +2428,7 @@ fn jump_nav_row_hinted(
     st: &DetailStyle,
     sel_bg: Hsla,
     active: Option<Hsla>,
+    status_mark: Option<AnyElement>,
 ) -> gpui::Stateful<gpui::Div> {
     let transparent: Hsla = rgba(0x00000000).into();
     let label = if label.trim().is_empty() {
@@ -2349,6 +2445,15 @@ fn jump_nav_row_hinted(
         probe_bounds_dyn(probe, badge_el.into_any_element())
     } else {
         badge_el.into_any_element()
+    };
+    let label_el = single_line_ellipsis(&label)
+        .flex_1()
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(st.fg);
+    let label_el = if let Some(probe) = label_probe {
+        probe_bounds_dyn(probe, label_el.into_any_element())
+    } else {
+        label_el.into_any_element()
     };
     let mut row = div()
         .id(id)
@@ -2373,14 +2478,10 @@ fn jump_nav_row_hinted(
         })
         .hover(|s| s.bg(sel_bg))
         .child(badge_el)
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(st.fg)
-                .child(SharedString::from(label)),
-        );
+        .child(label_el);
+    if let Some(status_mark) = status_mark {
+        row = row.child(status_mark);
+    }
     if let Some(hint) = hint {
         let hint_el = div()
             .flex_none()
