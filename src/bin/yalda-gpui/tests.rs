@@ -3412,6 +3412,12 @@ fn agent_menu_root_and_view_are_the_approved_items() {
     let menu = agent_local_menu();
     let actual: Vec<(String, &str)> = menu
         .iter()
+        .filter(|node| {
+            matches!(
+                node.kind(),
+                MenuNodeKind::Command | MenuNodeKind::Submenu
+            )
+        })
         .map(|node| (format_menu_key(&node.key), node.label.as_str()))
         .collect();
     assert_eq!(
@@ -3422,6 +3428,8 @@ fn agent_menu_root_and_view_are_the_approved_items() {
             ("s".into(), "select session"),
             ("c".into(), "clear"),
             ("v".into(), "view"),
+            ("h".into(), "hide"),
+            ("H".into(), "unhide"),
         ]
     );
     let view = menu
@@ -3444,6 +3452,8 @@ fn agent_menu_root_and_view_are_the_approved_items() {
         ('w', "agent-input-toggle"),
         ('s', "claude-session-picker"),
         ('c', "claude-clear"),
+        ('h', "tile-hide"),
+        ('H', "tile-unhide"),
     ] {
         let mut state = MenuState::new();
         state.open();
@@ -3452,6 +3462,35 @@ fn agent_menu_root_and_view_are_the_approved_items() {
             Some(expected.to_string()),
             "Agent root {key} must dispatch {expected}"
         );
+    }
+}
+
+#[test]
+fn every_tile_menu_has_shared_visibility_commands() {
+    for (name, menu) in [
+        ("doc", doc_local_menu()),
+        ("edit", edit_local_menu()),
+        ("agent", agent_local_menu()),
+        ("browser", browser_local_menu()),
+        ("linear", linear_local_menu()),
+        ("cog", cog_local_menu()),
+        ("keymap", keymap_local_menu()),
+    ] {
+        let suffix = menu
+            .get(menu.len().saturating_sub(3)..)
+            .unwrap_or_else(|| panic!("{name} menu is missing the visibility suffix"));
+        assert_eq!(suffix[0].kind(), MenuNodeKind::Separator, "{name}");
+        for (node, key, label, command) in [
+            (&suffix[1], "h", "hide", "tile-hide"),
+            (&suffix[2], "H", "unhide", "tile-unhide"),
+        ] {
+            assert_eq!(format_menu_key(&node.key), key, "{name}");
+            assert_eq!(node.label, label, "{name}");
+            assert!(
+                matches!(&node.action, MenuAction::Command(actual) if actual == command),
+                "{name} {label} must dispatch {command}"
+            );
+        }
     }
 }
 

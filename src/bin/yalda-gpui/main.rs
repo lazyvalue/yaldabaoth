@@ -1751,11 +1751,22 @@ fn gpui_menu() -> Vec<MenuNode> {
 // motions (links/headings/list-items/code-blocks) have real dispatch handlers
 // and leave for direct nav keys in T2.
 
+/// Visibility is a property of the focused tile shell, so these commands are
+/// appended uniformly to every App-specific menu. Keeping the entries in one
+/// builder prevents a new App kind from silently inventing different keys or
+/// command names (UXI-Menu-9).
+fn with_tile_visibility_commands(mut menu: Vec<MenuNode>) -> Vec<MenuNode> {
+    menu.push(MenuNode::separator());
+    menu.push(MenuNode::entry("h", "hide", "tile-hide"));
+    menu.push(MenuNode::entry("H", "unhide", "tile-unhide"));
+    menu
+}
+
 fn doc_local_menu() -> Vec<MenuNode> {
     // Verbs on the focused document. (`b` file-browser dropped — Cmd-O already
     // opens it. The `n`/`g` submenus are motions; they stay only until T2 gives
     // them direct nav keys — ADR-0032.)
-    vec![
+    with_tile_visibility_commands(vec![
         MenuNode::entry("e", "edit (raw markdown)", "enter-edit"),
         MenuNode::entry("w", "edit (word processor)", "enter-wp"),
         MenuNode::entry("r", "reload from disk", "reload-file"),
@@ -1781,11 +1792,11 @@ fn doc_local_menu() -> Vec<MenuNode> {
                 // `nav-headings`/`goto-heading` handler, same label).
             ],
         ),
-    ]
+    ])
 }
 
 fn edit_local_menu() -> Vec<MenuNode> {
-    vec![
+    with_tile_visibility_commands(vec![
         MenuNode::entry("v", "back to doc view", "back-to-doc"),
         MenuNode::entry("w", "toggle code/word-processor", "wp-toggle"),
         MenuNode::entry("r", "reload from disk", "reload-file"),
@@ -1804,14 +1815,14 @@ fn edit_local_menu() -> Vec<MenuNode> {
                 MenuNode::entry("x", "extend by line", "extend-line"),
             ],
         ),
-    ]
+    ])
 }
 
 fn agent_local_menu() -> Vec<MenuNode> {
     // UXI-Menu-8: the Agent root is deliberately exact and small. Commands
     // removed from this tree retain their handlers; they are simply not part of
     // the normal Agent command surface.
-    vec![
+    with_tile_visibility_commands(vec![
         MenuNode::entry("w", "switch worksheet ⇄ message box", "agent-input-toggle"),
         MenuNode::submenu(
             "m",
@@ -1828,42 +1839,42 @@ fn agent_local_menu() -> Vec<MenuNode> {
                 MenuNode::entry("t", "tasks", "agent-view-tasks"),
             ],
         ),
-    ]
+    ])
 }
 
 fn linear_local_menu() -> Vec<MenuNode> {
-    vec![
+    with_tile_visibility_commands(vec![
         MenuNode::entry("i", "edit query", "linear-edit"),
         MenuNode::entry("o", "open in browser", "linear-open-url"),
         MenuNode::entry("y", "copy URL", "linear-copy-url"),
-    ]
+    ])
 }
 
 fn cog_local_menu() -> Vec<MenuNode> {
-    vec![
+    with_tile_visibility_commands(vec![
         MenuNode::entry("g", "back to graph list", "cog-graphs"),
         MenuNode::entry("r", "refresh", "cog-refresh"),
-    ]
+    ])
 }
 
 fn keymap_local_menu() -> Vec<MenuNode> {
-    vec![
+    with_tile_visibility_commands(vec![
         MenuNode::entry("i", "filter", "keymap-filter"),
         MenuNode::entry("r", "rebind selected", "keymap-rebind"),
         MenuNode::entry("x", "reset selected", "keymap-reset"),
         MenuNode::entry("R", "reset all to defaults", "keymap-reset-all"),
-    ]
+    ])
 }
 
 fn browser_local_menu() -> Vec<MenuNode> {
-    vec![
+    with_tile_visibility_commands(vec![
         MenuNode::entry("s", "cycle sort", "browser-sort"),
         MenuNode::entry(".", "toggle hidden files", "browser-hidden"),
         MenuNode::entry("-", "go up", "browser-up"),
         MenuNode::separator(),
         MenuNode::entry("w", "open in new workspace", "browser-open-workspace"),
         MenuNode::entry("v", "open in split", "browser-open-split"),
-    ]
+    ])
 }
 
 struct YaldaGpuiView {
@@ -5440,6 +5451,38 @@ impl YaldaGpuiView {
         menu
     }
 
+    /// Applicability for the shared tile-visibility commands. Unhide is enabled
+    /// only while a hidden attachment is being presented solo; the ordinary
+    /// visible and Detached cases keep it present but dimmed. Hide is the exact
+    /// inverse and is unavailable when the focused tile is already hidden or
+    /// has no workspace attachment.
+    fn tile_visibility_menu_disabled(&self) -> HashSet<String> {
+        let membership = self
+            .workspace
+            .focused_window_id()
+            .and_then(|id| self.workspace.tile_membership(id));
+        let mut disabled = HashSet::new();
+        match membership {
+            Some(workspace::TileMembership::Attached {
+                visibility: workspace::AttachedVisibility::Visible,
+                ..
+            }) => {
+                disabled.insert("tile-unhide".to_string());
+            }
+            Some(workspace::TileMembership::Attached {
+                visibility: workspace::AttachedVisibility::Hidden,
+                ..
+            }) => {
+                disabled.insert("tile-hide".to_string());
+            }
+            Some(workspace::TileMembership::Detached) | None => {
+                disabled.insert("tile-hide".to_string());
+                disabled.insert("tile-unhide".to_string());
+            }
+        }
+        disabled
+    }
+
     fn open_local_menu_inner(&mut self, cx: &mut Context<Self>) {
         if self.overlay_is_menu() {
             return;
@@ -5447,22 +5490,15 @@ impl YaldaGpuiView {
         let Some(opened_from) = self.workspace.focused_window_id() else {
             return;
         };
-        let (menu, header, disabled) = match self.workspace.focused_content() {
-            Some(App::Buffer(BufferApp::Viewing(_))) => (doc_local_menu(), "DOC", HashSet::new()),
-            Some(App::Buffer(BufferApp::Editing(_))) => (edit_local_menu(), "EDIT", HashSet::new()),
-            Some(App::Agent(_)) => {
-                let mut disabled = HashSet::new();
-                if self.active_server_session_id().is_none() {
-                    disabled.insert("archive-session".to_string());
-                }
-                (self.agent_local_menu_dynamic(cx), "AGENT", disabled)
-            }
-            Some(App::Buffer(BufferApp::Picking(_))) => {
-                (browser_local_menu(), "BROWSE", HashSet::new())
-            }
-            Some(App::Linear(_)) => (linear_local_menu(), "LINEAR", HashSet::new()),
-            Some(App::Cog(_)) => (cog_local_menu(), "COG", HashSet::new()),
-            Some(App::Keymap(_)) => (keymap_local_menu(), "KEYBINDINGS", HashSet::new()),
+        let disabled = self.tile_visibility_menu_disabled();
+        let (menu, header) = match self.workspace.focused_content() {
+            Some(App::Buffer(BufferApp::Viewing(_))) => (doc_local_menu(), "DOC"),
+            Some(App::Buffer(BufferApp::Editing(_))) => (edit_local_menu(), "EDIT"),
+            Some(App::Agent(_)) => (self.agent_local_menu_dynamic(cx), "AGENT"),
+            Some(App::Buffer(BufferApp::Picking(_))) => (browser_local_menu(), "BROWSE"),
+            Some(App::Linear(_)) => (linear_local_menu(), "LINEAR"),
+            Some(App::Cog(_)) => (cog_local_menu(), "COG"),
+            Some(App::Keymap(_)) => (keymap_local_menu(), "KEYBINDINGS"),
             None => return,
         };
         self.transient_status = None;
