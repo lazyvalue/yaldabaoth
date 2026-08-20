@@ -667,13 +667,27 @@ wash) applies to **every listed session**, including ones
 this GUI has never opened — unbound Agent tiles, jump-panel-created ones, and sessions
 another GUI instance is driving.
 
-The derivation is **local-then-server**:
+The derivation **unions both authorities** — a session is **working** if EITHER
+the local reducer's `turn_phase.is_awaiting()` OR the server's `SessionInfo.busy`
+is set:
 
-1. session open in this GUI ⇒ its live `turn_phase` wins;
-2. otherwise ⇒ the server's `SessionInfo.busy` (a turn is in flight) drives
-   **working**; connected + not busy is **ready for input**. A **busy→idle**
-   broadcast may also raise the internal roster-side unread mark, cleared when
-   you jump to it, without changing the visible ready state.
+1. session open in this GUI ⇒ its live `turn_phase` shows **working**;
+2. AND, regardless of whether it is open here, the server's `SessionInfo.busy`
+   (a turn is in flight) also shows **working**.
+
+Connected + neither authority working is **ready for input**. A **busy→idle**
+broadcast may also raise the internal roster-side unread mark, cleared when you
+jump to it, without changing the visible ready state.
+
+The OR is load-bearing, not a fallback: the local `turn_phase` only enters
+`Awaiting` on a submit THIS GUI made, so a session open here whose current turn
+was started **elsewhere** — another GUI window, `yalda-mcp`, or a turn still
+streaming after a reconnect (`reset_for_replay` resets the phase to `Idle`) —
+keeps `turn_phase == Idle`. Masking `busy` with the local phase (the earlier
+"local wins" rule) painted that genuinely-working agent as **ready**. Because the
+union holds the row **working until BOTH agree it is idle**, a working agent is
+never shown as ready. `connected` still gates the dot to Neutral, so a
+disconnected session never reads working.
 
 The server owns `busy`: set when a prompt is accepted or queued, cleared when the
 turn settles or the channel is (re)spawned. `SessionInfo.busy` is
@@ -700,6 +714,9 @@ an old daemon never sends `SessionBusy`.
 never-opened connected roster session goes WaitingForYou → Working →
 WaitingForYou through the REAL `apply_server_batch` reducer + row builder.
 Reading clears its internal unread mark without changing its visible readiness.
+`verify_harness.rs::open_session_busy_from_elsewhere_shows_working` pins the
+union clause: a session open here with `turn_phase == Idle` still shows Working
+once the server's `SessionBusy` flag is set (the "driven from elsewhere" gap).
 The live server→GUI loop is verification gap 2.
 
 ### UXI-JumpPanel-10 — A live session shows state without redundant row text
@@ -1671,3 +1688,40 @@ mouse-drag gesture itself remains `NEEDS-RUNTIME` under harness gap #2; the
 typed payload and both gesture/state gates are code-reviewed.
 Negative control observed RED by removing the workspace-folder stable sort: the
 same-project reorder assertion returned `[1, 2, 3]` instead of `[3, 1, 2]`.
+
+### UXI-JumpPanel-30 — A workspace folder marks that it contains a working agent
+
+**Statement.** A workspace folder header carries a warm `◆` status dot exactly
+when at least one agent tile the workspace owns binds a session that is currently
+**working** (a reply in flight, `AgentActivity::Working`). The dot renders on the
+folder header — beside the tile-count pill — so a **collapsed** folder still
+surfaces that an agent inside it is busy, without expanding it. A folder with no
+working agent has no dot.
+
+The flag is `JumpWorkspaceFolder::has_working_agent`, derived from the folder's
+own `tiles` (`row.activity() == AgentActivity::Working`), so it reuses the exact
+per-session status the session dot shows — including the union-of-authorities
+rule (`UXI-JumpPanel-12`): a session driven from elsewhere marks its folder
+working too. Hidden/attached tiles inside the folder count the same as visible
+ones (they are in `tiles`). Detached tiles are not part of any workspace folder
+and do not contribute.
+
+**Applies to.** `jump_panel_view.rs` (`JumpWorkspaceFolder::has_working_agent`,
+computed in `jump_panel_sections_with_tab`; the `◆` header child in
+`render_jump_panel`, colored `jump_agent_status_color(Working)`).
+
+**Why.** Folders collapse, and a collapsed folder previously hid all activity
+inside it — a working agent in a folded workspace was invisible until you
+expanded it. The folder-level dot restores "is anything busy in here" at the
+scanning level the folder header already occupies, using the same status source
+as the rows so the two can never disagree.
+
+**Status.** `implemented` — headless for the derivation (the `has_working_agent`
+flag through the REAL `jump_panel_sections`); the exact glyph/hue is a paint
+detail (gap #1). The dot's PAINT is probe-taggable (`jump-ws-working-<idx>`).
+
+**Enforcement.** `verify_harness.rs::workspace_folder_marks_contained_working_agent`
+— an agent tile in a workspace, idle → the owning folder's `has_working_agent`
+is false; the REAL `SessionBusy` reducer flips the session to working → the flag
+is true; settling it → false again. Negative control observed RED by forcing
+`has_working_agent = false` at its construction site.
