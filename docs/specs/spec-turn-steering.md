@@ -6,8 +6,10 @@
 
 > **SCOPE NOTE (supersedes the queue/chips described below).** The shipped design
 > is **provider-aware delivery**: Claude sends at once (mid-turn via the
-> worker's `promptQueueing` concurrent driver), while Codex gracefully cancels
-> an in-flight turn before sending the normal message as its replacement prompt;
+> worker's `promptQueueing` concurrent driver), while capable Codex adapters use
+> their advertised native `_session/steering` FIFO. Older Codex adapters
+> gracefully cancel an in-flight turn before sending the normal message as a
+> replacement prompt;
 > both commit the user turn on a successful send. On send
 > failure the draft is left in the compose for retry. The earlier **client-side
 > steering queue + cancelable chips + `flush_idle_steering`** were removed (an
@@ -70,10 +72,16 @@ Delivery model:
   processes it after the current turn. This is the v2-ready shape: if the agent
   ever negotiates v2, the same path flips to true generation-time injection with
   no UI change.
-- **Interrupt then prompt (Codex):** a normal message submitted while Codex is
-  awaiting sends ACP `session/cancel` through the existing graceful-stop
-  transport, then sends the new prompt. It does not enter the Stop button's
-  `StopRequested` / force-restart state; idle Codex submits do not cancel.
+- **Native steering (Codex):** when initialize advertises root
+  `_meta.steering.supported`, a normal message submitted while Codex is awaiting
+  is sent as `_session/steering`. The adapter serializes successive requests in
+  FIFO order and injects them into the active turn. Yalda places the initial
+  capable-Codex prompt, native steering requests, and explicit Stop on one
+  ordered worker-control stream, then emits Stop as `session/cancel`; neither a
+  fast follow-up nor Stop can overtake an earlier submission.
+  Older adapters fall back to cancel-then-prompt. Neither path enters the Stop
+  button's `StopRequested` / force-restart state; idle Codex submits are ordinary
+  prompts.
 - **Offline queue (IMPLEMENTED, fallback):** if the send fails (disconnected), the
   message is held in `AgentState.steering` and retried at the next turn boundary
   (`flush_idle_steering`) — FIFO, never dropped. Surfaced as cancelable chips.
@@ -103,8 +111,13 @@ Named artifacts:
    (`FuturesUnordered`, no wait on the in-flight turn), bumping the turn counter
    per settled prompt. Non-capable agents use the unchanged sequential driver.
 3. For **Codex**, `submit_compose` detects `provider == Codex && awaiting` and
-   sends one graceful cancel before `send_prompt_to_session`. Claude never takes
-   this branch. The replacement prompt still uses the ordinary send/commit path.
+   asks the transport to steer. An adapter advertising root
+   `_meta.steering.supported` receives the initial `session/prompt`, subsequent
+   `_session/steering` requests, and later explicit Stop on the same ordered
+   worker-control stream;
+   otherwise the transport sends one graceful cancel before the ordinary
+   replacement prompt. Claude never takes this branch. Both Codex routes retain
+   the ordinary commit-on-success UI contract.
 
 ### Offline queue / retry (IMPLEMENTED)
 

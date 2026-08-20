@@ -59,11 +59,11 @@ use std::sync::mpsc as std_mpsc;
 use std::thread::{self, JoinHandle};
 
 use agent_client_protocol::schema::{
-    ContentBlock, ContentChunk, ImageContent, InitializeRequest, LoadSessionRequest, McpServer,
-    McpServerStdio, NewSessionRequest, PermissionOptionKind, ProtocolVersion, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionId,
-    SessionNotification, SessionUpdate, TextContent,
+    ContentBlock, ContentChunk, ImageContent, InitializeRequest, InitializeResponse,
+    LoadSessionRequest, McpServer, McpServerStdio, NewSessionRequest, PermissionOptionKind,
+    ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    SessionId, SessionNotification, SessionUpdate, TextContent,
 };
 // Re-exported via this module so consumers (App / GPUI) don't need a
 // direct dependency on the agent-client-protocol schema crate just to
@@ -73,7 +73,7 @@ pub use agent_client_protocol::schema::{
     Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, SessionModeId, ToolCall, ToolCallContent,
     ToolCallId, ToolCallStatus, ToolCallUpdate, ToolKind,
 };
-use agent_client_protocol::{Agent, Client, ConnectionTo};
+use agent_client_protocol::{Agent, Client, ConnectionTo, JsonRpcRequest};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 /// Emit a diagnostic line to stderr when YALDA_ACP_DEBUG is set in the env.
@@ -246,6 +246,49 @@ pub struct ImageAttachment {
 pub struct PromptPayload {
     pub text: String,
     pub images: Vec<ImageAttachment>,
+}
+
+/// Ordered interaction stream used only when an adapter advertises native
+/// steering. Keeping the initial prompt, follow-up steering requests, and
+/// explicit Stop together prevents any later user action from overtaking an
+/// earlier one.
+#[derive(Debug)]
+enum NativeSteeringCommand {
+    Prompt(PromptPayload),
+    Steer(PromptPayload),
+    Cancel,
+}
+
+/// Codex ACP extension request advertised by initialize root
+/// `_meta.steering.supported`. The adapter owns the per-session FIFO and
+/// injects each payload into the live turn (or starts one if the boundary raced
+/// us). A raw JSON response keeps us forward-compatible with additional
+/// outcomes beyond today's `injected` / `startedNewTurn` / `failed` values.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonRpcRequest)]
+#[request(method = "_session/steering", response = serde_json::Value)]
+#[serde(rename_all = "camelCase")]
+struct NativeSteeringRequest {
+    session_id: SessionId,
+    prompt: Vec<ContentBlock>,
+}
+
+impl NativeSteeringRequest {
+    fn new(session_id: SessionId, payload: &PromptPayload) -> Self {
+        Self {
+            session_id,
+            prompt: payload.content_blocks(),
+        }
+    }
+}
+
+fn supports_native_steering(response: &InitializeResponse) -> bool {
+    response
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.get("steering"))
+        .and_then(|steering| steering.get("supported"))
+        .and_then(|supported| supported.as_bool())
+        .unwrap_or(false)
 }
 
 impl PromptPayload {
@@ -772,7 +815,9 @@ mod fake {
         turns: Arc<AtomicUsize>,
         permission_mode: Arc<AtomicU8>,
         session_id: Arc<std::sync::Mutex<Option<String>>>,
+        steering_supported: Arc<AtomicBool>,
         prompt_tx: std_mpsc::Sender<PromptPayload>,
+        steer_tx: std_mpsc::Sender<NativeSteeringCommand>,
         set_model_tx: std_mpsc::Sender<String>,
         cancel_tx: f_mpsc::UnboundedSender<()>,
     }
@@ -790,6 +835,8 @@ mod fake {
         /// Receiver for prompts the transport side enqueues — lets a scenario
         /// assert a prompt arrived (e.g. admin_prompt) before auto-emitting a turn.
         pub prompt_rx: std_mpsc::Receiver<PromptPayload>,
+        /// Receiver for native steering payloads.
+        steer_rx: std_mpsc::Receiver<NativeSteeringCommand>,
         /// Receiver for model-switch requests the transport side enqueues — lets
         /// a scenario assert `set_model` reached the transport.
         pub set_model_rx: std_mpsc::Receiver<String>,
@@ -808,14 +855,24 @@ mod fake {
 
         /// Like [`new`] but with a caller-chosen synthetic session id.
         pub fn with_session_id(sid: &str) -> (FakeTransport, FakeAgentControls) {
+            Self::with_session_id_and_steering(sid, false)
+        }
+
+        /// Native-steering-capable fake for ordering regressions.
+        pub fn with_session_id_and_steering(
+            sid: &str,
+            steering_supported: bool,
+        ) -> (FakeTransport, FakeAgentControls) {
             let (reply_tx, reply_rx) = std_mpsc::channel::<ReplyEvent>();
             let (prompt_tx, prompt_rx) = std_mpsc::channel::<PromptPayload>();
+            let (steer_tx, steer_rx) = std_mpsc::channel::<NativeSteeringCommand>();
             let (set_model_tx, set_model_rx) = std_mpsc::channel::<String>();
             let (cancel_tx, cancel_rx) = f_mpsc::unbounded::<()>();
             let connected = Arc::new(AtomicBool::new(true));
             let turns = Arc::new(AtomicUsize::new(0));
             let permission_mode = Arc::new(AtomicU8::new(DEFAULT_PERMISSION_MODE as u8));
             let session_id = Arc::new(std::sync::Mutex::new(Some(sid.to_string())));
+            let steering_supported = Arc::new(AtomicBool::new(steering_supported));
 
             let transport = FakeTransport {
                 reply_rx,
@@ -823,7 +880,9 @@ mod fake {
                 turns: Arc::clone(&turns),
                 permission_mode: Arc::clone(&permission_mode),
                 session_id: Arc::clone(&session_id),
+                steering_supported,
                 prompt_tx,
+                steer_tx,
                 set_model_tx,
                 cancel_tx,
             };
@@ -834,6 +893,7 @@ mod fake {
                 permission_mode,
                 session_id,
                 prompt_rx,
+                steer_rx,
                 set_model_rx,
                 cancel_rx,
             };
@@ -854,12 +914,14 @@ mod fake {
         fn handle(&self) -> TransportHandle {
             TransportHandle {
                 prompt_tx: self.prompt_tx.clone(),
+                steer_tx: self.steer_tx.clone(),
                 set_model_tx: self.set_model_tx.clone(),
                 cancel_tx: self.cancel_tx.clone(),
                 connected: Arc::clone(&self.connected),
                 turns: Arc::clone(&self.turns),
                 permission_mode: Arc::clone(&self.permission_mode),
                 session_id: Arc::clone(&self.session_id),
+                steering_supported: Arc::clone(&self.steering_supported),
                 generation: 0,
             }
         }
@@ -869,6 +931,48 @@ mod fake {
     }
 
     impl FakeAgentControls {
+        /// Consume the next ordered native-control item as a steer.
+        pub fn try_recv_native_steer(&mut self) -> Option<PromptPayload> {
+            match self.steer_rx.try_recv() {
+                Ok(NativeSteeringCommand::Steer(payload)) => Some(payload),
+                Ok(NativeSteeringCommand::Prompt(_)) => {
+                    panic!("expected native steer, got ordered prompt")
+                }
+                Ok(NativeSteeringCommand::Cancel) => {
+                    panic!("expected native steer, got ordered cancel")
+                }
+                Err(_) => None,
+            }
+        }
+
+        /// Consume the next ordered native-control item as an explicit Stop.
+        pub fn try_recv_native_cancel(&mut self) -> bool {
+            match self.steer_rx.try_recv() {
+                Ok(NativeSteeringCommand::Cancel) => true,
+                Ok(NativeSteeringCommand::Prompt(_)) => {
+                    panic!("expected ordered cancel, got ordered prompt")
+                }
+                Ok(NativeSteeringCommand::Steer(_)) => {
+                    panic!("expected ordered cancel, got native steer")
+                }
+                Err(_) => false,
+            }
+        }
+
+        /// Consume the next ordered native-control item as the initial prompt.
+        pub fn try_recv_native_prompt(&mut self) -> Option<PromptPayload> {
+            match self.steer_rx.try_recv() {
+                Ok(NativeSteeringCommand::Prompt(payload)) => Some(payload),
+                Ok(NativeSteeringCommand::Steer(_)) => {
+                    panic!("expected ordered prompt, got native steer")
+                }
+                Ok(NativeSteeringCommand::Cancel) => {
+                    panic!("expected ordered prompt, got ordered cancel")
+                }
+                Err(_) => None,
+            }
+        }
+
         /// Push one reply event onto the transport's inbound stream. FIFO order is
         /// preserved exactly as the real notification-handler → pump path does.
         pub fn push(&self, event: ReplyEvent) {
@@ -990,6 +1094,10 @@ pub use fake::{FakeAgentControls, FakeAgentSpawner, FakeTransport};
 pub struct AcpChannelClient {
     /// Outbound prompts: `App::claude_acp_send_text` → worker.
     prompt_tx: std_mpsc::Sender<PromptPayload>,
+    /// Outbound capable-Codex prompts, native steering, and Stop controls.
+    /// One stream preserves the user's action order while prompt responses are
+    /// awaited independently.
+    steer_tx: std_mpsc::Sender<NativeSteeringCommand>,
     /// Outbound model switches: each model id pushed here makes the worker
     /// driver issue an ACP `session/set_config_option` for the `model`
     /// option. Separate from `prompt_tx` so a switch never rides the prompt
@@ -1027,6 +1135,8 @@ pub struct AcpChannelClient {
     /// `on_receive_request` closure on every gated tool call; written by
     /// the App side via [`set_permission_mode`].
     permission_mode: Arc<AtomicU8>,
+    /// Capability advertised at initialize as root `_meta.steering.supported`.
+    steering_supported: Arc<AtomicBool>,
     /// Joined on Drop so the worker has a chance to clean up the runtime
     /// (kill the child, drop streams) before yalda exits.
     worker: Option<JoinHandle<()>>,
@@ -1249,6 +1359,7 @@ impl AcpChannelClient {
         }
 
         let (prompt_tx, prompt_rx) = std_mpsc::channel::<PromptPayload>();
+        let (steer_tx, steer_rx) = std_mpsc::channel::<NativeSteeringCommand>();
         let (set_model_tx, set_model_rx) = std_mpsc::channel::<String>();
         let (reply_tx, reply_rx) = std_mpsc::channel::<ReplyEvent>();
         let (ready_tx, ready_rx) = std_mpsc::channel::<io::Result<()>>();
@@ -1268,7 +1379,9 @@ impl AcpChannelClient {
         // (`<space> c m`). The 0600 socket remains the gate against other
         // local users.
         let permission_mode = Arc::new(AtomicU8::new(DEFAULT_PERMISSION_MODE as u8));
+        let steering_supported = Arc::new(AtomicBool::new(false));
         let permission_mode_for_worker = permission_mode.clone();
+        let steering_supported_for_worker = steering_supported.clone();
 
         // Wake channel: the worker pushes `()` every time it forwards a
         // reply event, so the foreground pump task can `select!` on it
@@ -1290,6 +1403,7 @@ impl AcpChannelClient {
                     parts,
                     worker_cwd,
                     prompt_rx,
+                    steer_rx,
                     set_model_rx,
                     reply_tx,
                     ready_tx,
@@ -1298,6 +1412,7 @@ impl AcpChannelClient {
                     session_id_for_worker,
                     resume_session_id,
                     permission_mode_for_worker,
+                    steering_supported_for_worker,
                     wake_tx,
                     cancel_rx,
                     frontend,
@@ -1320,6 +1435,7 @@ impl AcpChannelClient {
 
         Ok(Self {
             prompt_tx,
+            steer_tx,
             set_model_tx,
             cancel_tx,
             reply_rx,
@@ -1327,6 +1443,7 @@ impl AcpChannelClient {
             turns,
             session_id,
             permission_mode,
+            steering_supported,
             wake_rx: std::sync::Mutex::new(Some(wake_rx)),
             worker: Some(worker),
             command: command.to_string(),
@@ -1395,10 +1512,58 @@ impl AcpChannelClient {
                 "ACP agent gone (worker exited) — re-attach to recover",
             ));
         }
-        self.prompt_tx.send(payload).map_err(|_| {
+        let result = if self.supports_steering() {
+            self.steer_tx.send(NativeSteeringCommand::Prompt(payload))
+        } else {
+            self.prompt_tx
+                .send(payload)
+                .map_err(|error| std_mpsc::SendError(NativeSteeringCommand::Prompt(error.0)))
+        };
+        result.map_err(|_| {
             self.connected.store(false, Ordering::SeqCst);
             io::Error::new(io::ErrorKind::BrokenPipe, "ACP worker channel closed")
         })
+    }
+
+    /// Send one native steering request when the adapter advertised support.
+    /// The worker-side bridge is installed by the production steering change;
+    /// this synchronous enqueue surface also gives the GUI harness an exact
+    /// observation point for routing regressions.
+    pub fn steer_payload(&self, payload: PromptPayload) -> io::Result<()> {
+        if !self.steering_supported.load(Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "ACP agent does not advertise native steering",
+            ));
+        }
+        if !self.is_connected() {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "ACP agent gone (worker exited) — re-attach to recover",
+            ));
+        }
+        self.steer_tx
+            .send(NativeSteeringCommand::Steer(payload))
+            .map_err(|_| {
+                self.connected.store(false, Ordering::SeqCst);
+                io::Error::new(io::ErrorKind::BrokenPipe, "ACP steering channel closed")
+            })
+    }
+
+    pub fn supports_steering(&self) -> bool {
+        self.steering_supported.load(Ordering::SeqCst)
+    }
+
+    /// Provider-aware Codex follow-up delivery. Capable adapters receive the
+    /// native FIFO steering request; older adapters retain the shipped
+    /// graceful-cancel + replacement-prompt compatibility behavior.
+    pub fn steer_or_replace_payload(&mut self, payload: PromptPayload) -> io::Result<()> {
+        if self.supports_steering() {
+            self.steer_payload(payload)
+        } else {
+            self.cancel();
+            self.send_payload(payload)
+        }
     }
 
     /// Request cancellation of the in-flight turn. Sends ACP
@@ -1407,7 +1572,11 @@ impl AcpChannelClient {
     /// without killing the session (unlike `Drop`). Best-effort: a no-op if
     /// the worker has already exited or nothing is in flight.
     pub fn cancel(&self) {
-        let _ = self.cancel_tx.unbounded_send(());
+        if self.supports_steering() {
+            let _ = self.steer_tx.send(NativeSteeringCommand::Cancel);
+        } else {
+            let _ = self.cancel_tx.unbounded_send(());
+        }
     }
 
     /// Switch the session's model. Enqueues `model_id` for the worker driver,
@@ -1436,12 +1605,14 @@ impl AcpChannelClient {
     pub fn handle(&self) -> TransportHandle {
         TransportHandle {
             prompt_tx: self.prompt_tx.clone(),
+            steer_tx: self.steer_tx.clone(),
             set_model_tx: self.set_model_tx.clone(),
             cancel_tx: self.cancel_tx.clone(),
             connected: Arc::clone(&self.connected),
             turns: Arc::clone(&self.turns),
             permission_mode: Arc::clone(&self.permission_mode),
             session_id: Arc::clone(&self.session_id),
+            steering_supported: Arc::clone(&self.steering_supported),
             generation: 0,
         }
     }
@@ -1458,7 +1629,14 @@ impl AcpChannelClient {
     /// `apply_server_batch`, not this channel.
     #[cfg(feature = "test-support")]
     pub fn test_connected() -> (Self, TestChannelControls) {
+        Self::test_connected_with_steering(false)
+    }
+
+    /// Native-steering-capable variant of [`test_connected`].
+    #[cfg(feature = "test-support")]
+    pub fn test_connected_with_steering(steering_supported: bool) -> (Self, TestChannelControls) {
         let (prompt_tx, prompt_rx) = std_mpsc::channel::<PromptPayload>();
+        let (steer_tx, steer_rx) = std_mpsc::channel::<NativeSteeringCommand>();
         let (set_model_tx, set_model_rx) = std_mpsc::channel::<String>();
         let (reply_tx, reply_rx) = std_mpsc::channel::<ReplyEvent>();
         let (_wake_tx, wake_rx) = futures::channel::mpsc::unbounded::<()>();
@@ -1466,6 +1644,7 @@ impl AcpChannelClient {
         let connected = Arc::new(AtomicBool::new(true));
         let client = Self {
             prompt_tx,
+            steer_tx,
             set_model_tx,
             cancel_tx,
             reply_rx,
@@ -1473,6 +1652,7 @@ impl AcpChannelClient {
             turns: Arc::new(AtomicUsize::new(0)),
             session_id: Arc::new(std::sync::Mutex::new(None)),
             permission_mode: Arc::new(AtomicU8::new(DEFAULT_PERMISSION_MODE as u8)),
+            steering_supported: Arc::new(AtomicBool::new(steering_supported)),
             wake_rx: std::sync::Mutex::new(Some(wake_rx)),
             worker: None,
             command: "test-in-process".to_string(),
@@ -1482,6 +1662,7 @@ impl AcpChannelClient {
             client,
             TestChannelControls {
                 prompt_rx,
+                steer_rx,
                 set_model_rx,
                 reply_tx,
                 cancel_rx,
@@ -1497,6 +1678,8 @@ impl AcpChannelClient {
 pub struct TestChannelControls {
     /// Retained so `send()` succeeds; drain it to assert what was submitted.
     pub prompt_rx: std_mpsc::Receiver<PromptPayload>,
+    /// Ordered native steering/Stop controls emitted by a capable transport.
+    steer_rx: std_mpsc::Receiver<NativeSteeringCommand>,
     /// Retained so `set_model()` succeeds without a worker; drain it (via
     /// [`try_recv_set_model`](Self::try_recv_set_model)) to assert a model
     /// switch reached the channel.
@@ -1515,6 +1698,48 @@ pub struct TestChannelControls {
 
 #[cfg(feature = "test-support")]
 impl TestChannelControls {
+    /// Consume the next ordered native-control item as a steer.
+    pub fn try_recv_native_steer(&mut self) -> Option<PromptPayload> {
+        match self.steer_rx.try_recv() {
+            Ok(NativeSteeringCommand::Steer(payload)) => Some(payload),
+            Ok(NativeSteeringCommand::Prompt(_)) => {
+                panic!("expected native steer, got ordered prompt")
+            }
+            Ok(NativeSteeringCommand::Cancel) => {
+                panic!("expected native steer, got ordered cancel")
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Consume the next ordered native-control item as an explicit Stop.
+    pub fn try_recv_native_cancel(&mut self) -> bool {
+        match self.steer_rx.try_recv() {
+            Ok(NativeSteeringCommand::Cancel) => true,
+            Ok(NativeSteeringCommand::Prompt(_)) => {
+                panic!("expected ordered cancel, got ordered prompt")
+            }
+            Ok(NativeSteeringCommand::Steer(_)) => {
+                panic!("expected ordered cancel, got native steer")
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Consume the next ordered native-control item as the initial prompt.
+    pub fn try_recv_native_prompt(&mut self) -> Option<PromptPayload> {
+        match self.steer_rx.try_recv() {
+            Ok(NativeSteeringCommand::Prompt(payload)) => Some(payload),
+            Ok(NativeSteeringCommand::Steer(_)) => {
+                panic!("expected ordered prompt, got native steer")
+            }
+            Ok(NativeSteeringCommand::Cancel) => {
+                panic!("expected ordered prompt, got ordered cancel")
+            }
+            Err(_) => None,
+        }
+    }
+
     /// Non-blocking pull of the next model id a `set_model()` enqueued, if any.
     pub fn try_recv_set_model(&self) -> Option<String> {
         self.set_model_rx.try_recv().ok()
@@ -1594,6 +1819,8 @@ impl AgentTransport for AcpChannelClient {
 pub struct TransportHandle {
     /// Outbound prompts (Clone+Send). `send`-equivalent of `AcpChannelClient`.
     pub prompt_tx: std_mpsc::Sender<PromptPayload>,
+    /// Outbound native steering payloads.
+    steer_tx: std_mpsc::Sender<NativeSteeringCommand>,
     /// Outbound model switches (Clone+Send). `set_model`-equivalent.
     pub set_model_tx: std_mpsc::Sender<String>,
     /// Cancel signal (Clone+Send).
@@ -1606,6 +1833,8 @@ pub struct TransportHandle {
     pub permission_mode: Arc<AtomicU8>,
     /// Live ACP session id, populated by the worker after `session/new`/`load`.
     pub session_id: Arc<std::sync::Mutex<Option<String>>>,
+    /// Whether the adapter advertised native steering.
+    pub steering_supported: Arc<AtomicBool>,
     /// The generation this transport was published at (stamped by the actor on
     /// install). Lets liveness/diagnostics correlate a handle with its pump.
     pub generation: u64,
@@ -1627,15 +1856,60 @@ impl TransportHandle {
                 "ACP agent gone (worker exited) — re-attach to recover",
             ));
         }
-        self.prompt_tx.send(payload).map_err(|_| {
+        let result = if self.supports_steering() {
+            self.steer_tx.send(NativeSteeringCommand::Prompt(payload))
+        } else {
+            self.prompt_tx
+                .send(payload)
+                .map_err(|error| std_mpsc::SendError(NativeSteeringCommand::Prompt(error.0)))
+        };
+        result.map_err(|_| {
             self.connected.store(false, Ordering::SeqCst);
             io::Error::new(io::ErrorKind::BrokenPipe, "ACP worker channel closed")
         })
     }
 
+    pub fn supports_steering(&self) -> bool {
+        self.steering_supported.load(Ordering::SeqCst)
+    }
+
+    pub fn steer_payload(&self, payload: PromptPayload) -> io::Result<()> {
+        if !self.supports_steering() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "ACP agent does not advertise native steering",
+            ));
+        }
+        if !self.is_connected() {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "ACP agent gone (worker exited) — re-attach to recover",
+            ));
+        }
+        self.steer_tx
+            .send(NativeSteeringCommand::Steer(payload))
+            .map_err(|_| {
+                self.connected.store(false, Ordering::SeqCst);
+                io::Error::new(io::ErrorKind::BrokenPipe, "ACP steering channel closed")
+            })
+    }
+
+    pub fn steer_or_replace_payload(&self, payload: PromptPayload) -> io::Result<()> {
+        if self.supports_steering() {
+            self.steer_payload(payload)
+        } else {
+            self.cancel();
+            self.send_payload(payload)
+        }
+    }
+
     /// Request cancellation of the in-flight turn. Best-effort.
     pub fn cancel(&self) {
-        let _ = self.cancel_tx.unbounded_send(());
+        if self.supports_steering() {
+            let _ = self.steer_tx.send(NativeSteeringCommand::Cancel);
+        } else {
+            let _ = self.cancel_tx.unbounded_send(());
+        }
     }
 
     /// Set the live permission policy (read by the worker on gated tool calls).
@@ -1684,6 +1958,12 @@ impl Drop for AcpChannelClient {
         // dropped — no manual swap needed.
         let real_tx = std::mem::replace(&mut self.prompt_tx, dummy_tx);
         drop(real_tx);
+
+        // Native steering has its own blocking std→async bridge; release its
+        // sender before joining for the same reason as prompts/model switches.
+        let (dummy_steer_tx, _dummy_steer_rx) = std_mpsc::channel::<NativeSteeringCommand>();
+        let real_steer_tx = std::mem::replace(&mut self.steer_tx, dummy_steer_tx);
+        drop(real_steer_tx);
 
         // Same for `set_model_tx`: the worker's `set_model` bridge is a
         // `spawn_blocking` thread parked on `set_model_rx.recv()`. `abort()`
@@ -1828,6 +2108,7 @@ fn run_worker(
     parts: Vec<String>,
     cwd: PathBuf,
     prompt_rx: std_mpsc::Receiver<PromptPayload>,
+    steer_rx: std_mpsc::Receiver<NativeSteeringCommand>,
     set_model_rx: std_mpsc::Receiver<String>,
     reply_tx: std_mpsc::Sender<ReplyEvent>,
     ready_tx: std_mpsc::Sender<io::Result<()>>,
@@ -1836,6 +2117,7 @@ fn run_worker(
     session_id_slot: Arc<std::sync::Mutex<Option<String>>>,
     resume_session_id: Option<String>,
     permission_mode: Arc<AtomicU8>,
+    steering_supported: Arc<AtomicBool>,
     wake_tx: futures::channel::mpsc::UnboundedSender<()>,
     cancel_rx: futures::channel::mpsc::UnboundedReceiver<()>,
     frontend: YaldaFrontend,
@@ -1865,6 +2147,7 @@ fn run_worker(
             parts,
             cwd,
             prompt_rx,
+            steer_rx,
             set_model_rx,
             reply_tx,
             ready_tx,
@@ -1873,6 +2156,7 @@ fn run_worker(
             session_id_slot,
             resume_session_id,
             permission_mode,
+            steering_supported,
             wake_tx,
             cancel_rx,
             frontend,
@@ -1898,6 +2182,7 @@ async fn worker_async(
     parts: Vec<String>,
     cwd: PathBuf,
     prompt_rx: std_mpsc::Receiver<PromptPayload>,
+    steer_rx: std_mpsc::Receiver<NativeSteeringCommand>,
     set_model_rx: std_mpsc::Receiver<String>,
     reply_tx: std_mpsc::Sender<ReplyEvent>,
     ready_tx: std_mpsc::Sender<io::Result<()>>,
@@ -1906,6 +2191,7 @@ async fn worker_async(
     session_id_slot: Arc<std::sync::Mutex<Option<String>>>,
     resume_session_id: Option<String>,
     permission_mode: Arc<AtomicU8>,
+    steering_supported: Arc<AtomicBool>,
     wake_tx: futures::channel::mpsc::UnboundedSender<()>,
     mut cancel_rx: futures::channel::mpsc::UnboundedReceiver<()>,
     frontend: YaldaFrontend,
@@ -2036,6 +2322,21 @@ async fn worker_async(
         // signals the driver loop to exit cleanly.
     });
 
+    // Native Codex steering is deliberately out-of-band from ordinary
+    // prompts: the prompt driver may be awaiting the active turn response,
+    // while steering must reach that live turn immediately. Explicit Stop
+    // shares this stream so it cannot overtake earlier steering. A single
+    // bridge + async consumer preserves order before the adapter's own FIFO.
+    let (async_steer_tx, async_steer_rx) =
+        tokio::sync::mpsc::unbounded_channel::<NativeSteeringCommand>();
+    let steer_bridge_task = tokio::task::spawn_blocking(move || {
+        while let Ok(command) = steer_rx.recv() {
+            if async_steer_tx.send(command).is_err() {
+                break;
+            }
+        }
+    });
+
     // Same std→async bridge for out-of-band model switches. A model id pushed
     // via `set_model` reaches the driver loop, which issues a
     // `session/set_config_option`. Kept on its own channel so it never queues
@@ -2058,6 +2359,7 @@ async fn worker_async(
     let event_tx_for_driver = event_tx.clone();
     // Clone for the model-switch task so it can emit the refreshed selector.
     let event_tx_for_setmodel = event_tx.clone();
+    let event_tx_for_steer = event_tx.clone();
     let connect_result = Client
         .builder()
         .name("yalda")
@@ -2240,8 +2542,10 @@ async fn worker_async(
                         .and_then(|c| c.get("promptQueueing"))
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
+                    let native_steering = supports_native_steering(&init_resp);
+                    steering_supported.store(native_steering, Ordering::SeqCst);
                     acp_debug!(
-                        "initialize ok; loadSession: {supports_load}, promptQueueing: {prompt_queueing}, resume id: {:?}",
+                        "initialize ok; loadSession: {supports_load}, promptQueueing: {prompt_queueing}, nativeSteering: {native_steering}, resume id: {:?}",
                         resume_session_id
                     );
 
@@ -2590,6 +2894,87 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                         })
                     };
 
+                    // === Native-steering task: independent of prompt driver ===
+                    // One ordered consumer means request N+1 is not put on the
+                    // wire until N has been accepted by the adapter. The Codex
+                    // adapter then serializes these per session and injects each
+                    // into the active turn. Explicit `session/cancel` shares
+                    // this stream, so it cannot overtake an earlier request.
+                    let steer_task = {
+                        let connection = connection.clone();
+                        let session_id = session_id.clone();
+                        let event_tx = event_tx_for_steer;
+                        let turns = Arc::clone(&turns);
+                        let mut rx = async_steer_rx;
+                        tokio::spawn(async move {
+                            while let Some(command) = rx.recv().await {
+                                match command {
+                                    NativeSteeringCommand::Prompt(payload) => {
+                                        acp_debug!("ordered prompt → agent: {payload:?}");
+                                        let request = connection
+                                            .send_request(
+                                                agent_client_protocol::schema::PromptRequest::new(
+                                                    session_id.clone(),
+                                                    payload.content_blocks(),
+                                                ),
+                                            )
+                                            .block_task();
+                                        let event_tx = event_tx.clone();
+                                        let turns = Arc::clone(&turns);
+                                        tokio::spawn(async move {
+                                            if let Err(error) = request.await {
+                                                let _ = event_tx.send(WorkerEvent::Reply(
+                                                    ReplyEvent::Notice(format!(
+                                                        "agent error: {}",
+                                                        short_err(&error),
+                                                    )),
+                                                ));
+                                            }
+                                            let count = turns.fetch_add(1, Ordering::SeqCst) + 1;
+                                            if std::env::var("YALDA_EMIT_TURN_ENDED").as_deref()
+                                                == Ok("1")
+                                            {
+                                                let _ = event_tx.send(WorkerEvent::Reply(
+                                                    ReplyEvent::TurnEnded { count },
+                                                ));
+                                            }
+                                        });
+                                    }
+                                    NativeSteeringCommand::Steer(payload) => {
+                                        acp_debug!("native steer → agent: {payload:?}");
+                                        let req = NativeSteeringRequest::new(
+                                            session_id.clone(),
+                                            &payload,
+                                        );
+                                        match connection.send_request(req).block_task().await {
+                                            Ok(response) => {
+                                                acp_debug!(
+                                                    "native steer accepted: {response:?}"
+                                                );
+                                            }
+                                            Err(e) => {
+                                                let _ = event_tx.send(WorkerEvent::Reply(
+                                                    ReplyEvent::Notice(format!(
+                                                        "steering failed: {}",
+                                                        short_err(&e)
+                                                    )),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    NativeSteeringCommand::Cancel => {
+                                        acp_debug!("ordered cancel → session/cancel");
+                                        let _ = connection.send_notification(
+                                            agent_client_protocol::schema::CancelNotification::new(
+                                                session_id.clone(),
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                        })
+                    };
+
                     // === Driver loop: forward prompts as session/prompt
                     //     requests until the App side closes the channel.  ===
                     use futures::StreamExt as _;
@@ -2724,6 +3109,7 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                             }
                         }
                         acp_debug!("queued driver loop exiting");
+                        steer_task.abort();
                         set_model_task.abort();
                         return Ok::<_, agent_client_protocol::Error>(());
                     }
@@ -2832,6 +3218,7 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                         }
                     }
                     acp_debug!("driver loop exiting");
+                    steer_task.abort();
                     set_model_task.abort();
                     Ok::<_, agent_client_protocol::Error>(())
                 }
@@ -2848,6 +3235,7 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
     drop(event_tx);
     pump_task.abort();
     bridge_task.abort();
+    steer_bridge_task.abort();
     set_model_bridge_task.abort();
     let _ = pump_task.await;
     // bridge_task is spawn_blocking; abort signals its JoinHandle but the
@@ -2868,6 +3256,54 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::process::Stdio;
+
+    /// Codex advertises native steering in the initialize response's root
+    /// `_meta`, not under `agentCapabilities`. Negative control: read the
+    /// latter (or require any value other than boolean true) and this fails.
+    #[test]
+    fn initialize_root_meta_enables_native_steering() {
+        let capable: InitializeResponse = serde_json::from_value(serde_json::json!({
+            "protocolVersion": 1,
+            "agentCapabilities": {},
+            "_meta": { "steering": { "supported": true } }
+        }))
+        .expect("deserialize capable initialize response");
+        assert!(supports_native_steering(&capable));
+
+        let incapable: InitializeResponse = serde_json::from_value(serde_json::json!({
+            "protocolVersion": 1,
+            "agentCapabilities": {
+                "_meta": { "steering": { "supported": true } }
+            }
+        }))
+        .expect("deserialize incapable initialize response");
+        assert!(!supports_native_steering(&incapable));
+    }
+
+    /// Pin the installed Codex adapter extension's wire method and camelCase
+    /// payload, including images. This guards against silently sending a valid
+    /// JSON-RPC request with the wrong extension name or parameter spelling.
+    #[test]
+    fn native_steering_request_matches_codex_extension_wire_shape() {
+        use agent_client_protocol::JsonRpcMessage;
+
+        let request = NativeSteeringRequest::new(
+            SessionId::new("codex-session"),
+            &PromptPayload {
+                text: "second question".into(),
+                images: vec![ImageAttachment {
+                    data: "AAAA".into(),
+                    mime_type: "image/png".into(),
+                }],
+            },
+        );
+        assert_eq!(request.method(), "_session/steering");
+        let params = serde_json::to_value(request).expect("serialize native steering request");
+        assert_eq!(params["sessionId"], "codex-session");
+        assert_eq!(params["prompt"][0]["text"], "second question");
+        assert_eq!(params["prompt"][1]["data"], "AAAA");
+        assert_eq!(params["prompt"][1]["mimeType"], "image/png");
+    }
 
     /// Every spawned agent session must carry exactly one `yalda` stdio MCP
     /// server, so an agent running inside Yalda can recursively control it.
@@ -3204,6 +3640,128 @@ while True:
             std::fs::set_permissions(&path, perms).unwrap();
         }
         path
+    }
+
+    /// A steering-capable ACP peer that keeps the initial prompt open, records
+    /// extension/cancel traffic, and acknowledges each steering request. The
+    /// log lets the test assert the production worker's actual wire order.
+    fn write_steering_agent_script(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("fake_steering_agent.py");
+        let script = r#"#!/usr/bin/env python3
+import sys, json
+
+log_path = sys.argv[1]
+pending_prompt = None
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+def record(value):
+    with open(log_path, "a", encoding="utf-8") as log:
+        log.write(value + "\n")
+        log.flush()
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    try:
+        msg = json.loads(line)
+    except Exception:
+        continue
+    method = msg.get("method", "")
+    msg_id = msg.get("id")
+    if method == "initialize":
+        emit({"jsonrpc": "2.0", "id": msg_id,
+              "result": {"protocolVersion": 1, "agentCapabilities": {},
+                         "_meta": {"steering": {"supported": True}}}})
+    elif method == "session/new":
+        emit({"jsonrpc": "2.0", "id": msg_id,
+              "result": {"sessionId": "steer-sess-1"}})
+    elif method == "session/prompt":
+        pending_prompt = msg_id
+        record("prompt")
+    elif method == "_session/steering":
+        blocks = msg.get("params", {}).get("prompt", [])
+        text = next((b.get("text", "") for b in blocks if b.get("type") == "text"), "")
+        record("steer:" + text)
+        emit({"jsonrpc": "2.0", "id": msg_id,
+              "result": {"outcome": "injected"}})
+    elif method == "session/cancel":
+        record("cancel")
+        if pending_prompt is not None:
+            emit({"jsonrpc": "2.0", "id": pending_prompt,
+                  "result": {"stopReason": "cancelled"}})
+            pending_prompt = None
+"#;
+        let mut file = std::fs::File::create(&path).expect("create steering script");
+        file.write_all(script.as_bytes())
+            .expect("write steering script");
+        drop(file);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&path, permissions).unwrap();
+        }
+        path
+    }
+
+    /// Production-worker regression for bug-0036's recurrence. This crosses
+    /// the real subprocess/JSON-RPC boundary and proves Stop cannot overtake
+    /// questions already accepted by the GUI-side ordered control stream.
+    #[test]
+    fn production_worker_sends_native_steers_before_later_stop() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| !status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("python3 not available — skipping native steering wire-order test");
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("tmpdir");
+        let script = write_steering_agent_script(temp.path());
+        let log = temp.path().join("wire-order.log");
+        let command = format!("{} {}", script.display(), log.display());
+        let mut client = AcpChannelClient::spawn(&command, Some(temp.path().to_path_buf()))
+            .expect("spawn steering ACP agent");
+        assert!(client.supports_steering());
+
+        client.send("initial work").expect("send initial prompt");
+        client
+            .steer_or_replace_payload(PromptPayload::text("first question"))
+            .expect("send first steer");
+        client
+            .steer_or_replace_payload(PromptPayload::text("second question"))
+            .expect("send second steer");
+        client.cancel();
+
+        let expected = [
+            "prompt",
+            "steer:first question",
+            "steer:second question",
+            "cancel",
+        ];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let observed = loop {
+            let observed = std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if observed.len() >= expected.len() || std::time::Instant::now() >= deadline {
+                break observed;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert_eq!(observed, expected, "wire controls must preserve user order");
     }
 
     #[test]

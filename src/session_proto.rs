@@ -95,6 +95,18 @@ pub enum Request {
         images: Vec<ImageAttachment>,
     },
 
+    /// Provider-aware mid-turn Codex input. A capable adapter receives native
+    /// `_session/steering`; an older adapter falls back server-side to graceful
+    /// cancel + replacement prompt. Kept distinct from `Prompt` so the two
+    /// operations cannot race across independent GUI requests.
+    #[serde(rename = "steer")]
+    Steer {
+        session_id: ServerSessionId,
+        text: String,
+        #[serde(default)]
+        images: Vec<ImageAttachment>,
+    },
+
     /// Interrupt the in-flight turn (ACP `session/cancel`). The session stays
     /// alive; the current turn resolves with `StopReason::Cancelled`.
     #[serde(rename = "cancel")]
@@ -524,6 +536,28 @@ mod tests {
                 assert_eq!(images[0].mime_type, "image/png");
             }
             other => panic!("expected Prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn steer_round_trips_images() {
+        let req = Request::Steer {
+            session_id: "s1".to_string(),
+            text: "follow up".to_string(),
+            images: vec![ImageAttachment {
+                data: "QUJD".to_string(),
+                mime_type: "image/png".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: Request = serde_json::from_str(&json).unwrap();
+        match back {
+            Request::Steer { text, images, .. } => {
+                assert_eq!(text, "follow up");
+                assert_eq!(images.len(), 1);
+                assert_eq!(images[0].data, "QUJD");
+            }
+            other => panic!("expected Steer, got {other:?}"),
         }
     }
 

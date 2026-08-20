@@ -14,30 +14,23 @@ be delivered as the next prompt.
 
 ## Context / root cause
 
-The real UI route is `submit_agent` → `submit_compose` →
-`send_prompt_to_session`. UXI-AgentTile-13 currently treats every provider as a
-Claude-style steer: it sends another `session/prompt` while preserving the clean
-`Awaiting` phase. Claude's adapter advertises `promptQueueing`, so that is useful
-there; Codex needs the current ACP turn cancelled first. The provider is already
-durable on `AgentState`, and both the server-managed and direct channel paths
-already expose the same graceful cancel transport used by the Stop button.
+The real UI route is `submit_agent` → `submit_compose` → transport. The original
+repair composed `session/cancel` with a replacement `session/prompt`, but those
+messages traveled through independent worker queues. Codex's non-
+`promptQueueing` worker drains extra cancel signals before starting the next
+queued prompt, so successive questions plus Stop had timing-dependent outcomes.
 
-This is not a missing keyboard binding and is not fixed by changing Esc or the
-Stop button. The missing behavior sits on normal submit itself.
+The installed Codex adapter advertises `_meta.steering.supported` and provides
+FIFO `_session/steering`. Yalda did not negotiate or use that extension.
 
 ## Solution
 
-On a normal submit, snapshot whether the bound session is both Codex and
-currently awaiting. If so, send one graceful ACP `session/cancel` through the
-active transport immediately before sending the new prompt. Reuse a factored
-transport helper shared with Stop, but do not enter `StopRequested` or invoke the
-second-Stop force-restart policy: the new prompt deliberately supersedes the old
-turn. Leave idle Codex submits and all Claude submits unchanged.
-
-The real path is guarded with an in-process `AcpChannelClient`: first establish
-`Awaiting` through a real submit, then type and submit a normal Codex follow-up,
-asserting that both a cancel and the new prompt reach the transport. In the same
-guard, prove an idle Codex submit and a mid-turn Claude submit emit no cancel.
+Negotiate native steering from the root initialize metadata. For capable Codex
+adapters, put the initial `session/prompt`, each `_session/steering` request, and
+explicit `session/cancel` on one ordered worker-control stream. Await prompt and
+steering responses outside that stream so control delivery remains responsive.
+Older adapters retain cancel-then-prompt compatibility; Claude's advertised
+`promptQueueing` behavior is unchanged.
 
 ## Approaches already tried (do NOT repeat)
 
@@ -75,3 +68,53 @@ Runtime gap: no live Codex subprocess was driven during this repair. The GUI's
 production submit path and cancellation/prompt transport queues are covered
 headlessly; restart the running Yalda app to load the rebuilt binary, then the
 reported live interaction is the remaining confirmation.
+
+### 2026-08-20 — recurred with successive questions + explicit Stop
+
+The one-follow-up repair is nondeterministic when the user submits more than one
+question and then presses ⌘. The normal prompt and cancel travel over independent
+transport queues. In the non-`promptQueueing` worker used by Codex, the active
+prompt consumes one cancel and the worker deliberately drains every additional
+cancel before it starts the next queued prompt. Depending on which prompt has
+become active when those queues are observed, the explicit Stop is discarded,
+one queued question runs, or a later question is cancelled. The original guard
+covered exactly one follow-up, so it could not expose this ordering failure.
+
+The installed `@agentclientprotocol/codex-acp` 1.1.7 advertises root capability
+`_meta.steering.supported: true` and implements `_session/steering` with a
+per-session FIFO queue. That is the correct transport for already-submitted
+mid-turn questions. Yalda places the initial capable-Codex prompt, native
+requests, and explicit Stop on one local ordered control stream, so a rapid
+follow-up cannot start ahead of the initial prompt and each question is accepted
+before the later `session/cancel` can reach the adapter. Yalda will use native
+steering when advertised and retain cancel-then-prompt only for older adapters. The new
+real-path guard submits two questions during one live Codex turn, presses the
+actual Stop handler, and requires two FIFO steering payloads plus exactly one
+explicit cancel—never the old three-cancel race.
+
+### 2026-08-20 — fixed and verified
+
+Capability negotiation now recognizes root `_meta.steering.supported`. Direct
+and session-server transports expose native steering, and capable Codex sessions
+send the initial prompt, every steer, and Stop through one ordered control
+stream. Older adapters still receive exactly one compatibility cancel followed
+by the replacement prompt.
+
+The exact GUI sequence—initial submit, two mid-turn questions, then the real
+Stop handler—was observed RED before routing changed: the first question never
+reached native steering. A production fake-ACP subprocess then exposed a deeper
+wire race where steering could overtake the separately queued initial prompt;
+unifying all capable-Codex control fixed the asserted wire order to prompt,
+first steer, second steer, cancel.
+
+Verification passed with 177 library tests (2 ignored), 51 session-server tests,
+and 688 GUI tests (2 ignored). Focused GUI, server actor, capability, wire-shape,
+and subprocess wire-order guards also passed. Mutation controls caught 3/3 GUI
+routing mutants and, after adding a direct legacy-fallback guard for the initial
+survivor, 10/10 expanded ACP capability/routing mutants. Both release binaries
+built successfully. `git diff --check` passed; repository-wide
+`cargo fmt --all -- --check` still reports unrelated pre-existing drift.
+
+Runtime gap: the installed, authenticated Codex adapter was not driven live.
+The production worker and JSON-RPC wire are exercised through a subprocess fake;
+restart Yalda and its session server to load the rebuilt binaries.

@@ -186,6 +186,12 @@ enum Command {
         images: Vec<ImageAttachment>,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+    Steer {
+        sid: ServerSessionId,
+        text: String,
+        images: Vec<ImageAttachment>,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     /// Headless "start-work" enqueue (ADR-0015): same as `Prompt` but with NO
     /// owner gate. The handler calls `enqueue_prompt` directly, so a non-GUI
     /// caller can drive a turn on a session it does not own.
@@ -1003,6 +1009,22 @@ impl SessionManager {
         rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
     }
 
+    async fn send_steer(
+        &self,
+        sid: &str,
+        text: &str,
+        images: Vec<ImageAttachment>,
+    ) -> Result<(), String> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let _ = self.cmd_tx.send(Command::Steer {
+            sid: sid.to_string(),
+            text: text.to_string(),
+            images,
+            reply,
+        });
+        rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
+    }
+
     /// Headless ungated enqueue (ADR-0015). No `conn_id` / owner check.
     async fn send_admin_prompt(&self, sid: &str, text: &str) -> Result<(), String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
@@ -1342,6 +1364,14 @@ impl Manager {
                 reply,
             } => {
                 let _ = reply.send(self.do_prompt(&sid, &text, images));
+            }
+            Command::Steer {
+                sid,
+                text,
+                images,
+                reply,
+            } => {
+                let _ = reply.send(self.do_steer(&sid, &text, images));
             }
             Command::AdminPrompt {
                 session_id,
@@ -1751,6 +1781,54 @@ impl Manager {
         images: Vec<ImageAttachment>,
     ) -> Result<(), String> {
         self.enqueue_prompt(session_id, text, images)
+    }
+
+    fn do_steer(
+        &mut self,
+        session_id: &str,
+        text: &str,
+        images: Vec<ImageAttachment>,
+    ) -> Result<(), String> {
+        let session = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or_else(|| format!("no such session: {session_id}"))?;
+        if session.archived {
+            return Err(format!(
+                "session {session_id} is archived; unarchive it before steering"
+            ));
+        }
+
+        session.log_only(Notification::UserPrompt {
+            session_id: session_id.to_string(),
+            text: text.to_string(),
+        });
+        session.record_agent(yalda::agent_event::AgentEventKind::UserMessage {
+            text: text.to_string(),
+        });
+        let payload = PromptPayload {
+            text: text.to_string(),
+            images,
+        };
+        let was_busy = session.busy;
+        session.busy = true;
+        let result = match session.channel.as_ref() {
+            Some(channel) => channel
+                .steer_or_replace_payload(payload)
+                .map_err(|e| format!("steer failed: {e}")),
+            // A channel that is still spawning has no active turn to steer.
+            // Queue an ordinary prompt; apply_channel_state drains it in order.
+            None => {
+                session.pending_prompts.push(payload);
+                Ok(())
+            }
+        };
+        if result.is_err() {
+            self.set_busy(session_id, false);
+        } else if !was_busy {
+            self.broadcast_busy(session_id, true);
+        }
+        result
     }
 
     /// Log the user's prompt durably, then hand it to the live channel (or queue
@@ -2624,6 +2702,35 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
                 }
             }
 
+            Request::Steer {
+                session_id,
+                text,
+                images,
+            } => match manager.send_steer(&session_id, &text, images).await {
+                Ok(()) => Response::Ok {
+                    data: ResponseData::Ack,
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %&session_id[..8.min(session_id.len())],
+                        reason = %e,
+                        "steer rejected — notifying submitter"
+                    );
+                    let frame = Frame::Notification {
+                        note: Notification::PromptRejected {
+                            session_id: session_id.clone(),
+                            reason: e.clone(),
+                            text,
+                        },
+                    };
+                    if let Ok(mut line) = serde_json::to_string(&frame) {
+                        line.push('\n');
+                        let _ = writer.lock().await.write_all(line.as_bytes()).await;
+                    }
+                    Response::Error { message: e }
+                }
+            },
+
             Request::AdminPrompt { session_id, text } => {
                 match manager.send_admin_prompt(&session_id, &text).await {
                     Ok(()) => Response::Ok {
@@ -3223,6 +3330,138 @@ async fn main() -> io::Result<()> {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    /// Regression (bug-0036 recurrence): two Codex questions submitted while a
+    /// turn is active must remain FIFO native-steering requests. A later,
+    /// explicit Stop is one independent cancel; it must not turn either
+    /// question into an ordinary prompt or consume an extra cancel signal.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn successive_codex_questions_then_stop_stay_fifo_through_server_actor() {
+        let (transport, mut controls) =
+            yalda::acp_channel::FakeTransport::with_session_id_and_steering(
+                "fake-codex-steer",
+                true,
+            );
+        let mut session = new_managed_session(
+            "codex-steer".into(),
+            "codex steering".into(),
+            PathBuf::from("/tmp/project"),
+            AgentProvider::Codex,
+            PermissionMode::ReadOnly,
+            None,
+            None,
+        );
+        session.channel = Some(transport.handle());
+        session.busy = true;
+
+        let (events, _) = broadcast::channel(16);
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let mut manager = Manager {
+            sessions: HashMap::from([("codex-steer".into(), session)]),
+            events,
+            default_permission_mode: PermissionMode::ReadOnly,
+            cmd_tx,
+            spawner: Arc::new(RealAgentSpawner),
+            bridge_tx: None,
+        };
+
+        manager
+            .do_steer("codex-steer", "first question", Vec::new())
+            .expect("first steer");
+        manager
+            .do_steer("codex-steer", "second question", Vec::new())
+            .expect("second steer");
+        manager.do_cancel("codex-steer").expect("explicit stop");
+
+        assert_eq!(
+            controls
+                .try_recv_native_steer()
+                .expect("first native steer")
+                .text,
+            "first question"
+        );
+        assert_eq!(
+            controls
+                .try_recv_native_steer()
+                .expect("second native steer")
+                .text,
+            "second question"
+        );
+        assert!(
+            controls.prompt_rx.try_recv().is_err(),
+            "capable Codex path must not fall back to ordinary prompts"
+        );
+        assert!(
+            controls.try_recv_native_cancel(),
+            "explicit Stop must follow both questions on the ordered control stream"
+        );
+        assert!(
+            !controls.try_recv_native_cancel(),
+            "ordered control stream must contain exactly one explicit Stop"
+        );
+        assert!(
+            controls.cancel_rx.try_recv().is_err(),
+            "capable path must not emit legacy compatibility cancels"
+        );
+    }
+
+    /// Older Codex adapters advertise no native steering. The server actor must
+    /// preserve the compatibility contract: one graceful cancel followed by
+    /// the replacement prompt, with nothing on the native-control stream.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn legacy_codex_steer_uses_cancel_then_prompt_through_server_actor() {
+        let (transport, mut controls) = yalda::acp_channel::FakeTransport::new();
+        let mut session = new_managed_session(
+            "legacy-codex".into(),
+            "legacy codex".into(),
+            PathBuf::from("/tmp/project"),
+            AgentProvider::Codex,
+            PermissionMode::ReadOnly,
+            None,
+            None,
+        );
+        session.channel = Some(transport.handle());
+        session.busy = true;
+
+        let (events, _) = broadcast::channel(16);
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let mut manager = Manager {
+            sessions: HashMap::from([("legacy-codex".into(), session)]),
+            events,
+            default_permission_mode: PermissionMode::ReadOnly,
+            cmd_tx,
+            spawner: Arc::new(RealAgentSpawner),
+            bridge_tx: None,
+        };
+
+        manager
+            .do_steer("legacy-codex", "replace the turn", Vec::new())
+            .expect("legacy steer fallback");
+
+        controls
+            .cancel_rx
+            .try_recv()
+            .expect("legacy fallback emits one graceful cancel");
+        assert!(
+            controls.cancel_rx.try_recv().is_err(),
+            "legacy fallback emits exactly one cancel"
+        );
+        assert_eq!(
+            controls
+                .prompt_rx
+                .try_recv()
+                .expect("legacy replacement prompt")
+                .text,
+            "replace the turn"
+        );
+        assert!(controls.prompt_rx.try_recv().is_err());
+        assert!(
+            controls.try_recv_native_steer().is_none(),
+            "legacy adapter must receive no native control"
+        );
+    }
 
     /// REGRESSION (bug-0028): archiving ONE session must not disconnect the
     /// GUI. The per-connection write half is shared by every session forwarder

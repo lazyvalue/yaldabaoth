@@ -530,6 +530,22 @@ impl SessionServerClient {
         })
     }
 
+    /// Send a provider-aware mid-turn Codex input. Fire-and-forget like
+    /// [`prompt_with_images`]; the server chooses native steering or the
+    /// old-adapter cancel+prompt fallback atomically in its actor.
+    pub fn steer_with_images(
+        &self,
+        session_id: &str,
+        text: &str,
+        images: Vec<crate::acp_channel::ImageAttachment>,
+    ) -> io::Result<()> {
+        self.request_fire(Request::Steer {
+            session_id: session_id.to_string(),
+            text: text.to_string(),
+            images,
+        })
+    }
+
     /// Headless "start-work" enqueue (ADR-0015): enqueue a prompt to an
     /// EXISTING session this caller does NOT own, and have the agent run the
     /// turn to completion with no GUI attached. Unlike [`prompt`] there is no
