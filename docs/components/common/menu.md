@@ -263,7 +263,8 @@ level's keys are unique.
 root entries, in this order: `w` switch worksheet/chatbox, `m` switch model, `s`
 select session, `c` clear, `v` view — followed by the shared tile-menu tail
 (`UXI-Menu-9`): `p` Send to Workspace, `X` Close, `t` Tag, then `h` Hide, `u`
-Unhide, `f` Detach, and finally the Agent-only `a` Archive. The View submenu
+Unhide, `f` Detach, and finally the Agent-only `r` Rename Session and `a`
+Archive. The View submenu
 contains only `a` Agents and `t` Tasks; choosing one shows that sidepanel view
 and marks the currently visible choice. Advertised model choices use `1..9,0` so
 changing provider model names cannot create key collisions.
@@ -312,9 +313,10 @@ menu** commands, appended after a separator, in three groups:
   established never-a-fake-success pattern): Hide needs attached-visible, Unhide
   needs attached-hidden, Detach needs any attachment; a Detached/unbound tile
   dims all three.
-- **Agent-only:** `a` Archive (`archive-session`) — appended to the Agent tile
-  menu alone, since archiving is a session concept. Dimmed when the focused
-  session has no stable server id yet.
+- **Agent-only:** `r` Rename Session (`claude-rename`) and `a` Archive
+  (`archive-session`) — appended to the Agent tile menu alone, since they are
+  session concepts. Archive is dimmed when the focused session has no stable
+  server id yet.
 
 The tail keys never collide with any App root (`UXI-Menu-7`). A dimmed key
 neither dispatches nor closes the menu.

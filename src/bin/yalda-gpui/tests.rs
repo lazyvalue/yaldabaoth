@@ -3441,6 +3441,8 @@ fn agent_menu_root_and_view_are_the_approved_items() {
             ("h".into(), "hide"),
             ("u".into(), "unhide"),
             ("f".into(), "detach tile"),
+            // agent-only session verbs
+            ("r".into(), "rename session"),
             ("a".into(), "archive"),
         ]
     );
@@ -3470,6 +3472,7 @@ fn agent_menu_root_and_view_are_the_approved_items() {
         ('h', "tile-hide"),
         ('u', "tile-unhide"),
         ('f', "tile-detach"),
+        ('r', "claude-rename"),
         ('a', "archive-session"),
     ] {
         let mut state = MenuState::new();
@@ -3516,7 +3519,7 @@ fn every_tile_menu_has_shared_tile_commands() {
             );
         }
     }
-    // Archive is Agent-only.
+    // Rename + Archive are Agent-only (session concepts).
     let agent = agent_local_menu();
     let archive = agent
         .iter()
@@ -3526,14 +3529,22 @@ fn every_tile_menu_has_shared_tile_commands() {
     assert!(
         matches!(&archive.action, MenuAction::Command(c) if c == "archive-session"),
     );
+    let rename = agent
+        .iter()
+        .find(|n| n.label == "rename session")
+        .expect("agent menu must carry rename session");
+    assert_eq!(format_menu_key(&rename.key), "r");
+    assert!(
+        matches!(&rename.action, MenuAction::Command(c) if c == "claude-rename"),
+    );
     for (name, menu) in [
         ("doc", doc_local_menu()),
         ("edit", edit_local_menu()),
         ("browser", browser_local_menu()),
     ] {
         assert!(
-            !menu.iter().any(|n| n.label == "archive"),
-            "{name} menu must NOT carry archive (session-only)"
+            !menu.iter().any(|n| n.label == "archive" || n.label == "rename session"),
+            "{name} menu must NOT carry session-only verbs"
         );
     }
 }

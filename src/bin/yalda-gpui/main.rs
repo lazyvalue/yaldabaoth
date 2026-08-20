@@ -1837,10 +1837,11 @@ fn agent_local_menu() -> Vec<MenuNode> {
             ],
         ),
     ]);
-    // Agent-only: archiving is a session concept, so it is present only on the
-    // Agent tile menu (UXI-Menu-9). Contextually dimmed when the session lacks a
-    // stable server id (`tile_menu_disabled`).
+    // Agent-only: rename and archive are session concepts, so they are present
+    // only on the Agent tile menu (UXI-Menu-9). Archive is contextually dimmed
+    // when the session lacks a stable server id (`tile_menu_disabled`).
     menu.push(MenuNode::separator());
+    menu.push(MenuNode::entry("r", "rename session", "claude-rename"));
     menu.push(MenuNode::entry("a", "archive", "archive-session"));
     menu
 }
