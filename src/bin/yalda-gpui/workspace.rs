@@ -548,8 +548,8 @@ impl Detail {
 /// which THREE are user-selectable arrangements:
 /// - `Columns` — every tile is an equal-width, full-height column, side by side
 ///   in signed reading order. The default.
-/// - `Tiling` — dwm-style master/stack: the first `master_count` tiles fill
-///   `master_ratio` of the width on the left (the master area); the remaining
+/// - `Tiling` — dwm-style primary/stack: the first `primary_count` tiles fill
+///   `primary_ratio` of the width on the left (the primary area); the remaining
 ///   tiles stack as equal columns on the right.
 /// - `Monocle` — only the focused tile renders, filling the whole region; the
 ///   others are present (never moved or closed) but not painted.
@@ -1508,11 +1508,11 @@ pub struct Workspace<C> {
     /// The workspace interior. Always [`LayoutMode::Plane`] (infinite-plane, Stage D);
     /// persisted for snapshot-format stability but ignored on load (Behavior 7).
     pub layout_mode: LayoutMode,
-    /// Dwm-style Columns master-area parameters (`UXI-Workspace-20`). Plane
-    /// ignores them, while Columns gives the first `master_count` tiles
-    /// `master_ratio` of the available width.
-    pub master_ratio: f32,
-    pub master_count: usize,
+    /// Dwm-style Columns primary-area parameters (`UXI-Workspace-20`). Plane
+    /// ignores them, while Columns gives the first `primary_count` tiles
+    /// `primary_ratio` of the available width.
+    pub primary_ratio: f32,
+    pub primary_count: usize,
     /// Tag-view filter. When non-empty, the workspace shows only windows whose
     /// buffer carries at least one tag in this set. Empty = show all.
     pub tag_view: TagSet,
@@ -1584,8 +1584,8 @@ impl<C> Workspace<C> {
             rail: None,
             ephemeral: false,
             layout_mode: LayoutMode::default(),
-            master_ratio: 0.6,
-            master_count: 1,
+            primary_ratio: 0.6,
+            primary_count: 1,
             tag_view: BTreeSet::new(),
             desktop: DesktopState::default(),
             view: WorkspaceView::default(),
@@ -1610,54 +1610,54 @@ impl<C> Workspace<C> {
         true
     }
 
-    /// Adjust the Tiling master-area ratio, clamped to the product bounds.
+    /// Adjust the Tiling primary-area ratio, clamped to the product bounds.
     /// Returns whether persisted state changed; every non-Tiling view is a
-    /// strict no-op (only Tiling has a master area).
-    pub fn adjust_master_ratio(&mut self, delta: f32) -> bool {
+    /// strict no-op (only Tiling has a primary area).
+    pub fn adjust_primary_ratio(&mut self, delta: f32) -> bool {
         if self.view != WorkspaceView::Tiling {
             return false;
         }
-        let next = (self.master_ratio.clamp(0.20, 0.80) + delta).clamp(0.20, 0.80);
-        if next == self.master_ratio {
+        let next = (self.primary_ratio.clamp(0.20, 0.80) + delta).clamp(0.20, 0.80);
+        if next == self.primary_ratio {
             return false;
         }
-        self.master_ratio = next;
+        self.primary_ratio = next;
         true
     }
 
-    /// Add one tile to the Tiling master area, bounded by the live tile count.
-    pub fn increase_master_count(&mut self) -> bool {
+    /// Add one tile to the Tiling primary area, bounded by the live tile count.
+    pub fn increase_primary_count(&mut self) -> bool {
         if self.view != WorkspaceView::Tiling {
             return false;
         }
         let tile_count = self.layout.leaf_ids().len().max(1);
         let next = self
-            .master_count
+            .primary_count
             .clamp(1, tile_count)
             .saturating_add(1)
             .min(tile_count);
-        if next == self.master_count {
+        if next == self.primary_count {
             return false;
         }
-        self.master_count = next;
+        self.primary_count = next;
         true
     }
 
-    /// Remove one tile from the Tiling master area, retaining at least one.
-    pub fn decrease_master_count(&mut self) -> bool {
+    /// Remove one tile from the Tiling primary area, retaining at least one.
+    pub fn decrease_primary_count(&mut self) -> bool {
         if self.view != WorkspaceView::Tiling {
             return false;
         }
         let tile_count = self.layout.leaf_ids().len().max(1);
         let next = self
-            .master_count
+            .primary_count
             .clamp(1, tile_count)
             .saturating_sub(1)
             .max(1);
-        if next == self.master_count {
+        if next == self.primary_count {
             return false;
         }
-        self.master_count = next;
+        self.primary_count = next;
         true
     }
 
@@ -4128,8 +4128,8 @@ mod tests {
             rail: None,
             ephemeral: false,
             layout_mode: LayoutMode::Plane,
-            master_ratio: 0.6,
-            master_count: 1,
+            primary_ratio: 0.6,
+            primary_count: 1,
             tag_view: BTreeSet::new(),
             desktop: DesktopState::default(),
             view: WorkspaceView::default(),
@@ -4450,8 +4450,8 @@ mod tests {
             rail: None,
             ephemeral: false,
             layout_mode: LayoutMode::Plane,
-            master_ratio: 0.6,
-            master_count: 1,
+            primary_ratio: 0.6,
+            primary_count: 1,
             tag_view: BTreeSet::new(),
             desktop: DesktopState::default(),
             view: WorkspaceView::default(),
@@ -4478,8 +4478,8 @@ mod tests {
             rail: None,
             ephemeral: false,
             layout_mode: LayoutMode::Plane,
-            master_ratio: 0.6,
-            master_count: 1,
+            primary_ratio: 0.6,
+            primary_count: 1,
             tag_view: BTreeSet::new(),
             desktop: DesktopState::default(),
             view: WorkspaceView::default(),
@@ -4515,8 +4515,8 @@ mod tests {
             rail: None,
             ephemeral: false,
             layout_mode: LayoutMode::Plane,
-            master_ratio: 0.6,
-            master_count: 1,
+            primary_ratio: 0.6,
+            primary_count: 1,
             tag_view: BTreeSet::new(),
             desktop: DesktopState::default(),
             view: WorkspaceView::default(),
@@ -4974,9 +4974,9 @@ mod tests {
     }
 
     #[test]
-    fn tiling_master_controls_clamp_and_other_views_unchanged() {
-        // UXI-Workspace-26: the master area belongs to Tiling. Columns, Monocle,
-        // and Plane leave the master ratio/count untouched.
+    fn tiling_primary_controls_clamp_and_other_views_unchanged() {
+        // UXI-Workspace-26: the primary area belongs to Tiling. Columns, Monocle,
+        // and Plane leave the primary ratio/count untouched.
         let mut frame = Frame::with_initial(TestContent("a"), ProjectId(0));
         frame.split_focused(SplitDir::V, TestContent("b")).unwrap();
         frame.split_focused(SplitDir::V, TestContent("c")).unwrap();
@@ -4984,17 +4984,17 @@ mod tests {
         wsp.view = WorkspaceView::Tiling;
 
         for _ in 0..20 {
-            wsp.adjust_master_ratio(0.05);
-            wsp.increase_master_count();
+            wsp.adjust_primary_ratio(0.05);
+            wsp.increase_primary_count();
         }
-        assert_eq!(wsp.master_ratio, 0.8);
-        assert_eq!(wsp.master_count, 3);
+        assert_eq!(wsp.primary_ratio, 0.8);
+        assert_eq!(wsp.primary_count, 3);
         for _ in 0..20 {
-            wsp.adjust_master_ratio(-0.05);
-            wsp.decrease_master_count();
+            wsp.adjust_primary_ratio(-0.05);
+            wsp.decrease_primary_count();
         }
-        assert_eq!(wsp.master_ratio, 0.2);
-        assert_eq!(wsp.master_count, 1);
+        assert_eq!(wsp.primary_ratio, 0.2);
+        assert_eq!(wsp.primary_count, 1);
 
         for other in [
             WorkspaceView::Columns,
@@ -5002,10 +5002,10 @@ mod tests {
             WorkspaceView::Plane,
         ] {
             wsp.view = other;
-            let before = (wsp.master_ratio, wsp.master_count);
-            assert!(!wsp.adjust_master_ratio(0.05), "{other:?} ratio is a no-op");
-            assert!(!wsp.increase_master_count(), "{other:?} count is a no-op");
-            assert_eq!((wsp.master_ratio, wsp.master_count), before);
+            let before = (wsp.primary_ratio, wsp.primary_count);
+            assert!(!wsp.adjust_primary_ratio(0.05), "{other:?} ratio is a no-op");
+            assert!(!wsp.increase_primary_count(), "{other:?} count is a no-op");
+            assert_eq!((wsp.primary_ratio, wsp.primary_count), before);
         }
     }
 }

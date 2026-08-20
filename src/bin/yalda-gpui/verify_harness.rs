@@ -19326,7 +19326,7 @@ fn plane_focused_tile_renders_when_off_viewport(cx: &mut TestAppContext) {
 }
 
 /// UXI-Workspace-14: the columns arrangement lays EVERY tile out as an
-/// full-height master/stack column, side by side — including a tile the plane
+/// full-height primary/stack column, side by side — including a tile the plane
 /// would cull off-viewport. Drives the REAL toggle handler (`Ctrl-W a` / the `.`
 /// menu both call `toggle_workspace_columns` → `Workspace::toggle_view`). The
 /// fixture explicitly starts in `Plane` so this toggle guard remains independent
@@ -19335,7 +19335,7 @@ fn plane_focused_tile_renders_when_off_viewport(cx: &mut TestAppContext) {
 /// The fixture (`boot_desktop_two_tiles`) parks B at slot (0,100) — far off the
 /// 800×600 viewport — so on the PLANE only A paints (proven first, for
 /// non-vacuity). After the toggle BOTH tiles paint as columns: B is now on
-/// screen, to the RIGHT of A, with the default 60/40 master split.
+/// screen, to the RIGHT of A, with the default 60/40 primary split.
 ///
 /// NEGATIVE CONTROL (observed RED): in `render_focused_window`, drop the
 /// `WorkspaceView::Columns` arm (always call `render_desktop`). Re-run: after the
@@ -19405,7 +19405,7 @@ fn columns_view_arranges_tiles_side_by_side(cx: &mut TestAppContext) {
         "columns must be side by side (A at x={ax} w={aw}, B at x={bx}) — B must be \
          to the RIGHT of A with no overlap"
     );
-    // Columns is equal-width (no master area — that belongs to Tiling now,
+    // Columns is equal-width (no primary area — that belongs to Tiling now,
     // UXI-Workspace-26). Both tiles split the width evenly, within a small
     // tolerance for gutters and borders.
     assert!(
@@ -19794,14 +19794,14 @@ fn ctrl_w_hide_unhide_and_workspace_back_and_forth_are_global(cx: &mut TestAppCo
     });
 }
 
-/// UXI-Workspace-20/22: all four registered master commands mutate the Tiling
+/// UXI-Workspace-20/22: all four registered primary commands mutate the Tiling
 /// arrangement and the ratio command changes painted geometry without touching
-/// plane slots. (The master area moved from Columns to Tiling in UXI-Workspace-26.)
+/// plane slots. (The primary area moved from Columns to Tiling in UXI-Workspace-26.)
 #[gpui::test]
-fn ctrl_w_master_commands_change_columns_state_and_geometry(cx: &mut TestAppContext) {
+fn ctrl_w_primary_commands_change_columns_state_and_geometry(cx: &mut TestAppContext) {
     use crate::workspace::WorkspaceView;
     cx.update(crate::register_keymap);
-    let (view, vcx, master_id, stack_id) = boot_desktop_two_tiles(cx);
+    let (view, vcx, primary_id, stack_id) = boot_desktop_two_tiles(cx);
     view.update(vcx, |v, cx| {
         v.workspace.active_workspace_mut().unwrap().view = WorkspaceView::Tiling;
         cx.notify();
@@ -19811,8 +19811,8 @@ fn ctrl_w_master_commands_change_columns_state_and_geometry(cx: &mut TestAppCont
     crate::layout_probe_begin();
     view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
-    let before_master = crate::layout_probe_get(&format!("columns-tile-{master_id}"))
-        .expect("master paints before adjustment");
+    let before_primary = crate::layout_probe_get(&format!("columns-tile-{primary_id}"))
+        .expect("primary paints before adjustment");
     let before_stack = crate::layout_probe_get(&format!("columns-tile-{stack_id}"))
         .expect("stack paints before adjustment");
     crate::layout_probe_end();
@@ -19820,17 +19820,17 @@ fn ctrl_w_master_commands_change_columns_state_and_geometry(cx: &mut TestAppCont
     vcx.simulate_keystrokes("ctrl-w f");
     vcx.run_until_parked();
     view.read_with(vcx, |v, _| {
-        assert!((v.workspace.active_workspace().unwrap().master_ratio - 0.65).abs() < 0.001);
+        assert!((v.workspace.active_workspace().unwrap().primary_ratio - 0.65).abs() < 0.001);
     });
     crate::layout_probe_begin();
     view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
-    let after_master = crate::layout_probe_get(&format!("columns-tile-{master_id}"))
-        .expect("master paints after adjustment");
+    let after_primary = crate::layout_probe_get(&format!("columns-tile-{primary_id}"))
+        .expect("primary paints after adjustment");
     let after_stack = crate::layout_probe_get(&format!("columns-tile-{stack_id}"))
         .expect("stack paints after adjustment");
     crate::layout_probe_end();
-    assert!(after_master.2 > before_master.2, "grow makes master wider");
+    assert!(after_primary.2 > before_primary.2, "grow makes primary wider");
     assert!(after_stack.2 < before_stack.2, "grow makes stack narrower");
 
     vcx.simulate_keystrokes("ctrl-w shift-f");
@@ -19838,20 +19838,20 @@ fn ctrl_w_master_commands_change_columns_state_and_geometry(cx: &mut TestAppCont
     vcx.run_until_parked();
     view.read_with(vcx, |v, _| {
         let wsp = v.workspace.active_workspace().unwrap();
-        assert!((wsp.master_ratio - 0.60).abs() < 0.001);
-        assert_eq!(wsp.master_count, 2);
+        assert!((wsp.primary_ratio - 0.60).abs() < 0.001);
+        assert_eq!(wsp.primary_count, 2);
     });
     crate::layout_probe_begin();
     view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
-    let all_master_a = crate::layout_probe_get(&format!("columns-tile-{master_id}"))
-        .expect("first all-master tile paints");
-    let all_master_b = crate::layout_probe_get(&format!("columns-tile-{stack_id}"))
-        .expect("second all-master tile paints");
+    let all_primary_a = crate::layout_probe_get(&format!("columns-tile-{primary_id}"))
+        .expect("first all-primary tile paints");
+    let all_primary_b = crate::layout_probe_get(&format!("columns-tile-{stack_id}"))
+        .expect("second all-primary tile paints");
     crate::layout_probe_end();
     assert!(
-        (all_master_a.2 - all_master_b.2).abs() <= 2.0,
-        "when master_count covers every tile, the full width is shared equally"
+        (all_primary_a.2 - all_primary_b.2).abs() <= 2.0,
+        "when primary_count covers every tile, the full width is shared equally"
     );
     vcx.simulate_keystrokes("ctrl-w shift-n");
     vcx.run_until_parked();
@@ -19860,8 +19860,87 @@ fn ctrl_w_master_commands_change_columns_state_and_geometry(cx: &mut TestAppCont
             .workspace
             .active_workspace()
             .unwrap()
-            .master_count),
+            .primary_count),
         1
+    );
+}
+
+/// UXI-Workspace-26: Tiling stacks the non-primary tiles VERTICALLY in the
+/// right-hand stack column — they share an x and descend in y — while the primary
+/// tile sits in the left column. Uses three tiles (1 primary + 2 stack) so the
+/// vertical relationship among stack tiles is observable.
+///
+/// NEGATIVE CONTROL (observed RED): change the Tiling stack pane back to
+/// `.flex_row()` in `render_columns`. Re-run: the two stack tiles get DIFFERENT x
+/// and equal y, so the "same x / descending y" asserts fire.
+#[gpui::test]
+fn tiling_stacks_non_primary_tiles_vertically(cx: &mut TestAppContext) {
+    use crate::workspace::{Slot, WorkspaceView};
+    use crate::{AgentSession, AgentState, AgentTile, App};
+    let (view, vcx, win_a, win_b) = boot_desktop_two_tiles(cx);
+
+    // Add a third tile C so the stack column holds two tiles.
+    let win_c = view.update(vcx, |v, cx| {
+        let mk = AgentSession {
+            state: AgentState::new_server_managed(None),
+            label: "C".into(),
+            cwd: PathBuf::from("."),
+            resume_id: None,
+        };
+        v.workspace
+            .split_focused(crate::workspace::SplitDir::H, App::Agent(AgentTile::new()));
+        let id_c = v.show_local_session(mk, cx);
+        v.sessions.bind_sid(id_c, "C".into()).unwrap();
+        let win_c = v.workspace.focused_window_id().expect("focused C");
+        let wsp = v.workspace.active_workspace_mut().unwrap();
+        // Deterministic reading order A,B,C along one row so primary=A, stack=B,C.
+        // 1×1 spans so the adjacent anchors don't overlap (which would make the
+        // per-frame reconcile re-seed and scramble the order).
+        for id in [win_a, win_b, win_c] {
+            wsp.desktop.set_span(id, crate::workspace::Span::new(1, 1));
+        }
+        wsp.desktop.set_anchor(win_a, Slot::new(0, 0));
+        wsp.desktop.set_anchor(win_b, Slot::new(0, 1));
+        wsp.desktop.set_anchor(win_c, Slot::new(0, 2));
+        wsp.view = WorkspaceView::Tiling; // primary_count defaults to 1
+        wsp.focused = win_a;
+        cx.notify();
+        win_c
+    });
+    vcx.run_until_parked();
+
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let a = crate::layout_probe_get(&format!("columns-tile-{win_a}")).expect("primary A paints");
+    let b = crate::layout_probe_get(&format!("columns-tile-{win_b}")).expect("stack B paints");
+    let c = crate::layout_probe_get(&format!("columns-tile-{win_c}")).expect("stack C paints");
+    crate::layout_probe_end();
+
+    // Stack tiles sit to the RIGHT of the primary.
+    assert!(
+        b.0 > a.0 && c.0 > a.0,
+        "stack tiles must be right of the primary (A.x={}, B.x={}, C.x={})",
+        a.0,
+        b.0,
+        c.0
+    );
+    // Stack tiles share a column: same x, roughly same width.
+    assert!(
+        (b.0 - c.0).abs() <= 2.0 && (b.2 - c.2).abs() <= 2.0,
+        "stack tiles must share an x-column (B x={} w={}, C x={} w={})",
+        b.0,
+        b.2,
+        c.0,
+        c.2
+    );
+    // …and stack VERTICALLY: C is strictly below B, non-overlapping.
+    assert!(
+        c.1 > b.1 && c.1 >= b.1 + b.3 - 1.0,
+        "stack tiles must stack vertically (B y={} h={}, C y={})",
+        b.1,
+        b.3,
+        c.1
     );
 }
 

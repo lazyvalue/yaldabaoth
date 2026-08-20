@@ -20,16 +20,16 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
   Unhide / Detach when in a workspace; Archive when an agent. System menu (`.`) =
   drop send-to-workspace (moved to tile menu), flatten the system submenu to the
   root, drop hide/unhide/close/set-cwd/also-show/plane-view/toggle-columns; add
-  layout modes Keep columns / Tiling (dwm master-left, stack-right) / Monocle.*
+  layout modes Keep columns / Tiling (dwm primary-left, stack-right) / Monocle.*
   Shipped: `WorkspaceView` = Columns (default) / Tiling / Monocle, Plane retired
   from the UI (persisted `"plane"` loads as Columns; variant + `render_desktop`
   kept for reversibility). `Ctrl-W a` cycles the three modes; `.` → layout submenu
-  selects directly + carries the master-area controls (now Tiling-only). Tile menu
+  selects directly + carries the primary-area controls (now Tiling-only). Tile menu
   tail keys `p`/`X`/`t`/`h`/`u`/`f`/`a`. Full suite pending; headless guards:
   `monocle_view_paints_only_the_focused_tile`,
   `layout_mode_commands_set_the_active_arrangement`,
   `columns_view_arranges_tiles_side_by_side` (now equal-width),
-  `ctrl_w_master_commands_change_columns_state_and_geometry` (Tiling),
+  `ctrl_w_primary_commands_change_columns_state_and_geometry` (Tiling),
   `tile_menu_hide_unhide_enablement_tracks_focused_membership`, +
   `every_tile_menu_has_shared_tile_commands` / `shell_layout_submenu_selects_modes`.
   Runtime-flagged for: exact painted mode geometry + the `Ctrl-W a` OS chord.
@@ -636,7 +636,7 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
   zoom in/out; pan around; reset the view to origin, where all workspaces start."
   A workspace is now one infinite signed-coordinate plane with a pan +
   discrete-semantic-zoom (`Full`/`Card`/`Minimap`) camera + reset-to-origin;
-  the layout-mode / master-stack / split-resize / equalize surface is retired
+  the layout-mode / primary-stack / split-resize / equalize surface is retired
   (`SplitH`/`SplitV` remain as the plane's new-tile mechanism). Built in 4 staged
   subagent passes (engine → persistence → Detail render → surface-retirement +
   binding reflow). `UXI-Workspace-2..7` all `implemented` + headless-guarded (12
@@ -757,7 +757,7 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
   survives relaunch. NOTE: pre-existing `~/.yalda/workspace.json` entries have no
   stored cwd → the first Set CWD per workspace populates it going forward.
 - **Desktop mode** — `NEEDS-RUNTIME` (built 2026-06-10, spec
-  `spec-desktop-mode.md`, engine `1f7c269^..1f7c269` on master). Fifth
+  `spec-desktop-mode.md`, engine `1f7c269^..1f7c269` on primary). Fifth
   per-tab LayoutMode (`Ctrl-W Space` cycle, sigil `[#]`): fixed-size tiles
   (global `{cols}x{rows}` via `Ctrl-W p`, default 120×40) on a pannable slot
   grid; drag tiles by title bar (insert-and-shift, right-click cancels);
@@ -836,7 +836,7 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
   always returns EOF and the `append_llm_chunk_floored` path is inert. Pinned by
   `inv_order_*`. Ticket closed.
 - **Mid-turn message drops (lease gate + invisible rejection)** — `FIXED`
-  (2026-06-09, `b7bdcde` on master); `NEEDS-RUNTIME` for the GUI
+  (2026-06-09, `b7bdcde` on primary); `NEEDS-RUNTIME` for the GUI
   PromptRejected surfacing (notice + chatbox restore — headless tests cover
   the server half only). Root cause was two-part: `prompt()` is
   fire-and-forget so a server rejection had no waiter (the optimistic echo
@@ -848,7 +848,7 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
   submitter with the text restored into the chatbox. Tests 3b/3c/3d in
   `session_transcript_test.rs` (red on old gate, green now).
 - **Agent transcript typing lag (worksheet + while-streaming)** — `FIXED`
-  (2026-06-09, `8af1d4c` merged to master); `NEEDS-RUNTIME` (worksheet typing
+  (2026-06-09, `8af1d4c` merged to primary); `NEEDS-RUNTIME` (worksheet typing
   feel + typing-while-streaming on the real resumed session). Both shared one
   hot path: every `edit_seq` bump (worksheet keystroke; every streamed chunk)
   misses the S1 view-model cache, and the rebuild (a) deep-cloned EVERY
@@ -873,13 +873,13 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
   it was filed.
 
 - **Resume hang (replay fence never cleared)** — `FIXED` (2026-06-09,
-  `9112188` on master). After a server restart, a recovered session's pump
+  `9112188` on primary). After a server restart, a recovered session's pump
   fence waited for the channel turn counter to reach the restored count — but
   the counter restarts at 0 every spawn and `092c218` removed the post-load
   bump, so the fence never cleared and EVERY post-resume event (replay, marker,
   live turns) was silently discarded: prompts looked hung while the agent
   worked invisibly (a queued "integrate" actually ran + folded a branch to
-  master unseen). Fix: marker-based fence (`src/replay_fence.rs`), worker emits
+  primary unseen). Fix: marker-based fence (`src/replay_fence.rs`), worker emits
   `ReplayComplete` on every resume attempt incl. fallbacks, pump reports
   session-absolute TurnCounts (`turn_base +`), restart-with-resume arms the
   fence (kills the restart double-record). Regression test:
@@ -947,9 +947,9 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
   broadcast lag — that path was already self-healing; the real cause was the
   missing shutdown.
 
-## Session-server hardening + actor extraction (all MERGED to `master`)
+## Session-server hardening + actor extraction (all MERGED to `primary`)
 
-Phase-3 + phase-7 of `spec-session-server-actor.md`. All landed on `master`
+Phase-3 + phase-7 of `spec-session-server-actor.md`. All landed on `primary`
 (`bd796d4`,`1e2c881`,`03e8d10`,`23747a0`,`a70ef74`); branches deleted. Headlessly
 verified via the resilience+transcript harness. Worklogs:
 `2026-06-07-session-server-hardening.md`, `2026-06-07-actor-extraction-and-perm-ux.md`.
@@ -983,7 +983,7 @@ verified via the resilience+transcript harness. Worklogs:
   `cursor_reconnect_streams_only_tail`. **GUI cursor-wiring is NEEDS-RUNTIME** (have
   the GUI send its last cursor on reconnect; the transcript reconciler must be
   checked under tail-only streams — GPUI not headless-drivable).
-- **Lease ownership (phase 4)** — `DONE` — runtime-verified, merging to master
+- **Lease ownership (phase 4)** — `DONE` — runtime-verified, merging to primary
   (branch `phase4-lease` → `ba12d5d`, 2026-06-08). `owner: conn_id` → `Lease{
   client_id, expires_at: Instant}` + 5s client heartbeat / 15s TTL; dual-clock
   (actor owns monotonic `Instant`, wire carries display-only millis); stable
@@ -1008,7 +1008,7 @@ verified via the resilience+transcript harness. Worklogs:
   Acceptable per user — the self-hosting / blue-green loop is the real case and
   works; same-machine multi-window is the edge. Follow-up only if that matters
   (heartbeat off an App-Nap-immune timer / disable App Nap / longer TTL).
-- **`AgentTransport` seam (phase 6)** — `DONE` / merging to master (branch
+- **`AgentTransport` seam (phase 6)** — `DONE` / merging to primary (branch
   `phase6-transport` → `b0375e9` + `1f80296`, 2026-06-08). `AgentTransport` trait
   (object-safe, sync, pump-facing) + `AgentSpawner` factory + `RealAgentSpawner`;
   `FakeTransport`/`FakeAgentControls`/`FakeAgentSpawner` in-process fake (gated
@@ -1021,7 +1021,7 @@ verified via the resilience+transcript harness. Worklogs:
   Behavior-preserving → foldable after build-check. Overlaps
   `tests/session_resilience_test.rs` with phase 4 at integrate (kept additive).
   Unblocks the phase-8 eventlog reducer/forwarder headless tests.
-- **GUI projection + full eventlog end-to-end (phase 8)** — `MERGED` to master
+- **GUI projection + full eventlog end-to-end (phase 8)** — `MERGED` to primary
   (`f0710fc`, 2026-06-08; v3 WAL cutover landed). Post-merge runtime confirms still
   owed (see end of entry) but non-blocking — headless + reviews are green.
   Producer collapse `Notification::{ReplyEvent,TurnEnded,UserPrompt}` +
@@ -1139,8 +1139,8 @@ verified via the resilience+transcript harness. Worklogs:
 
 ## State (2026-06-02)
 
-`master` fast-forwarded `f282130` → `8036ccf` (= `integration`): base ACP + rail
-+ perf + workspaces are now on `master`. Rail is **runtime-confirmed by the
+`primary` fast-forwarded `f282130` → `8036ccf` (= `integration`): base ACP + rail
++ perf + workspaces are now on `primary`. Rail is **runtime-confirmed by the
 user**; the rest is `NEEDS-RUNTIME`. Follow-ups below are off `integration`,
 **not yet folded**.
 
@@ -1215,7 +1215,7 @@ user**; the rest is `NEEDS-RUNTIME`. Follow-ups below are off `integration`,
 - **Workspaces multi-membership for agents** — `NEEDS-DECISION`. Needs the
   multi-subscriber session core/view split (see `spec-workspaces-tagging.md`).
   Bigger lift; confirm it's wanted before building.
-- **Merge order to `master`/`main`** — `NEEDS-DECISION`. `integration` is the
+- **Merge order to `primary`/`main`** — `NEEDS-DECISION`. `integration` is the
   combined buildable branch; none of it is runtime-verified yet.
 
 ## Needs runtime verification
