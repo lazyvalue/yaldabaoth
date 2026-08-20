@@ -10,9 +10,16 @@ use super::*;
 /// present. Pinned by `worksheet_backdrop_fainter_in_insert`.
 pub(crate) fn worksheet_backdrop_alpha(mode: EditMode) -> f32 {
     match mode {
-        EditMode::Insert => 0.05,
-        EditMode::Normal => 0.11,
+        EditMode::Insert => 0.13,
+        EditMode::Normal => 0.22,
     }
+}
+
+/// The teal used for the worksheet backdrop wash. Brighter/more saturated than
+/// the darker `warm_accent` (which is tuned for text/border legibility) so it
+/// still reads clearly TEAL at the low wash alphas above.
+pub(crate) fn worksheet_wash_teal() -> Hsla {
+    gpui::rgb(0x2f9084).into()
 }
 
 /// Test-only record of the source text and syntax background that the real
@@ -1368,7 +1375,7 @@ impl YaldaGpuiView {
             // A slight teal wash behind the worksheet draft. Fainter while
             // TYPING (Insert) than resting (Normal), per request.
             let worksheet_backdrop: Hsla = {
-                let mut c = worksheet_accent;
+                let mut c = worksheet_wash_teal();
                 c.a = worksheet_backdrop_alpha(compose_mode);
                 c
             };
