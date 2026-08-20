@@ -111,7 +111,7 @@ impl YaldaGpuiView {
     }
 
     /// Swap from Doc view into Edit screen with the Word-Processor (live
-    /// preview) view. Bound to `Ctrl-W` in the YaldaView key context.
+    /// preview) view. Bound to `Ctrl-Shift-E` in the YaldaView key context.
     pub(crate) fn enter_wp(&mut self, _: &EnterWp, _w: &mut Window, cx: &mut Context<Self>) {
         self.enter_edit_with(EditView::WordProcessor, cx);
     }
@@ -406,10 +406,6 @@ impl YaldaGpuiView {
                     self.back_to_doc(cx);
                     return;
                 }
-                'w' | 'W' => {
-                    self.toggle_edit_view(cx);
-                    return;
-                }
                 _ => {}
             }
         }
@@ -459,7 +455,8 @@ impl YaldaGpuiView {
     }
 
     /// Flip between Code and WordProcessor views without touching buffer
-    /// state. Bound to `Ctrl-W`.
+    /// state. Exposed through the Buffer tile menu; bare `Ctrl-W` is reserved
+    /// exclusively as the shell's multi-key workspace prefix.
     pub(crate) fn toggle_edit_view(&mut self, cx: &mut Context<Self>) {
         let edit = match self.edit_mut() {
             Some(e) => e,

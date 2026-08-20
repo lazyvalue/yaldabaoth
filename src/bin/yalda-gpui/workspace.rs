@@ -1691,6 +1691,23 @@ impl<C> Workspace<C> {
         }
     }
 
+    /// Resolve directional focus against the arrangement the user can see.
+    /// Columns and Tiling flatten retained Plane slots into one horizontal
+    /// reading-order row, so their target must never come from hidden Plane
+    /// coordinates. Monocle maps both backward keys and both forward keys onto
+    /// reading-order siblings so movement remains deterministic.
+    pub fn focus_target(&self, dir: FocusDir) -> Option<WindowId> {
+        match (self.view, dir) {
+            (WorkspaceView::Monocle, FocusDir::Left | FocusDir::Up) => {
+                self.desktop.sequence_adjacent(self.focused, false)
+            }
+            (WorkspaceView::Monocle, FocusDir::Right | FocusDir::Down) => {
+                self.desktop.sequence_adjacent(self.focused, true)
+            }
+            _ => self.placement_target(dir),
+        }
+    }
+
     /// Swap the focused tile with its visible directional neighbor.
     pub fn swap_focused_direction(&mut self, dir: FocusDir) -> bool {
         let Some(target) = self.placement_target(dir) else {
@@ -3285,34 +3302,16 @@ impl<C> Frame<C> {
         Ok(())
     }
 
-    /// Topological focus motion. Walks up the tree from the focused leaf to
-    /// find the nearest ancestor `Split` whose direction matches:
-    ///
-    /// - `Left`/`Right` → nearest `SplitDir::V` ancestor (children laid out
-    ///   left-to-right).
-    /// - `Up`/`Down` → nearest `SplitDir::H` ancestor (children laid out
-    ///   top-to-bottom).
-    ///
-    /// At that ancestor, moves to the sibling at `current_idx ± 1`. If the
-    /// sibling is itself a `Split`, descends into its first leaf (matching
-    /// vim's "land on the most-recently-focused descendant" heuristic with
-    /// a simpler proxy — left-most/top-most leaf).
-    ///
-    /// No-op when there's no sibling in the requested direction.
+    /// Move focus to the active arrangement's visible directional target.
+    /// Plane is spatial; Columns/Tiling use their flattened horizontal order;
+    /// Monocle traverses the reading-order tile being presented. No-op when the
+    /// active arrangement has no target in the requested direction.
     pub fn focus_motion(&mut self, dir: FocusDir) -> Result<(), ()> {
         if self.solo_presentation.is_some() {
             return Err(());
         }
         let wsp = self.active_workspace_mut().ok_or(())?;
-        // Spatial navigation over plane slots (spec-infinite-plane-workspace.md
-        // Behavior 5). No candidate = no-op.
-        let sdir = match dir {
-            FocusDir::Left => SpatialDir::Left,
-            FocusDir::Right => SpatialDir::Right,
-            FocusDir::Up => SpatialDir::Up,
-            FocusDir::Down => SpatialDir::Down,
-        };
-        if let Some(next) = wsp.desktop.spatial_neighbor(wsp.focused, sdir) {
+        if let Some(next) = wsp.focus_target(dir) {
             wsp.focused = next;
         }
         Ok(())

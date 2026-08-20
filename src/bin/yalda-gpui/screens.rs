@@ -424,7 +424,7 @@ impl YaldaGpuiView {
             .text_size(px(11.0))
             .child(left_status)
             .child(SharedString::new_static(
-                "Ctrl-W toggle wp/raw · Ctrl-S save · Ctrl-V view · v ext · d del · y yank",
+                "Space menu for wp/raw · Ctrl-S save · Ctrl-V view · v ext · d del · y yank",
             ));
 
         // No `actions!` wired here — the EditView key context catches all

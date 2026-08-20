@@ -16,7 +16,7 @@ three modes:
   orange cursor-bar on the focused block; `j/k`/arrows move block focus; `g`/`G`
   top/bottom; page scroll; wiki-links; marks. Built from `RenderedBlock`s.
 - **`Editing` (Edit view, `EditView`)** — raw markdown source in two submodes toggled
-  with `Ctrl-W`: **Code (RAW)** — monospace, line-number gutter, `md_highlight`
+  from the Buffer tile menu: **Code (RAW)** — monospace, line-number gutter, `md_highlight`
   source colors; **WordProcessor (WP)** — proportional font with per-line
   typographic classification (`classify_wp_line`). Vim-style Normal/Insert submodes
   (`AppMode`).

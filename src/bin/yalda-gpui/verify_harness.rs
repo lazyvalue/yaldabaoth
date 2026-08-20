@@ -9311,6 +9311,202 @@ fn agent_identity_guard_rejects_duplicate_local_and_durable_owners(cx: &mut Test
 /// deliberately a focus assertion, not a split-command proxy: the reported bug
 /// was specifically that the directional chord vanished in some tile states.
 #[gpui::test]
+fn ctrl_w_direction_survives_a_render_between_prefix_and_direction(
+    cx: &mut TestAppContext,
+) {
+    use crate::{
+        App, BrowserWindow, BufferApp,
+        workspace::{Slot, SplitDir, WorkspaceView},
+    };
+
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_browser(cx);
+    let (center, left) = view.update(vcx, |v, cx| {
+        let center = v.workspace.focused_window_id().expect("center tile");
+        let cwd = v.active_workspace_cwd().unwrap_or_else(crate::process_cwd);
+        let left = v
+            .workspace
+            .split_focused(
+                SplitDir::V,
+                App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd))),
+            )
+            .expect("left neighbor");
+        let workspace = v.workspace.active_workspace_mut().expect("workspace");
+        workspace.view = WorkspaceView::Plane;
+        let leaves = workspace.layout.leaf_ids();
+        workspace.desktop.reconcile(&leaves);
+        workspace.desktop.set_anchor(center, Slot::new(0, 0));
+        workspace.desktop.set_anchor(left, Slot::new(0, -1));
+        workspace.focused = center;
+        v.test_open_edit("staggered ctrl-w focus");
+        cx.notify();
+        (center, left)
+    });
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("ctrl-w");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert_eq!(v.workspace.focused_window_id(), Some(center));
+    });
+    vcx.simulate_keystrokes("h");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert_eq!(
+            v.workspace.focused_window_id(),
+            Some(left),
+            "Ctrl-W must remain a pending shell prefix across an intervening render"
+        );
+    });
+}
+
+/// bug-0045 recurrence / UXI-Workspace-22: Columns and Tiling flatten signed
+/// Plane reading order into one visible horizontal row. Directional focus must
+/// use that painted geometry, not the hidden two-dimensional Plane coordinates.
+#[gpui::test]
+fn ctrl_w_direction_follows_visible_arrangement_not_hidden_plane_geometry(
+    cx: &mut TestAppContext,
+) {
+    use crate::{
+        App, BrowserWindow, BufferApp,
+        workspace::{Slot, SplitDir, WorkspaceView},
+    };
+
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_browser(cx);
+    let (left, center, right) = view.update(vcx, |v, cx| {
+        let center = v.workspace.focused_window_id().expect("center tile");
+        let cwd = v.active_workspace_cwd().unwrap_or_else(crate::process_cwd);
+        let picker = || App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd.clone())));
+        let left = v.workspace.split_focused(SplitDir::V, picker()).expect("left tile");
+        let right = v.workspace.split_focused(SplitDir::V, picker()).expect("right tile");
+        let workspace = v.workspace.active_workspace_mut().expect("workspace");
+        workspace.view = WorkspaceView::Columns;
+        let leaves = workspace.layout.leaf_ids();
+        workspace.desktop.reconcile(&leaves);
+        workspace.desktop.set_anchor(left, Slot::new(-1, 99));
+        workspace.desktop.set_anchor(center, Slot::new(0, 0));
+        workspace.desktop.set_anchor(right, Slot::new(1, -99));
+        workspace.focused = center;
+        cx.notify();
+        (left, center, right)
+    });
+    vcx.run_until_parked();
+
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let left_bounds = crate::layout_probe_get(&format!("columns-tile-{left}"))
+        .expect("left column paints");
+    let center_bounds = crate::layout_probe_get(&format!("columns-tile-{center}"))
+        .expect("center column paints");
+    let right_bounds = crate::layout_probe_get(&format!("columns-tile-{right}"))
+        .expect("right column paints");
+    crate::layout_probe_end();
+    assert!(
+        left_bounds.0 < center_bounds.0 && center_bounds.0 < right_bounds.0,
+        "fixture must paint left/center/right in visible order: {left_bounds:?} {center_bounds:?} {right_bounds:?}"
+    );
+
+    vcx.simulate_keystrokes("ctrl-w h");
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(vcx, |v, _| v.workspace.focused_window_id()),
+        Some(left),
+        "Columns h selects the visibly-left tile"
+    );
+    view.update(vcx, |v, cx| {
+        v.workspace.active_workspace_mut().unwrap().focused = center;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("ctrl-w l");
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(vcx, |v, _| v.workspace.focused_window_id()),
+        Some(right),
+        "Columns l selects the visibly-right tile"
+    );
+
+    view.update(vcx, |v, cx| {
+        let workspace = v.workspace.active_workspace_mut().unwrap();
+        workspace.view = WorkspaceView::Tiling;
+        workspace.focused = center;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let tiling_left = crate::layout_probe_get(&format!("columns-tile-{left}"))
+        .expect("tiling left paints");
+    let tiling_center = crate::layout_probe_get(&format!("columns-tile-{center}"))
+        .expect("tiling center paints");
+    let tiling_right = crate::layout_probe_get(&format!("columns-tile-{right}"))
+        .expect("tiling right paints");
+    crate::layout_probe_end();
+    assert!(
+        tiling_left.0 < tiling_center.0 && tiling_center.0 < tiling_right.0,
+        "Tiling must paint left/center/right: {tiling_left:?} {tiling_center:?} {tiling_right:?}"
+    );
+    vcx.simulate_keystrokes("ctrl-w h");
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(vcx, |v, _| v.workspace.focused_window_id()),
+        Some(left),
+        "Tiling h selects the visibly-left tile"
+    );
+    view.update(vcx, |v, cx| {
+        v.workspace.active_workspace_mut().unwrap().focused = center;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("ctrl-w l");
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(vcx, |v, _| v.workspace.focused_window_id()),
+        Some(right),
+        "Tiling l selects the visibly-right tile"
+    );
+    for direction in ["j", "k"] {
+        view.update(vcx, |v, cx| {
+            v.workspace.active_workspace_mut().unwrap().focused = center;
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes(&format!("ctrl-w {direction}"));
+        vcx.run_until_parked();
+        assert_eq!(
+            view.read_with(vcx, |v, _| v.workspace.focused_window_id()),
+            Some(center),
+            "Tiling {direction} is a no-op for full-height tiles"
+        );
+    }
+
+    view.update(vcx, |v, cx| {
+        let workspace = v.workspace.active_workspace_mut().unwrap();
+        workspace.view = WorkspaceView::Monocle;
+        workspace.focused = center;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    for (direction, expected) in [("h", left), ("k", left), ("l", right), ("j", right)] {
+        view.update(vcx, |v, cx| {
+            v.workspace.active_workspace_mut().unwrap().focused = center;
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes(&format!("ctrl-w {direction}"));
+        vcx.run_until_parked();
+        assert_eq!(
+            view.read_with(vcx, |v, _| v.workspace.focused_window_id()),
+            Some(expected),
+            "Monocle {direction} traverses reading order"
+        );
+    }
+}
+
+#[gpui::test]
 fn ctrl_w_shell_commands_reach_every_tile_app(cx: &mut TestAppContext) {
     use crate::{
         AgentTile, App, BrowserWindow, BufferApp, CogTile, KeymapTile, LinearTile,

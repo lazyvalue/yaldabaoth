@@ -1112,6 +1112,15 @@ central shell wiring is a test failure. Overlay focus remains an intentional
 boundary; an active modal overlay owns its own keyboard surface and is not a
 tile App silently consuming the prefix.
 
+Directional focus resolves against the **active visible arrangement**, never a
+different arrangement's retained geometry. Plane uses two-dimensional spatial
+neighbors. Columns and Tiling paint one horizontal signed-reading-order row, so
+`h`/`l` select the previous/next visible column and `j`/`k` are no-ops. Monocle
+maps `h`/`k` backward and `l`/`j` forward through non-wrapping reading order so
+all four movement keys predictably change the one tile being presented. No App
+may assign behavior to bare `Ctrl-W`; Buffer Code/WP switching remains in its
+tile menu.
+
 **Applies to.** `main.rs`: the central Ctrl-W action-wiring extension and
 coverage vocabulary; `chrome.rs::render_focused_window`: the sole tile-shell
 wiring point; `screens.rs`: App-local action wiring only;
@@ -1127,8 +1136,13 @@ capture.
 
 **Enforcement.** `verify_harness.rs::ctrl_w_shell_commands_reach_every_tile_app`
 uses the production keymap and real `Ctrl-W` keystrokes across the App-state
-matrix. A registry coverage guard compares every configured `ctrl-w` action to
-the central declarative handler vocabulary.
+matrix. `ctrl_w_direction_follows_visible_arrangement_not_hidden_plane_geometry`
+proves painted Columns/Tiling order wins over deliberately contradictory retained
+Plane coordinates, and `ctrl_w_direction_survives_a_render_between_prefix_and_direction`
+keeps the prefix live across a between-key render. A registry coverage guard
+compares every configured `ctrl-w` action to the central declarative handler
+vocabulary, while `bare_ctrl_w_is_exclusively_reserved_as_the_shell_prefix`
+pins the common raw-key interceptor that prevents App reinterpretation.
 
 ### UXI-Workspace-23 — Closing a bound Agent tile stashes it
 
