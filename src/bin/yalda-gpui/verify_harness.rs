@@ -19124,6 +19124,129 @@ fn ctrl_w_send_and_send_follow_use_the_same_project_picker(cx: &mut TestAppConte
     });
 }
 
+/// UXI-Workspace-25 / bug-0048: destination rows identify the workspace, not
+/// the content of whichever tile happens to be focused there. This drives the
+/// real Ctrl-W picker path, then resolves the exact production label helper
+/// used by the rendered row.
+#[gpui::test]
+fn send_picker_agent_destination_uses_workspace_name_without_provider_prefix(
+    cx: &mut TestAppContext,
+) {
+    use crate::{AgentTile, App};
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_browser(cx);
+    let target = view.update(vcx, |v, _| {
+        v.workspace
+            .push_workspace_inheriting(App::Agent(AgentTile::new()));
+        let target = v.workspace.active_workspace;
+        v.workspace.workspaces[target].display_name = Some("Research".into());
+        v.workspace.set_active_workspace(0);
+        target
+    });
+
+    vcx.simulate_keystrokes("ctrl-w m");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        let picker = v.workspace_picker_ref().expect("send picker opened");
+        assert!(picker.targets.contains(&target));
+        let label = crate::workspace_picker_destination_label(&v.workspace.workspaces[target]);
+        assert_eq!(
+            label, "Research",
+            "a destination is the workspace named Research, not the focused Agent tile: {label:?}"
+        );
+    });
+}
+
+/// UXI-Workspace-25: the real picker paints as a compact destination card, not
+/// a nearly full-width debug list. Its fixed chrome and 42px option rows do not
+/// inherit document zoom; the creation action is separated below the existing
+/// destinations. The selected row's real painted bounds are also clickable.
+#[gpui::test]
+fn send_picker_paints_compact_hierarchy_and_click_moves_tile(cx: &mut TestAppContext) {
+    use crate::workspace::TileMembership;
+    use crate::{AgentTile, App, LinearTile};
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_browser(cx);
+    let (moved, target) = view.update(vcx, |v, _| {
+        let moved = v
+            .workspace
+            .split_focused(
+                crate::workspace::SplitDir::V,
+                App::Linear(LinearTile::new()),
+            )
+            .expect("second source tile");
+        v.workspace
+            .push_workspace_inheriting(App::Agent(AgentTile::new()));
+        let target = v.workspace.active_workspace;
+        v.workspace.workspaces[target].display_name = Some("Research".into());
+        v.workspace
+            .push_workspace_inheriting(App::Linear(LinearTile::new()));
+        v.workspace.set_active_workspace(0);
+        (moved, target)
+    });
+
+    vcx.simulate_keystrokes("ctrl-w m");
+    vcx.run_until_parked();
+
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let card = crate::layout_probe_get("workspace-picker-card").expect("picker card paints");
+    let header =
+        crate::layout_probe_get("workspace-picker-header").expect("picker header paints");
+    let options =
+        crate::layout_probe_get("workspace-picker-options").expect("picker options paint");
+    let row0 = crate::layout_probe_get("workspace-picker-row-0").expect("source row paints");
+    let selected =
+        crate::layout_probe_get("workspace-picker-row-1").expect("selected target row paints");
+    let last = crate::layout_probe_get("workspace-picker-row-2").expect("last target row paints");
+    let create =
+        crate::layout_probe_get("workspace-picker-new-row").expect("creation row paints");
+    crate::layout_probe_end();
+
+    let (card_x, card_y, card_w, card_h) = card;
+    assert!(
+        (450.0..=481.0).contains(&card_w) && (220.0..=420.0).contains(&card_h),
+        "picker must be a compact 480px card, got ({card_x}, {card_y}, {card_w}, {card_h})"
+    );
+    assert!(
+        header.1 >= card_y && options.1 >= header.1 + header.3 - 1.0,
+        "title/subtitle header must sit above the destination list: header={header:?} options={options:?}"
+    );
+    for (name, row) in [("first", row0), ("selected", selected), ("last", last)] {
+        assert!(
+            (row.3 - 42.0).abs() <= 1.0 && row.0 > card_x && row.2 < card_w,
+            "{name} destination row must use compact fixed chrome inside the card: {row:?}"
+        );
+    }
+    assert!(
+        create.1 >= last.1 + last.3 + 10.0 && (create.3 - 42.0).abs() <= 1.0,
+        "New workspace must be a separated 42px action below destinations: last={last:?} create={create:?}"
+    );
+
+    let at = point(
+        px(selected.0 + selected.2 / 2.0),
+        px(selected.1 + selected.3 / 2.0),
+    );
+    vcx.simulate_mouse_move(at, None, gpui::Modifiers::default());
+    vcx.simulate_click(at, gpui::Modifiers::default());
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert!(!v.overlay_is_workspace(), "click commits and closes picker");
+        assert_eq!(
+            v.workspace.tile_membership(moved),
+            Some(TileMembership::Attached {
+                workspace: target,
+                visibility: crate::workspace::AttachedVisibility::Visible,
+            })
+        );
+        assert_eq!(
+            v.workspace.active_workspace, 0,
+            "plain Move stays in the source workspace"
+        );
+    });
+}
+
 /// ADR-0034: hide/unhide and back-and-forth actions are wired at the shared
 /// tile wrapper, so the real chords work regardless of focused App kind.
 #[gpui::test]

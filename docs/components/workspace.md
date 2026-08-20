@@ -1206,3 +1206,36 @@ ownership graph. Production-path guards
 `hidden_tile_navigation_is_solo_until_explicit_unhide`, and
 `close_bound_agent_tile_retires_tile_without_hiding_or_detaching` exercise the shared
 shell actions, solo visit/Unhide-follow, and independent Close behavior.
+
+### UXI-Workspace-25 — Destination pickers name places, not their contents
+
+**Statement.** The **Send tile to workspace** picker is a compact destination
+chooser. Every existing destination row uses only the workspace's durable
+display label. It never substitutes the focused tile's kind, provider, file,
+or title, so a workspace named **Research** remains **Research** even when its
+only tile is a Claude Agent.
+
+The overlay presents one clear action title, a short sentence describing the
+follow policy, and a restrained list hierarchy. Selection uses both an accent
+rail and background; the active source carries a quiet **Current** badge; and
+**New workspace** is a visually separated creation action. Body labels use the
+standard UI font and fixed chrome sizing rather than inheriting document zoom.
+Keyboard hints remain secondary and the full existing `j`/`k`, arrows,
+`g`/`G`, Enter/`l`, and Esc/`q` interaction contract is unchanged.
+
+**Applies to.** `main.rs`: workspace-picker presentation model and overlay;
+`yux/detail.rs`: reusable option-row chrome.
+
+**Why.** A destination selector answers “where?” Workspace-strip content
+summaries answer “what is open there?” Mixing them produces unstable labels
+such as `Claude (Research)` and makes the same workspace look like a different
+place as its contents change.
+
+**Status.** `implemented (headless)`.
+
+**Enforcement.** `send_picker_agent_destination_uses_workspace_name_without_provider_prefix`
+drives the production `Ctrl-W m` picker path and asserts the rendered row's
+production label projection. A painted geometry guard covers the compact card,
+row hierarchy, separated creation action, and real click dispatch. Restoring
+the Agent-derived `Claude (<workspace>)` projection makes the identity guard
+fail.
