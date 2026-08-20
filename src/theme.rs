@@ -1509,7 +1509,7 @@ impl AgentTheme {
     /// Folio agent palette — warm paper with steel/teal/sage accents.
     pub fn folio() -> Self {
         Self {
-            frozen_bar: Color::Rgb(0x40, 0x5d, 0x72), // steel
+            frozen_bar: Color::Rgb(0x40, 0x67, 0x64), // teal — agent accent (consistent w/ cog)
             user_bar: Color::Rgb(0x49, 0x5f, 0x4e),   // sage
             tool_label: Color::Rgb(0x50, 0x50, 0x52), // warm-gray
             dim: Color::Rgb(0x9a, 0x9a, 0x9a),        // tan
@@ -1521,7 +1521,7 @@ impl AgentTheme {
             agent_turn_bg: Color::Rgb(0xf0, 0xef, 0xec), // barely darker than paper
             user_turn_bg: Color::Rgb(0xde, 0xe5, 0xee),  // faint blue tint (UXI-AgentTile-23)
 
-            turn_header_agent: Color::Rgb(0x40, 0x5d, 0x72), // steel
+            turn_header_agent: Color::Rgb(0x40, 0x67, 0x64), // teal — agent accent
             turn_header_user: Color::Rgb(0x49, 0x5f, 0x4e),  // sage
             turn_rule: Color::Rgb(0xd4, 0xd4, 0xd2),
 
@@ -1542,11 +1542,11 @@ impl AgentTheme {
 
             selection_bg: Color::Rgb(0xe3, 0xe3, 0xe0), // Visual bg
             compose_separator: Color::Rgb(0x9a, 0x9a, 0x9a),
-            cursor: Color::Rgb(0x40, 0x5d, 0x72), // steel caret (was error-red)
+            cursor: Color::Rgb(0x40, 0x67, 0x64), // teal caret — agent accent
 
             sidebar_bg: Color::Rgb(0xeb, 0xea, 0xe7),
             sidebar_border: Color::Rgb(0xd4, 0xd4, 0xd2),
-            sidebar_header: Color::Rgb(0x40, 0x5d, 0x72), // steel
+            sidebar_header: Color::Rgb(0x40, 0x67, 0x64), // teal — "Subagents"/"Tasklist" headers
             warm_accent: Color::Rgb(0x40, 0x67, 0x64), // teal (cog section headings)
 
             jump_header: Color::Rgb(0xff, 0x6b, 0x6b),
