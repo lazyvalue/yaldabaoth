@@ -27,13 +27,28 @@ frontier 3: omega [open] (omega)
   `Workspace::display_label`; the selector is a compact yux-built card with
   structured header, selected/current/create states, fixed chrome, scrolling,
   and click dispatch.
-- `j30p` `verify-integrate`: claimed; focused and broad verification, mutation
-  proof, branch integration, and release build completed.
-- `ehsd` `omega`: pending final aggregate closure.
+- `j30p` `verify-integrate`: claimed → closed; output: focused and broad
+  verification, mutation proof, branch integration, release build, and worklog
+  completed while preserving the pre-existing user changes.
+- `ehsd` `omega`: claimed → closed; output: identity, aesthetics, interaction
+  parity, regression coverage, documentation, integration, and release build
+  are complete.
+
+### Notes
+
+- No Cog deviation or failure notes were recorded.
 
 ### Final status
 
-- Status: `in progress` (final Cog closure and worklog validation pending)
+- Status: `complete`
+
+```text
+graph polish-send-workspace-picker (frontiers)
+frontier 0: diagnose-contract [done]
+frontier 1: implement-picker [done]
+frontier 2: verify-integrate [done]
+frontier 3: omega [done] (omega)
+```
 
 ## Built (with status)
 
@@ -68,7 +83,9 @@ frontier 3: omega [open] (omega)
 - `cargo check --bin yalda-gpui`: passed.
 - `cargo build --release --bin yalda-gpui`: passed after merge.
 - `git diff --check`: passed.
-- Final post-merge picker guard and Cog worklog validation: pending.
+- Post-merge focused picker guards: 2 passed, 0 failed.
+- `scripts/check-cog-worklog.sh
+  docs/worklog/2026-08-19-workspace-picker-polish.md`: passed after omega.
 
 ## Next
 
