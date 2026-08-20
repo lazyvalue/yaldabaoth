@@ -1,7 +1,8 @@
 # Fix Codex stop and interruption loops
 
 **Date:** 2026-08-20
-**Branches touched:** `codex/fix-codex-stop-steering-loop` → `main`
+**Branches touched:** `codex/fix-codex-stop-steering-loop` (`778abf6`) →
+`main` (`ec0f6be`)
 
 ## Cog execution evidence
 
@@ -88,6 +89,9 @@ frontier 3: omega [done] (omega)
 - Mutation controls caught 3/3 GUI routing mutants and 10/10 expanded ACP
   capability/routing mutants.
 - `cargo build --release --bin yalda-gpui --bin yalda-session-server`: passed.
+- After merge, the exact GUI action-path guard, production subprocess wire-order
+  guard, both server actor guards, and both release builds passed from the actual
+  `main` checkout.
 - `git diff --check`: passed.
 - `scripts/check-cog-worklog.sh docs/worklog/2026-08-20-fix-codex-stop-steering-loop.md`
   passes.
