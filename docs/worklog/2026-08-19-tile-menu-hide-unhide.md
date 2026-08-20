@@ -1,8 +1,8 @@
 # Worklog: Tile menu Hide and Unhide
 
 **Date:** 2026-08-19
-**Branches touched:** `codex/tile-menu-hide-unhide` (`<pending>`), then `main`
-(`<pending>` merge)
+**Branches touched:** `codex/tile-menu-hide-unhide` (`37d8293`), then `main`
+(`612d635` merge)
 
 ## Cog execution evidence
 
@@ -23,10 +23,12 @@ frontier 2: omega [open] (omega)
   builders share one Hide/Unhide suffix, applicability comes from typed tile
   membership, UXI-Menu-6/-8 were reconciled, and UXI-Menu-9 plus real-path
   guards were added.
-- `0ol3` `verify-integrate`: claimed → pending close; output: focused and broad
-  tests, changed-diff mutation testing, isolated commit, merge, release rebuild,
-  and worklog finalization.
-- `ux56` `omega`: pending.
+- `0ol3` `verify-integrate`: claimed → closed; output: focused and broad tests,
+  changed-diff mutation testing, feature commit `37d8293`, merge `612d635`,
+  post-merge verification, and release rebuild all passed while preserving the
+  pre-existing user changes.
+- `ux56` `omega`: claimed → closed; output: the menu contract, implementation,
+  verification, integration, and release build are complete.
 
 ### Notes
 
@@ -39,13 +41,13 @@ frontier 2: omega [open] (omega)
 
 ### Final status
 
-- Status: `pending integration`
+- Status: `complete`
 
 ```text
 graph tile-menu-hide-unhide (frontiers)
 frontier 0: implement [done]
-frontier 1: verify-integrate [claimed]
-frontier 2: omega [open] (omega)
+frontier 1: verify-integrate [done]
+frontier 2: omega [done] (omega)
 ```
 
 ## Built (with status)
@@ -76,11 +78,13 @@ frontier 2: omega [open] (omega)
   steering tests filtered.
 - `cargo check --bin yalda-gpui --bin yalda-session-server`: passed.
 - Changed-diff mutations: 20 tested, 12 caught, 8 unviable, zero survivors.
+- Post-merge deterministic GUI suite: 655 passed, 0 failed, 2 ignored, 2
+  pre-existing steering tests filtered.
+- `cargo build --release --bin yalda-gpui --bin yalda-session-server`: passed.
 - `git diff --check`: passed.
 - `scripts/check-cog-worklog.sh
-  docs/worklog/2026-08-19-tile-menu-hide-unhide.md`: pending omega.
+  docs/worklog/2026-08-19-tile-menu-hide-unhide.md`: passed after omega.
 
 ## Next
 
-- Merge to `main`, rebuild the release GUI, close omega, and validate this
-  worklog.
+- Restart the GUI to load the rebuilt release executable.
