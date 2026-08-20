@@ -1521,3 +1521,43 @@ the production Folio selection style;
 against a standard navigation row; and
 `jump_panel_hidden_tiles_paint_indicator` hides a real attached tile and
 requires its dedicated painted marker.
+
+### UXI-JumpPanel-27 — Workspace ownership is a bounded blue group
+
+**Statement.** Every workspace in the jump panel reads as one flat, bounded
+group rather than a header followed by visually ambiguous loose rows:
+
+1. A subtle outline encloses the workspace header and every currently painted
+   attached tile row. Tile rows are inset inside that shared boundary; no row
+   outside the boundary can appear to belong to the workspace.
+2. The workspace header uses the same cool-blue semantic family as the
+   `DETACHED` heading. Its outline, identity, count, active rail, and quiet
+   active wash are derived only from that blue; warm brown/gold accents are not
+   workspace chrome.
+3. The header carries a compact attached-tile count. The count includes hidden
+   attached tiles because they remain members of the workspace.
+4. A collapsed workspace remains a self-contained compact outlined group. Its
+   tile rows disappear, but its name and membership count remain visible.
+5. `DETACHED` remains outside all workspace boundaries. It stays a flat sibling
+   collection so attachment is spatially unmistakable at a glance.
+6. The treatment must preserve fixed chrome typography, one-line ellipsis,
+   hidden markers, folding, selection, and direct tile activation.
+
+**Applies to.** `jump_panel_view.rs`: workspace-folder group, header, child body,
+and blue-derived style projection; `yux/detail.rs`: existing compact status and
+single-line identity primitives.
+
+**Why.** Indentation plus a hairline tree guide is too easy to lose in a long
+panel, especially when adjacent workspaces contain many similarly named Agent
+tiles. A restrained shared boundary makes ownership perceptual rather than
+something the user must infer from indentation, while blue preserves the flat
+Fulcrum vocabulary already established by `DETACHED`.
+
+**Status.** `implemented (headless)`.
+
+**Enforcement.** `jump_panel_workspace_group_bounds_make_membership_explicit`
+drives an expanded and collapsed workspace through the production paint path,
+requires the header and attached tile to sit inside one group boundary, and
+requires the collapsed group to retain its boundary and membership count while
+removing the child row. The style projection is checked under Folio to prove
+all structural workspace accents derive from the cool-blue subheader token.

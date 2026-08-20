@@ -9,7 +9,8 @@
 //!    domain-free building blocks (`multiline_text`, `kv_row`,
 //!    `section_heading`, `compact_tab`, `compact_count_indicator`,
 //!    `compact_list_group_heading`,
-//!    `single_line_ellipsis`, `compact_status_mark`, `context_menu_item`,
+//!    `single_line_ellipsis`, `compact_status_mark`, `compact_bounded_group`,
+//!    `context_menu_item`,
 //!    `picker_option_row`, `note_block`,
 //!    `fmt_iso_datetime`) that any surface composes from.
 //! 3. **Virtualized scroll surfaces** (`list`) — `ScrollAnchoredList`, the one

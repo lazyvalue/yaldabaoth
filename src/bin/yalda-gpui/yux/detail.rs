@@ -202,6 +202,47 @@ pub(crate) fn compact_status_mark(
         .child(SharedString::from(label.to_string()))
 }
 
+/// A flat bounded group for dense hierarchy surfaces. The caller owns the
+/// semantic header/body contents and colors; yux owns the shared outline,
+/// compact spacing, rounded clipping, and the separator that makes the body
+/// read as children of the header rather than as adjacent loose rows.
+pub(crate) fn compact_bounded_group(
+    id: impl Into<ElementId>,
+    header: AnyElement,
+    body: Option<AnyElement>,
+    outline: Hsla,
+    separator: Hsla,
+) -> gpui::Stateful<gpui::Div> {
+    let mut group = div()
+        .id(id)
+        .flex()
+        .flex_col()
+        .w_auto()
+        .min_w_0()
+        .mx_2()
+        .mt(px(4.0))
+        .mb(px(2.0))
+        .overflow_hidden()
+        .rounded(px(4.0))
+        .border_1()
+        .border_color(outline)
+        .child(header);
+    if let Some(body) = body {
+        group = group.child(
+            div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .px(px(3.0))
+                .py(px(2.0))
+                .border_t_1()
+                .border_color(separator)
+                .child(body),
+        );
+    }
+    group
+}
+
 /// A compact heading inside a dense list. The caller supplies the semantic
 /// glyph and tint; this primitive owns the shared uppercase label, count,
 /// trailing hairline, and spacing so repeated list groups read as one system.

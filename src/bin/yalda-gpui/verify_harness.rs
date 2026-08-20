@@ -8460,14 +8460,15 @@ fn jump_panel_active_workspace_keeps_folio_foreground(cx: &mut TestAppContext) {
     view.update(vcx, |v, cx| v.set_theme(crate::ThemeName::Folio, cx));
     vcx.run_until_parked();
 
-    let (style, foreground, pale_divider) = view.read_with(vcx, |v, _| {
+    let (style, foreground, pale_divider, workspace_blue) = view.read_with(vcx, |v, _| {
         let foreground = v.editor_fg();
         let pale_divider = crate::nc(v.theme.overlay.border);
-        let selected_bg = crate::nc(crate::jump_selection_color(&v.theme.overlay));
+        let workspace_blue = crate::nc(v.theme.agent.jump_subheader);
         (
-            crate::jump_workspace_row_style(true, foreground, pale_divider, selected_bg),
+            crate::jump_workspace_group_style(true, foreground, workspace_blue),
             foreground,
             pale_divider,
+            workspace_blue,
         )
     });
 
@@ -8480,9 +8481,28 @@ fn jump_panel_active_workspace_keeps_folio_foreground(cx: &mut TestAppContext) {
         "Folio's pale structural divider must never become label text"
     );
     assert!(
-        style.background.a > 0.0 && style.rail.a > 0.0,
-        "active state must remain visible through a neutral background and accent rail"
+        style.background.a > 0.0 && style.rail.a > 0.0 && style.outline.a > 0.0,
+        "active state must remain visible through a quiet background, accent rail, and outline"
     );
+    assert_eq!(
+        style.identity, workspace_blue,
+        "workspace identity must use the same cool blue semantic token as Detached"
+    );
+    assert_eq!(
+        style.rail, workspace_blue,
+        "the active rail must be blue rather than a theme's warm accent"
+    );
+    for (name, structural) in [
+        ("background", style.background),
+        ("outline", style.outline),
+        ("separator", style.separator),
+    ] {
+        assert_eq!(
+            (structural.h, structural.s, structural.l),
+            (workspace_blue.h, workspace_blue.s, workspace_blue.l),
+            "{name} must be an alpha-only derivation of workspace blue"
+        );
+    }
 }
 
 /// UXI-JumpPanel-26: a primary tile name is one line of navigation chrome.
@@ -8640,6 +8660,102 @@ fn jump_panel_hidden_tiles_paint_indicator(cx: &mut TestAppContext) {
     );
     crate::layout_probe_end();
 }
+
+/// UXI-JumpPanel-27: a workspace and its attached tiles paint as one bounded
+/// visual group. Folding removes the children without dissolving the workspace
+/// card, so membership remains readable in either state.
+#[gpui::test]
+fn jump_panel_workspace_group_bounds_make_membership_explicit(cx: &mut TestAppContext) {
+    use crate::{App, LinearTile};
+
+    let (view, vcx) = boot_browser(cx);
+    let (workspace, tile, fold_key) = view.update(vcx, |v, cx| {
+        let workspace = v.workspace.active_workspace;
+        let project = v.workspace.workspaces[workspace].project();
+        let project_name = v.projects.name_of(project).to_string();
+        let auto_name = v.workspace.workspaces[workspace].auto_name.clone();
+        let mut linear = LinearTile::new();
+        linear.title = "bounded member".into();
+        let tile = v
+            .workspace
+            .split_focused(crate::workspace::SplitDir::V, App::Linear(linear))
+            .expect("attached tile joins the current workspace");
+        v.workspace
+            .hide_window(tile)
+            .expect("hidden tile remains an attached workspace member");
+        let folder = v
+            .jump_panel_sections(cx)
+            .0
+            .into_iter()
+            .flat_map(|section| section.workspace_folders)
+            .find(|folder| folder.index == workspace)
+            .expect("workspace folder projects hidden members");
+        assert_eq!(folder.tiles.len(), 2, "visible and hidden tiles both count");
+        assert_eq!(
+            crate::jump_workspace_membership_label(folder.tiles.len()),
+            "2 tiles"
+        );
+        (
+            workspace,
+            tile,
+            YaldaGpuiView::workspace_fold_key(&project_name, &auto_name),
+        )
+    });
+
+    let measure = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        crate::layout_probe_begin();
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+        let group = crate::layout_probe_get(&format!("jump-workspace-group-{workspace}"))
+            .expect("workspace paints one shared group boundary");
+        let header = crate::layout_probe_get(&format!("jump-workspace-row-{workspace}"))
+            .expect("workspace header paints inside its group");
+        let count = crate::layout_probe_get(&format!("jump-workspace-count-{workspace}"))
+            .expect("workspace header paints its attached-tile count");
+        let child = crate::layout_probe_get(&format!("jump-tile-row-{tile}-ws{workspace}"));
+        crate::layout_probe_end();
+        (group, header, count, child)
+    };
+
+    let (group, header, count, child) = measure(&view, &mut *vcx);
+    let child = child.expect("expanded workspace paints its attached child");
+    let contains = |outer: (f32, f32, f32, f32), inner: (f32, f32, f32, f32)| {
+        inner.0 >= outer.0
+            && inner.1 >= outer.1
+            && inner.0 + inner.2 <= outer.0 + outer.2 + 0.5
+            && inner.1 + inner.3 <= outer.1 + outer.3 + 0.5
+    };
+    assert!(
+        contains(group, header),
+        "header must sit inside group: group={group:?} header={header:?}"
+    );
+    assert!(
+        contains(group, child),
+        "tile must sit inside group: group={group:?} child={child:?}"
+    );
+    assert!(
+        contains(header, count),
+        "membership count must sit inside header: header={header:?} count={count:?}"
+    );
+    assert!(
+        child.0 > group.0 && child.1 >= header.1 + header.3,
+        "attached tiles must read as inset children below the header: group={group:?} header={header:?} child={child:?}"
+    );
+
+    view.update(vcx, |v, cx| v.toggle_workspace_fold(&fold_key, cx));
+    let (folded_group, folded_header, folded_count, folded_child) = measure(&view, &mut *vcx);
+    assert!(
+        folded_child.is_none(),
+        "collapsed workspace hides attached rows"
+    );
+    assert!(contains(folded_group, folded_header));
+    assert!(contains(folded_header, folded_count));
+    assert!(
+        folded_group.3 < group.3,
+        "collapsed group contracts to its header: expanded={group:?} folded={folded_group:?}"
+    );
+}
+
 /// ADR-0034 / UXI-JumpPanel-25: hidden attachments remain under their owning
 /// workspace in both navigation surfaces. Selection presents them solo without
 /// changing membership; Unhide follows them back into the workspace.
