@@ -543,30 +543,61 @@ impl Detail {
     }
 }
 
-/// How a workspace arranges its tiles (`UXI-Workspace-14`). Two arrangements
-/// over the SAME set of tiles (the `Layout<C>` content tree):
-/// - `Plane` — the infinite signed-grid plane with the pan/semantic-zoom camera
-///   (every other `UXI-Workspace-*` describes it).
-/// - `Columns` — every tile laid out as an equal-width, full-height column,
-///   side by side in signed reading order. This is the default. Camera/pan/zoom/
-///   drag are irrelevant here; the tiles' plane slots are left untouched so
-///   toggling back to `Plane` restores the exact arrangement.
+/// How a workspace arranges its tiles (`UXI-Workspace-14`, `UXI-Workspace-26`).
+/// Four values over the SAME set of tiles (the `Layout<C>` content tree), of
+/// which THREE are user-selectable arrangements:
+/// - `Columns` — every tile is an equal-width, full-height column, side by side
+///   in signed reading order. The default.
+/// - `Tiling` — dwm-style master/stack: the first `master_count` tiles fill
+///   `master_ratio` of the width on the left (the master area); the remaining
+///   tiles stack as equal columns on the right.
+/// - `Monocle` — only the focused tile renders, filling the whole region; the
+///   others are present (never moved or closed) but not painted.
+/// - `Plane` — the infinite signed-grid plane with the pan/semantic-zoom camera.
+///   **Retired from the UI** (`going to retire that for now`): no menu selects it
+///   and persisted `"plane"` loads as `Columns`. The variant + `render_desktop`
+///   path are kept so the arrangement can be reinstated later without a data
+///   migration.
 ///
 /// This is a pure VIEW choice — like the camera it never moves or removes a
-/// tile, so switching back and forth is lossless.
+/// tile, so switching arrangements is lossless.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WorkspaceView {
     Plane,
     #[default]
     Columns,
+    Tiling,
+    Monocle,
 }
 
-/// Serialize as `"plane" | "columns"`.
+impl WorkspaceView {
+    /// The three UI-selectable arrangements, in cycle order. `Plane` is retired
+    /// and excluded.
+    pub const CYCLE: [WorkspaceView; 3] = [
+        WorkspaceView::Columns,
+        WorkspaceView::Tiling,
+        WorkspaceView::Monocle,
+    ];
+
+    /// The next arrangement in `CYCLE`, wrapping. A retired `Plane` cycles into
+    /// the first UI arrangement.
+    pub fn next(self) -> WorkspaceView {
+        match self {
+            WorkspaceView::Columns => WorkspaceView::Tiling,
+            WorkspaceView::Tiling => WorkspaceView::Monocle,
+            WorkspaceView::Monocle | WorkspaceView::Plane => WorkspaceView::Columns,
+        }
+    }
+}
+
+/// Serialize as `"plane" | "columns" | "tiling" | "monocle"`.
 impl serde::Serialize for WorkspaceView {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(match self {
             WorkspaceView::Plane => "plane",
             WorkspaceView::Columns => "columns",
+            WorkspaceView::Tiling => "tiling",
+            WorkspaceView::Monocle => "monocle",
         })
     }
 }
@@ -574,13 +605,16 @@ impl serde::Serialize for WorkspaceView {
 /// Hand-rolled deserialize with an unknown-string fallback to `Columns` — the SAME
 /// safety `Detail`/`LayoutMode` use: an arrangement value from a newer binary
 /// degrades to the default rather than failing the parse and dropping the whole
-/// workspace snapshot.
+/// workspace snapshot. Persisted `"plane"` is force-mapped to `Columns` because
+/// the Plane arrangement is retired from the UI (`UXI-Workspace-26`).
 impl<'de> serde::Deserialize<'de> for WorkspaceView {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
         Ok(match s.as_str() {
-            "plane" => WorkspaceView::Plane,
-            // "columns" and any string from the future use the current default.
+            "tiling" => WorkspaceView::Tiling,
+            "monocle" => WorkspaceView::Monocle,
+            // "columns", the retired "plane", and any future string all resolve
+            // to the current default arrangement.
             _ => WorkspaceView::Columns,
         })
     }
@@ -1559,20 +1593,28 @@ impl<C> Workspace<C> {
         }
     }
 
-    /// Toggle this workspace's tile arrangement between `Plane` and `Columns`
-    /// (`UXI-Workspace-14`). Pure view flip — no tile is moved or removed.
-    /// Caller is responsible for `cx.notify()` + persist.
+    /// Cycle this workspace's tile arrangement through the UI-selectable modes
+    /// Columns → Tiling → Monocle → Columns (`UXI-Workspace-26`). Pure view flip
+    /// — no tile is moved or removed. Caller does `cx.notify()` + persist.
     pub fn toggle_view(&mut self) {
-        self.view = match self.view {
-            WorkspaceView::Plane => WorkspaceView::Columns,
-            WorkspaceView::Columns => WorkspaceView::Plane,
-        };
+        self.view = self.view.next();
     }
 
-    /// Adjust the Columns master-area ratio, clamped to the product bounds.
-    /// Returns whether persisted state changed; Plane is a strict no-op.
+    /// Set this workspace's tile arrangement directly (`UXI-Workspace-26`).
+    /// Returns whether it changed. Pure view choice — lossless.
+    pub fn set_view(&mut self, view: WorkspaceView) -> bool {
+        if self.view == view {
+            return false;
+        }
+        self.view = view;
+        true
+    }
+
+    /// Adjust the Tiling master-area ratio, clamped to the product bounds.
+    /// Returns whether persisted state changed; every non-Tiling view is a
+    /// strict no-op (only Tiling has a master area).
     pub fn adjust_master_ratio(&mut self, delta: f32) -> bool {
-        if self.view != WorkspaceView::Columns {
+        if self.view != WorkspaceView::Tiling {
             return false;
         }
         let next = (self.master_ratio.clamp(0.20, 0.80) + delta).clamp(0.20, 0.80);
@@ -1583,9 +1625,9 @@ impl<C> Workspace<C> {
         true
     }
 
-    /// Add one tile to the Columns master area, bounded by the live tile count.
+    /// Add one tile to the Tiling master area, bounded by the live tile count.
     pub fn increase_master_count(&mut self) -> bool {
-        if self.view != WorkspaceView::Columns {
+        if self.view != WorkspaceView::Tiling {
             return false;
         }
         let tile_count = self.layout.leaf_ids().len().max(1);
@@ -1601,9 +1643,9 @@ impl<C> Workspace<C> {
         true
     }
 
-    /// Remove one tile from the Columns master area, retaining at least one.
+    /// Remove one tile from the Tiling master area, retaining at least one.
     pub fn decrease_master_count(&mut self) -> bool {
-        if self.view != WorkspaceView::Columns {
+        if self.view != WorkspaceView::Tiling {
             return false;
         }
         let tile_count = self.layout.leaf_ids().len().max(1);
@@ -1621,17 +1663,22 @@ impl<C> Workspace<C> {
 
     /// Resolve the visible placement target for a directional swap
     /// (`UXI-Workspace-15`). Plane uses the same spatial resolver as lower-case
-    /// focus motion. Columns has only visible left/right adjacency; up/down is
-    /// deliberately a no-op rather than consulting hidden plane geometry.
+    /// focus motion. Columns/Tiling have only visible left/right adjacency; up/down
+    /// is deliberately a no-op rather than consulting hidden plane geometry.
+    /// Monocle paints a single tile, so it has no directional neighbor.
     pub fn placement_target(&self, dir: FocusDir) -> Option<WindowId> {
         match (self.view, dir) {
-            (WorkspaceView::Columns, FocusDir::Left) => {
+            (WorkspaceView::Columns | WorkspaceView::Tiling, FocusDir::Left) => {
                 self.desktop.sequence_adjacent(self.focused, false)
             }
-            (WorkspaceView::Columns, FocusDir::Right) => {
+            (WorkspaceView::Columns | WorkspaceView::Tiling, FocusDir::Right) => {
                 self.desktop.sequence_adjacent(self.focused, true)
             }
-            (WorkspaceView::Columns, FocusDir::Up | FocusDir::Down) => None,
+            (
+                WorkspaceView::Columns | WorkspaceView::Tiling,
+                FocusDir::Up | FocusDir::Down,
+            ) => None,
+            (WorkspaceView::Monocle, _) => None,
             (WorkspaceView::Plane, dir) => {
                 let spatial = match dir {
                     FocusDir::Left => SpatialDir::Left,
@@ -4927,12 +4974,14 @@ mod tests {
     }
 
     #[test]
-    fn columns_master_controls_clamp_and_plane_is_unchanged() {
+    fn tiling_master_controls_clamp_and_other_views_unchanged() {
+        // UXI-Workspace-26: the master area belongs to Tiling. Columns, Monocle,
+        // and Plane leave the master ratio/count untouched.
         let mut frame = Frame::with_initial(TestContent("a"), ProjectId(0));
         frame.split_focused(SplitDir::V, TestContent("b")).unwrap();
         frame.split_focused(SplitDir::V, TestContent("c")).unwrap();
         let wsp = frame.active_workspace_mut().unwrap();
-        wsp.view = WorkspaceView::Columns;
+        wsp.view = WorkspaceView::Tiling;
 
         for _ in 0..20 {
             wsp.adjust_master_ratio(0.05);
@@ -4947,10 +4996,16 @@ mod tests {
         assert_eq!(wsp.master_ratio, 0.2);
         assert_eq!(wsp.master_count, 1);
 
-        wsp.view = WorkspaceView::Plane;
-        let before = (wsp.master_ratio, wsp.master_count);
-        assert!(!wsp.adjust_master_ratio(0.05));
-        assert!(!wsp.increase_master_count());
-        assert_eq!((wsp.master_ratio, wsp.master_count), before);
+        for other in [
+            WorkspaceView::Columns,
+            WorkspaceView::Monocle,
+            WorkspaceView::Plane,
+        ] {
+            wsp.view = other;
+            let before = (wsp.master_ratio, wsp.master_count);
+            assert!(!wsp.adjust_master_ratio(0.05), "{other:?} ratio is a no-op");
+            assert!(!wsp.increase_master_count(), "{other:?} count is a no-op");
+            assert_eq!((wsp.master_ratio, wsp.master_count), before);
+        }
     }
 }

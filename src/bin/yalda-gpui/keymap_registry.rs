@@ -146,7 +146,7 @@ const DEFAULT_BINDINGS: &[DefaultBinding] = &[
     b!("ctrl-w -",          "ZoomOutWorkspace",   GLOBAL, "Plane", "Zoom the plane out"),
     b!("ctrl-w =",          "ZoomInWorkspace",    GLOBAL, "Plane", "Zoom the plane in"),
     b!("ctrl-w 0",          "ResetWorkspaceView", GLOBAL, "Plane", "Reset plane view to origin"),
-    b!("ctrl-w a",          "ToggleWorkspaceColumns", GLOBAL, "Plane", "Toggle plane / columns arrangement"),
+    b!("ctrl-w a",          "ToggleWorkspaceColumns", GLOBAL, "Layout", "Cycle layout: columns / tiling / monocle"),
     b!("ctrl-w p",          "DesktopTileSize", GLOBAL, "Plane", "Set desktop tile size"),
     b!("ctrl-w t",          "TagViewChord",    GLOBAL, "Layout", "Tag: view by tag"),
     b!("ctrl-w ctrl-t",     "TagToggleChord",  GLOBAL, "Layout", "Tag: toggle tag on tile"),

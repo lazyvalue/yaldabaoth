@@ -1677,11 +1677,6 @@ fn gpui_menu() -> Vec<MenuNode> {
                 MenuNode::entry("k", "keybindings", "new-keymap-tile"),
             ],
         ),
-        MenuNode::entry("X", "close tile", "close-window"),
-        // One placement command for every tile membership state. `follow: true`
-        // is important for a Detached tile: once attached it leaves the Detached
-        // surface, so following keeps the result visible.
-        MenuNode::entry("m", "send tile to workspace", "send-tile-follow"),
         MenuNode::submenu(
             "t",
             "theme",
@@ -1691,19 +1686,26 @@ fn gpui_menu() -> Vec<MenuNode> {
             ],
         ),
         MenuNode::entry("j", "toggle jump panel", "toggle-jump-panel"),
-        // System / dev — formerly split between `.` (rebuild) and `?` (console).
+        // Layout modes (UXI-Workspace-26) — the arrangement of the active
+        // workspace's tiles. Plane is retired; the master-area controls apply to
+        // Tiling only.
         MenuNode::submenu(
-            "s",
-            "system",
+            "l",
+            "layout",
             vec![
-                MenuNode::entry("r", "rebuild and restart gui", "dev-restart-gui"),
-                MenuNode::entry("R", "rebuild and restart all", "dev-restart-all"),
-                MenuNode::entry("`", "system console", "open-system-console"),
+                MenuNode::entry("c", "columns", "layout-columns"),
+                MenuNode::entry("t", "tiling", "layout-tiling"),
+                MenuNode::entry("m", "monocle", "layout-monocle"),
+                MenuNode::separator(),
+                MenuNode::entry("f", "grow master area", "master-grow"),
+                MenuNode::entry("F", "shrink master area", "master-shrink"),
+                MenuNode::entry("n", "increase master count", "master-count-increase"),
+                MenuNode::entry("N", "decrease master count", "master-count-decrease"),
             ],
         ),
-        // Workspace + project ops — formerly scattered across the shell root.
-        // The root stays learnably small; deeper workspace vocabulary remains
-        // reachable here without deleting its existing command handlers.
+        // Workspace + project ops. The root stays learnably small; tile-scoped
+        // verbs (close, send, hide/unhide, detach) now live on the `<space>` tile
+        // menu instead.
         MenuNode::submenu(
             "w",
             "workspace",
@@ -1711,35 +1713,14 @@ fn gpui_menu() -> Vec<MenuNode> {
                 MenuNode::entry("n", "new workspace", "new-workspace"),
                 MenuNode::entry("r", "rename workspace", "rename-workspace"),
                 MenuNode::entry("x", "close workspace", "close-workspace"),
-                MenuNode::entry("c", "set cwd", "workspace-set-cwd"),
                 MenuNode::entry("p", "new project", "new-project"),
                 MenuNode::entry("b", "back and forth", "workspace-back-and-forth"),
-                MenuNode::entry("o", "also show document", "also-show-tile"),
-                MenuNode::entry("d", "detach tile", "tile-detach"),
-                MenuNode::entry("h", "hide tile", "tile-hide"),
-                MenuNode::entry("H", "unhide tile", "tile-unhide"),
-                MenuNode::entry("a", "toggle plane / columns", "workspace-toggle-columns"),
-                MenuNode::submenu(
-                    "l",
-                    "plane view",
-                    vec![
-                        MenuNode::entry("=", "zoom in", "plane-zoom-in"),
-                        MenuNode::entry("-", "zoom out", "plane-zoom-out"),
-                        MenuNode::entry("0", "reset to origin", "plane-reset-view"),
-                    ],
-                ),
-                MenuNode::submenu(
-                    "m",
-                    "columns master area",
-                    vec![
-                        MenuNode::entry("f", "grow master area", "master-grow"),
-                        MenuNode::entry("F", "shrink master area", "master-shrink"),
-                        MenuNode::entry("n", "increase master count", "master-count-increase"),
-                        MenuNode::entry("N", "decrease master count", "master-count-decrease"),
-                    ],
-                ),
             ],
         ),
+        // System / dev — flattened up from the former `s` submenu to the root.
+        MenuNode::entry("r", "rebuild and restart gui", "dev-restart-gui"),
+        MenuNode::entry("R", "rebuild and restart all", "dev-restart-all"),
+        MenuNode::entry("`", "system console", "open-system-console"),
     ]
 }
 
@@ -1751,14 +1732,30 @@ fn gpui_menu() -> Vec<MenuNode> {
 // motions (links/headings/list-items/code-blocks) have real dispatch handlers
 // and leave for direct nav keys in T2.
 
-/// Visibility is a property of the focused tile shell, so these commands are
-/// appended uniformly to every App-specific menu. Keeping the entries in one
-/// builder prevents a new App kind from silently inventing different keys or
-/// command names (UXI-Menu-9).
-fn with_tile_visibility_commands(mut menu: Vec<MenuNode>) -> Vec<MenuNode> {
+/// The shared **tile menu** tail appended to every App-specific `<space>` menu
+/// (UXI-Menu-9). These verbs act on the tile shell regardless of its App, so
+/// keeping them in one builder prevents a new App kind from inventing different
+/// keys or command names. Three groups:
+///
+/// - **Always present:** send to workspace, close, tag.
+/// - **In-a-workspace (attached):** hide, unhide, detach — present but
+///   contextually dimmed (`tile_menu_disabled`) when the focused tile is not
+///   attached to a workspace.
+/// - **Agent-only:** archive — appended only when `include_archive` is true (the
+///   Agent tile), since archiving is a session concept.
+///
+/// Keys are chosen to not collide with any App root (UXI-Menu-7): `p` send,
+/// `X` close, `t` tag, `h` hide, `u` unhide, `f` detach (`a` archive is appended
+/// by the Agent menu only).
+fn with_tile_commands(mut menu: Vec<MenuNode>) -> Vec<MenuNode> {
+    menu.push(MenuNode::separator());
+    menu.push(MenuNode::entry("p", "send to workspace", "send-tile-follow"));
+    menu.push(MenuNode::entry("X", "close", "close-window"));
+    menu.push(MenuNode::entry("t", "tag", "tile-tag"));
     menu.push(MenuNode::separator());
     menu.push(MenuNode::entry("h", "hide", "tile-hide"));
-    menu.push(MenuNode::entry("H", "unhide", "tile-unhide"));
+    menu.push(MenuNode::entry("u", "unhide", "tile-unhide"));
+    menu.push(MenuNode::entry("f", "detach tile", "tile-detach"));
     menu
 }
 
@@ -1766,7 +1763,7 @@ fn doc_local_menu() -> Vec<MenuNode> {
     // Verbs on the focused document. (`b` file-browser dropped — Cmd-O already
     // opens it. The `n`/`g` submenus are motions; they stay only until T2 gives
     // them direct nav keys — ADR-0032.)
-    with_tile_visibility_commands(vec![
+    with_tile_commands(vec![
         MenuNode::entry("e", "edit (raw markdown)", "enter-edit"),
         MenuNode::entry("w", "edit (word processor)", "enter-wp"),
         MenuNode::entry("r", "reload from disk", "reload-file"),
@@ -1796,7 +1793,7 @@ fn doc_local_menu() -> Vec<MenuNode> {
 }
 
 fn edit_local_menu() -> Vec<MenuNode> {
-    with_tile_visibility_commands(vec![
+    with_tile_commands(vec![
         MenuNode::entry("v", "back to doc view", "back-to-doc"),
         MenuNode::entry("w", "toggle code/word-processor", "wp-toggle"),
         MenuNode::entry("r", "reload from disk", "reload-file"),
@@ -1822,7 +1819,7 @@ fn agent_local_menu() -> Vec<MenuNode> {
     // UXI-Menu-8: the Agent root is deliberately exact and small. Commands
     // removed from this tree retain their handlers; they are simply not part of
     // the normal Agent command surface.
-    with_tile_visibility_commands(vec![
+    let mut menu = with_tile_commands(vec![
         MenuNode::entry("w", "switch worksheet ⇄ message box", "agent-input-toggle"),
         MenuNode::submenu(
             "m",
@@ -1839,11 +1836,17 @@ fn agent_local_menu() -> Vec<MenuNode> {
                 MenuNode::entry("t", "tasks", "agent-view-tasks"),
             ],
         ),
-    ])
+    ]);
+    // Agent-only: archiving is a session concept, so it is present only on the
+    // Agent tile menu (UXI-Menu-9). Contextually dimmed when the session lacks a
+    // stable server id (`tile_menu_disabled`).
+    menu.push(MenuNode::separator());
+    menu.push(MenuNode::entry("a", "archive", "archive-session"));
+    menu
 }
 
 fn linear_local_menu() -> Vec<MenuNode> {
-    with_tile_visibility_commands(vec![
+    with_tile_commands(vec![
         MenuNode::entry("i", "edit query", "linear-edit"),
         MenuNode::entry("o", "open in browser", "linear-open-url"),
         MenuNode::entry("y", "copy URL", "linear-copy-url"),
@@ -1851,14 +1854,14 @@ fn linear_local_menu() -> Vec<MenuNode> {
 }
 
 fn cog_local_menu() -> Vec<MenuNode> {
-    with_tile_visibility_commands(vec![
+    with_tile_commands(vec![
         MenuNode::entry("g", "back to graph list", "cog-graphs"),
         MenuNode::entry("r", "refresh", "cog-refresh"),
     ])
 }
 
 fn keymap_local_menu() -> Vec<MenuNode> {
-    with_tile_visibility_commands(vec![
+    with_tile_commands(vec![
         MenuNode::entry("i", "filter", "keymap-filter"),
         MenuNode::entry("r", "rebind selected", "keymap-rebind"),
         MenuNode::entry("x", "reset selected", "keymap-reset"),
@@ -1867,7 +1870,7 @@ fn keymap_local_menu() -> Vec<MenuNode> {
 }
 
 fn browser_local_menu() -> Vec<MenuNode> {
-    with_tile_visibility_commands(vec![
+    with_tile_commands(vec![
         MenuNode::entry("s", "cycle sort", "browser-sort"),
         MenuNode::entry(".", "toggle hidden files", "browser-hidden"),
         MenuNode::entry("-", "go up", "browser-up"),
@@ -4808,9 +4811,9 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
-    /// `Ctrl-W a` (and the `.` workspace menu) — toggle the active workspace's
-    /// tile arrangement between the infinite plane and equal-width columns
-    /// (`UXI-Workspace-14`). Pure view flip: no tile moves, so switching back is
+    /// `Ctrl-W a` — cycle the active workspace's tile arrangement through the
+    /// UI-selectable layout modes Columns → Tiling → Monocle → Columns
+    /// (`UXI-Workspace-26`). Pure view flip: no tile moves, so switching is
     /// lossless. Persists so the arrangement survives a round-trip.
     fn toggle_workspace_columns(
         &mut self,
@@ -4822,6 +4825,23 @@ impl YaldaGpuiView {
         self.workspace.workspaces[workspace_idx].toggle_view();
         self.save_workspace_state();
         cx.notify();
+    }
+
+    /// Set the active workspace's layout mode directly (`UXI-Workspace-26`), from
+    /// the `.` layout menu. Pure view choice — lossless; persists.
+    fn set_active_workspace_view(
+        &mut self,
+        view: workspace::WorkspaceView,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .workspace
+            .active_workspace_mut()
+            .is_some_and(|wsp| wsp.set_view(view))
+        {
+            self.save_workspace_state();
+            cx.notify();
+        }
     }
 
     // ---- Layout patterns (spec-layout-patterns.md) -------------------------
@@ -5451,12 +5471,12 @@ impl YaldaGpuiView {
         menu
     }
 
-    /// Applicability for the shared tile-visibility commands. Unhide is enabled
-    /// only while a hidden attachment is being presented solo; the ordinary
-    /// visible and Detached cases keep it present but dimmed. Hide is the exact
-    /// inverse and is unavailable when the focused tile is already hidden or
-    /// has no workspace attachment.
-    fn tile_visibility_menu_disabled(&self) -> HashSet<String> {
+    /// Applicability for the shared tile-menu commands (UXI-Menu-9). Send/close/
+    /// tag are always enabled. The in-a-workspace verbs dim when the focused tile
+    /// is not attached: Hide needs attached-visible, Unhide needs attached-hidden,
+    /// Detach needs any attachment. Archive (Agent tiles) dims when the focused
+    /// session has no stable server id yet.
+    fn tile_menu_disabled(&self) -> HashSet<String> {
         let membership = self
             .workspace
             .focused_window_id()
@@ -5478,7 +5498,12 @@ impl YaldaGpuiView {
             Some(workspace::TileMembership::Detached) | None => {
                 disabled.insert("tile-hide".to_string());
                 disabled.insert("tile-unhide".to_string());
+                // Detach is meaningless without a workspace attachment.
+                disabled.insert("tile-detach".to_string());
             }
+        }
+        if self.active_server_session_id().is_none() {
+            disabled.insert("archive-session".to_string());
         }
         disabled
     }
@@ -5490,7 +5515,7 @@ impl YaldaGpuiView {
         let Some(opened_from) = self.workspace.focused_window_id() else {
             return;
         };
-        let disabled = self.tile_visibility_menu_disabled();
+        let disabled = self.tile_menu_disabled();
         let (menu, header) = match self.workspace.focused_content() {
             Some(App::Buffer(BufferApp::Viewing(_))) => (doc_local_menu(), "DOC"),
             Some(App::Buffer(BufferApp::Editing(_))) => (edit_local_menu(), "EDIT"),
@@ -5712,6 +5737,15 @@ impl YaldaGpuiView {
             "claude-clear" => self.clear_agent_session(cx),
             "claude-rename" => self.open_rename_overlay(cx),
             "claude-tag" => self.open_tag_editor(cx),
+            // Shared tile-menu "tag" verb: an Agent tile edits its session tags
+            // (the two-column editor); any other tile tags its buffer.
+            "tile-tag" => {
+                if matches!(self.workspace.focused_content(), Some(App::Agent(_))) {
+                    self.open_tag_editor(cx);
+                } else {
+                    self.open_tag_input(TagInputMode::Tag, cx);
+                }
+            }
             "archive-session" => self.set_focused_session_archived(true, cx),
             "unarchive-session" => self.set_focused_session_archived(false, cx),
             "claude-cd" => self.open_change_agent_cwd_overlay(cx),
@@ -5880,6 +5914,17 @@ impl YaldaGpuiView {
                     self.save_workspace_state();
                     cx.notify();
                 }
+            }
+            // Layout modes (UXI-Workspace-26): set the active workspace's tile
+            // arrangement directly. Pure view choice — lossless.
+            "layout-columns" => {
+                self.set_active_workspace_view(workspace::WorkspaceView::Columns, cx)
+            }
+            "layout-tiling" => {
+                self.set_active_workspace_view(workspace::WorkspaceView::Tiling, cx)
+            }
+            "layout-monocle" => {
+                self.set_active_workspace_view(workspace::WorkspaceView::Monocle, cx)
             }
             // Plane view (spec-infinite-plane-workspace.md). Routed through the
             // same camera ops as the `Ctrl-W -/=/0` bindings.

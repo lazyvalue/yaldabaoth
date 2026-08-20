@@ -253,65 +253,90 @@ level's keys are unique.
 
 ### UXI-Menu-8 — the Agent and shell roots are deliberately small
 
-**Statement.** The Agent tile menu (`space`) contains exactly seven dispatchable
-root entries, in this order: `w` switch worksheet/chatbox, `m` switch model, `s`
-select session, `c` clear, `v` view, then the shared `h` Hide and `H` Unhide
-entries after a separator. The View submenu contains only `a` Agents and `t`
-Tasks; choosing one shows that sidepanel view and marks the currently visible
-choice. Advertised model choices use `1..9,0` so changing provider model names
-cannot create key collisions.
+> **Amended (menu restructure).** The shell root no longer holds tile verbs
+> (Close, Send) — those moved to the tile menu (`UXI-Menu-9`). It gained a
+> `layout` submenu (`UXI-Workspace-26`) and flattened the former `system`
+> submenu to the root. The Agent root gained the shared tile-menu tail + an
+> Agent-only Archive.
 
-The shell menu (`.`) contains exactly seven root entries, in this order: `n` New
-Tile, `X` Close Tile, `m` Send Tile to Workspace, `t` Theme, `j` Toggle Jump
-Panel, `s` System, and `w` Workspace. Send Tile always opens the same destination
-picker for a bound or unbound focused tile. Commands removed from these roots are
-not deleted; they may remain available through direct keys or another explicit
-surface.
+**Statement.** The Agent tile menu (`space`) leads with exactly five App-specific
+root entries, in this order: `w` switch worksheet/chatbox, `m` switch model, `s`
+select session, `c` clear, `v` view — followed by the shared tile-menu tail
+(`UXI-Menu-9`): `p` Send to Workspace, `X` Close, `t` Tag, then `h` Hide, `u`
+Unhide, `f` Detach, and finally the Agent-only `a` Archive. The View submenu
+contains only `a` Agents and `t` Tasks; choosing one shows that sidepanel view
+and marks the currently visible choice. Advertised model choices use `1..9,0` so
+changing provider model names cannot create key collisions.
+
+The shell menu (`.`) contains these root entries, in this order: `n` New Tile,
+`t` Theme, `j` Toggle Jump Panel, `l` Layout, `w` Workspace, `r` Rebuild and
+Restart GUI, `R` Rebuild and Restart All, and `` ` `` System Console. The Layout
+submenu carries the three arrangement modes (`c` columns, `t` tiling, `m`
+monocle) plus the master-area adjustments; the Workspace submenu holds new /
+rename / close workspace, new project, and back-and-forth. Commands removed from
+these roots are not deleted; tile verbs live on the tile menu, and retired ones
+(plane view, set cwd, also-show) are simply gone.
 
 Buffer and other App-specific tile menus are unchanged until their vocabularies
 are separately specified, except that every tile menu carries the same shared
-Hide and Unhide suffix required by UXI-Menu-9.
+tile-menu tail required by UXI-Menu-9.
 
 **Applies to.** `agent_local_menu`, `agent_local_menu_dynamic`, `gpui_menu`,
-`dispatch_menu_command`, and `open_workspace_picker` (`main.rs`).
+`with_tile_commands`, `dispatch_menu_command`, and `open_workspace_picker`
+(`main.rs`).
 
 **Why.** A leader menu is useful only when its choices are predictable enough to
-learn. The previous roots mixed motions, session lifecycle, layout tuning, and
-one-off commands, obscuring the small set of operations used in normal work.
+learn. Splitting by object — tile verbs on the tile menu, shell/appearance/layout
+on the shell menu — keeps each root small and stops the shell root from mixing
+tile lifecycle with workspace and system operations.
 
 **Status.** `implemented`
 
-**Enforcement.** `tests.rs::shell_menu_root_is_the_approved_seven_items` and
+**Enforcement.** `tests.rs::shell_menu_root_is_the_approved_items` and
 `tests.rs::agent_menu_root_and_view_are_the_approved_items` assert exact trees and
-keys; `verify_harness.rs::agent_menu_lists_advertised_models_and_marks_current`
+keys; `tests.rs::shell_layout_submenu_selects_modes` covers the layout submenu;
+`verify_harness.rs::agent_menu_lists_advertised_models_and_marks_current`
 checks the live model submenu; workspace-picker harness tests exercise the real
 bound and unbound send path.
 
-### UXI-Menu-9 — tile visibility commands are universal and contextual
+### UXI-Menu-9 — the tile menu tail is universal and contextual
 
-**Statement.** Every tile-specific menu (`space`) ends with `h` Hide and `H`
-Unhide, separated from its App-specific entries. The command names are always
-present so the menu remains learnable. Unhide is enabled only when the focused
-tile is an attached-hidden tile being presented solo; in every other state it is
-dimmed and does not dispatch. Hide is enabled only for an attached-visible tile;
-for an attached-hidden or Detached tile it is dimmed and does not dispatch.
+**Statement.** Every tile-specific menu (`space`) ends with the shared **tile
+menu** commands, appended after a separator, in three groups:
 
-**Applies to.** All `*_local_menu()` builders,
-`with_tile_visibility_commands`, `tile_visibility_menu_disabled`,
-`open_local_menu_inner`, and disabled-command handling (`main.rs`).
+- **Always present + enabled:** `p` Send to Workspace (`send-tile-follow`), `X`
+  Close (`close-window`), `t` Tag (`tile-tag` — the session tag editor on an
+  Agent tile, the buffer tag input elsewhere).
+- **In-a-workspace (attached):** `h` Hide, `u` Unhide, `f` Detach. Always present
+  so the menu stays learnable, but **contextually dimmed** by membership (the
+  established never-a-fake-success pattern): Hide needs attached-visible, Unhide
+  needs attached-hidden, Detach needs any attachment; a Detached/unbound tile
+  dims all three.
+- **Agent-only:** `a` Archive (`archive-session`) — appended to the Agent tile
+  menu alone, since archiving is a session concept. Dimmed when the focused
+  session has no stable server id yet.
 
-**Why.** Visibility is a property of the tile regardless of its App. Keeping the
-same two commands at the same location makes hide/unhide discoverable without
-allowing an invalid state transition to masquerade as a successful command.
+The tail keys never collide with any App root (`UXI-Menu-7`). A dimmed key
+neither dispatches nor closes the menu.
+
+**Applies to.** All `*_local_menu()` builders, `with_tile_commands`,
+`tile_menu_disabled`, `open_local_menu_inner`, the `tile-tag` /
+`archive-session` dispatch, and disabled-command handling (`main.rs`).
+
+**Why.** These verbs act on the tile shell regardless of its App, so they belong
+in one shared, always-in-the-same-place block. Keeping the names present while
+dimming the inapplicable ones makes them discoverable without letting an invalid
+transition masquerade as a successful command.
 
 **Status.** `implemented`
 
-**Enforcement.** `tests.rs::every_tile_menu_has_shared_visibility_commands`
-asserts the exact shared suffix for every App menu. The real-path GUI guard
+**Enforcement.** `tests.rs::every_tile_menu_has_shared_tile_commands` asserts the
+shared send/close/tag/hide/unhide/detach commands (and Agent-only archive) for
+every App menu. The real-path GUI guard
 `verify_harness.rs::tile_menu_hide_unhide_enablement_tracks_focused_membership`
 opens the production tile menu, verifies applicability across visible, hidden,
-and Detached membership, and proves a disabled key neither dispatches nor
-closes the menu.
+and Detached membership (including Detach dimming), and proves a disabled key
+neither dispatches nor closes the menu.
 
 ## Deviations from the design brief (Fable, "The Sigil Card")
 

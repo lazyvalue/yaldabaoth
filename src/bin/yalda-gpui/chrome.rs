@@ -166,9 +166,16 @@ impl YaldaGpuiView {
         // the workspace interior (infinite-plane, Stage D); columns is a pure
         // view over the same content tree, leaving the plane slots untouched.
         let content = match self.workspace.workspaces[workspace_idx].view {
-            workspace::WorkspaceView::Columns => {
-                self.render_columns(root, layout, focused_id, attach_focus, rail_focusable, cx)
+            // Columns: equal-width columns (no master area). Tiling: dwm-style
+            // master/stack. Both share `render_columns`; `use_master` selects.
+            workspace::WorkspaceView::Columns => self
+                .render_columns(root, layout, focused_id, attach_focus, rail_focusable, false, cx),
+            workspace::WorkspaceView::Tiling => self
+                .render_columns(root, layout, focused_id, attach_focus, rail_focusable, true, cx),
+            workspace::WorkspaceView::Monocle => {
+                self.render_monocle(root, layout, focused_id, attach_focus, rail_focusable, cx)
             }
+            // Retired from the UI (`UXI-Workspace-26`) but the render path is kept.
             workspace::WorkspaceView::Plane => {
                 self.render_desktop(root, layout, focused_id, attach_focus, rail_focusable, cx)
             }
@@ -195,6 +202,7 @@ impl YaldaGpuiView {
         focused_id: workspace::WindowId,
         attach_focus: bool,
         rail_focusable: bool,
+        use_master: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let workspace_idx = self.workspace.active_workspace;
@@ -245,7 +253,14 @@ impl YaldaGpuiView {
             .overflow_hidden();
 
         let tile_count = order.len();
-        let master_count = wsp.master_count.clamp(1, tile_count.max(1));
+        // Columns (`use_master == false`) forces every tile into the master area
+        // so they lay out equal-width with no stack. Tiling honors `master_count`
+        // to keep the dwm master area on the left and the stack on the right.
+        let master_count = if use_master {
+            wsp.master_count.clamp(1, tile_count.max(1))
+        } else {
+            tile_count.max(1)
+        };
         let master_ratio = wsp.master_ratio.clamp(0.20, 0.80);
         let has_stack = master_count < tile_count;
         let mut master_columns = Vec::with_capacity(master_count);
@@ -352,6 +367,125 @@ impl YaldaGpuiView {
             container = container.child(master).child(stack);
         } else {
             container = container.children(master_columns);
+        }
+
+        self.wrap_leaf_with_rail(container.into_any_element(), rail_focusable, cx)
+    }
+
+    /// Monocle arrangement (`UXI-Workspace-26`): only the focused tile paints,
+    /// filling the whole content region. The other tiles are untouched (never
+    /// moved or closed) — switching focus (`focus_next` / directional / jump)
+    /// swaps which tile is shown, and switching back to Columns/Tiling restores
+    /// the full arrangement losslessly. Same title bar + click-to-focus body as
+    /// a column, minus the side-by-side layout.
+    fn render_monocle(
+        &mut self,
+        root: gpui::Div,
+        layout: &mut workspace::Layout<App>,
+        focused_id: workspace::WindowId,
+        attach_focus: bool,
+        rail_focusable: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let workspace_idx = self.workspace.active_workspace;
+        // Keep the plane slots seeded/consistent (same upkeep as render_columns)
+        // so a toggle back to a side-by-side arrangement is valid.
+        {
+            let new_tile_span =
+                workspace::Span::new(self.desktop_grid_rows, self.desktop_grid_cols);
+            let wsp = &mut self.workspace.workspaces[workspace_idx];
+            let leaves = wsp.layout.leaf_ids();
+            wsp.desktop
+                .reconcile_near_with_span(&leaves, Some(focused_id), new_tile_span);
+        }
+
+        let base_bg = self.editor_bg();
+        let content_fg = self.editor_fg();
+        let dim: Hsla = nc(self.theme.agent.dim);
+        let accent: Hsla = rgb(CURSOR_BAR_COLOR).into();
+        let tile_bg = tint_bg(base_bg, 0.5, 0.06, 0.02);
+        let title_bg = tint_bg(base_bg, 0.5, 0.12, 0.05);
+
+        // Show the focused leaf; fall back to the first leaf if focus is stale.
+        let show_id = if layout.find_leaf(focused_id).is_some() {
+            focused_id
+        } else {
+            layout.leaf_ids().into_iter().next().unwrap_or(focused_id)
+        };
+
+        let mut container = root
+            .size_full()
+            .flex()
+            .flex_col()
+            .p(px(DESKTOP_GUTTER))
+            .bg(base_bg)
+            .overflow_hidden();
+
+        if let Some(window) = layout.find_leaf_mut(show_id) {
+            let content_ptr: *mut App = &mut window.content as *mut _;
+            // SAFETY: same argument as render_columns — no structural tree
+            // mutation happens during this render pass.
+            let content = unsafe { &mut *content_ptr };
+            let title = Self::desktop_tile_title(&self.sessions, content, cx);
+            let mark = self.workspace.marks.mark_for_window(show_id);
+            let is_focused = show_id == focused_id;
+
+            let inner = self.render_tile_content(
+                show_id,
+                content,
+                is_focused,
+                attach_focus,
+                base_bg,
+                content_fg,
+                cx,
+            );
+
+            let mut title_bar = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .h(px(DESKTOP_TITLE_H))
+                .px_2()
+                .flex_none()
+                .bg(title_bg)
+                .text_size(px(11.0))
+                .text_color(if is_focused { accent } else { dim })
+                .child(title);
+            if let Some(m) = mark {
+                title_bar =
+                    title_bar.child(div().px_1().text_color(accent).child(format!("[{m}]")));
+            }
+
+            let tile_body = div()
+                .flex_1()
+                .min_h_0()
+                .overflow_hidden()
+                .child(inner)
+                .capture_any_mouse_down(cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
+                    if ev.button != MouseButton::Left {
+                        return;
+                    }
+                    if this.workspace.focused_window_id() == Some(show_id) {
+                        return;
+                    }
+                    this.desktop_focus_click(show_id, cx);
+                    cx.stop_propagation();
+                }));
+
+            let tile = div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .rounded_md()
+                .bg(tile_bg)
+                .border_1()
+                .border_color(if is_focused { accent } else { dim.opacity(0.4) })
+                .child(title_bar)
+                .child(tile_body);
+            let tile = probe_bounds_dyn(format!("monocle-tile-{show_id}"), tile.into_any_element());
+            container = container.child(tile);
         }
 
         self.wrap_leaf_with_rail(container.into_any_element(), rail_focusable, cx)
