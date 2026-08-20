@@ -217,6 +217,11 @@ pub(crate) fn compact_bounded_group(
         .id(id)
         .flex()
         .flex_col()
+        // This group is designed for scrolling flex columns. Without
+        // `flex_none`, a crowded parent compresses it to its border-only
+        // minimum and `overflow_hidden` clips the otherwise-correct header and
+        // body into an empty band (bug-0052).
+        .flex_none()
         .w_auto()
         .min_w_0()
         .mx_2()
