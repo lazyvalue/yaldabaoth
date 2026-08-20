@@ -4,6 +4,19 @@
 
 use super::*;
 
+/// Tile/pane surface color. The desktop margin is painted with `editor_bg`
+/// (`base_bg`); each tile uses the theme's explicit `tile_bg` when set (Folio →
+/// Bone, a step darker than its Soft White desktop), else a derived tint of the
+/// desktop so tiles still read against it on themes that don't specify one.
+/// This is the single source the three layout renderers call, so a test over it
+/// exercises the real chrome path.
+pub(crate) fn resolve_tile_bg(theme: &Theme, base_bg: Hsla) -> Hsla {
+    theme
+        .tile_bg
+        .map(nc)
+        .unwrap_or_else(|| tint_bg(base_bg, 0.5, 0.06, 0.02))
+}
+
 /// Desktop-mode geometry calibrated from the 1350×1344px @2× reference
 /// screenshot: a 160×160 logical-pixel cell is 320×320 physical Retina pixels.
 /// A default 4×4 tile with the established 12px gutters is 676×676 logical px
@@ -223,7 +236,7 @@ impl YaldaGpuiView {
         let content_fg = self.editor_fg();
         let dim: Hsla = nc(self.theme.agent.dim);
         let accent: Hsla = rgb(CURSOR_BAR_COLOR).into();
-        let tile_bg = tint_bg(base_bg, 0.5, 0.06, 0.02);
+        let tile_bg = resolve_tile_bg(&self.theme, base_bg);
         let title_bg = tint_bg(base_bg, 0.5, 0.12, 0.05);
 
         // Column order: signed reading order over the plane slots (the same
@@ -415,7 +428,7 @@ impl YaldaGpuiView {
         let content_fg = self.editor_fg();
         let dim: Hsla = nc(self.theme.agent.dim);
         let accent: Hsla = rgb(CURSOR_BAR_COLOR).into();
-        let tile_bg = tint_bg(base_bg, 0.5, 0.06, 0.02);
+        let tile_bg = resolve_tile_bg(&self.theme, base_bg);
         let title_bg = tint_bg(base_bg, 0.5, 0.12, 0.05);
 
         // Show the focused leaf; fall back to the first leaf if focus is stale.
@@ -634,7 +647,7 @@ impl YaldaGpuiView {
         let content_fg = self.editor_fg();
         let dim: Hsla = nc(self.theme.agent.dim);
         let accent: Hsla = rgb(CURSOR_BAR_COLOR).into();
-        let tile_bg = tint_bg(base_bg, 0.5, 0.06, 0.02);
+        let tile_bg = resolve_tile_bg(&self.theme, base_bg);
         let title_bg = tint_bg(base_bg, 0.5, 0.12, 0.05);
 
         let mut canvas = root

@@ -5840,8 +5840,8 @@ fn jump_panel_state_palette_is_orange_green_and_gray() {
     );
     assert_eq!(
         crate::jump_selection_color(&folio),
-        Color::Rgb(0xd6, 0xdc, 0xe4),
-        "Folio selection uses its neutral blue-gray"
+        Color::Rgb(0xdb, 0xe3, 0xec),
+        "Folio selection uses its cool blue-gray"
     );
     assert_ne!(
         crate::jump_selection_color(&nightfox),
@@ -5851,6 +5851,53 @@ fn jump_panel_state_palette_is_orange_green_and_gray() {
         crate::jump_selection_color(&nightfox),
         crate::jump_agent_status_color(&agent, crate::AgentDotStatus::WaitingForYou)
     );
+}
+
+/// Folio surface tiers + Nightfox Steel accent. Drives the REAL chrome tile-bg
+/// resolver (`resolve_tile_bg`, called by all three layout renderers) plus the
+/// overlay palette the menus/jump/dialog read.
+///
+/// Negative control: set Folio `tile_bg` back to `None` (or restore the Nightfox
+/// purple key) and the matching assert fails — verified inline.
+#[test]
+fn folio_bone_surfaces_and_nightfox_steel_accent() {
+    use yalda::style::Color;
+    use yalda::theme::{OverlayTheme, Theme};
+
+    // --- Folio: tiles (Bone) sit a step DARKER than the Soft White desktop. ---
+    let folio = Theme::folio();
+    let desktop = nc(folio.editor_bg); // #f5f5f0 Soft White (margin)
+    let tile = crate::chrome::resolve_tile_bg(&folio, desktop); // real chrome path
+    assert_eq!(
+        tile,
+        nc(Color::Rgb(0xf0, 0xed, 0xe4)),
+        "Folio tiles paint Bone via the explicit theme.tile_bg"
+    );
+    assert_ne!(tile, desktop, "tiles must differ from the desktop margin");
+    assert!(
+        tile.l < desktop.l,
+        "Bone tiles must be darker than the Soft White desktop so tiles read"
+    );
+
+    // A theme without an explicit tile_bg still derives a tile surface (not Bone).
+    let dracula = Theme::dracula();
+    assert!(dracula.tile_bg.is_none());
+    let derived = crate::chrome::resolve_tile_bg(&dracula, nc(dracula.editor_bg));
+    assert_eq!(
+        derived,
+        tint_bg(nc(dracula.editor_bg), 0.5, 0.06, 0.02),
+        "themes without tile_bg fall back to the derived tint"
+    );
+
+    // --- Nightfox Steel: the overlay key is steel-blue, never the old purple. ---
+    let nf = OverlayTheme::nightfox();
+    assert_eq!(nf.key, Color::Rgb(0x7a, 0xa7, 0xd6), "Nightfox key is steel");
+    assert_ne!(
+        nf.key,
+        Color::Rgb(0x9d, 0x79, 0xd6),
+        "the retired Nightfox purple must be gone"
+    );
+    assert_eq!(nf.input, nf.key, "Nightfox caret follows the steel key, not yellow");
 }
 
 #[test]

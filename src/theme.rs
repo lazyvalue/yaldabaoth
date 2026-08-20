@@ -106,6 +106,11 @@ pub struct Theme {
     /// screen-level `.bg(...)` call so that light themes (Solarized,
     /// Financial Times) actually look light.
     pub editor_bg: Color,
+    /// Optional tile/pane surface color. The desktop margin is painted with
+    /// `editor_bg`; each tile is painted with this when `Some`, else the GPUI
+    /// binary derives a tile surface from `editor_bg` via `tint_bg`. Folio sets
+    /// this to Bone so tiles read a step DARKER than the Soft White desktop.
+    pub tile_bg: Option<Color>,
     /// Default foreground used when a span has no explicit color (or
     /// `Color::Reset`). The GPUI binary's `DEFAULT_FG` fallback.
     pub editor_fg: Color,
@@ -259,13 +264,13 @@ impl OverlayTheme {
         Self {
             bg: Color::Rgb(0x14, 0x1b, 0x25),
             border: Color::Rgb(0x2b, 0x3b, 0x51),
-            label: Color::Rgb(0x71, 0x83, 0x9b),       // fg3
-            fg: Color::Rgb(0xcd, 0xce, 0xcf),          // fg1
-            key: Color::Rgb(0x9d, 0x79, 0xd6),         // purple
+            label: Color::Rgb(0x73, 0x85, 0x9c),       // fg3 (cooled)
+            fg: Color::Rgb(0xcd, 0xd2, 0xd8),          // fg1 (cooled)
+            key: Color::Rgb(0x7a, 0xa7, 0xd6),         // steel-blue (was purple) — Nightfox Steel
             accent: Color::Rgb(0x63, 0xcd, 0xcf),      // cyan
             selected_bg: Color::Rgb(0x2b, 0x3b, 0x51), // sel0
-            modified: Color::Rgb(0xdb, 0xc0, 0x74),    // yellow
-            input: Color::Rgb(0xdb, 0xc0, 0x74),
+            modified: Color::Rgb(0xdb, 0xc0, 0x74),    // yellow (status only)
+            input: Color::Rgb(0x7a, 0xa7, 0xd6),       // steel caret (was yellow)
         }
     }
 
@@ -341,15 +346,15 @@ impl OverlayTheme {
 
     pub fn folio() -> Self {
         Self {
-            bg: Color::Rgb(0xed, 0xeb, 0xe6), // linen
-            border: Color::Rgb(0xd6, 0xd2, 0xca),
-            label: Color::Rgb(0xb5, 0xa4, 0x83),       // tan
-            fg: Color::Rgb(0x34, 0x2d, 0x1f),          // ink
-            key: Color::Rgb(0x40, 0x5d, 0x72),         // steel
-            accent: Color::Rgb(0x40, 0x67, 0x64),      // teal
-            selected_bg: Color::Rgb(0xd6, 0xdc, 0xe4), // visual bg
-            modified: Color::Rgb(0x8b, 0x35, 0x35),    // error red
-            input: Color::Rgb(0x2d, 0x30, 0x50),       // navy
+            bg: Color::Rgb(0xfc, 0xfb, 0xfa), // pinned near-white card (menus/dialogs)
+            border: Color::Rgb(0xdc, 0xd8, 0xce), // bone-neutral divider
+            label: Color::Rgb(0x8a, 0x92, 0x9b),       // cool grey (was tan)
+            fg: Color::Rgb(0x26, 0x2a, 0x2f),          // cool ink
+            key: Color::Rgb(0x40, 0x60, 0x7a),         // steel
+            accent: Color::Rgb(0x40, 0x67, 0x64),      // teal (kept)
+            selected_bg: Color::Rgb(0xdb, 0xe3, 0xec), // cool selection
+            modified: Color::Rgb(0xa2, 0x46, 0x38),    // terracotta status
+            input: Color::Rgb(0x40, 0x60, 0x7a),       // steel caret
         }
     }
 }
@@ -444,6 +449,7 @@ impl Theme {
             line_number: Style::default().fg(Color::Rgb(98, 114, 164)),
             line_number_current: Style::default().fg(Color::Rgb(248, 248, 242)),
             editor_bg: Color::Rgb(40, 42, 54),
+            tile_bg: None,
             editor_fg: Color::Rgb(248, 248, 242),
             agent: AgentTheme::dracula(),
             overlay: OverlayTheme::dracula(),
@@ -561,6 +567,7 @@ impl Theme {
             line_number: Style::default().fg(Color::Rgb(0x39, 0x50, 0x6d)),
             line_number_current: Style::default().fg(Color::Rgb(0xd8, 0xde, 0xe9)),
             editor_bg: Color::Rgb(0x13, 0x1a, 0x24),
+            tile_bg: None,
             editor_fg: Color::Rgb(0xcd, 0xce, 0xcf),
             agent: AgentTheme::nightfox(),
             overlay: OverlayTheme::nightfox(),
@@ -653,6 +660,7 @@ impl Theme {
             line_number: Style::default().fg(Color::Rgb(0x93, 0xa1, 0xa1)),
             line_number_current: Style::default().fg(Color::Rgb(0x00, 0x2b, 0x36)),
             editor_bg: Color::Rgb(0xfd, 0xf6, 0xe3), // base3
+            tile_bg: None,
             editor_fg: Color::Rgb(0x58, 0x6e, 0x75), // base01
             agent: AgentTheme::solarized_light(),
             overlay: OverlayTheme::solarized_light(),
@@ -745,6 +753,7 @@ impl Theme {
             line_number: Style::default().fg(Color::Rgb(0x58, 0x6e, 0x75)),
             line_number_current: Style::default().fg(Color::Rgb(0xfd, 0xf6, 0xe3)),
             editor_bg: Color::Rgb(0x00, 0x2b, 0x36), // base03
+            tile_bg: None,
             editor_fg: Color::Rgb(0x83, 0x94, 0x96), // base0
             agent: AgentTheme::solarized_dark(),
             overlay: OverlayTheme::solarized_dark(),
@@ -836,6 +845,7 @@ impl Theme {
             line_number: Style::default().fg(Color::Rgb(0x50, 0x49, 0x45)),
             line_number_current: Style::default().fg(Color::Rgb(0xeb, 0xdb, 0xb2)),
             editor_bg: Color::Rgb(0x1d, 0x20, 0x21),
+            tile_bg: None,
             editor_fg: Color::Rgb(0xeb, 0xdb, 0xb2),
             agent: AgentTheme::gruvbox_dark(),
             overlay: OverlayTheme::gruvbox_dark(),
@@ -932,6 +942,7 @@ impl Theme {
             line_number: Style::default().fg(Color::Rgb(0xcc, 0xc1, 0xb7)),
             line_number_current: Style::default().fg(Color::Rgb(0x33, 0x30, 0x2e)),
             editor_bg: Color::Rgb(0xff, 0xf1, 0xe5), // paper
+            tile_bg: None,
             editor_fg: Color::Rgb(0x33, 0x30, 0x2e), // slate
             agent: AgentTheme::financial_times(),
             overlay: OverlayTheme::financial_times(),
@@ -1027,6 +1038,7 @@ impl Theme {
             line_number: Style::default().fg(Color::Rgb(0x4a, 0x44, 0x40)),
             line_number_current: Style::default().fg(Color::Rgb(0xff, 0xf1, 0xe5)),
             editor_bg: Color::Rgb(0x1a, 0x1a, 0x1a), // charcoal
+            tile_bg: None,
             editor_fg: Color::Rgb(0xf2, 0xdf, 0xce), // wheat
             agent: AgentTheme::financial_times_dark(),
             overlay: OverlayTheme::financial_times_dark(),
@@ -1122,8 +1134,9 @@ impl Theme {
             midpoint_marker: Style::default().fg(Color::Rgb(0xb5, 0xa4, 0x83)),
             line_number: Style::default().fg(Color::Rgb(0xb5, 0xa4, 0x83)), // tan
             line_number_current: Style::default().fg(Color::Rgb(0x34, 0x2d, 0x1f)),
-            editor_bg: Color::Rgb(0xf6, 0xf4, 0xf0), // paper
-            editor_fg: Color::Rgb(0x34, 0x2d, 0x1f), // ink
+            editor_bg: Color::Rgb(0xf5, 0xf5, 0xf0), // desktop margin — Soft White
+            tile_bg: Some(Color::Rgb(0xf0, 0xed, 0xe4)), // tiles/paper — Bone (a step darker)
+            editor_fg: Color::Rgb(0x26, 0x2a, 0x2f), // ink — cool near-black
             agent: AgentTheme::folio(),
             overlay: OverlayTheme::folio(),
         }
