@@ -2054,6 +2054,11 @@ struct YaldaGpuiView {
     /// Independently folded workspace folders, keyed by durable project name
     /// plus the workspace's immutable auto-name.
     jump_folded_workspaces: std::collections::HashSet<String>,
+    /// User's drag-reordered jump-panel workspace-folder order
+    /// (`Preferences::jump_workspace_order`, UXI-JumpPanel-29). Entries are
+    /// durable project/immutable auto-name keys; this affects presentation only,
+    /// never `Frame::workspaces` identity, numbering, or keyboard shortcuts.
+    jump_workspace_order: Vec<String>,
     /// User's drag-reordered order of jump-panel tag folders, per project
     /// (`Preferences::jump_tag_order`, UXI-JumpPanel-21). `project name → [tag]`;
     /// unlisted tags sort after alphabetically. Keyed by durable project name
@@ -2172,6 +2177,7 @@ impl YaldaGpuiView {
             jump_agent_tabs: HashMap::new(),
             jump_folded_projects: std::collections::HashSet::new(),
             jump_folded_workspaces: std::collections::HashSet::new(),
+            jump_workspace_order: Vec::new(),
             jump_tag_order: HashMap::new(),
             jump_folded_tags: std::collections::HashSet::new(),
             jump_tile_order: Vec::new(),
@@ -2237,6 +2243,7 @@ impl YaldaGpuiView {
             jump_agent_tabs: HashMap::new(),
             jump_folded_projects: std::collections::HashSet::new(),
             jump_folded_workspaces: std::collections::HashSet::new(),
+            jump_workspace_order: Vec::new(),
             jump_tag_order: HashMap::new(),
             jump_folded_tags: std::collections::HashSet::new(),
             jump_tile_order: Vec::new(),
@@ -3781,6 +3788,8 @@ impl YaldaGpuiView {
                 keys.sort();
                 keys
             }),
+            jump_workspace_order: (!self.jump_workspace_order.is_empty())
+                .then(|| self.jump_workspace_order.clone()),
             jump_tag_order: (!self.jump_tag_order.is_empty()).then(|| self.jump_tag_order.clone()),
             jump_folded_tags: (!self.jump_folded_tags.is_empty()).then(|| {
                 let mut keys: Vec<_> = self.jump_folded_tags.iter().cloned().collect();
@@ -9784,6 +9793,9 @@ fn main() {
                         }
                         if let Some(keys) = prefs.jump_folded_workspaces {
                             view.jump_folded_workspaces = keys.into_iter().collect();
+                        }
+                        if let Some(order) = prefs.jump_workspace_order {
+                            view.jump_workspace_order = order;
                         }
                         // Per-project tag-folder order + fold state (UXI-JumpPanel-21).
                         if let Some(o) = prefs.jump_tag_order {

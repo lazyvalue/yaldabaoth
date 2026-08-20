@@ -165,6 +165,16 @@ pub(crate) struct TileDrag {
     pub(crate) group: usize,
 }
 
+/// Drag payload for a workspace folder header (UXI-JumpPanel-29). The durable
+/// key identifies the presentation-order entry; the typed `ProjectId` lets the
+/// target reject cross-project drops before a state mutation is dispatched.
+/// It is distinct from every row/folder payload, so drag kinds cannot cross-fire.
+#[derive(Clone)]
+pub(crate) struct WorkspaceDrag {
+    pub(crate) key: String,
+    pub(crate) project: ProjectId,
+}
+
 /// The little floating label rendered under the cursor while dragging a
 /// jump-panel row (jump-reorder). GPUI's `on_drag` wants an `Entity<impl
 /// Render>` for the drag image; this is that image — just the row's label on a
@@ -723,7 +733,7 @@ impl YaldaGpuiView {
             let agent_tab = forced_tab.unwrap_or(selected_tab);
             let project_rows = by_project.remove(&id).unwrap_or_default();
             let sessions = agent_rows_for_tab(project_rows, agent_tab);
-            let workspace_folders: Vec<JumpWorkspaceFolder> = self
+            let mut workspace_folders: Vec<JumpWorkspaceFolder> = self
                 .workspace
                 .workspaces
                 .iter()
@@ -777,6 +787,16 @@ impl YaldaGpuiView {
                     }
                 })
                 .collect();
+            // UXI-JumpPanel-29: this is a stable PRESENTATION sort. Unlisted
+            // folders retain their Frame order, while the immutable `index`
+            // continues to drive selection and ctrl-number labels.
+            let workspace_rank = |key: &str| {
+                self.jump_workspace_order
+                    .iter()
+                    .position(|ordered| ordered == key)
+                    .unwrap_or(usize::MAX)
+            };
+            workspace_folders.sort_by_key(|folder| workspace_rank(&folder.key));
             let mut detached: Vec<JumpTileRow> = self
                 .workspace
                 .detached_tiles
@@ -1243,6 +1263,57 @@ impl YaldaGpuiView {
         self.save_settings();
         cx.notify();
     }
+
+    /// Reorder a workspace folder within its project (UXI-JumpPanel-29).
+    ///
+    /// The drag surface has a typed same-project drop predicate, and this state
+    /// boundary independently derives project ownership from the live projection
+    /// before changing anything. The resulting preference is a total display
+    /// order; `Frame::workspaces` and its global indices are never mutated.
+    pub(crate) fn reorder_workspace(
+        &mut self,
+        dragged: &str,
+        target: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if dragged == target {
+            return;
+        }
+
+        let (sections, _) = self.jump_panel_sections(cx);
+        let project_of = |key: &str| {
+            sections
+                .iter()
+                .find(|section| {
+                    section
+                        .workspace_folders
+                        .iter()
+                        .any(|folder| folder.key == key)
+                })
+                .map(|section| section.id)
+        };
+        match (project_of(dragged), project_of(target)) {
+            (Some(dragged_project), Some(target_project)) if dragged_project == target_project => {}
+            _ => return,
+        }
+
+        let mut keys: Vec<String> = sections
+            .iter()
+            .flat_map(|section| {
+                section
+                    .workspace_folders
+                    .iter()
+                    .map(|folder| folder.key.clone())
+            })
+            .collect();
+        reorder_move(&mut keys, dragged, target);
+        if keys == self.jump_workspace_order {
+            return;
+        }
+        self.jump_workspace_order = keys;
+        self.save_settings();
+        cx.notify();
+    }
 }
 
 impl YaldaGpuiView {
@@ -1703,9 +1774,13 @@ impl YaldaGpuiView {
             for folder in section.workspace_folders {
                 let idx = folder.index;
                 let key = folder.key.clone();
+                let fold_key = key.clone();
+                let drag_key = key.clone();
+                let target_key = key.clone();
                 let folder_folded = self.jump_folded_workspaces.contains(&key);
                 let num = format!("{}", idx + 1);
                 let label = folder.label.clone();
+                let drag_label: SharedString = label.clone().into();
                 let tile_count = folder.tiles.len();
                 let has_working = folder.has_working_agent;
                 let count_label = jump_workspace_membership_label(tile_count);
@@ -1736,7 +1811,7 @@ impl YaldaGpuiView {
                                 "▾"
                             }))
                             .on_click(cx.listener(move |this, _ev, _window, cx| {
-                                this.toggle_workspace_fold(&key, cx)
+                                this.toggle_workspace_fold(&fold_key, cx)
                             })),
                     )
                     .child(
@@ -1762,7 +1837,24 @@ impl YaldaGpuiView {
                             )
                             .on_click(cx.listener(move |this, _ev, _window, cx| {
                                 this.select_workspace(idx, cx)
-                            })),
+                            }))
+                            .on_drag(
+                                WorkspaceDrag {
+                                    key: drag_key,
+                                    project: pid,
+                                },
+                                {
+                                    let (fg, bg, font) = (drag_fg, sel_bg, drag_font.clone());
+                                    move |_payload, _pos, _window, cx| {
+                                        cx.new(|_| JumpDragPreview {
+                                            label: drag_label.clone(),
+                                            fg,
+                                            bg,
+                                            font: font.clone(),
+                                        })
+                                    }
+                                },
+                            ),
                     )
                     // UXI-JumpPanel-30: a warm ◆ when any agent tile inside this
                     // workspace is working, so a collapsed folder still shows it.
@@ -1795,6 +1887,17 @@ impl YaldaGpuiView {
                             .font_family(st.mono.clone())
                             .text_size(px(st.pt * 0.75))
                             .child(SharedString::from(num)),
+                    )
+                    .can_drop(move |dragged, _window, _cx| {
+                        dragged
+                            .downcast_ref::<WorkspaceDrag>()
+                            .is_some_and(|drag| drag.project == pid)
+                    })
+                    .drag_over::<WorkspaceDrag>(move |style, _, _, _| style.bg(sel_bg))
+                    .on_drop(
+                        cx.listener(move |this, dragged: &WorkspaceDrag, _window, cx| {
+                            this.reorder_workspace(&dragged.key, &target_key, cx)
+                        }),
                     );
                 let body = if !folder_folded {
                     let mut children = div()
