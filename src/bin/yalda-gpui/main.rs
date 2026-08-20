@@ -2055,6 +2055,12 @@ struct YaldaGpuiView {
     /// Folded jump-panel tag folders, keyed by `"{project}\u{1f}{tag}"`
     /// (`Preferences::jump_folded_tags`, UXI-JumpPanel-21). Absent = expanded.
     jump_folded_tags: std::collections::HashSet<String>,
+    /// User's drag-reordered order of jump-panel TILE rows within a workspace
+    /// folder (`Preferences::jump_tile_order`, UXI-JumpPanel-28). One global list
+    /// of durable `WindowId`s; within each folder tiles sort by their index here,
+    /// unlisted tiles keep layout-traversal order after. Empty = layout order. A
+    /// tile drag is folder-gated, so one global list suffices.
+    jump_tile_order: Vec<workspace::WindowId>,
     /// Per-session user tags, keyed by SERVER sid (UXI-JumpPanel-20). Loaded once
     /// at construction from the id-keyed sidecar (`session_tags.json`), written on
     /// every tag edit. The jump panel reads this to group sessions into tag
@@ -2161,6 +2167,7 @@ impl YaldaGpuiView {
             jump_folded_workspaces: std::collections::HashSet::new(),
             jump_tag_order: HashMap::new(),
             jump_folded_tags: std::collections::HashSet::new(),
+            jump_tile_order: Vec::new(),
             jump_order_succession: HashMap::new(),
             recaps: HashMap::new(),
             roster_unread: HashMap::new(),
@@ -2225,6 +2232,7 @@ impl YaldaGpuiView {
             jump_folded_workspaces: std::collections::HashSet::new(),
             jump_tag_order: HashMap::new(),
             jump_folded_tags: std::collections::HashSet::new(),
+            jump_tile_order: Vec::new(),
             jump_order_succession: HashMap::new(),
             recaps: HashMap::new(),
             roster_unread: HashMap::new(),
@@ -3772,6 +3780,8 @@ impl YaldaGpuiView {
                 keys.sort();
                 keys
             }),
+            jump_tile_order: (!self.jump_tile_order.is_empty())
+                .then(|| self.jump_tile_order.clone()),
         });
     }
 
@@ -9773,6 +9783,9 @@ fn main() {
                         }
                         if let Some(keys) = prefs.jump_folded_tags {
                             view.jump_folded_tags = keys.into_iter().collect();
+                        }
+                        if let Some(o) = prefs.jump_tile_order {
+                            view.jump_tile_order = o;
                         }
                         // Universal agent roster (universal-agent-list): start
                         // the server pump + seed the roster at boot (not only

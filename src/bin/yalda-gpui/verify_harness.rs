@@ -8654,9 +8654,12 @@ fn jump_panel_hidden_tiles_paint_indicator(cx: &mut TestAppContext) {
         "Detached is a distinct placement and must never inherit the hidden marker"
     );
     let (_, _, mark_w, mark_h) = hidden_mark.unwrap();
+    // UXI-JumpPanel-28: the hidden mark is now a single fixed-width icon glyph
+    // (was a wider text pill), so its cell is narrow (~16px) and never wider than
+    // a normal row's badge column.
     assert!(
-        (28.0..=58.0).contains(&mark_w) && mark_h <= 16.5,
-        "the hidden mark remains a compact trailing pill: {mark_w}x{mark_h}px"
+        mark_w <= 20.0 && mark_h <= 24.0,
+        "the hidden mark is a compact fixed-width icon: {mark_w}x{mark_h}px"
     );
     crate::layout_probe_end();
 }
@@ -12070,6 +12073,120 @@ fn jump_reorder_methods_reorder_and_gate_by_cwd(cx: &mut TestAppContext) {
     assert!(
         g.iter()
             .all(|(k, rows)| k != "/proj/alpha" || !rows.contains(&"b-one".to_string()))
+    );
+}
+
+/// Unit (UXI-JumpPanel-28): `reorder_move_win` is the `WindowId` analog of
+/// `reorder_move` — drops the dragged tile into the target's slot (target shifts
+/// down); a no-op when dragged == target or absent.
+#[test]
+fn jump_tile_reorder_move_semantics() {
+    use crate::reorder_move_win;
+    let mut v: Vec<crate::workspace::WindowId> = vec![10, 20, 30];
+    // Drag 30 onto 10 → 30 takes 10's slot.
+    reorder_move_win(&mut v, 30, 10);
+    assert_eq!(v, vec![30, 10, 20]);
+    // Drag 30 onto 20 → 30 lands in 20's slot.
+    reorder_move_win(&mut v, 30, 20);
+    assert_eq!(v, vec![10, 30, 20], "dragged tile lands in target's slot");
+    // Self-drop is a no-op.
+    let before = v.clone();
+    reorder_move_win(&mut v, 10, 10);
+    assert_eq!(v, before, "self-drop is a no-op");
+    // Absent dragged is a no-op.
+    reorder_move_win(&mut v, 999, 10);
+    assert_eq!(v, before, "absent dragged is a no-op");
+}
+
+/// UXI-JumpPanel-28, REAL path: tiles inside a workspace folder reorder by drag,
+/// folder-bounded. Builds the production view with three tiles in workspace 0 and
+/// one tile in workspace 1 (a second folder), then calls the exact method the
+/// tile-drop handler invokes (`reorder_tile`):
+///   1. default (empty order) = layout-traversal order;
+///   2. `reorder_tile(third, first)` moves the third tile into the first slot,
+///      and the new order is persisted on `jump_tile_order`;
+///   3. a CROSS-FOLDER `reorder_tile` (a workspace-1 tile onto a workspace-0 tile)
+///      is REFUSED — a tile can never be dragged into another workspace folder.
+///
+/// The GPUI mouse-drag GESTURE that dispatches the drop is the runtime gap (gap
+/// #2, no headless drag-dispatch seam), but the state change the drop runs IS this
+/// method. Negative control (mandatory, observed RED): delete the
+/// `tiles.sort_by_key(rank)` line in `jump_panel_sections_with_tab` → assertion 2
+/// fails (the projected order stays in layout order after the reorder).
+#[gpui::test]
+fn jump_tile_reorder_applies_within_folder_and_gates_by_folder(cx: &mut TestAppContext) {
+    use crate::{App, AgentTile};
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+    vcx.run_until_parked();
+
+    // Workspace 0: three tiles (seed Buffer + two agent splits).
+    view.update(vcx, |v, _| {
+        v.workspace
+            .split_focused(crate::workspace::SplitDir::H, App::Agent(AgentTile::new()));
+        v.workspace
+            .split_focused(crate::workspace::SplitDir::H, App::Agent(AgentTile::new()));
+    });
+    // Workspace 1: one more tile, a second folder under the same project.
+    view.update(vcx, |v, _| {
+        v.workspace
+            .push_workspace_inheriting(App::Agent(AgentTile::new()));
+    });
+
+    // Snapshot every workspace folder's tile ids in the order render builds them.
+    let folders = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.update(vcx, |v, cx| {
+            let (sections, _) = v.jump_panel_sections(cx);
+            sections
+                .iter()
+                .flat_map(|s| &s.workspace_folders)
+                .map(|f| (f.index, f.tiles.iter().map(|t| t.id).collect::<Vec<_>>()))
+                .collect::<Vec<(usize, Vec<crate::workspace::WindowId>)>>()
+        })
+    };
+
+    // Default: workspace-0 folder has three tiles in layout order.
+    let f0 = folders(&view, vcx);
+    let folder0 = f0.iter().find(|(_, ids)| ids.len() >= 3).cloned();
+    let (folder0_idx, layout_ids) = folder0.expect("workspace-0 folder with 3 tiles");
+    assert_eq!(layout_ids.len(), 3);
+    let (t0, t1, t2) = (layout_ids[0], layout_ids[1], layout_ids[2]);
+    assert!(
+        view.update(vcx, |v, _| v.jump_tile_order.is_empty()),
+        "no drag yet → empty order → the projection is pure layout order"
+    );
+
+    // Drag the third tile onto the first → third takes the first slot.
+    view.update(vcx, |v, cx| v.reorder_tile(t2, t0, cx));
+    let after = folders(&view, vcx);
+    let reordered = after
+        .iter()
+        .find(|(idx, _)| *idx == folder0_idx)
+        .map(|(_, ids)| ids.clone())
+        .expect("workspace-0 folder still present");
+    assert_eq!(
+        reordered,
+        vec![t2, t0, t1],
+        "tile drag reordered the folder: third moved into the first slot"
+    );
+    assert!(
+        view.update(vcx, |v, _| v.jump_tile_order.starts_with(&[t2, t0, t1])),
+        "the tile order persisted on the view"
+    );
+
+    // A second folder (workspace 1) exists with its own tile.
+    let other = after
+        .iter()
+        .find(|(idx, ids)| *idx != folder0_idx && !ids.is_empty())
+        .map(|(_, ids)| ids[0])
+        .expect("workspace-1 folder with a tile");
+
+    // CROSS-FOLDER is refused: dragging the workspace-1 tile onto t0 does nothing.
+    let before = view.update(vcx, |v, _| v.jump_tile_order.clone());
+    view.update(vcx, |v, cx| v.reorder_tile(other, t0, cx));
+    let unchanged = view.update(vcx, |v, _| v.jump_tile_order.clone());
+    assert_eq!(
+        before, unchanged,
+        "a tile cannot be reordered into another workspace folder"
     );
 }
 
