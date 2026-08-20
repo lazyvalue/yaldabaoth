@@ -344,10 +344,15 @@ provider's interaction model:
   `promptQueueing`, the worker forwards the prompt concurrently and Claude
   processes it as soon as the current turn finishes; the running clocks are not
   reset.
-- **Codex:** the submit first sends one graceful ACP `session/cancel` for the
-  running turn, then sends the typed message as the replacement prompt. This is
-  the normal-message interruption path; it does not enter the Stop button's
-  `StopRequested` / second-press force-restart state.
+- **Codex:** when the adapter advertises root
+  `_meta.steering.supported`, the submit uses its native
+  `_session/steering` request. Successive submitted messages are delivered FIFO
+  and remain distinct. The initial capable-Codex prompt, native requests, and
+  explicit Stop share one ordered worker-control stream, so neither a fast
+  follow-up nor Stop can overtake an earlier submission. Older adapters fall back to one
+  graceful ACP `session/cancel` followed by the typed replacement prompt. A
+  normal submit never enters the Stop button's `StopRequested` / second-press
+  force-restart state.
 
 If the prompt send
 **fails** (offline / reconnecting) the draft is **left in the compose** with a
@@ -357,9 +362,10 @@ is NOT a stop** — it is the worksheet mode key (Insert→Normal, leave-block),
 binding it to stop conflicted with mode switching, so it was unbound (2026-06-29).
 
 **Applies to.** The agent tile: `submit_compose` / `send_prompt_to_session`
-(`agent_ui.rs`), the shared graceful-cancel transport used by Stop, and the
-worker's concurrent driver (`acp_channel.rs`, gated on `promptQueueing`). There
-is no client-side steering queue.
+(`agent_ui.rs`), native steering + graceful-cancel transports, and the worker's
+provider capability routing (`acp_channel.rs`). There is no client-side
+steering queue: capable Codex adapters own the FIFO; Claude owns its advertised
+`promptQueueing` queue.
 
 **Why.** Over ACP **v1 a prompt is a turn** and there is no portable mid-turn
 input message. The live Claude agent advertises a vendor capability
@@ -368,22 +374,27 @@ input message. The live Claude agent advertises a vendor capability
 yalda's worker previously *serialized* (awaited each turn before sending the next),
 so a steer couldn't reach the agent until the boundary; the concurrent driver
 fixes that for Claude. Codex does not treat a normal queued prompt as an
-interruption, so its user-facing redirect composes ACP's portable
-`session/cancel` with the replacement prompt. ACP v2 (the
+interruption. Current Codex adapters instead advertise native
+`_session/steering`, whose per-session queue serializes multiple inputs and
+injects them into the live turn. The portable `session/cancel` + replacement
+prompt composition remains the old-adapter fallback. ACP v2 (the
 `unstable_protocol_v2` draft) is NOT yet honored by the Claude agent — it
 negotiates down to v1 — so promptQueueing remains Claude's real mechanism, and
 this design is the v2-ready shape (`spec-turn-steering.md`).
 
 **Status.** `implemented` — provider-specific state, ordering, and transport are
-guarded headlessly; the live Codex subprocess remains the documented runtime gap.
+guarded headlessly, including a real subprocess/JSON-RPC wire-order test; the
+installed Codex adapter itself is the remaining live runtime confirmation.
 
 **Enforcement.** Headless in `verify_harness.rs`:
 `steering_submit_while_awaiting_sends_immediately` (mid-turn submit sends + commits
 + doesn't reset the turn), `steering_midturn_ordering_and_dedup` (steer lands after
 prior agent content, committed once, agent echo deduped — via the real reducer),
 `codex_normal_message_interrupts_in_flight_turn` (real submit and in-process
-transport: idle Codex no cancel; mid-turn Codex cancel + prompt; mid-turn Claude
-prompt without cancel), and `esc_does_not_stop_in_flight_turn` /
+transport: idle Codex prompt; capable mid-turn Codex FIFO steering followed by
+explicit Stop exactly once on the same ordered control stream; fallback Codex
+cancel + prompt; mid-turn Claude prompt
+without cancel), and `esc_does_not_stop_in_flight_turn` /
 `stop_interrupts_only_when_in_flight`.
 Transport (live, not headless): `tests/steering_midturn_live.rs` drives the REAL
 worker + REAL `claude-agent-acp` and proves a mid-turn steer is delivered and

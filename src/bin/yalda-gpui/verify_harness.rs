@@ -13541,6 +13541,19 @@ fn boot_worksheet_channel(
     crate::SessionId,
     yalda::acp_channel::TestChannelControls,
 ) {
+    boot_worksheet_channel_with_steering(cx, false)
+}
+
+#[cfg(feature = "test-support")]
+fn boot_worksheet_channel_with_steering(
+    cx: &mut TestAppContext,
+    steering_supported: bool,
+) -> (
+    gpui::Entity<YaldaGpuiView>,
+    &mut gpui::VisualTestContext,
+    crate::SessionId,
+    yalda::acp_channel::TestChannelControls,
+) {
     let (view, vcx) = cx.add_window_view(|window, cx| {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
@@ -13552,7 +13565,8 @@ fn boot_worksheet_channel(
     });
     vcx.run_until_parked();
     install_agent_slot(&view, &mut *vcx, None); // None sid ⇒ channel.send() path
-    let (client, controls) = yalda::acp_channel::AcpChannelClient::test_connected();
+    let (client, controls) =
+        yalda::acp_channel::AcpChannelClient::test_connected_with_steering(steering_supported);
     let id = view.update(vcx, |v, cx| {
         v.splash_until = None;
         let id = v.focused_bound_session().expect("bound session");
@@ -18542,6 +18556,79 @@ fn codex_normal_message_interrupts_in_flight_turn(cx: &mut TestAppContext) {
         .try_recv()
         .expect("post-stop replacement reached channel");
     assert_eq!(fourth.text, "resume now");
+}
+
+/// bug-0036 recurrence / UXI-AgentTile-13: two ordinary questions submitted
+/// during one capable Codex turn must use the adapter's FIFO native-steering
+/// path. A subsequent explicit Stop is the ONLY cancel. This is the exact real
+/// GUI sequence reported by the user: submit -> submit -> ⌘.
+///
+/// Negative control: with the old cancel+prompt routing, the native-control
+/// stream is empty, `prompt_rx` contains both follow-ups, and the legacy cancel
+/// stream contains three cancels (one per submit plus Stop), so this guard is
+/// RED on all three observables.
+#[cfg(feature = "test-support")]
+#[gpui::test]
+fn codex_successive_questions_then_stop_use_fifo_native_steering(cx: &mut TestAppContext) {
+    use yalda::acp_channel::AgentProvider;
+
+    let (view, vcx, id, mut controls) = boot_worksheet_channel_with_steering(cx, true);
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| c.provider = AgentProvider::Codex);
+    });
+
+    worksheet_real_submit(&view, vcx, "initial work");
+    let initial = controls
+        .try_recv_native_prompt()
+        .expect("initial idle prompt reached the ordered capable-Codex transport");
+    assert_eq!(initial.text, "initial work");
+
+    for question in ["first pending question", "second pending question"] {
+        for ch in question.chars() {
+            view.update_in(vcx, |v, w, cx| {
+                v.handle_claude_key(&ws_bare_key(&ch.to_string()), w, cx)
+            });
+        }
+        view.update(vcx, |v, cx| v.submit_agent(cx));
+        vcx.run_until_parked();
+    }
+
+    // Drive the real explicit Stop handler after both questions are submitted.
+    view.update(vcx, |v, cx| v.stop_agent_inner(cx));
+    vcx.run_until_parked();
+
+    let first = controls
+        .try_recv_native_steer()
+        .expect("first question reached native steering");
+    let second = controls
+        .try_recv_native_steer()
+        .expect("second question reached native steering");
+    assert_eq!(first.text, "first pending question");
+    assert_eq!(second.text, "second pending question");
+    assert!(
+        controls.try_recv_native_cancel(),
+        "explicit Stop follows both questions on the ordered native-control queue"
+    );
+    assert!(
+        controls.prompt_rx.try_recv().is_err(),
+        "mid-turn capable Codex questions must not enter the ordinary prompt queue"
+    );
+    assert!(
+        !controls.try_recv_native_cancel(),
+        "ordered native-control queue contains exactly one explicit Stop"
+    );
+    assert!(
+        !controls.try_recv_cancel(),
+        "capable Codex path must not also emit a legacy cancellation"
+    );
+
+    let transcript = view
+        .update(vcx, |v, cx| {
+            v.read_session(id, cx, |c| c.editor.document().full_text())
+        })
+        .expect("session");
+    assert!(transcript.contains("first pending question"));
+    assert!(transcript.contains("second pending question"));
 }
 
 /// `stop_agent_inner` (the function Esc and ⌘. both call) interrupts ONLY when a

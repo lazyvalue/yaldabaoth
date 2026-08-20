@@ -5148,23 +5148,18 @@ impl YaldaGpuiView {
         }
 
         // PROVIDER-AWARE STEERING (spec-turn-steering.md, UXI-AgentTile-13):
-        // Claude keeps its promptQueueing path, where the steer rides the current
-        // turn. Codex normal messages are interrupts: gracefully cancel a CLEAN
-        // in-flight turn before sending the replacement prompt. Do not take this
-        // branch for StopRequested — that turn already has a cancel pending, and
-        // `send_prompt_to_session` will supersede that phase with a fresh Awaiting
-        // turn. The cancel is transport-only: normal-message interruption never
-        // enters StopRequested or the Stop button's second-press force-restart
-        // policy.
-        let interrupt_codex = self
+        // Claude keeps its promptQueueing path. A clean in-flight Codex turn
+        // asks the transport to steer: capable adapters receive their native
+        // FIFO `_session/steering`; older adapters atomically retain the shipped
+        // cancel+replacement-prompt fallback. StopRequested already owns a
+        // cancel, so a new submit supersedes it through an ordinary prompt and
+        // never emits a duplicate cancel.
+        let steer_codex = self
             .read_session(id, cx, |c| {
                 c.provider == AgentProvider::Codex
                     && matches!(c.turn_phase, TurnPhase::Awaiting { .. })
             })
             .unwrap_or(false);
-        if interrupt_codex {
-            self.cancel_session_transport(id, cx);
-        }
 
         // `send_prompt_to_session` commits the user turn on a successful write.
         // On send FAILURE we LEAVE the draft in the compose (no clear, no queue)
@@ -5180,7 +5175,7 @@ impl YaldaGpuiView {
                     .flatten()
             })
             .flatten();
-        if self.send_prompt_to_session(id, &text, &images, anchor, cx) {
+        if self.send_prompt_to_session(id, &text, &images, anchor, steer_codex, cx) {
             self.with_session(id, cx, |claude| {
                 // Reset the compose, PRESERVING placement (Model C §4.1).
                 let mode = claude.input_surface.mode;
@@ -5322,6 +5317,7 @@ impl YaldaGpuiView {
         text: &str,
         images: &[yalda::acp_channel::ImageAttachment],
         anchor: Option<usize>,
+        steer_codex: bool,
         cx: &mut Context<Self>,
     ) -> bool {
         let server_sid = self.sessions.sid_of(id).map(|s| s.to_string());
@@ -5330,8 +5326,12 @@ impl YaldaGpuiView {
             self.session_server
                 .as_ref()
                 .and_then(|s| {
-                    s.prompt_with_images(sid, &prompt_body, images.to_vec())
-                        .ok()
+                    if steer_codex {
+                        s.steer_with_images(sid, &prompt_body, images.to_vec()).ok()
+                    } else {
+                        s.prompt_with_images(sid, &prompt_body, images.to_vec())
+                            .ok()
+                    }
                 })
                 .is_some()
         } else {
@@ -5343,7 +5343,13 @@ impl YaldaGpuiView {
                 claude
                     .channel
                     .as_mut()
-                    .map(|ch| ch.send_payload(payload).is_ok())
+                    .map(|ch| {
+                        if steer_codex {
+                            ch.steer_or_replace_payload(payload).is_ok()
+                        } else {
+                            ch.send_payload(payload).is_ok()
+                        }
+                    })
                     .unwrap_or(false)
             })
             .unwrap_or(false)
