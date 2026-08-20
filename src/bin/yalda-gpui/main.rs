@@ -2073,6 +2073,11 @@ struct YaldaGpuiView {
     /// unlisted tiles keep layout-traversal order after. Empty = layout order. A
     /// tile drag is folder-gated, so one global list suffices.
     jump_tile_order: Vec<workspace::WindowId>,
+    /// User's drag-reordered Detached tile presentation order
+    /// (`Preferences::jump_detached_tile_order`, UXI-JumpPanel-28). This is
+    /// independent of attached workspace tile order. Empty = alphabetical;
+    /// unlisted tiles retain alphabetical order after ranked tiles.
+    jump_detached_tile_order: Vec<workspace::WindowId>,
     /// Per-session user tags, keyed by SERVER sid (UXI-JumpPanel-20). Loaded once
     /// at construction from the id-keyed sidecar (`session_tags.json`), written on
     /// every tag edit. The jump panel reads this to group sessions into tag
@@ -2181,6 +2186,7 @@ impl YaldaGpuiView {
             jump_tag_order: HashMap::new(),
             jump_folded_tags: std::collections::HashSet::new(),
             jump_tile_order: Vec::new(),
+            jump_detached_tile_order: Vec::new(),
             jump_order_succession: HashMap::new(),
             recaps: HashMap::new(),
             roster_unread: HashMap::new(),
@@ -2247,6 +2253,7 @@ impl YaldaGpuiView {
             jump_tag_order: HashMap::new(),
             jump_folded_tags: std::collections::HashSet::new(),
             jump_tile_order: Vec::new(),
+            jump_detached_tile_order: Vec::new(),
             jump_order_succession: HashMap::new(),
             recaps: HashMap::new(),
             roster_unread: HashMap::new(),
@@ -3798,6 +3805,8 @@ impl YaldaGpuiView {
             }),
             jump_tile_order: (!self.jump_tile_order.is_empty())
                 .then(|| self.jump_tile_order.clone()),
+            jump_detached_tile_order: (!self.jump_detached_tile_order.is_empty())
+                .then(|| self.jump_detached_tile_order.clone()),
         });
     }
 
@@ -9806,6 +9815,9 @@ fn main() {
                         }
                         if let Some(o) = prefs.jump_tile_order {
                             view.jump_tile_order = o;
+                        }
+                        if let Some(o) = prefs.jump_detached_tile_order {
+                            view.jump_detached_tile_order = o;
                         }
                         // Universal agent roster (universal-agent-list): start
                         // the server pump + seed the roster at boot (not only

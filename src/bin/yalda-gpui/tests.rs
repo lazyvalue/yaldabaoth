@@ -671,6 +671,7 @@ fn preferences_round_trip_with_text_scale() {
         )])),
         jump_folded_tags: Some(vec!["Yaldabaoth\u{1f}frontend".into()]),
         jump_tile_order: Some(vec![30, 10, 20]),
+        jump_detached_tile_order: Some(vec![60, 40, 50]),
     };
     let json = serde_json::to_string(&prefs).unwrap();
     let back: Preferences = serde_json::from_str(&json).unwrap();
@@ -725,6 +726,10 @@ fn preferences_round_trip_with_text_scale() {
     );
     // UXI-JumpPanel-28: the tile drag order round-trips.
     assert_eq!(back.jump_tile_order.as_deref(), Some(&[30, 10, 20][..]));
+    assert_eq!(
+        back.jump_detached_tile_order.as_deref(),
+        Some(&[60, 40, 50][..])
+    );
 
     // Default (no zoom) is omitted from the serialized form.
     let bare = Preferences::default();
@@ -737,6 +742,7 @@ fn preferences_round_trip_with_text_scale() {
     assert_eq!(parsed.window_width_px, None);
     assert_eq!(parsed.window_height_px, None);
     assert_eq!(parsed.jump_workspace_order, None);
+    assert_eq!(parsed.jump_detached_tile_order, None);
     assert_eq!(parsed.theme.as_deref(), Some("folio"));
 }
 

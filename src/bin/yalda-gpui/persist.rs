@@ -681,6 +681,13 @@ pub(crate) struct Preferences {
     /// so one global list suffices. `None`/absent = layout order (the default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) jump_tile_order: Option<Vec<workspace::WindowId>>,
+    /// User's drag-reordered order of Detached tile rows (UXI-JumpPanel-28).
+    /// Kept separate from `jump_tile_order` so rebuilding the complete attached
+    /// order cannot erase the Detached presentation order (and vice versa).
+    /// Drops are project/tag-group gated; one global durable `WindowId` rank is
+    /// sufficient. `None`/absent = alphabetical order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) jump_detached_tile_order: Option<Vec<workspace::WindowId>>,
 }
 
 pub(crate) fn load_preferences() -> Preferences {

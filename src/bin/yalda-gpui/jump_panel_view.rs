@@ -153,16 +153,24 @@ pub(crate) struct TagDrag {
     pub(crate) tag: String,
 }
 
-/// Drag payload for a tile row being reordered within its workspace folder
-/// (UXI-JumpPanel-28). Carries the tile's durable `WindowId` (identity for the
-/// reorder) plus its `group` — the owning workspace folder index — so a drop
-/// target rejects a cross-folder drop via `can_drop`, making "a tile can't be
-/// dragged into another workspace folder" a hard gate at the gesture level. Typed
-/// distinctly from the session/cwd/tag drags so the drops never cross-fire.
+/// The exact visible group in which a tile row may reorder (UXI-JumpPanel-28).
+/// Encoding workspace, project, tag, and untagged membership as a closed enum
+/// makes every drop boundary explicit and exhaustively gateable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TileDragGroup {
+    Workspace(usize),
+    DetachedTag { project: ProjectId, tag: String },
+    DetachedUntagged(ProjectId),
+}
+
+/// Drag payload for a tile row being reordered within its visible group
+/// (UXI-JumpPanel-28). Carries the tile's durable `WindowId` plus a typed group
+/// gate. It is distinct from session/cwd/tag-folder drags so those operations
+/// cannot cross-fire.
 #[derive(Clone)]
 pub(crate) struct TileDrag {
     pub(crate) id: workspace::WindowId,
-    pub(crate) group: usize,
+    pub(crate) group: TileDragGroup,
 }
 
 /// Drag payload for a workspace folder header (UXI-JumpPanel-29). The durable
@@ -340,6 +348,70 @@ impl AgentRow {
 }
 
 impl YaldaGpuiView {
+    /// Reorder a Detached tile within its exact project/tag (or untagged) group
+    /// (UXI-JumpPanel-28). The typed drag predicate rejects invalid gestures;
+    /// this state boundary independently derives live tile membership and is a
+    /// no-op unless both identities still belong to the supplied group.
+    pub(crate) fn reorder_detached_tile(
+        &mut self,
+        dragged: workspace::WindowId,
+        target: workspace::WindowId,
+        group: &TileDragGroup,
+        cx: &mut Context<Self>,
+    ) {
+        let belongs_to_group = |id: workspace::WindowId| {
+            self.workspace
+                .detached_tiles
+                .iter()
+                .find(|tile| tile.window.id() == id)
+                .is_some_and(|tile| match group {
+                    TileDragGroup::Workspace(_) => false,
+                    TileDragGroup::DetachedTag { project, tag } => {
+                        tile.project() == *project && tile.window.tags.contains(tag)
+                    }
+                    TileDragGroup::DetachedUntagged(project) => {
+                        tile.project() == *project && tile.window.tags.is_empty()
+                    }
+                })
+        };
+        if !belongs_to_group(dragged) || !belongs_to_group(target) {
+            return;
+        }
+
+        // Rebuild a total order over ALL Detached tiles, not merely the current
+        // Waiting/Working/Archived filter. That keeps switching tabs from
+        // silently dropping identities out of the durable preference.
+        let agent_rows = self.jump_panel_agent_rows(cx);
+        let mut ids = Vec::with_capacity(self.workspace.detached_tiles.len());
+        for (project, _) in self.projects.iter() {
+            let mut rows: Vec<_> = self
+                .workspace
+                .detached_tiles
+                .iter()
+                .filter(|tile| tile.project() == project)
+                .map(|tile| {
+                    self.jump_tile_row(&tile.window, &agent_rows, JumpTilePlacement::Detached, cx)
+                })
+                .collect();
+            rows.sort_by(|a, b| a.label.cmp(&b.label));
+            let rank = |id: workspace::WindowId| {
+                self.jump_detached_tile_order
+                    .iter()
+                    .position(|ordered| *ordered == id)
+                    .unwrap_or(usize::MAX)
+            };
+            rows.sort_by_key(|row| rank(row.id));
+            ids.extend(rows.into_iter().map(|row| row.id));
+        }
+        reorder_move_win(&mut ids, dragged, target);
+        if ids == self.jump_detached_tile_order {
+            return;
+        }
+        self.jump_detached_tile_order = ids;
+        self.save_settings();
+        cx.notify();
+    }
+
     /// Build the deduped agent-session rows for the jump panel: the universal
     /// roster (every server session) unioned with local-only sessions not yet
     /// represented in the roster (mid-create placeholders). Sessions opened here
@@ -824,6 +896,16 @@ impl YaldaGpuiView {
                 })
                 .collect();
             detached.sort_by(|a, b| a.label.cmp(&b.label));
+            // Detached order is independent from attached workspace tile order.
+            // This stable rank sort preserves the alphabetical default for an
+            // absent preference and for newly discovered, unlisted tiles.
+            let detached_rank = |tile_id: workspace::WindowId| {
+                self.jump_detached_tile_order
+                    .iter()
+                    .position(|ordered| *ordered == tile_id)
+                    .unwrap_or(usize::MAX)
+            };
+            detached.sort_by_key(|tile| detached_rank(tile.id));
             let waiting_count = detached
                 .iter()
                 .filter_map(|tile| tile.agent.as_ref())
@@ -1922,7 +2004,7 @@ impl YaldaGpuiView {
                             drag_fg,
                             drag_font.clone(),
                             supporting_text,
-                            Some(idx),
+                            Some(TileDragGroup::Workspace(idx)),
                             cx,
                         ));
                     }
@@ -2089,7 +2171,10 @@ impl YaldaGpuiView {
                             drag_fg,
                             drag_font.clone(),
                             supporting_text,
-                            None,
+                            Some(TileDragGroup::DetachedTag {
+                                project: pid,
+                                tag: tag.clone(),
+                            }),
                             cx,
                         ));
                     }
@@ -2123,7 +2208,7 @@ impl YaldaGpuiView {
                     drag_fg,
                     drag_font.clone(),
                     supporting_text,
-                    None,
+                    Some(TileDragGroup::DetachedUntagged(pid)),
                     cx,
                 ));
             }
@@ -2400,37 +2485,50 @@ impl YaldaGpuiView {
 }
 
 /// Attach the tile drag-reorder wiring (UXI-JumpPanel-28) to a nav-row element:
-/// a `TileDrag` payload carrying the tile's `WindowId` + owning workspace-folder
-/// `group`, a `can_drop` gate that refuses a drop from a different folder, the
-/// drag-over highlight, and the drop handler that calls `reorder_tile`. Shared by
-/// the non-agent (`◇`) and agent-backed tile rows so both reorder identically.
+/// a `TileDrag` payload carrying the tile's `WindowId` + exact visible `group`,
+/// a `can_drop` gate that refuses a drop from a different group, the drag-over
+/// highlight, and a typed dispatch to the relevant guarded state transition.
+/// Shared by non-agent (`◇`) and agent-backed tile rows so both behave alike.
 fn attach_tile_drag(
     row: gpui::Stateful<gpui::Div>,
     id: workspace::WindowId,
-    group: usize,
+    group: TileDragGroup,
     label: SharedString,
     drag_fg: Hsla,
     sel_bg: Hsla,
     drag_font: SharedString,
     cx: &mut Context<YaldaGpuiView>,
 ) -> gpui::Stateful<gpui::Div> {
-    row.on_drag(TileDrag { id, group }, move |_payload, _pos, _window, cx| {
-        cx.new(|_| JumpDragPreview {
-            label: label.clone(),
-            fg: drag_fg,
-            bg: sel_bg,
-            font: drag_font.clone(),
-        })
-    })
+    let predicate_group = group.clone();
+    let drop_group = group.clone();
+    row.on_drag(
+        TileDrag {
+            id,
+            group: group.clone(),
+        },
+        move |_payload, _pos, _window, cx| {
+            cx.new(|_| JumpDragPreview {
+                label: label.clone(),
+                fg: drag_fg,
+                bg: sel_bg,
+                font: drag_font.clone(),
+            })
+        },
+    )
     .can_drop(move |dragged, _window, _cx| {
         dragged
             .downcast_ref::<TileDrag>()
-            .is_some_and(|d| d.group == group)
+            .is_some_and(|d| d.group == predicate_group)
     })
     .drag_over::<TileDrag>(move |s, _, _, _| s.bg(sel_bg))
-    .on_drop(cx.listener(move |this, dragged: &TileDrag, _window, cx| {
-        this.reorder_tile(dragged.id, id, cx)
-    }))
+    .on_drop(cx.listener(
+        move |this, dragged: &TileDrag, _window, cx| match &drop_group {
+            TileDragGroup::Workspace(_) => this.reorder_tile(dragged.id, id, cx),
+            TileDragGroup::DetachedTag { .. } | TileDragGroup::DetachedUntagged(_) => {
+                this.reorder_detached_tile(dragged.id, id, &drop_group, cx)
+            }
+        },
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2445,9 +2543,9 @@ fn jump_tile_row_el(
     drag_fg: Hsla,
     drag_font: SharedString,
     supporting_text: Hsla,
-    // `Some(folder index)` makes this tile row drag-reorderable within that
-    // workspace folder (UXI-JumpPanel-28); `None` for detached/tag-folder rows.
-    tile_drag: Option<usize>,
+    // `Some(group)` makes this tile row drag-reorderable only within that exact
+    // workspace or Detached project/tag/untagged group (UXI-JumpPanel-28).
+    tile_drag: Option<TileDragGroup>,
     cx: &mut Context<YaldaGpuiView>,
 ) -> AnyElement {
     // A hidden (stashed) tile is marked with a single dim "eye-off" glyph at the
@@ -2552,11 +2650,11 @@ fn jump_session_row_el(
     allow_drag: bool,
     supporting_text: Hsla,
     hidden_indicator: Option<AnyElement>,
-    // `Some((tile WindowId, folder index))` makes this agent-backed tile row
-    // drag-reorderable within its workspace folder (UXI-JumpPanel-28). Mutually
-    // exclusive with `allow_drag` (the session-level reorder), which is `false`
-    // in the tile context. `None` for flat session-list rows.
-    tile_drag: Option<(workspace::WindowId, usize)>,
+    // `Some((tile WindowId, exact group))` makes this agent-backed tile row
+    // drag-reorderable within its workspace or Detached group
+    // (UXI-JumpPanel-28). Mutually exclusive with `allow_drag` (session-level
+    // reorder), which is `false` in the tile context.
+    tile_drag: Option<(workspace::WindowId, TileDragGroup)>,
     cx: &mut Context<YaldaGpuiView>,
 ) -> gpui::AnyElement {
     // Cloned up front so the tile-drag attach below still has a font handle after

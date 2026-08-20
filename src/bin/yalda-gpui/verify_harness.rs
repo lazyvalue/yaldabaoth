@@ -12396,6 +12396,215 @@ fn jump_tile_reorder_applies_within_folder_and_gates_by_folder(cx: &mut TestAppC
     );
 }
 
+/// UXI-JumpPanel-28, REAL Detached path: a tile drag changes only the durable
+/// presentation order inside its exact project/tag (or project/untagged) group.
+/// Project ownership, tags, attachment, and tile identity are invariant, while
+/// cross-project, tag-to-untagged, and attached-to-detached drops are refused.
+#[gpui::test]
+fn jump_detached_tile_reorder_is_group_bounded_and_preserves_ownership(cx: &mut TestAppContext) {
+    use crate::{App, LinearTile, TileDragGroup};
+    let (view, vcx) = boot_browser(cx);
+
+    let (project, other_project, alpha, beta, gamma, tagged_a, tagged_b, foreign, attached) = view
+        .update(vcx, |v, _| {
+            let project = v.workspace.active_workspace().expect("workspace").project();
+            let other_project = v
+                .projects
+                .create(
+                    "Detached order B".into(),
+                    PathBuf::from("/tmp/yalda-detached-order-b"),
+                )
+                .expect("second project");
+            let make_detached = |v: &mut YaldaGpuiView, label: &str, pid| {
+                let mut tile = LinearTile::new();
+                tile.title = label.into();
+                v.workspace.push_detached(App::Linear(tile), pid)
+            };
+            let alpha = make_detached(v, "alpha", project);
+            let beta = make_detached(v, "beta", project);
+            let gamma = make_detached(v, "gamma", project);
+            let tagged_a = make_detached(v, "tagged alpha", project);
+            let tagged_b = make_detached(v, "tagged beta", project);
+            v.workspace
+                .tile_mut(tagged_a)
+                .unwrap()
+                .tags
+                .insert("focus".into());
+            v.workspace
+                .tile_mut(tagged_b)
+                .unwrap()
+                .tags
+                .insert("focus".into());
+            let foreign = make_detached(v, "foreign", other_project);
+            v.workspace
+                .tile_mut(foreign)
+                .unwrap()
+                .tags
+                .insert("focus".into());
+            let mut attached_tile = LinearTile::new();
+            attached_tile.title = "attached".into();
+            let attached = v
+                .workspace
+                .push_workspace_inheriting(App::Linear(attached_tile));
+            (
+                project,
+                other_project,
+                alpha,
+                beta,
+                gamma,
+                tagged_a,
+                tagged_b,
+                foreign,
+                attached,
+            )
+        });
+
+    let project_rows = |v: &mut YaldaGpuiView, cx: &mut gpui::Context<YaldaGpuiView>, pid| {
+        v.jump_panel_sections_with_tab(cx, Some(crate::JumpAgentTab::All))
+            .0
+            .into_iter()
+            .find(|section| section.id == pid)
+            .expect("project section")
+            .detached
+    };
+    let untagged_ids = |rows: Vec<crate::JumpTileRow>| {
+        rows.into_iter()
+            .filter(|row| row.tags.is_empty())
+            .map(|row| row.id)
+            .collect::<Vec<_>>()
+    };
+    let ownership_before = view.update(vcx, |v, _| {
+        v.workspace
+            .detached_tiles
+            .iter()
+            .map(|tile| (tile.window.id(), tile.project(), tile.window.tags.clone()))
+            .collect::<Vec<_>>()
+    });
+
+    let initial = view.update(vcx, |v, cx| untagged_ids(project_rows(v, cx, project)));
+    assert_eq!(initial, vec![alpha, beta, gamma]);
+    view.update(vcx, |v, cx| {
+        v.reorder_detached_tile(gamma, alpha, &TileDragGroup::DetachedUntagged(project), cx)
+    });
+    assert_eq!(
+        view.update(vcx, |v, cx| untagged_ids(project_rows(v, cx, project))),
+        vec![gamma, alpha, beta],
+        "same-project untagged drag moves the tile into the target slot"
+    );
+    assert!(
+        view.update(vcx, |v, _| {
+            v.jump_detached_tile_order
+                .windows(3)
+                .any(|ids| ids == [gamma, alpha, beta])
+        }),
+        "the Detached presentation order is retained for preference persistence"
+    );
+    view.update(vcx, |v, cx| {
+        v.reorder_detached_tile(beta, alpha, &TileDragGroup::DetachedUntagged(project), cx)
+    });
+    assert_eq!(
+        view.update(vcx, |v, cx| untagged_ids(project_rows(v, cx, project))),
+        vec![gamma, beta, alpha],
+        "a later reorder starts from the previously persisted rank order"
+    );
+
+    view.update(vcx, |v, cx| {
+        v.reorder_detached_tile(
+            tagged_b,
+            tagged_a,
+            &TileDragGroup::DetachedTag {
+                project,
+                tag: "focus".into(),
+            },
+            cx,
+        )
+    });
+    let tagged_ids = view.update(vcx, |v, cx| {
+        project_rows(v, cx, project)
+            .into_iter()
+            .filter(|row| row.tags.iter().any(|tag| tag == "focus"))
+            .map(|row| row.id)
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(tagged_ids, vec![tagged_b, tagged_a]);
+    view.read_with(vcx, |v, _| {
+        assert_eq!(
+            v.jump_detached_tile_order.last(),
+            Some(&foreign),
+            "the total durable order retains every project in panel order"
+        );
+        assert_eq!(
+            v.jump_detached_tile_order.len(),
+            ownership_before.len(),
+            "the durable order includes every Detached identity exactly once"
+        );
+    });
+
+    let order_after_valid = view.update(vcx, |v, cx| {
+        project_rows(v, cx, project)
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>()
+    });
+    let durable_after_valid = view.read_with(vcx, |v, _| v.jump_detached_tile_order.clone());
+    for (dragged, target, group) in [
+        (foreign, alpha, TileDragGroup::DetachedUntagged(project)),
+        (tagged_a, alpha, TileDragGroup::DetachedUntagged(project)),
+        (
+            foreign,
+            tagged_a,
+            TileDragGroup::DetachedTag {
+                project,
+                tag: "focus".into(),
+            },
+        ),
+        (
+            alpha,
+            tagged_a,
+            TileDragGroup::DetachedTag {
+                project,
+                tag: "focus".into(),
+            },
+        ),
+        (attached, alpha, TileDragGroup::DetachedUntagged(project)),
+        (
+            alpha,
+            foreign,
+            TileDragGroup::DetachedUntagged(other_project),
+        ),
+    ] {
+        view.update(vcx, |v, cx| {
+            v.reorder_detached_tile(dragged, target, &group, cx)
+        });
+    }
+    assert_eq!(
+        view.update(vcx, |v, cx| {
+            project_rows(v, cx, project)
+                .into_iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>()
+        }),
+        order_after_valid,
+        "invalid cross-boundary drops are no-ops"
+    );
+    assert_eq!(
+        view.read_with(vcx, |v, _| v.jump_detached_tile_order.clone()),
+        durable_after_valid,
+        "invalid drops cannot mutate the durable order behind the projection"
+    );
+    assert_eq!(
+        view.update(vcx, |v, _| {
+            v.workspace
+                .detached_tiles
+                .iter()
+                .map(|tile| (tile.window.id(), tile.project(), tile.window.tags.clone()))
+                .collect::<Vec<_>>()
+        }),
+        ownership_before,
+        "reordering cannot change identity, project, tags, or attachment"
+    );
+}
+
 /// UXI-JumpPanel-29, REAL state-transition path: workspace folders reorder only
 /// inside their project in the jump-panel projection. The operation must never
 /// mutate `Frame::workspaces`, so global indices (`Ctrl-<n>`) and project/tile
