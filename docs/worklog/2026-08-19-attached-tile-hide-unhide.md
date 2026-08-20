@@ -1,8 +1,8 @@
 # Worklog: Attached tile hide/unhide
 
 **Date:** 2026-08-19
-**Branches touched:** `codex/hide-unhide-tiles` (`<pending>`), then `main`
-(`<pending>` merge)
+**Branches touched:** `codex/hide-unhide-tiles` (`c0b9128`), then `main`
+(`4f43044` merge)
 
 ## Cog execution evidence
 
@@ -41,9 +41,11 @@ frontier 6: omega [open] (omega)
 - `xcnw` `verify`: claimed → closed; output: complete deterministic GUI,
   library, non-benchmark target, and benchmark suites passed; focused mutation
   checks caught every viable Hide/Detach/persisted-identity mutation.
-- `qw66` `integrate`: claimed → pending close; output: isolated feature commit,
-  merge, post-merge verification, release rebuild, and worklog finalization.
-- `c4ly` `omega`: pending.
+- `qw66` `integrate`: claimed → closed; output: feature commit `c0b9128`
+  merged as `4f43044`; post-merge check, library and deterministic GUI suites,
+  and release builds passed while preserving the pre-existing user changes.
+- `c4ly` `omega`: claimed → closed; output: all graph nodes completed, the
+  feature is merged, and post-merge debug/release verification passed.
 
 ### Notes
 
@@ -61,7 +63,7 @@ frontier 6: omega [open] (omega)
 
 ### Final status
 
-- Status: `pending integration`
+- Status: `complete`
 
 ```text
 graph attached-tile-hide-unhide (frontiers)
@@ -70,8 +72,8 @@ frontier 1: typed-model [done]
 frontier 2: persist-migrate [done]
 frontier 3: commands-nav [done]
 frontier 4: verify [done]
-frontier 5: integrate [claimed]
-frontier 6: omega [open] (omega)
+frontier 5: integrate [done]
+frontier 6: omega [done] (omega)
 ```
 
 ## Built (with status)
@@ -106,6 +108,9 @@ frontier 6: omega [open] (omega)
 
 - `cargo check --bin yalda-gpui`: passed.
 - `cargo build --bin yalda-gpui --bin yalda-session-server`: passed.
+- Post-merge `cargo check --bin yalda-gpui --bin yalda-session-server`: passed.
+- Post-merge `cargo build --release --bin yalda-gpui
+  --bin yalda-session-server`: passed.
 - Deterministic GUI suite: 653 passed, 0 failed, 2 ignored, 2 baseline tests
   filtered.
 - Library suite: 173 passed, 0 failed, 2 ignored.
@@ -115,7 +120,7 @@ frontier 6: omega [open] (omega)
   unviable; Detach action boundary 3 caught / 1 unviable; zero viable survivors.
 - `git diff --check`: passed before commit.
 - `scripts/check-cog-worklog.sh
-  docs/worklog/2026-08-19-attached-tile-hide-unhide.md`: pending omega.
+  docs/worklog/2026-08-19-attached-tile-hide-unhide.md`: passed after omega.
 
 ## Next
 
