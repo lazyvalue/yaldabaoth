@@ -646,6 +646,7 @@ fn preferences_round_trip_with_text_scale() {
             vec!["urgent".to_string(), "frontend".to_string()],
         )])),
         jump_folded_tags: Some(vec!["Yaldabaoth\u{1f}frontend".into()]),
+        jump_tile_order: Some(vec![30, 10, 20]),
     };
     let json = serde_json::to_string(&prefs).unwrap();
     let back: Preferences = serde_json::from_str(&json).unwrap();
@@ -689,6 +690,8 @@ fn preferences_round_trip_with_text_scale() {
         back.jump_folded_tags.as_deref(),
         Some(&["Yaldabaoth\u{1f}frontend".to_string()][..])
     );
+    // UXI-JumpPanel-28: the tile drag order round-trips.
+    assert_eq!(back.jump_tile_order.as_deref(), Some(&[30, 10, 20][..]));
 
     // Default (no zoom) is omitted from the serialized form.
     let bare = Preferences::default();
