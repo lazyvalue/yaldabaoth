@@ -668,6 +668,13 @@ pub(crate) struct Preferences {
     /// (UXI-JumpPanel-21). Absent means every folder starts expanded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) jump_folded_tags: Option<Vec<String>>,
+    /// User's drag-reordered order of jump-panel TILE rows within a workspace
+    /// folder (UXI-JumpPanel-28). One global ordered list of durable `WindowId`s;
+    /// within each workspace folder tiles sort by their index here, any tile not
+    /// listed sorts after in layout-traversal order. A tile drag is folder-gated,
+    /// so one global list suffices. `None`/absent = layout order (the default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) jump_tile_order: Option<Vec<workspace::WindowId>>,
 }
 
 pub(crate) fn load_preferences() -> Preferences {

@@ -1567,3 +1567,62 @@ all structural workspace accents derive from the cool-blue subheader token.
 `crowded_jump_panel_workspace_groups_never_shrink_to_bands` constrains the real
 renderer to a 900×360 viewport with sixteen mixed expanded/collapsed workspaces
 and requires every group to retain its intrinsic height under scroll pressure.
+
+### UXI-JumpPanel-28 — Tiles reorder by drag within their workspace folder; hidden is an icon
+
+**Statement.** The tiles inside a workspace folder are user-orderable by
+drag-and-drop, folder-bounded, and the order survives restart:
+
+1. **Tiles reorder within their folder.** Dragging a tile row onto another tile
+   row in the SAME workspace folder moves it into that slot (the target shifts
+   down). The order is one global list of durable `WindowId`s, persisted in
+   `Preferences::jump_tile_order`. Both non-agent (`◇`) and agent-backed tile
+   rows drag identically.
+2. **A tile never crosses folders.** A tile drag is accepted only by a drop
+   target in its own workspace folder (`can_drop` gates on the drag payload's
+   `group` = the owning folder index), and `reorder_tile` defensively re-checks
+   both tiles share a folder and refuses otherwise — a hard gate at the gesture
+   AND a guard in the state change.
+3. The order is applied as a **stable** sort by "rank in `jump_tile_order`" over
+   each folder's layout-traversal-plus-hidden tile list, so an empty/absent order
+   is a total no-op (tiles stay in layout order) and a tile not yet in the list
+   keeps its default position after the listed ones.
+4. Only workspace-folder tile rows drag; Detached and tag-folder tile rows do
+   not participate.
+
+**Hidden marker.** A hidden (stashed) attached tile is marked by a single dim
+`⊘` glyph in a fixed-width cell at the row's FAR trailing edge — identical
+placement for tile and agent rows. This replaces the earlier `"hidden"` text
+pill (`compact_status_mark`), which read as heavy chrome and, because it shared
+the mid-row status slot, sat in a different column on tile vs agent rows. The
+leading nav glyph (`◇`/`✦`/`⊞`) renders one step larger than the row text so the
+icon column carries row identity at a glance.
+
+**Applies to.** `jump_panel_view.rs` (`TileDrag` payload, `attach_tile_drag`,
+`reorder_move_win`, `reorder_tile`, the per-folder stable sort in
+`jump_panel_sections_with_tab`, and the `on_drag`/`can_drop`/`drag_over`/
+`on_drop` wiring on the workspace-folder tile rows; the hidden-icon +
+`jump_nav_row_hinted` trailing-slot / badge-size changes) and the
+`Preferences::jump_tile_order` persistence (`persist.rs`, loaded/saved in
+`main.rs`).
+
+**Why.** Layout order is not how a user thinks about a workspace's tiles; manual
+curation (drag the tile you work in most to the top of the folder list) is — the
+direct analog of the session-level reorder (`UXI-JumpPanel-2`). Bounding the drag
+to one folder keeps the list a faithful map of workspace membership; a tile
+appearing under a foreign folder would be a lie about where it lives, hence the
+hard folder gate. The hidden text pill was replaced with an icon because a word
+in the row is heavier and less consistent than a glyph.
+
+**Status.** `implemented` — headless for the ordering + reorder state change +
+folder gate; the GPUI mouse-drag GESTURE that dispatches the drop is
+`NEEDS-RUNTIME` (gap #2, no headless drag-dispatch seam), and the exact hidden
+glyph / enlarged badge are a paint/human-eye detail (gap #1).
+
+**Enforcement.** `verify_harness.rs`: `jump_tile_reorder_move_semantics` (the
+`WindowId` list surgery + no-op cases) and
+`jump_tile_reorder_applies_within_folder_and_gates_by_folder` (drives the REAL
+`reorder_tile` the drop handler calls: default = layout order, a within-folder
+drag reorders + persists, a cross-folder drag is refused). Negative control
+observed RED by deleting the `tiles.sort_by_key(rank)` line in
+`jump_panel_sections_with_tab` (the reorder assertion then fails).

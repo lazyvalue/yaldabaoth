@@ -153,6 +153,18 @@ pub(crate) struct TagDrag {
     pub(crate) tag: String,
 }
 
+/// Drag payload for a tile row being reordered within its workspace folder
+/// (UXI-JumpPanel-28). Carries the tile's durable `WindowId` (identity for the
+/// reorder) plus its `group` — the owning workspace folder index — so a drop
+/// target rejects a cross-folder drop via `can_drop`, making "a tile can't be
+/// dragged into another workspace folder" a hard gate at the gesture level. Typed
+/// distinctly from the session/cwd/tag drags so the drops never cross-fire.
+#[derive(Clone)]
+pub(crate) struct TileDrag {
+    pub(crate) id: workspace::WindowId,
+    pub(crate) group: usize,
+}
+
 /// The little floating label rendered under the cursor while dragging a
 /// jump-panel row (jump-reorder). GPUI's `on_drag` wants an `Entity<impl
 /// Render>` for the drag image; this is that image — just the row's label on a
@@ -720,6 +732,16 @@ impl YaldaGpuiView {
                             cx,
                         ));
                     }
+                    // Apply the user's drag order (UXI-JumpPanel-28): a STABLE sort
+                    // by rank in `jump_tile_order`, so unlisted tiles keep their
+                    // layout-traversal position and an empty order is a total no-op.
+                    let tile_rank = |id: workspace::WindowId| {
+                        self.jump_tile_order
+                            .iter()
+                            .position(|x| *x == id)
+                            .unwrap_or(usize::MAX)
+                    };
+                    tiles.sort_by_key(|t| tile_rank(t.id));
                     JumpWorkspaceFolder {
                         index,
                         key: Self::workspace_fold_key(&p.name, &wsp.auto_name),
@@ -1048,6 +1070,29 @@ pub(crate) fn reorder_move(v: &mut Vec<String>, dragged: &str, target: &str) {
     v.insert(to, dragged.to_string());
 }
 
+/// `reorder_move` for durable `WindowId`s — the tile-row analog of the session
+/// reorder (UXI-JumpPanel-28). Same "move dragged to target's slot" semantics on
+/// a `Vec<WindowId>`, kept separate from the `String` version so both stay
+/// trivially unit-testable.
+pub(crate) fn reorder_move_win(
+    v: &mut Vec<workspace::WindowId>,
+    dragged: workspace::WindowId,
+    target: workspace::WindowId,
+) {
+    if dragged == target {
+        return;
+    }
+    let Some(from) = v.iter().position(|x| *x == dragged) else {
+        return;
+    };
+    v.remove(from);
+    let to = v
+        .iter()
+        .position(|x| *x == target)
+        .unwrap_or(from.min(v.len()));
+    v.insert(to, dragged);
+}
+
 impl YaldaGpuiView {
     /// Append newly discovered server sessions to the durable All order without
     /// disturbing any existing slot. On the first roster seed this freezes the
@@ -1132,6 +1177,44 @@ impl YaldaGpuiView {
             return;
         }
         self.jump_session_order = sids;
+        self.save_settings();
+        cx.notify();
+    }
+
+    /// Reorder tile `dragged` (durable `WindowId`) to `target`'s slot WITHIN their
+    /// shared workspace folder (UXI-JumpPanel-28). The drop is folder-gated
+    /// (`can_drop`), and we defensively re-check both tiles live in the same
+    /// workspace folder and bail otherwise — a tile drag never crosses folders.
+    /// Rebuilds `jump_tile_order` over ALL tiles in current display order across
+    /// every folder (so it stays a total order as folders come and go), then
+    /// persists + notifies.
+    pub(crate) fn reorder_tile(
+        &mut self,
+        dragged: workspace::WindowId,
+        target: workspace::WindowId,
+        cx: &mut Context<Self>,
+    ) {
+        let (sections, _) = self.jump_panel_sections(cx);
+        let folders = || sections.iter().flat_map(|s| &s.workspace_folders);
+        let folder_of = |id: workspace::WindowId| {
+            folders()
+                .find(|f| f.tiles.iter().any(|t| t.id == id))
+                .map(|f| f.index)
+        };
+        // Defensive same-folder gate (the drop predicate already enforces it).
+        match (folder_of(dragged), folder_of(target)) {
+            (Some(a), Some(b)) if a == b => {}
+            _ => return,
+        }
+        // Total order over all folder tiles in present display order.
+        let mut ids: Vec<workspace::WindowId> = folders()
+            .flat_map(|f| f.tiles.iter().map(|t| t.id))
+            .collect();
+        reorder_move_win(&mut ids, dragged, target);
+        if ids == self.jump_tile_order {
+            return;
+        }
+        self.jump_tile_order = ids;
         self.save_settings();
         cx.notify();
     }
@@ -1696,6 +1779,7 @@ impl YaldaGpuiView {
                             drag_fg,
                             drag_font.clone(),
                             supporting_text,
+                            Some(idx),
                             cx,
                         ));
                     }
@@ -1862,6 +1946,7 @@ impl YaldaGpuiView {
                             drag_fg,
                             drag_font.clone(),
                             supporting_text,
+                            None,
                             cx,
                         ));
                     }
@@ -1895,6 +1980,7 @@ impl YaldaGpuiView {
                     drag_fg,
                     drag_font.clone(),
                     supporting_text,
+                    None,
                     cx,
                 ));
             }
@@ -1926,6 +2012,7 @@ impl YaldaGpuiView {
                             drag_font.clone(),
                             allow_drag,
                             supporting_text,
+                            None,
                             None,
                             cx,
                         ))
@@ -2158,6 +2245,7 @@ impl YaldaGpuiView {
                         true,
                         supporting_text,
                         None,
+                        None,
                         cx,
                     ));
                 }
@@ -2168,6 +2256,41 @@ impl YaldaGpuiView {
     }
 }
 
+/// Attach the tile drag-reorder wiring (UXI-JumpPanel-28) to a nav-row element:
+/// a `TileDrag` payload carrying the tile's `WindowId` + owning workspace-folder
+/// `group`, a `can_drop` gate that refuses a drop from a different folder, the
+/// drag-over highlight, and the drop handler that calls `reorder_tile`. Shared by
+/// the non-agent (`◇`) and agent-backed tile rows so both reorder identically.
+fn attach_tile_drag(
+    row: gpui::Stateful<gpui::Div>,
+    id: workspace::WindowId,
+    group: usize,
+    label: SharedString,
+    drag_fg: Hsla,
+    sel_bg: Hsla,
+    drag_font: SharedString,
+    cx: &mut Context<YaldaGpuiView>,
+) -> gpui::Stateful<gpui::Div> {
+    row.on_drag(TileDrag { id, group }, move |_payload, _pos, _window, cx| {
+        cx.new(|_| JumpDragPreview {
+            label: label.clone(),
+            fg: drag_fg,
+            bg: sel_bg,
+            font: drag_font.clone(),
+        })
+    })
+    .can_drop(move |dragged, _window, _cx| {
+        dragged
+            .downcast_ref::<TileDrag>()
+            .is_some_and(|d| d.group == group)
+    })
+    .drag_over::<TileDrag>(move |s, _, _, _| s.bg(sel_bg))
+    .on_drop(cx.listener(move |this, dragged: &TileDrag, _window, cx| {
+        this.reorder_tile(dragged.id, id, cx)
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn jump_tile_row_el(
     row: &JumpTileRow,
     suffix: &str,
@@ -2179,14 +2302,31 @@ fn jump_tile_row_el(
     drag_fg: Hsla,
     drag_font: SharedString,
     supporting_text: Hsla,
+    // `Some(folder index)` makes this tile row drag-reorderable within that
+    // workspace folder (UXI-JumpPanel-28); `None` for detached/tag-folder rows.
+    tile_drag: Option<usize>,
     cx: &mut Context<YaldaGpuiView>,
 ) -> AnyElement {
+    // A hidden (stashed) tile is marked with a single dim "eye-off" glyph at the
+    // row's trailing edge — the old text pill read as ugly chrome and, because it
+    // shared the mid-row status slot, sat inconsistently between tile and agent
+    // rows. The glyph is a fixed-width flex_none cell so every hidden row's mark
+    // lands in exactly the same column.
     let hidden_indicator = || {
         row.placement.is_hidden().then(|| {
             let probe = format!("jump-tile-hidden-{}{suffix}", row.id);
             probe_bounds_dyn(
-                probe.clone(),
-                compact_status_mark(SharedString::from(probe), "hidden", supporting_text, st)
+                probe,
+                div()
+                    .flex_none()
+                    .w(px(16.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(supporting_text)
+                    .font_family(st.mono.clone())
+                    .text_size(px(st.pt * 0.9))
+                    .child(SharedString::new_static("⊘"))
                     .into_any_element(),
             )
         })
@@ -2207,26 +2347,40 @@ fn jump_tile_row_el(
             false,
             supporting_text,
             hidden_indicator(),
+            tile_drag.map(|group| (row.id, group)),
             cx,
         );
     }
     let id = row.id;
+    let mut row_el = jump_nav_row(
+        SharedString::from(format!("jump-tile-{id}{suffix}")),
+        &row.label,
+        Some(format!("jump-tile-label-{id}{suffix}")),
+        Some("◇"),
+        None,
+        None,
+        st,
+        sel_bg,
+        row.active.then_some(selection_mark),
+        hidden_indicator(),
+    );
+    if let Some(group) = tile_drag {
+        row_el = attach_tile_drag(
+            row_el,
+            id,
+            group,
+            SharedString::from(row.label.clone()),
+            drag_fg,
+            sel_bg,
+            drag_font.clone(),
+            cx,
+        );
+    }
     probe_bounds_dyn(
         format!("jump-tile-row-{id}{suffix}"),
-        jump_nav_row(
-            SharedString::from(format!("jump-tile-{id}{suffix}")),
-            &row.label,
-            Some(format!("jump-tile-label-{id}{suffix}")),
-            Some("◇"),
-            None,
-            None,
-            st,
-            sel_bg,
-            row.active.then_some(selection_mark),
-            hidden_indicator(),
-        )
-        .on_click(cx.listener(move |this, _ev, _window, cx| this.jump_to_tile(id, cx)))
-        .into_any_element(),
+        row_el
+            .on_click(cx.listener(move |this, _ev, _window, cx| this.jump_to_tile(id, cx)))
+            .into_any_element(),
     )
 }
 
@@ -2255,8 +2409,17 @@ fn jump_session_row_el(
     allow_drag: bool,
     supporting_text: Hsla,
     hidden_indicator: Option<AnyElement>,
+    // `Some((tile WindowId, folder index))` makes this agent-backed tile row
+    // drag-reorderable within its workspace folder (UXI-JumpPanel-28). Mutually
+    // exclusive with `allow_drag` (the session-level reorder), which is `false`
+    // in the tile context. `None` for flat session-list rows.
+    tile_drag: Option<(workspace::WindowId, usize)>,
     cx: &mut Context<YaldaGpuiView>,
 ) -> gpui::AnyElement {
+    // Cloned up front so the tile-drag attach below still has a font handle after
+    // the session-drag closure moves `drag_font` (the two paths are exclusive, but
+    // the borrow checker can't see that).
+    let tile_drag_font = drag_font.clone();
     // The agent-session icon is a `✦` whose COLOR carries the status (one glyph =
     // "this is an agent" + what it's doing): working (reply in flight) → orange;
     // ready for input (every connected non-working agent) → green; disconnected
@@ -2349,6 +2512,18 @@ fn jump_session_row_el(
                     this.reorder_session(&dragged.sid, &target_sid, cx)
                 }
             }));
+    }
+    if let Some((id, group)) = tile_drag {
+        r = attach_tile_drag(
+            r,
+            id,
+            group,
+            row.label.clone().into(),
+            drag_fg,
+            sel_bg,
+            tile_drag_font,
+            cx,
+        );
     }
     // UXI-AgentTile-27: the autoname summary sits UNDER the label as a small
     // italic cool-prose line. Chrome-class (fixed size, unaffected by document
@@ -2479,10 +2654,17 @@ fn jump_nav_row_hinted(
     } else {
         label.to_string()
     };
+    // The leading nav glyph reads a touch larger than the row text so the icon
+    // column carries the row's identity at a glance (jump-tile-reorder polish).
+    // Its line-height is pinned to the base row line box (gpui's default is
+    // 1.618×font) so the bigger glyph does NOT grow the row — chrome height stays
+    // fixed (UXI-JumpPanel-24/26).
     let badge_el = div()
-        .w(px(16.0))
+        .w(px(18.0))
         .flex_none()
         .text_color(badge_color.unwrap_or(st.dim))
+        .text_size(px(st.pt * 1.15))
+        .line_height(px(st.pt * 1.618))
         .child(SharedString::from(badge.unwrap_or("").to_string()));
     let badge_el = if let Some(probe) = badge_probe {
         probe_bounds_dyn(probe, badge_el.into_any_element())
@@ -2522,9 +2704,6 @@ fn jump_nav_row_hinted(
         .hover(|s| s.bg(sel_bg))
         .child(badge_el)
         .child(label_el);
-    if let Some(status_mark) = status_mark {
-        row = row.child(status_mark);
-    }
     if let Some(hint) = hint {
         let hint_el = div()
             .flex_none()
@@ -2537,6 +2716,12 @@ fn jump_nav_row_hinted(
             hint_el.into_any_element()
         };
         row = row.child(hint_el);
+    }
+    // The status mark (currently the "hidden" glyph) always sits at the FAR
+    // trailing edge, after any provider hint, so its placement is identical for
+    // tile and agent rows (jump-tile-reorder: consistent icon, was a ragged pill).
+    if let Some(status_mark) = status_mark {
+        row = row.child(status_mark);
     }
     row
 }
