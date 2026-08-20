@@ -42,7 +42,7 @@
 //!   * `Ctrl-V` returns to whatever screen you came from.
 //!   * Same Helix-style normal/insert dispatch as the Edit screen.
 //!
-//! Edit screen — two views over the same buffer (toggle with Ctrl-W):
+//! Edit screen — two views over the same buffer (toggle from the Space menu):
 //!   * RAW view: monospace + per-line markdown syntax highlighting + gutter.
 //!   * WP view: proportional font, headings at variable sizes, inline
 //!     bold/italic styling, list/blockquote decoration. Source markers
@@ -55,7 +55,7 @@
 //!   Mode switch:    i insert at sel-start · a insert after sel-end
 //!                   o/O open line below/above
 //!   Edits:          u undo · (no redo binding by default; see config)
-//!   Both views:     Ctrl-S save · Ctrl-W toggle wp/raw · Ctrl-V back to Doc
+//!   Both views:     Ctrl-S save · Space menu toggles wp/raw · Ctrl-V back to Doc
 //!   Insert mode:    type to insert · Esc → Normal · Backspace · Tab (2 spaces)
 //!
 //! File-browser view keys:
@@ -516,6 +516,13 @@ fn keystroke_to_keypress(ks: &Keystroke) -> KeyPress {
         }
     };
     KeyPress::new(key, mods)
+}
+
+/// Bare Ctrl-W is a reserved shell prefix, never App input. GPUI normally
+/// retains it while matching a multi-key binding; if it reaches an App's raw
+/// key handler, the common interceptor consumes it before App dispatch.
+fn is_ctrl_w_shell_prefix(press: &KeyPress) -> bool {
+    press.modifiers == KMods::CONTROL && matches!(press.key, Key::Char('w' | 'W'))
 }
 
 // ----------------------------------------------------------------------------
@@ -5633,13 +5640,14 @@ impl YaldaGpuiView {
         }
     }
 
-    /// Universal leader dispatch: when the focused tile is NOT in text entry, the
-    /// bare leader keys open their menus with TOP priority, before any
-    /// tile-specific key handling. Returns true if it consumed the key (the
-    /// caller then returns early). Every tile's `on_key_down` calls this first,
-    /// so the menus are reachable from any tile that isn't capturing text —
-    /// including the agent session picker and the Linear project picker.
+    /// Common shell-key dispatch before any App-specific raw-key handling.
+    /// Bare Ctrl-W is always consumed as the reserved workspace prefix. When
+    /// the focused tile is not in text entry, the bare menu leaders also open
+    /// with top priority. Every tile's `on_key_down` calls this first.
     fn leader_intercept(&mut self, press: &KeyPress, cx: &mut Context<Self>) -> bool {
+        if is_ctrl_w_shell_prefix(press) {
+            return true;
+        }
         if !press.modifiers.is_empty() || self.focused_in_insert_mode(cx) {
             return false;
         }

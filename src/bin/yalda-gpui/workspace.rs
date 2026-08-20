@@ -549,8 +549,8 @@ impl Detail {
 /// - `Columns` — every tile is an equal-width, full-height column, side by side
 ///   in signed reading order. The default.
 /// - `Tiling` — dwm-style primary/stack: the first `primary_count` tiles fill
-///   `primary_ratio` of the width on the left (the primary area); the remaining
-///   tiles stack as equal columns on the right.
+///   `primary_ratio` of the width on the left (the primary area); both that area
+///   and the remaining stack on the right arrange their tiles vertically.
 /// - `Monocle` — only the focused tile renders, filling the whole region; the
 ///   others are present (never moved or closed) but not painted.
 /// - `Plane` — the infinite signed-grid plane with the pan/semantic-zoom camera.
@@ -1663,21 +1663,19 @@ impl<C> Workspace<C> {
 
     /// Resolve the visible placement target for a directional swap
     /// (`UXI-Workspace-15`). Plane uses the same spatial resolver as lower-case
-    /// focus motion. Columns/Tiling have only visible left/right adjacency; up/down
-    /// is deliberately a no-op rather than consulting hidden plane geometry.
+    /// focus motion. Columns use visible left/right adjacency. Tiling follows its
+    /// two painted vertical panes, including row-preserving cross-pane motion.
     /// Monocle paints a single tile, so it has no directional neighbor.
     pub fn placement_target(&self, dir: FocusDir) -> Option<WindowId> {
         match (self.view, dir) {
-            (WorkspaceView::Columns | WorkspaceView::Tiling, FocusDir::Left) => {
+            (WorkspaceView::Columns, FocusDir::Left) => {
                 self.desktop.sequence_adjacent(self.focused, false)
             }
-            (WorkspaceView::Columns | WorkspaceView::Tiling, FocusDir::Right) => {
+            (WorkspaceView::Columns, FocusDir::Right) => {
                 self.desktop.sequence_adjacent(self.focused, true)
             }
-            (
-                WorkspaceView::Columns | WorkspaceView::Tiling,
-                FocusDir::Up | FocusDir::Down,
-            ) => None,
+            (WorkspaceView::Columns, FocusDir::Up | FocusDir::Down) => None,
+            (WorkspaceView::Tiling, dir) => self.tiling_target(dir),
             (WorkspaceView::Monocle, _) => None,
             (WorkspaceView::Plane, dir) => {
                 let spatial = match dir {
@@ -1688,6 +1686,63 @@ impl<C> Workspace<C> {
                 };
                 self.desktop.spatial_neighbor(self.focused, spatial)
             }
+        }
+    }
+
+    /// Resolve a neighbor in the visible dwm primary/stack arrangement. The
+    /// signed reading-order prefix is the left pane and the suffix is the right
+    /// pane. Vertical movement stays inside a pane; horizontal movement crosses
+    /// to the closest available row in the other pane.
+    fn tiling_target(&self, dir: FocusDir) -> Option<WindowId> {
+        let order = &self.desktop.slots;
+        let tile_count = order.len();
+        if tile_count == 0 {
+            return None;
+        }
+        let index = order.iter().position(|(id, _)| *id == self.focused)?;
+        let primary_count = self.primary_count.clamp(1, tile_count);
+        let in_primary = index < primary_count;
+
+        let target_index = match dir {
+            FocusDir::Up => {
+                let pane_start = if in_primary { 0 } else { primary_count };
+                (index > pane_start).then(|| index - 1)
+            }
+            FocusDir::Down => {
+                let pane_end = if in_primary {
+                    primary_count
+                } else {
+                    tile_count
+                };
+                (index + 1 < pane_end).then_some(index + 1)
+            }
+            FocusDir::Left if !in_primary => {
+                let row = index - primary_count;
+                Some(row.min(primary_count - 1))
+            }
+            FocusDir::Right if in_primary && primary_count < tile_count => {
+                let stack_count = tile_count - primary_count;
+                Some(primary_count + index.min(stack_count - 1))
+            }
+            FocusDir::Left | FocusDir::Right => None,
+        }?;
+        Some(order[target_index].0)
+    }
+
+    /// Resolve directional focus against the arrangement the user can see.
+    /// Columns and Tiling derive targets from their painted reading-order
+    /// arrangements, never retained Plane coordinates. Monocle maps both
+    /// backward keys and both forward keys onto reading-order siblings so
+    /// movement remains deterministic.
+    pub fn focus_target(&self, dir: FocusDir) -> Option<WindowId> {
+        match (self.view, dir) {
+            (WorkspaceView::Monocle, FocusDir::Left | FocusDir::Up) => {
+                self.desktop.sequence_adjacent(self.focused, false)
+            }
+            (WorkspaceView::Monocle, FocusDir::Right | FocusDir::Down) => {
+                self.desktop.sequence_adjacent(self.focused, true)
+            }
+            _ => self.placement_target(dir),
         }
     }
 
@@ -3285,34 +3340,16 @@ impl<C> Frame<C> {
         Ok(())
     }
 
-    /// Topological focus motion. Walks up the tree from the focused leaf to
-    /// find the nearest ancestor `Split` whose direction matches:
-    ///
-    /// - `Left`/`Right` → nearest `SplitDir::V` ancestor (children laid out
-    ///   left-to-right).
-    /// - `Up`/`Down` → nearest `SplitDir::H` ancestor (children laid out
-    ///   top-to-bottom).
-    ///
-    /// At that ancestor, moves to the sibling at `current_idx ± 1`. If the
-    /// sibling is itself a `Split`, descends into its first leaf (matching
-    /// vim's "land on the most-recently-focused descendant" heuristic with
-    /// a simpler proxy — left-most/top-most leaf).
-    ///
-    /// No-op when there's no sibling in the requested direction.
+    /// Move focus to the active arrangement's visible directional target.
+    /// Plane is spatial; Columns/Tiling use their flattened horizontal order;
+    /// Monocle traverses the reading-order tile being presented. No-op when the
+    /// active arrangement has no target in the requested direction.
     pub fn focus_motion(&mut self, dir: FocusDir) -> Result<(), ()> {
         if self.solo_presentation.is_some() {
             return Err(());
         }
         let wsp = self.active_workspace_mut().ok_or(())?;
-        // Spatial navigation over plane slots (spec-infinite-plane-workspace.md
-        // Behavior 5). No candidate = no-op.
-        let sdir = match dir {
-            FocusDir::Left => SpatialDir::Left,
-            FocusDir::Right => SpatialDir::Right,
-            FocusDir::Up => SpatialDir::Up,
-            FocusDir::Down => SpatialDir::Down,
-        };
-        if let Some(next) = wsp.desktop.spatial_neighbor(wsp.focused, sdir) {
+        if let Some(next) = wsp.focus_target(dir) {
             wsp.focused = next;
         }
         Ok(())
@@ -3862,8 +3899,7 @@ mod desktop_tests {
         assert!(d.arrangement_history.is_empty());
     }
 
-    /// UXI-Workspace-15: Columns resolves only visible horizontal adjacency;
-    /// Plane resolves all four directions through the existing spatial model.
+    /// UXI-Workspace-15/22: each view resolves against only its painted geometry.
     #[test]
     fn placement_target_is_view_aware_and_promotion_keeps_focus() {
         let mut wsp = Workspace::with_layout(
@@ -3882,7 +3918,28 @@ mod desktop_tests {
         assert_eq!(wsp.placement_target(FocusDir::Up), None);
         assert_eq!(wsp.placement_target(FocusDir::Down), None);
 
+        wsp.view = WorkspaceView::Tiling;
+        wsp.primary_count = 1;
+        assert_eq!(wsp.placement_target(FocusDir::Left), Some(1));
+        assert_eq!(wsp.placement_target(FocusDir::Right), None);
+        assert_eq!(wsp.placement_target(FocusDir::Up), None);
+        assert_eq!(wsp.placement_target(FocusDir::Down), Some(3));
+        wsp.focused = 3;
+        assert_eq!(wsp.placement_target(FocusDir::Left), Some(1));
+        assert_eq!(wsp.placement_target(FocusDir::Up), Some(2));
+        wsp.focused = 1;
+        assert_eq!(wsp.placement_target(FocusDir::Right), Some(2));
+        assert_eq!(wsp.placement_target(FocusDir::Up), None);
+
+        wsp.primary_count = 2;
+        wsp.focused = 2;
+        assert_eq!(wsp.placement_target(FocusDir::Up), Some(1));
+        assert_eq!(wsp.placement_target(FocusDir::Right), Some(3));
+        wsp.focused = 3;
+        assert_eq!(wsp.placement_target(FocusDir::Left), Some(1));
+
         wsp.view = WorkspaceView::Plane;
+        wsp.focused = 2;
         assert_eq!(wsp.placement_target(FocusDir::Left), Some(1));
         assert_eq!(wsp.placement_target(FocusDir::Down), Some(3));
         assert!(wsp.promote_focused());

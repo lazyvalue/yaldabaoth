@@ -3,6 +3,26 @@
 use super::*;
 use crate::chrome::{DESKTOP_CELL_H, DESKTOP_CELL_W, DESKTOP_GUTTER};
 
+#[test]
+fn bare_ctrl_w_is_exclusively_reserved_as_the_shell_prefix() {
+    assert!(is_ctrl_w_shell_prefix(&KeyPress::new(
+        Key::Char('w'),
+        KMods::CONTROL,
+    )));
+    assert!(is_ctrl_w_shell_prefix(&KeyPress::new(
+        Key::Char('W'),
+        KMods::CONTROL,
+    )));
+    assert!(!is_ctrl_w_shell_prefix(&KeyPress::new(
+        Key::Char('w'),
+        KMods::ALT,
+    )));
+    assert!(!is_ctrl_w_shell_prefix(&KeyPress::new(
+        Key::Char('h'),
+        KMods::CONTROL,
+    )));
+}
+
 /// UXI-Workspace-22: every shipped `Ctrl-W …` command is shell-owned and is
 /// wired at the common tile ancestor. This exact-set assertion is the change
 /// detector: adding a registry row without adding its central listener fails
