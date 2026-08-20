@@ -273,7 +273,7 @@ The shell menu (`.`) contains these root entries, in this order: `n` New Tile,
 `t` Theme, `j` Toggle Jump Panel, `l` Layout, `w` Workspace, `r` Rebuild and
 Restart GUI, `R` Rebuild and Restart All, and `` ` `` System Console. The Layout
 submenu carries the three arrangement modes (`c` columns, `t` tiling, `m`
-monocle) plus the master-area adjustments; the Workspace submenu holds new /
+monocle) plus the primary-area adjustments; the Workspace submenu holds new /
 rename / close workspace, new project, and back-and-forth. Commands removed from
 these roots are not deleted; tile verbs live on the tile menu, and retired ones
 (plane view, set cwd, also-show) are simply gone.

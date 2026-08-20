@@ -244,10 +244,10 @@ actions!(
         HideFocusedTile,
         UnhideFocusedTile,
         WorkspaceBackAndForth,
-        GrowMasterArea,
-        ShrinkMasterArea,
-        IncreaseMasterCount,
-        DecreaseMasterCount,
+        GrowPrimaryArea,
+        ShrinkPrimaryArea,
+        IncreasePrimaryCount,
+        DecreasePrimaryCount,
         // Splits (Ctrl-W chord prefix per spec-workspaces-and-splits.md §12)
         SplitH,
         SplitV,
@@ -464,10 +464,10 @@ define_ctrl_w_shell_actions! {
     HideFocusedTile => hide_focused_tile,
     UnhideFocusedTile => unhide_focused_tile,
     WorkspaceBackAndForth => workspace_back_and_forth,
-    GrowMasterArea => grow_master_area,
-    ShrinkMasterArea => shrink_master_area,
-    IncreaseMasterCount => increase_master_count,
-    DecreaseMasterCount => decrease_master_count,
+    GrowPrimaryArea => grow_primary_area,
+    ShrinkPrimaryArea => shrink_primary_area,
+    IncreasePrimaryCount => increase_primary_count,
+    DecreasePrimaryCount => decrease_primary_count,
 }
 
 // ----------------------------------------------------------------------------
@@ -1687,7 +1687,7 @@ fn gpui_menu() -> Vec<MenuNode> {
         ),
         MenuNode::entry("j", "toggle jump panel", "toggle-jump-panel"),
         // Layout modes (UXI-Workspace-26) — the arrangement of the active
-        // workspace's tiles. Plane is retired; the master-area controls apply to
+        // workspace's tiles. Plane is retired; the primary-area controls apply to
         // Tiling only.
         MenuNode::submenu(
             "l",
@@ -1697,10 +1697,10 @@ fn gpui_menu() -> Vec<MenuNode> {
                 MenuNode::entry("t", "tiling", "layout-tiling"),
                 MenuNode::entry("m", "monocle", "layout-monocle"),
                 MenuNode::separator(),
-                MenuNode::entry("f", "grow master area", "master-grow"),
-                MenuNode::entry("F", "shrink master area", "master-shrink"),
-                MenuNode::entry("n", "increase master count", "master-count-increase"),
-                MenuNode::entry("N", "decrease master count", "master-count-decrease"),
+                MenuNode::entry("f", "grow primary area", "primary-grow"),
+                MenuNode::entry("F", "shrink primary area", "primary-shrink"),
+                MenuNode::entry("n", "increase primary count", "primary-count-increase"),
+                MenuNode::entry("N", "decrease primary count", "primary-count-decrease"),
             ],
         ),
         // Workspace + project ops. The root stays learnably small; tile-scoped
@@ -2343,8 +2343,8 @@ impl YaldaGpuiView {
             // resurrect a mode. Content (tree leaves) is preserved; geometry
             // reflows once via the first render's seed/reconcile below.
             wsp.layout_mode = workspace::LayoutMode::Plane;
-            wsp.master_ratio = pws.master_ratio;
-            wsp.master_count = pws.master_count;
+            wsp.primary_ratio = pws.primary_ratio;
+            wsp.primary_count = pws.primary_count;
             wsp.tag_view = pws.tag_view;
             // Restore the tile arrangement (UXI-Workspace-14). Old snapshots
             // (no field) load as `Columns` via `#[serde(default)]`.
@@ -4421,56 +4421,56 @@ impl YaldaGpuiView {
         }
     }
 
-    fn adjust_master_area(&mut self, delta: f32, cx: &mut Context<Self>) {
+    fn adjust_primary_area(&mut self, delta: f32, cx: &mut Context<Self>) {
         if self
             .workspace
             .active_workspace_mut()
-            .is_some_and(|workspace| workspace.adjust_master_ratio(delta))
+            .is_some_and(|workspace| workspace.adjust_primary_ratio(delta))
         {
             self.save_workspace_state();
             cx.notify();
         }
     }
 
-    fn grow_master_area(&mut self, _: &GrowMasterArea, _w: &mut Window, cx: &mut Context<Self>) {
-        self.adjust_master_area(0.05, cx);
+    fn grow_primary_area(&mut self, _: &GrowPrimaryArea, _w: &mut Window, cx: &mut Context<Self>) {
+        self.adjust_primary_area(0.05, cx);
     }
 
-    fn shrink_master_area(
+    fn shrink_primary_area(
         &mut self,
-        _: &ShrinkMasterArea,
+        _: &ShrinkPrimaryArea,
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.adjust_master_area(-0.05, cx);
+        self.adjust_primary_area(-0.05, cx);
     }
 
-    fn increase_master_count(
+    fn increase_primary_count(
         &mut self,
-        _: &IncreaseMasterCount,
+        _: &IncreasePrimaryCount,
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self
             .workspace
             .active_workspace_mut()
-            .is_some_and(workspace::Workspace::increase_master_count)
+            .is_some_and(workspace::Workspace::increase_primary_count)
         {
             self.save_workspace_state();
             cx.notify();
         }
     }
 
-    fn decrease_master_count(
+    fn decrease_primary_count(
         &mut self,
-        _: &DecreaseMasterCount,
+        _: &DecreasePrimaryCount,
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self
             .workspace
             .active_workspace_mut()
-            .is_some_and(workspace::Workspace::decrease_master_count)
+            .is_some_and(workspace::Workspace::decrease_primary_count)
         {
             self.save_workspace_state();
             cx.notify();
@@ -5894,23 +5894,23 @@ impl YaldaGpuiView {
             "tile-hide" => self.hide_focused_tile_inner(cx),
             "tile-unhide" => self.unhide_focused_tile_inner(cx),
             "workspace-back-and-forth" => self.workspace_back_and_forth_inner(cx),
-            "master-grow" => self.adjust_master_area(0.05, cx),
-            "master-shrink" => self.adjust_master_area(-0.05, cx),
-            "master-count-increase" => {
+            "primary-grow" => self.adjust_primary_area(0.05, cx),
+            "primary-shrink" => self.adjust_primary_area(-0.05, cx),
+            "primary-count-increase" => {
                 if self
                     .workspace
                     .active_workspace_mut()
-                    .is_some_and(workspace::Workspace::increase_master_count)
+                    .is_some_and(workspace::Workspace::increase_primary_count)
                 {
                     self.save_workspace_state();
                     cx.notify();
                 }
             }
-            "master-count-decrease" => {
+            "primary-count-decrease" => {
                 if self
                     .workspace
                     .active_workspace_mut()
-                    .is_some_and(workspace::Workspace::decrease_master_count)
+                    .is_some_and(workspace::Workspace::decrease_primary_count)
                 {
                     self.save_workspace_state();
                     cx.notify();

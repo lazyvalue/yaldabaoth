@@ -3328,10 +3328,10 @@ fn gpui_menu_has_required_entries() {
         "layout-columns",
         "layout-tiling",
         "layout-monocle",
-        "master-grow",
-        "master-shrink",
-        "master-count-increase",
-        "master-count-decrease",
+        "primary-grow",
+        "primary-shrink",
+        "primary-count-increase",
+        "primary-count-decrease",
         // workspace submenu
         "new-workspace",
         "rename-workspace",
@@ -4895,8 +4895,8 @@ fn plane_persist_test_workspace() -> PersistedWorkspace {
         hidden_tiles: Vec::new(),
         rail: None,
         layout_mode: workspace::LayoutMode::Plane,
-        master_ratio: default_master_ratio(),
-        master_count: default_master_count(),
+        primary_ratio: default_primary_ratio(),
+        primary_count: default_primary_count(),
         tag_view: Default::default(),
         desktop_slots: Vec::new(),
         desktop_spans: Vec::new(),
@@ -4937,6 +4937,34 @@ fn plane_persist_round_trips_signed_slots_and_camera() {
         "negative-coordinate slot round-trips intact: {:?}",
         back.desktop_slots
     );
+}
+
+/// Back-compat for the master→primary rename: a snapshot written by a pre-rename
+/// binary (JSON keys `master_ratio`/`master_count`) still loads into the renamed
+/// `primary_ratio`/`primary_count` fields via `#[serde(alias = ...)]`, and a new
+/// snapshot serializes with the new keys.
+#[test]
+fn primary_area_serde_reads_legacy_master_keys() {
+    // Legacy keys deserialize via alias.
+    let legacy = r#"{
+        "auto_name": "plane-1",
+        "display_name": null,
+        "focused_window": 1,
+        "layout": { "leaf": { "id": 1, "kind": "claude", "data": { "session_id": null } } },
+        "master_ratio": 0.35,
+        "master_count": 3,
+        "cwd": "/tmp"
+    }"#;
+    let back: PersistedWorkspace =
+        serde_json::from_str(legacy).expect("legacy master_* snapshot must load");
+    assert!((back.primary_ratio - 0.35).abs() < 0.001, "master_ratio alias");
+    assert_eq!(back.primary_count, 3, "master_count alias");
+
+    // New snapshots serialize with the new keys.
+    let json = serde_json::to_string(&plane_persist_test_workspace()).expect("serialize");
+    assert!(json.contains("\"primary_ratio\""), "writes primary_ratio: {json}");
+    assert!(json.contains("\"primary_count\""), "writes primary_count: {json}");
+    assert!(!json.contains("\"master_ratio\""), "no legacy master_ratio key");
 }
 
 /// UXI-Workspace-26: the UI arrangements (`view`) round-trip, retired `"plane"`
@@ -5020,8 +5048,8 @@ fn old_workspace_json_loads_as_plane_with_origin_camera() {
         "focused_window": 1,
         "layout": { "leaf": { "id": 1, "kind": "claude", "data": { "session_id": null } } },
         "layout_mode": "master_stack",
-        "master_ratio": 0.6,
-        "master_count": 1,
+        "primary_ratio": 0.6,
+        "primary_count": 1,
         "desktop_slots": [[1, 0, 0], [2, 1, 3]],
         "cwd": "/tmp"
     }"#;
@@ -5074,8 +5102,8 @@ fn old_workspace_json_frame_loads_with_pre_rename_keys() {
                 "focused_window": 1,
                 "layout": { "leaf": { "id": 1, "kind": "claude", "data": { "session_id": null } } },
                 "layout_mode": "master_stack",
-                "master_ratio": 0.6,
-                "master_count": 1,
+                "primary_ratio": 0.6,
+                "primary_count": 1,
                 "desktop_slots": [[1, 0, 0], [2, 1, 3]],
                 "cwd": "/tmp"
             }
