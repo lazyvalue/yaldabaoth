@@ -1860,7 +1860,6 @@ impl YaldaGpuiView {
                 let drag_key = key.clone();
                 let target_key = key.clone();
                 let folder_folded = self.jump_folded_workspaces.contains(&key);
-                let num = format!("{}", idx + 1);
                 let label = folder.label.clone();
                 let drag_label: SharedString = label.clone().into();
                 let tile_count = folder.tiles.len();
@@ -1962,14 +1961,6 @@ impl YaldaGpuiView {
                         )
                         .into_any_element(),
                     ))
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_color(st.dim)
-                            .font_family(st.mono.clone())
-                            .text_size(px(st.pt * 0.75))
-                            .child(SharedString::from(num)),
-                    )
                     .can_drop(move |dragged, _window, _cx| {
                         dragged
                             .downcast_ref::<WorkspaceDrag>()

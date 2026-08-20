@@ -1550,7 +1550,7 @@ impl AgentTheme {
             warm_accent: Color::Rgb(0x40, 0x67, 0x64), // teal (cog section headings)
 
             jump_header: Color::Rgb(0xd6, 0x4f, 0x5a), // deep red (was neon coral #ff6b6b)
-            jump_subheader: Color::Rgb(0x5a, 0x7f, 0xa8), // muted denim (was neon #3b9eff)
+            jump_subheader: Color::Rgb(0xaa, 0x5a, 0x61), // muted rose-red (workspace identity; was denim)
             jump_working: Color::Rgb(0xff, 0x9e, 0x64),
         }
     }

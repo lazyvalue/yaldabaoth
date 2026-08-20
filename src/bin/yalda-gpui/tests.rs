@@ -5937,7 +5937,7 @@ fn folio_jump_and_caret_colors() {
     use yalda::style::Color;
     let at = yalda::theme::AgentTheme::folio();
     assert_eq!(at.jump_header, Color::Rgb(0xd6, 0x4f, 0x5a), "deep red, not neon coral");
-    assert_eq!(at.jump_subheader, Color::Rgb(0x5a, 0x7f, 0xa8), "muted denim, not neon azure");
+    assert_eq!(at.jump_subheader, Color::Rgb(0xaa, 0x5a, 0x61), "muted rose-red workspace identity");
     assert_eq!(at.cursor, at.jump_header, "block caret matches the deep red");
     assert_eq!(at.warm_accent, Color::Rgb(0x40, 0x67, 0x64), "teal stays the agent accent");
     assert_ne!(at.cursor, at.warm_accent, "caret (red) is decoupled from the teal accent");

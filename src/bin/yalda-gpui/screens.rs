@@ -10,8 +10,8 @@ use super::*;
 /// present. Pinned by `worksheet_backdrop_fainter_in_insert`.
 pub(crate) fn worksheet_backdrop_alpha(mode: EditMode) -> f32 {
     match mode {
-        EditMode::Insert => 0.13,
-        EditMode::Normal => 0.22,
+        EditMode::Insert => 0.18,
+        EditMode::Normal => 0.30,
     }
 }
 
