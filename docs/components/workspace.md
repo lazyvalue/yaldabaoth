@@ -1231,9 +1231,11 @@ summaries answer “what is open there?” Mixing them produces unstable labels
 such as `Claude (Research)` and makes the same workspace look like a different
 place as its contents change.
 
-**Status.** `in progress`.
+**Status.** `implemented (headless)`.
 
 **Enforcement.** `send_picker_agent_destination_uses_workspace_name_without_provider_prefix`
 drives the production `Ctrl-W m` picker path and asserts the rendered row's
 production label projection. A painted geometry guard covers the compact card,
-row hierarchy, and separated creation action.
+row hierarchy, separated creation action, and real click dispatch. Restoring
+the Agent-derived `Claude (<workspace>)` projection makes the identity guard
+fail.
