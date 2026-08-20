@@ -8525,9 +8525,10 @@ fn hidden_tile_navigation_is_solo_until_explicit_unhide(cx: &mut TestAppContext)
 /// key is inert: it neither invokes the command nor closes the menu.
 ///
 /// Negative control: remove `tile-unhide` from the visible/Detached arms of
-/// `tile_visibility_menu_disabled` → the first `shift-h` closes the production
-/// menu and this guard fails RED. Remove the hidden arm's `tile-hide` entry →
-/// lowercase `h` closes the hidden tile menu and also fails RED.
+/// `tile_menu_disabled` → the first `u` closes the production menu and this
+/// guard fails RED. Remove the hidden arm's `tile-hide` entry → lowercase `h`
+/// closes the hidden tile menu and also fails RED. (Unhide is now `u`, detach is
+/// `f`; UXI-Menu-9.)
 #[gpui::test]
 fn tile_menu_hide_unhide_enablement_tracks_focused_membership(cx: &mut TestAppContext) {
     use crate::workspace::{AttachedVisibility, TileMembership};
@@ -8546,7 +8547,7 @@ fn tile_menu_hide_unhide_enablement_tracks_focused_membership(cx: &mut TestAppCo
         assert!(!menu.disabled.contains("tile-hide"));
         assert!(menu.disabled.contains("tile-unhide"));
     });
-    vcx.simulate_keystrokes("shift-h");
+    vcx.simulate_keystrokes("u");
     vcx.run_until_parked();
     view.read_with(vcx, |v, _| {
         assert!(v.overlay_is_menu(), "disabled Unhide keeps the menu open");
@@ -8586,7 +8587,7 @@ fn tile_menu_hide_unhide_enablement_tracks_focused_membership(cx: &mut TestAppCo
     vcx.simulate_keystrokes("h");
     vcx.run_until_parked();
     assert!(view.read_with(vcx, |v, _| v.overlay_is_menu()));
-    vcx.simulate_keystrokes("shift-h");
+    vcx.simulate_keystrokes("u");
     vcx.run_until_parked();
     view.read_with(vcx, |v, _| {
         assert!(!v.overlay_is_menu());
@@ -8599,8 +8600,8 @@ fn tile_menu_hide_unhide_enablement_tracks_focused_membership(cx: &mut TestAppCo
         ));
     });
 
-    // Detached tiles cannot participate in workspace visibility; both commands
-    // remain discoverable and dimmed.
+    // Detached tiles cannot participate in workspace visibility; hide, unhide,
+    // and detach all remain discoverable and dimmed.
     vcx.simulate_keystrokes("ctrl-w shift-b");
     vcx.run_until_parked();
     assert_eq!(
@@ -8613,8 +8614,9 @@ fn tile_menu_hide_unhide_enablement_tracks_focused_membership(cx: &mut TestAppCo
         let menu = v.menu_ref().expect("Detached tile menu");
         assert!(menu.disabled.contains("tile-hide"));
         assert!(menu.disabled.contains("tile-unhide"));
+        assert!(menu.disabled.contains("tile-detach"));
     });
-    vcx.simulate_keystrokes("shift-h");
+    vcx.simulate_keystrokes("u");
     vcx.run_until_parked();
     assert!(view.read_with(vcx, |v, _| v.overlay_is_menu()));
 }
@@ -11334,11 +11336,11 @@ fn jump_session_archive_controls_toggle_the_same_durable_flag(cx: &mut TestAppCo
         v.jump_to_agent(JumpTarget::Local(id), cx);
     });
 
-    // UXI-Menu-8 removes archive from the Space tree without deleting its
-    // underlying dispatcher.
+    // UXI-Menu-9: Archive is the Agent-only tail of the Space tile menu, and it
+    // still dispatches the same underlying command.
     view.update(vcx, |v, cx| v.open_local_menu_inner(cx));
     view.read_with(vcx, |v, _| {
-        assert!(!menu_tree_has_command(
+        assert!(menu_tree_has_command(
             &v.menu_ref().expect("space menu").menu,
             "archive-session"
         ));
@@ -19033,11 +19035,12 @@ fn columns_view_arranges_tiles_side_by_side(cx: &mut TestAppContext) {
         "columns must be side by side (A at x={ax} w={aw}, B at x={bx}) — B must be \
          to the RIGHT of A with no overlap"
     );
-    // Default master ratio is 60/40: A is the one-tile master area and B the
-    // one-tile stack. Allow a small tolerance for gutters and borders.
+    // Columns is equal-width (no master area — that belongs to Tiling now,
+    // UXI-Workspace-26). Both tiles split the width evenly, within a small
+    // tolerance for gutters and borders.
     assert!(
-        aw > bw && (aw / (aw + bw) - 0.60).abs() <= 0.03,
-        "columns must honor the default 60/40 master ratio (A={aw}, B={bw})"
+        (aw - bw).abs() <= 4.0,
+        "columns must be equal width (A={aw}, B={bw})"
     );
     assert!(
         ah > 1.0 && (ah - bh).abs() <= 2.0,
@@ -19048,6 +19051,70 @@ fn columns_view_arranges_tiles_side_by_side(cx: &mut TestAppContext) {
         aw > 50.0 && ay >= 0.0,
         "column A painted with no real area (x={ax}, y={ay}, w={aw})"
     );
+}
+
+/// UXI-Workspace-26: Monocle paints ONLY the focused tile, filling the region;
+/// the other tile's live content does not paint. Non-vacuous: the fixture has
+/// two real tiles and columns proves both CAN paint, so Monocle hiding one is a
+/// real contrast.
+///
+/// NEGATIVE CONTROL (observed RED): in `render_focused_window`, route the
+/// `Monocle` arm to `render_columns(..., false, ..)` instead of `render_monocle`.
+/// Re-run: the non-focused tile's live content paints and the "B is hidden"
+/// assert fires.
+#[gpui::test]
+fn monocle_view_paints_only_the_focused_tile(cx: &mut TestAppContext) {
+    use crate::workspace::WorkspaceView;
+    let (view, vcx, focused_id, other_id) = boot_desktop_two_tiles(cx);
+    view.update(vcx, |v, cx| {
+        v.workspace.active_workspace_mut().unwrap().view = WorkspaceView::Monocle;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let mono_focused = crate::layout_probe_get(&format!("monocle-tile-{focused_id}"));
+    let live_focused = crate::layout_probe_get(&format!("plane-tile-content-{focused_id}"));
+    let live_other = crate::layout_probe_get(&format!("plane-tile-content-{other_id}"));
+    crate::layout_probe_end();
+
+    let (_x, _y, mw, mh) = mono_focused.expect("focused tile must paint in monocle");
+    assert!(
+        live_focused.is_some(),
+        "focused tile's live content must paint in monocle"
+    );
+    assert!(
+        live_other.is_none(),
+        "non-focused tile must NOT paint in monocle (only the focused tile shows)"
+    );
+    assert!(
+        mw > 200.0 && mh > 100.0,
+        "the monocle tile fills the region (w={mw}, h={mh})"
+    );
+}
+
+/// UXI-Workspace-26: the `.` layout-mode commands set the active workspace's
+/// arrangement through the REAL dispatcher. Negative control: make
+/// `set_active_workspace_view` a no-op ⇒ the view never changes and this fails RED.
+#[gpui::test]
+fn layout_mode_commands_set_the_active_arrangement(cx: &mut TestAppContext) {
+    use crate::workspace::WorkspaceView;
+    let (view, vcx) = boot_browser(cx);
+    for (command, expected) in [
+        ("layout-tiling", WorkspaceView::Tiling),
+        ("layout-monocle", WorkspaceView::Monocle),
+        ("layout-columns", WorkspaceView::Columns),
+    ] {
+        view.update(vcx, |v, cx| v.dispatch_menu_command(command, cx));
+        vcx.run_until_parked();
+        assert_eq!(
+            view.read_with(vcx, |v, _| v.workspace.active_workspace().unwrap().view),
+            expected,
+            "{command} must set the arrangement to {expected:?}"
+        );
+    }
 }
 
 /// UXI-Workspace-17: the registered lowercase command sends without following;
@@ -19357,15 +19424,16 @@ fn ctrl_w_hide_unhide_and_workspace_back_and_forth_are_global(cx: &mut TestAppCo
     });
 }
 
-/// UXI-Workspace-20: all four registered master commands mutate Columns and
-/// the ratio command changes painted geometry without touching plane slots.
+/// UXI-Workspace-20/22: all four registered master commands mutate the Tiling
+/// arrangement and the ratio command changes painted geometry without touching
+/// plane slots. (The master area moved from Columns to Tiling in UXI-Workspace-26.)
 #[gpui::test]
 fn ctrl_w_master_commands_change_columns_state_and_geometry(cx: &mut TestAppContext) {
     use crate::workspace::WorkspaceView;
     cx.update(crate::register_keymap);
     let (view, vcx, master_id, stack_id) = boot_desktop_two_tiles(cx);
     view.update(vcx, |v, cx| {
-        v.workspace.active_workspace_mut().unwrap().view = WorkspaceView::Columns;
+        v.workspace.active_workspace_mut().unwrap().view = WorkspaceView::Tiling;
         cx.notify();
     });
     vcx.run_until_parked();

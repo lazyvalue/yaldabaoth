@@ -741,6 +741,13 @@ was removed. The floor mutation above guards the remaining state predicate.
 
 ### UXI-Workspace-14 — A workspace switches between the plane and a columns arrangement
 
+> **Amended by `UXI-Workspace-26`.** The two-value `Plane ⇄ Columns` toggle is
+> superseded by three UI-selectable arrangements (Columns / Tiling / Monocle);
+> `Plane` is retired from the UI. `Ctrl-W a` now *cycles* the three modes and the
+> `.` menu's "toggle plane / columns" entry is replaced by the `.` → layout
+> submenu. The Columns arrangement + `render_columns` + persistence described
+> here still hold; read `UXI-Workspace-26` for the current mode set.
+
 **Statement.** A workspace carries a **`view: WorkspaceView`** — either `Plane`
 (the infinite-plane arrangement every other `UXI-Workspace-*` describes) or
 `Columns` (the default). One command toggles between them: **`Ctrl-W a`** (and the `.`
@@ -1024,6 +1031,12 @@ model command a no-op made the guard RED.
 
 ### UXI-Workspace-20 — Columns has a controllable master area
 
+> **Amended by `UXI-Workspace-26`.** The master area moved from `Columns` to the
+> new `Tiling` arrangement — `Columns` is now plain equal-width columns. The four
+> `Ctrl-W f/F/n/N` master mutators (and the layout submenu's grow/shrink/count
+> entries) now act on `Tiling`; every non-Tiling view is a no-op. Everything else
+> below (clamps, no plane-slot mutation, persistence) is unchanged.
+
 **Statement.** Columns divides its reading-order tiles into two horizontal
 areas. The first `master_count` tiles share `master_ratio` of the available
 width equally; remaining tiles share the stack area equally. If every tile is
@@ -1239,3 +1252,70 @@ production label projection. A painted geometry guard covers the compact card,
 row hierarchy, separated creation action, and real click dispatch. Restoring
 the Agent-derived `Claude (<workspace>)` projection makes the identity guard
 fail.
+
+### UXI-Workspace-26 — Three UI layout modes: Columns, Tiling, Monocle (Plane retired)
+
+**Statement.** A workspace's **`view: WorkspaceView`** offers **three
+UI-selectable arrangements** over the SAME tiles, all lossless pure-view choices
+(no tile is moved, re-seeded, or closed):
+
+- **`Columns`** (the default) — every tile is an **equal-width, full-height
+  column**, side by side in signed reading order. No master area.
+- **`Tiling`** — dwm-style **master/stack**: the first `master_count` tiles fill
+  `master_ratio` of the width on the **left** (the master area); the remaining
+  tiles stack as equal columns on the **right**. The `Ctrl-W f/F/n/N` master
+  mutators and the layout submenu's grow/shrink/count entries act on this mode
+  only (`UXI-Workspace-20`, amended).
+- **`Monocle`** — only the **focused** tile paints, filling the whole content
+  region; the others stay materialized (never moved/closed) but are not painted.
+  Switching focus swaps which tile shows.
+
+The **`Plane`** arrangement (`UXI-Workspace-2` … the infinite signed-grid camera)
+is **retired from the UI**: no menu selects it, `Ctrl-W a` never lands on it, and
+a persisted `"plane"` loads as `Columns`. The `Plane` enum variant + `render_desktop`
+path are kept so the arrangement can be reinstated later without a data migration.
+
+Selection:
+- **`.` → layout submenu** picks a mode directly: `c` columns, `t` tiling, `m`
+  monocle (`layout-columns` / `layout-tiling` / `layout-monocle`). The submenu
+  also carries the four master-area adjustments.
+- **`Ctrl-W a`** *cycles* Columns → Tiling → Monocle → Columns.
+- The mode **persists** (`"columns" | "tiling" | "monocle"`; absent, `"plane"`,
+  or any unknown value ⇒ `Columns`), so a fresh workspace starts in Columns.
+
+**Applies to.** `workspace.rs`: `WorkspaceView` (four variants, `next()`,
+`set_view`, hand-rolled serde: `plane`→`Columns`), master mutators gated on
+`Tiling`, `placement_target` (Columns/Tiling share left/right adjacency, Monocle
+none). `chrome.rs`: `render_focused_window` dispatch; `render_columns(use_master)`
+(false = equal Columns, true = Tiling master/stack); `render_monocle`. `main.rs`:
+`layout-columns/tiling/monocle` dispatch → `set_active_workspace_view`,
+`toggle_workspace_columns` (cycles), the `.` layout submenu. `keymap_registry.rs`:
+`ctrl-w a` label. `persist.rs`: `PersistedWorkspace.view` round-trip.
+
+**Why.** The infinite plane was powerful but demanded panning/zoom to see
+everything. Most sessions want a simple dense arrangement — equal columns, a
+dwm master/stack, or one maximized tile — chosen by name. Three explicit modes
+give that directly; retiring the plane (reversibly) removes the mode nobody
+selected by default without discarding its code or anyone's saved slots.
+
+**Status.** `implemented (headless)`.
+
+**Enforcement.** `verify_harness.rs::columns_view_arranges_tiles_side_by_side`
+(Columns = equal-width, both tiles paint side by side, negative-control RED),
+`ctrl_w_master_commands_change_columns_state_and_geometry` (Tiling master/stack
+geometry via the real `Ctrl-W f/F/n/N` paths),
+`monocle_view_paints_only_the_focused_tile` (only the focused tile paints;
+negative control routes Monocle to `render_columns` → RED),
+`layout_mode_commands_set_the_active_arrangement` (the `.` `layout-*` dispatch
+sets `view`). `tests.rs::workspace_view_round_trips_and_unknown_defaults_columns`
+(serde round-trip for the three modes + `plane`/unknown → Columns);
+`workspace.rs::tiling_master_controls_clamp_and_other_views_unchanged` (master
+mutators act on Tiling only). `tests.rs::shell_layout_submenu_selects_modes`
+(the `.` → layout submenu keys).
+
+**Deviation from plan.** The `/new-ux` brief said "retire plane"; the code keeps
+the `Plane` variant + `render_desktop` behind a UI cutoff (no menu / persisted
+`plane`→`Columns`) rather than deleting the ~500-line plane render path, so the
+arrangement is reversible without a migration. Hide/unhide of individual tiles is
+unchanged and orthogonal to Monocle (Monocle is a pure paint filter, not a
+membership change).

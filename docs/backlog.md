@@ -13,6 +13,29 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Leader-menu restructure: tile menu + system menu + layout modes** —
+  `NEEDS-RUNTIME` (2026-08-19 via `/new-ux`; graph 896; branch `menu-updates`;
+  `UXI-Menu-8`/`UXI-Menu-9` amended, `UXI-Workspace-26` new). Captured verbatim:
+  *tile menu (`space`) = Send to workspace / Close (X) / Tag always; Hide /
+  Unhide / Detach when in a workspace; Archive when an agent. System menu (`.`) =
+  drop send-to-workspace (moved to tile menu), flatten the system submenu to the
+  root, drop hide/unhide/close/set-cwd/also-show/plane-view/toggle-columns; add
+  layout modes Keep columns / Tiling (dwm master-left, stack-right) / Monocle.*
+  Shipped: `WorkspaceView` = Columns (default) / Tiling / Monocle, Plane retired
+  from the UI (persisted `"plane"` loads as Columns; variant + `render_desktop`
+  kept for reversibility). `Ctrl-W a` cycles the three modes; `.` → layout submenu
+  selects directly + carries the master-area controls (now Tiling-only). Tile menu
+  tail keys `p`/`X`/`t`/`h`/`u`/`f`/`a`. Full suite pending; headless guards:
+  `monocle_view_paints_only_the_focused_tile`,
+  `layout_mode_commands_set_the_active_arrangement`,
+  `columns_view_arranges_tiles_side_by_side` (now equal-width),
+  `ctrl_w_master_commands_change_columns_state_and_geometry` (Tiling),
+  `tile_menu_hide_unhide_enablement_tracks_focused_membership`, +
+  `every_tile_menu_has_shared_tile_commands` / `shell_layout_submenu_selects_modes`.
+  Runtime-flagged for: exact painted mode geometry + the `Ctrl-W a` OS chord.
+  *Side note answered:* "also show document" = the old `also-show-tile` command
+  (present a second copy of a Buffer doc in another workspace); removed per brief.
+
 - **Cog graph explorer tile** — `NEEDS-RUNTIME` (2026-08-17 via `/new-ux`;
   `UXI-Cog-1..3`; branch `cog-explorer`). Captured verbatim: *"I want a cog graph
   explorer tile. In left pane of tile should be able to select nodes. In right

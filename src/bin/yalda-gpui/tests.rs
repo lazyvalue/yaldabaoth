@@ -3312,39 +3312,36 @@ fn gpui_menu_has_required_entries() {
     let menu = gpui_menu();
     let mut leaf_actions: Vec<&str> = Vec::new();
     collect_leaves(&menu, &mut leaf_actions);
-    // UXI-Menu-8 keeps seven exact roots while their approved submenus retain
-    // the deeper tile/workspace/system vocabulary.
+    // UXI-Menu-8 / UXI-Workspace-26: the shell root holds new-tile, theme,
+    // toggle-jump, the layout-modes submenu, workspace ops, and the flattened
+    // system/dev commands. Tile-scoped verbs moved to the `<space>` tile menu.
     let expected = [
-        "workspace-set-cwd",
         "new-agent-tile",
         "new-buffer-tile",
         "new-linear-tile",
+        "new-cog-tile",
+        "new-keymap-tile",
         "theme-nightfox",
         "theme-folio",
-        "plane-zoom-in",
-        "plane-zoom-out",
-        "plane-reset-view",
-        "workspace-toggle-columns",
         "toggle-jump-panel",
-        "dev-restart-gui",
-        "dev-restart-all",
-        "open-system-console",
-        "close-window",
-        // workspace submenu (formerly the `?` global menu)
+        // layout modes submenu
+        "layout-columns",
+        "layout-tiling",
+        "layout-monocle",
+        "master-grow",
+        "master-shrink",
+        "master-count-increase",
+        "master-count-decrease",
+        // workspace submenu
         "new-workspace",
         "rename-workspace",
         "close-workspace",
         "new-project",
         "workspace-back-and-forth",
-        "send-tile-follow",
-        "also-show-tile",
-        "tile-detach",
-        "tile-hide",
-        "tile-unhide",
-        "master-grow",
-        "master-shrink",
-        "master-count-increase",
-        "master-count-decrease",
+        // flattened system/dev
+        "dev-restart-gui",
+        "dev-restart-all",
+        "open-system-console",
     ];
     for e in expected {
         assert!(
@@ -3354,49 +3351,58 @@ fn gpui_menu_has_required_entries() {
             leaf_actions
         );
     }
-    // Everything else is out of the shell scope: focused-App verbs live in the
-    // `<space>` local menus, window/layout management on chords, quit on Cmd-Q.
-    // (`goto-workspace-N` is a direct chord, ctrl-1..0, never a menu entry.)
+    // Everything else is out of the shell scope. Tile verbs (close, send, tag,
+    // hide/unhide, detach, archive) now live on the `<space>` tile menu; the
+    // retired plane view + set-cwd + also-show are gone entirely.
     for gone in [
-        "open-browser",
-        "buffer-list",
-        "split-h",
-        "goto-workspace-0",
-        "move-tile",
-        "cycle-layout",
+        "close-window",
+        "send-tile-follow",
+        "tile-tag",
+        "tile-detach",
+        "tile-hide",
+        "tile-unhide",
+        "archive-session",
+        "workspace-set-cwd",
+        "also-show-tile",
+        "plane-zoom-in",
+        "plane-reset-view",
+        "workspace-toggle-columns",
         "tag-add",
-        "list-marks",
-        "back-to-doc",
         "quit",
     ] {
         assert!(
             !leaf_actions.contains(&gone),
-            "{gone:?} should no longer be in the global menu"
+            "{gone:?} should no longer be in the shell menu"
         );
     }
 }
 
 #[test]
-fn shell_menu_root_is_the_approved_seven_items() {
+fn shell_menu_root_is_the_approved_items() {
     let menu = gpui_menu();
     let actual: Vec<(String, &str)> = menu
         .iter()
+        .filter(|node| {
+            matches!(node.kind(), MenuNodeKind::Command | MenuNodeKind::Submenu)
+        })
         .map(|node| (format_menu_key(&node.key), node.label.as_str()))
         .collect();
     assert_eq!(
         actual,
         vec![
             ("n".into(), "new tile"),
-            ("X".into(), "close tile"),
-            ("m".into(), "send tile to workspace"),
             ("t".into(), "theme"),
             ("j".into(), "toggle jump panel"),
-            ("s".into(), "system"),
+            ("l".into(), "layout"),
             ("w".into(), "workspace"),
+            ("r".into(), "rebuild and restart gui"),
+            ("R".into(), "rebuild and restart all"),
+            ("`".into(), "system console"),
         ],
-        "the shell root is an exact contract; extra commands belong elsewhere"
+        "the shell root is an exact contract; tile verbs belong on the tile menu"
     );
-    for (key, expected) in [('X', "close-window"), ('m', "send-tile-follow")] {
+    // The flattened system commands dispatch straight from the root.
+    for (key, expected) in [('r', "dev-restart-gui"), ('R', "dev-restart-all")] {
         let mut state = MenuState::new();
         state.open();
         assert_eq!(
@@ -3428,8 +3434,14 @@ fn agent_menu_root_and_view_are_the_approved_items() {
             ("s".into(), "select session"),
             ("c".into(), "clear"),
             ("v".into(), "view"),
+            // shared tile-menu tail (UXI-Menu-9) + agent-only archive
+            ("p".into(), "send to workspace"),
+            ("X".into(), "close"),
+            ("t".into(), "tag"),
             ("h".into(), "hide"),
-            ("H".into(), "unhide"),
+            ("u".into(), "unhide"),
+            ("f".into(), "detach tile"),
+            ("a".into(), "archive"),
         ]
     );
     let view = menu
@@ -3452,8 +3464,13 @@ fn agent_menu_root_and_view_are_the_approved_items() {
         ('w', "agent-input-toggle"),
         ('s', "claude-session-picker"),
         ('c', "claude-clear"),
+        ('p', "send-tile-follow"),
+        ('X', "close-window"),
+        ('t', "tile-tag"),
         ('h', "tile-hide"),
-        ('H', "tile-unhide"),
+        ('u', "tile-unhide"),
+        ('f', "tile-detach"),
+        ('a', "archive-session"),
     ] {
         let mut state = MenuState::new();
         state.open();
@@ -3466,7 +3483,18 @@ fn agent_menu_root_and_view_are_the_approved_items() {
 }
 
 #[test]
-fn every_tile_menu_has_shared_visibility_commands() {
+fn every_tile_menu_has_shared_tile_commands() {
+    // UXI-Menu-9: every `<space>` tile menu ends with the shared tile commands:
+    // send(p)/close(X)/tag(t) then hide(h)/unhide(u)/detach(f). The Agent menu
+    // additionally carries archive(a).
+    let shared = [
+        ("p", "send to workspace", "send-tile-follow"),
+        ("X", "close", "close-window"),
+        ("t", "tag", "tile-tag"),
+        ("h", "hide", "tile-hide"),
+        ("u", "unhide", "tile-unhide"),
+        ("f", "detach tile", "tile-detach"),
+    ];
     for (name, menu) in [
         ("doc", doc_local_menu()),
         ("edit", edit_local_menu()),
@@ -3476,47 +3504,87 @@ fn every_tile_menu_has_shared_visibility_commands() {
         ("cog", cog_local_menu()),
         ("keymap", keymap_local_menu()),
     ] {
-        let suffix = menu
-            .get(menu.len().saturating_sub(3)..)
-            .unwrap_or_else(|| panic!("{name} menu is missing the visibility suffix"));
-        assert_eq!(suffix[0].kind(), MenuNodeKind::Separator, "{name}");
-        for (node, key, label, command) in [
-            (&suffix[1], "h", "hide", "tile-hide"),
-            (&suffix[2], "H", "unhide", "tile-unhide"),
-        ] {
-            assert_eq!(format_menu_key(&node.key), key, "{name}");
-            assert_eq!(node.label, label, "{name}");
+        for (key, label, command) in shared {
+            let node = menu
+                .iter()
+                .find(|n| n.label == label)
+                .unwrap_or_else(|| panic!("{name} menu is missing shared command {label}"));
+            assert_eq!(format_menu_key(&node.key), key, "{name} {label} key");
             assert!(
                 matches!(&node.action, MenuAction::Command(actual) if actual == command),
                 "{name} {label} must dispatch {command}"
             );
         }
     }
+    // Archive is Agent-only.
+    let agent = agent_local_menu();
+    let archive = agent
+        .iter()
+        .find(|n| n.label == "archive")
+        .expect("agent menu must carry archive");
+    assert_eq!(format_menu_key(&archive.key), "a");
+    assert!(
+        matches!(&archive.action, MenuAction::Command(c) if c == "archive-session"),
+    );
+    for (name, menu) in [
+        ("doc", doc_local_menu()),
+        ("edit", edit_local_menu()),
+        ("browser", browser_local_menu()),
+    ] {
+        assert!(
+            !menu.iter().any(|n| n.label == "archive"),
+            "{name} menu must NOT carry archive (session-only)"
+        );
+    }
 }
 
 #[test]
 fn menu_state_round_trip_picks_command() {
-    // Pressing root `m` closes the menu and opens the universal send picker.
+    // Pressing root `j` closes the menu and dispatches the jump-panel toggle.
     let mut state = MenuState::new();
     state.open();
     let menu = gpui_menu();
-    let cmd = state.process_key(KeyPress::new(Key::Char('m'), KMods::NONE), &menu);
-    assert_eq!(cmd, Some("send-tile-follow".to_string()));
+    let cmd = state.process_key(KeyPress::new(Key::Char('j'), KMods::NONE), &menu);
+    assert_eq!(cmd, Some("toggle-jump-panel".to_string()));
     assert!(!state.is_active(), "menu should close after a leaf select");
 }
 
 #[test]
+fn shell_layout_submenu_selects_modes() {
+    // UXI-Workspace-26: `l` opens the layout submenu; c/t/m pick a mode.
+    let menu = gpui_menu();
+    for (key, expected) in [
+        ('c', "layout-columns"),
+        ('t', "layout-tiling"),
+        ('m', "layout-monocle"),
+    ] {
+        let mut state = MenuState::new();
+        state.open();
+        assert_eq!(
+            state.process_key(KeyPress::new(Key::Char('l'), KMods::NONE), &menu),
+            None,
+            "l opens the layout submenu"
+        );
+        assert_eq!(
+            state.process_key(KeyPress::new(Key::Char(key), KMods::NONE), &menu),
+            Some(expected.to_string()),
+            "l {key} must dispatch {expected}"
+        );
+    }
+}
+
+#[test]
 fn shell_menu_close_tile_at_root_close_workspace_under_w() {
-    // UXI-Menu-8: destructive tile close is uppercase `X`; workspace close
-    // remains lowercase `w x` one level down.
+    // UXI-Menu-8/9: tile close moved to the `<space>` tile menu, so the shell
+    // root no longer binds `X`; workspace close remains lowercase `w x`.
     let menu = gpui_menu();
 
     let mut upper = MenuState::new();
     upper.open();
     assert_eq!(
         upper.process_key(KeyPress::new(Key::Char('X'), KMods::NONE), &menu),
-        Some("close-window".to_string()),
-        "root X closes the focused tile"
+        None,
+        "root X is no longer bound (close moved to the tile menu)"
     );
 
     let mut lower = MenuState::new();
@@ -3683,13 +3751,13 @@ fn agent_local_c_resolves_to_clear() {
 }
 
 #[test]
-fn agent_local_p_is_absent_send_lives_in_shell_menu() {
+fn agent_local_p_sends_tile_to_workspace() {
+    // Send-to-workspace moved onto the tile menu (UXI-Menu-9); `p` dispatches it.
     let mut state = MenuState::new();
     state.open();
     let menu = agent_local_menu();
     let cmd = state.process_key(KeyPress::new(Key::Char('p'), KMods::NONE), &menu);
-    assert_eq!(cmd, None);
-    assert!(state.is_active());
+    assert_eq!(cmd, Some("send-tile-follow".to_string()));
 }
 
 #[test]
@@ -4860,31 +4928,39 @@ fn plane_persist_round_trips_signed_slots_and_camera() {
     );
 }
 
-/// UXI-Workspace-14: both tile arrangements (`view`) round-trip, an OLD snapshot
-/// with no `view` field loads as the `Columns` default, and an UNKNOWN value from
-/// a newer binary degrades to `Columns` (never dropping the snapshot).
+/// UXI-Workspace-26: the UI arrangements (`view`) round-trip, retired `"plane"`
+/// loads as `Columns`, an OLD snapshot with no `view` field loads as the
+/// `Columns` default, and an UNKNOWN value from a newer binary degrades to
+/// `Columns` (never dropping the snapshot).
 #[test]
 fn workspace_view_round_trips_and_unknown_defaults_columns() {
-    // Round-trip Columns.
-    let mut wsp = plane_persist_test_workspace();
-    wsp.view = workspace::WorkspaceView::Columns;
-    let json = serde_json::to_string(&wsp).expect("serialize");
-    assert!(
-        json.contains("\"columns\""),
-        "view serializes as a string: {json}"
-    );
-    let back: PersistedWorkspace = serde_json::from_str(&json).expect("deserialize");
-    assert_eq!(
-        back.view,
-        workspace::WorkspaceView::Columns,
-        "columns survives"
-    );
+    // Round-trip each UI-selectable arrangement.
+    for (view, token) in [
+        (workspace::WorkspaceView::Columns, "columns"),
+        (workspace::WorkspaceView::Tiling, "tiling"),
+        (workspace::WorkspaceView::Monocle, "monocle"),
+    ] {
+        let mut wsp = plane_persist_test_workspace();
+        wsp.view = view;
+        let json = serde_json::to_string(&wsp).expect("serialize");
+        assert!(
+            json.contains(&format!("\"{token}\"")),
+            "view serializes as {token}: {json}"
+        );
+        let back: PersistedWorkspace = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.view, view, "{token} survives");
+    }
 
-    // Explicit Plane remains an honored persisted preference.
+    // Retired Plane loads as Columns (UXI-Workspace-26: retired from the UI).
+    let mut wsp = plane_persist_test_workspace();
     wsp.view = workspace::WorkspaceView::Plane;
     let json = serde_json::to_string(&wsp).expect("serialize plane");
     let back: PersistedWorkspace = serde_json::from_str(&json).expect("deserialize plane");
-    assert_eq!(back.view, workspace::WorkspaceView::Plane, "plane survives");
+    assert_eq!(
+        back.view,
+        workspace::WorkspaceView::Columns,
+        "retired plane loads as columns"
+    );
 
     // Absent field (old snapshot) ⇒ Columns via #[serde(default)].
     let old = r#"{
