@@ -1542,6 +1542,9 @@ group rather than a header followed by visually ambiguous loose rows:
    collection so attachment is spatially unmistakable at a glance.
 6. The treatment must preserve fixed chrome typography, one-line ellipsis,
    hidden markers, folding, selection, and direct tile activation.
+7. A workspace group is a non-shrinking item in the panel's scrolling flex
+   column. When groups exceed the viewport, the column scrolls; no group may
+   compress its clipped header/body into a border-only band.
 
 **Applies to.** `jump_panel_view.rs`: workspace-folder group, header, child body,
 and blue-derived style projection; `yux/detail.rs`: existing compact status and
@@ -1561,3 +1564,6 @@ requires the header and attached tile to sit inside one group boundary, and
 requires the collapsed group to retain its boundary and membership count while
 removing the child row. The style projection is checked under Folio to prove
 all structural workspace accents derive from the cool-blue subheader token.
+`crowded_jump_panel_workspace_groups_never_shrink_to_bands` constrains the real
+renderer to a 900×360 viewport with sixteen mixed expanded/collapsed workspaces
+and requires every group to retain its intrinsic height under scroll pressure.

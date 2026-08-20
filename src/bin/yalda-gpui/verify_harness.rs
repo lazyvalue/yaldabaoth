@@ -8756,6 +8756,70 @@ fn jump_panel_workspace_group_bounds_make_membership_explicit(cx: &mut TestAppCo
     );
 }
 
+/// bug-0052 / UXI-JumpPanel-27: a scrollable flex column must overflow rather
+/// than shrink workspace cards into border-only bands. One card cannot expose
+/// this failure, so exercise the production renderer with enough expanded
+/// workspaces to exceed the test viewport.
+#[gpui::test]
+fn crowded_jump_panel_workspace_groups_never_shrink_to_bands(cx: &mut TestAppContext) {
+    use crate::{App, LinearTile};
+
+    let (view, vcx) = boot_browser(cx);
+    vcx.simulate_resize(gpui::size(px(900.0), px(360.0)));
+    vcx.run_until_parked();
+    let groups = view.update(vcx, |v, _| {
+        let mut groups = Vec::new();
+        for n in 0..16 {
+            let mut tile = LinearTile::new();
+            tile.title = format!("member {n}").into();
+            let id = v.workspace.push_workspace_inheriting(App::Linear(tile));
+            let workspace = v.workspace.active_workspace;
+            let project = v.workspace.workspaces[workspace].project();
+            let key = YaldaGpuiView::workspace_fold_key(
+                v.projects.name_of(project),
+                &v.workspace.workspaces[workspace].auto_name,
+            );
+            let folded = n % 2 == 1;
+            if folded {
+                v.jump_folded_workspaces.insert(key);
+            }
+            groups.push((workspace, id, folded));
+        }
+        v.workspace.set_active_workspace(0);
+        groups
+    });
+
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    for (workspace, tile, folded) in groups {
+        let group = crate::layout_probe_get(&format!("jump-workspace-group-{workspace}"))
+            .expect("crowded workspace group still paints");
+        let header = crate::layout_probe_get(&format!("jump-workspace-row-{workspace}"))
+            .expect("crowded workspace header still paints");
+        let row = crate::layout_probe_get(&format!("jump-tile-row-{tile}-ws{workspace}"));
+        assert!(
+            header.3 >= 24.0,
+            "workspace header must retain normal row height under scroll pressure: workspace={workspace} group={group:?} header={header:?}"
+        );
+        if folded {
+            assert!(row.is_none(), "folded workspace hides its member row");
+            assert!(
+                group.3 + 0.5 >= header.3,
+                "folded group must not shrink below its header: workspace={workspace} group={group:?} header={header:?}"
+            );
+        } else {
+            let row = row.expect("expanded crowded workspace member still paints");
+            assert!(row.3 >= 24.0);
+            assert!(
+                group.3 + 0.5 >= header.3 + row.3,
+                "expanded group must not shrink below its header and member: workspace={workspace} group={group:?} header={header:?} row={row:?}"
+            );
+        }
+    }
+    crate::layout_probe_end();
+}
+
 /// ADR-0034 / UXI-JumpPanel-25: hidden attachments remain under their owning
 /// workspace in both navigation surfaces. Selection presents them solo without
 /// changing membership; Unhide follows them back into the workspace.

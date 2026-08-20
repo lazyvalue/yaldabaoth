@@ -73,6 +73,7 @@ and a **timestamped log** of every actual attempt.
 | bug-0049 | active-workspace-label-low-contrast | FIXED | 2026-08-19 | 1 | active workspace names retain foreground contrast while a neutral background and narrow accent rail carry selection |
 | bug-0050 | jump-tile-name-wraps | FIXED | 2026-08-19 | 1 | primary jump-panel names are single-line ellipsizing labels with stable row geometry |
 | bug-0051 | hidden-tile-has-no-indicator | FIXED | 2026-08-19 | 1 | typed tile placement now paints a compact hidden marker for every hidden Agent and non-Agent tile |
+| bug-0052 | jump-workspace-cards-collapse-to-bands | FIXED | 2026-08-19 | 1 | bounded workspace groups are non-shrinking scroll items; crowded expanded/collapsed paint coverage prevents 4px clipped blue bands |
 <!-- Example row once populated:
 | bug-0001 | chatbox-caret-offscreen | RECURRED | 2026-05-02 | 16 | caret + text scroll out of the visible chatbox; no single owner of caret-in-viewport |
 -->
