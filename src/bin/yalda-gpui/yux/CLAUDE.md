@@ -39,6 +39,9 @@ style bundle so a caller themes once:
   contrast. The caller owns the enclosing tab group.
 - **`compact_count_indicator(id, count, tint, &DetailStyle)`** — compact semantic
   number pill for tabs and other narrow chrome.
+- **`compact_bounded_group(id, header, body, outline, separator)`** — flat,
+  compact hierarchy card whose optional body is spatially enclosed beneath its
+  header with shared outline, spacing, clipping, and separator.
 - **`compact_list_group_heading(id, glyph, label, count, tint, &DetailStyle)`**
   — small uppercase label + count + trailing hairline for headed dense lists.
 - **`context_menu_item(id, glyph, colors, label, font)`** — shared compact

@@ -247,29 +247,48 @@ pub(crate) fn jump_selection_color(theme: &yalda::theme::OverlayTheme) -> yalda:
     theme.selected_bg
 }
 
-/// The complete visual treatment for a workspace-folder row. Keeping these
-/// colors together gives tests and every renderer one production seam for the
-/// selected-state contract instead of independently choosing a text tint,
-/// background, and rail.
+/// The complete visual treatment for a workspace-folder group. Every
+/// structural color is derived from the same cool blue used by `DETACHED`, so
+/// workspace ownership never drifts into a warm brown/gold accent on paper
+/// themes. The title itself keeps the normal foreground for reliable contrast.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct JumpWorkspaceRowStyle {
+pub(crate) struct JumpWorkspaceGroupStyle {
     pub(crate) label: Hsla,
+    pub(crate) identity: Hsla,
     pub(crate) background: Hsla,
+    pub(crate) hover: Hsla,
     pub(crate) rail: Hsla,
+    pub(crate) outline: Hsla,
+    pub(crate) separator: Hsla,
 }
 
-pub(crate) fn jump_workspace_row_style(
+pub(crate) fn jump_workspace_group_style(
     active: bool,
     foreground: Hsla,
-    selection_mark: Hsla,
-    selected_bg: Hsla,
-) -> JumpWorkspaceRowStyle {
+    workspace_blue: Hsla,
+) -> JumpWorkspaceGroupStyle {
     let transparent: Hsla = rgba(0x00000000).into();
-    JumpWorkspaceRowStyle {
+    let wash = |alpha: f32| {
+        let mut color = workspace_blue;
+        color.a *= alpha;
+        color
+    };
+    JumpWorkspaceGroupStyle {
         label: foreground,
-        background: if active { selected_bg } else { transparent },
-        rail: if active { selection_mark } else { transparent },
+        identity: workspace_blue,
+        background: wash(if active { 0.12 } else { 0.045 }),
+        hover: wash(if active { 0.16 } else { 0.09 }),
+        rail: if active { workspace_blue } else { transparent },
+        outline: wash(if active { 0.58 } else { 0.30 }),
+        separator: wash(0.20),
     }
+}
+
+pub(crate) fn jump_workspace_membership_label(tile_count: usize) -> String {
+    format!(
+        "{tile_count} {}",
+        if tile_count == 1 { "tile" } else { "tiles" }
+    )
 }
 
 impl AgentRow {
@@ -1579,12 +1598,9 @@ impl YaldaGpuiView {
                 let folder_folded = self.jump_folded_workspaces.contains(&key);
                 let num = format!("{}", idx + 1);
                 let label = folder.label.clone();
-                let row_style = jump_workspace_row_style(
-                    folder.active,
-                    st.fg,
-                    selection_mark,
-                    sel_bg,
-                );
+                let tile_count = folder.tiles.len();
+                let count_label = jump_workspace_membership_label(tile_count);
+                let group_style = jump_workspace_group_style(folder.active, st.fg, electric);
                 let header = div()
                     .id(SharedString::from(format!("jump-ws-{idx}")))
                     .flex()
@@ -1595,16 +1611,16 @@ impl YaldaGpuiView {
                     .py_1()
                     .text_size(st.base)
                     .border_l_2()
-                    .border_color(row_style.rail)
-                    .bg(row_style.background)
-                    .hover(|s| s.bg(sel_bg))
+                    .border_color(group_style.rail)
+                    .bg(group_style.background)
+                    .hover(move |s| s.bg(group_style.hover))
                     .child(
                         div()
                             .id(SharedString::from(format!("jump-ws-fold-{idx}")))
                             .w(px(18.0))
                             .flex_none()
                             .cursor_pointer()
-                            .text_color(st.dim)
+                            .text_color(group_style.identity)
                             .child(SharedString::new_static(if folder_folded {
                                 "▸"
                             } else {
@@ -1616,13 +1632,22 @@ impl YaldaGpuiView {
                     )
                     .child(
                         div()
+                            .w(px(16.0))
+                            .flex_none()
+                            .text_color(group_style.identity)
+                            .font_family(st.mono.clone())
+                            .font_weight(FontWeight::BOLD)
+                            .child(SharedString::new_static("⊞")),
+                    )
+                    .child(
+                        div()
                             .id(SharedString::from(format!("jump-ws-label-{idx}")))
                             .flex_1()
                             .min_w_0()
                             .cursor_pointer()
                             .child(
-                                single_line_ellipsis(&format!("⊞ {label}"))
-                                    .text_color(row_style.label)
+                                single_line_ellipsis(&label)
+                                    .text_color(group_style.label)
                                     .font_family(st.mono.clone())
                                     .font_weight(FontWeight::SEMIBOLD),
                             )
@@ -1630,6 +1655,16 @@ impl YaldaGpuiView {
                                 this.select_workspace(idx, cx)
                             })),
                     )
+                    .child(probe_bounds_dyn(
+                        format!("jump-workspace-count-{idx}"),
+                        compact_status_mark(
+                            SharedString::from(format!("jump-ws-count-pill-{idx}")),
+                            &count_label,
+                            group_style.identity,
+                            &st,
+                        )
+                        .into_any_element(),
+                    ))
                     .child(
                         div()
                             .flex_none()
@@ -1638,20 +1673,12 @@ impl YaldaGpuiView {
                             .text_size(px(st.pt * 0.75))
                             .child(SharedString::from(num)),
                     );
-                col = col.child(probe_bounds_dyn(
-                    format!("jump-workspace-row-{idx}"),
-                    header.into_any_element(),
-                ));
-                if !folder_folded {
+                let body = if !folder_folded {
                     let mut children = div()
                         .id(SharedString::from(format!("jump-ws-children-{idx}")))
                         .flex()
                         .flex_col()
-                        .w_full()
-                        .ml(px(20.0))
-                        .border_l_1()
-                        .border_color(divider_color)
-                        .pl(px(2.0));
+                        .w_full();
                     for tile in &folder.tiles {
                         let suffix = if tile.agent.is_some() {
                             String::new()
@@ -1672,8 +1699,24 @@ impl YaldaGpuiView {
                             cx,
                         ));
                     }
-                    col = col.child(children);
-                }
+                    Some(children.into_any_element())
+                } else {
+                    None
+                };
+                let group = compact_bounded_group(
+                    SharedString::from(format!("jump-ws-group-{idx}")),
+                    probe_bounds_dyn(
+                        format!("jump-workspace-row-{idx}"),
+                        header.into_any_element(),
+                    ),
+                    body,
+                    group_style.outline,
+                    group_style.separator,
+                );
+                col = col.child(probe_bounds_dyn(
+                    format!("jump-workspace-group-{idx}"),
+                    group.into_any_element(),
+                ));
             }
 
             // Per-project state tabs sit directly under the workspace list.
