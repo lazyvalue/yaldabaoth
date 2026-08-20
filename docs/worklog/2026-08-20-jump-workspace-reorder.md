@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-20
 **Branches touched:** `codex/jump-workspace-reorder` (`9c25e1e` feature,
-`8ad6539` main-sync merge), then `main` (integration recorded after merge)
+`8ad6539` main-sync merge), then `main` (`b8fb3ac` merge)
 
 ## Cog execution evidence
 
