@@ -1486,3 +1486,38 @@ asserts workspace-follow plus visible focus. Existing
 `jump_panel_workspace_folders_and_unbound_rows_are_tile_native` and
 `jump_palette_opens_detached_tile_then_attaches_same_identity` cover visible and
 Detached activation, stable identity, tag grouping, and attachment.
+
+### UXI-JumpPanel-26 — Navigation identity stays legible, compact, and explicit
+
+**Statement.** Jump-panel hierarchy and state must remain readable without
+changing row geometry:
+
+1. An active workspace keeps the theme's normal foreground for its name.
+   Selection is conveyed by a neutral selected background and a narrow accent
+   rail; structural divider colors are never used as foreground text.
+2. Every primary workspace and tile name occupies one line. When available
+   width is exhausted, the name clips with a trailing ellipsis instead of word
+   wrapping or increasing row height.
+3. Every attached hidden tile carries a compact, subdued `hidden` marker at the
+   trailing edge. The marker is independent of tile type, agent provider, live
+   activity, focus, and workspace selection, so those states remain separately
+   visible.
+
+**Applies to.** `jump_panel_view.rs`: workspace folder headers,
+`jump_tile_row_el`, `jump_session_row_el`, and the shared navigation-row
+renderer; `yux/detail.rs`: reusable single-line labels and compact status marks.
+
+**Why.** Folio's pale overlay border is useful as structure but becomes nearly
+invisible when repurposed as active-workspace text. Unbounded primary labels
+wrap and destabilize navigation rhythm. Hidden attachment state was retained in
+the workspace model but discarded by the jump-panel row projection, leaving a
+listed hidden tile visually indistinguishable from a visible one.
+
+**Status.** `implemented (headless)`.
+
+**Enforcement.** `jump_panel_active_workspace_keeps_folio_foreground` drives
+the production Folio selection style;
+`jump_panel_long_tile_names_stay_single_line` compares real constrained paint
+against a standard navigation row; and
+`jump_panel_hidden_tiles_paint_indicator` hides a real attached tile and
+requires its dedicated painted marker.

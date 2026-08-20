@@ -70,6 +70,9 @@ and a **timestamped log** of every actual attempt.
 | bug-0046 | close-bound-agent-drops-unbound-entry | FIXED | 2026-08-19 | 1 | Close Tile now routes keyboard/menu through one exhaustive transition; bound Agents move intact to Unbound + scratchpad, including the sole-workspace floor case |
 | bug-0047 | agent-session-duplicated-across-projects | FIXED | 2026-08-19 | 1 | the bind choke retires racing roster duplicates; restore chooses the canonical tile by authoritative session cwd/project and rewrites healed state; persistence rejects duplicate identity graphs |
 | bug-0048 | send-workspace-picker-content-label | FIXED | 2026-08-19 | 1 | Send tile destinations now use stable workspace names only; the compact centered picker has explicit Current/Create hierarchy, fixed chrome, clickable rows, and painted regression coverage |
+| bug-0049 | active-workspace-label-low-contrast | FIXED | 2026-08-19 | 1 | active workspace names retain foreground contrast while a neutral background and narrow accent rail carry selection |
+| bug-0050 | jump-tile-name-wraps | FIXED | 2026-08-19 | 1 | primary jump-panel names are single-line ellipsizing labels with stable row geometry |
+| bug-0051 | hidden-tile-has-no-indicator | FIXED | 2026-08-19 | 1 | typed tile placement now paints a compact hidden marker for every hidden Agent and non-Agent tile |
 <!-- Example row once populated:
 | bug-0001 | chatbox-caret-offscreen | RECURRED | 2026-05-02 | 16 | caret + text scroll out of the visible chatbox; no single owner of caret-in-viewport |
 -->
