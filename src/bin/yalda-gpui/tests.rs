@@ -661,6 +661,10 @@ fn preferences_round_trip_with_text_scale() {
         jump_archived_sessions: Some(vec!["sid-old".into()]),
         jump_folded_projects: Some(vec!["Fulcrum".into(), "Yaldabaoth".into()]),
         jump_folded_workspaces: Some(vec!["Yaldabaoth\u{1f}workspace-1".into()]),
+        jump_workspace_order: Some(vec![
+            "Yaldabaoth\u{1f}workspace-3".into(),
+            "Yaldabaoth\u{1f}workspace-1".into(),
+        ]),
         jump_tag_order: Some(std::collections::HashMap::from([(
             "Yaldabaoth".to_string(),
             vec!["urgent".to_string(), "frontend".to_string()],
@@ -698,6 +702,15 @@ fn preferences_round_trip_with_text_scale() {
         back.jump_folded_workspaces.as_deref(),
         Some(&["Yaldabaoth\u{1f}workspace-1".into()][..])
     );
+    assert_eq!(
+        back.jump_workspace_order.as_deref(),
+        Some(
+            &[
+                "Yaldabaoth\u{1f}workspace-3".to_string(),
+                "Yaldabaoth\u{1f}workspace-1".to_string(),
+            ][..]
+        )
+    );
     // UXI-JumpPanel-21: per-project tag order + folded-tag keys round-trip.
     assert_eq!(
         back.jump_tag_order
@@ -723,6 +736,7 @@ fn preferences_round_trip_with_text_scale() {
     assert_eq!(parsed.text_scale, None);
     assert_eq!(parsed.window_width_px, None);
     assert_eq!(parsed.window_height_px, None);
+    assert_eq!(parsed.jump_workspace_order, None);
     assert_eq!(parsed.theme.as_deref(), Some("folio"));
 }
 

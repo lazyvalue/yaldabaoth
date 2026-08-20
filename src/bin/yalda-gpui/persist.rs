@@ -658,6 +658,12 @@ pub(crate) struct Preferences {
     /// Folded workspace folders, keyed by a durable project/auto-name pair.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) jump_folded_workspaces: Option<Vec<String>>,
+    /// User's drag-reordered jump-panel WORKSPACE folder order
+    /// (UXI-JumpPanel-29). Each entry is the same durable project/immutable
+    /// auto-name composite used by `jump_folded_workspaces`. Reordering is
+    /// project-gated; unlisted workspaces retain frame order after listed ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) jump_workspace_order: Option<Vec<String>>,
     /// User's drag-reordered order of jump-panel tag folders, per project
     /// (UXI-JumpPanel-21). `project name → [tag]`; folders render in this order,
     /// any tag not listed sorts after alphabetically. Tags are project-scoped, so

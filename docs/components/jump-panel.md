@@ -1626,3 +1626,48 @@ glyph / enlarged badge are a paint/human-eye detail (gap #1).
 drag reorders + persists, a cross-folder drag is refused). Negative control
 observed RED by deleting the `tiles.sort_by_key(rank)` line in
 `jump_panel_sections_with_tab` (the reorder assertion then fails).
+
+### UXI-JumpPanel-29 — Workspace folders reorder by drag within their project
+
+**Statement.** Workspace folders in the jump panel are user-orderable by
+drag-and-drop, project-bounded, and the order survives restart:
+
+1. Dragging a workspace header onto another workspace header in the SAME project
+   moves the dragged folder into the target's visible slot.
+2. A workspace never crosses project sections. The gesture accepts only a
+   `WorkspaceDrag` from the target's project, and `reorder_workspace`
+   defensively verifies both workspace keys still belong to that project before
+   changing the order.
+3. The order is a jump-panel presentation preference only. It does not reorder
+   `Frame::workspaces`, change the global workspace index shown at the header's
+   trailing edge, alter `Ctrl-<n>` destinations, move tiles, or change project
+   ownership.
+4. The preference is one stable order of durable project/immutable-workspace
+   keys. Each project's folders sort by their rank in that order; absent and
+   unlisted workspaces retain frame order after listed workspaces.
+5. Folding a workspace and clicking its label retain their existing independent
+   gestures; dragging is owned by the workspace identity area and dropping by
+   the header.
+
+**Applies to.** `jump_panel_view.rs` (`WorkspaceDrag`, workspace-folder stable
+sort, `reorder_workspace`, and workspace-header drag/drop wiring),
+`Preferences::jump_workspace_order` in `persist.rs`, and its load/save state in
+`main.rs`.
+
+**Why.** Workspace order in the frame is operational: it defines stable
+`Ctrl-<n>` navigation. The jump panel is also a curated navigation surface, so
+users need to arrange its workspace folders by relevance without silently
+renumbering keyboard destinations or changing tile ownership.
+
+**Status.** `implemented` — the ordering/state transition is headless; the GPUI
+mouse-drag gesture that dispatches it remains `NEEDS-RUNTIME` under harness gap
+#2 (no headless drag-dispatch seam).
+
+**Enforcement.** `jump_workspace_reorder_applies_within_project_and_preserves_frame`
+drives the production folder projection and the exact state transition invoked
+by the drop handler. It proves same-project reordering, cross-project refusal,
+durable order state, and unchanged frame indices/project ownership. The GPUI
+mouse-drag gesture itself remains `NEEDS-RUNTIME` under harness gap #2; the
+typed payload and both gesture/state gates are code-reviewed.
+Negative control observed RED by removing the workspace-folder stable sort: the
+same-project reorder assertion returned `[1, 2, 3]` instead of `[3, 1, 2]`.

@@ -12396,6 +12396,140 @@ fn jump_tile_reorder_applies_within_folder_and_gates_by_folder(cx: &mut TestAppC
     );
 }
 
+/// UXI-JumpPanel-29, REAL state-transition path: workspace folders reorder only
+/// inside their project in the jump-panel projection. The operation must never
+/// mutate `Frame::workspaces`, so global indices (`Ctrl-<n>`) and project/tile
+/// ownership remain stable.
+#[gpui::test]
+fn jump_workspace_reorder_applies_within_project_and_preserves_frame(cx: &mut TestAppContext) {
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+    vcx.run_until_parked();
+
+    let (project_a, project_b, a_indices, b_index) = view.update(vcx, |v, cx| {
+        let project_a = v
+            .projects
+            .create(
+                "Workspace order A".into(),
+                PathBuf::from("/tmp/yalda-ws-order-a"),
+            )
+            .expect("project A");
+        let project_b = v
+            .projects
+            .create(
+                "Workspace order B".into(),
+                PathBuf::from("/tmp/yalda-ws-order-b"),
+            )
+            .expect("project B");
+        let mut a_indices = Vec::new();
+        for _ in 0..3 {
+            v.new_workspace_in(project_a, cx);
+            a_indices.push(v.workspace.active_workspace);
+        }
+        v.new_workspace_in(project_b, cx);
+        let b_index = v.workspace.active_workspace;
+        (project_a, project_b, a_indices, b_index)
+    });
+
+    let folders = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.update(vcx, |v, cx| {
+            let (sections, _) = v.jump_panel_sections(cx);
+            sections
+                .into_iter()
+                .map(|section| {
+                    (
+                        section.id,
+                        section
+                            .workspace_folders
+                            .into_iter()
+                            .map(|folder| (folder.key, folder.index))
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    let frame_snapshot = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.read_with(vcx, |v, _| {
+            v.workspace
+                .workspaces
+                .iter()
+                .map(|workspace| {
+                    (
+                        workspace.auto_name.clone(),
+                        workspace.project(),
+                        workspace.layout.leaf_ids(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+
+    let before = folders(&view, vcx);
+    let frame_before = frame_snapshot(&view, vcx);
+    let a_before = before
+        .iter()
+        .find(|(project, _)| *project == project_a)
+        .map(|(_, folders)| folders.clone())
+        .expect("project A folders");
+    assert_eq!(
+        a_before.iter().map(|(_, index)| *index).collect::<Vec<_>>(),
+        a_indices,
+        "empty preference keeps frame order"
+    );
+    let first_key = a_before[0].0.clone();
+    let third_key = a_before[2].0.clone();
+
+    view.update(vcx, |v, cx| v.reorder_workspace(&third_key, &first_key, cx));
+    let reordered = folders(&view, vcx);
+    let a_after = reordered
+        .iter()
+        .find(|(project, _)| *project == project_a)
+        .map(|(_, folders)| folders.clone())
+        .expect("project A folders remain");
+    assert_eq!(
+        a_after.iter().map(|(_, index)| *index).collect::<Vec<_>>(),
+        vec![a_indices[2], a_indices[0], a_indices[1]],
+        "dragging the third workspace onto the first reorders the panel folders"
+    );
+    let projected_keys: Vec<_> = reordered
+        .iter()
+        .flat_map(|(_, folders)| folders.iter().map(|(key, _)| key.clone()))
+        .collect();
+    view.read_with(vcx, |v, _| {
+        assert_eq!(
+            v.jump_workspace_order, projected_keys,
+            "the complete projected order is retained for preference persistence"
+        );
+    });
+    assert_eq!(
+        frame_snapshot(&view, vcx),
+        frame_before,
+        "panel ordering cannot renumber workspaces or move their tiles"
+    );
+
+    // A cross-project drop is refused and cannot move either folder.
+    let b_key = reordered
+        .iter()
+        .find(|(project, _)| *project == project_b)
+        .and_then(|(_, folders)| folders.first())
+        .map(|(key, _)| key.clone())
+        .expect("project B folder");
+    let order_before_cross = view.read_with(vcx, |v, _| v.jump_workspace_order.clone());
+    view.update(vcx, |v, cx| v.reorder_workspace(&b_key, &first_key, cx));
+    assert_eq!(
+        folders(&view, vcx),
+        reordered,
+        "cross-project drop is a no-op"
+    );
+    view.read_with(vcx, |v, _| {
+        assert_eq!(
+            v.jump_workspace_order, order_before_cross,
+            "cross-project drops cannot mutate the durable presentation order"
+        );
+        assert_eq!(v.workspace.workspaces[b_index].project(), project_b);
+    });
+}
+
 /// bug-0007 (RECURRED), REAL path: a session must NEVER change slot in the jump
 /// panel because of `/clear`. `/clear` kills the server session and creates a new
 /// one with a NEW sid; the user's drag order (`jump_session_order`) ranks by sid,
