@@ -8520,6 +8520,105 @@ fn hidden_tile_navigation_is_solo_until_explicit_unhide(cx: &mut TestAppContext)
     });
 }
 
+/// UXI-Menu-9: Hide and Unhide are the shared suffix of the real tile menu,
+/// and applicability follows the focused tile's typed membership. A disabled
+/// key is inert: it neither invokes the command nor closes the menu.
+///
+/// Negative control: remove `tile-unhide` from the visible/Detached arms of
+/// `tile_visibility_menu_disabled` → the first `shift-h` closes the production
+/// menu and this guard fails RED. Remove the hidden arm's `tile-hide` entry →
+/// lowercase `h` closes the hidden tile menu and also fails RED.
+#[gpui::test]
+fn tile_menu_hide_unhide_enablement_tracks_focused_membership(cx: &mut TestAppContext) {
+    use crate::workspace::{AttachedVisibility, TileMembership};
+
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_worksheet_nav(cx);
+    let tile = view.read_with(vcx, |v, _| v.workspace.focused_window_id().unwrap());
+
+    // Visible attachment: Hide is actionable; Unhide is present but dimmed.
+    vcx.simulate_keystrokes("space");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        let menu = v.menu_ref().expect("visible tile menu");
+        assert!(menu_tree_has_command(&menu.menu, "tile-hide"));
+        assert!(menu_tree_has_command(&menu.menu, "tile-unhide"));
+        assert!(!menu.disabled.contains("tile-hide"));
+        assert!(menu.disabled.contains("tile-unhide"));
+    });
+    vcx.simulate_keystrokes("shift-h");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert!(v.overlay_is_menu(), "disabled Unhide keeps the menu open");
+        assert!(matches!(
+            v.workspace.tile_membership(tile),
+            Some(TileMembership::Attached {
+                visibility: AttachedVisibility::Visible,
+                ..
+            })
+        ));
+    });
+
+    // Invoke Hide through that still-open production menu.
+    vcx.simulate_keystrokes("h");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert!(!v.overlay_is_menu());
+        assert!(matches!(
+            v.workspace.tile_membership(tile),
+            Some(TileMembership::Attached {
+                visibility: AttachedVisibility::Hidden,
+                ..
+            })
+        ));
+    });
+
+    // Visiting the hidden tile presents it solo. The same tile menu now flips
+    // applicability: Hide is dimmed, Unhide is actionable.
+    view.update(vcx, |v, cx| v.jump_to_tile(tile, cx));
+    vcx.simulate_keystrokes("space");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        let menu = v.menu_ref().expect("hidden tile menu");
+        assert!(menu.disabled.contains("tile-hide"));
+        assert!(!menu.disabled.contains("tile-unhide"));
+    });
+    vcx.simulate_keystrokes("h");
+    vcx.run_until_parked();
+    assert!(view.read_with(vcx, |v, _| v.overlay_is_menu()));
+    vcx.simulate_keystrokes("shift-h");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert!(!v.overlay_is_menu());
+        assert!(matches!(
+            v.workspace.tile_membership(tile),
+            Some(TileMembership::Attached {
+                visibility: AttachedVisibility::Visible,
+                ..
+            })
+        ));
+    });
+
+    // Detached tiles cannot participate in workspace visibility; both commands
+    // remain discoverable and dimmed.
+    vcx.simulate_keystrokes("ctrl-w shift-b");
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(vcx, |v, _| v.workspace.tile_membership(tile)),
+        Some(TileMembership::Detached)
+    );
+    vcx.simulate_keystrokes("space");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        let menu = v.menu_ref().expect("Detached tile menu");
+        assert!(menu.disabled.contains("tile-hide"));
+        assert!(menu.disabled.contains("tile-unhide"));
+    });
+    vcx.simulate_keystrokes("shift-h");
+    vcx.run_until_parked();
+    assert!(view.read_with(vcx, |v, _| v.overlay_is_menu()));
+}
+
 /// The destination picker carries the focused tile's project as typed state.
 /// Creating a destination while viewing another project cannot re-home the tile.
 #[gpui::test]

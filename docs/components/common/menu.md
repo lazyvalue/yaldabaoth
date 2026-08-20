@@ -195,10 +195,11 @@ color per theme is the documented pixel gap.
 **Statement.** Exactly **two** leaders open the command panel, and each owns one
 object class (ADR-0032):
 
-- **`space`** opens the menu whose verbs act on the **focused tile's App**. The
+- **`space`** opens the menu whose verbs act on the **focused tile**. The
   tree is selected by the focused content kind (`open_local_menu_inner` matches
   `App::{Buffer(Viewing/Editing/Picking), Agent, Linear, Cog, Keymap}`). The
-  mechanism is uniform; the vocabulary is per-App.
+  mechanism is uniform; the primary vocabulary is per-App, followed by the
+  shared tile-visibility verbs Hide (`h`) and Unhide (`H`).
 - **`.`** opens the single **shell** menu (`gpui_menu`) — verbs on tiles,
   workspaces, appearance, and system. It is the same tree regardless of focused
   tile. It contains everything the retired `?` global menu held.
@@ -210,9 +211,10 @@ literal character where text is captured). Actions that must work *while typing*
 **The placement test (shape+object).** A candidate action is placed by shape,
 then object: a **motion** (repeatable, reversible, no state change) is a direct
 key, never a menu entry; a **verb** (discrete named state change) is a menu entry,
-under `space` if its object is the focused App and under `.` if its object is the
-shell; an **escape hatch** (invoked by name — rare or destructive) goes to the `:`
-command line (deferred until that surface exists). Frequency is not a criterion.
+under `space` if its object is the focused App or its visibility, and under `.`
+for other shell operations; an **escape hatch** (invoked by name — rare or
+destructive) goes to the `:` command line (deferred until that surface exists).
+Frequency is not a criterion.
 
 **Applies to.** `leader_intercept` (`main.rs`) — only `' '` and `.` route to a
 menu; `open_local_menu_inner`, `open_menu_inner`, `gpui_menu`.
@@ -251,12 +253,13 @@ level's keys are unique.
 
 ### UXI-Menu-8 — the Agent and shell roots are deliberately small
 
-**Statement.** The Agent tile menu (`space`) contains exactly five root entries,
-in this order: `w` switch worksheet/chatbox, `m` switch model, `s` select session,
-`c` clear, and `v` view. The View submenu contains only `a` Agents and `t` Tasks;
-choosing one shows that sidepanel view and marks the currently visible choice.
-Advertised model choices use `1..9,0` so changing provider model names cannot
-create key collisions.
+**Statement.** The Agent tile menu (`space`) contains exactly seven dispatchable
+root entries, in this order: `w` switch worksheet/chatbox, `m` switch model, `s`
+select session, `c` clear, `v` view, then the shared `h` Hide and `H` Unhide
+entries after a separator. The View submenu contains only `a` Agents and `t`
+Tasks; choosing one shows that sidepanel view and marks the currently visible
+choice. Advertised model choices use `1..9,0` so changing provider model names
+cannot create key collisions.
 
 The shell menu (`.`) contains exactly seven root entries, in this order: `n` New
 Tile, `X` Close Tile, `m` Send Tile to Workspace, `t` Theme, `j` Toggle Jump
@@ -266,7 +269,8 @@ not deleted; they may remain available through direct keys or another explicit
 surface.
 
 Buffer and other App-specific tile menus are unchanged until their vocabularies
-are separately specified.
+are separately specified, except that every tile menu carries the same shared
+Hide and Unhide suffix required by UXI-Menu-9.
 
 **Applies to.** `agent_local_menu`, `agent_local_menu_dynamic`, `gpui_menu`,
 `dispatch_menu_command`, and `open_workspace_picker` (`main.rs`).
@@ -282,6 +286,32 @@ one-off commands, obscuring the small set of operations used in normal work.
 keys; `verify_harness.rs::agent_menu_lists_advertised_models_and_marks_current`
 checks the live model submenu; workspace-picker harness tests exercise the real
 bound and unbound send path.
+
+### UXI-Menu-9 — tile visibility commands are universal and contextual
+
+**Statement.** Every tile-specific menu (`space`) ends with `h` Hide and `H`
+Unhide, separated from its App-specific entries. The command names are always
+present so the menu remains learnable. Unhide is enabled only when the focused
+tile is an attached-hidden tile being presented solo; in every other state it is
+dimmed and does not dispatch. Hide is enabled only for an attached-visible tile;
+for an attached-hidden or Detached tile it is dimmed and does not dispatch.
+
+**Applies to.** All `*_local_menu()` builders,
+`with_tile_visibility_commands`, `tile_visibility_menu_disabled`,
+`open_local_menu_inner`, and disabled-command handling (`main.rs`).
+
+**Why.** Visibility is a property of the tile regardless of its App. Keeping the
+same two commands at the same location makes hide/unhide discoverable without
+allowing an invalid state transition to masquerade as a successful command.
+
+**Status.** `implemented`
+
+**Enforcement.** `tests.rs::every_tile_menu_has_shared_visibility_commands`
+asserts the exact shared suffix for every App menu. The real-path GUI guard
+`verify_harness.rs::tile_menu_hide_unhide_enablement_tracks_focused_membership`
+opens the production tile menu, verifies applicability across visible, hidden,
+and Detached membership, and proves a disabled key neither dispatches nor
+closes the menu.
 
 ## Deviations from the design brief (Fable, "The Sigil Card")
 
