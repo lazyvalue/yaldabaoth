@@ -23046,6 +23046,201 @@ fn roster_only_session_shows_live_status(cx: &mut TestAppContext) {
     );
 }
 
+/// UXI-JumpPanel-12 (union clause): a session OPEN in this GUI whose current turn
+/// was started ELSEWHERE — another GUI window, `yalda-mcp`, or a turn still
+/// streaming after a reconnect — has `turn_phase == Idle` locally (the phase only
+/// enters `Awaiting` on a submit THIS GUI made), yet the server's `SessionBusy`
+/// flag is set. The row must read WORKING: the derivation unions the local phase
+/// with `SessionInfo.busy`, so the server flag is never masked by the local Idle.
+///
+/// This is the "poor sense of awareness of when an agent is working" report: an
+/// open session driven from elsewhere painted green "ready" while genuinely busy.
+///
+/// Drives the REAL row builder over a REAL bound local session (`install_agent_slot`)
+/// plus the REAL reducer (`apply_server_batch` with `SessionBusy`). The local
+/// `turn_phase` is left at its Idle default — nothing local ever makes it Awaiting.
+///
+/// Negative control (observed RED): restore the local-wins derivation
+/// `let awaiting = local.map(|(a,_,_)| a).or(Some(info.busy));` in
+/// `jump_panel_agent_rows` → the open session reports WaitingForYou while the
+/// server says busy.
+#[gpui::test]
+fn open_session_busy_from_elsewhere_shows_working(cx: &mut TestAppContext) {
+    use yalda::session_proto::{Notification as ServerNotification, SessionInfo};
+    let (view, vcx) = boot_browser(cx);
+
+    // A session bound to a tile HERE (so `opened`/local state resolves) AND
+    // present in the roster (so the row is a Roster target the server flag drives).
+    install_agent_slot(&view, &mut *vcx, Some("S-open"));
+    view.update(vcx, |v, _cx| {
+        v.agent_roster.upsert(SessionInfo {
+            session_id: "S-open".into(),
+            acp_session_id: None,
+            label: "claude-1".into(),
+            cwd: PathBuf::from("."),
+            provider: yalda::acp_channel::AgentProvider::Claude,
+            turns: 0,
+            connected: true,
+            permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+            busy: false,
+            archived: false,
+        });
+    });
+    vcx.run_until_parked();
+
+    let status_of = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.update(vcx, |v, cx| {
+            v.jump_panel_agent_rows(cx)
+                .into_iter()
+                .find(|r| matches!(&r.target, crate::JumpTarget::Roster(s) if s == "S-open"))
+                .map(|r| r.dot_status())
+        })
+    };
+
+    // Precondition: locally Idle + server idle ⇒ ready for input.
+    assert_eq!(
+        status_of(&view, vcx),
+        Some(crate::AgentDotStatus::WaitingForYou),
+        "an open, idle session begins ready for input"
+    );
+    // Guard: the local turn_phase is genuinely Idle — this is not a vacuous pass.
+    assert!(
+        view.read_with(vcx, |v, cx| {
+            let id = v
+                .sessions
+                .locate(&ServerSid::new("S-open"))
+                .expect("bound session");
+            v.read_session(id, cx, |c| c.turn_phase.is_awaiting()) == Some(false)
+        }),
+        "the open session's local turn_phase must stay Idle (the elsewhere case)"
+    );
+
+    // The server says the turn started — via the REAL reducer. Nothing touches
+    // the local turn_phase, exactly like a turn another driver initiated.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![ServerNotification::SessionBusy {
+                session_id: "S-open".into(),
+                busy: true,
+            }],
+            cx,
+        );
+    });
+    assert_eq!(
+        status_of(&view, vcx),
+        Some(crate::AgentDotStatus::Working),
+        "an open session whose turn runs elsewhere must read WORKING, not ready"
+    );
+
+    // And the server settling it returns the row to ready.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![ServerNotification::SessionBusy {
+                session_id: "S-open".into(),
+                busy: false,
+            }],
+            cx,
+        );
+    });
+    assert_eq!(
+        status_of(&view, vcx),
+        Some(crate::AgentDotStatus::WaitingForYou),
+        "when the server clears busy and local is idle, the row is ready again"
+    );
+}
+
+/// UXI-JumpPanel-30: a workspace folder marks that it contains a working agent, so
+/// a collapsed folder still surfaces activity inside it. Derived from the folder's
+/// own tiles (`AgentActivity::Working`), it tracks the same union-of-authorities
+/// status the session dot uses — here the turn is driven by the server flag while
+/// the local phase stays Idle.
+///
+/// Drives the REAL folder projection (`jump_panel_sections`) over a REAL agent tile
+/// in the active workspace, and the REAL `SessionBusy` reducer.
+///
+/// Negative control (observed RED): force `has_working_agent = false` at its
+/// construction site in `jump_panel_sections_with_tab` → the busy assertion fails.
+#[gpui::test]
+fn workspace_folder_marks_contained_working_agent(cx: &mut TestAppContext) {
+    use yalda::session_proto::{Notification as ServerNotification, SessionInfo};
+    // boot_with_transcript installs an agent tile bound to S1 in the active
+    // workspace, so that workspace's folder owns the tile.
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    view.update(vcx, |v, _cx| {
+        v.agent_roster.upsert(SessionInfo {
+            session_id: "S1".into(),
+            acp_session_id: None,
+            label: "claude-1".into(),
+            cwd: PathBuf::from("."),
+            provider: yalda::acp_channel::AgentProvider::Claude,
+            turns: 0,
+            connected: true,
+            permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+            busy: false,
+            archived: false,
+        });
+    });
+    vcx.run_until_parked();
+
+    let any_folder_working =
+        |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+            view.update(vcx, |v, cx| {
+                v.jump_panel_sections(cx)
+                    .0
+                    .iter()
+                    .flat_map(|s| &s.workspace_folders)
+                    .any(|f| f.has_working_agent)
+            })
+        };
+    // Guard the setup is non-vacuous: a folder actually owns the S1 tile.
+    assert!(
+        view.update(vcx, |v, cx| {
+            v.jump_panel_sections(cx)
+                .0
+                .iter()
+                .flat_map(|s| &s.workspace_folders)
+                .flat_map(|f| &f.tiles)
+                .any(|t| t.agent.is_some())
+        }),
+        "a workspace folder must own the bound agent tile (setup non-vacuous)"
+    );
+
+    assert!(
+        !any_folder_working(&view, vcx),
+        "idle agent ⇒ no folder marked working"
+    );
+
+    // The server starts a turn; the local phase is never touched (driven elsewhere).
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![ServerNotification::SessionBusy {
+                session_id: "S1".into(),
+                busy: true,
+            }],
+            cx,
+        );
+    });
+    assert!(
+        any_folder_working(&view, vcx),
+        "a working agent inside the workspace marks its folder working"
+    );
+
+    // Settling the turn clears the folder mark.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![ServerNotification::SessionBusy {
+                session_id: "S1".into(),
+                busy: false,
+            }],
+            cx,
+        );
+    });
+    assert!(
+        !any_folder_working(&view, vcx),
+        "the folder mark clears when the contained agent goes idle"
+    );
+}
+
 /// bug-0021 / `UXI-AgentTile-27` property 1 (amended): the one-shot autoname is armed
 /// by SESSION IDENTITY, not by which constructor built the state. A session that
 /// arrives by ATTACH (created free from the jump panel, `/clear`ed, or restored)

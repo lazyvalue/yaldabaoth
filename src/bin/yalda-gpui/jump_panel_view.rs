@@ -354,26 +354,30 @@ impl YaldaGpuiView {
             let label = opened
                 .map(|e| e.read(cx).label.clone())
                 .unwrap_or_else(|| info.label.clone());
-            // Local activity can lead the roster briefly while the server's
-            // SessionBusy broadcast is in flight. Capture its phase and entry
-            // time together so status and chronology are one coherent read.
-            let local_activity = opened.map(|e| {
+            // Two authorities decide whether the session is working: the local
+            // reducer's turn phase (rich, but only enters Awaiting on a submit
+            // THIS GUI made) and the server's `busy` flag (a turn is owed, set
+            // for ANY driver). Capture the local phase plus both candidate entry
+            // timestamps — the turn start (working) and the idle transition.
+            let local = opened.map(|e| {
                 let state = &e.read(cx).state;
-                let awaiting = state.turn_phase.is_awaiting();
-                let entered_at = if awaiting {
-                    state.turn_phase.turn_started()
-                } else {
-                    state.waiting_since
-                };
-                (awaiting, entered_at)
+                (
+                    state.turn_phase.is_awaiting(),
+                    state.turn_phase.turn_started(),
+                    state.waiting_since,
+                )
             });
-            // bug-0022: local state is authoritative when this GUI holds the
-            // session; otherwise the SERVER's in-flight flag drives it, so a
-            // free session (or one another GUI is driving) shows real status
-            // instead of a permanent neutral dot.
-            let awaiting = local_activity
-                .map(|(awaiting, _)| awaiting)
-                .or(Some(info.busy));
+            let local_awaiting = local.map(|(a, _, _)| a).unwrap_or(false);
+            // bug-0022 + working-awareness: the session is Working if EITHER
+            // authority says so. Local alone is not enough — a turn started
+            // elsewhere (another GUI, yalda-mcp) or still streaming after a
+            // reconnect (`reset_for_replay` drops the phase to Idle) never moves
+            // the local phase off Idle, so masking the server flag with local
+            // state (the old `.or` fallback, dead whenever the session was open
+            // here) painted a working agent as "ready". OR-ing also holds the row
+            // Working until BOTH agree it is idle. `connected` still gates the
+            // dot to Neutral, so a disconnected session never reads Working.
+            let awaiting = Some(local_awaiting || info.busy);
             let unread = opened
                 .map(|e| e.read(cx).state.unread)
                 .unwrap_or_else(|| self.roster_unread.contains_key(&info.session_id));
@@ -381,17 +385,22 @@ impl YaldaGpuiView {
             // UXI-JumpPanel-14: attaching/viewing a roster session constructs a
             // fresh local AgentState whose default waiting_since is "now". That
             // construction is NOT an operational transition and must not send
-            // the row to the bottom of Waiting. While local + roster activity
-            // agree, retain the roster's identity-stable entry time. If they
-            // disagree, local state has begun a real transition ahead of the
-            // corresponding server broadcast, so its timestamp leads until the
-            // roster catches up.
-            let state_entered_at = match local_activity {
-                Some((local_busy, local_entered_at)) if local_busy == info.busy => {
-                    roster_entered_at.or(local_entered_at)
-                }
-                Some((_, local_entered_at)) => local_entered_at.or(roster_entered_at),
-                None => roster_entered_at,
+            // the row to the bottom of Waiting. Source the entry time from
+            // whichever authority owns the CURRENT state: the server's transition
+            // time is identity-stable across a fresh attach, so it wins whenever
+            // the server is a party to the state (busy, or both idle). Only when
+            // the LOCAL turn leads a not-yet-broadcast server flag does the local
+            // timestamp lead, until the roster catches up.
+            let state_entered_at = if info.busy {
+                // Working per the server — its transition time is stable.
+                roster_entered_at.or(local.and_then(|(_, started, _)| started))
+            } else if local_awaiting {
+                // Local turn leads the SessionBusy broadcast.
+                local.and_then(|(_, started, _)| started).or(roster_entered_at)
+            } else {
+                // Idle: the roster's idle transition is identity-stable across a
+                // fresh attach; fall back to the local waiting_since.
+                roster_entered_at.or(local.and_then(|(_, _, waiting)| waiting))
             };
             // bug-0020: the live session is authoritative, but a session that is
             // NOT open here (free, or freshly restored before attach) still has a
@@ -607,6 +616,12 @@ pub(crate) struct JumpWorkspaceFolder {
     pub(crate) label: String,
     pub(crate) active: bool,
     pub(crate) tiles: Vec<JumpTileRow>,
+    /// UXI-JumpPanel-30: at least one agent tile this workspace owns holds a
+    /// session that is currently **working** (a reply in flight). Drives a
+    /// folder-header status dot so a collapsed workspace still surfaces that an
+    /// agent inside it is busy. Derived from the folder's `tiles` so it uses the
+    /// same per-session `AgentActivity` the rows do — one source of truth.
+    pub(crate) has_working_agent: bool,
 }
 
 /// One rendered project section in the jump panel (UXI-Project-3): a project's
@@ -742,6 +757,15 @@ impl YaldaGpuiView {
                             .unwrap_or(usize::MAX)
                     };
                     tiles.sort_by_key(|t| tile_rank(t.id));
+                    // UXI-JumpPanel-30: the folder is "working" if any tile it
+                    // owns binds a session with a reply in flight. Reuses the row's
+                    // `AgentActivity`, so it tracks the same union-of-authorities
+                    // status the session dot shows (UXI-JumpPanel-12).
+                    let has_working_agent = tiles.iter().any(|t| {
+                        t.agent
+                            .as_ref()
+                            .is_some_and(|row| row.activity() == AgentActivity::Working)
+                    });
                     JumpWorkspaceFolder {
                         index,
                         key: Self::workspace_fold_key(&p.name, &wsp.auto_name),
@@ -749,6 +773,7 @@ impl YaldaGpuiView {
                         active: self.workspace.presented_tile().is_none()
                             && self.workspace.active_workspace == index,
                         tiles,
+                        has_working_agent,
                     }
                 })
                 .collect();
@@ -1682,6 +1707,7 @@ impl YaldaGpuiView {
                 let num = format!("{}", idx + 1);
                 let label = folder.label.clone();
                 let tile_count = folder.tiles.len();
+                let has_working = folder.has_working_agent;
                 let count_label = jump_workspace_membership_label(tile_count);
                 let group_style = jump_workspace_group_style(folder.active, st.fg, electric);
                 let header = div()
@@ -1738,6 +1764,20 @@ impl YaldaGpuiView {
                                 this.select_workspace(idx, cx)
                             })),
                     )
+                    // UXI-JumpPanel-30: a warm ◆ when any agent tile inside this
+                    // workspace is working, so a collapsed folder still shows it.
+                    .children(has_working.then(|| {
+                        probe_bounds_dyn(
+                            format!("jump-ws-working-{idx}"),
+                            div()
+                                .flex_none()
+                                .mr_1()
+                                .text_color(working_orange)
+                                .font_family(st.mono.clone())
+                                .child(SharedString::new_static("◆"))
+                                .into_any_element(),
+                        )
+                    }))
                     .child(probe_bounds_dyn(
                         format!("jump-workspace-count-{idx}"),
                         compact_status_mark(
