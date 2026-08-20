@@ -1045,8 +1045,8 @@ impl Theme {
         }
     }
 
-    /// Folio — a cool, muted light theme: Bone tiles on a Soft White desktop,
-    /// cool ink text (`#262a2f`), cool-grey secondary text (no tan/sepia).
+    /// Folio — a warm, muted light theme inspired by aged paper and ink.
+    /// Background `#F6F4F0` (warm off-white), text `#342d1f` (dark sepia).
     /// Steel-blue keywords, sage-green strings, teal types, navy headings.
     pub fn folio() -> Self {
         // Paper:     #F6F4F0   Linen:     #EDEBE6   Parchment: #E4E1DB
@@ -1077,63 +1077,63 @@ impl Theme {
                     .add_modifier(Modifier::BOLD),
                 // h6: comment
                 Style::default()
-                    .fg(Color::Rgb(0x6f, 0x78, 0x83))
+                    .fg(Color::Rgb(0x75, 0x6f, 0x61))
                     .add_modifier(Modifier::BOLD),
             ],
-            paragraph: Style::default().fg(Color::Rgb(0x26, 0x2a, 0x2f)), // ink
+            paragraph: Style::default().fg(Color::Rgb(0x34, 0x2d, 0x1f)), // ink
             bold: Style::default()
                 .add_modifier(Modifier::BOLD)
-                .fg(Color::Rgb(0x26, 0x2a, 0x2f)),
+                .fg(Color::Rgb(0x34, 0x2d, 0x1f)),
             italic: Style::default()
                 .add_modifier(Modifier::ITALIC)
-                .fg(Color::Rgb(0x26, 0x2a, 0x2f)),
+                .fg(Color::Rgb(0x34, 0x2d, 0x1f)),
             strikethrough: Style::default()
                 .add_modifier(Modifier::CROSSED_OUT)
-                .fg(Color::Rgb(0x8a, 0x92, 0x9b)), // tan
+                .fg(Color::Rgb(0xb5, 0xa4, 0x83)), // tan
             code_inline: Style::default()
                 .fg(Color::Rgb(0x49, 0x5f, 0x4e)) // sage (matches String)
-                .bg(Color::Rgb(0xe9, 0xec, 0xef)), // linen
-            code_block_bg: Style::default().bg(Color::Rgb(0xe9, 0xec, 0xef)),
+                .bg(Color::Rgb(0xed, 0xeb, 0xe6)), // linen
+            code_block_bg: Style::default().bg(Color::Rgb(0xed, 0xeb, 0xe6)),
             blockquote_bar: Style::default().fg(Color::Rgb(0x40, 0x5d, 0x72)), // steel
             blockquote_text: Style::default()
-                .fg(Color::Rgb(0x6f, 0x78, 0x83)) // comment
+                .fg(Color::Rgb(0x75, 0x6f, 0x61)) // comment
                 .add_modifier(Modifier::ITALIC),
             link: Style::default()
                 .fg(Color::Rgb(0x40, 0x5d, 0x72)) // steel (matches markdownLinkText)
                 .add_modifier(Modifier::UNDERLINED),
-            table_border: Style::default().fg(Color::Rgb(0x8a, 0x92, 0x9b)), // tan
+            table_border: Style::default().fg(Color::Rgb(0xb5, 0xa4, 0x83)), // tan
             table_header: Style::default()
                 .fg(Color::Rgb(0x2d, 0x30, 0x50)) // navy
                 .add_modifier(Modifier::BOLD),
-            horizontal_rule: Style::default().fg(Color::Rgb(0x8a, 0x92, 0x9b)),
+            horizontal_rule: Style::default().fg(Color::Rgb(0xb5, 0xa4, 0x83)),
             list_marker: Style::default().fg(Color::Rgb(0x40, 0x5d, 0x72)), // steel
             image_label: Style::default()
                 .fg(Color::Rgb(0x40, 0x67, 0x64)) // teal
                 .add_modifier(Modifier::ITALIC),
-            cursor_line: Style::default().bg(Color::Rgb(0xe9, 0xec, 0xef)), // linen
+            cursor_line: Style::default().bg(Color::Rgb(0xed, 0xeb, 0xe6)), // linen
             top_bar: Style::default()
                 .fg(Color::Rgb(0x40, 0x5d, 0x72)) // steel
-                .bg(Color::Rgb(0xe7, 0xea, 0xed)), // parchment
+                .bg(Color::Rgb(0xe4, 0xe1, 0xdb)), // parchment
             top_bar_mode: Style::default()
                 .fg(Color::Rgb(0x2d, 0x30, 0x50)) // navy
-                .bg(Color::Rgb(0xe7, 0xea, 0xed))
+                .bg(Color::Rgb(0xe4, 0xe1, 0xdb))
                 .add_modifier(Modifier::BOLD),
             bottom_bar: Style::default()
-                .fg(Color::Rgb(0x6f, 0x78, 0x83)) // comment
-                .bg(Color::Rgb(0xe7, 0xea, 0xed)),
+                .fg(Color::Rgb(0x75, 0x6f, 0x61)) // comment
+                .bg(Color::Rgb(0xe4, 0xe1, 0xdb)),
             mode_indicator: Style::default()
                 .fg(Color::Rgb(0x40, 0x5d, 0x72))
                 .add_modifier(Modifier::BOLD),
             search_match: Style::default()
-                .fg(Color::Rgb(0x26, 0x2a, 0x2f))
+                .fg(Color::Rgb(0x34, 0x2d, 0x1f))
                 .bg(Color::Rgb(0xd6, 0xdc, 0xe4)), // Visual bg
             search_match_current: Style::default()
-                .fg(Color::Rgb(0xf4, 0xf6, 0xf8))
+                .fg(Color::Rgb(0xf6, 0xf4, 0xf0))
                 .bg(Color::Rgb(0x40, 0x5d, 0x72)) // steel on paper
                 .add_modifier(Modifier::BOLD),
-            midpoint_marker: Style::default().fg(Color::Rgb(0x8a, 0x92, 0x9b)),
-            line_number: Style::default().fg(Color::Rgb(0x8a, 0x92, 0x9b)), // tan
-            line_number_current: Style::default().fg(Color::Rgb(0x26, 0x2a, 0x2f)),
+            midpoint_marker: Style::default().fg(Color::Rgb(0xb5, 0xa4, 0x83)),
+            line_number: Style::default().fg(Color::Rgb(0xb5, 0xa4, 0x83)), // tan
+            line_number_current: Style::default().fg(Color::Rgb(0x34, 0x2d, 0x1f)),
             editor_bg: Color::Rgb(0xf5, 0xf5, 0xf0), // desktop margin — Soft White
             tile_bg: Some(Color::Rgb(0xf0, 0xed, 0xe4)), // tiles/paper — Bone (a step darker)
             editor_fg: Color::Rgb(0x26, 0x2a, 0x2f), // ink — cool near-black
@@ -1510,43 +1510,43 @@ impl AgentTheme {
         Self {
             frozen_bar: Color::Rgb(0x40, 0x5d, 0x72), // steel
             user_bar: Color::Rgb(0x49, 0x5f, 0x4e),   // sage
-            tool_label: Color::Rgb(0x5b, 0x63, 0x6e), // cool slate-gray (was warm-gray)
-            dim: Color::Rgb(0x8a, 0x92, 0x9b),        // cool grey (was tan)
+            tool_label: Color::Rgb(0x52, 0x4b, 0x46), // warm-gray
+            dim: Color::Rgb(0xb5, 0xa4, 0x83),        // tan
 
             agent_tint: Color::Rgb(0x2d, 0x3d, 0x4e), // deep steel — darker for readability on paper
-            user_tint: Color::Rgb(0x26, 0x2a, 0x2f),  // cool ink (was sepia)
+            user_tint: Color::Rgb(0x34, 0x2d, 0x1f),  // ink
             frozen_fg: Color::Rgb(0x3a, 0x3e, 0x48),
 
-            agent_turn_bg: Color::Rgb(0xf1, 0xf3, 0xf5), // cool, barely off the tile
+            agent_turn_bg: Color::Rgb(0xf2, 0xf0, 0xeb), // barely darker than paper
             user_turn_bg: Color::Rgb(0xde, 0xe5, 0xee),  // faint blue tint (UXI-AgentTile-23)
 
             turn_header_agent: Color::Rgb(0x40, 0x5d, 0x72), // steel
             turn_header_user: Color::Rgb(0x49, 0x5f, 0x4e),  // sage
-            turn_rule: Color::Rgb(0xd5, 0xda, 0xde), // cool divider (was warm)
+            turn_rule: Color::Rgb(0xd6, 0xd2, 0xca),
 
-            tool_card_bg: Color::Rgb(0xe9, 0xec, 0xef), // cool light (was linen)
-            tool_card_border: Color::Rgb(0xd5, 0xda, 0xde),
+            tool_card_bg: Color::Rgb(0xed, 0xeb, 0xe6), // linen
+            tool_card_border: Color::Rgb(0xd6, 0xd2, 0xca),
             tool_completed: Color::Rgb(0x49, 0x5f, 0x4e), // sage
-            tool_in_progress: Color::Rgb(0xa6, 0x88, 0x2c), // muted gold (cooled from warm amber)
+            tool_in_progress: Color::Rgb(0x8b, 0x70, 0x20), // warm amber
             tool_failed: Color::Rgb(0x8b, 0x35, 0x35),    // error
-            tool_pending: Color::Rgb(0x8a, 0x92, 0x9b),   // cool grey (was tan)
+            tool_pending: Color::Rgb(0xb5, 0xa4, 0x83),   // tan
 
-            tool_body_bg: Color::Rgb(0xe9, 0xec, 0xef), // cool light (was linen)
-            tool_output_bg: Color::Rgb(0xf4, 0xf6, 0xf8), // cool near-white (was paper)
-            tool_body_fg: Color::Rgb(0x5b, 0x63, 0x6e), // cool slate-gray (was warm-gray)
+            tool_body_bg: Color::Rgb(0xed, 0xeb, 0xe6), // linen
+            tool_output_bg: Color::Rgb(0xf6, 0xf4, 0xf0), // paper
+            tool_body_fg: Color::Rgb(0x52, 0x4b, 0x46), // warm-gray
 
             diff_add: Color::Rgb(0x49, 0x5f, 0x4e),    // sage
             diff_remove: Color::Rgb(0x8b, 0x35, 0x35), // error
             diff_header: Color::Rgb(0x2d, 0x30, 0x50), // navy
 
             selection_bg: Color::Rgb(0xd6, 0xdc, 0xe4), // Visual bg
-            compose_separator: Color::Rgb(0xcd, 0xd3, 0xda), // cool divider (was tan)
-            cursor: Color::Rgb(0x40, 0x60, 0x7a), // steel caret (was error-red)
+            compose_separator: Color::Rgb(0xb5, 0xa4, 0x83),
+            cursor: Color::Rgb(0x8b, 0x35, 0x35),
 
-            sidebar_bg: Color::Rgb(0xe9, 0xec, 0xef), // cool light (was linen)
-            sidebar_border: Color::Rgb(0xd5, 0xda, 0xde),
+            sidebar_bg: Color::Rgb(0xed, 0xeb, 0xe6),
+            sidebar_border: Color::Rgb(0xd6, 0xd2, 0xca),
             sidebar_header: Color::Rgb(0x40, 0x5d, 0x72), // steel
-            warm_accent: Color::Rgb(0x40, 0x67, 0x64), // teal (was brown — no brown accents)
+            warm_accent: Color::Rgb(0x8b, 0x70, 0x20),
 
             jump_header: Color::Rgb(0xff, 0x6b, 0x6b),
             jump_subheader: Color::Rgb(0x3b, 0x9e, 0xff),
