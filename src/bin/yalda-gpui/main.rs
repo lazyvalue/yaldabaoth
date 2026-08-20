@@ -6555,7 +6555,7 @@ impl YaldaGpuiView {
             let is_active = i == active;
             let marker = if is_selected { "\u{25b8} " } else { "  " };
             let here = if is_active { " (here)" } else { "" };
-            let label_text = format!("{}{}", workspace_strip_label(wsp), here);
+            let label_text = format!("{}{}", workspace_picker_destination_label(wsp), here);
             let name_color = if is_active { label_fg } else { normal_fg };
 
             let mut row = div().flex().flex_row().items_center().px_2().py_0p5();
@@ -9431,6 +9431,12 @@ fn workspace_strip_label(wsp: &workspace::Workspace<App>) -> String {
     } else {
         wsp.display_label().to_string()
     }
+}
+
+/// Workspace identity shown in destination pickers. Kept separate from the
+/// workspace strip's content summary so the picker can evolve independently.
+fn workspace_picker_destination_label(wsp: &workspace::Workspace<App>) -> String {
+    workspace_strip_label(wsp)
 }
 
 fn basename_or_full(path: &str) -> String {

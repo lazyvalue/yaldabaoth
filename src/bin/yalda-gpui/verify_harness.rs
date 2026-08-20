@@ -19124,6 +19124,39 @@ fn ctrl_w_send_and_send_follow_use_the_same_project_picker(cx: &mut TestAppConte
     });
 }
 
+/// UXI-Workspace-25 / bug-0048: destination rows identify the workspace, not
+/// the content of whichever tile happens to be focused there. This drives the
+/// real Ctrl-W picker path, then resolves the exact production label helper
+/// used by the rendered row.
+#[gpui::test]
+fn send_picker_agent_destination_uses_workspace_name_without_provider_prefix(
+    cx: &mut TestAppContext,
+) {
+    use crate::{AgentTile, App};
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_browser(cx);
+    let target = view.update(vcx, |v, _| {
+        v.workspace
+            .push_workspace_inheriting(App::Agent(AgentTile::new()));
+        let target = v.workspace.active_workspace;
+        v.workspace.workspaces[target].display_name = Some("Research".into());
+        v.workspace.set_active_workspace(0);
+        target
+    });
+
+    vcx.simulate_keystrokes("ctrl-w m");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        let picker = v.workspace_picker_ref().expect("send picker opened");
+        assert!(picker.targets.contains(&target));
+        let label = crate::workspace_picker_destination_label(&v.workspace.workspaces[target]);
+        assert_eq!(
+            label, "Research",
+            "a destination is the workspace named Research, not the focused Agent tile: {label:?}"
+        );
+    });
+}
+
 /// ADR-0034: hide/unhide and back-and-forth actions are wired at the shared
 /// tile wrapper, so the real chords work regardless of focused App kind.
 #[gpui::test]
