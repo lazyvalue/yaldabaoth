@@ -1542,15 +1542,15 @@ impl AgentTheme {
 
             selection_bg: Color::Rgb(0xe3, 0xe3, 0xe0), // Visual bg
             compose_separator: Color::Rgb(0x9a, 0x9a, 0x9a),
-            cursor: Color::Rgb(0x40, 0x67, 0x64), // teal caret — agent accent
+            cursor: Color::Rgb(0xd6, 0x4f, 0x5a), // deep red block caret (matches jump_header)
 
             sidebar_bg: Color::Rgb(0xeb, 0xea, 0xe7),
             sidebar_border: Color::Rgb(0xd4, 0xd4, 0xd2),
             sidebar_header: Color::Rgb(0x40, 0x67, 0x64), // teal — "Subagents"/"Tasklist" headers
             warm_accent: Color::Rgb(0x40, 0x67, 0x64), // teal (cog section headings)
 
-            jump_header: Color::Rgb(0xff, 0x6b, 0x6b),
-            jump_subheader: Color::Rgb(0x3b, 0x9e, 0xff),
+            jump_header: Color::Rgb(0xd6, 0x4f, 0x5a), // deep red (was neon coral #ff6b6b)
+            jump_subheader: Color::Rgb(0x5a, 0x7f, 0xa8), // muted denim (was neon #3b9eff)
             jump_working: Color::Rgb(0xff, 0x9e, 0x64),
         }
     }

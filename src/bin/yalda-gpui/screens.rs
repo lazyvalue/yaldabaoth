@@ -4,6 +4,17 @@
 
 use super::*;
 
+/// Alpha of the teal wash behind the worksheet draft. Fainter while TYPING
+/// (Insert) than at rest (Normal), so an active input reads as a lighter
+/// backdrop than a resting/selected one. Both non-zero so the wash is always
+/// present. Pinned by `worksheet_backdrop_fainter_in_insert`.
+pub(crate) fn worksheet_backdrop_alpha(mode: EditMode) -> f32 {
+    match mode {
+        EditMode::Insert => 0.05,
+        EditMode::Normal => 0.11,
+    }
+}
+
 /// Test-only record of the source text and syntax background that the real
 /// virtualized Buffer edit renderer handed to GPUI for a visible line.
 #[cfg(test)]
@@ -1350,6 +1361,17 @@ impl YaldaGpuiView {
             let compose_sel = tb.editor.selection_range();
             let sep_color: Hsla = nc(at.compose_separator);
             let compose_cursor_color: Hsla = nc(at.cursor);
+            // Worksheet accent = teal (the app accent), used for the left `›`
+            // gutter bar — kept SEPARATE from the block caret (which is red), so
+            // the caret pops while the placement cue stays teal.
+            let worksheet_accent: Hsla = nc(at.warm_accent);
+            // A slight teal wash behind the worksheet draft. Fainter while
+            // TYPING (Insert) than resting (Normal), per request.
+            let worksheet_backdrop: Hsla = {
+                let mut c = worksheet_accent;
+                c.a = worksheet_backdrop_alpha(compose_mode);
+                c
+            };
             // Same theme selection color the edit view paints (see
             // `build_edit_body_*` → `self.theme.agent.selection_bg`), so the
             // chatbox highlight contrast matches the rest of the app.
@@ -1357,7 +1379,7 @@ impl YaldaGpuiView {
             // Worksheet (inline placement) tints the box border with the accent
             // as a placement cue; chatbox stays neutral.
             let compose_border: Hsla = if is_worksheet {
-                compose_cursor_color
+                worksheet_accent
             } else {
                 dim_fg
             };
@@ -1440,7 +1462,10 @@ impl YaldaGpuiView {
                 // accent left bar as the `›` draft gutter, so the draft reads as a
                 // continuation of the conversation. Chatbox keeps the pinned box.
                 if is_worksheet {
-                    scroll = scroll.border_l_2().border_color(compose_cursor_color);
+                    scroll = scroll
+                        .border_l_2()
+                        .border_color(worksheet_accent)
+                        .bg(worksheet_backdrop);
                 } else {
                     scroll = scroll
                         .bg(compose_panel_bg)
@@ -1537,7 +1562,10 @@ impl YaldaGpuiView {
                 // Same placement chrome as the small-draft path (design-c.md §1):
                 // inline-flush worksheet (accent left bar) vs pinned box.
                 if is_worksheet {
-                    scroll = scroll.border_l_2().border_color(compose_cursor_color);
+                    scroll = scroll
+                        .border_l_2()
+                        .border_color(worksheet_accent)
+                        .bg(worksheet_backdrop);
                 } else {
                     scroll = scroll
                         .bg(compose_panel_bg)
@@ -1584,7 +1612,7 @@ impl YaldaGpuiView {
                         .text_size(px(11.0))
                         .font_family(compose_code_font.clone())
                         .font_weight(FontWeight::BOLD)
-                        .text_color(compose_cursor_color)
+                        .text_color(worksheet_accent)
                         .child(SharedString::new_static("You")),
                 );
             }

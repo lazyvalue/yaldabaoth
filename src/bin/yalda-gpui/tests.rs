@@ -5920,6 +5920,29 @@ fn folio_bone_surfaces_and_nightfox_steel_accent() {
     assert_eq!(nf.input, nf.key, "Nightfox caret follows the steel key, not yellow");
 }
 
+/// Worksheet backdrop is fainter while typing (Insert) than at rest (Normal),
+/// and always present. Negative control: make the two arms equal → this fails.
+#[test]
+fn worksheet_backdrop_fainter_in_insert() {
+    let insert = crate::screens::worksheet_backdrop_alpha(EditMode::Insert);
+    let normal = crate::screens::worksheet_backdrop_alpha(EditMode::Normal);
+    assert!(insert > 0.0 && normal > 0.0, "the wash is always present");
+    assert!(insert < normal, "typing (Insert) is fainter than resting (Normal)");
+}
+
+/// Folio jump-panel + worksheet accent colors: the neon blue/red are toned
+/// down, the block caret is the deep red, teal stays the agent accent.
+#[test]
+fn folio_jump_and_caret_colors() {
+    use yalda::style::Color;
+    let at = yalda::theme::AgentTheme::folio();
+    assert_eq!(at.jump_header, Color::Rgb(0xd6, 0x4f, 0x5a), "deep red, not neon coral");
+    assert_eq!(at.jump_subheader, Color::Rgb(0x5a, 0x7f, 0xa8), "muted denim, not neon azure");
+    assert_eq!(at.cursor, at.jump_header, "block caret matches the deep red");
+    assert_eq!(at.warm_accent, Color::Rgb(0x40, 0x67, 0x64), "teal stays the agent accent");
+    assert_ne!(at.cursor, at.warm_accent, "caret (red) is decoupled from the teal accent");
+}
+
 #[test]
 fn parse_naming_reply_tolerates_real_model_output() {
     use crate::agent_naming::parse_naming_reply;
