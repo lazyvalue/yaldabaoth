@@ -87,15 +87,14 @@ impl YaldaGpuiView {
         rail_focusable: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        if let Some(id) = self.workspace.directly_focused_unbound() {
+        if let Some(presentation) = self.workspace.presented_tile() {
+            let id = presentation.window_id();
             let tile_ptr: *mut workspace::Window<App> = self
                 .workspace
-                .unbound_tiles
-                .iter_mut()
-                .find(|tile| tile.window.id() == id)
-                .map(|tile| &mut tile.window as *mut _)
-                .expect("direct-unbound focus must point at an unbound tile");
-            // SAFETY: render does not structurally mutate the Unbound collection;
+                .tile_mut(id)
+                .map(|tile| tile as *mut _)
+                .expect("validated solo presentation must point at its tile");
+            // SAFETY: render does not structurally mutate tile ownership;
             // the pointer only releases the field borrow so per-App renderers can
             // borrow the rest of `self`.
             let tile = unsafe { &mut *tile_ptr };
@@ -108,6 +107,38 @@ impl YaldaGpuiView {
                 self.editor_fg(),
                 cx,
             );
+            return div()
+                .size_full()
+                .ctrl_w_shell_actions(cx)
+                .child(content)
+                .into_any_element();
+        }
+        let workspace_idx = self.workspace.active_workspace;
+        if matches!(
+            self.workspace.workspaces[workspace_idx].layout,
+            workspace::Layout::Empty
+        ) {
+            let hidden = self.workspace.workspaces[workspace_idx].hidden_tiles.len();
+            let message = if hidden == 0 {
+                "Empty workspace".to_string()
+            } else {
+                format!("All {hidden} tiles hidden")
+            };
+            let content = div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .bg(self.editor_bg())
+                .text_color(nc(self.theme.agent.dim))
+                .child(message)
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .child("Choose a hidden tile in the jump panel or Cmd-P to view it"),
+                );
             return div()
                 .size_full()
                 .ctrl_w_shell_actions(cx)
@@ -267,18 +298,16 @@ impl YaldaGpuiView {
                 .min_h_0()
                 .overflow_hidden()
                 .child(inner)
-                .capture_any_mouse_down(cx.listener(
-                    move |this, ev: &MouseDownEvent, _w, cx| {
-                        if ev.button != MouseButton::Left {
-                            return;
-                        }
-                        if this.workspace.focused_window_id() == Some(id) {
-                            return;
-                        }
-                        this.desktop_focus_click(id, cx);
-                        cx.stop_propagation();
-                    },
-                ));
+                .capture_any_mouse_down(cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
+                    if ev.button != MouseButton::Left {
+                        return;
+                    }
+                    if this.workspace.focused_window_id() == Some(id) {
+                        return;
+                    }
+                    this.desktop_focus_click(id, cx);
+                    cx.stop_propagation();
+                }));
 
             let column = div()
                 .flex_1()
@@ -295,10 +324,7 @@ impl YaldaGpuiView {
                 .child(tile_body);
             // Tag the column frame so the layout probe can assert the tiles paint
             // side by side (increasing x, equal width, full height).
-            let column = probe_bounds_dyn(
-                format!("columns-tile-{id}"),
-                column.into_any_element(),
-            );
+            let column = probe_bounds_dyn(format!("columns-tile-{id}"), column.into_any_element());
             if position < master_count {
                 master_columns.push(column);
             } else {
@@ -453,10 +479,8 @@ impl YaldaGpuiView {
         // Live edge-resize preview (spec Behavior 4b): the clamped anchor +
         // span the resized tile renders at this frame, which is also what
         // commits. West/North move the anchor, so the preview carries it.
-        let resize_preview: Option<(workspace::WindowId, workspace::Slot, workspace::Span)> = wsp
-            .desktop
-            .resize
-            .map(|r| {
+        let resize_preview: Option<(workspace::WindowId, workspace::Slot, workspace::Span)> =
+            wsp.desktop.resize.map(|r| {
                 let (slot, span) = self.desktop_resize_target(r);
                 (r.id, slot, span)
             });
@@ -640,15 +664,36 @@ impl YaldaGpuiView {
             if zoom != workspace::Detail::Full {
                 let glyph = Self::desktop_status_glyph(&self.sessions, content, cx);
                 let placeholder = self.desktop_placeholder(
-                    zoom, id, x, y, tw, th, is_focused, attach_focus, &title, glyph, mark, accent,
-                    dim, tile_bg, title_bg, content_fg,
+                    zoom,
+                    id,
+                    x,
+                    y,
+                    tw,
+                    th,
+                    is_focused,
+                    attach_focus,
+                    &title,
+                    glyph,
+                    mark,
+                    accent,
+                    dim,
+                    tile_bg,
+                    title_bg,
+                    content_fg,
                 );
                 canvas = canvas.child(placeholder);
                 continue;
             }
 
-            let inner =
-                self.render_tile_content(id, content, is_focused, attach_focus, base_bg, content_fg, cx);
+            let inner = self.render_tile_content(
+                id,
+                content,
+                is_focused,
+                attach_focus,
+                base_bg,
+                content_fg,
+                cx,
+            );
 
             let mut title_bar = div()
                 .flex()
@@ -773,18 +818,16 @@ impl YaldaGpuiView {
                 .min_h_0()
                 .overflow_hidden()
                 .child(inner)
-                .capture_any_mouse_down(cx.listener(
-                    move |this, ev: &MouseDownEvent, _w, cx| {
-                        if ev.button != MouseButton::Left {
-                            return;
-                        }
-                        if this.workspace.focused_window_id() == Some(id) {
-                            return; // already focused ⇒ normal interaction, nothing swallowed
-                        }
-                        this.desktop_focus_click(id, cx);
-                        cx.stop_propagation();
-                    },
-                ));
+                .capture_any_mouse_down(cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
+                    if ev.button != MouseButton::Left {
+                        return;
+                    }
+                    if this.workspace.focused_window_id() == Some(id) {
+                        return; // already focused ⇒ normal interaction, nothing swallowed
+                    }
+                    this.desktop_focus_click(id, cx);
+                    cx.stop_propagation();
+                }));
 
             let mut frame = div()
                 .absolute()
@@ -844,12 +887,17 @@ impl YaldaGpuiView {
     /// holds a live `&mut App` (`content_ptr`) into the layout tree, and
     /// reborrowing all of `&self` here would alias it (UB under Stacked
     /// Borrows). `sessions` is field-disjoint from the layout tree.
-    pub(crate) fn desktop_tile_title(sessions: &AgentSessions, content: &App, cx: &GpuiApp) -> String {
+    pub(crate) fn desktop_tile_title(
+        sessions: &AgentSessions,
+        content: &App,
+        cx: &GpuiApp,
+    ) -> String {
         match content {
             App::Buffer(BufferApp::Viewing(d)) => d.file_label.to_string(),
             App::Buffer(BufferApp::Editing(e)) => e.file_label.to_string(),
             App::Buffer(BufferApp::Picking(_)) => "files".to_string(),
-            App::Agent(tile) => tile.session()
+            App::Agent(tile) => tile
+                .session()
                 .and_then(|id| sessions.get(id))
                 .map(|s| s.read(cx).label.clone())
                 .unwrap_or_else(|| "claude".to_string()),
@@ -867,7 +915,8 @@ impl YaldaGpuiView {
     fn desktop_status_glyph(sessions: &AgentSessions, content: &App, cx: &GpuiApp) -> &'static str {
         match content {
             App::Agent(tile) => {
-                let busy = tile.session()
+                let busy = tile
+                    .session()
                     .and_then(|id| sessions.get(id))
                     .map(|s| s.read(cx).state.turn_phase.is_awaiting())
                     .unwrap_or(false);
@@ -930,10 +979,11 @@ impl YaldaGpuiView {
             workspace::Detail::Minimap => {
                 // A pip: a filled rect the size of the tile's span. Label only on
                 // the FOCUSED pip (spec Behavior 3).
-                let mut pip = div()
-                    .size_full()
-                    .rounded_sm()
-                    .bg(if is_focused { accent.opacity(0.55) } else { dim.opacity(0.45) });
+                let mut pip = div().size_full().rounded_sm().bg(if is_focused {
+                    accent.opacity(0.55)
+                } else {
+                    dim.opacity(0.45)
+                });
                 if is_focused {
                     pip = pip.child(
                         div()
@@ -961,8 +1011,7 @@ impl YaldaGpuiView {
                     .child(div().child(glyph.to_string()))
                     .child(div().child(title.to_string()));
                 if let Some(m) = mark {
-                    header = header
-                        .child(div().px_1().text_color(accent).child(format!("[{m}]")));
+                    header = header.child(div().px_1().text_color(accent).child(format!("[{m}]")));
                 }
                 div()
                     .size_full()
@@ -1010,11 +1059,7 @@ impl YaldaGpuiView {
     /// over a tile so the tile keeps scrolling, and pan over empty canvas). Pan
     /// is mutated in SLOT units (pixel delta ÷ pitch). Exact feel is
     /// NEEDS-RUNTIME.
-    pub(crate) fn desktop_scroll(
-        &mut self,
-        ev: &gpui::ScrollWheelEvent,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn desktop_scroll(&mut self, ev: &gpui::ScrollWheelEvent, cx: &mut Context<Self>) {
         let full_tile = self.desktop_tile_px();
         let (cx0, cy0, mut cw, mut ch) = self.desktop_canvas_bounds.get();
         if cw <= 0.0 {
@@ -1128,11 +1173,7 @@ impl YaldaGpuiView {
     /// `desktop_grab` — the title bar / resize bands focus *and* arm a gesture, the
     /// content area only focuses (and the press is consumed by the caller, so the
     /// content never sees the focus-changing click).
-    pub(crate) fn desktop_focus_click(
-        &mut self,
-        id: workspace::WindowId,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn desktop_focus_click(&mut self, id: workspace::WindowId, cx: &mut Context<Self>) {
         let workspace_idx = self.workspace.active_workspace;
         self.workspace.workspaces[workspace_idx].focused = id;
         self.save_workspace_state();
@@ -1173,7 +1214,10 @@ impl YaldaGpuiView {
     /// commit, so what you see is exactly what lands. East/South keep the
     /// anchor and grow the far edge; West/North move the anchor (the pulled
     /// near edge follows the pointer, the far edge stays put).
-    fn desktop_resize_target(&self, r: workspace::DesktopResize) -> (workspace::Slot, workspace::Span) {
+    fn desktop_resize_target(
+        &self,
+        r: workspace::DesktopResize,
+    ) -> (workspace::Slot, workspace::Span) {
         let tile = self.desktop_tile_px();
         let g = DESKTOP_GUTTER;
         let wsp = &self.workspace.workspaces[self.workspace.active_workspace];
@@ -1217,7 +1261,9 @@ impl YaldaGpuiView {
         // move the camera relative to the grab, converting the pixel delta to
         // slot units at the CURRENT zoom pitch (pan is pitch-independent).
         if let Some(p) = self.workspace.workspaces[workspace_idx].desktop.pan_drag {
-            let scale = workspace::detail_scale(self.workspace.workspaces[workspace_idx].desktop.camera.zoom);
+            let scale = workspace::detail_scale(
+                self.workspace.workspaces[workspace_idx].desktop.camera.zoom,
+            );
             let zpitch = (
                 (tile.0 * scale) + DESKTOP_GUTTER * scale,
                 (tile.1 * scale) + DESKTOP_GUTTER * scale,
@@ -1306,8 +1352,15 @@ impl YaldaGpuiView {
         // while dragging but rests the view cell-aligned on release, the same
         // contract as a tile drag/edge-resize (UXI-Workspace-8 / bug-0009); then
         // persist the final view.
-        if self.workspace.workspaces[workspace_idx].desktop.pan_drag.take().is_some() {
-            self.workspace.workspaces[workspace_idx].desktop.snap_camera_to_slots();
+        if self.workspace.workspaces[workspace_idx]
+            .desktop
+            .pan_drag
+            .take()
+            .is_some()
+        {
+            self.workspace.workspaces[workspace_idx]
+                .desktop
+                .snap_camera_to_slots();
             self.save_workspace_state();
             cx.notify();
             return;
@@ -1316,7 +1369,11 @@ impl YaldaGpuiView {
         // Commit a live edge resize (spec Behavior 4b) — the clamped anchor +
         // span the preview showed become the stored placement. West/North move
         // the anchor; East/South leave it unchanged.
-        if let Some(r) = self.workspace.workspaces[workspace_idx].desktop.resize.take() {
+        if let Some(r) = self.workspace.workspaces[workspace_idx]
+            .desktop
+            .resize
+            .take()
+        {
             let (slot, span) = self.desktop_resize_target(r);
             let d = &mut self.workspace.workspaces[workspace_idx].desktop;
             d.set_anchor(r.id, slot);
@@ -1613,7 +1670,11 @@ impl YaldaGpuiView {
             &rail.content,
             workspace::RailContent::FileBrowser(fb) if fb.filter_mode
         );
-        let mut col = col.key_context(if rail_filtering { "RailFilter" } else { "RailView" });
+        let mut col = col.key_context(if rail_filtering {
+            "RailFilter"
+        } else {
+            "RailView"
+        });
         if focused {
             col = col.track_focus(&self.focus_handle);
         }

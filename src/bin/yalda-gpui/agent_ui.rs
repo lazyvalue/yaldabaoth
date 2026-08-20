@@ -57,7 +57,7 @@ enum BindOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentIdentityRepair {
     Unique,
-    RetiredUnboundDuplicates(usize),
+    RetiredDetachedDuplicates(usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,9 +75,7 @@ pub(crate) enum AgentIdentityViolation {
 }
 
 impl YaldaGpuiView {
-    pub(crate) fn validate_agent_tile_identities(
-        &self,
-    ) -> Result<(), AgentIdentityViolation> {
+    pub(crate) fn validate_agent_tile_identities(&self) -> Result<(), AgentIdentityViolation> {
         let mut local = std::collections::HashMap::new();
         let mut durable = std::collections::HashMap::new();
         let mut visit = |window: &workspace::Window<App>| {
@@ -109,7 +107,7 @@ impl YaldaGpuiView {
                 continue;
             }
             let mut violation = None;
-            workspace.layout.for_each_leaf(&mut |window| {
+            workspace.for_each_attached_window(&mut |window| {
                 if violation.is_none() {
                     violation = visit(window).err();
                 }
@@ -118,7 +116,7 @@ impl YaldaGpuiView {
                 return Err(violation);
             }
         }
-        for tile in &self.workspace.unbound_tiles {
+        for tile in &self.workspace.detached_tiles {
             visit(&tile.window)?;
         }
         Ok(())
@@ -136,10 +134,7 @@ impl YaldaGpuiView {
 
     pub(crate) fn open_agent_inner(&mut self, cx: &mut Context<Self>) {
         // If already on an Agent tile, open the picker/rebind switcher instead.
-        if matches!(
-            self.workspace.focused_content().expect("no focused window"),
-            App::Agent(_)
-        ) {
+        if matches!(self.workspace.focused_content(), Some(App::Agent(_))) {
             self.new_agent_session(None, cx);
             return;
         }
@@ -155,7 +150,7 @@ impl YaldaGpuiView {
 
         if self.session_server.is_some() {
             // ── Session-server path: in-tile session picker ──────────
-            // Open the tile straight into the picker (unbound). The picker
+            // Open the tile straight into the picker. The picker
             // projects the FREE sessions for the cwd + "start new" from the
             // universal roster (universal-agent-list); refresh it in case it's
             // stale since the last seed. (A fresh `AgentTile::new()` is already
@@ -178,7 +173,9 @@ impl YaldaGpuiView {
         let id = match chosen {
             None => {
                 let label = self.next_agent_label(cx);
-                let state = self.create_agent_session(None, base_cwd.clone(), cx).armed_for_autoname();
+                let state = self
+                    .create_agent_session(None, base_cwd.clone(), cx)
+                    .armed_for_autoname();
                 self.show_local_session(
                     AgentSession {
                         state,
@@ -198,8 +195,10 @@ impl YaldaGpuiView {
                     cx,
                 );
                 // Restore placement + seed the persisted compose draft (Model C).
-                state.input_surface =
-                    InputSurface::with_draft(slot.mode, slot.compose_draft.as_deref().unwrap_or(""));
+                state.input_surface = InputSurface::with_draft(
+                    slot.mode,
+                    slot.compose_draft.as_deref().unwrap_or(""),
+                );
                 // Make focus/You-block consistent with the restored placement+draft
                 // (replay's finish_replay re-settles too; this covers a no-history
                 // restore): restored chatbox focuses its box; a restored worksheet
@@ -286,8 +285,7 @@ impl YaldaGpuiView {
                             archive_changed |=
                                 this.jump_archived_sessions.insert(info.session_id.clone());
                         } else {
-                            archive_changed |=
-                                this.jump_archived_sessions.remove(&info.session_id);
+                            archive_changed |= this.jump_archived_sessions.remove(&info.session_id);
                         }
                     }
                     let changed = this.agent_roster.replace_all(sessions);
@@ -311,7 +309,7 @@ impl YaldaGpuiView {
                     // momentarily-stale roster.
                     let recovered_labels = this.recover_labels_from_roster(cx);
                     let recovered_providers = this.recover_providers_from_roster(cx);
-                    let materialized = this.materialize_roster_unbound_tiles();
+                    let materialized = this.materialize_roster_detached_tiles();
                     if materialized {
                         this.save_workspace_state();
                     }
@@ -489,11 +487,7 @@ impl YaldaGpuiView {
         self.next_agent_label_for(AgentProvider::Claude, cx)
     }
 
-    pub(crate) fn next_agent_label_for(
-        &self,
-        provider: AgentProvider,
-        cx: &GpuiApp,
-    ) -> String {
+    pub(crate) fn next_agent_label_for(&self, provider: AgentProvider, cx: &GpuiApp) -> String {
         let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (_, s) in self.sessions.iter() {
             used.insert(s.read(cx).label.clone());
@@ -518,7 +512,7 @@ impl YaldaGpuiView {
     pub(crate) fn bound_sid_set(&self) -> std::collections::HashSet<String> {
         let mut bound: std::collections::HashSet<String> = std::collections::HashSet::new();
         for wsp in self.workspace.workspaces.iter() {
-            wsp.layout.for_each_leaf(&mut |w| {
+            wsp.for_each_attached_window(&mut |w| {
                 if let App::Agent(tile) = &w.content
                     && let Some(id) = tile.session()
                     && let Some(sid) = self.sessions.sid_of(id)
@@ -606,30 +600,23 @@ impl YaldaGpuiView {
                 label,
                 connected,
                 permission_mode,
-            }) => {
-                self.picker_attach_existing(
-                    cwd,
-                    sid,
-                    acp_id,
-                    provider,
-                    label,
-                    connected,
-                    permission_mode,
-                    cx,
-                )
-            }
+            }) => self.picker_attach_existing(
+                cwd,
+                sid,
+                acp_id,
+                provider,
+                label,
+                connected,
+                permission_mode,
+                cx,
+            ),
             None => {}
         }
     }
 
     /// Picker → "start a new session": clear the picker, bind a placeholder
     /// session to this tile, and create a fresh session via the shared path.
-    fn picker_start_new(
-        &mut self,
-        provider: AgentProvider,
-        cwd: PathBuf,
-        cx: &mut Context<Self>,
-    ) {
+    fn picker_start_new(&mut self, provider: AgentProvider, cwd: PathBuf, cx: &mut Context<Self>) {
         let label = self.next_agent_label_for(provider, cx);
         let open_token = alloc_open_token();
         if self.agent_tile_mut().is_none() {
@@ -714,7 +701,7 @@ impl YaldaGpuiView {
         }
 
         // The roster owns one stable tile for this session even while that tile
-        // is Unbound. Selecting it from a temporary Agent picker inside a
+        // is Detached. Selecting it from a temporary Agent picker inside a
         // workspace is a placement operation, not a request to mint a second
         // tile. Move the stable tile into the picker's exact layout slot before
         // attaching so mouse and keyboard activation share the same identity-
@@ -725,19 +712,21 @@ impl YaldaGpuiView {
             && current != stable
             && matches!(
                 self.workspace.tile_membership(current),
-                Some(workspace::TileMembership::Bound { .. })
+                Some(workspace::TileMembership::Attached {
+                    visibility: workspace::AttachedVisibility::Visible,
+                    ..
+                })
             )
-            && self.workspace.tile_membership(stable)
-                == Some(workspace::TileMembership::Unbound)
+            && self.workspace.tile_membership(stable) == Some(workspace::TileMembership::Detached)
             && self
                 .workspace
-                .replace_bound_with_unbound(current, stable)
+                .replace_attached_with_detached(current, stable)
                 .is_ok()
         {
             self.save_workspace_state();
 
             // A session may already be attached locally while its stable tile
-            // is Unbound. In that case placement is complete: bind/focus that
+            // is Detached. In that case placement is complete: attach/focus that
             // existing owner and do not create a duplicate placeholder.
             if let Some(owner) = self.sessions.locate(&ServerSid::new(sid.clone())) {
                 if let Some(tile) = self.agent_tile_mut() {
@@ -756,10 +745,7 @@ impl YaldaGpuiView {
         }
         self.show_local_session(
             AgentSession {
-                state: AgentState::new_server_managed_for(
-                    provider,
-                    Some("reconnecting…".into()),
-                ),
+                state: AgentState::new_server_managed_for(provider, Some("reconnecting…".into())),
                 label: label.clone(),
                 cwd,
                 resume_id: None,
@@ -969,7 +955,7 @@ impl YaldaGpuiView {
     fn session_id_for_open_token(&self, token: u64) -> Option<SessionId> {
         for wsp in self.workspace.workspaces.iter() {
             let mut found = None;
-            wsp.layout.for_each_leaf(&mut |w| {
+            wsp.for_each_attached_window(&mut |w| {
                 if let App::Agent(tile) = &w.content
                     && tile.pending_token() == Some(token)
                 {
@@ -980,7 +966,7 @@ impl YaldaGpuiView {
                 return found;
             }
         }
-        for tile in &self.workspace.unbound_tiles {
+        for tile in &self.workspace.detached_tiles {
             if let App::Agent(agent) = &tile.window.content
                 && agent.pending_token() == Some(token)
             {
@@ -1004,7 +990,7 @@ impl YaldaGpuiView {
                 continue;
             }
             let mut found = None;
-            wsp.layout.for_each_leaf(&mut |w| {
+            wsp.for_each_attached_window(&mut |w| {
                 if let App::Agent(tile) = &w.content
                     && tile.session() == Some(sid)
                 {
@@ -1019,12 +1005,9 @@ impl YaldaGpuiView {
     }
 
     /// Stable tile showing `sid` in either placement domain.
-    pub(crate) fn agent_tile_id_for_session(
-        &self,
-        sid: SessionId,
-    ) -> Option<workspace::WindowId> {
+    pub(crate) fn agent_tile_id_for_session(&self, sid: SessionId) -> Option<workspace::WindowId> {
         self.agent_tile_id_bound_to(sid).or_else(|| {
-            self.workspace.unbound_tiles.iter().find_map(|tile| {
+            self.workspace.detached_tiles.iter().find_map(|tile| {
                 matches!(
                     &tile.window.content,
                     App::Agent(agent) if agent.session() == Some(sid)
@@ -1035,18 +1018,15 @@ impl YaldaGpuiView {
     }
 
     /// Find the stable Agent tile remembering a durable server sid, whether
-    /// locally attached, dormant, unavailable, bound, or unbound.
-    pub(crate) fn agent_tile_id_for_server_sid(
-        &self,
-        sid: &str,
-    ) -> Option<workspace::WindowId> {
+    /// locally attached, dormant, unavailable, session-bound, or Detached.
+    pub(crate) fn agent_tile_id_for_server_sid(&self, sid: &str) -> Option<workspace::WindowId> {
         let remembers = |tile: &AgentTile| {
             tile.remembered_sid(|id| self.sessions.sid_of(id).cloned())
                 .is_some_and(|remembered| remembered.as_str() == sid)
         };
         for wsp in &self.workspace.workspaces {
             let mut found = None;
-            wsp.layout.for_each_leaf(&mut |window| {
+            wsp.for_each_attached_window(&mut |window| {
                 if let App::Agent(tile) = &window.content
                     && remembers(tile)
                 {
@@ -1057,7 +1037,7 @@ impl YaldaGpuiView {
                 return found;
             }
         }
-        self.workspace.unbound_tiles.iter().find_map(|tile| {
+        self.workspace.detached_tiles.iter().find_map(|tile| {
             matches!(&tile.window.content, App::Agent(agent) if remembers(agent))
                 .then_some(tile.window.id())
         })
@@ -1070,13 +1050,13 @@ impl YaldaGpuiView {
         };
         let mut ids = Vec::new();
         for workspace in &self.workspace.workspaces {
-            workspace.layout.for_each_leaf(&mut |window| {
+            workspace.for_each_attached_window(&mut |window| {
                 if matches!(&window.content, App::Agent(tile) if remembers(tile)) {
                     ids.push(window.id());
                 }
             });
         }
-        ids.extend(self.workspace.unbound_tiles.iter().filter_map(|tile| {
+        ids.extend(self.workspace.detached_tiles.iter().filter_map(|tile| {
             matches!(&tile.window.content, App::Agent(agent) if remembers(agent))
                 .then_some(tile.window.id())
         }));
@@ -1085,7 +1065,7 @@ impl YaldaGpuiView {
 
     /// Enforce one stable tile for a newly bound durable session. The tile
     /// that owns the live local session is canonical; roster-created dormant
-    /// Unbound duplicates are retired and their tags are merged into it.
+    /// Detached duplicates are retired and their tags are merged into it.
     fn reconcile_bound_agent_identity(
         &mut self,
         owner: SessionId,
@@ -1099,8 +1079,7 @@ impl YaldaGpuiView {
             .into_iter()
             .filter(|id| *id != canonical)
             .filter(|id| {
-                self.workspace.tile_membership(*id)
-                    == Some(workspace::TileMembership::Unbound)
+                self.workspace.tile_membership(*id) == Some(workspace::TileMembership::Detached)
             })
             .collect();
         for duplicate in &duplicates {
@@ -1112,19 +1091,19 @@ impl YaldaGpuiView {
             if let Some(tile) = self.workspace.tile_mut(canonical) {
                 tile.tags.extend(tags);
             }
-            self.workspace.remove_unbound_window(*duplicate);
+            self.workspace.remove_detached_window(*duplicate);
         }
         if duplicates.is_empty() {
             AgentIdentityRepair::Unique
         } else {
             self.save_workspace_state();
-            AgentIdentityRepair::RetiredUnboundDuplicates(duplicates.len())
+            AgentIdentityRepair::RetiredDetachedDuplicates(duplicates.len())
         }
     }
 
-    /// Migrate every roster-only session into exactly one dormant unbound Agent
-    /// tile. Idempotent: existing bound/unbound tiles win by durable sid.
-    pub(crate) fn materialize_roster_unbound_tiles(&mut self) -> bool {
+    /// Migrate every roster-only session into exactly one dormant Detached Agent
+    /// tile. Idempotent: existing Attached/Detached tiles win by durable sid.
+    pub(crate) fn materialize_roster_detached_tiles(&mut self) -> bool {
         let entries: Vec<_> = self
             .agent_roster
             .entries_by_label()
@@ -1139,14 +1118,11 @@ impl YaldaGpuiView {
             {
                 continue;
             }
-            let project = self.projects.ensure_at_cwd(
-                info.cwd.clone(),
-                &project_name_for_cwd(&info.cwd),
-            );
-            let id = self.workspace.push_unbound(
-                App::Agent(AgentTile::dormant(ServerSid::new(
-                    info.session_id.clone(),
-                ))),
+            let project = self
+                .projects
+                .ensure_at_cwd(info.cwd.clone(), &project_name_for_cwd(&info.cwd));
+            let id = self.workspace.push_detached(
+                App::Agent(AgentTile::dormant(ServerSid::new(info.session_id.clone()))),
                 project,
             );
             if let Some(tags) = self.session_tags.get(&info.session_id)
@@ -1168,8 +1144,8 @@ impl YaldaGpuiView {
     pub(crate) fn show_pickers_for_session(&mut self, sid: SessionId) -> bool {
         let mut changed = false;
         for wsp in self.workspace.workspaces.iter_mut() {
-            wsp.layout.for_each_leaf_content_mut(&mut |content| {
-                if let App::Agent(tile) = content
+            wsp.for_each_attached_window_mut(&mut |window| {
+                if let App::Agent(tile) = &mut window.content
                     && tile.session() == Some(sid)
                 {
                     tile.show_picker();
@@ -1177,7 +1153,7 @@ impl YaldaGpuiView {
                 }
             });
         }
-        for tile in &mut self.workspace.unbound_tiles {
+        for tile in &mut self.workspace.detached_tiles {
             if let App::Agent(agent) = &mut tile.window.content
                 && agent.session() == Some(sid)
             {
@@ -1188,10 +1164,10 @@ impl YaldaGpuiView {
         changed
     }
 
-    /// Jump-panel / Cmd-P activation (ADR-0033): focus the one stable Agent tile
-    /// showing this session. Bound tiles reveal their workspace; unbound tiles
-    /// open directly without changing membership. A session with no tile is
-    /// materialized once as an unbound Agent tile.
+    /// Jump-panel / Cmd-P activation (ADR-0034): focus the one stable Agent tile
+    /// showing this session. Attached tiles reveal their workspace; Detached tiles
+    /// open solo without changing membership. A session with no tile is
+    /// materialized once as a Detached Agent tile.
     pub(crate) fn jump_to_session(&mut self, sid: SessionId, cx: &mut Context<Self>) {
         if !self.sessions.contains(sid) {
             return;
@@ -1208,8 +1184,8 @@ impl YaldaGpuiView {
                 .and_then(|cwd| self.projects.membership_for_cwd(&cwd).project())
                 .or_else(|| self.active_project(cx))
                 .unwrap_or_else(|| self.workspace.inherited_project());
-            let id = self.workspace.push_unbound(App::Agent(tile), project);
-            self.workspace.focus_unbound(id);
+            let id = self.workspace.push_detached(App::Agent(tile), project);
+            self.workspace.present_solo(id);
         }
         // You're now looking at this session — clear its "waiting on you" mark
         // eagerly (the pump also clears it, but this makes the dot update on the
@@ -1283,7 +1259,7 @@ impl YaldaGpuiView {
     }
 
     /// Open a roster session (one not yet in this GUI's store) by materializing
-    /// one unbound Agent tile, focusing it directly, and reusing the picker's
+    /// one Detached Agent tile, presenting it solo, and reusing the picker's
     /// bind+attach path.
     pub(crate) fn jump_to_roster_session(&mut self, sid: String, cx: &mut Context<Self>) {
         // Wire boundary: the roster/jump-target sid is a raw String; type it for
@@ -1307,14 +1283,12 @@ impl YaldaGpuiView {
             .project()
             .or_else(|| self.active_project(cx))
             .unwrap_or_else(|| self.workspace.inherited_project());
-        let id = self
-            .agent_tile_id_for_server_sid(&sid)
-            .unwrap_or_else(|| {
-                self.workspace.push_unbound(
-                    App::Agent(AgentTile::dormant(ServerSid::new(sid.clone()))),
-                    proj,
-                )
-            });
+        let id = self.agent_tile_id_for_server_sid(&sid).unwrap_or_else(|| {
+            self.workspace.push_detached(
+                App::Agent(AgentTile::dormant(ServerSid::new(sid.clone()))),
+                proj,
+            )
+        });
         self.workspace.focus_tile(id);
         self.picker_attach_existing(
             info.cwd,
@@ -1369,8 +1343,8 @@ impl YaldaGpuiView {
     /// Clear the `pending_open_token` on whichever tile carries `token`.
     fn clear_open_token(&mut self, token: u64) {
         for wsp in self.workspace.workspaces.iter_mut() {
-            wsp.layout.for_each_leaf_content_mut(&mut |content| {
-                if let App::Agent(tile) = content
+            wsp.for_each_attached_window_mut(&mut |window| {
+                if let App::Agent(tile) = &mut window.content
                     && tile.pending_token() == Some(token)
                 {
                     tile.set_pending(None);
@@ -1420,7 +1394,11 @@ impl YaldaGpuiView {
     /// jump panel ranks its row by the predecessor's sid, so the row never
     /// leaves its slot (bug-0007). No-op when the dead session had no sid (it
     /// was never in the user's order to begin with).
-    pub(crate) fn record_order_succession(&mut self, new_id: SessionId, predecessor: Option<String>) {
+    pub(crate) fn record_order_succession(
+        &mut self,
+        new_id: SessionId,
+        predecessor: Option<String>,
+    ) {
         if let Some(sid) = predecessor {
             self.jump_order_succession.insert(new_id, sid);
         }
@@ -1620,7 +1598,8 @@ impl YaldaGpuiView {
         // The workspace's cwd is its project's cwd, resolved at the point of use
         // (ADR-0028 §3 — no cwd is cached on the workspace).
         self.workspace
-            .directly_focused_unbound()
+            .presented_tile()
+            .map(workspace::SoloPresentation::window_id)
             .and_then(|id| self.workspace.tile_project(id))
             .or_else(|| self.workspace.active_workspace().map(|t| t.project()))
             .and_then(|pid| self.projects.cwd_of(pid).map(|p| p.to_path_buf()))
@@ -1645,7 +1624,8 @@ impl YaldaGpuiView {
     /// moving it.
     pub(crate) fn active_project(&self, cx: &GpuiApp) -> Option<ProjectId> {
         self.workspace
-            .directly_focused_unbound()
+            .presented_tile()
+            .map(workspace::SoloPresentation::window_id)
             .and_then(|id| self.workspace.tile_project(id))
             .or_else(|| self.workspace.active_workspace().map(|t| t.project()))
             .or_else(|| {
@@ -1727,7 +1707,7 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
-    /// Swap the focused tile for a FRESH unbound agent tile showing the session
+    /// Swap the focused tile for a fresh Agent tile showing the session
     /// picker, **in place** — no split, no new tile (`UXI-Workspace-8` clause 2).
     /// This is what "new agent" means in a bare agent view (an ephemeral virtual
     /// workspace): that view is one agent fullscreen, so a second tile there is a
@@ -1736,7 +1716,7 @@ impl YaldaGpuiView {
     ///
     /// The session the tile was showing is NOT killed — dropping the tile's binding
     /// returns it to *free* in the store (the tile holds only a `SessionId` key), so
-    /// it stays running as an unbound row in the jump panel and is re-pickable from
+    /// it stays running as a Detached row in the jump panel and is re-pickable from
     /// the very picker this opens (clause 3). Only `claude-close` kills a session.
     pub(crate) fn open_new_agent_selector_in_place(&mut self, cx: &mut Context<Self>) {
         // A fresh `AgentTile::new()` is already `Selecting`, so replacing the
@@ -1908,8 +1888,8 @@ impl YaldaGpuiView {
     /// `create_session` round-trip. The resulting session lands in the universal
     /// roster via the `SessionCreated` broadcast (and an explicit
     /// `refresh_roster` to make it appear immediately), so it shows up in the
-    /// jump panel as an unbound, bindable row — never auto-bound here. A user can
-    /// later bind it by selecting it (jump panel → `jump_to_roster_session`, or a
+    /// jump panel as a Detached, attachable row — never auto-attached here. A user can
+    /// later attach it by selecting it (jump panel → `jump_to_roster_session`, or a
     /// tile selector). It is server-only: with no session server there is no
     /// roster to host a free session, so this no-ops with a status note.
     pub(crate) fn spawn_free_agent_session(&mut self, cx: &mut Context<Self>) {
@@ -1926,8 +1906,7 @@ impl YaldaGpuiView {
     /// inherit — runs where the user chose.
     pub(crate) fn spawn_free_agent_session_at(&mut self, cwd: PathBuf, cx: &mut Context<Self>) {
         let Some(handle) = self.session_server.as_ref().map(|s| s.handle()) else {
-            self.transient_status =
-                Some("no session server — free agent sessions need one".into());
+            self.transient_status = Some("no session server — free agent sessions need one".into());
             cx.notify();
             return;
         };
@@ -2059,8 +2038,7 @@ impl YaldaGpuiView {
             if let Some(ent) = self.session_entity(id) {
                 ent.update(cx, |session, scx| {
                     session.state.attach_pending = fresh.attach_pending;
-                    let msg =
-                        format!("cwd → {}, fresh session", shorten_cwd_for_display(&new_cwd));
+                    let msg = format!("cwd → {}, fresh session", shorten_cwd_for_display(&new_cwd));
                     Self::append_system_notice(&mut session.state, &msg);
                     session.state.status = Some(msg.into());
                     scx.notify();
@@ -2236,7 +2214,7 @@ impl YaldaGpuiView {
         }
         self.save_agent_ring(cx);
         cx.notify();
-        // No early `back_to_doc` — the tile stays Agent (unbound → selector).
+        // No early `back_to_doc` — the tile stays Agent (Detached → selector).
     }
 
     /// Another agent session belonging to `project` to land on when a bare agent
@@ -2261,7 +2239,8 @@ impl YaldaGpuiView {
         self.jump_panel_agent_rows(cx)
             .into_iter()
             .find(|row| {
-                let same_project = self.projects.membership_for_cwd(&row.cwd).project() == Some(project);
+                let same_project =
+                    self.projects.membership_for_cwd(&row.cwd).project() == Some(project);
                 let is_the_closed_one = match &row.target {
                     JumpTarget::Local(id) => *id == closed,
                     JumpTarget::Roster(sid) => Some(sid.as_str()) == closed_sid,
@@ -2306,7 +2285,7 @@ impl YaldaGpuiView {
     }
 
     /// Snapshot every materialized agent session to disk. Walks both workspace
-    /// leaves and the unbound collection so it is symmetric with
+    /// leaves and the Detached collection so it is symmetric with
     /// `restore_agent_leaves`: ownership changes must not decide whether a live
     /// session's draft and presentation state survive restart. The first live
     /// session is marked active. Best-effort.
@@ -2316,52 +2295,52 @@ impl YaldaGpuiView {
         };
         let mut snaps: Vec<SessionSnapshot> = Vec::new();
         let mut snapshot_window = |window: &workspace::Window<App>| {
-                if let App::Agent(tile) = &window.content
-                    && let Some(id) = tile.session()
-                    && let Some(ent) = self.sessions.get(id)
-                {
-                    let session = ent.read(cx);
-                    // The store's sid binding is authoritative and covers BOTH
-                    // created AND resumed sessions (a freshly-created server-managed
-                    // session has `resume_id == None` + `channel == None`, so those
-                    // sources miss it — bug-0001). `sid_of` is the id the store
-                    // bound at create/attach time.
-                    let resolved_id: Option<ServerSid> = self
-                        .sessions
-                        .sid_of(id)
-                        .cloned()
-                        .or_else(|| session.resume_id.clone())
-                        // Wire boundary: the channel's ACP session id enters as a String.
-                        .or_else(|| {
-                            session
-                                .state
-                                .channel
-                                .as_ref()
-                                .and_then(|c| c.session_id())
-                                .map(ServerSid::new)
-                        });
-                    if let Some(rid) = resolved_id {
-                        let draft = session.state.input_surface.compose().text();
-                        snaps.push(SessionSnapshot {
-                            id: rid,
-                            label: session.label.clone(),
-                            provider: session.state.provider,
-                            active: snaps.is_empty(),
-                            mode: session.state.input_surface.mode(),
-                            tasklist_open: session.state.tasklist_open,
-                            subagents_open: session.state.subagents_open,
-                            sidepanel_hidden: session.state.sidepanel_hidden,
-                            cwd: session.cwd.clone(),
-                            compose_draft: (!draft.trim().is_empty()).then_some(draft),
-                            summary: session.state.summary.clone(),
-                        });
-                    }
+            if let App::Agent(tile) = &window.content
+                && let Some(id) = tile.session()
+                && let Some(ent) = self.sessions.get(id)
+            {
+                let session = ent.read(cx);
+                // The store's sid binding is authoritative and covers BOTH
+                // created AND resumed sessions (a freshly-created server-managed
+                // session has `resume_id == None` + `channel == None`, so those
+                // sources miss it — bug-0001). `sid_of` is the id the store
+                // bound at create/attach time.
+                let resolved_id: Option<ServerSid> = self
+                    .sessions
+                    .sid_of(id)
+                    .cloned()
+                    .or_else(|| session.resume_id.clone())
+                    // Wire boundary: the channel's ACP session id enters as a String.
+                    .or_else(|| {
+                        session
+                            .state
+                            .channel
+                            .as_ref()
+                            .and_then(|c| c.session_id())
+                            .map(ServerSid::new)
+                    });
+                if let Some(rid) = resolved_id {
+                    let draft = session.state.input_surface.compose().text();
+                    snaps.push(SessionSnapshot {
+                        id: rid,
+                        label: session.label.clone(),
+                        provider: session.state.provider,
+                        active: snaps.is_empty(),
+                        mode: session.state.input_surface.mode(),
+                        tasklist_open: session.state.tasklist_open,
+                        subagents_open: session.state.subagents_open,
+                        sidepanel_hidden: session.state.sidepanel_hidden,
+                        cwd: session.cwd.clone(),
+                        compose_draft: (!draft.trim().is_empty()).then_some(draft),
+                        summary: session.state.summary.clone(),
+                    });
                 }
+            }
         };
         for wsp in &self.workspace.workspaces {
-            wsp.layout.for_each_leaf(&mut snapshot_window);
+            wsp.for_each_attached_window(&mut snapshot_window);
         }
-        for tile in &self.workspace.unbound_tiles {
+        for tile in &self.workspace.detached_tiles {
             snapshot_window(&tile.window);
         }
         save_persisted_acp_sessions(&cwd, &snaps);
@@ -2521,7 +2500,10 @@ impl YaldaGpuiView {
                     let _ = this.update(cx, |this, cx| {
                         wake_rx = this
                             .read_session(id, cx, |state| {
-                                state.channel.as_ref().and_then(|ch| ch.take_wake_receiver())
+                                state
+                                    .channel
+                                    .as_ref()
+                                    .and_then(|ch| ch.take_wake_receiver())
                             })
                             .flatten();
                     });
@@ -2872,8 +2854,8 @@ impl YaldaGpuiView {
         let mut tile_was_respawning = false;
         let mut tile_found = false;
         for wsp in self.workspace.workspaces.iter_mut() {
-            wsp.layout.for_each_leaf_content_mut(&mut |content| {
-                if let App::Agent(tile) = content
+            wsp.for_each_attached_window_mut(&mut |window| {
+                if let App::Agent(tile) = &mut window.content
                     && tile.session() == Some(id)
                 {
                     tile_found = true;
@@ -2891,7 +2873,7 @@ impl YaldaGpuiView {
         }
         self.transcript_views.remove(&id);
         self.sessions.close(id);
-        // The now-unbound tile's selector projects from the roster (the closed
+        // The now-Detached tile's selector projects from the roster (the closed
         // session was already removed from it by the SessionClosed handler / is
         // gone after this). Refresh to be safe on non-broadcast close paths.
         let _ = tile_found;
@@ -2906,7 +2888,11 @@ impl YaldaGpuiView {
     /// Keeps `resume_sid` so the layout re-persists the id (a later restart
     /// re-attempts the resume rather than silently forgetting it). Returns whether
     /// a tile was flipped.
-    pub(crate) fn reconcile_session_unavailable(&mut self, sid: &str, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn reconcile_session_unavailable(
+        &mut self,
+        sid: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
         // Wire boundary: `sid` is a raw string from a failed-resume attach.
         let remembered = ServerSid::new(sid);
         let Some(id) = self.sessions.locate(&remembered) else {
@@ -2919,8 +2905,8 @@ impl YaldaGpuiView {
             .unwrap_or_else(|| sid.chars().take(8).collect::<String>().into());
         let mut tile_found = false;
         for wsp in self.workspace.workspaces.iter_mut() {
-            wsp.layout.for_each_leaf_content_mut(&mut |content| {
-                if let App::Agent(tile) = content
+            wsp.for_each_attached_window_mut(&mut |window| {
+                if let App::Agent(tile) = &mut window.content
                     && tile.session() == Some(id)
                 {
                     tile_found = true;
@@ -3372,8 +3358,7 @@ impl YaldaGpuiView {
         let Some(ent) = self.session_entity(id) else {
             return false; // session gone: pump task should exit
         };
-        let Some((has_events, more_pending, attached_with_id)) =
-            ent.update(cx, |session, scx| {
+        let Some((has_events, more_pending, attached_with_id)) = ent.update(cx, |session, scx| {
             let claude = &mut session.state;
 
             // 1) Resolve pending attach.
@@ -4077,14 +4062,10 @@ impl YaldaGpuiView {
         // server session that inherits the old name, so without carrying the
         // latch a user-typed name would come back marked `Auto` and become
         // autoname-eligible again.
-        let Some((label, slot_cwd, name_origin)) = self
-            .sessions
-            .get(id)
-            .map(|ent| {
-                let s = ent.read(cx);
-                (s.label.clone(), s.cwd.clone(), s.state.name_origin)
-            })
-        else {
+        let Some((label, slot_cwd, name_origin)) = self.sessions.get(id).map(|ent| {
+            let s = ent.read(cx);
+            (s.label.clone(), s.cwd.clone(), s.state.name_origin)
+        }) else {
             return;
         };
         let desired_mode = self.read_session(id, cx, |s| s.permission_mode);
@@ -4127,7 +4108,7 @@ impl YaldaGpuiView {
             self.session_server.is_some()
         ));
 
-        // Re-create in place on the now-unbound focused tile, reusing the
+        // Re-create in place on the now-Detached focused tile, reusing the
         // snapshotted label + cwd and forcing the preserved permission mode.
         if self.session_server.is_some() || crate::force_server_clear_branch() {
             let open_token = alloc_open_token();
@@ -4136,11 +4117,10 @@ impl YaldaGpuiView {
             // worksheet rests in nav and post-clear keystrokes vanish into transcript
             // navigation (the "/clear then can't type" bug). (The connecting
             // placeholder has no history, so finish_replay won't re-settle it.)
-            let mut state =
-                AgentState::new_server_managed_for(
-                    provider,
-                    Some("connecting to session server…".into()),
-                );
+            let mut state = AgentState::new_server_managed_for(
+                provider,
+                Some("connecting to session server…".into()),
+            );
             state.name_origin = name_origin;
             state.settle_input_focus();
             let new_id = self.show_local_session(
@@ -4170,8 +4150,7 @@ impl YaldaGpuiView {
             // attaches asynchronously, so the permission mode is not forced here
             // — this path keeps the server default. The server path above is the
             // real one.
-            let mut state =
-                self.create_agent_session_for(provider, None, slot_cwd.clone(), cx);
+            let mut state = self.create_agent_session_for(provider, None, slot_cwd.clone(), cx);
             state.name_origin = name_origin;
             let new_id = self.show_local_session(
                 AgentSession {
@@ -4204,9 +4183,9 @@ impl YaldaGpuiView {
         // while also touching `self.session_server` (also borrows `self`), so
         // we snapshot the current mode + whether a local channel exists first,
         // then drop the borrow before talking to the server.
-        let snapshot = self.focused_bound_session().and_then(|id| {
-            self.read_session(id, cx, |s| (s.permission_mode, s.channel.is_some()))
-        });
+        let snapshot = self
+            .focused_bound_session()
+            .and_then(|id| self.read_session(id, cx, |s| (s.permission_mode, s.channel.is_some())));
         let (current, has_channel) = match snapshot {
             Some(v) => v,
             None => {
@@ -4305,11 +4284,11 @@ impl YaldaGpuiView {
             .unwrap_or_else(|| model_id.clone());
 
         let sid = self.active_server_session_id();
-        let server_result: Option<std::io::Result<()>> =
-            match (&sid, self.session_server.as_ref()) {
-                (Some(sid), Some(server)) => Some(server.set_model(sid, &model_id)),
-                _ => None,
-            };
+        let server_result: Option<std::io::Result<()>> = match (&sid, self.session_server.as_ref())
+        {
+            (Some(sid), Some(server)) => Some(server.set_model(sid, &model_id)),
+            _ => None,
+        };
 
         if let Some(result) = server_result {
             match result {
@@ -4405,7 +4384,9 @@ impl YaldaGpuiView {
             return;
         }
         let already_attached = self
-            .read_session(id, cx, |c| c.channel.is_some() || c.attach_pending.is_some())
+            .read_session(id, cx, |c| {
+                c.channel.is_some() || c.attach_pending.is_some()
+            })
             .unwrap_or(false);
         if already_attached {
             if let Some(mut c) = self.agent_mut(cx) {
@@ -4572,7 +4553,10 @@ impl YaldaGpuiView {
                     if !matches!(
                         state.subagent_transcripts.get(thread_id),
                         Some(SubAgentTranscriptLoad::Loading | SubAgentTranscriptLoad::Loaded(_))
-                    ) => Some(thread_id.clone()),
+                    ) =>
+                {
+                    Some(thread_id.clone())
+                }
                 _ => None,
             };
             (exists, session.cwd.clone(), thread_to_load)
@@ -4800,8 +4784,7 @@ impl YaldaGpuiView {
                         claude.you_block_open = true;
                         // Fresh anchor at the caret if legal, else the tail (None).
                         let l = claude.editor.cursor().line;
-                        claude.you_block_anchor =
-                            claude.you_block_anchor_is_legal(l).then_some(l);
+                        claude.you_block_anchor = claude.you_block_anchor_is_legal(l).then_some(l);
                         claude.focus = AgentFocus::Compose;
                     } else {
                         claude.close_you_block();
@@ -5056,8 +5039,7 @@ impl YaldaGpuiView {
                     &mut session.state,
                     "force-restarting agent (resuming session)…",
                 );
-                session.state.status =
-                    Some("force-restarting agent (resuming session)…".into());
+                session.state.status = Some("force-restarting agent (resuming session)…".into());
                 scx.notify();
             });
         }
@@ -5262,8 +5244,8 @@ impl YaldaGpuiView {
             self.clear_agent_session(cx);
             return;
         }
-        let no_channel = self.agent_read(cx, |c| c.channel.is_none()).unwrap_or(true)
-            && server_sid.is_none();
+        let no_channel =
+            self.agent_read(cx, |c| c.channel.is_none()).unwrap_or(true) && server_sid.is_none();
         if no_channel {
             if let Some(mut c) = self.agent_mut(cx) {
                 c.status = Some("no channel attached".into());
@@ -5347,7 +5329,10 @@ impl YaldaGpuiView {
         let sent = if let Some(sid) = &server_sid {
             self.session_server
                 .as_ref()
-                .and_then(|s| s.prompt_with_images(sid, &prompt_body, images.to_vec()).ok())
+                .and_then(|s| {
+                    s.prompt_with_images(sid, &prompt_body, images.to_vec())
+                        .ok()
+                })
                 .is_some()
         } else {
             let payload = yalda::acp_channel::PromptPayload {
@@ -5624,12 +5609,7 @@ impl YaldaGpuiView {
     /// call is dev-system verification gap 2, so headless tests never make a
     /// network request — they leave the session `Requested` and drive
     /// `apply_autoname_result` directly, exactly as the worker would.
-    fn spawn_autoname_worker(
-        &mut self,
-        id: SessionId,
-        transcript: String,
-        cx: &mut Context<Self>,
-    ) {
+    fn spawn_autoname_worker(&mut self, id: SessionId, transcript: String, cx: &mut Context<Self>) {
         if cfg!(test) {
             return;
         }
@@ -5764,9 +5744,7 @@ impl YaldaGpuiView {
                     crate::persist::save_session_summary(&sid, &summary);
                 }
                 None => {
-                    self.session_summaries
-                        .entry(sid.to_string())
-                        .or_default();
+                    self.session_summaries.entry(sid.to_string()).or_default();
                     crate::persist::mark_autoname_attempted(&sid);
                 }
             }
@@ -5880,7 +5858,9 @@ impl YaldaGpuiView {
                     }
                     while rx.next().now_or_never().flatten().is_some() {}
                 } else {
-                    cx.background_executor().timer(Duration::from_millis(50)).await;
+                    cx.background_executor()
+                        .timer(Duration::from_millis(50))
+                        .await;
                 }
                 let keep_going = this.update(cx, |this, cx| this.drain_recap(id, token, cx));
                 match keep_going {
@@ -6005,10 +5985,7 @@ impl YaldaGpuiView {
     pub(crate) fn send_agent_selection(&mut self, cx: &mut Context<Self>) {
         let server_sid = self.active_server_session_id();
 
-        let text = match self
-            .agent_read(cx, |c| c.editor.selection_text())
-            .flatten()
-        {
+        let text = match self.agent_read(cx, |c| c.editor.selection_text()).flatten() {
             Some(t) if !t.trim().is_empty() => t,
             _ => {
                 if let Some(mut c) = self.agent_mut(cx) {
@@ -6018,9 +5995,7 @@ impl YaldaGpuiView {
                 return;
             }
         };
-        let no_channel = self
-            .agent_read(cx, |c| c.channel.is_none())
-            .unwrap_or(true);
+        let no_channel = self.agent_read(cx, |c| c.channel.is_none()).unwrap_or(true);
         if no_channel && server_sid.is_none() {
             if let Some(mut c) = self.agent_mut(cx) {
                 c.status = Some("no channel attached".into());
@@ -6586,7 +6561,9 @@ impl YaldaGpuiView {
         // Fallback for non-mac platforms (and any board GPUI does surface as an
         // image entry): stage GPUI's own image entries when the direct read found
         // nothing.
-        if staged == 0 && let Some(item) = &item {
+        if staged == 0
+            && let Some(item) = &item
+        {
             for entry in item.entries() {
                 if let gpui::ClipboardEntry::Image(img) = entry
                     && let Some(mut pending) = pending_image_from_clipboard(img)
@@ -6601,9 +6578,15 @@ impl YaldaGpuiView {
             }
         }
 
-        if staged > 0 && let Some(mut c) = self.agent_mut(cx) {
+        if staged > 0
+            && let Some(mut c) = self.agent_mut(cx)
+        {
             c.status = Some(
-                format!("{staged} image{} attached", if staged == 1 { "" } else { "s" }).into(),
+                format!(
+                    "{staged} image{} attached",
+                    if staged == 1 { "" } else { "s" }
+                )
+                .into(),
             );
         }
         staged
@@ -6680,7 +6663,11 @@ pub(crate) fn image_turn_marker(
         if i > 0 {
             out.push('\n');
         }
-        out.push_str(&format!("🖼 image {} ({})", i + 1, image_ext(&img.mime_type)));
+        out.push_str(&format!(
+            "🖼 image {} ({})",
+            i + 1,
+            image_ext(&img.mime_type)
+        ));
     }
     out
 }

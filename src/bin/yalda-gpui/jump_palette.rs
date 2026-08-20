@@ -1,6 +1,6 @@
 //! The **jump palette** (`UXI-JumpPanel-9`) — `Cmd-P`'s type-to-filter dialog
 //! over the jump panel's ordinary navigable set: durable workspaces and the
-//! stable tiles they own, followed by the **Unbound** tile collection.
+//! stable tiles they own, followed by the **Detached** tile collection.
 //!
 //! The palette is a pure alternate *input* onto that list. It builds its
 //! candidates directly from the ownership model, independent of which filtered
@@ -188,7 +188,7 @@ impl YaldaGpuiView {
     }
 
     /// Every ordinary-navigation candidate in ownership order: each workspace
-    /// folder followed by its tiles, then every unbound tile. A selected jump
+    /// folder followed by its visible and hidden tiles, then every Detached tile. A selected jump
     /// panel activity tab never changes `Cmd-P` candidates.
     pub(crate) fn jump_palette_items(&self, cx: &gpui::App) -> Vec<PaletteItem> {
         let mut items = Vec::new();
@@ -201,23 +201,30 @@ impl YaldaGpuiView {
                 detail: project.clone(),
                 is_agent: false,
                 status: None,
-                active: self.workspace.directly_focused_unbound().is_none()
+                active: self.workspace.presented_tile().is_none()
                     && self.workspace.active_workspace == idx,
             });
             wsp.layout.for_each_leaf(&mut |window| {
+                if let Some(item) =
+                    self.palette_tile_item(window, format!("{project} · {workspace_label}"), cx)
+                {
+                    items.push(item);
+                }
+            });
+            for hidden in &wsp.hidden_tiles {
                 if let Some(item) = self.palette_tile_item(
-                    window,
-                    format!("{project} · {workspace_label}"),
+                    &hidden.window,
+                    format!("{project} · {workspace_label} · Hidden"),
                     cx,
                 ) {
                     items.push(item);
                 }
-            });
+            }
         }
-        for tile in &self.workspace.unbound_tiles {
+        for tile in &self.workspace.detached_tiles {
             let project = self.projects.name_of(tile.project());
             if let Some(item) =
-                self.palette_tile_item(&tile.window, format!("{project} · Unbound"), cx)
+                self.palette_tile_item(&tile.window, format!("{project} · Detached"), cx)
             {
                 items.push(item);
             }
@@ -265,7 +272,10 @@ impl YaldaGpuiView {
     /// all derive "what's on screen" from.
     pub(crate) fn jump_palette_ranked(&self, cx: &gpui::App) -> (Vec<PaletteItem>, Vec<usize>) {
         let items = self.jump_palette_items(cx);
-        let query = self.jump_palette_ref().map(|p| p.query.clone()).unwrap_or_default();
+        let query = self
+            .jump_palette_ref()
+            .map(|p| p.query.clone())
+            .unwrap_or_default();
         let ranked = rank_palette_items(&items, &query);
         (items, ranked)
     }
@@ -431,9 +441,11 @@ impl YaldaGpuiView {
             );
         } else {
             // Scroll the fixed-height window so the highlight is always on screen.
-            let start = selected
-                .saturating_sub(PALETTE_VISIBLE_ROWS - 1)
-                .min(ranked.len().saturating_sub(PALETTE_VISIBLE_ROWS.min(ranked.len())));
+            let start = selected.saturating_sub(PALETTE_VISIBLE_ROWS - 1).min(
+                ranked
+                    .len()
+                    .saturating_sub(PALETTE_VISIBLE_ROWS.min(ranked.len())),
+            );
             for (row_n, &idx) in ranked
                 .iter()
                 .enumerate()
@@ -458,24 +470,20 @@ impl YaldaGpuiView {
                     .px_4()
                     .py_1()
                     .hover(|s| s.bg(sel_bg))
-                    .child(
-                        div()
-                            .w(px(16.0))
-                            .flex_none()
-                            .text_color(badge_color)
-                            .child(SharedString::new_static(if it.is_agent {
-                                "✦"
-                            } else {
-                                "⊞"
-                            })),
-                    )
+                    .child(div().w(px(16.0)).flex_none().text_color(badge_color).child(
+                        SharedString::new_static(if it.is_agent { "✦" } else { "⊞" }),
+                    ))
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_size(px(13.0))
-                            .text_color(if is_sel || it.active { active_accent } else { st.fg })
+                            .text_color(if is_sel || it.active {
+                                active_accent
+                            } else {
+                                st.fg
+                            })
                             .child(SharedString::from(it.label.clone())),
                     )
                     .child(
@@ -515,7 +523,9 @@ impl YaldaGpuiView {
             .py_1()
             .text_color(label_fg)
             .text_size(px(11.0))
-            .child(SharedString::new_static("↑↓:select  enter:jump  esc:cancel"));
+            .child(SharedString::new_static(
+                "↑↓:select  enter:jump  esc:cancel",
+            ));
 
         probe_bounds(
             "jump-palette",

@@ -13,10 +13,7 @@ impl YaldaGpuiView {
     }
 
     pub(crate) fn open_linear_inner(&mut self, cx: &mut Context<Self>) {
-        if matches!(
-            self.workspace.focused_content().expect("no focused window"),
-            App::Linear(_)
-        ) {
+        if matches!(self.workspace.focused_content(), Some(App::Linear(_))) {
             return;
         }
         self.set_screen(App::Linear(LinearTile::new()));
@@ -67,10 +64,12 @@ impl YaldaGpuiView {
             self.linear_apply(
                 target,
                 req,
-                Err("LINEAR_API_KEY is not set. Create a Linear personal API key \
+                Err(
+                    "LINEAR_API_KEY is not set. Create a Linear personal API key \
                      (Linear → Settings → Security & access → Personal API keys), \
                      export it, and relaunch yalda."
-                    .to_string()),
+                        .to_string(),
+                ),
                 cx,
             );
             return;
@@ -229,7 +228,8 @@ impl YaldaGpuiView {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    linear::fetch_project_by_id(&key, &id).map(|p| LinearFetch::Project(Box::new(p)))
+                    linear::fetch_project_by_id(&key, &id)
+                        .map(|p| LinearFetch::Project(Box::new(p)))
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -301,26 +301,17 @@ impl YaldaGpuiView {
     }
 
     fn linear_focused_tile_mut(&mut self) -> Option<&mut LinearTile> {
-        match self
-            .workspace
-            .focused_content_mut()
-            .expect("no focused window")
-        {
+        match self.workspace.focused_content_mut()? {
             App::Linear(tile) => Some(tile),
             _ => None,
         }
     }
 
     fn linear_tile_by_id_mut(&mut self, id: workspace::WindowId) -> Option<&mut LinearTile> {
-        for wsp in self.workspace.workspaces.iter_mut() {
-            if let Some(w) = wsp.layout.find_leaf_mut(id) {
-                return match &mut w.content {
-                    App::Linear(tile) => Some(tile),
-                    _ => None,
-                };
-            }
+        match &mut self.workspace.tile_mut(id)?.content {
+            App::Linear(tile) => Some(tile),
+            _ => None,
         }
-        None
     }
 
     /// Scroll the focused Linear tile's body. The view (not the tile) owns the

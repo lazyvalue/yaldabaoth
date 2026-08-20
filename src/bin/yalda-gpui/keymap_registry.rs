@@ -41,7 +41,13 @@ struct DefaultBinding {
 
 macro_rules! b {
     ($keys:literal, $action:literal, $ctx:expr, $cat:literal, $desc:literal) => {
-        DefaultBinding { keys: $keys, action: $action, ctx: $ctx, cat: $cat, desc: $desc }
+        DefaultBinding {
+            keys: $keys,
+            action: $action,
+            ctx: $ctx,
+            cat: $cat,
+            desc: $desc,
+        }
     };
 }
 
@@ -145,10 +151,10 @@ const DEFAULT_BINDINGS: &[DefaultBinding] = &[
     b!("ctrl-w t",          "TagViewChord",    GLOBAL, "Layout", "Tag: view by tag"),
     b!("ctrl-w ctrl-t",     "TagToggleChord",  GLOBAL, "Layout", "Tag: toggle tag on tile"),
     b!("ctrl-w shift-t",    "ClearTagView",    GLOBAL, "Layout", "Tag: clear tag view"),
-    b!("ctrl-w b",          "BindFocusedTile", GLOBAL, "Workspaces", "Bind tile to active workspace"),
-    b!("ctrl-w shift-b",    "UnbindFocusedTile", GLOBAL, "Workspaces", "Move tile to Unbound"),
-    b!("ctrl-w d",          "StashScratchpad", GLOBAL, "Workspaces", "Stash tile in scratchpad"),
-    b!("ctrl-w shift-d",    "SummonScratchpad", GLOBAL, "Workspaces", "Summon next scratchpad tile"),
+    b!("ctrl-w b",          "AttachFocusedTile", GLOBAL, "Workspaces", "Attach tile to active workspace"),
+    b!("ctrl-w shift-b",    "DetachFocusedTile", GLOBAL, "Workspaces", "Detach tile from workspace"),
+    b!("ctrl-w d",          "HideFocusedTile", GLOBAL, "Workspaces", "Hide tile in its workspace"),
+    b!("ctrl-w shift-d",    "UnhideFocusedTile", GLOBAL, "Workspaces", "Unhide focused hidden tile"),
     b!("ctrl-w backspace",  "WorkspaceBackAndForth", GLOBAL, "Workspaces", "Toggle previous workspace"),
     b!("ctrl-w f",          "GrowMasterArea", GLOBAL, "Columns", "Grow master area"),
     b!("ctrl-w shift-f",    "ShrinkMasterArea", GLOBAL, "Columns", "Shrink master area"),
@@ -221,8 +227,13 @@ pub(crate) fn context_label(ctx: Option<&str>) -> &'static str {
 }
 
 /// The display order of context sections in the reference.
-pub(crate) const CONTEXT_ORDER: &[Option<&str>] =
-    &[None, Some("YaldaView"), Some("AgentView"), Some("BrowserView"), Some("RailView")];
+pub(crate) const CONTEXT_ORDER: &[Option<&str>] = &[
+    None,
+    Some("YaldaView"),
+    Some("AgentView"),
+    Some("BrowserView"),
+    Some("RailView"),
+];
 
 /// One live binding: its current keystrokes plus the immutable defaults it was
 /// built from (so we can show "changed", reset it, and key persistence stably).
@@ -461,7 +472,8 @@ fn contexts_overlap(a: Option<&str>, b: Option<&str>) -> bool {
 /// chord must parse via `Keystroke::parse`.
 fn keystrokes_parse(s: &str) -> bool {
     !s.split_whitespace().count().eq(&0)
-        && s.split_whitespace().all(|chord| Keystroke::parse(chord).is_ok())
+        && s.split_whitespace()
+            .all(|chord| Keystroke::parse(chord).is_ok())
 }
 
 fn load_overrides() -> Vec<PersistedOverride> {

@@ -91,7 +91,11 @@ fn workspace_cwd_inheritance(cx: &mut TestAppContext) {
 
     // A browser workspace boots with its start dir as the cwd — always present.
     let booted = view.read_with(vcx, |v, _| v.active_workspace_cwd());
-    assert_eq!(booted, Some(start.clone()), "workspace boots with a real cwd");
+    assert_eq!(
+        booted,
+        Some(start.clone()),
+        "workspace boots with a real cwd"
+    );
 
     // Set CWD → both the surfaced cwd and what a new agent inherits move.
     view.update(vcx, |v, _cx| {
@@ -213,9 +217,7 @@ fn open_picker_lands_on_the_file_just_left(cx: &mut TestAppContext) {
     vcx.run_until_parked();
 
     let selected_name = view.read_with(vcx, |v, _| match v.workspace.focused_content() {
-        Some(App::Buffer(BufferApp::Picking(bw))) => {
-            bw.fb.selected_entry().map(|e| e.name.clone())
-        }
+        Some(App::Buffer(BufferApp::Picking(bw))) => bw.fb.selected_entry().map(|e| e.name.clone()),
         _ => None,
     });
     assert_eq!(
@@ -442,7 +444,10 @@ fn buffer_reload_does_not_reuse_old_syntax_state(cx: &mut TestAppContext) {
         .rev()
         .find(|line| line.line_idx == 1)
         .expect("reloaded second line painted through the real Buffer render path");
-    assert_eq!(line.text, "reloaded plain", "reload must paint the new text");
+    assert_eq!(
+        line.text, "reloaded plain",
+        "reload must paint the new text"
+    );
     assert!(
         !line.has_code_bg,
         "plain reloaded text must not retain the old unclosed-fence code style"
@@ -542,12 +547,13 @@ fn edit_newline_delete_keeps_viewport_anchored(cx: &mut TestAppContext) {
 
     let (top, count) = view.update(vcx, |v, _cx| {
         let e = v.edit_mut().expect("edit view");
-        (
-            e.list.state().logical_scroll_top().item_ix,
-            e.list.len(),
-        )
+        (e.list.state().logical_scroll_top().item_ix, e.list.len())
     });
-    assert_eq!(count, count_before - 1, "a line merge removes exactly one line");
+    assert_eq!(
+        count,
+        count_before - 1,
+        "a line merge removes exactly one line"
+    );
     assert!(
         top >= 80,
         "after a newline delete below the fold the viewport must stay anchored \
@@ -772,12 +778,18 @@ fn transcript_paragraph_start_row_is_taller_than_within_paragraph_row(cx: &mut T
             !c.editor.document().line_text(1).trim().is_empty(),
             "line 1 is a within-paragraph soft break (non-blank, prev non-blank)"
         );
-        assert!(c.editor.document().line_text(2).trim().is_empty(), "line 2 blank");
+        assert!(
+            c.editor.document().line_text(2).trim().is_empty(),
+            "line 2 blank"
+        );
         assert!(
             c.editor.document().line_text(3).starts_with("Beta"),
             "line 3 starts paragraph β (prev source line 2 is blank)"
         );
-        assert!(c.editor.is_frozen_line(3), "paragraph-start line must be frozen");
+        assert!(
+            c.editor.is_frozen_line(3),
+            "paragraph-start line must be frozen"
+        );
         c.focus = crate::AgentFocus::Transcript;
     });
     view.update(vcx, |v, cx| v.set_text_scale(1.0, cx));
@@ -1016,7 +1028,9 @@ fn doc_drag_autocopies_selection_to_clipboard(cx: &mut TestAppContext) {
     // Seed the clipboard with a sentinel so a "no copy happened" bug is
     // distinguishable from an empty write.
     view.update(vcx, |_, cx| {
-        cx.write_to_clipboard(gpui::ClipboardItem::new_string("SENTINEL-NOT-COPIED".into()))
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+            "SENTINEL-NOT-COPIED".into(),
+        ))
     });
 
     // Drag across the first painted line (left edge → right edge) so the whole
@@ -1201,8 +1215,7 @@ fn menu_tree_has_command(nodes: &[crate::MenuNode], cmd: &str) -> bool {
 fn shell_menu_has_label(label: &str) -> bool {
     fn walk(nodes: &[crate::MenuNode], label: &str) -> bool {
         nodes.iter().any(|n| {
-            n.label == label
-                || matches!(&n.action, crate::MenuAction::Submenu(c) if walk(c, label))
+            n.label == label || matches!(&n.action, crate::MenuAction::Submenu(c) if walk(c, label))
         })
     }
     walk(&crate::gpui_menu(), label)
@@ -1216,10 +1229,8 @@ fn shell_menu_has_label(label: &str) -> bool {
 /// Negative control: restore `Key::Char('?') => self.open_global_menu_inner(cx)`
 /// in `leader_intercept` ⇒ the `?`-returns-false assert goes RED.
 #[gpui::test]
-fn question_mark_leader_is_inert_former_global_commands_live_under_dot(
-    cx: &mut TestAppContext,
-) {
-    use crate::{Key, KMods, KeyPress};
+fn question_mark_leader_is_inert_former_global_commands_live_under_dot(cx: &mut TestAppContext) {
+    use crate::{KMods, Key, KeyPress};
     let (view, vcx) = boot_browser(cx);
     vcx.run_until_parked();
 
@@ -1240,7 +1251,11 @@ fn question_mark_leader_is_inert_former_global_commands_live_under_dot(
         let c = v.leader_intercept(&KeyPress::new(Key::Char('.'), KMods::NONE), cx);
         (c, v.overlay_is_menu())
     });
-    assert_eq!(consumed_dot, (true, true), "the `.` shell leader still opens a menu");
+    assert_eq!(
+        consumed_dot,
+        (true, true),
+        "the `.` shell leader still opens a menu"
+    );
     view.update(vcx, |v, _| v.clear_overlay());
 
     // Every former `?`-menu command now lives in the `.` shell menu.
@@ -1278,8 +1293,14 @@ fn agent_dynamic_menu_has_no_duplicate_keys(cx: &mut TestAppContext) {
                 event: ReplyEvent::ModelsAvailable {
                     current: "sonnet".into(),
                     options: vec![
-                        ModelOption { id: "default".into(), label: "Default".into() },
-                        ModelOption { id: "sonnet".into(), label: "Sonnet".into() },
+                        ModelOption {
+                            id: "default".into(),
+                            label: "Default".into(),
+                        },
+                        ModelOption {
+                            id: "sonnet".into(),
+                            label: "Sonnet".into(),
+                        },
                     ],
                 },
             }],
@@ -1328,7 +1349,11 @@ fn agent_view_menu_selects_and_marks_agents_or_tasks(cx: &mut TestAppContext) {
         v.dispatch_menu_command("agent-view-tasks", cx);
         assert_eq!(
             v.agent_read(cx, |state| {
-                (state.subagents_open, state.tasklist_open, state.sidepanel_hidden)
+                (
+                    state.subagents_open,
+                    state.tasklist_open,
+                    state.sidepanel_hidden,
+                )
             }),
             Some((false, true, false))
         );
@@ -1461,9 +1486,10 @@ fn ctrl_digit_switches_workspace(cx: &mut TestAppContext) {
     view.update(vcx, |v, _| {
         let cwd = PathBuf::from(".");
         for _ in 0..3 {
-            v.workspace.push_workspace_inheriting(
-                App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd.clone()))),
-            );
+            v.workspace
+                .push_workspace_inheriting(App::Buffer(BufferApp::Picking(
+                    BrowserWindow::standalone(cwd.clone()),
+                )));
         }
         assert_eq!(v.workspace.workspaces.len(), 4);
         v.workspace.set_active_workspace(0); // start the keystroke run on workspace 1
@@ -1475,14 +1501,20 @@ fn ctrl_digit_switches_workspace(cx: &mut TestAppContext) {
     vcx.simulate_keystrokes("ctrl-3");
     vcx.run_until_parked();
     view.update(vcx, |v, _| {
-        assert_eq!(v.workspace.active_workspace, 2, "ctrl-3 selects the 3rd workspace");
+        assert_eq!(
+            v.workspace.active_workspace, 2,
+            "ctrl-3 selects the 3rd workspace"
+        );
     });
 
     // ctrl-1 → back to the first.
     vcx.simulate_keystrokes("ctrl-1");
     vcx.run_until_parked();
     view.update(vcx, |v, _| {
-        assert_eq!(v.workspace.active_workspace, 0, "ctrl-1 selects the 1st workspace");
+        assert_eq!(
+            v.workspace.active_workspace, 0,
+            "ctrl-1 selects the 1st workspace"
+        );
     });
 
     // ctrl-9 with only four workspaces is a no-op (stays put).
@@ -1544,7 +1576,8 @@ fn closing_workspace_frees_sessions_and_never_quits(cx: &mut TestAppContext) {
         let mut tile = AgentTile::new();
         tile.bind(session);
         let project = v.workspace.inherited_project();
-        v.workspace.push_initial_workspace(App::Agent(tile), project);
+        v.workspace
+            .push_initial_workspace(App::Agent(tile), project);
         cwd
     });
     view.read_with(vcx, |v, _cx| {
@@ -1560,7 +1593,11 @@ fn closing_workspace_frees_sessions_and_never_quits(cx: &mut TestAppContext) {
     view.update(vcx, |v, cx| v.dispatch_menu_command("close-workspace", cx));
     vcx.run_until_parked();
     view.read_with(vcx, |v, _cx| {
-        assert_eq!(v.workspace.workspaces.len(), 1, "the active workspace is gone");
+        assert_eq!(
+            v.workspace.workspaces.len(),
+            1,
+            "the active workspace is gone"
+        );
         assert!(
             v.sessions.contains(session),
             "dropping the workspace's Agent tile must not close its session"
@@ -1621,9 +1658,10 @@ fn agent_picker_does_not_eat_workspace_switch_keys(cx: &mut TestAppContext) {
     view.update(vcx, |v, _| {
         let cwd = PathBuf::from(".");
         for _ in 0..3 {
-            v.workspace.push_workspace_inheriting(
-                App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd.clone()))),
-            );
+            v.workspace
+                .push_workspace_inheriting(App::Buffer(BufferApp::Picking(
+                    BrowserWindow::standalone(cwd.clone()),
+                )));
         }
         v.workspace.set_active_workspace(0);
     });
@@ -1637,7 +1675,10 @@ fn agent_picker_does_not_eat_workspace_switch_keys(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     view.read_with(vcx, |v, _| {
         let tile = v.agent_tile().expect("agent tile on workspace 1");
-        assert!(tile.session().is_none(), "tile is unbound → picker is showing");
+        assert!(
+            tile.session().is_none(),
+            "tile is unbound → picker is showing"
+        );
         assert_eq!(v.workspace.active_workspace, 0);
     });
 
@@ -1681,9 +1722,10 @@ fn workspace_cycle_works_from_the_agent_screen(cx: &mut TestAppContext) {
     view.update(vcx, |v, _| {
         let cwd = PathBuf::from(".");
         for _ in 0..2 {
-            v.workspace.push_workspace_inheriting(
-                App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd.clone()))),
-            );
+            v.workspace
+                .push_workspace_inheriting(App::Buffer(BufferApp::Picking(
+                    BrowserWindow::standalone(cwd.clone()),
+                )));
         }
         assert_eq!(v.workspace.workspaces.len(), 3, "agent workspace + 2 more");
         v.workspace.set_active_workspace(0); // start on the agent workspace
@@ -1712,17 +1754,27 @@ fn workspace_cycle_works_from_the_agent_screen(cx: &mut TestAppContext) {
 fn workspace_number_ignores_direct_unbound_focus(cx: &mut TestAppContext) {
     let (view, vcx) = boot_browser(cx);
     let sid = add_free_session(&view, vcx, "claude-1");
-    view.update(vcx, |v, _| v.push_empty_workspace()); // workspaces 1 and 2 are real
+    view.update(vcx, |v, _| {
+        let project = v.workspace.inherited_project();
+        v.push_empty_workspace(project);
+    }); // workspaces 1 and 2 are real
     // Open the free session → an ephemeral workspace is appended (sorts last).
     view.update(vcx, |v, cx| v.jump_to_session(sid, cx));
     view.update(vcx, |v, _| {
-        assert_eq!(v.workspace.workspaces.len(), 2, "direct focus adds no workspace");
-        assert!(v.workspace.directly_focused_unbound().is_some());
+        assert_eq!(
+            v.workspace.workspaces.len(),
+            2,
+            "direct focus adds no workspace"
+        );
+        assert!(v.workspace.presented_detached_tile_id().is_some());
     });
     // ctrl-2 must land on the 2nd REAL workspace (index 1), not the ephemeral.
     view.update(vcx, |v, cx| v.goto_workspace_number(2, cx));
     view.update(vcx, |v, _| {
-        assert_eq!(v.workspace.active_workspace, 1, "number 2 = 2nd non-ephemeral workspace");
+        assert_eq!(
+            v.workspace.active_workspace, 1,
+            "number 2 = 2nd non-ephemeral workspace"
+        );
         assert!(!v.workspace.active_is_ephemeral());
     });
 }
@@ -1795,7 +1847,10 @@ fn agent_dot_status_mapping() {
         tags: Vec::new(),
     };
     // Reply in flight → working (unread irrelevant while working).
-    assert_eq!(row(true, Some(true), false).dot_status(), AgentDotStatus::Working);
+    assert_eq!(
+        row(true, Some(true), false).dot_status(),
+        AgentDotStatus::Working
+    );
     // Every connected idle row is ready for input, regardless of unread state.
     assert_eq!(
         row(true, Some(false), true).dot_status(),
@@ -1806,9 +1861,15 @@ fn agent_dot_status_mapping() {
         AgentDotStatus::WaitingForYou
     );
     // A connected roster-only row with an unknown phase is also admitted to Waiting.
-    assert_eq!(row(true, None, false).dot_status(), AgentDotStatus::WaitingForYou);
+    assert_eq!(
+        row(true, None, false).dot_status(),
+        AgentDotStatus::WaitingForYou
+    );
     // Disconnected wins even if it was mid-turn / had unread.
-    assert_eq!(row(false, Some(true), true).dot_status(), AgentDotStatus::Neutral);
+    assert_eq!(
+        row(false, Some(true), true).dot_status(),
+        AgentDotStatus::Neutral
+    );
 }
 
 /// UXI-JumpPanel-6: a turn that finalizes on a session you are NOT focused on
@@ -1840,10 +1901,14 @@ fn jump_dot_unread_on_background_turn_end_read_on_focused(cx: &mut TestAppContex
         };
         v.set_screen(App::Agent(AgentTile::new()));
         let s1 = v.show_local_session(mk("S1"), cx);
-        v.sessions.bind_sid(s1, ServerSid::new("S1")).expect("S1 binds");
+        v.sessions
+            .bind_sid(s1, ServerSid::new("S1"))
+            .expect("S1 binds");
         v.set_screen(App::Agent(AgentTile::new()));
         let s2 = v.show_local_session(mk("S2"), cx);
-        v.sessions.bind_sid(s2, ServerSid::new("S2")).expect("S2 binds");
+        v.sessions
+            .bind_sid(s2, ServerSid::new("S2"))
+            .expect("S2 binds");
         (s1, s2)
     });
     vcx.run_until_parked();
@@ -1919,7 +1984,7 @@ fn jump_dot_unread_on_background_turn_end_read_on_focused(cx: &mut TestAppContex
 /// the "user turn is tinted" assert fails RED (observed).
 #[test]
 fn user_turn_gets_tint_agent_turn_does_not() {
-    use crate::{committed_row_bg, TurnId};
+    use crate::{TurnId, committed_row_bg};
     let tint: gpui::Hsla = gpui::rgb(0x283040).into();
     let transparent: gpui::Hsla = gpui::rgba(0x00000000).into();
     assert_eq!(
@@ -1961,7 +2026,7 @@ fn user_turn_gets_tint_agent_turn_does_not() {
 /// → the "exactly one active row" assert fails RED (observed).
 #[gpui::test]
 fn jump_active_box_marks_focused_workspace_and_session(cx: &mut TestAppContext) {
-    use crate::{jump_target_is_active, JumpTarget};
+    use crate::{JumpTarget, jump_target_is_active};
     let (view, vcx, id, _session) = boot_with_transcript(cx);
     // A second session added straight to the store (NOT via show_local_session,
     // which would rebind the focused agent tile) so it stays free + unfocused —
@@ -1979,7 +2044,10 @@ fn jump_active_box_marks_focused_workspace_and_session(cx: &mut TestAppContext) 
     view.read_with(vcx, |v, cx| {
         // The active workspace is a listed (non-ephemeral) wsp, so its row is
         // boxed (workspace arm; the box reuses the row's existing `active`).
-        assert!(!v.workspace.active_is_ephemeral(), "active workspace is listed");
+        assert!(
+            !v.workspace.active_is_ephemeral(),
+            "active workspace is listed"
+        );
         assert!(!v.workspace.workspaces[v.workspace.active_workspace].ephemeral);
 
         // The focused tile's bound session is the active-session identity.
@@ -1991,8 +2059,15 @@ fn jump_active_box_marks_focused_workspace_and_session(cx: &mut TestAppContext) 
             .iter()
             .filter(|r| jump_target_is_active(&r.target, active_local, active_sid.as_deref()))
             .collect();
-        assert_eq!(active.len(), 1, "exactly the focused session's row is active");
-        assert!(active[0].bound, "the boxed row is the bound (focused) session");
+        assert_eq!(
+            active.len(),
+            1,
+            "exactly the focused session's row is active"
+        );
+        assert!(
+            active[0].bound,
+            "the boxed row is the bound (focused) session"
+        );
         // The other, unfocused session is present but NOT active.
         let other_active = rows.iter().any(|r| {
             matches!(&r.target, JumpTarget::Local(lid) if *lid == other)
@@ -2035,13 +2110,22 @@ fn jump_to_unbound_session_preserves_tile_after_workspace_focus(cx: &mut TestApp
     // Jump to the free session → one directly focused unbound tile.
     view.update(vcx, |v, cx| v.jump_to_session(sid, cx));
     view.update(vcx, |v, _| {
-        assert_eq!(v.workspace.workspaces.len(), 1, "no workspace is manufactured");
-        let id = v.workspace.directly_focused_unbound().expect("direct unbound focus");
         assert_eq!(
-            v.workspace.tile(id).and_then(|window| match &window.content {
-                crate::App::Agent(tile) => tile.session(),
-                _ => None,
-            }),
+            v.workspace.workspaces.len(),
+            1,
+            "no workspace is manufactured"
+        );
+        let id = v
+            .workspace
+            .presented_detached_tile_id()
+            .expect("direct unbound focus");
+        assert_eq!(
+            v.workspace
+                .tile(id)
+                .and_then(|window| match &window.content {
+                    crate::App::Agent(tile) => tile.session(),
+                    _ => None,
+                }),
             Some(sid),
             "the unbound tile retains the session"
         );
@@ -2059,12 +2143,15 @@ fn jump_to_unbound_session_preserves_tile_after_workspace_focus(cx: &mut TestApp
     view.update(vcx, |v, cx| v.select_workspace(0, cx));
     view.update(vcx, |v, _| {
         assert_eq!(v.workspace.workspaces.len(), 1);
-        assert_eq!(v.workspace.directly_focused_unbound(), None);
+        assert_eq!(v.workspace.presented_detached_tile_id(), None);
         assert!(
             v.agent_tile_id_bound_to(sid).is_none(),
             "session returned to free"
         );
-        assert!(v.sessions.contains(sid), "session itself survives the teardown");
+        assert!(
+            v.sessions.contains(sid),
+            "session itself survives the teardown"
+        );
     });
 }
 
@@ -2079,12 +2166,18 @@ fn jump_to_second_unbound_session_preserves_both_tiles(cx: &mut TestAppContext) 
     view.update(vcx, |v, cx| v.jump_to_session(a, cx));
     view.update(vcx, |v, cx| v.jump_to_session(b, cx));
     view.update(vcx, |v, _| {
-        assert_eq!(v.workspace.workspaces.len(), 1, "direct views add no workspaces");
         assert_eq!(
-            v.workspace.focused_content().and_then(|content| match content {
-                crate::App::Agent(tile) => tile.session(),
-                _ => None,
-            }),
+            v.workspace.workspaces.len(),
+            1,
+            "direct views add no workspaces"
+        );
+        assert_eq!(
+            v.workspace
+                .focused_content()
+                .and_then(|content| match content {
+                    crate::App::Agent(tile) => tile.session(),
+                    _ => None,
+                }),
             Some(b),
             "the second session is now shown"
         );
@@ -2097,7 +2190,7 @@ fn jump_to_second_unbound_session_preserves_both_tiles(cx: &mut TestAppContext) 
             "the first session returned to free"
         );
         assert!(v.sessions.contains(a) && v.sessions.contains(b));
-        assert_eq!(v.workspace.unbound_tiles.len(), 2);
+        assert_eq!(v.workspace.detached_tiles.len(), 2);
     });
 }
 
@@ -2108,9 +2201,7 @@ fn jump_to_second_unbound_session_preserves_both_tiles(cx: &mut TestAppContext) 
 /// `jump_to_window(owner_wid)` branch. The first assertion fails because no
 /// ephemeral workspace exists.
 #[gpui::test]
-fn bound_session_jumps_focus_single_owner_workspace(
-    cx: &mut TestAppContext,
-) {
+fn bound_session_jumps_focus_single_owner_workspace(cx: &mut TestAppContext) {
     use crate::{AgentTile, App, BrowserWindow, BufferApp};
     cx.update(crate::register_keymap);
     let (view, vcx) = boot_browser(cx);
@@ -2119,22 +2210,28 @@ fn bound_session_jumps_focus_single_owner_workspace(
     let (sid, owner_workspace, owner_wid) = view.update(vcx, |v, _| {
         let sid = v.sessions.locate(&ServerSid::new("S1")).expect("S1 bound");
         let wid = v.agent_tile_id_bound_to(sid).expect("S1 has a tile");
-        let wsp = v.workspace.workspace_containing(wid).expect("tile in a workspace");
+        let wsp = v
+            .workspace
+            .workspace_containing(wid)
+            .expect("tile in a workspace");
         (sid, wsp, wid)
     });
     // Add a second workspace and start there. A direct visit must NOT navigate
     // back to the owner's workspace.
     view.update(vcx, |v, cx| {
-        v.workspace.push_workspace_inheriting(
-            App::Buffer(BufferApp::Picking(BrowserWindow::standalone(PathBuf::from(".")))),
-        );
+        v.workspace
+            .push_workspace_inheriting(App::Buffer(BufferApp::Picking(BrowserWindow::standalone(
+                PathBuf::from("."),
+            ))));
         v.workspace.set_active_workspace(1);
         cx.notify();
     });
     let workspaces_before = view.update(vcx, |v, _| v.workspace.workspaces.len());
 
     // Jump-panel row dispatcher.
-    view.update(vcx, |v, cx| v.jump_to_agent(crate::JumpTarget::Local(sid), cx));
+    view.update(vcx, |v, cx| {
+        v.jump_to_agent(crate::JumpTarget::Local(sid), cx)
+    });
     view.update(vcx, |v, _| {
         assert_eq!(v.workspace.workspaces.len(), workspaces_before);
         assert_eq!(v.workspace.active_workspace, owner_workspace);
@@ -2212,13 +2309,14 @@ fn agent_session_binds_at_most_one_tile(cx: &mut TestAppContext) {
 
     // Workspace 0: an agent tile bound to session "S1".
     install_agent_slot(&view, vcx, Some("S1"));
-    let owner = view.update(vcx, |v, _| v.sessions.locate(&ServerSid::new("S1")).expect("S1 bound"));
+    let owner = view.update(vcx, |v, _| {
+        v.sessions.locate(&ServerSid::new("S1")).expect("S1 bound")
+    });
 
     // Workspace 1: a fresh agent tile, now focused.
     view.update(vcx, |v, _cx| {
-        v.workspace.push_workspace_inheriting(
-            App::Agent(AgentTile::new()),
-        );
+        v.workspace
+            .push_workspace_inheriting(App::Agent(AgentTile::new()));
     });
 
     // Attempt to bind the already-owned session from workspace 1's tile.
@@ -2287,7 +2385,10 @@ fn worksheet_resume_multiturn_caret_on_editable_tail(cx: &mut TestAppContext) {
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
         let text = c.editor.document().full_text();
-        assert!(text.contains("agent turn one reply"), "turn-one text present");
+        assert!(
+            text.contains("agent turn one reply"),
+            "turn-one text present"
+        );
         assert!(
             text.contains("agent turn two after the tool"),
             "turn-two text present and ordered after the tool"
@@ -2358,7 +2459,10 @@ fn worksheet_already_active_during_replay_lands_caret_on_tail(cx: &mut TestAppCo
             last,
             "caret must snap to the editable tail at end of replay, not stay at line 0"
         );
-        assert!(c.pending_reveal_cursor, "tail snap queues a viewport reveal");
+        assert!(
+            c.pending_reveal_cursor,
+            "tail snap queues a viewport reveal"
+        );
     });
 }
 
@@ -2390,7 +2494,9 @@ fn tool_call_midtoken_does_not_split_agent_text_run(cx: &mut TestAppContext) {
             ev(ReplyEvent::Chunk("only re-push the 8 GB `m".into())),
             ev(ReplyEvent::ToolCallStarted(tc)),
             // Continuation completes the `mode=max` token.
-            ev(ReplyEvent::Chunk("ode=max cache when inputs changed.\n".into())),
+            ev(ReplyEvent::Chunk(
+                "ode=max cache when inputs changed.\n".into(),
+            )),
         ];
         v.apply_server_batch(batch, cx);
     });
@@ -2492,7 +2598,10 @@ fn tool_group_header_click_expands_the_fold(cx: &mut TestAppContext) {
     crate::layout_probe_end();
 
     let (x, y, w, h) = rect.expect("the folded tool header never painted");
-    assert!(w > 4.0 && h > 4.0, "fold header painted with no area ({w}x{h}) — nothing to click");
+    assert!(
+        w > 4.0 && h > 4.0,
+        "fold header painted with no area ({w}x{h}) — nothing to click"
+    );
     let at = point(px(x + w / 2.0), px(y + h / 2.0));
 
     view.read_with(vcx, |v, cx| {
@@ -2553,8 +2662,12 @@ fn transcript_jk_hops_over_tool_blocks(cx: &mut TestAppContext) {
         // ONE merged group. Both must be crossed in a single press.
         let batch = vec![
             ev(ReplyEvent::Chunk("before the tools\n".into())),
-            ev(ReplyEvent::ToolCallStarted(ToolCall::new("t-1", "Bash one"))),
-            ev(ReplyEvent::ToolCallStarted(ToolCall::new("t-2", "Bash two"))),
+            ev(ReplyEvent::ToolCallStarted(ToolCall::new(
+                "t-1", "Bash one",
+            ))),
+            ev(ReplyEvent::ToolCallStarted(ToolCall::new(
+                "t-2", "Bash two",
+            ))),
             ev(ReplyEvent::Chunk("after the tools\n".into())),
         ];
         v.apply_server_batch(batch, cx);
@@ -2569,8 +2682,15 @@ fn transcript_jk_hops_over_tool_blocks(cx: &mut TestAppContext) {
         })
         .expect("session")
     });
-    assert_eq!(anchors.len(), 2, "two tool calls ⇒ two anchor lines, got {anchors:?}");
-    assert!(start > 0, "the anchor run must have a content line above it");
+    assert_eq!(
+        anchors.len(),
+        2,
+        "two tool calls ⇒ two anchor lines, got {anchors:?}"
+    );
+    assert!(
+        start > 0,
+        "the anchor run must have a content line above it"
+    );
     // Non-vacuous: the anchors are CONSECUTIVE, so a plain one-line `j` from just
     // above would land on the first one (and a second `j` on the second).
     assert!(
@@ -2591,7 +2711,9 @@ fn transcript_jk_hops_over_tool_blocks(cx: &mut TestAppContext) {
         })
     };
 
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("j"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("j"), w, cx)
+    });
     let after_j = line(&view, vcx);
     assert!(
         !anchors.contains(&after_j),
@@ -2602,13 +2724,19 @@ fn transcript_jk_hops_over_tool_blocks(cx: &mut TestAppContext) {
         "one press clears the WHOLE run of tool anchors (landed {after_j}, anchors {anchors:?})"
     );
 
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("k"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("k"), w, cx)
+    });
     let after_k = line(&view, vcx);
     assert!(
         !anchors.contains(&after_k),
         "k must hop back over the block too (landed {after_k}, anchors {anchors:?})"
     );
-    assert_eq!(after_k, start - 1, "k returns to the content line above the block");
+    assert_eq!(
+        after_k,
+        start - 1,
+        "k returns to the content line above the block"
+    );
 }
 
 /// REGRESSION (live report "undo erased the buffer"): agent content that
@@ -3192,6 +3320,7 @@ fn active_overlay_open_replaces_and_clears(cx: &mut TestAppContext) {
         // open REPLACES, never stacks: opening a different overlay drops the
         // previous one (the workspace-double-click-behind-menu case can't strand).
         v.open_overlay(ActiveOverlay::WorkspacePicker(WorkspacePicker {
+            project: v.workspace.inherited_project(),
             mode: WorkspacePickerMode::Move { follow: false },
             targets: vec![0],
             selected: 0,
@@ -3283,17 +3412,26 @@ fn toggle_agent_focus_round_trips(cx: &mut TestAppContext) {
     // Worksheet (default) rests in transcript nav. toggle → Compose OPENS a block
     // (a visible surface); toggle back → Transcript nav.
     view.update(vcx, |v, cx| {
-        assert_eq!(v.agent_mut(cx).unwrap().focus, crate::AgentFocus::Transcript);
+        assert_eq!(
+            v.agent_mut(cx).unwrap().focus,
+            crate::AgentFocus::Transcript
+        );
     });
     view.update(vcx, |v, cx| v.toggle_agent_focus(cx));
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).unwrap();
         assert_eq!(c.focus, crate::AgentFocus::Compose);
-        assert!(c.inline_you_block_active(), "focus→Compose opened a visible block");
+        assert!(
+            c.inline_you_block_active(),
+            "focus→Compose opened a visible block"
+        );
     });
     view.update(vcx, |v, cx| v.toggle_agent_focus(cx));
     view.update(vcx, |v, cx| {
-        assert_eq!(v.agent_mut(cx).unwrap().focus, crate::AgentFocus::Transcript);
+        assert_eq!(
+            v.agent_mut(cx).unwrap().focus,
+            crate::AgentFocus::Transcript
+        );
     });
 }
 
@@ -3322,11 +3460,9 @@ fn worksheet_blank_submit_is_noop(cx: &mut TestAppContext) {
         assert!(c.input_surface.compose().text().trim().is_empty());
     });
 
-    let before = view
-        .update(vcx, |v, cx| {
-            v.agent_mut(cx).unwrap().editor.document().full_text()
-        })
-        ;
+    let before = view.update(vcx, |v, cx| {
+        v.agent_mut(cx).unwrap().editor.document().full_text()
+    });
     view.update(vcx, |v, cx| v.submit_compose(cx));
     view.update(vcx, |v, cx| {
         let mut c = v.agent_mut(cx).unwrap();
@@ -3753,7 +3889,15 @@ fn restore_keeps_replayed_history_across_a_gate_closed_generation_bump(cx: &mut 
             reply(ReplyEvent::Chunk("GEN0-PARTIAL-then-crash".into())),
             // ── generation 1: respawn re-emits the full history, ends ReplayEnd
             agent_note("S1", 1, 0, 0, K::ChannelOpened { resumed: true }),
-            agent_note("S1", 1, 0, 1, K::UserMessage { text: "the question".into() }),
+            agent_note(
+                "S1",
+                1,
+                0,
+                1,
+                K::UserMessage {
+                    text: "the question".into(),
+                },
+            ),
             reply(ReplyEvent::UserMessage("the question".into())),
             agent_note(
                 "S1",
@@ -4529,7 +4673,10 @@ fn session_picker_renders_empty_ring(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     view.read_with(vcx, |v, cx| {
         let tile = v.agent_tile().expect("agent tile");
-        assert!(tile.session().is_none(), "tile stays unbound until a row binds");
+        assert!(
+            tile.session().is_none(),
+            "tile stays unbound until a row binds"
+        );
         // The picker has no cached cwd — it projects from the active workspace's
         // live cwd (`agent_base_cwd`).
         let cwd = v.agent_base_cwd();
@@ -4576,7 +4723,7 @@ fn selector_projection_reflects_binding_across_tiles(cx: &mut TestAppContext) {
                 archived: false,
             });
         }
-        v.materialize_roster_unbound_tiles();
+        v.materialize_roster_detached_tiles();
     });
 
     // An unbound selector tile. Both sessions are FREE.
@@ -4660,7 +4807,11 @@ fn session_picker_groups_free_sessions_by_tag(cx: &mut TestAppContext) {
         assert_eq!(free[0].group_key(), Some("alpha"));
         assert_eq!(free[1].group_key(), Some("alpha"));
         assert_eq!(free[2].group_key(), Some("beta"));
-        assert_eq!(free[3].group_key(), None, "claude-4 is untagged, filed last");
+        assert_eq!(
+            free[3].group_key(),
+            None,
+            "claude-4 is untagged, filed last"
+        );
     });
 }
 
@@ -4816,7 +4967,11 @@ fn new_agent_uses_live_workspace_cwd_after_set_cwd(cx: &mut TestAppContext) {
     vcx.run_until_parked();
 
     let session_cwd = view.read_with(vcx, |v, cx| {
-        let id = v.agent_tile().expect("agent tile").session().expect("a session bound");
+        let id = v
+            .agent_tile()
+            .expect("agent tile")
+            .session()
+            .expect("a session bound");
         v.sessions.get(id).expect("session").read(cx).cwd.clone()
     });
     assert_eq!(
@@ -4895,7 +5050,10 @@ fn session_close_shows_selector_on_bound_tile_not_focused(cx: &mut TestAppContex
     // must resolve to A by BINDING, even though B holds focus. This is the
     // exact value a revert to `focused_window_id()` would get wrong.
     view.read_with(vcx, |v, cx| {
-        let sid_a = v.sessions.locate(&ServerSid::new("A")).expect("sid A in store");
+        let sid_a = v
+            .sessions
+            .locate(&ServerSid::new("A"))
+            .expect("sid A in store");
         assert_eq!(
             v.agent_tile_id_bound_to(sid_a),
             Some(win_a),
@@ -4950,22 +5108,21 @@ fn next_agent_label_is_unique_and_fills_gaps(cx: &mut TestAppContext) {
     });
     vcx.run_until_parked();
 
-    let add = |view: &gpui::Entity<YaldaGpuiView>,
-               vcx: &mut gpui::VisualTestContext,
-               label: &str| {
-        let label = label.to_string();
-        view.update(vcx, |v, cx| {
-            v.show_local_session(
-                AgentSession {
-                    state: AgentState::new_server_managed(None),
-                    label,
-                    cwd: PathBuf::from("."),
-                    resume_id: None,
-                },
-                cx,
-            );
-        });
-    };
+    let add =
+        |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext, label: &str| {
+            let label = label.to_string();
+            view.update(vcx, |v, cx| {
+                v.show_local_session(
+                    AgentSession {
+                        state: AgentState::new_server_managed(None),
+                        label,
+                        cwd: PathBuf::from("."),
+                        resume_id: None,
+                    },
+                    cx,
+                );
+            });
+        };
 
     // Empty store → claude-1.
     view.read_with(vcx, |v, cx| {
@@ -5046,7 +5203,11 @@ fn assert_existing_agent_picker_activation_stays_in_workspace(
     let (workspace_idx, picker_tile, old_unbound_tile) = view.update(vcx, |v, cx| {
         let workspace_idx = v.workspace.active_workspace;
         let project = v.workspace.workspaces[workspace_idx].project();
-        let cwd = v.projects.cwd_of(project).expect("project cwd").to_path_buf();
+        let cwd = v
+            .projects
+            .cwd_of(project)
+            .expect("project cwd")
+            .to_path_buf();
         v.agent_roster.upsert(SessionInfo {
             session_id: server_sid.into(),
             acp_session_id: None,
@@ -5059,7 +5220,7 @@ fn assert_existing_agent_picker_activation_stays_in_workspace(
             busy: false,
             archived: false,
         });
-        assert!(v.materialize_roster_unbound_tiles());
+        assert!(v.materialize_roster_detached_tiles());
         let old_unbound_tile = v
             .agent_tile_id_for_server_sid(server_sid)
             .expect("roster session materialized as an unbound tile");
@@ -5076,7 +5237,7 @@ fn assert_existing_agent_picker_activation_stays_in_workspace(
         assert_eq!(v.workspace.focused_window_id(), Some(picker_tile));
         assert_eq!(
             v.workspace.tile_membership(old_unbound_tile),
-            Some(TileMembership::Unbound)
+            Some(TileMembership::Detached)
         );
         let (free, _) = v.picker_projection(&v.agent_base_cwd());
         assert_eq!(free.first().map(|row| row.sid.as_str()), Some(server_sid));
@@ -5111,7 +5272,7 @@ fn assert_existing_agent_picker_activation_stays_in_workspace(
             "activation must stay in the workspace"
         );
         assert_eq!(
-            v.workspace.directly_focused_unbound(),
+            v.workspace.presented_detached_tile_id(),
             None,
             "activation must not bounce to the old unbound Agent tile"
         );
@@ -5122,8 +5283,9 @@ fn assert_existing_agent_picker_activation_stays_in_workspace(
         );
         assert_eq!(
             v.workspace.tile_membership(old_unbound_tile),
-            Some(TileMembership::Bound {
-                workspace: workspace_idx
+            Some(TileMembership::Attached {
+                workspace: workspace_idx,
+                visibility: crate::workspace::AttachedVisibility::Visible,
             }),
             "picker activation binds the existing stable Agent tile"
         );
@@ -5161,9 +5323,7 @@ fn session_picker_enter_stays_in_workspace(cx: &mut TestAppContext) {
 /// highlighted rather than submitting the now-stale stored index and doing
 /// nothing.
 #[gpui::test]
-fn session_picker_enter_uses_visually_clamped_row_after_roster_shrink(
-    cx: &mut TestAppContext,
-) {
+fn session_picker_enter_uses_visually_clamped_row_after_roster_shrink(cx: &mut TestAppContext) {
     use crate::workspace::{SplitDir, TileMembership};
     use crate::{AgentTile, App};
     use yalda::session_proto::SessionInfo;
@@ -5172,7 +5332,11 @@ fn session_picker_enter_uses_visually_clamped_row_after_roster_shrink(
     let (workspace, picker, beta_tile) = view.update(vcx, |v, cx| {
         let workspace = v.workspace.active_workspace;
         let project = v.workspace.workspaces[workspace].project();
-        let cwd = v.projects.cwd_of(project).expect("project cwd").to_path_buf();
+        let cwd = v
+            .projects
+            .cwd_of(project)
+            .expect("project cwd")
+            .to_path_buf();
         for (sid, label) in [("picker-alpha", "alpha"), ("picker-beta", "beta")] {
             v.agent_roster.upsert(SessionInfo {
                 session_id: sid.into(),
@@ -5187,11 +5351,9 @@ fn session_picker_enter_uses_visually_clamped_row_after_roster_shrink(
                 archived: false,
             });
         }
-        v.session_tags.insert(
-            "picker-alpha".into(),
-            vec!["first-group".into()],
-        );
-        assert!(v.materialize_roster_unbound_tiles());
+        v.session_tags
+            .insert("picker-alpha".into(), vec!["first-group".into()]);
+        assert!(v.materialize_roster_detached_tiles());
         let beta_tile = v
             .agent_tile_id_for_server_sid("picker-beta")
             .expect("beta stable tile");
@@ -5208,7 +5370,10 @@ fn session_picker_enter_uses_visually_clamped_row_after_roster_shrink(
     vcx.simulate_keystrokes("down down down");
     vcx.run_until_parked();
     view.read_with(vcx, |v, _| {
-        assert_eq!(v.agent_tile().and_then(AgentTile::picker).unwrap().selected, 3);
+        assert_eq!(
+            v.agent_tile().and_then(AgentTile::picker).unwrap().selected,
+            3
+        );
     });
 
     // Alpha disappears from the live roster. Beta is now row 2 and the render
@@ -5226,7 +5391,10 @@ fn session_picker_enter_uses_visually_clamped_row_after_roster_shrink(
         assert_eq!(v.workspace.tile_membership(picker), None);
         assert_eq!(
             v.workspace.tile_membership(beta_tile),
-            Some(TileMembership::Bound { workspace })
+            Some(TileMembership::Attached {
+                workspace,
+                visibility: crate::workspace::AttachedVisibility::Visible
+            })
         );
         assert_eq!(
             v.agent_tile()
@@ -5242,9 +5410,7 @@ fn session_picker_enter_uses_visually_clamped_row_after_roster_shrink(
 /// but its stable Agent tile is Unbound. Placement must move that tile without
 /// minting a duplicate local session or navigating away.
 #[gpui::test]
-fn session_picker_places_already_local_unbound_agent_without_duplicate(
-    cx: &mut TestAppContext,
-) {
+fn session_picker_places_already_local_unbound_agent_without_duplicate(cx: &mut TestAppContext) {
     use crate::workspace::{SplitDir, TileMembership};
     use crate::{AgentTile, App};
     use yalda::session_proto::SessionInfo;
@@ -5254,7 +5420,11 @@ fn session_picker_places_already_local_unbound_agent_without_duplicate(
     let (stable, picker, workspace, session) = view.update(vcx, |v, cx| {
         let workspace = v.workspace.active_workspace;
         let project = v.workspace.workspaces[workspace].project();
-        let cwd = v.projects.cwd_of(project).expect("project cwd").to_path_buf();
+        let cwd = v
+            .projects
+            .cwd_of(project)
+            .expect("project cwd")
+            .to_path_buf();
         let session = v.show_local_session(
             crate::AgentSession {
                 state: crate::AgentState::new_server_managed(None),
@@ -5281,7 +5451,7 @@ fn session_picker_places_already_local_unbound_agent_without_duplicate(
         });
         let mut tile = AgentTile::new();
         tile.bind(session);
-        let stable = v.workspace.push_unbound(App::Agent(tile), project);
+        let stable = v.workspace.push_detached(App::Agent(tile), project);
         let picker = v
             .workspace
             .split_focused(SplitDir::H, App::Agent(AgentTile::new()))
@@ -5305,7 +5475,10 @@ fn session_picker_places_already_local_unbound_agent_without_duplicate(
         assert_eq!(v.workspace.tile_membership(picker), None);
         assert_eq!(
             v.workspace.tile_membership(stable),
-            Some(TileMembership::Bound { workspace })
+            Some(TileMembership::Attached {
+                workspace,
+                visibility: crate::workspace::AttachedVisibility::Visible
+            })
         );
         assert_eq!(v.agent_tile().and_then(AgentTile::session), Some(session));
     });
@@ -5326,13 +5499,13 @@ fn shell_send_to_workspace_command_binds_an_unbound_agent(cx: &mut TestAppContex
             .push_workspace_inheriting(App::Linear(LinearTile::new()));
         let target = v.workspace.active_workspace;
         v.workspace.set_active_workspace(0);
-        let agent = v.workspace.push_unbound(
+        let agent = v.workspace.push_detached(
             App::Agent(AgentTile::dormant(crate::ServerSid::new(
                 "send-agent-to-workspace",
             ))),
             project,
         );
-        assert!(v.workspace.focus_unbound(agent));
+        assert!(v.workspace.present_solo(agent));
         (agent, target)
     });
 
@@ -5341,7 +5514,10 @@ fn shell_send_to_workspace_command_binds_an_unbound_agent(cx: &mut TestAppContex
         let picker = v
             .workspace_picker_ref()
             .expect("shell command opens workspace picker");
-        assert_eq!(picker.mode, crate::WorkspacePickerMode::Move { follow: true });
+        assert_eq!(
+            picker.mode,
+            crate::WorkspacePickerMode::Move { follow: true }
+        );
         assert_eq!(picker.targets, vec![0, target]);
         assert_eq!(picker.selected, 1);
     });
@@ -5350,7 +5526,10 @@ fn shell_send_to_workspace_command_binds_an_unbound_agent(cx: &mut TestAppContex
     view.read_with(vcx, |v, _| {
         assert_eq!(
             v.workspace.tile_membership(agent),
-            Some(TileMembership::Bound { workspace: target })
+            Some(TileMembership::Attached {
+                workspace: target,
+                visibility: crate::workspace::AttachedVisibility::Visible,
+            })
         );
         assert_eq!(v.workspace.active_workspace, target);
         assert_eq!(v.workspace.focused_window_id(), Some(agent));
@@ -5375,7 +5554,10 @@ fn session_picker_activation_binds_slot(cx: &mut TestAppContext) {
             tile.session().is_some(),
             "a session is bound after activation and survives the attach"
         );
-        assert!(tile.picker().is_none(), "picker cleared once a session binds");
+        assert!(
+            tile.picker().is_none(),
+            "picker cleared once a session binds"
+        );
         assert_eq!(v.sessions.len(), 1, "exactly one session in the store");
         let id = tile.session().unwrap();
         assert_eq!(
@@ -5580,7 +5762,9 @@ fn clear_async_bind_leaves_worksheet_typeable(cx: &mut TestAppContext) {
         );
     });
     view.read_with(vcx, |v, cx| {
-        let id = v.focused_bound_session().expect("still bound after resolution");
+        let id = v
+            .focused_bound_session()
+            .expect("still bound after resolution");
         let (active, focus) = v
             .read_session(id, cx, |c| (c.inline_you_block_active(), c.focus))
             .unwrap();
@@ -5589,7 +5773,11 @@ fn clear_async_bind_leaves_worksheet_typeable(cx: &mut TestAppContext) {
             "after the async /clear bind the worksheet must be typeable (inline block active) \
              — else keystrokes fall into nav and nothing repaints"
         );
-        assert_eq!(focus, crate::AgentFocus::Compose, "focused so typing lands + repaints");
+        assert_eq!(
+            focus,
+            crate::AgentFocus::Compose,
+            "focused so typing lands + repaints"
+        );
     });
 }
 
@@ -5658,7 +5846,10 @@ fn multi_session_persistence_round_trips_distinct_sids() {
     assert!(loaded[1].tasklist_open);
     // UXI-AgentTile-20: the hidden flag round-trips (A shown, B hidden).
     assert!(!loaded[0].sidepanel_hidden, "SID-A sidepanel stays shown");
-    assert!(loaded[1].sidepanel_hidden, "SID-B sidepanel restores hidden");
+    assert!(
+        loaded[1].sidepanel_hidden,
+        "SID-B sidepanel restores hidden"
+    );
 }
 
 // ---- Render-skip keystone + invalidation model (rev 2) -------------------
@@ -6079,10 +6270,8 @@ fn agent_markdown_link_opens_local_file_in_buffer_tile(cx: &mut TestAppContext) 
     use crate::{App, BufferApp};
     use gpui::{Modifiers, point, px};
 
-    let dir = std::env::temp_dir().join(format!(
-        "yalda-agent-markdown-link-{}",
-        std::process::id()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("yalda-agent-markdown-link-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create agent link fixture dir");
     let target = dir.join("target.md");
     std::fs::write(&target, "# Agent target\n").expect("write agent target");
@@ -6185,7 +6374,9 @@ fn transcript_drag_on_frozen_markdown_line_copies_visual_span(cx: &mut TestAppCo
     vcx.run_until_parked();
 
     view.update(vcx, |_, cx| {
-        cx.write_to_clipboard(gpui::ClipboardItem::new_string("SENTINEL-NOT-COPIED".into()))
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+            "SENTINEL-NOT-COPIED".into(),
+        ))
     });
 
     let tv = view
@@ -6203,8 +6394,7 @@ fn transcript_drag_on_frozen_markdown_line_copies_visual_span(cx: &mut TestAppCo
         .iter()
         .max_by(|a, b| a.bounds.left().partial_cmp(&b.bounds.left()).unwrap())
         .unwrap();
-    let midy = email_tok.bounds.top()
-        + (email_tok.bounds.bottom() - email_tok.bounds.top()) / 2.0;
+    let midy = email_tok.bounds.top() + (email_tok.bounds.bottom() - email_tok.bounds.top()) / 2.0;
     let start = point(email_tok.bounds.left() + px(1.0), midy);
     let end = point(email_tok.bounds.right() - px(1.0), midy);
 
@@ -6262,7 +6452,9 @@ fn transcript_drag_autocopies_selection_to_clipboard(cx: &mut TestAppContext) {
 
     // Seed a sentinel so "no copy happened" ≠ "copied empty".
     view.update(vcx, |_, cx| {
-        cx.write_to_clipboard(gpui::ClipboardItem::new_string("SENTINEL-NOT-COPIED".into()))
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+            "SENTINEL-NOT-COPIED".into(),
+        ))
     });
 
     // Grab the transcript view + its painted token-hit sink.
@@ -6364,18 +6556,28 @@ fn transcript_tail_jump_collapses_stale_selection(cx: &mut TestAppContext) {
         .max_by(|a, b| a.partial_cmp(b).unwrap())
         .unwrap();
     let midy = line0[0].bounds.top() + (line0[0].bounds.bottom() - line0[0].bounds.top()) / 2.0;
-    vcx.simulate_mouse_down(point(left + px(1.0), midy), MouseButton::Left, Modifiers::default());
+    vcx.simulate_mouse_down(
+        point(left + px(1.0), midy),
+        MouseButton::Left,
+        Modifiers::default(),
+    );
     vcx.simulate_mouse_move(
         point(right - px(1.0), midy),
         Some(MouseButton::Left),
         Modifiers::default(),
     );
-    vcx.simulate_mouse_up(point(right - px(1.0), midy), MouseButton::Left, Modifiers::default());
+    vcx.simulate_mouse_up(
+        point(right - px(1.0), midy),
+        MouseButton::Left,
+        Modifiers::default(),
+    );
     vcx.run_until_parked();
 
     // Precondition: a real, non-empty selection persists after the drag.
     let before = view
-        .update(vcx, |v, cx| v.agent_read(cx, |c| c.editor.selection_range()))
+        .update(vcx, |v, cx| {
+            v.agent_read(cx, |c| c.editor.selection_range())
+        })
         .expect("session");
     assert!(
         matches!(before, Some((a, b)) if a != b),
@@ -6437,15 +6639,17 @@ fn transcript_block_table_is_mouse_selectable(cx: &mut TestAppContext) {
             .iter()
             .any(|it| matches!(it, crate::FlatItem::Block(_)))
     });
-    assert!(has_block, "the frozen table did not render as a FlatItem::Block");
+    assert!(
+        has_block,
+        "the frozen table did not render as a FlatItem::Block"
+    );
 
     let tv = view
         .update(vcx, |v, _| v.transcript_views.get(&id).cloned())
         .expect("transcript view exists");
     let tokens: Vec<crate::TokenHit> = tv.update(vcx, |t, _| t.token_hits.borrow().clone());
     // The core defect: the block's raw lines (0..3) must now register hit bands.
-    let table_hits: Vec<&crate::TokenHit> =
-        tokens.iter().filter(|t| t.line_idx < 3).collect();
+    let table_hits: Vec<&crate::TokenHit> = tokens.iter().filter(|t| t.line_idx < 3).collect();
     assert!(
         !table_hits.is_empty(),
         "the table block registered NO hit-test tokens — its content is unselectable (bug-0008)"
@@ -6463,17 +6667,22 @@ fn transcript_block_table_is_mouse_selectable(cx: &mut TestAppContext) {
         .iter()
         .find(|t| t.line_idx == 2 && t.start_char == 10)
         .expect("data row registers the EMAIL cell at its raw char span (per-cell, bug-0008)");
-    assert_eq!(email_cell.char_count, 11, "email cell covers exactly `scott@x.com`");
+    assert_eq!(
+        email_cell.char_count, 11,
+        "email cell covers exactly `scott@x.com`"
+    );
     assert!(
-        table_hits.iter().any(|t| t.line_idx == 2 && t.start_char == 2),
+        table_hits
+            .iter()
+            .any(|t| t.line_idx == 2 && t.start_char == 2),
         "the `Scott` cell is a SEPARATE hit — cells are distinct, not one row"
     );
 
     // Drive the REAL hit-test (`hit_test_tokens`, the function the mouse path uses):
     // the email cell's center maps to the data row and a column inside the cell, and
     // its LEFT edge maps to the cell START (char 10) — proving the cell, not the row.
-    let midy = email_cell.bounds.top()
-        + (email_cell.bounds.bottom() - email_cell.bounds.top()) / 2.0;
+    let midy =
+        email_cell.bounds.top() + (email_cell.bounds.bottom() - email_cell.bounds.top()) / 2.0;
     let center = point(
         (email_cell.bounds.left() + email_cell.bounds.right()) / 2.0,
         midy,
@@ -6484,12 +6693,13 @@ fn transcript_block_table_is_mouse_selectable(cx: &mut TestAppContext) {
         (10..=21).contains(&hc),
         "and to a column INSIDE the email cell (got {hc})"
     );
-    let (ll, lc) = crate::hit_test_tokens(
-        point(email_cell.bounds.left() + px(1.0), midy),
-        &tokens,
-    )
-    .expect("left edge hits a token");
-    assert_eq!((ll, lc), (2, 10), "the cell's left edge maps to the cell START char");
+    let (ll, lc) = crate::hit_test_tokens(point(email_cell.bounds.left() + px(1.0), midy), &tokens)
+        .expect("left edge hits a token");
+    assert_eq!(
+        (ll, lc),
+        (2, 10),
+        "the cell's left edge maps to the cell START char"
+    );
 }
 
 /// REGRESSION (bug-0030): dragging over a TABLE CELL in the transcript
@@ -6540,7 +6750,10 @@ fn transcript_block_table_selection_is_painted(cx: &mut TestAppContext) {
             .iter()
             .any(|it| matches!(it, crate::FlatItem::Block(_)))
     });
-    assert!(has_block, "the frozen table did not render as a FlatItem::Block");
+    assert!(
+        has_block,
+        "the frozen table did not render as a FlatItem::Block"
+    );
 
     let tv = view
         .update(vcx, |v, _| v.transcript_views.get(&id).cloned())
@@ -6655,7 +6868,9 @@ fn transcript_drag_on_focused_caret_line_copies_that_line(cx: &mut TestAppContex
     vcx.run_until_parked();
 
     view.update(vcx, |_, cx| {
-        cx.write_to_clipboard(gpui::ClipboardItem::new_string("SENTINEL-NOT-COPIED".into()))
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+            "SENTINEL-NOT-COPIED".into(),
+        ))
     });
 
     let tv = view
@@ -6727,7 +6942,10 @@ fn transcript_021_chatbox_keystroke_is_render_flat(cx: &mut TestAppContext) {
     _view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
     let base = crate::perf_render_count("transcript");
-    assert!(base >= 1, "transcript must render at least once on first frame");
+    assert!(
+        base >= 1,
+        "transcript must render at least once on first frame"
+    );
 
     // A real chatbox keystroke mutates the COMPOSE editor (inside the
     // `InputSurface::Chatbox`) and notifies the SESSION — but the transcript's
@@ -6845,7 +7063,10 @@ fn transcript_dropped_notify_id_forces_render(cx: &mut TestAppContext) {
     view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
     let base = crate::perf_render_count("transcript");
-    assert!(base >= 1, "transcript must render at least once on first frame");
+    assert!(
+        base >= 1,
+        "transcript must render at least once on first frame"
+    );
 
     // SILENT transcript mutation — the dropped-notify simulation. `edit_seq`
     // advances (fingerprint moves) but NO `cx.notify()` fires, so the observe
@@ -7077,7 +7298,10 @@ fn transcript_021_user_turn_jump_toggle(cx: &mut TestAppContext) {
     session.update(vcx, |s, _cx| s.state.pending_jump_ord = Some(0));
     let after = session.read_with(vcx, |s, _| crate::TranscriptSeqs::of(&s.state).pending_jump);
     assert!(!before, "no jump queued ⇒ pending_jump seq is false");
-    assert!(after, "a queued jump ⇒ pending_jump seq flips true (busts the cache)");
+    assert!(
+        after,
+        "a queued jump ⇒ pending_jump seq flips true (busts the cache)"
+    );
 }
 
 /// UXI-AgentTile-40: uppercase J/K are direct user-turn motions. This drives
@@ -7122,15 +7346,27 @@ fn uppercase_jk_move_directly_between_user_turns(cx: &mut TestAppContext) {
     vcx.simulate_keystrokes("shift-j");
     vcx.run_until_parked();
     view.read_with(vcx, |v, cx| {
-        assert_eq!(v.read_session(id, cx, |state| state.user_turn_jump_ord), Some(1));
-        assert_eq!(v.read_session(id, cx, |state| state.user_turn_jump_mode), Some(false));
+        assert_eq!(
+            v.read_session(id, cx, |state| state.user_turn_jump_ord),
+            Some(1)
+        );
+        assert_eq!(
+            v.read_session(id, cx, |state| state.user_turn_jump_mode),
+            Some(false)
+        );
     });
 
     vcx.simulate_keystrokes("shift-k");
     vcx.run_until_parked();
     view.read_with(vcx, |v, cx| {
-        assert_eq!(v.read_session(id, cx, |state| state.user_turn_jump_ord), Some(0));
-        assert_eq!(v.read_session(id, cx, |state| state.user_turn_jump_mode), Some(false));
+        assert_eq!(
+            v.read_session(id, cx, |state| state.user_turn_jump_ord),
+            Some(0)
+        );
+        assert_eq!(
+            v.read_session(id, cx, |state| state.user_turn_jump_mode),
+            Some(false)
+        );
     });
 }
 
@@ -7224,7 +7460,10 @@ fn transcript_021_anim_tick_busts_awaiting_cache(cx: &mut TestAppContext) {
     // IDLE: a tick must NOT touch the transcript (nothing is awaiting).
     let ticked_idle = view.update(vcx, |v, cx| v.tick_awaiting_transcript_views(cx));
     vcx.run_until_parked();
-    assert!(!ticked_idle, "idle session: anim tick must notify no transcript view");
+    assert!(
+        !ticked_idle,
+        "idle session: anim tick must notify no transcript view"
+    );
     assert_eq!(
         crate::perf_render_count("transcript"),
         base,
@@ -7249,7 +7488,10 @@ fn transcript_021_anim_tick_busts_awaiting_cache(cx: &mut TestAppContext) {
 
     let ticked = view.update(vcx, |v, cx| v.tick_awaiting_transcript_views(cx));
     vcx.run_until_parked();
-    assert!(ticked, "awaiting session: anim tick must notify its transcript view");
+    assert!(
+        ticked,
+        "awaiting session: anim tick must notify its transcript view"
+    );
     let after_tick = crate::perf_render_count("transcript");
     assert_eq!(
         after_tick,
@@ -7291,9 +7533,10 @@ fn boot_with_linear<'a>(
     });
     vcx.run_until_parked();
     let lv = view.update(vcx, |v, _cx| match v.workspace.focused_content() {
-        Some(crate::App::Linear(tile)) => {
-            tile.view.clone().expect("render_linear lazily creates the LinearView")
-        }
+        Some(crate::App::Linear(tile)) => tile
+            .view
+            .clone()
+            .expect("render_linear lazily creates the LinearView"),
         _ => panic!("expected a focused Linear tile"),
     });
     (view, vcx, lv)
@@ -7312,7 +7555,10 @@ fn linear_input_keystroke_is_render_flat(cx: &mut TestAppContext) {
     view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
     let base = crate::perf_render_count("linear");
-    assert!(base >= 1, "linear body must render at least once on first frame");
+    assert!(
+        base >= 1,
+        "linear body must render at least once on first frame"
+    );
 
     for _ in 0..5 {
         view.update(vcx, |v, cx| {
@@ -7400,7 +7646,11 @@ fn linear_picker_move_busts_cache(cx: &mut TestAppContext) {
         "a picker move must re-render the cached body exactly once (base {base}), got {after}"
     );
     let sel = lv.update(vcx, |v, _| v.selected_candidate().and_then(|c| c.name));
-    assert_eq!(sel.as_deref(), Some("Beta"), "picker_move advanced the selection");
+    assert_eq!(
+        sel.as_deref(),
+        Some("Beta"),
+        "picker_move advanced the selection"
+    );
 }
 
 /// Entering browse on a loaded project body puts the cursor on its first issue,
@@ -7420,20 +7670,22 @@ fn linear_nav_move_busts_cache(cx: &mut TestAppContext) {
             title: Some(format!("{id} title")),
             state: None,
         };
-        v.set_state(crate::LinearViewState::Project(Box::new(crate::ProjectDetail {
-            name: Some("Fulcrum".into()),
-            description: None,
-            content: None,
-            state: None,
-            url: None,
-            lead: None,
-            target_date: None,
-            milestones: None,
-            issues: Some(crate::NodeList {
-                nodes: vec![issue("FUL-19"), issue("FUL-620")],
-            }),
-            updates: None,
-        })));
+        v.set_state(crate::LinearViewState::Project(Box::new(
+            crate::ProjectDetail {
+                name: Some("Fulcrum".into()),
+                description: None,
+                content: None,
+                state: None,
+                url: None,
+                lead: None,
+                target_date: None,
+                milestones: None,
+                issues: Some(crate::NodeList {
+                    nodes: vec![issue("FUL-19"), issue("FUL-620")],
+                }),
+                updates: None,
+            },
+        )));
         v.enter_select();
         cx.notify();
     });
@@ -7445,7 +7697,11 @@ fn linear_nav_move_busts_cache(cx: &mut TestAppContext) {
         Some(crate::NavTarget::Issue(id)) => Some(id),
         _ => None,
     });
-    assert_eq!(target0.as_deref(), Some("FUL-19"), "browse starts on first issue");
+    assert_eq!(
+        target0.as_deref(),
+        Some("FUL-19"),
+        "browse starts on first issue"
+    );
 
     // One move → one body re-render; cursor advanced to the next issue.
     lv.update(vcx, |v, cx| {
@@ -7464,7 +7720,11 @@ fn linear_nav_move_busts_cache(cx: &mut TestAppContext) {
         Some(crate::NavTarget::Issue(id)) => Some(id),
         _ => None,
     });
-    assert_eq!(target1.as_deref(), Some("FUL-620"), "nav_move advanced the cursor");
+    assert_eq!(
+        target1.as_deref(),
+        Some("FUL-620"),
+        "nav_move advanced the cursor"
+    );
 }
 
 /// The Linear tile is modal: in Normal mode printable keys are commands, not
@@ -7473,7 +7733,7 @@ fn linear_nav_move_busts_cache(cx: &mut TestAppContext) {
 /// Regression for the "can't access any menus, every key types into the input" trap.
 #[gpui::test]
 fn linear_normal_mode_frees_keys_for_menus(cx: &mut TestAppContext) {
-    use crate::{Key, KMods, KeyPress, LinearMode};
+    use crate::{KMods, Key, KeyPress, LinearMode};
     let kp = |c: char| KeyPress::new(Key::Char(c), KMods::NONE);
     let (view, vcx, _lv) = boot_with_linear(cx);
 
@@ -7485,7 +7745,10 @@ fn linear_normal_mode_frees_keys_for_menus(cx: &mut TestAppContext) {
         Some(crate::App::Linear(t)) => t.input.clone(),
         _ => String::new(),
     });
-    assert_eq!(typed, "x", "Insert mode types printable keys into the query");
+    assert_eq!(
+        typed, "x",
+        "Insert mode types printable keys into the query"
+    );
 
     // Switch to Normal: a letter is now a no-op (NOT appended), and `<space>`
     // opens the global menu instead of inserting a space.
@@ -7497,7 +7760,10 @@ fn linear_normal_mode_frees_keys_for_menus(cx: &mut TestAppContext) {
         Some(crate::App::Linear(t)) => t.input.clone(),
         _ => String::new(),
     });
-    assert_eq!(after_letter, "x", "Normal mode does NOT type unbound letters");
+    assert_eq!(
+        after_letter, "x",
+        "Normal mode does NOT type unbound letters"
+    );
 
     // `<space>` in Normal mode is intercepted as a leader (universal path) and
     // opens the tile/app (LINEAR) local menu — the tile is not in text entry.
@@ -7508,7 +7774,11 @@ fn linear_normal_mode_frees_keys_for_menus(cx: &mut TestAppContext) {
     });
     assert!(consumed, "`<space>` is consumed as a leader in Normal mode");
     assert!(opened, "`<space>` in Normal mode opens the menu");
-    assert_eq!(header, Some("LINEAR"), "`<space>` opens the tile/app (LINEAR) local menu");
+    assert_eq!(
+        header,
+        Some("LINEAR"),
+        "`<space>` opens the tile/app (LINEAR) local menu"
+    );
 
     // And `.` (after closing the space menu) opens the per-workspace menu.
     let dot_header = view.update(vcx, |v, cx| {
@@ -7516,7 +7786,11 @@ fn linear_normal_mode_frees_keys_for_menus(cx: &mut TestAppContext) {
         v.leader_intercept(&kp('.'), cx);
         v.menu_ref().map(|m| m.header)
     });
-    assert_eq!(dot_header, Some("MENU"), "`.` opens the per-workspace command menu");
+    assert_eq!(
+        dot_header,
+        Some("MENU"),
+        "`.` opens the per-workspace command menu"
+    );
 }
 
 /// The universal leader rule: when a tile is NOT in text entry, `<space>`/`.`/
@@ -7525,20 +7799,26 @@ fn linear_normal_mode_frees_keys_for_menus(cx: &mut TestAppContext) {
 /// priority when not in insert mode" property.
 #[gpui::test]
 fn leader_intercept_respects_insert_mode(cx: &mut TestAppContext) {
-    use crate::{Key, KMods, KeyPress, LinearMode};
+    use crate::{KMods, Key, KeyPress, LinearMode};
     let kp = |c: char| KeyPress::new(Key::Char(c), KMods::NONE);
     let (view, vcx, _lv) = boot_with_linear(cx);
 
     // Linear opens in Insert: a leader is NOT intercepted (it's text).
     let insert = view.update(vcx, |v, cx| v.leader_intercept(&kp(' '), cx));
-    assert!(!insert, "in Insert mode a leader is left to the tile as text");
+    assert!(
+        !insert,
+        "in Insert mode a leader is left to the tile as text"
+    );
 
     // Switch to Normal: now the leader IS intercepted.
     let normal = view.update(vcx, |v, cx| {
         v.linear_set_mode(LinearMode::Normal, cx);
         v.leader_intercept(&kp('.'), cx)
     });
-    assert!(normal, "in Normal mode a leader is intercepted as a menu-opener");
+    assert!(
+        normal,
+        "in Normal mode a leader is intercepted as a menu-opener"
+    );
 }
 
 /// REGRESSION (live report: in worksheet mode `<space>` opened the WORKSPACE
@@ -7589,7 +7869,10 @@ fn focused_in_insert_mode_tracks_compose_not_transcript(cx: &mut TestAppContext)
         drop(c);
         v.focused_in_insert_mode(cx)
     });
-    assert!(in_insert2, "compose in Insert + non-empty draft ⇒ text entry ⇒ space types");
+    assert!(
+        in_insert2,
+        "compose in Insert + non-empty draft ⇒ text entry ⇒ space types"
+    );
 
     // Transcript focus is read-only NAVIGATION ⇒ leaders fire even though the
     // compose is still Insert.
@@ -7633,7 +7916,10 @@ fn shell_menu_offers_workspace_ops_and_goto_still_switches(cx: &mut TestAppConte
     // goto list (that is ctrl-1..0, a direct chord — UXI-Menu-6).
     let cmds = shell_menu_commands();
     for expect in ["rename-workspace", "new-workspace"] {
-        assert!(cmds.contains(&expect.to_string()), "shell menu missing {expect}: {cmds:?}");
+        assert!(
+            cmds.contains(&expect.to_string()),
+            "shell menu missing {expect}: {cmds:?}"
+        );
     }
     assert!(
         !cmds.iter().any(|c| c.starts_with("goto-workspace-")),
@@ -7689,7 +7975,10 @@ fn roster_surfaces_unopened_session_and_tracks_rename_close(cx: &mut TestAppCont
     let rows = view.update(vcx, |v, cx| v.jump_panel_agent_rows(cx));
     assert_eq!(rows.len(), 1, "roster session appears in the jump panel");
     assert_eq!(rows[0].label, "claude-7");
-    assert!(!rows[0].bound, "an unopened session is free (no tile binds it)");
+    assert!(
+        !rows[0].bound,
+        "an unopened session is free (no tile binds it)"
+    );
     assert!(matches!(rows[0].target, crate::JumpTarget::Roster(ref s) if s == "srv-1"));
 
     // A rename broadcast updates the label in place.
@@ -7704,7 +7993,10 @@ fn roster_surfaces_unopened_session_and_tracks_rename_close(cx: &mut TestAppCont
     });
     let rows = view.update(vcx, |v, cx| v.jump_panel_agent_rows(cx));
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].label, "renamed-session", "rename updates the row label");
+    assert_eq!(
+        rows[0].label, "renamed-session",
+        "rename updates the row label"
+    );
 
     view.update(vcx, |v, cx| {
         v.apply_server_batch(
@@ -7717,7 +8009,9 @@ fn roster_surfaces_unopened_session_and_tracks_rename_close(cx: &mut TestAppCont
     });
     assert!(view.read_with(vcx, |v, _| {
         v.jump_archived_sessions.contains("srv-1")
-            && v.agent_roster.get("srv-1").is_some_and(|info| info.archived)
+            && v.agent_roster
+                .get("srv-1")
+                .is_some_and(|info| info.archived)
     }));
     assert!(
         crate::agent_rows_for_tab(
@@ -7727,8 +8021,8 @@ fn roster_surfaces_unopened_session_and_tracks_rename_close(cx: &mut TestAppCont
                 .collect(),
             crate::JumpAgentTab::All,
         )
-            .iter()
-            .all(|(_, row)| !matches!(&row.target, crate::JumpTarget::Roster(s) if s == "srv-1")),
+        .iter()
+        .all(|(_, row)| !matches!(&row.target, crate::JumpTarget::Roster(s) if s == "srv-1")),
         "cold archived session leaves the live projection"
     );
 
@@ -7749,8 +8043,8 @@ fn roster_surfaces_unopened_session_and_tracks_rename_close(cx: &mut TestAppCont
                 .collect(),
             crate::JumpAgentTab::All,
         )
-            .iter()
-            .any(|(_, row)| matches!(&row.target, crate::JumpTarget::Roster(s) if s == "srv-1")),
+        .iter()
+        .any(|(_, row)| matches!(&row.target, crate::JumpTarget::Roster(s) if s == "srv-1")),
         "unarchive restores the live projection"
     );
 
@@ -7856,7 +8150,10 @@ fn jump_panel_renders_per_project_sections(cx: &mut TestAppContext) {
         v.new_workspace_in(b_pid, cx);
         v.workspace.active_workspace
     });
-    assert_ne!(a_idx, b_idx, "badges (idx+1) are distinct global workspace numbers");
+    assert_ne!(
+        a_idx, b_idx,
+        "badges (idx+1) are distinct global workspace numbers"
+    );
     // A free session rooted at A's cwd → groups under A.
     view.update(vcx, |v, cx| {
         let s = AgentSession {
@@ -7870,8 +8167,14 @@ fn jump_panel_renders_per_project_sections(cx: &mut TestAppContext) {
     vcx.run_until_parked();
 
     let (sections, _unfiled) = view.update(vcx, |v, cx| v.jump_panel_sections(cx));
-    let sec_a = sections.iter().find(|s| s.id == a_pid).expect("section A present");
-    let sec_b = sections.iter().find(|s| s.id == b_pid).expect("section B present (even if empty)");
+    let sec_a = sections
+        .iter()
+        .find(|s| s.id == a_pid)
+        .expect("section A present");
+    let sec_b = sections
+        .iter()
+        .find(|s| s.id == b_pid)
+        .expect("section B present (even if empty)");
 
     assert!(
         sec_a.workspaces.iter().any(|(i, _, _)| *i == a_idx),
@@ -7889,7 +8192,10 @@ fn jump_panel_renders_per_project_sections(cx: &mut TestAppContext) {
         sec_a.sessions.iter().any(|(_, r)| r.label == "sess-a"),
         "A groups the session rooted at its cwd"
     );
-    assert!(sec_b.sessions.is_empty(), "B (no sessions) still renders an empty section");
+    assert!(
+        sec_b.sessions.is_empty(),
+        "B (no sessions) still renders an empty section"
+    );
 }
 
 /// A project disclosure hides every workspace/session row beneath that header,
@@ -7952,12 +8258,18 @@ fn jump_panel_workspace_folders_and_unbound_rows_are_tile_native(cx: &mut TestAp
         let cwd = v.projects.cwd_of(pid).unwrap().to_path_buf();
         let mut bound_tile = LinearTile::new();
         bound_tile.title = "bound-linear".into();
-        let bound = v.workspace.push_workspace_inheriting(App::Linear(bound_tile));
+        let bound = v
+            .workspace
+            .push_workspace_inheriting(App::Linear(bound_tile));
         let workspace_idx = v.workspace.active_workspace;
         let mut unbound_tile = LinearTile::new();
         unbound_tile.title = "unbound-linear".into();
-        let unbound = v.workspace.push_unbound(App::Linear(unbound_tile), pid);
-        v.workspace.tile_mut(unbound).unwrap().tags.insert("frontend".into());
+        let unbound = v.workspace.push_detached(App::Linear(unbound_tile), pid);
+        v.workspace
+            .tile_mut(unbound)
+            .unwrap()
+            .tags
+            .insert("frontend".into());
         v.agent_roster.upsert(yalda::session_proto::SessionInfo {
             session_id: "S-unbound-status".into(),
             acp_session_id: None,
@@ -7970,23 +8282,24 @@ fn jump_panel_workspace_folders_and_unbound_rows_are_tile_native(cx: &mut TestAp
             busy: true,
             archived: false,
         });
-        let agent = v.workspace.push_unbound(
+        let agent = v.workspace.push_detached(
             App::Agent(crate::AgentTile::dormant(crate::ServerSid::new(
                 "S-unbound-status",
             ))),
             pid,
         );
-        v.workspace.tile_mut(agent).unwrap().tags.insert("backend".into());
+        v.workspace
+            .tile_mut(agent)
+            .unwrap()
+            .tags
+            .insert("backend".into());
         v.jump_tag_order.insert(
             v.projects.name_of(pid).to_string(),
             vec!["frontend".into(), "backend".into()],
         );
         v.workspace.set_active_workspace(0);
         let wsp = &v.workspace.workspaces[workspace_idx];
-        let fold_key = YaldaGpuiView::workspace_fold_key(
-            v.projects.name_of(pid),
-            &wsp.auto_name,
-        );
+        let fold_key = YaldaGpuiView::workspace_fold_key(v.projects.name_of(pid), &wsp.auto_name);
         (pid, workspace_idx, bound, unbound, agent, fold_key)
     });
 
@@ -8005,13 +8318,13 @@ fn jump_panel_workspace_folders_and_unbound_rows_are_tile_native(cx: &mut TestAp
         assert!(folder.tiles.iter().any(|tile| tile.id == bound));
         assert!(folder.tiles.iter().all(|tile| tile.id != unbound));
         let loose = section
-            .unbound
+            .detached
             .iter()
             .find(|tile| tile.id == unbound)
             .expect("unbound projection");
         assert_eq!(loose.tags, vec!["frontend"]);
         let agent_row = section
-            .unbound
+            .detached
             .iter()
             .find(|tile| tile.id == agent)
             .and_then(|tile| tile.agent.as_ref())
@@ -8019,7 +8332,7 @@ fn jump_panel_workspace_folders_and_unbound_rows_are_tile_native(cx: &mut TestAp
         assert_eq!(agent_row.provider, yalda::acp_channel::AgentProvider::Codex);
         assert_eq!(agent_row.dot_status(), crate::AgentDotStatus::Working);
         assert_eq!(agent_row.tags, vec!["backend"]);
-        assert!(section.unbound.iter().all(|tile| tile.id != bound));
+        assert!(section.detached.iter().all(|tile| tile.id != bound));
     });
 
     crate::layout_probe_begin();
@@ -8047,7 +8360,7 @@ fn jump_panel_workspace_folders_and_unbound_rows_are_tile_native(cx: &mut TestAp
     vcx.simulate_click(at, Modifiers::default());
     vcx.run_until_parked();
     view.update(vcx, |v, _| {
-        assert_eq!(v.workspace.directly_focused_unbound(), Some(unbound));
+        assert_eq!(v.workspace.presented_detached_tile_id(), Some(unbound));
     });
 
     view.update(vcx, |v, cx| v.toggle_workspace_fold(&fold_key, cx));
@@ -8075,17 +8388,20 @@ fn jump_panel_tagged_items_keep_fixed_chrome_size(cx: &mut TestAppContext) {
         let pid = v.workspace.active_workspace().expect("workspace").project();
         let mut tagged_tile = LinearTile::new();
         tagged_tile.title = "tagged-linear".into();
-        let tagged = v.workspace.push_unbound(App::Linear(tagged_tile), pid);
-        v.workspace.tile_mut(tagged).unwrap().tags.insert("frontend".into());
+        let tagged = v.workspace.push_detached(App::Linear(tagged_tile), pid);
+        v.workspace
+            .tile_mut(tagged)
+            .unwrap()
+            .tags
+            .insert("frontend".into());
 
         let mut loose_tile = LinearTile::new();
         loose_tile.title = "loose-linear".into();
-        let loose = v.workspace.push_unbound(App::Linear(loose_tile), pid);
+        let loose = v.workspace.push_detached(App::Linear(loose_tile), pid);
         (pid, tagged, loose)
     });
 
-    let measure = |view: &gpui::Entity<YaldaGpuiView>,
-                   vcx: &mut gpui::VisualTestContext| {
+    let measure = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
         crate::layout_probe_begin();
         view.update(vcx, |_, cx| cx.notify());
         vcx.run_until_parked();
@@ -8134,6 +8450,156 @@ fn jump_panel_tagged_items_keep_fixed_chrome_size(cx: &mut TestAppContext) {
         );
     }
 }
+/// ADR-0034 / UXI-JumpPanel-25: hidden attachments remain under their owning
+/// workspace in both navigation surfaces. Selection presents them solo without
+/// changing membership; Unhide follows them back into the workspace.
+#[gpui::test]
+fn hidden_tile_navigation_is_solo_until_explicit_unhide(cx: &mut TestAppContext) {
+    use crate::jump_palette::PaletteTarget;
+    use crate::workspace::{AttachedVisibility, SoloPresentation, TileMembership};
+
+    let (view, vcx) = boot_browser(cx);
+    let (tile, workspace_index, project) = view.update(vcx, |v, _| {
+        let tile = v.workspace.focused_window_id().unwrap();
+        let workspace_index = v.workspace.active_workspace;
+        let project = v.workspace.workspaces[workspace_index].project();
+        v.workspace.hide_window(tile).unwrap();
+        (tile, workspace_index, project)
+    });
+
+    view.read_with(vcx, |v, cx| {
+        let section = v
+            .jump_panel_sections(cx)
+            .0
+            .into_iter()
+            .find(|section| section.id == project)
+            .unwrap();
+        let folder = section
+            .workspace_folders
+            .iter()
+            .find(|folder| folder.index == workspace_index)
+            .unwrap();
+        assert!(folder.tiles.iter().any(|row| row.id == tile));
+        assert!(section.detached.iter().all(|row| row.id != tile));
+        assert!(
+            v.jump_palette_items(cx)
+                .iter()
+                .any(|item| item.target == PaletteTarget::Tile(tile)
+                    && item.detail.contains("Hidden"))
+        );
+    });
+
+    view.update(vcx, |v, cx| v.jump_to_tile(tile, cx));
+    view.read_with(vcx, |v, _| {
+        assert_eq!(
+            v.workspace.presented_tile(),
+            Some(SoloPresentation::HiddenAttached(tile))
+        );
+        assert_eq!(
+            v.workspace.tile_membership(tile),
+            Some(TileMembership::Attached {
+                workspace: workspace_index,
+                visibility: AttachedVisibility::Hidden,
+            })
+        );
+    });
+
+    view.update(vcx, |v, cx| v.dispatch_menu_command("tile-unhide", cx));
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert_eq!(v.workspace.presented_tile(), None);
+        assert_eq!(v.workspace.active_workspace, workspace_index);
+        assert_eq!(v.workspace.focused_window_id(), Some(tile));
+        assert_eq!(
+            v.workspace.tile_membership(tile),
+            Some(TileMembership::Attached {
+                workspace: workspace_index,
+                visibility: AttachedVisibility::Visible,
+            })
+        );
+    });
+}
+
+/// The destination picker carries the focused tile's project as typed state.
+/// Creating a destination while viewing another project cannot re-home the tile.
+#[gpui::test]
+fn send_detached_tile_to_new_workspace_preserves_its_project(cx: &mut TestAppContext) {
+    use crate::workspace::{AttachedVisibility, TileMembership};
+    use crate::{App, LinearTile, WorkspacePickerMode};
+
+    let (view, vcx) = boot_browser(cx);
+    let (tile, tile_project) = view.update(vcx, |v, cx| {
+        let cwd = std::env::temp_dir().join("yalda-hidden-send-foreign-project");
+        let tile_project = v.projects.ensure_at_cwd(cwd, "foreign");
+        let tile = v
+            .workspace
+            .push_detached(App::Linear(LinearTile::new()), tile_project);
+        assert!(v.workspace.present_solo(tile));
+        v.open_workspace_picker(WorkspacePickerMode::Move { follow: true }, cx);
+        let picker = v.workspace_picker_ref().unwrap();
+        assert_eq!(picker.project, tile_project);
+        assert!(picker.targets.is_empty());
+        (tile, tile_project)
+    });
+
+    view.update(vcx, |v, cx| v.commit_workspace_picker(0, cx));
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        let owner = v.workspace.workspace_index_of_window(tile).unwrap();
+        assert_eq!(v.workspace.workspaces[owner].project(), tile_project);
+        assert_eq!(
+            v.workspace.tile_membership(tile),
+            Some(TileMembership::Attached {
+                workspace: owner,
+                visibility: AttachedVisibility::Visible,
+            })
+        );
+        assert_eq!(v.workspace.tile(tile).unwrap().project(), tile_project);
+    });
+}
+
+/// A hidden Agent is still a materialized tile and owns its durable session id.
+/// Roster reconciliation must not create a second Detached copy in any project.
+#[gpui::test]
+fn hidden_agent_prevents_cross_project_roster_duplicate(cx: &mut TestAppContext) {
+    use crate::{AgentTile, App, ServerSid};
+    use yalda::session_proto::SessionInfo;
+
+    let (view, vcx) = boot_browser(cx);
+    let (tile, sid) = view.update(vcx, |v, _| {
+        let cwd = std::env::temp_dir().join("yalda-hidden-agent-foreign-roster");
+        let _foreign_project = v.projects.ensure_at_cwd(cwd.clone(), "foreign-roster");
+        let sid = "HIDDEN-IDENTITY".to_string();
+        let tile = v
+            .workspace
+            .split_focused(
+                crate::workspace::SplitDir::V,
+                App::Agent(AgentTile::dormant(ServerSid::new(sid.clone()))),
+            )
+            .unwrap();
+        v.workspace.hide_window(tile).unwrap();
+        v.agent_roster.upsert(SessionInfo {
+            session_id: sid.clone(),
+            acp_session_id: None,
+            label: "hidden identity".into(),
+            cwd,
+            provider: yalda::acp_channel::AgentProvider::Codex,
+            turns: 0,
+            connected: true,
+            permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+            busy: false,
+            archived: false,
+        });
+        (tile, sid)
+    });
+
+    view.update(vcx, |v, _| {
+        assert!(!v.materialize_roster_detached_tiles());
+        assert_eq!(v.agent_tile_id_for_server_sid(&sid), Some(tile));
+        assert!(v.workspace.detached_tiles.is_empty());
+        assert!(v.validate_agent_tile_identities().is_ok());
+    });
+}
 
 /// UXI-Workspace-21: Close Tile acts on the directly focused stable tile even
 /// when it lives in Unbound. Exercise the exact two picker states from the bug
@@ -8145,42 +8611,60 @@ fn close_tile_removes_unbound_buffer_and_agent_picker(cx: &mut TestAppContext) {
     let (buffer, agent, workspace_count) = view.update(vcx, |v, _| {
         let pid = v.workspace.active_workspace().expect("workspace").project();
         let cwd = v.projects.cwd_of(pid).expect("project cwd").to_path_buf();
-        let buffer = v.workspace.push_unbound(
+        let buffer = v.workspace.push_detached(
             App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd))),
             pid,
         );
-        let agent = v.workspace.push_unbound(App::Agent(AgentTile::new()), pid);
+        let agent = v.workspace.push_detached(App::Agent(AgentTile::new()), pid);
         (buffer, agent, v.workspace.workspaces.len())
     });
 
-    view.update(vcx, |v, _| assert!(v.workspace.focus_unbound(buffer)));
+    view.update(vcx, |v, _| assert!(v.workspace.present_solo(buffer)));
     view.update(vcx, |v, cx| v.dispatch_menu_command("close-window", cx));
     vcx.run_until_parked();
     view.read_with(vcx, |v, _| {
-        assert!(v.workspace.tile(buffer).is_none(), "the unbound Buffer picker closes");
-        assert!(v.workspace.tile(agent).is_some(), "closing Buffer does not remove Agent");
-        assert_eq!(v.workspace.directly_focused_unbound(), None);
-        assert_eq!(v.workspace.workspaces.len(), workspace_count, "no workspace closes");
+        assert!(
+            v.workspace.tile(buffer).is_none(),
+            "the unbound Buffer picker closes"
+        );
+        assert!(
+            v.workspace.tile(agent).is_some(),
+            "closing Buffer does not remove Agent"
+        );
+        assert_eq!(v.workspace.presented_detached_tile_id(), None);
+        assert_eq!(
+            v.workspace.workspaces.len(),
+            workspace_count,
+            "no workspace closes"
+        );
     });
 
-    view.update(vcx, |v, _| assert!(v.workspace.focus_unbound(agent)));
+    view.update(vcx, |v, _| assert!(v.workspace.present_solo(agent)));
     view.update(vcx, |v, cx| v.dispatch_menu_command("close-window", cx));
     vcx.run_until_parked();
     view.read_with(vcx, |v, _| {
-        assert!(v.workspace.tile(agent).is_none(), "the empty unbound Agent picker closes");
-        assert_eq!(v.workspace.directly_focused_unbound(), None);
-        assert_eq!(v.workspace.workspaces.len(), workspace_count, "workspace floor survives");
-        assert!(v.workspace.active_workspace().is_some(), "the active workspace is revealed");
+        assert!(
+            v.workspace.tile(agent).is_none(),
+            "the empty unbound Agent picker closes"
+        );
+        assert_eq!(v.workspace.presented_detached_tile_id(), None);
+        assert_eq!(
+            v.workspace.workspaces.len(),
+            workspace_count,
+            "workspace floor survives"
+        );
+        assert!(
+            v.workspace.active_workspace().is_some(),
+            "the active workspace is revealed"
+        );
     });
 }
 
-/// UXI-Workspace-23: closing a bound Agent tile is a placement transition,
-/// equivalent to Stash. The complete stable tile moves to Unbound and enters
-/// the scratchpad MRU; its session remains selected and alive. Exercise the
-/// production system-menu dispatcher, not `Frame::stash_window` directly.
+/// ADR-0034: Close is independent of attachment and visibility. It retires the
+/// stable tile while leaving the server-owned session alive.
 #[gpui::test]
-fn close_bound_agent_tile_stashes_same_tile_and_session(cx: &mut TestAppContext) {
-    use crate::{workspace::TileMembership, AgentTile, App, BrowserWindow, BufferApp};
+fn close_bound_agent_tile_retires_tile_without_hiding_or_detaching(cx: &mut TestAppContext) {
+    use crate::{App, BrowserWindow, BufferApp};
 
     let (view, vcx, session, _) = boot_with_transcript(cx);
     let agent = view.update(vcx, |v, _| {
@@ -8198,64 +8682,39 @@ fn close_bound_agent_tile_stashes_same_tile_and_session(cx: &mut TestAppContext)
 
     view.update(vcx, |v, cx| v.dispatch_menu_command("close-window", cx));
     vcx.run_until_parked();
-    view.read_with(vcx, |v, cx| {
-        assert_eq!(
-            v.workspace.tile_membership(agent),
-            Some(TileMembership::Unbound),
-            "Close Tile must move the same Agent tile to Unbound"
-        );
-        assert_eq!(
-            v.workspace.tile(agent).and_then(|window| match &window.content {
-                App::Agent(AgentTile::Bound { session, .. }) => Some(*session),
-                _ => None,
-            }),
-            Some(session),
-            "the stashed tile must retain its selected live session"
-        );
-        assert!(v.sessions.contains(session), "Close Tile cannot kill the session");
-        assert_eq!(v.workspace.scratchpad.first(), Some(&agent));
-        let rows = v.jump_panel_sections(cx).0;
+    view.read_with(vcx, |v, _| {
         assert!(
-            rows.iter().flat_map(|section| &section.unbound).any(|row| row.id == agent),
-            "the same tile must appear in the jump-panel Unbound list immediately"
+            v.workspace.tile(agent).is_none(),
+            "Close Tile retires the tile"
+        );
+        assert!(
+            v.sessions.contains(session),
+            "Close Tile cannot kill the session"
         );
     });
 }
 
-/// The durable workspace floor must not make Agent close destructive. Closing
-/// the sole tile seeds a Buffer picker and still stashes the exact Agent tile.
+/// Closing the sole visible tile leaves the valid empty workspace state.
 #[gpui::test]
-fn close_sole_bound_agent_stashes_and_seeds_workspace_floor(cx: &mut TestAppContext) {
-    use crate::{workspace::TileMembership, AgentTile, App, BufferApp};
-
+fn close_sole_bound_agent_leaves_empty_workspace(cx: &mut TestAppContext) {
     let (view, vcx, session, _) = boot_with_transcript(cx);
-    let (agent, project) = view.update(vcx, |v, _| {
+    let agent = view.update(vcx, |v, _| {
         let agent = v.workspace.focused_window_id().expect("sole Agent tile");
-        let project = v.workspace.tile(agent).expect("Agent tile").project();
-        v.workspace
-            .tile_mut(agent)
-            .expect("Agent tile")
-            .tags
-            .insert("preserved-tag".into());
-        (agent, project)
+        agent
     });
 
     view.update(vcx, |v, cx| v.dispatch_menu_command("close-window", cx));
     vcx.run_until_parked();
     view.read_with(vcx, |v, _| {
         assert_eq!(v.workspace.workspaces.len(), 1);
-        assert_eq!(v.workspace.tile_membership(agent), Some(TileMembership::Unbound));
-        let tile = v.workspace.tile(agent).expect("same stashed Agent tile");
-        assert_eq!(tile.project(), project);
-        assert!(tile.tags.contains("preserved-tag"));
+        assert!(v.workspace.tile(agent).is_none());
+        assert!(v.sessions.contains(session));
         assert!(matches!(
-            &tile.content,
-            App::Agent(AgentTile::Bound { session: bound, .. }) if *bound == session
-        ));
-        assert!(matches!(
-            &v.workspace.active_workspace().expect("workspace floor").layout,
-            crate::workspace::Layout::Leaf(window)
-                if matches!(&window.content, App::Buffer(BufferApp::Picking(_)))
+            &v.workspace
+                .active_workspace()
+                .expect("workspace floor")
+                .layout,
+            crate::workspace::Layout::Empty
         ));
     });
 }
@@ -8296,7 +8755,7 @@ fn provisional_bind_reconciles_racing_roster_tile(cx: &mut TestAppContext) {
             busy: false,
             archived: false,
         });
-        assert!(v.materialize_roster_unbound_tiles(), "roster wins the race");
+        assert!(v.materialize_roster_detached_tiles(), "roster wins the race");
         v.apply_open_agent_resolution(
             token,
             crate::OpenResolution::Created {
@@ -8320,7 +8779,7 @@ fn provisional_bind_reconciles_racing_roster_tile(cx: &mut TestAppContext) {
                 }
             });
         }
-        for tile in &v.workspace.unbound_tiles {
+        for tile in &v.workspace.detached_tiles {
             if matches!(&tile.window.content, App::Agent(agent)
                 if agent.remembered_sid(|local| v.sessions.sid_of(local).cloned()).as_ref() == Some(&sid))
             {
@@ -8332,15 +8791,13 @@ fn provisional_bind_reconciles_racing_roster_tile(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn agent_identity_guard_rejects_duplicate_local_and_durable_owners(
-    cx: &mut TestAppContext,
-) {
-    use crate::{agent_ui::AgentIdentityViolation, AgentTile, App, ServerSid};
+fn agent_identity_guard_rejects_duplicate_local_and_durable_owners(cx: &mut TestAppContext) {
+    use crate::{AgentTile, App, ServerSid, agent_ui::AgentIdentityViolation};
 
     let (view, vcx, session, _) = boot_with_transcript(cx);
     view.update(vcx, |v, _| {
         let project = v.workspace.inherited_project();
-        let duplicate_local = v.workspace.push_unbound(
+        let duplicate_local = v.workspace.push_detached(
             App::Agent(AgentTile::Bound {
                 session,
                 reopening: None,
@@ -8356,7 +8813,7 @@ fn agent_identity_guard_rejects_duplicate_local_and_durable_owners(
             }) if duplicate == session && second == duplicate_local
         ));
         v.workspace
-            .remove_unbound_window(duplicate_local)
+            .remove_detached_window(duplicate_local)
             .expect("remove corrupt test tile");
 
         let sid = ServerSid::new("DUPLICATE-DURABLE-SID");
@@ -8365,7 +8822,7 @@ fn agent_identity_guard_rejects_duplicate_local_and_durable_owners(
             .expect("bind durable identity");
         let duplicate_durable = v
             .workspace
-            .push_unbound(App::Agent(AgentTile::dormant(sid.clone())), project);
+            .push_detached(App::Agent(AgentTile::dormant(sid.clone())), project);
         assert!(matches!(
             v.validate_agent_tile_identities(),
             Err(AgentIdentityViolation::DuplicateServerSession {
@@ -8385,8 +8842,8 @@ fn agent_identity_guard_rejects_duplicate_local_and_durable_owners(
 #[gpui::test]
 fn ctrl_w_shell_commands_reach_every_tile_app(cx: &mut TestAppContext) {
     use crate::{
-        workspace::{Slot, SplitDir, WorkspaceView}, AgentTile, App, BrowserWindow, BufferApp,
-        CogTile, KeymapTile, LinearTile,
+        AgentTile, App, BrowserWindow, BufferApp, CogTile, KeymapTile, LinearTile,
+        workspace::{Slot, SplitDir, WorkspaceView},
     };
     cx.update(crate::register_keymap);
     let (view, vcx) = boot_browser(cx);
@@ -8425,31 +8882,30 @@ fn ctrl_w_shell_commands_reach_every_tile_app(cx: &mut TestAppContext) {
     });
     vcx.run_until_parked();
 
-    let assert_directions = |label: &str,
-                             view: &gpui::Entity<YaldaGpuiView>,
-                             vcx: &mut gpui::VisualTestContext| {
-        for (keys, expected) in [
-            ("ctrl-w h", left),
-            ("ctrl-w l", right),
-            ("ctrl-w k", up),
-            ("ctrl-w j", down),
-        ] {
-            view.update(vcx, |v, cx| {
-                v.workspace.active_workspace_mut().unwrap().focused = center;
-                cx.notify();
-            });
-            vcx.run_until_parked();
-            vcx.simulate_keystrokes(keys);
-            vcx.run_until_parked();
-            view.read_with(vcx, |v, _| {
-                assert_eq!(
-                    v.workspace.focused_window_id(),
-                    Some(expected),
-                    "{keys} must move workspace focus from the {label} tile"
-                );
-            });
-        }
-    };
+    let assert_directions =
+        |label: &str, view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+            for (keys, expected) in [
+                ("ctrl-w h", left),
+                ("ctrl-w l", right),
+                ("ctrl-w k", up),
+                ("ctrl-w j", down),
+            ] {
+                view.update(vcx, |v, cx| {
+                    v.workspace.active_workspace_mut().unwrap().focused = center;
+                    cx.notify();
+                });
+                vcx.run_until_parked();
+                vcx.simulate_keystrokes(keys);
+                vcx.run_until_parked();
+                view.read_with(vcx, |v, _| {
+                    assert_eq!(
+                        v.workspace.focused_window_id(),
+                        Some(expected),
+                        "{keys} must move workspace focus from the {label} tile"
+                    );
+                });
+            }
+        };
 
     let install = |label: &str,
                    app: App,
@@ -8534,7 +8990,7 @@ fn ctrl_w_shell_commands_reach_every_tile_app(cx: &mut TestAppContext) {
 /// arm is the built-in negative control for the rank sort.
 #[test]
 fn session_tags_partition_folders_and_untagged() {
-    use crate::{partition_rows_by_tag, AgentRow, JumpTarget};
+    use crate::{AgentRow, JumpTarget, partition_rows_by_tag};
     let row = |label: &str, tags: &[&str]| AgentRow {
         target: JumpTarget::Roster(label.into()),
         label: label.into(),
@@ -8556,16 +9012,29 @@ fn session_tags_partition_folders_and_untagged() {
         (1, row("b", &["urgent"])),
         (2, row("c", &[])),
     ];
-    let labels = |g: &[(usize, AgentRow)]| g.iter().map(|(_, r)| r.label.clone()).collect::<Vec<_>>();
+    let labels =
+        |g: &[(usize, AgentRow)]| g.iter().map(|(_, r)| r.label.clone()).collect::<Vec<_>>();
 
     // Manual order floats "urgent" first; "frontend" (unlisted) sorts alpha after.
     let (folders, untagged) = partition_rows_by_tag(rows.clone(), &["urgent".to_string()]);
     assert_eq!(folders.len(), 2, "one folder per distinct tag");
     assert_eq!(folders[0].0, "urgent");
-    assert_eq!(labels(&folders[0].1), vec!["a", "b"], "urgent holds a and b");
+    assert_eq!(
+        labels(&folders[0].1),
+        vec!["a", "b"],
+        "urgent holds a and b"
+    );
     assert_eq!(folders[1].0, "frontend");
-    assert_eq!(labels(&folders[1].1), vec!["a"], "a appears again under frontend (multi-appearance)");
-    assert_eq!(labels(&untagged), vec!["c"], "the tagless row is the residual");
+    assert_eq!(
+        labels(&folders[1].1),
+        vec!["a"],
+        "a appears again under frontend (multi-appearance)"
+    );
+    assert_eq!(
+        labels(&untagged),
+        vec!["c"],
+        "the tagless row is the residual"
+    );
 
     // Negative control for the rank sort: with NO manual order, folders are
     // alphabetical — "frontend" before "urgent" (the opposite of above).
@@ -8587,7 +9056,10 @@ fn seed_project_sessions(
     use yalda::session_proto::SessionInfo;
     let (pid, cwd) = view.read_with(vcx, |v, _| {
         let pid = v.workspace.active_workspace().expect("workspace").project();
-        (pid, v.projects.cwd_of(pid).expect("project cwd").to_path_buf())
+        (
+            pid,
+            v.projects.cwd_of(pid).expect("project cwd").to_path_buf(),
+        )
     });
     view.update(vcx, |v, _| {
         for (sid, label) in sessions {
@@ -8604,7 +9076,7 @@ fn seed_project_sessions(
                 archived: false,
             });
         }
-        v.materialize_roster_unbound_tiles();
+        v.materialize_roster_detached_tiles();
     });
     pid
 }
@@ -8614,8 +9086,10 @@ fn set_materialized_tile_tags(v: &mut YaldaGpuiView, sid: &str, tags: &[&str]) {
         .agent_tile_id_for_server_sid(sid)
         .unwrap_or_else(|| panic!("materialized tile for {sid}"));
     v.workspace.tile_mut(id).unwrap().tags = tags.iter().map(|tag| tag.to_string()).collect();
-    v.session_tags
-        .insert(sid.to_string(), tags.iter().map(|tag| tag.to_string()).collect());
+    v.session_tags.insert(
+        sid.to_string(),
+        tags.iter().map(|tag| tag.to_string()).collect(),
+    );
 }
 
 /// UXI-JumpPanel-20: a tagged session paints under its tag folder header; an
@@ -8625,7 +9099,11 @@ fn set_materialized_tile_tags(v: &mut YaldaGpuiView, sid: &str, tags: &[&str]) {
 #[gpui::test]
 fn jump_panel_groups_sessions_under_tag_folders(cx: &mut TestAppContext) {
     let (view, vcx) = boot_browser(cx);
-    let pid = seed_project_sessions(&view, &mut *vcx, &[("S-tag", "alpha"), ("S-plain", "plain")]);
+    let pid = seed_project_sessions(
+        &view,
+        &mut *vcx,
+        &[("S-tag", "alpha"), ("S-plain", "plain")],
+    );
     view.update(vcx, |v, _| {
         set_materialized_tile_tags(v, "S-tag", &["frontend"]);
     });
@@ -8659,14 +9137,17 @@ fn jump_panel_groups_sessions_under_tag_folders(cx: &mut TestAppContext) {
     let sep_y = crate::layout_probe_get(&format!("jump-untagged-sep-{}", pid.0))
         .expect("the untagged separator paints when folders AND loose rows coexist")
         .1;
-    assert!(tagged_y < sep_y && sep_y < plain_y, "the separator divides tagged from untagged");
+    assert!(
+        tagged_y < sep_y && sep_y < plain_y,
+        "the separator divides tagged from untagged"
+    );
     crate::layout_probe_end();
 
     // With no tagged sessions (all loose) there are no folders, so the separator
     // must NOT paint — it only exists to divide the two groups.
     view.update(vcx, |v, _| {
         v.session_tags.clear();
-        for tile in &mut v.workspace.unbound_tiles {
+        for tile in &mut v.workspace.detached_tiles {
             tile.window.tags.clear();
         }
     });
@@ -8708,25 +9189,44 @@ fn jump_tag_folder_fold_hides_and_restores(cx: &mut TestAppContext) {
     crate::layout_probe_begin();
     view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
-    assert!(crate::layout_probe_get(&row_probe).is_some(), "expanded folder paints its row");
+    assert!(
+        crate::layout_probe_get(&row_probe).is_some(),
+        "expanded folder paints its row"
+    );
     crate::layout_probe_end();
 
-    view.update(vcx, |v, cx| v.toggle_tag_fold(&project_name, "frontend", cx));
+    view.update(vcx, |v, cx| {
+        v.toggle_tag_fold(&project_name, "frontend", cx)
+    });
     view.read_with(vcx, |v, _| {
-        assert!(v.tag_folder_folded(&project_name, "frontend"), "fold state is set");
+        assert!(
+            v.tag_folder_folded(&project_name, "frontend"),
+            "fold state is set"
+        );
     });
     crate::layout_probe_begin();
     view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
-    assert!(crate::layout_probe_get(&row_probe).is_none(), "folded folder hides its row");
-    assert!(crate::layout_probe_get(&folder_probe).is_some(), "the header stays painted while folded");
+    assert!(
+        crate::layout_probe_get(&row_probe).is_none(),
+        "folded folder hides its row"
+    );
+    assert!(
+        crate::layout_probe_get(&folder_probe).is_some(),
+        "the header stays painted while folded"
+    );
     crate::layout_probe_end();
 
-    view.update(vcx, |v, cx| v.toggle_tag_fold(&project_name, "frontend", cx));
+    view.update(vcx, |v, cx| {
+        v.toggle_tag_fold(&project_name, "frontend", cx)
+    });
     crate::layout_probe_begin();
     view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
-    assert!(crate::layout_probe_get(&row_probe).is_some(), "unfolding restores the row");
+    assert!(
+        crate::layout_probe_get(&row_probe).is_some(),
+        "unfolding restores the row"
+    );
     crate::layout_probe_end();
 }
 
@@ -8749,7 +9249,9 @@ fn jump_reorder_tag_folders_persists(cx: &mut TestAppContext) {
         );
     });
     // Drop beta onto alpha → order becomes beta, alpha; persisted.
-    view.update(vcx, |v, cx| v.reorder_tag(&project_name, "beta", "alpha", cx));
+    view.update(vcx, |v, cx| {
+        v.reorder_tag(&project_name, "beta", "alpha", cx)
+    });
     view.read_with(vcx, |v, _| {
         assert_eq!(
             v.jump_tag_order.get(&project_name).map(|v| v.as_slice()),
@@ -8758,7 +9260,9 @@ fn jump_reorder_tag_folders_persists(cx: &mut TestAppContext) {
         );
     });
     // Project-scope guard: a tag absent from this project can't be reordered.
-    view.update(vcx, |v, cx| v.reorder_tag(&project_name, "ghost", "alpha", cx));
+    view.update(vcx, |v, cx| {
+        v.reorder_tag(&project_name, "ghost", "alpha", cx)
+    });
     view.read_with(vcx, |v, _| {
         assert_eq!(
             v.jump_tag_order.get(&project_name).map(|v| v.as_slice()),
@@ -8779,7 +9283,8 @@ fn tag_editor_keyboard_adds_and_removes(cx: &mut TestAppContext) {
     install_agent_slot(&view, &mut *vcx, Some("SID"));
     // A tag used on another session, so the ADD column has an existing candidate.
     view.update(vcx, |v, _| {
-        v.session_tags.insert("OTHER".into(), vec!["backend".into()]);
+        v.session_tags
+            .insert("OTHER".into(), vec!["backend".into()]);
     });
 
     view.update(vcx, |v, cx| v.dispatch_menu_command("claude-tag", cx));
@@ -8810,7 +9315,11 @@ fn tag_editor_keyboard_adds_and_removes(cx: &mut TestAppContext) {
     view.read_with(vcx, |v, _| {
         let mut got = v.session_tags.get("SID").cloned().unwrap_or_default();
         got.sort();
-        assert_eq!(got, vec!["backend".to_string(), "frontend".to_string()], "an existing tag adds");
+        assert_eq!(
+            got,
+            vec!["backend".to_string(), "frontend".to_string()],
+            "an existing tag adds"
+        );
     });
 
     // `esc` returns to Normal (does NOT close); vim `l` focuses the Current column.
@@ -8818,8 +9327,16 @@ fn tag_editor_keyboard_adds_and_removes(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     view.read_with(vcx, |v, _| {
         let ov = v.tag_editor_ref().expect("still open after esc-to-normal");
-        assert_eq!(ov.mode, crate::TagEditorMode::Normal, "esc leaves Insert, not the dialog");
-        assert_eq!(ov.column, crate::TagEditorColumn::Current, "l moves to the Current column");
+        assert_eq!(
+            ov.mode,
+            crate::TagEditorMode::Normal,
+            "esc leaves Insert, not the dialog"
+        );
+        assert_eq!(
+            ov.column,
+            crate::TagEditorColumn::Current,
+            "l moves to the Current column"
+        );
     });
 
     // `x` removes the highlighted current tag (backend, sorted first).
@@ -8836,7 +9353,12 @@ fn tag_editor_keyboard_adds_and_removes(cx: &mut TestAppContext) {
     // `esc` in Normal closes.
     vcx.simulate_keystrokes("escape");
     vcx.run_until_parked();
-    view.read_with(vcx, |v, _| assert!(!v.overlay_is_tag_editor(), "esc in Normal closes the dialog"));
+    view.read_with(vcx, |v, _| {
+        assert!(
+            !v.overlay_is_tag_editor(),
+            "esc in Normal closes the dialog"
+        )
+    });
 }
 
 /// UXI-AgentTile-33: clicking a row in either column toggles that tag (mouse path,
@@ -8846,7 +9368,8 @@ fn tag_editor_mouse_click_toggles(cx: &mut TestAppContext) {
     let (view, vcx) = boot_browser(cx);
     install_agent_slot(&view, &mut *vcx, Some("SID"));
     view.update(vcx, |v, _| {
-        v.session_tags.insert("OTHER".into(), vec!["backend".into()]);
+        v.session_tags
+            .insert("OTHER".into(), vec!["backend".into()]);
     });
     view.update(vcx, |v, cx| v.dispatch_menu_command("claude-tag", cx));
     vcx.run_until_parked();
@@ -8855,7 +9378,8 @@ fn tag_editor_mouse_click_toggles(cx: &mut TestAppContext) {
         crate::layout_probe_begin();
         view.update(vcx, |_, cx| cx.notify());
         vcx.run_until_parked();
-        let (x, y, w, h) = crate::layout_probe_get(probe).unwrap_or_else(|| panic!("{probe} paints"));
+        let (x, y, w, h) =
+            crate::layout_probe_get(probe).unwrap_or_else(|| panic!("{probe} paints"));
         crate::layout_probe_end();
         let at = point(px(x + w / 2.0), px(y + h / 2.0));
         vcx.simulate_mouse_move(at, None, gpui::Modifiers::default());
@@ -8891,9 +9415,14 @@ fn tag_editor_requires_a_sid(cx: &mut TestAppContext) {
     view.update(vcx, |v, cx| v.dispatch_menu_command("claude-tag", cx));
     vcx.run_until_parked();
     view.read_with(vcx, |v, _| {
-        assert!(!v.overlay_is_tag_editor(), "a sid-less session opens no dialog");
         assert!(
-            v.transient_status.as_deref().is_some_and(|s| s.contains("not ready")),
+            !v.overlay_is_tag_editor(),
+            "a sid-less session opens no dialog"
+        );
+        assert!(
+            v.transient_status
+                .as_deref()
+                .is_some_and(|s| s.contains("not ready")),
             "it notes why, got: {:?}",
             v.transient_status
         );
@@ -8920,19 +9449,25 @@ fn new_project_overlay_creates_from_cwd_and_rejects_duplicate_cwd(cx: &mut TestA
     let before = view.read_with(vcx, |v, _| v.projects.len());
     view.update(vcx, |v, cx| {
         v.open_new_project_overlay(cx);
-        v.new_project_mut().expect("new-project overlay open").cwd =
-            dir1.display().to_string();
+        v.new_project_mut().expect("new-project overlay open").cwd = dir1.display().to_string();
         v.commit_new_project_overlay(cx);
     });
     let zid = view.read_with(vcx, |v, _| {
-        let zid = v.projects.by_name(&derived).expect("derived-name project created");
+        let zid = v
+            .projects
+            .by_name(&derived)
+            .expect("derived-name project created");
         assert_eq!(v.projects.len(), before + 1, "exactly one new project");
         zid
     });
     // The new project starts EMPTY — no workspaces, no sessions.
     view.read_with(vcx, |v, _| {
         assert_eq!(
-            v.workspace.workspaces.iter().filter(|t| t.project() == zid).count(),
+            v.workspace
+                .workspaces
+                .iter()
+                .filter(|t| t.project() == zid)
+                .count(),
             0,
             "new project owns zero workspaces"
         );
@@ -8958,9 +9493,20 @@ fn new_project_overlay_creates_from_cwd_and_rejects_duplicate_cwd(cx: &mut TestA
         v.commit_new_project_overlay(cx);
     });
     view.read_with(vcx, |v, _| {
-        assert_eq!(v.projects.len(), after_unique, "duplicate cwd creates NOTHING");
-        let note = v.transient_status.as_ref().map(|s| s.to_string()).unwrap_or_default();
-        assert!(note.contains("already roots"), "duplicate cwd surfaces an error: {note:?}");
+        assert_eq!(
+            v.projects.len(),
+            after_unique,
+            "duplicate cwd creates NOTHING"
+        );
+        let note = v
+            .transient_status
+            .as_ref()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        assert!(
+            note.contains("already roots"),
+            "duplicate cwd surfaces an error: {note:?}"
+        );
     });
     let _ = std::fs::remove_dir_all(root1);
     let _ = std::fs::remove_dir_all(root2);
@@ -8981,7 +9527,10 @@ fn delete_nonempty_project_confirms_then_cascades(cx: &mut TestAppContext) {
     let (view, vcx) = boot_browser(cx);
     let pa = PathBuf::from("/tmp/yalda-del-a");
     let (pid, ws_idx, sid) = view.update(vcx, |v, cx| {
-        let pid = v.projects.create("Doomed".into(), pa.clone()).expect("create");
+        let pid = v
+            .projects
+            .create("Doomed".into(), pa.clone())
+            .expect("create");
         v.new_workspace_in(pid, cx);
         let ws_idx = v.workspace.active_workspace;
         let s = AgentSession {
@@ -8997,8 +9546,14 @@ fn delete_nonempty_project_confirms_then_cascades(cx: &mut TestAppContext) {
     // Non-empty → arms the confirm overlay, removes NOTHING yet.
     view.update(vcx, |v, cx| v.request_delete_project(pid, cx));
     view.read_with(vcx, |v, _| {
-        assert!(matches!(v.confirm_delete_ref(), Some(p) if p == pid), "confirm overlay armed");
-        assert!(v.projects.contains(pid), "project still present pre-confirm");
+        assert!(
+            matches!(v.confirm_delete_ref(), Some(p) if p == pid),
+            "confirm overlay armed"
+        );
+        assert!(
+            v.projects.contains(pid),
+            "project still present pre-confirm"
+        );
         assert_eq!(
             v.workspace.workspaces.get(ws_idx).map(|t| t.project()),
             Some(pid),
@@ -9012,23 +9567,40 @@ fn delete_nonempty_project_confirms_then_cascades(cx: &mut TestAppContext) {
     view.read_with(vcx, |v, _| {
         assert!(!v.projects.contains(pid), "project removed");
         assert!(!v.sessions.contains(sid), "session killed by the cascade");
-        assert!(!v.transcript_views.contains_key(&sid), "transcript view dropped");
+        assert!(
+            !v.transcript_views.contains_key(&sid),
+            "transcript view dropped"
+        );
         assert!(
             !v.workspace.workspaces.iter().any(|t| t.project() == pid),
             "the project's workspaces are closed"
         );
-        assert!(!v.workspace.workspaces.is_empty(), "≥1 workspace always survives (Behavior 2)");
-        assert!(!v.overlay_is_confirm_delete(), "the overlay clears after cascade");
+        assert!(
+            !v.workspace.workspaces.is_empty(),
+            "≥1 workspace always survives (Behavior 2)"
+        );
+        assert!(
+            !v.overlay_is_confirm_delete(),
+            "the overlay clears after cascade"
+        );
     });
 
     // An EMPTY project deletes directly — no confirm overlay.
     let empty = view.update(vcx, |v, _| {
-        v.projects.create("Empty".into(), PathBuf::from("/tmp/yalda-del-empty")).expect("create")
+        v.projects
+            .create("Empty".into(), PathBuf::from("/tmp/yalda-del-empty"))
+            .expect("create")
     });
     view.update(vcx, |v, cx| v.request_delete_project(empty, cx));
     view.read_with(vcx, |v, _| {
-        assert!(!v.overlay_is_confirm_delete(), "an empty project needs no confirmation");
-        assert!(!v.projects.contains(empty), "the empty project deleted directly");
+        assert!(
+            !v.overlay_is_confirm_delete(),
+            "an empty project needs no confirmation"
+        );
+        assert!(
+            !v.projects.contains(empty),
+            "the empty project deleted directly"
+        );
     });
 }
 
@@ -9065,36 +9637,49 @@ fn agent_row_marks_name_the_live_states() {
 
 #[test]
 fn agent_header_uses_compact_activity_and_transient_editor_vocabulary() {
-    assert_eq!(crate::screens::agent_header_activity(true), ("*", "working"));
+    assert_eq!(
+        crate::screens::agent_header_activity(true),
+        ("*", "working")
+    );
     assert_eq!(crate::screens::agent_header_activity(false), ("+", "ready"));
 
     assert_eq!(crate::screens::agent_editing_status_label(false, false), "");
     assert_eq!(crate::screens::agent_editing_status_label(true, false), "•");
-    assert_eq!(crate::screens::agent_editing_status_label(false, true), "EXT");
+    assert_eq!(
+        crate::screens::agent_editing_status_label(false, true),
+        "EXT"
+    );
     let transient = crate::screens::agent_editing_status_label(true, true);
     assert_eq!(transient, "• EXT");
-    for removed in ["CHATBOX", "WORKSHEET", "NORMAL", "INSERT", "L3:C12", "awaiting", "server"] {
+    for removed in [
+        "CHATBOX",
+        "WORKSHEET",
+        "NORMAL",
+        "INSERT",
+        "L3:C12",
+        "awaiting",
+        "server",
+    ] {
         assert!(!transient.contains(removed));
     }
 
     let folio = yalda::theme::AgentTheme::folio();
     let supporting = crate::screens::agent_header_supporting_text_color(&folio);
     assert_eq!(supporting, folio.agent_tint);
-    assert_ne!(supporting, folio.warm_accent, "header text must not be gold");
+    assert_ne!(
+        supporting, folio.warm_accent,
+        "header text must not be gold"
+    );
     assert_ne!(supporting, folio.dim, "header text must not be tan");
 }
 
 #[test]
 fn agent_location_names_linked_worktrees_else_cwd() {
-    let root = std::env::temp_dir().join(format!(
-        "yalda-header-worktree-{}",
-        std::process::id()
-    ));
+    let root = std::env::temp_dir().join(format!("yalda-header-worktree-{}", std::process::id()));
     let worktree = root.join("header-layout");
     let nested = worktree.join("docs");
     std::fs::create_dir_all(&nested).expect("create worktree fixture");
-    std::fs::write(worktree.join(".git"), "gitdir: /tmp/fake\n")
-        .expect("mark linked worktree");
+    std::fs::write(worktree.join(".git"), "gitdir: /tmp/fake\n").expect("mark linked worktree");
     assert_eq!(
         crate::screens::agent_location_label(&nested),
         "WORKTREE header-layout"
@@ -9171,8 +9756,7 @@ fn agent_usage_paints_on_the_activity_header_line(cx: &mut TestAppContext) {
         "activity must start below identity: status={status:?}, activity={activity:?}"
     );
     assert!(
-        usage.1 >= activity.1 - 0.5
-            && usage.1 + usage.3 <= activity.1 + activity.3 + 0.5,
+        usage.1 >= activity.1 - 0.5 && usage.1 + usage.3 <= activity.1 + activity.3 + 0.5,
         "usage must be vertically contained by the activity line: \
          activity={activity:?}, usage={usage:?}"
     );
@@ -9180,7 +9764,10 @@ fn agent_usage_paints_on_the_activity_header_line(cx: &mut TestAppContext) {
         location.1 >= activity.1 + activity.3 - 0.5,
         "location must start below activity: activity={activity:?}, location={location:?}"
     );
-    assert!(usage.2 > 100.0 && usage.3 > 6.0, "usage line has real size: {usage:?}");
+    assert!(
+        usage.2 > 100.0 && usage.3 > 6.0,
+        "usage line has real size: {usage:?}"
+    );
 }
 
 /// UXI-JumpPanel-11: the jump panel is painted on the SAME surface as the
@@ -9197,8 +9784,18 @@ fn jump_panel_surface_matches_the_command_menu() {
     use gpui::Hsla;
     // Folio-ish paper (the theme that prompted the reversal) and a dark theme.
     for editor in [
-        Hsla { h: 0.12, s: 0.30, l: 0.94, a: 1.0 },
-        Hsla { h: 0.62, s: 0.30, l: 0.17, a: 1.0 },
+        Hsla {
+            h: 0.12,
+            s: 0.30,
+            l: 0.94,
+            a: 1.0,
+        },
+        Hsla {
+            h: 0.62,
+            s: 0.30,
+            l: 0.17,
+            a: 1.0,
+        },
     ] {
         let panel = jump_panel_surface(editor);
         assert_eq!(
@@ -9232,15 +9829,30 @@ fn menu_panel_bg_is_elevated_above_the_editor() {
     use crate::menu_panel_bg;
     use gpui::Hsla;
     // Dark theme (Nightfox-ish editor_bg L≈0.17): card lifts above the bg.
-    let dark = Hsla { h: 0.62, s: 0.30, l: 0.17, a: 1.0 };
+    let dark = Hsla {
+        h: 0.62,
+        s: 0.30,
+        l: 0.17,
+        a: 1.0,
+    };
     let d = menu_panel_bg(dark);
-    assert!(d.l > dark.l + 0.02, "dark bg → lighter card (got L {} vs {})", d.l, dark.l);
+    assert!(
+        d.l > dark.l + 0.02,
+        "dark bg → lighter card (got L {} vs {})",
+        d.l,
+        dark.l
+    );
     assert!(
         (d.h - dark.h).abs() < 1e-6 && (d.s - dark.s).abs() < 1e-6 && d.a == dark.a,
         "hue + saturation + alpha preserved (no muddying)"
     );
     // Light theme (paper L≈0.94): still lifts (a near-white elevated card).
-    let light = Hsla { h: 0.12, s: 0.5, l: 0.94, a: 1.0 };
+    let light = Hsla {
+        h: 0.12,
+        s: 0.5,
+        l: 0.94,
+        a: 1.0,
+    };
     let l = menu_panel_bg(light);
     assert!(l.l > light.l, "light bg → lighter card, got L {}", l.l);
     assert!(l.l <= 1.0, "clamped");
@@ -9260,7 +9872,11 @@ fn menu_panel_bg_is_elevated_above_the_editor() {
 fn project_menu_opens_on_name_click_and_actions_dispatch(cx: &mut TestAppContext) {
     let (view, vcx) = boot_browser(cx);
     let pa = PathBuf::from("/tmp/yalda-projmenu-a");
-    let pid = view.update(vcx, |v, _cx| v.projects.create("Menu".into(), pa.clone()).expect("create"));
+    let pid = view.update(vcx, |v, _cx| {
+        v.projects
+            .create("Menu".into(), pa.clone())
+            .expect("create")
+    });
 
     // Click the name → menu opens anchored, targeting this project.
     view.update(vcx, |v, cx| v.open_project_menu(pid, (40.0, 30.0), cx));
@@ -9272,15 +9888,27 @@ fn project_menu_opens_on_name_click_and_actions_dispatch(cx: &mut TestAppContext
     });
 
     // "New workspace" → creates a workspace in this project, closes the menu.
-    let before = view
-        .read_with(vcx, |v, _| v.workspace.workspaces.iter().filter(|t| t.project() == pid).count());
+    let before = view.read_with(vcx, |v, _| {
+        v.workspace
+            .workspaces
+            .iter()
+            .filter(|t| t.project() == pid)
+            .count()
+    });
     view.update(vcx, |v, cx| {
         v.project_menu_action(pid, crate::ProjectMenuAction::NewWorkspace, cx)
     });
     view.read_with(vcx, |v, _| {
-        assert!(!v.overlay_is_project_menu(), "menu dismissed after the action fires");
+        assert!(
+            !v.overlay_is_project_menu(),
+            "menu dismissed after the action fires"
+        );
         assert_eq!(
-            v.workspace.workspaces.iter().filter(|t| t.project() == pid).count(),
+            v.workspace
+                .workspaces
+                .iter()
+                .filter(|t| t.project() == pid)
+                .count(),
             before + 1,
             "New workspace created a workspace scoped to this project"
         );
@@ -9320,8 +9948,11 @@ fn project_menu_opens_on_name_click_and_actions_dispatch(cx: &mut TestAppContext
 fn project_menu_item_click_runs_the_action(cx: &mut TestAppContext) {
     let (view, vcx) = boot_browser(cx);
     let pa = PathBuf::from("/tmp/yalda-projmenu-click");
-    let pid =
-        view.update(vcx, |v, _cx| v.projects.create("Click".into(), pa.clone()).expect("create"));
+    let pid = view.update(vcx, |v, _cx| {
+        v.projects
+            .create("Click".into(), pa.clone())
+            .expect("create")
+    });
 
     view.update(vcx, |v, cx| v.open_project_menu(pid, (60.0, 80.0), cx));
     vcx.run_until_parked();
@@ -9334,13 +9965,24 @@ fn project_menu_item_click_runs_the_action(cx: &mut TestAppContext) {
     let backdrop_open = view.read_with(vcx, |v, _| v.overlay_is_project_menu());
     crate::layout_probe_end();
 
-    assert!(backdrop_open, "the project menu must still be open when we click it");
+    assert!(
+        backdrop_open,
+        "the project menu must still be open when we click it"
+    );
     let (x, y, w, h) = rect.expect("the New workspace menu item never painted");
-    assert!(w > 4.0 && h > 4.0, "menu item painted with no area ({w}x{h}) — nothing to click");
+    assert!(
+        w > 4.0 && h > 4.0,
+        "menu item painted with no area ({w}x{h}) — nothing to click"
+    );
     let at = point(px(x + w / 2.0), px(y + h / 2.0));
 
-    let before = view
-        .read_with(vcx, |v, _| v.workspace.workspaces.iter().filter(|t| t.project() == pid).count());
+    let before = view.read_with(vcx, |v, _| {
+        v.workspace
+            .workspaces
+            .iter()
+            .filter(|t| t.project() == pid)
+            .count()
+    });
 
     vcx.simulate_mouse_move(at, None, gpui::Modifiers::default());
     vcx.simulate_click(at, gpui::Modifiers::default());
@@ -9348,11 +9990,18 @@ fn project_menu_item_click_runs_the_action(cx: &mut TestAppContext) {
 
     view.read_with(vcx, |v, _| {
         assert_eq!(
-            v.workspace.workspaces.iter().filter(|t| t.project() == pid).count(),
+            v.workspace
+                .workspaces
+                .iter()
+                .filter(|t| t.project() == pid)
+                .count(),
             before + 1,
             "clicking 'New workspace' did NOTHING — the menu item's on_click never fired (bug-0019)"
         );
-        assert!(!v.overlay_is_project_menu(), "the menu dismisses once the action runs");
+        assert!(
+            !v.overlay_is_project_menu(),
+            "the menu dismisses once the action runs"
+        );
     });
 
     // …and occluding the popup must NOT cost click-away: a press anywhere else
@@ -9364,7 +10013,10 @@ fn project_menu_item_click_runs_the_action(cx: &mut TestAppContext) {
     vcx.simulate_click(away, gpui::Modifiers::default());
     vcx.run_until_parked();
     view.read_with(vcx, |v, _| {
-        assert!(!v.overlay_is_project_menu(), "clicking outside the popup dismisses the menu");
+        assert!(
+            !v.overlay_is_project_menu(),
+            "clicking outside the popup dismisses the menu"
+        );
     });
 }
 
@@ -9384,7 +10036,10 @@ fn new_project_relocated_to_global_menu(cx: &mut TestAppContext) {
     );
     view.update(vcx, |v, cx| v.dispatch_menu_command("new-project", cx));
     view.read_with(vcx, |v, _| {
-        assert!(v.overlay_is_new_project(), "dispatching new-project opens the New Project overlay");
+        assert!(
+            v.overlay_is_new_project(),
+            "dispatching new-project opens the New Project overlay"
+        );
     });
 }
 
@@ -9423,7 +10078,9 @@ fn free_agent_row_is_unbound_and_bindable(cx: &mut TestAppContext) {
     // to no tile.
     view.update(vcx, |v, cx| {
         v.apply_server_batch(
-            vec![ServerNotification::SessionCreated { session: info.clone() }],
+            vec![ServerNotification::SessionCreated {
+                session: info.clone(),
+            }],
             cx,
         );
     });
@@ -9543,7 +10200,7 @@ fn jump_panel_orders_local_and_roster_sessions_by_label(cx: &mut TestAppContext)
 /// either sort in `order_grouped_rows` and one of these fails.
 #[test]
 fn jump_reorder_ordering_applies_and_defaults_to_alpha() {
-    use crate::{group_agent_rows_by_cwd, order_grouped_rows, AgentRow, JumpTarget};
+    use crate::{AgentRow, JumpTarget, group_agent_rows_by_cwd, order_grouped_rows};
     let row = |sid: &str, label: &str, cwd: &str| AgentRow {
         target: JumpTarget::Roster(sid.into()),
         label: label.into(),
@@ -9572,25 +10229,41 @@ fn jump_reorder_ordering_applies_and_defaults_to_alpha() {
         g.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>()
     };
     let sess = |g: &Vec<(String, Vec<(usize, AgentRow)>)>, idx: usize| {
-        g[idx].1.iter().map(|(_, r)| r.label.clone()).collect::<Vec<_>>()
+        g[idx]
+            .1
+            .iter()
+            .map(|(_, r)| r.label.clone())
+            .collect::<Vec<_>>()
     };
 
     // Empty orders → default: groups alphabetical (alpha, beta); alpha's
     // sessions in by-label order (a, b). (Negative control for "no drag".)
     let g = order_grouped_rows(group_agent_rows_by_cwd(mk()), &[], &[]);
-    assert_eq!(keys(&g), vec!["/work/alpha", "/work/beta"], "default: alpha before beta");
+    assert_eq!(
+        keys(&g),
+        vec!["/work/alpha", "/work/beta"],
+        "default: alpha before beta"
+    );
     assert_eq!(sess(&g, 0), vec!["a", "b"], "default: sessions by label");
 
     // A cwd order flips the groups (beta before alpha).
     let cwd_order = vec!["/work/beta".to_string(), "/work/alpha".to_string()];
     let g = order_grouped_rows(group_agent_rows_by_cwd(mk()), &cwd_order, &[]);
-    assert_eq!(keys(&g), vec!["/work/beta", "/work/alpha"], "cwd order reorders headers");
+    assert_eq!(
+        keys(&g),
+        vec!["/work/beta", "/work/alpha"],
+        "cwd order reorders headers"
+    );
 
     // A session order flips alpha's sessions (b before a); groups still alpha.
     let sess_order = vec!["s-b".to_string(), "s-a".to_string()];
     let g = order_grouped_rows(group_agent_rows_by_cwd(mk()), &[], &sess_order);
     let alpha_idx = keys(&g).iter().position(|k| k == "/work/alpha").unwrap();
-    assert_eq!(sess(&g, alpha_idx), vec!["b", "a"], "session order reorders within group");
+    assert_eq!(
+        sess(&g, alpha_idx),
+        vec!["b", "a"],
+        "session order reorders within group"
+    );
 }
 
 /// UXI-JumpPanel-14: Waiting and Working are chronological live queues
@@ -9598,28 +10271,25 @@ fn jump_reorder_ordering_applies_and_defaults_to_alpha() {
 /// custom order exactly.
 #[test]
 fn jump_agent_state_tabs_filter_and_sort_without_moving_all() {
-    use crate::{agent_rows_for_tab, AgentRow, JumpAgentTab, JumpTarget};
+    use crate::{AgentRow, JumpAgentTab, JumpTarget, agent_rows_for_tab};
     let base = std::time::Instant::now();
-    let row = |sid: &str,
-               label: &str,
-               awaiting: Option<bool>,
-               unread: bool,
-               age_secs: u64| AgentRow {
-        target: JumpTarget::Roster(sid.into()),
-        label: label.into(),
-        provider: yalda::acp_channel::AgentProvider::Claude,
-        summary: None,
-        summary_pending: false,
-        archived: false,
-        cwd: std::path::PathBuf::from("/work"),
-        bound: false,
-        connected: true,
-        awaiting,
-        unread,
-        order_sid: Some(sid.into()),
-        state_entered_at: Some(base - std::time::Duration::from_secs(age_secs)),
-        tags: Vec::new(),
-    };
+    let row =
+        |sid: &str, label: &str, awaiting: Option<bool>, unread: bool, age_secs: u64| AgentRow {
+            target: JumpTarget::Roster(sid.into()),
+            label: label.into(),
+            provider: yalda::acp_channel::AgentProvider::Claude,
+            summary: None,
+            summary_pending: false,
+            archived: false,
+            cwd: std::path::PathBuf::from("/work"),
+            bound: false,
+            connected: true,
+            awaiting,
+            unread,
+            order_sid: Some(sid.into()),
+            state_entered_at: Some(base - std::time::Duration::from_secs(age_secs)),
+            tags: Vec::new(),
+        };
     // Incoming order represents the user's custom All order, deliberately
     // unrelated to either state's chronology.
     let make = || {
@@ -9634,9 +10304,8 @@ fn jump_agent_state_tabs_filter_and_sort_without_moving_all() {
             (5, archived),
         ]
     };
-    let labels = |rows: Vec<(usize, AgentRow)>| {
-        rows.into_iter().map(|(_, r)| r.label).collect::<Vec<_>>()
-    };
+    let labels =
+        |rows: Vec<(usize, AgentRow)>| rows.into_iter().map(|(_, r)| r.label).collect::<Vec<_>>();
 
     assert_eq!(
         labels(agent_rows_for_tab(make(), JumpAgentTab::Waiting)),
@@ -9683,7 +10352,10 @@ fn viewing_a_waiting_agent_does_not_change_waiting_order(cx: &mut TestAppContext
     let (view, vcx) = boot_browser(cx);
     let (pid, cwd) = view.update(vcx, |v, _| {
         let pid = v.workspace.active_workspace().expect("workspace").project();
-        (pid, v.projects.cwd_of(pid).expect("project cwd").to_path_buf())
+        (
+            pid,
+            v.projects.cwd_of(pid).expect("project cwd").to_path_buf(),
+        )
     });
     let info = |sid: &str, label: &str| SessionInfo {
         session_id: sid.into(),
@@ -9706,20 +10378,19 @@ fn viewing_a_waiting_agent_does_not_change_waiting_order(cx: &mut TestAppContext
         v.select_jump_agent_tab(pid, JumpAgentTab::Waiting, cx);
     });
 
-    let waiting_labels =
-        |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
-            view.update(vcx, |v, cx| {
-                v.jump_panel_sections(cx)
-                    .0
-                    .into_iter()
-                    .find(|section| section.id == pid)
-                    .expect("project section")
-                    .sessions
-                    .into_iter()
-                    .map(|(_, row)| row.label)
-                    .collect::<Vec<_>>()
-            })
-        };
+    let waiting_labels = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.update(vcx, |v, cx| {
+            v.jump_panel_sections(cx)
+                .0
+                .into_iter()
+                .find(|section| section.id == pid)
+                .expect("project section")
+                .sessions
+                .into_iter()
+                .map(|(_, row)| row.label)
+                .collect::<Vec<_>>()
+        })
+    };
     assert_eq!(
         waiting_labels(&view, vcx),
         vec!["z-old", "a-new"],
@@ -9734,9 +10405,7 @@ fn viewing_a_waiting_agent_does_not_change_waiting_order(cx: &mut TestAppContext
     vcx.run_until_parked();
     assert!(
         view.read_with(vcx, |v, _| {
-            v.sessions
-                .locate(&ServerSid::new("S-old"))
-                .is_some()
+            v.sessions.locate(&ServerSid::new("S-old")).is_some()
         }),
         "the real roster jump attached a fresh local view for S-old"
     );
@@ -9759,8 +10428,10 @@ fn viewing_a_waiting_agent_does_not_change_waiting_order(cx: &mut TestAppContext
         v.session_entity(local)
             .expect("local session")
             .update(cx, |session, _| {
-                session.state.turn_phase =
-                    crate::TurnPhase::Awaiting { started: now, last_event: now };
+                session.state.turn_phase = crate::TurnPhase::Awaiting {
+                    started: now,
+                    last_event: now,
+                };
             });
         v.apply_server_batch(
             vec![ServerNotification::SessionBusy {
@@ -9809,7 +10480,10 @@ fn jump_project_agent_tabs_are_independent_and_all_appends(cx: &mut TestAppConte
         let pid = v.workspace.active_workspace().expect("workspace").project();
         let other = v
             .projects
-            .create("Other tab project".into(), PathBuf::from("/tmp/yalda-tab-other"))
+            .create(
+                "Other tab project".into(),
+                PathBuf::from("/tmp/yalda-tab-other"),
+            )
             .expect("other project");
         (
             pid,
@@ -9834,9 +10508,9 @@ fn jump_project_agent_tabs_are_independent_and_all_appends(cx: &mut TestAppConte
         v.agent_roster.upsert(info("S-wait", "wait", false));
         v.agent_roster.upsert(info("S-work", "work", true));
         v.agent_roster.upsert(info("S-quiet", "quiet", false));
-        v.roster_unread.insert("S-wait".into(), std::time::Instant::now());
-        v.jump_session_order =
-            vec!["S-quiet".into(), "S-work".into(), "S-wait".into()];
+        v.roster_unread
+            .insert("S-wait".into(), std::time::Instant::now());
+        v.jump_session_order = vec!["S-quiet".into(), "S-work".into(), "S-wait".into()];
     });
 
     crate::layout_probe_begin();
@@ -9868,8 +10542,7 @@ fn jump_project_agent_tabs_are_independent_and_all_appends(cx: &mut TestAppConte
     }
     crate::layout_probe_end();
 
-    let labels = |view: &gpui::Entity<YaldaGpuiView>,
-                  vcx: &mut gpui::VisualTestContext| {
+    let labels = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
         view.update(vcx, |v, cx| {
             v.jump_panel_sections(cx)
                 .0
@@ -9882,7 +10555,9 @@ fn jump_project_agent_tabs_are_independent_and_all_appends(cx: &mut TestAppConte
                 .collect::<Vec<_>>()
         })
     };
-    view.update(vcx, |v, cx| v.select_jump_agent_tab(pid, JumpAgentTab::Waiting, cx));
+    view.update(vcx, |v, cx| {
+        v.select_jump_agent_tab(pid, JumpAgentTab::Waiting, cx)
+    });
     assert_eq!(
         labels(&view, vcx),
         vec!["wait", "quiet"],
@@ -9896,11 +10571,19 @@ fn jump_project_agent_tabs_are_independent_and_all_appends(cx: &mut TestAppConte
             .expect("other section")
             .agent_tab
     });
-    assert_eq!(other_tab, JumpAgentTab::All, "one project's tab does not affect another");
+    assert_eq!(
+        other_tab,
+        JumpAgentTab::All,
+        "one project's tab does not affect another"
+    );
 
-    view.update(vcx, |v, cx| v.select_jump_agent_tab(pid, JumpAgentTab::Working, cx));
+    view.update(vcx, |v, cx| {
+        v.select_jump_agent_tab(pid, JumpAgentTab::Working, cx)
+    });
     assert_eq!(labels(&view, vcx), vec!["work"]);
-    view.update(vcx, |v, cx| v.select_jump_agent_tab(pid, JumpAgentTab::All, cx));
+    view.update(vcx, |v, cx| {
+        v.select_jump_agent_tab(pid, JumpAgentTab::All, cx)
+    });
     assert_eq!(
         labels(&view, vcx),
         vec!["quiet", "work", "wait"],
@@ -9931,7 +10614,10 @@ fn jump_session_rows_do_not_paint_redundant_status_words(cx: &mut TestAppContext
     let (view, vcx) = boot_browser(cx);
     let (pid, cwd) = view.update(vcx, |v, _| {
         let pid = v.workspace.active_workspace().expect("workspace").project();
-        (pid, v.projects.cwd_of(pid).expect("project cwd").to_path_buf())
+        (
+            pid,
+            v.projects.cwd_of(pid).expect("project cwd").to_path_buf(),
+        )
     });
     let info = |sid: &str, label: &str, busy: bool| SessionInfo {
         session_id: sid.into(),
@@ -9951,7 +10637,7 @@ fn jump_session_rows_do_not_paint_redundant_status_words(cx: &mut TestAppContext
         v.agent_roster
             .upsert(info("no-word-work", "working row", true));
         v.jump_session_order = vec!["no-word-wait".into(), "no-word-work".into()];
-        v.materialize_roster_unbound_tiles();
+        v.materialize_roster_detached_tiles();
     });
     let row_ids: HashMap<String, usize> = view.update(vcx, |v, cx| {
         v.jump_panel_sections(cx)
@@ -10005,7 +10691,10 @@ fn jump_panel_session_rows_paint_provider_ownership_marks(cx: &mut TestAppContex
     let (view, vcx) = boot_browser(cx);
     let (pid, cwd) = view.update(vcx, |v, _| {
         let pid = v.workspace.active_workspace().expect("workspace").project();
-        (pid, v.projects.cwd_of(pid).expect("project cwd").to_path_buf())
+        (
+            pid,
+            v.projects.cwd_of(pid).expect("project cwd").to_path_buf(),
+        )
     });
     let info = |sid: &str, label: &str, provider: AgentProvider, busy: bool| SessionInfo {
         session_id: sid.into(),
@@ -10020,10 +10709,18 @@ fn jump_panel_session_rows_paint_provider_ownership_marks(cx: &mut TestAppContex
         archived: false,
     };
     view.update(vcx, |v, cx| {
-        v.agent_roster
-            .upsert(info("provider-claude", "alpha claude", AgentProvider::Claude, false));
-        v.agent_roster
-            .upsert(info("provider-codex", "beta codex", AgentProvider::Codex, true));
+        v.agent_roster.upsert(info(
+            "provider-claude",
+            "alpha claude",
+            AgentProvider::Claude,
+            false,
+        ));
+        v.agent_roster.upsert(info(
+            "provider-codex",
+            "beta codex",
+            AgentProvider::Codex,
+            true,
+        ));
         let local = v.show_local_session(
             AgentSession {
                 state: AgentState::new_server_managed_for(AgentProvider::Codex, None),
@@ -10033,7 +10730,7 @@ fn jump_panel_session_rows_paint_provider_ownership_marks(cx: &mut TestAppContex
             },
             cx,
         );
-        v.materialize_roster_unbound_tiles();
+        v.materialize_roster_detached_tiles();
         v.jump_to_session(local, cx);
         v.workspace.set_active_workspace(0);
         cx.notify();
@@ -10051,7 +10748,9 @@ fn jump_panel_session_rows_paint_provider_ownership_marks(cx: &mut TestAppContex
             .collect()
     });
     assert_eq!(rows["alpha claude"].1, AgentProvider::Claude);
-    assert!(matches!(rows["alpha claude"].2, JumpTarget::Roster(ref sid) if sid == "provider-claude"));
+    assert!(
+        matches!(rows["alpha claude"].2, JumpTarget::Roster(ref sid) if sid == "provider-claude")
+    );
     assert_eq!(rows["beta codex"].1, AgentProvider::Codex);
     assert!(matches!(rows["beta codex"].2, JumpTarget::Roster(ref sid) if sid == "provider-codex"));
     assert_eq!(rows["gamma local codex"].1, AgentProvider::Codex);
@@ -10069,11 +10768,8 @@ fn jump_panel_session_rows_paint_provider_ownership_marks(cx: &mut TestAppContex
             "{label} row must paint, making its mark assertions non-vacuous"
         );
         assert!(
-            crate::layout_probe_get(&format!(
-                "jump-session-provider-{i}-{}",
-                provider.label()
-            ))
-            .is_some(),
+            crate::layout_probe_get(&format!("jump-session-provider-{i}-{}", provider.label()))
+                .is_some(),
             "{label} must paint its {} ownership mark",
             provider.label()
         );
@@ -10159,7 +10855,10 @@ fn jump_waiting_working_tabs_paint_live_counts(cx: &mut TestAppContext) {
     let (view, vcx) = boot_browser(cx);
     let (pid, cwd) = view.update(vcx, |v, _| {
         let pid = v.workspace.active_workspace().expect("workspace").project();
-        (pid, v.projects.cwd_of(pid).expect("project cwd").to_path_buf())
+        (
+            pid,
+            v.projects.cwd_of(pid).expect("project cwd").to_path_buf(),
+        )
     });
     let info = |sid: &str, label: &str, busy: bool, connected: bool| SessionInfo {
         session_id: sid.into(),
@@ -10192,11 +10891,10 @@ fn jump_waiting_working_tabs_paint_live_counts(cx: &mut TestAppContext) {
             "count-wait-b".into(),
             "count-archived".into(),
         ];
-        v.materialize_roster_unbound_tiles();
+        v.materialize_roster_detached_tiles();
     });
 
-    let counts = |view: &gpui::Entity<YaldaGpuiView>,
-                  vcx: &mut gpui::VisualTestContext| {
+    let counts = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
         view.update(vcx, |v, cx| {
             let section = v
                 .jump_panel_sections(cx)
@@ -10219,18 +10917,14 @@ fn jump_waiting_working_tabs_paint_live_counts(cx: &mut TestAppContext) {
         vcx.run_until_parked();
     }
     for tab in ["waiting", "working"] {
-        let tab_bounds =
-            crate::layout_probe_get(&format!("jump-agent-tab-{}-{tab}", pid.0))
-                .expect("the counted tab must paint");
+        let tab_bounds = crate::layout_probe_get(&format!("jump-agent-tab-{}-{tab}", pid.0))
+            .expect("the counted tab must paint");
         let (x, y, w, h) =
             crate::layout_probe_get(&format!("jump-agent-tab-count-{}-{tab}", pid.0))
                 .unwrap_or_else(|| panic!("the {tab} tab's live total must paint"));
         let (tab_x, tab_y, tab_w, tab_h) = tab_bounds;
         assert!(
-            x >= tab_x
-                && y >= tab_y
-                && x + w <= tab_x + tab_w
-                && y + h <= tab_y + tab_h,
+            x >= tab_x && y >= tab_y && x + w <= tab_x + tab_w && y + h <= tab_y + tab_h,
             "the {tab} total must stay inside its tab target"
         );
     }
@@ -10268,7 +10962,10 @@ fn jump_all_tab_groups_activity_with_headers(cx: &mut TestAppContext) {
     let (view, vcx) = boot_browser(cx);
     let (pid, cwd) = view.update(vcx, |v, _| {
         let pid = v.workspace.active_workspace().expect("workspace").project();
-        (pid, v.projects.cwd_of(pid).expect("project cwd").to_path_buf())
+        (
+            pid,
+            v.projects.cwd_of(pid).expect("project cwd").to_path_buf(),
+        )
     });
     let info = |sid: &str, label: &str, busy: bool, connected: bool| SessionInfo {
         session_id: sid.into(),
@@ -10302,7 +10999,7 @@ fn jump_all_tab_groups_activity_with_headers(cx: &mut TestAppContext) {
             "S-work-1".into(),
             "S-wait-1".into(),
         ];
-        v.materialize_roster_unbound_tiles();
+        v.materialize_roster_detached_tiles();
     });
 
     let row_ids: HashMap<String, usize> = view.update(vcx, |v, cx| {
@@ -10369,7 +11066,10 @@ fn jump_session_archive_filters_tabs_palette_and_persists(cx: &mut TestAppContex
     let (view, vcx) = boot_browser(cx);
     let (pid, cwd) = view.update(vcx, |v, _| {
         let pid = v.workspace.active_workspace().expect("workspace").project();
-        (pid, v.projects.cwd_of(pid).expect("project cwd").to_path_buf())
+        (
+            pid,
+            v.projects.cwd_of(pid).expect("project cwd").to_path_buf(),
+        )
     });
     let info = |sid: &str, label: &str, busy: bool| SessionInfo {
         session_id: sid.into(),
@@ -10385,16 +11085,18 @@ fn jump_session_archive_filters_tabs_palette_and_persists(cx: &mut TestAppContex
     };
     view.update(vcx, |v, _| {
         v.agent_roster.upsert(info("S-live", "live-session", false));
-        v.agent_roster.upsert(info("S-arch", "archived-session", true));
+        v.agent_roster
+            .upsert(info("S-arch", "archived-session", true));
         v.jump_session_order = vec!["S-arch".into(), "S-live".into()];
-        v.materialize_roster_unbound_tiles();
+        v.materialize_roster_detached_tiles();
     });
     let temp = tempfile::tempdir().expect("temp preferences dir");
     let prefs_path = temp.path().join("preferences.json");
     crate::persist::with_preferences_path(prefs_path.clone(), || {
         view.update(vcx, |v, cx| v.set_session_archived("S-arch", true, cx));
     });
-    let persisted = crate::persist::with_preferences_path(prefs_path, crate::persist::load_preferences);
+    let persisted =
+        crate::persist::with_preferences_path(prefs_path, crate::persist::load_preferences);
     assert_eq!(
         persisted.jump_archived_sessions.as_deref(),
         Some(&["S-arch".to_string()][..]),
@@ -10418,7 +11120,10 @@ fn jump_session_archive_filters_tabs_palette_and_persists(cx: &mut TestAppContex
         })
     };
     assert_eq!(labels(&view, vcx, JumpAgentTab::All), vec!["live-session"]);
-    assert_eq!(labels(&view, vcx, JumpAgentTab::Waiting), vec!["live-session"]);
+    assert_eq!(
+        labels(&view, vcx, JumpAgentTab::Waiting),
+        vec!["live-session"]
+    );
     assert!(labels(&view, vcx, JumpAgentTab::Working).is_empty());
     assert_eq!(
         labels(&view, vcx, JumpAgentTab::Archived),
@@ -10470,8 +11175,7 @@ fn jump_session_archive_controls_toggle_the_same_durable_flag(cx: &mut TestAppCo
     });
     vcx.run_until_parked();
 
-    let row_center = |view: &gpui::Entity<YaldaGpuiView>,
-                      vcx: &mut gpui::VisualTestContext| {
+    let row_center = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
         crate::layout_probe_begin();
         view.update(vcx, |_, cx| cx.notify());
         vcx.run_until_parked();
@@ -10510,7 +11214,9 @@ fn jump_session_archive_controls_toggle_the_same_durable_flag(cx: &mut TestAppCo
     assert!(view.read_with(vcx, |v, _| v.jump_archived_sessions.contains("S-menu")));
 
     // Archived row → right click → Unarchive.
-    view.update(vcx, |v, cx| v.select_jump_agent_tab(pid, JumpAgentTab::Archived, cx));
+    view.update(vcx, |v, cx| {
+        v.select_jump_agent_tab(pid, JumpAgentTab::Archived, cx)
+    });
     let at = row_center(&view, vcx);
     vcx.simulate_mouse_move(at, None, Modifiers::default());
     vcx.simulate_mouse_down(at, MouseButton::Right, Modifiers::default());
@@ -10568,23 +11274,20 @@ fn jump_session_archive_controls_toggle_the_same_durable_flag(cx: &mut TestAppCo
 
     // The direct context entry point refuses sid-less local placeholders.
     view.update(vcx, |v, cx| {
-        v.open_session_menu(JumpTarget::Local(crate::SessionId(u64::MAX)), (20.0, 20.0), cx);
+        v.open_session_menu(
+            JumpTarget::Local(crate::SessionId(u64::MAX)),
+            (20.0, 20.0),
+            cx,
+        );
         assert!(!v.overlay_is_session_menu());
     });
 }
 
-/// UXI-JumpPanel-16: archiving is an immediate viewport transition. Every tile
-/// showing the session becomes a live picker, but the session and transcript
-/// stay alive; selecting the archived session directly from the jump panel
-/// opens that same transcript in a bare ephemeral view.
-///
-/// Negative control (mandatory): remove the `show_pickers_for_session` call
-/// from `set_session_archived`; the first picker assertion fails because the
-/// original workspace tile remains bound.
+/// UXI-JumpPanel-16 amended by ADR-0034: archiving detaches the complete Agent
+/// tile. The session and transcript stay alive; selecting it presents that exact
+/// tile solo.
 #[gpui::test]
-fn archive_unbinds_tiles_but_direct_jump_reopens_the_transcript(
-    cx: &mut TestAppContext,
-) {
+fn archive_detaches_tile_and_direct_jump_reopens_the_transcript(cx: &mut TestAppContext) {
     use crate::JumpTarget;
 
     let (view, vcx, id, _session) = boot_with_transcript(cx);
@@ -10596,22 +11299,27 @@ fn archive_unbinds_tiles_but_direct_jump_reopens_the_transcript(
 
     view.read_with(vcx, |v, cx| {
         assert!(v.jump_archived_sessions.contains("S1"));
-        assert!(
-            v.agent_tile().is_some_and(|tile| tile.picker().is_some()),
-            "archiving immediately replaces the bound workspace tile with its picker"
-        );
         assert_eq!(
             v.agent_tile_id_bound_to(id),
             None,
-            "no workspace tile remains bound to the archived session"
+            "no workspace owns the archived session tile"
         );
+        assert!(matches!(
+            v.workspace
+                .tile_membership(v.agent_tile_id_for_session(id).unwrap()),
+            Some(crate::workspace::TileMembership::Detached)
+        ));
         assert!(
             v.sessions.contains(id),
             "archive keeps the live session in the store"
         );
         assert!(
             v.read_session(id, cx, |state| {
-                state.editor.document().full_text().contains("session archived")
+                state
+                    .editor
+                    .document()
+                    .full_text()
+                    .contains("session archived")
             })
             .unwrap_or(false),
             "the preserved transcript contains the archive notice"
@@ -10623,7 +11331,7 @@ fn archive_unbinds_tiles_but_direct_jump_reopens_the_transcript(
 
     view.read_with(vcx, |v, cx| {
         assert!(
-            v.workspace.directly_focused_unbound().is_some(),
+            v.workspace.presented_detached_tile_id().is_some(),
             "a direct visit focuses the preserved session's unbound tile"
         );
         assert_eq!(
@@ -10633,7 +11341,11 @@ fn archive_unbinds_tiles_but_direct_jump_reopens_the_transcript(
         );
         assert!(
             v.read_session(id, cx, |state| {
-                state.editor.document().full_text().contains("session archived")
+                state
+                    .editor
+                    .document()
+                    .full_text()
+                    .contains("session archived")
             })
             .unwrap_or(false),
             "the direct visit shows the preserved transcript normally"
@@ -10650,9 +11362,7 @@ fn archive_unbinds_tiles_but_direct_jump_reopens_the_transcript(
 /// Waiting projection". Restoring the predicate passes through paint and proves
 /// the session remains reachable only from Archived.
 #[gpui::test]
-fn archived_waiting_session_is_removed_from_the_painted_waiting_tab(
-    cx: &mut TestAppContext,
-) {
+fn archived_waiting_session_is_removed_from_the_painted_waiting_tab(cx: &mut TestAppContext) {
     use crate::JumpAgentTab;
     use gpui::{Modifiers, MouseButton};
     use yalda::session_proto::SessionInfo;
@@ -10678,12 +11388,9 @@ fn archived_waiting_session_is_removed_from_the_painted_waiting_tab(
             .agent_tile_id_for_server_sid("S-archived-waiting")
             .expect("installed Agent tile");
         v.workspace
-            .unbind_window_with_replacement(
-                tile,
-                crate::App::Agent(crate::AgentTile::new()),
-            )
-            .expect("the Waiting list is the Unbound list");
-        v.workspace.clear_direct_unbound();
+            .detach_window(tile)
+            .expect("the Waiting list is the Detached list");
+        v.workspace.clear_solo_presentation();
         v.select_jump_agent_tab(pid, JumpAgentTab::Waiting, cx);
         pid
     });
@@ -10770,7 +11477,11 @@ fn jump_reorder_move_semantics() {
     assert_eq!(v, vec!["c", "a", "b"]);
     // Drag c onto b → c between a and b's new positions (b's slot).
     reorder_move(&mut v, "c", "b");
-    assert_eq!(v, vec!["a", "c", "b"], "dragged item lands in target's slot");
+    assert_eq!(
+        v,
+        vec!["a", "c", "b"],
+        "dragged item lands in target's slot"
+    );
     // Same item is a no-op.
     let before = v.clone();
     reorder_move(&mut v, "a", "a");
@@ -10831,7 +11542,10 @@ fn jump_reorder_methods_reorder_and_gate_by_cwd(cx: &mut TestAppContext) {
             );
             g.into_iter()
                 .map(|(k, rows)| {
-                    (k, rows.into_iter().map(|(_, r)| r.label).collect::<Vec<_>>())
+                    (
+                        k,
+                        rows.into_iter().map(|(_, r)| r.label).collect::<Vec<_>>(),
+                    )
                 })
                 .collect::<Vec<_>>()
         })
@@ -10844,11 +11558,17 @@ fn jump_reorder_methods_reorder_and_gate_by_cwd(cx: &mut TestAppContext) {
     assert_eq!(g[0].1, vec!["a-one", "a-two"]);
 
     // Reorder the HEADERS: drop beta onto alpha → beta first. Persisted.
-    view.update(vcx, |v, cx| v.reorder_cwd_group("/proj/beta", "/proj/alpha", cx));
+    view.update(vcx, |v, cx| {
+        v.reorder_cwd_group("/proj/beta", "/proj/alpha", cx)
+    });
     let g = snapshot(&view, vcx);
     assert_eq!(g[0].0, "/proj/beta", "cwd drag reordered the group headers");
     assert!(
-        view.update(vcx, |v, _| v.jump_cwd_order.first().map(|s| s == "/proj/beta").unwrap_or(false)),
+        view.update(vcx, |v, _| v
+            .jump_cwd_order
+            .first()
+            .map(|s| s == "/proj/beta")
+            .unwrap_or(false)),
         "cwd order persisted on the view"
     );
 
@@ -10856,17 +11576,30 @@ fn jump_reorder_methods_reorder_and_gate_by_cwd(cx: &mut TestAppContext) {
     view.update(vcx, |v, cx| v.reorder_session("a2", "a1", cx));
     let g = snapshot(&view, vcx);
     let alpha = g.iter().find(|(k, _)| k == "/proj/alpha").unwrap();
-    assert_eq!(alpha.1, vec!["a-two", "a-one"], "session drag reordered within the group");
+    assert_eq!(
+        alpha.1,
+        vec!["a-two", "a-one"],
+        "session drag reordered within the group"
+    );
 
     // CROSS-CWD is refused: dragging b1 (beta) onto a1 (alpha) does nothing.
     let before = view.update(vcx, |v, _| v.jump_session_order.clone());
     view.update(vcx, |v, cx| v.reorder_session("b1", "a1", cx));
     let after = view.update(vcx, |v, _| v.jump_session_order.clone());
-    assert_eq!(before, after, "a session cannot be reordered into another cwd group");
+    assert_eq!(
+        before, after,
+        "a session cannot be reordered into another cwd group"
+    );
     // And b1 is still under beta, not alpha.
     let g = snapshot(&view, vcx);
-    assert!(g.iter().any(|(k, rows)| k == "/proj/beta" && rows.contains(&"b-one".to_string())));
-    assert!(g.iter().all(|(k, rows)| k != "/proj/alpha" || !rows.contains(&"b-one".to_string())));
+    assert!(
+        g.iter()
+            .any(|(k, rows)| k == "/proj/beta" && rows.contains(&"b-one".to_string()))
+    );
+    assert!(
+        g.iter()
+            .all(|(k, rows)| k != "/proj/alpha" || !rows.contains(&"b-one".to_string()))
+    );
 }
 
 /// bug-0007 (RECURRED), REAL path: a session must NEVER change slot in the jump
@@ -11006,7 +11739,7 @@ fn clear_keeps_the_sessions_jump_panel_slot(cx: &mut TestAppContext) {
 /// regardless of grouping).
 #[test]
 fn jump_panel_groups_agent_rows_by_cwd() {
-    use crate::{group_agent_rows_by_cwd, AgentRow, JumpTarget};
+    use crate::{AgentRow, JumpTarget, group_agent_rows_by_cwd};
     let row = |label: &str, cwd: &str| AgentRow {
         order_sid: Some(label.into()),
         state_entered_at: None,
@@ -11035,12 +11768,18 @@ fn jump_panel_groups_agent_rows_by_cwd() {
     assert_eq!(groups[0].0, "/work/alpha");
     assert_eq!(groups[1].0, "/work/beta");
     // alpha holds b (idx 1) and c (idx 2), in incoming order, original indices kept.
-    let alpha: Vec<(usize, &str)> =
-        groups[0].1.iter().map(|(i, r)| (*i, r.label.as_str())).collect();
+    let alpha: Vec<(usize, &str)> = groups[0]
+        .1
+        .iter()
+        .map(|(i, r)| (*i, r.label.as_str()))
+        .collect();
     assert_eq!(alpha, vec![(1, "b"), (2, "c")]);
     // beta holds a (idx 0).
-    let beta: Vec<(usize, &str)> =
-        groups[1].1.iter().map(|(i, r)| (*i, r.label.as_str())).collect();
+    let beta: Vec<(usize, &str)> = groups[1]
+        .1
+        .iter()
+        .map(|(i, r)| (*i, r.label.as_str()))
+        .collect();
     assert_eq!(beta, vec![(0, "a")]);
 }
 
@@ -11090,9 +11829,14 @@ fn clear_worksheet_you_block_keystroke_splices_item(cx: &mut TestAppContext) {
     // Sanity: we ARE in the state where a You-block item is present + active, so a
     // keystroke's staleness would actually be user-visible (non-vacuous).
     let active = view
-        .update(vcx, |v, cx| v.agent_read(cx, |c| c.inline_you_block_active()))
+        .update(vcx, |v, cx| {
+            v.agent_read(cx, |c| c.inline_you_block_active())
+        })
         .unwrap_or(false);
-    assert!(active, "precondition: inline You-block must be active (else nothing to keep fresh)");
+    assert!(
+        active,
+        "precondition: inline You-block must be active (else nothing to keep fresh)"
+    );
 
     // Let the initial render settle so `last_you_block_seq` has caught up to the
     // empty block, THEN start the measurement window — so the count we read is
@@ -11102,17 +11846,28 @@ fn clear_worksheet_you_block_keystroke_splices_item(cx: &mut TestAppContext) {
     view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
     let base = crate::perf_render_count(crate::YOU_BLOCK_SPLICE_LABEL);
-    assert_eq!(base, 0, "a plain notify (no compose change) must NOT splice the You-block item");
+    assert_eq!(
+        base, 0,
+        "a plain notify (no compose change) must NOT splice the You-block item"
+    );
 
     // The user types — through the REAL key handler, no `i`, no toggle.
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("h"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("h"), w, cx)
+    });
     vcx.run_until_parked();
     let after = crate::perf_render_count(crate::YOU_BLOCK_SPLICE_LABEL);
 
     let text = view
-        .update(vcx, |v, cx| v.agent_read(cx, |c| c.input_surface.compose().text()))
+        .update(vcx, |v, cx| {
+            v.agent_read(cx, |c| c.input_surface.compose().text())
+        })
         .expect("session");
-    assert_eq!(text.trim(), "h", "sanity: the char landed in the compose buffer");
+    assert_eq!(
+        text.trim(),
+        "h",
+        "sanity: the char landed in the compose buffer"
+    );
     assert!(
         after > base,
         "ROOT CAUSE: typing into the active You-block MUST splice its list item so GPUI \
@@ -11150,13 +11905,18 @@ fn jump_panel_toggle_hides_and_summons(cx: &mut TestAppContext) {
     // Defaults visible, renders, and the shell menu offers the toggle (ADR-0032:
     // the entry moved from the `?` menu to the `.` shell menu and is now a static
     // "toggle jump panel" label — gpui_menu is a pure builder with no live state).
-    assert!(view.update(vcx, |v, _| v.jump_panel_visible), "defaults visible");
+    assert!(
+        view.update(vcx, |v, _| v.jump_panel_visible),
+        "defaults visible"
+    );
     let rendered = crate::perf_render_count("jump_panel");
     assert!(rendered >= 1, "visible panel renders at least once");
     assert!(shell_menu_has_label("toggle jump panel"));
 
     // Hide it (via the menu command). It stops rendering.
-    view.update(vcx, |v, cx| v.dispatch_menu_command("toggle-jump-panel", cx));
+    view.update(vcx, |v, cx| {
+        v.dispatch_menu_command("toggle-jump-panel", cx)
+    });
     assert!(!view.update(vcx, |v, _| v.jump_panel_visible), "now hidden");
     let base = crate::perf_render_count("jump_panel");
     view.update(vcx, |_, cx| cx.notify());
@@ -11167,8 +11927,13 @@ fn jump_panel_toggle_hides_and_summons(cx: &mut TestAppContext) {
         "a hidden jump panel is not rendered"
     );
     // Summon it again — it renders once more.
-    view.update(vcx, |v, cx| v.dispatch_menu_command("toggle-jump-panel", cx));
-    assert!(view.update(vcx, |v, _| v.jump_panel_visible), "visible again");
+    view.update(vcx, |v, cx| {
+        v.dispatch_menu_command("toggle-jump-panel", cx)
+    });
+    assert!(
+        view.update(vcx, |v, _| v.jump_panel_visible),
+        "visible again"
+    );
     vcx.run_until_parked();
     assert!(
         crate::perf_render_count("jump_panel") > base,
@@ -11223,8 +11988,9 @@ fn compose_caret_row_painted_inside_box_when_wrapped(cx: &mut TestAppContext) {
     vcx.run_until_parked();
 
     let caret = crate::layout_probe_get("compose-cursor-row");
-    let box_bounds =
-        view.update(vcx, |v, cx| v.agent_read(cx, |c| c.input_surface.compose().bounds.get()));
+    let box_bounds = view.update(vcx, |v, cx| {
+        v.agent_read(cx, |c| c.input_surface.compose().bounds.get())
+    });
     crate::layout_probe_end();
 
     let (_, box_y, _, box_h) =
@@ -11239,7 +12005,10 @@ fn compose_caret_row_painted_inside_box_when_wrapped(cx: &mut TestAppContext) {
         )
     });
 
-    assert!(box_h > 1.0, "compose box has no height ({box_h}) — nothing painted");
+    assert!(
+        box_h > 1.0,
+        "compose box has no height ({box_h}) — nothing painted"
+    );
     // The caret row's TOP must be inside the box (caret glyph visible, not below
     // the fold). A genuine below-fold caret is either unpainted (handled above) or
     // off by a full row (≥18px); the small bottom tolerance only absorbs the 1px
@@ -11274,13 +12043,18 @@ fn worksheet_renders_flush_chatbox_renders_boxed(cx: &mut TestAppContext) {
     // Worksheet (the default) with an open You-block: the editable reply paints
     // INLINE in the transcript; there is no pinned bottom box.
     assert!(
-        !view.update(vcx, |v, cx| v.agent_read(cx, |c| c.input_surface.is_chatbox()))
+        !view
+            .update(vcx, |v, cx| v
+                .agent_read(cx, |c| c.input_surface.is_chatbox()))
             .expect("bound agent session"),
         "precondition: a fresh session defaults to Worksheet"
     );
-    view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("i"), window, cx));
+    view.update_in(vcx, |v, window, cx| {
+        v.handle_claude_key(&ws_bare_key("i"), window, cx)
+    });
     vcx.run_until_parked();
-    let (_, yb_y, _, _) = probe_dirty(&view, vcx, "you-block").expect("worksheet block paints inline");
+    let (_, yb_y, _, _) =
+        probe_dirty(&view, vcx, "you-block").expect("worksheet block paints inline");
     assert!(
         probe_dirty(&view, vcx, "compose-box").is_none(),
         "the worksheet block is inline — no bottom box"
@@ -11289,8 +12063,12 @@ fn worksheet_renders_flush_chatbox_renders_boxed(cx: &mut TestAppContext) {
     // Toggle to Chatbox: a pinned bottom box paints; the inline block is gone.
     view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
     vcx.run_until_parked();
-    let (_, chat_y, _, _) = probe_dirty(&view, vcx, "compose-box").expect("chatbox paints a bottom box");
-    assert!(probe_dirty(&view, vcx, "you-block").is_none(), "chatbox has no inline block");
+    let (_, chat_y, _, _) =
+        probe_dirty(&view, vcx, "compose-box").expect("chatbox paints a bottom box");
+    assert!(
+        probe_dirty(&view, vcx, "you-block").is_none(),
+        "chatbox has no inline block"
+    );
 
     // The inline block sits in the scrolling transcript column, ABOVE where the
     // pinned chatbox sits at the window bottom — a genuinely different placement.
@@ -11357,7 +12135,11 @@ fn boot_worksheet_nav(
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
         assert!(!c.input_surface.is_chatbox(), "default is worksheet");
-        assert_eq!(c.focus, crate::AgentFocus::Transcript, "worksheet rests in nav");
+        assert_eq!(
+            c.focus,
+            crate::AgentFocus::Transcript,
+            "worksheet rests in nav"
+        );
         assert!(!c.you_block_open, "no You-block until Insert");
     });
     (view, vcx)
@@ -11403,19 +12185,35 @@ fn image_paste_stages_pending_attachment(cx: &mut TestAppContext) {
             })
         })
         .expect("session");
-    assert_eq!(staged.len(), 1, "Cmd+V with a clipboard image stages one attachment");
-    assert_eq!(staged[0].0, "image/png", "mime type carried from the clipboard format");
-    assert!(staged[0].2.contains("PNG"), "chip label names the format: {}", staged[0].2);
+    assert_eq!(
+        staged.len(),
+        1,
+        "Cmd+V with a clipboard image stages one attachment"
+    );
+    assert_eq!(
+        staged[0].0, "image/png",
+        "mime type carried from the clipboard format"
+    );
+    assert!(
+        staged[0].2.contains("PNG"),
+        "chip label names the format: {}",
+        staged[0].2
+    );
     // The base64 payload decodes back to the exact bytes the agent will read.
     use base64::Engine as _;
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(&staged[0].1)
         .expect("valid base64");
-    assert_eq!(decoded, png, "the staged data round-trips to the original image bytes");
+    assert_eq!(
+        decoded, png,
+        "the staged data round-trips to the original image bytes"
+    );
 
     // The compose editor stayed empty — Cmd+V did NOT type the 'v' or paste junk.
     let compose_text = view
-        .update(vcx, |v, cx| v.agent_read(cx, |c| c.input_surface.compose().text()))
+        .update(vcx, |v, cx| {
+            v.agent_read(cx, |c| c.input_surface.compose().text())
+        })
         .expect("session");
     assert!(
         compose_text.trim().is_empty(),
@@ -11463,17 +12261,26 @@ fn image_paste_direct_read_stages_even_with_text_on_clipboard(cx: &mut TestAppCo
             })
         })
         .expect("session");
-    assert_eq!(staged.len(), 1, "direct pasteboard read stages the image despite text on the clipboard");
+    assert_eq!(
+        staged.len(),
+        1,
+        "direct pasteboard read stages the image despite text on the clipboard"
+    );
     assert_eq!(staged[0].0, "image/png");
     use base64::Engine as _;
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(&staged[0].1)
         .expect("valid base64");
-    assert_eq!(decoded, png, "staged bytes are the direct-read PNG, not the clipboard text");
+    assert_eq!(
+        decoded, png,
+        "staged bytes are the direct-read PNG, not the clipboard text"
+    );
 
     // The URL text was NOT pasted into the compose.
     let compose_text = view
-        .update(vcx, |v, cx| v.agent_read(cx, |c| c.input_surface.compose().text()))
+        .update(vcx, |v, cx| {
+            v.agent_read(cx, |c| c.input_surface.compose().text())
+        })
         .expect("session");
     assert!(
         !compose_text.contains("example.com"),
@@ -11495,8 +12302,12 @@ fn image_paste_chip_paints_before_send_chatbox(cx: &mut TestAppContext) {
 
     // Force chatbox mode so the pinned compose panel is shown.
     view.update(vcx, |v, cx| {
-        let is_cb = v.agent_read(cx, |c| c.input_surface.is_chatbox()).unwrap_or(false);
-        if !is_cb { v.toggle_agent_input_mode(cx); }
+        let is_cb = v
+            .agent_read(cx, |c| c.input_surface.is_chatbox())
+            .unwrap_or(false);
+        if !is_cb {
+            v.toggle_agent_input_mode(cx);
+        }
     });
     vcx.run_until_parked();
 
@@ -11510,7 +12321,9 @@ fn image_paste_chip_paints_before_send_chatbox(cx: &mut TestAppContext) {
     // Precondition: the image really staged (so a missing paint is a paint bug,
     // not a missing image).
     let staged = view
-        .update(vcx, |v, cx| v.agent_read(cx, |c| c.input_surface.compose().pending_images.len()))
+        .update(vcx, |v, cx| {
+            v.agent_read(cx, |c| c.input_surface.compose().pending_images.len())
+        })
         .expect("session");
     assert_eq!(staged, 1, "image staged onto the compose");
 
@@ -11533,7 +12346,9 @@ fn image_paste_chip_paints_before_send_worksheet_idle(cx: &mut TestAppContext) {
 
     // Force worksheet mode (idle) — the state with no compose panel.
     view.update(vcx, |v, cx| {
-        let is_cb = v.agent_read(cx, |c| c.input_surface.is_chatbox()).unwrap_or(false);
+        let is_cb = v
+            .agent_read(cx, |c| c.input_surface.is_chatbox())
+            .unwrap_or(false);
         if is_cb {
             v.toggle_agent_input_mode(cx);
         }
@@ -11559,7 +12374,10 @@ fn image_paste_chip_paints_before_send_worksheet_idle(cx: &mut TestAppContext) {
         })
         .expect("session");
     assert_eq!(staged.0, 1, "image staged onto the compose");
-    assert!(!staged.1, "test must be in worksheet mode (no compose panel)");
+    assert!(
+        !staged.1,
+        "test must be in worksheet mode (no compose panel)"
+    );
     // Guard is non-vacuous: worksheet-idle really has NO compose box painted, so
     // the chip strip is the ONLY indication.
     assert!(
@@ -11618,7 +12436,9 @@ fn worksheet_real_submit(
     vcx: &mut gpui::VisualTestContext,
     text: &str,
 ) {
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("i"), w, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         let id = v.focused_bound_session().expect("bound");
@@ -11663,7 +12483,9 @@ fn image_submit_sends_block_marks_transcript_and_clears(cx: &mut TestAppContext)
     vcx.run_until_parked();
 
     // Open a You-block, type text, submit through the REAL path.
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("i"), w, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         let id = v.focused_bound_session().expect("bound");
@@ -11726,7 +12548,9 @@ fn real_midturn_worksheet_m_types_not_marks(cx: &mut TestAppContext) {
     // CONTROL: genuine (idle) transcript nav — bare `m` DOES start a mark chord.
     // (This half kills the `try_start_mark_chord` mutants the audit found surviving:
     // "return false" / "delete the `m` arm" both break this assertion.)
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("m"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("m"), w, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, _| {
         assert_eq!(
@@ -11739,12 +12563,15 @@ fn real_midturn_worksheet_m_types_not_marks(cx: &mut TestAppContext) {
     worksheet_real_submit(&view, vcx, "do the thing");
     view.update(vcx, |v, cx| {
         assert!(
-            v.read_session(id, cx, |c| c.turn_phase.is_awaiting()).unwrap(),
+            v.read_session(id, cx, |c| c.turn_phase.is_awaiting())
+                .unwrap(),
             "real submit must start a turn (we are genuinely mid-turn)"
         );
         v.pending_mark_chord = None;
     });
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("m"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("m"), w, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         assert_eq!(
@@ -11754,7 +12581,10 @@ fn real_midturn_worksheet_m_types_not_marks(cx: &mut TestAppContext) {
         let text = v
             .read_session(id, cx, |c| c.input_surface.compose().text())
             .unwrap();
-        assert!(text.contains('m'), "mid-turn `m` types into the chatbox (got {text:?})");
+        assert!(
+            text.contains('m'),
+            "mid-turn `m` types into the chatbox (got {text:?})"
+        );
     });
 }
 
@@ -11768,9 +12598,17 @@ fn real_midturn_worksheet_empty_draft_space_opens_menu(cx: &mut TestAppContext) 
     let (view, vcx, id, _controls) = boot_worksheet_channel(cx);
     worksheet_real_submit(&view, vcx, "go"); // submit RESETS the compose ⇒ empty draft
     view.update(vcx, |v, cx| {
-        assert!(v.read_session(id, cx, |c| c.turn_phase.is_awaiting()).unwrap());
         assert!(
-            v.read_session(id, cx, |c| c.input_surface.compose().text().trim().is_empty())
+            v.read_session(id, cx, |c| c.turn_phase.is_awaiting())
+                .unwrap()
+        );
+        assert!(
+            v.read_session(id, cx, |c| c
+                .input_surface
+                .compose()
+                .text()
+                .trim()
+                .is_empty())
                 .unwrap(),
             "post-submit steering draft is empty"
         );
@@ -11779,7 +12617,9 @@ fn real_midturn_worksheet_empty_draft_space_opens_menu(cx: &mut TestAppContext) 
             "empty-draft mid-turn worksheet rests in nav ⇒ leaders active"
         );
     });
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("space"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("space"), w, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, _| {
         assert!(
@@ -11798,11 +12638,18 @@ fn real_midturn_worksheet_typed_draft_space_is_suppressed(cx: &mut TestAppContex
     let (view, vcx, id, _controls) = boot_worksheet_channel(cx);
     worksheet_real_submit(&view, vcx, "go");
     // Type into the mid-turn chatbox so the draft is non-empty.
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("f"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("f"), w, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         assert!(
-            !v.read_session(id, cx, |c| c.input_surface.compose().text().trim().is_empty())
+            !v.read_session(id, cx, |c| c
+                .input_surface
+                .compose()
+                .text()
+                .trim()
+                .is_empty())
                 .unwrap(),
             "typed a char ⇒ draft non-empty"
         );
@@ -11811,7 +12658,9 @@ fn real_midturn_worksheet_typed_draft_space_is_suppressed(cx: &mut TestAppContex
             "non-empty steer ⇒ text entry ⇒ leaders suppressed"
         );
     });
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("space"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("space"), w, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         assert!(
@@ -11821,7 +12670,10 @@ fn real_midturn_worksheet_typed_draft_space_is_suppressed(cx: &mut TestAppContex
         let text = v
             .read_session(id, cx, |c| c.input_surface.compose().text())
             .unwrap();
-        assert!(text.contains(' '), "the space typed into the steer (got {text:?})");
+        assert!(
+            text.contains(' '),
+            "the space typed into the steer (got {text:?})"
+        );
     });
 }
 
@@ -11856,9 +12708,18 @@ fn agent_reply_models_available_captures_picklist(cx: &mut TestAppContext) {
     });
 
     let opts = vec![
-        ModelOption { id: "default".into(), label: "Default".into() },
-        ModelOption { id: "claude-fable-5[1m]".into(), label: "Fable".into() },
-        ModelOption { id: "sonnet".into(), label: "Sonnet".into() },
+        ModelOption {
+            id: "default".into(),
+            label: "Default".into(),
+        },
+        ModelOption {
+            id: "claude-fable-5[1m]".into(),
+            label: "Fable".into(),
+        },
+        ModelOption {
+            id: "sonnet".into(),
+            label: "Sonnet".into(),
+        },
     ];
     view.update(vcx, |v, cx| {
         v.apply_server_batch(
@@ -11873,7 +12734,8 @@ fn agent_reply_models_available_captures_picklist(cx: &mut TestAppContext) {
         );
         let id = v.focused_bound_session().expect("bound");
         assert_eq!(
-            v.read_session(id, cx, |c| c.available_models.clone()).unwrap(),
+            v.read_session(id, cx, |c| c.available_models.clone())
+                .unwrap(),
             opts,
             "advertised picklist captured verbatim + in order"
         );
@@ -11909,9 +12771,18 @@ fn agent_model_badge_click_opens_the_model_switcher(cx: &mut TestAppContext) {
     // Advertise a picklist through the REAL reducer — this is what puts the `▾`
     // on the badge (`has_models`) and makes it clickable at all.
     let opts = vec![
-        ModelOption { id: "default".into(), label: "Default (recommended)".into() },
-        ModelOption { id: "claude-fable-5[1m]".into(), label: "Fable".into() },
-        ModelOption { id: "sonnet".into(), label: "Sonnet".into() },
+        ModelOption {
+            id: "default".into(),
+            label: "Default (recommended)".into(),
+        },
+        ModelOption {
+            id: "claude-fable-5[1m]".into(),
+            label: "Fable".into(),
+        },
+        ModelOption {
+            id: "sonnet".into(),
+            label: "Sonnet".into(),
+        },
     ];
     view.update(vcx, |v, cx| {
         v.apply_server_batch(
@@ -11935,7 +12806,10 @@ fn agent_model_badge_click_opens_the_model_switcher(cx: &mut TestAppContext) {
     crate::layout_probe_end();
 
     let (x, y, w, h) = rect.expect("the model badge never painted");
-    assert!(w > 4.0 && h > 4.0, "badge painted with no area ({w}x{h}) — nothing to click");
+    assert!(
+        w > 4.0 && h > 4.0,
+        "badge painted with no area ({w}x{h}) — nothing to click"
+    );
     let at = point(px(x + w / 2.0), px(y + h / 2.0));
 
     view.read_with(vcx, |v, _| {
@@ -11953,7 +12827,10 @@ fn agent_model_badge_click_opens_the_model_switcher(cx: &mut TestAppContext) {
                  OpenLocalMenu found no handler on the AgentView root (bug-0029)"
             );
         };
-        assert_eq!(m.header, "AGENT", "the badge opens the agent-scoped local menu");
+        assert_eq!(
+            m.header, "AGENT",
+            "the badge opens the agent-scoped local menu"
+        );
 
         // …and the menu it opens actually carries the advertised models, not the
         // "(models not available yet)" placeholder.
@@ -11971,7 +12848,9 @@ fn agent_model_badge_click_opens_the_model_switcher(cx: &mut TestAppContext) {
             "the advertised picklist is offered (got {labels:?})"
         );
         assert!(
-            labels.iter().any(|l| l.starts_with("Sonnet") && l.contains('✓')),
+            labels
+                .iter()
+                .any(|l| l.starts_with("Sonnet") && l.contains('✓')),
             "the current model is marked (got {labels:?})"
         );
     });
@@ -12008,9 +12887,18 @@ fn agent_authoritative_models_available_via_agent_stream(cx: &mut TestAppContext
     });
 
     let opts = vec![
-        ModelOption { id: "default".into(), label: "Default".into() },
-        ModelOption { id: "claude-fable-5[1m]".into(), label: "Fable".into() },
-        ModelOption { id: "sonnet".into(), label: "Sonnet".into() },
+        ModelOption {
+            id: "default".into(),
+            label: "Default".into(),
+        },
+        ModelOption {
+            id: "claude-fable-5[1m]".into(),
+            label: "Fable".into(),
+        },
+        ModelOption {
+            id: "sonnet".into(),
+            label: "Sonnet".into(),
+        },
     ];
     view.update(vcx, |v, cx| {
         v.apply_server_batch(
@@ -12028,7 +12916,8 @@ fn agent_authoritative_models_available_via_agent_stream(cx: &mut TestAppContext
         );
         let id = v.focused_bound_session().expect("bound");
         assert_eq!(
-            v.read_session(id, cx, |c| c.available_models.clone()).unwrap(),
+            v.read_session(id, cx, |c| c.available_models.clone())
+                .unwrap(),
             opts,
             "authoritative session captures the picklist via the Agent stream"
         );
@@ -12073,7 +12962,9 @@ fn agent_menu_lists_advertised_models_and_marks_current(cx: &mut TestAppContext)
             panic!("switch model is a submenu");
         };
         assert!(
-            children.iter().all(|c| matches!(c.action, crate::MenuAction::Label(_))),
+            children
+                .iter()
+                .all(|c| matches!(c.action, crate::MenuAction::Label(_))),
             "pre-advertise: only a placeholder label, no set-model commands"
         );
     });
@@ -12085,8 +12976,14 @@ fn agent_menu_lists_advertised_models_and_marks_current(cx: &mut TestAppContext)
                 event: ReplyEvent::ModelsAvailable {
                     current: "sonnet".into(),
                     options: vec![
-                        ModelOption { id: "default".into(), label: "Default".into() },
-                        ModelOption { id: "sonnet".into(), label: "Sonnet".into() },
+                        ModelOption {
+                            id: "default".into(),
+                            label: "Default".into(),
+                        },
+                        ModelOption {
+                            id: "sonnet".into(),
+                            label: "Sonnet".into(),
+                        },
                     ],
                 },
             }],
@@ -12101,8 +12998,14 @@ fn agent_menu_lists_advertised_models_and_marks_current(cx: &mut TestAppContext)
             panic!("switch model is a submenu");
         };
         let labels: Vec<&str> = children.iter().map(|c| c.label.as_str()).collect();
-        assert!(labels.contains(&"Sonnet ✓"), "current model marked: {labels:?}");
-        assert!(labels.contains(&"Default"), "other model unmarked: {labels:?}");
+        assert!(
+            labels.contains(&"Sonnet ✓"),
+            "current model marked: {labels:?}"
+        );
+        assert!(
+            labels.contains(&"Default"),
+            "other model unmarked: {labels:?}"
+        );
         let cmds: Vec<&str> = children
             .iter()
             .filter_map(|c| match &c.action {
@@ -12118,7 +13021,11 @@ fn agent_menu_lists_advertised_models_and_marks_current(cx: &mut TestAppContext)
             .iter()
             .map(|child| crate::format_menu_key(&child.key))
             .collect();
-        assert_eq!(keys, vec!["1", "2"], "model choices use stable numbered keys");
+        assert_eq!(
+            keys,
+            vec!["1", "2"],
+            "model choices use stable numbered keys"
+        );
     });
 }
 
@@ -12152,7 +13059,9 @@ fn set_agent_model_issues_set_config_on_channel(cx: &mut TestAppContext) {
 fn mark_chord_fires_for_m_and_apostrophe_in_idle_nav(cx: &mut TestAppContext) {
     for (key, expect) in [("m", 'm'), ("'", '\'')] {
         let (view, vcx) = boot_worksheet_nav(cx);
-        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(key), w, cx));
+        view.update_in(vcx, |v, w, cx| {
+            v.handle_claude_key(&ws_bare_key(key), w, cx)
+        });
         vcx.run_until_parked();
         view.update(vcx, |v, _| {
             assert_eq!(
@@ -12233,7 +13142,9 @@ fn worksheet_typing_after_clear_is_visible_without_pressing_i(cx: &mut TestAppCo
     }
     vcx.run_until_parked();
     let text = view
-        .update(vcx, |v, cx| v.agent_read(cx, |c| c.input_surface.compose().text()))
+        .update(vcx, |v, cx| {
+            v.agent_read(cx, |c| c.input_surface.compose().text())
+        })
         .unwrap();
     assert_eq!(
         text.trim(),
@@ -12280,18 +13191,27 @@ fn repro_clear_worksheet_typed_text_repaints_simulated(cx: &mut TestAppContext) 
     let base = crate::perf_render_count("transcript");
 
     // The user types — NO `i`, NO mode toggle — via the REAL key handler.
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("h"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("h"), w, cx)
+    });
     vcx.run_until_parked();
     let after = crate::perf_render_count("transcript");
 
     let (active, text) = view
         .update(vcx, |v, cx| {
             v.agent_read(cx, |c| {
-                (c.inline_you_block_active(), c.input_surface.compose().text())
+                (
+                    c.inline_you_block_active(),
+                    c.input_surface.compose().text(),
+                )
             })
         })
         .expect("session");
-    assert_eq!(text.trim(), "h", "sanity: the char landed in the compose buffer");
+    assert_eq!(
+        text.trim(),
+        "h",
+        "sanity: the char landed in the compose buffer"
+    );
     assert!(
         active,
         "inline You-block must be active after /clear so the keystroke renders"
@@ -12333,7 +13253,13 @@ fn repro_clear_worksheet_typed_text_repaints_real_path(cx: &mut TestAppContext) 
     // settle. THE UNTESTED TAIL — driven through the REAL reducer.
     view.update(vcx, |v, cx| {
         v.apply_server_batch(
-            vec![agent_note("S1", 1, 1, 0, K::ChannelOpened { resumed: false })],
+            vec![agent_note(
+                "S1",
+                1,
+                1,
+                0,
+                K::ChannelOpened { resumed: false },
+            )],
             cx,
         );
     });
@@ -12345,7 +13271,9 @@ fn repro_clear_worksheet_typed_text_repaints_real_path(cx: &mut TestAppContext) 
     let base = crate::perf_render_count("transcript");
 
     // The user types — NO `i`, NO mode toggle — through the REAL key handler.
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("h"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("h"), w, cx)
+    });
     vcx.run_until_parked();
     let after = crate::perf_render_count("transcript");
 
@@ -12362,7 +13290,11 @@ fn repro_clear_worksheet_typed_text_repaints_real_path(cx: &mut TestAppContext) 
             })
         })
         .expect("session still bound");
-    assert_eq!(text.trim(), "h", "sanity: the char landed in the compose buffer");
+    assert_eq!(
+        text.trim(),
+        "h",
+        "sanity: the char landed in the compose buffer"
+    );
     assert!(
         active,
         "REAL PATH: inline You-block inactive after /clear + ChannelOpened replay \
@@ -12438,7 +13370,9 @@ fn clear_worksheet_hole_types_and_paints(cx: &mut TestAppContext) {
     // REAL typing + REAL render, with the paint probe active so the keystroke's
     // re-render (if any) is captured.
     crate::layout_probe_begin();
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("h"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("h"), w, cx)
+    });
     vcx.run_until_parked();
     let after = crate::perf_render_count("transcript");
     let you_block = crate::layout_probe_get("you-block");
@@ -12446,17 +13380,23 @@ fn clear_worksheet_hole_types_and_paints(cx: &mut TestAppContext) {
     crate::layout_probe_end();
 
     let text = view
-        .update(vcx, |v, cx| v.agent_read(cx, |c| c.input_surface.compose().text()))
+        .update(vcx, |v, cx| {
+            v.agent_read(cx, |c| c.input_surface.compose().text())
+        })
         .expect("session");
-    assert_eq!(text.trim(), "h", "sanity: the char landed in the compose buffer");
+    assert_eq!(
+        text.trim(),
+        "h",
+        "sanity: the char landed in the compose buffer"
+    );
     // The assertions the six prior fixes never made — RENDER + PAINT, not buffer:
     assert!(
         after > base,
         "typing in the hole MUST bust the cached transcript (render count {base} -> {after}); \
          flat == the invisible-text bug",
     );
-    let (_, by, _, bh) = you_block
-        .expect("typing in the hole MUST paint an inline You-block (invisible-text bug)");
+    let (_, by, _, bh) =
+        you_block.expect("typing in the hole MUST paint an inline You-block (invisible-text bug)");
     let (_, vy, _, vh) = viewport.expect("transcript viewport did not paint");
     // The block must paint INSIDE the visible viewport — a block painted off-screen
     // would be just as invisible (non-vacuous paint, critique axis 5.2).
@@ -12493,7 +13433,13 @@ fn repro_clear_worksheet_typed_text_repaints_fresh_transcript_view(cx: &mut Test
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         v.apply_server_batch(
-            vec![agent_note("S1", 1, 1, 0, K::ChannelOpened { resumed: false })],
+            vec![agent_note(
+                "S1",
+                1,
+                1,
+                0,
+                K::ChannelOpened { resumed: false },
+            )],
             cx,
         );
     });
@@ -12510,16 +13456,27 @@ fn repro_clear_worksheet_typed_text_repaints_fresh_transcript_view(cx: &mut Test
     vcx.run_until_parked();
     let base = crate::perf_render_count("transcript");
 
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("h"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("h"), w, cx)
+    });
     vcx.run_until_parked();
     let after = crate::perf_render_count("transcript");
 
     let (active, text) = view
         .update(vcx, |v, cx| {
-            v.agent_read(cx, |c| (c.inline_you_block_active(), c.input_surface.compose().text()))
+            v.agent_read(cx, |c| {
+                (
+                    c.inline_you_block_active(),
+                    c.input_surface.compose().text(),
+                )
+            })
         })
         .expect("session");
-    assert_eq!(text.trim(), "h", "sanity: the char landed in the compose buffer");
+    assert_eq!(
+        text.trim(),
+        "h",
+        "sanity: the char landed in the compose buffer"
+    );
     assert!(active, "inline You-block active");
     assert!(
         after > base,
@@ -12598,7 +13555,9 @@ fn real_clear_server_branch_then_type_paints(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     crate::perf_reset("transcript");
     crate::layout_probe_begin();
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("x"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("x"), w, cx)
+    });
     vcx.run_until_parked();
     let ctrl_r = crate::perf_render_count("transcript");
     let ctrl_yb = crate::layout_probe_get("you-block");
@@ -12638,7 +13597,9 @@ fn real_clear_server_branch_then_type_paints(cx: &mut TestAppContext) {
 
     // Precondition: the typeable idle worksheet the user faces post-clear (non-vacuous).
     let (active, focus) = view
-        .update(vcx, |v, cx| v.agent_read(cx, |c| (c.inline_you_block_active(), c.focus)))
+        .update(vcx, |v, cx| {
+            v.agent_read(cx, |c| (c.inline_you_block_active(), c.focus))
+        })
         .expect("bound after resolution");
     assert!(
         active && focus == crate::AgentFocus::Compose,
@@ -12654,7 +13615,9 @@ fn real_clear_server_branch_then_type_paints(cx: &mut TestAppContext) {
 
     // REAL keystroke, through the REAL key handler, paint probe active.
     crate::layout_probe_begin();
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("h"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("h"), w, cx)
+    });
     vcx.run_until_parked();
     let after_r = crate::perf_render_count("transcript");
     let after_s = crate::perf_render_count(crate::YOU_BLOCK_SPLICE_LABEL);
@@ -12663,9 +13626,15 @@ fn real_clear_server_branch_then_type_paints(cx: &mut TestAppContext) {
     crate::layout_probe_end();
 
     let text = view
-        .update(vcx, |v, cx| v.agent_read(cx, |c| c.input_surface.compose().text()))
+        .update(vcx, |v, cx| {
+            v.agent_read(cx, |c| c.input_surface.compose().text())
+        })
         .expect("session");
-    assert_eq!(text.trim(), "h", "sanity: the char landed in the compose buffer");
+    assert_eq!(
+        text.trim(),
+        "h",
+        "sanity: the char landed in the compose buffer"
+    );
     assert!(
         after_r > base_r,
         "REAL PATH: typing after /clear MUST bust the cached transcript ({base_r} -> {after_r}); \
@@ -12820,13 +13789,29 @@ fn caret_token_split_lands_on_word_start(_cx: &mut TestAppContext) {
          not a blank box after the space"
     );
     // Mid-token still resolves inside the token.
-    assert_eq!(crate::caret_token_split(&lens, 1), Some((0, 1)), "col 1 = 2nd char of 'foo'");
+    assert_eq!(
+        crate::caret_token_split(&lens, 1),
+        Some((0, 1)),
+        "col 1 = 2nd char of 'foo'"
+    );
     // On the last char (Normal max) → owned by the last token.
-    assert_eq!(crate::caret_token_split(&lens, 6), Some((2, 2)), "col 6 = 'r' of 'bar'");
+    assert_eq!(
+        crate::caret_token_split(&lens, 6),
+        Some((2, 2)),
+        "col 6 = 'r' of 'bar'"
+    );
     // Past the last char (EOL beam) → no owner, caller draws a trailing caret.
-    assert_eq!(crate::caret_token_split(&lens, 7), None, "col 7 = EOL, trailing caret");
+    assert_eq!(
+        crate::caret_token_split(&lens, 7),
+        None,
+        "col 7 = EOL, trailing caret"
+    );
     // The space between words is owned by the space token, not the word after.
-    assert_eq!(crate::caret_token_split(&lens, 3), Some((1, 0)), "col 3 = the space itself");
+    assert_eq!(
+        crate::caret_token_split(&lens, 3),
+        Some((1, 0)),
+        "col 3 = the space itself"
+    );
 }
 
 /// Build a Cmd-modified (platform) key-down event — for verifying that unbound
@@ -12873,13 +13858,19 @@ fn edit_view_insert_arrows_move_caret_and_delete(cx: &mut TestAppContext) {
     key(&view, vcx, "right");
     key(&view, vcx, "right");
     key(&view, vcx, "right");
-    assert_eq!(col(&view, vcx), 3, "three Right presses move the caret to col 3");
+    assert_eq!(
+        col(&view, vcx),
+        3,
+        "three Right presses move the caret to col 3"
+    );
     key(&view, vcx, "end");
     assert_eq!(col(&view, vcx), 11, "End moves to the line end");
     key(&view, vcx, "home");
     assert_eq!(col(&view, vcx), 0, "Home moves to col 0");
     key(&view, vcx, "delete");
-    let text = view.update(vcx, |v, _| v.edit_mut().unwrap().editor.line_text_at_cursor());
+    let text = view.update(vcx, |v, _| {
+        v.edit_mut().unwrap().editor.line_text_at_cursor()
+    });
     assert_eq!(
         text.trim_end(),
         "ello world",
@@ -12896,7 +13887,9 @@ fn compose_insert_arrows_move_caret(cx: &mut TestAppContext) {
     let (view, vcx) = boot_worksheet_nav(cx);
     // `i` opens the tail You-block in Insert; then type "hello" through the real
     // dispatch so the caret advances char-by-char.
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("i"), w, cx)
+    });
     vcx.run_until_parked();
     for ch in ["h", "e", "l", "l", "o"] {
         view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(ch), w, cx));
@@ -12908,11 +13901,25 @@ fn compose_insert_arrows_move_caret(cx: &mut TestAppContext) {
                 .expect("session")
         })
     };
-    assert_eq!(col(&view, vcx), 5, "typing 'hello' leaves the caret at col 5");
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("left"), w, cx));
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("left"), w, cx));
-    assert_eq!(col(&view, vcx), 3, "two Left presses move the compose caret to col 3");
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("home"), w, cx));
+    assert_eq!(
+        col(&view, vcx),
+        5,
+        "typing 'hello' leaves the caret at col 5"
+    );
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("left"), w, cx)
+    });
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("left"), w, cx)
+    });
+    assert_eq!(
+        col(&view, vcx),
+        3,
+        "two Left presses move the compose caret to col 3"
+    );
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("home"), w, cx)
+    });
     assert_eq!(col(&view, vcx), 0, "Home moves the compose caret to col 0");
 }
 
@@ -12944,7 +13951,9 @@ fn buffer_enter_continues_nested_list_at_same_indent(cx: &mut TestAppContext) {
     key(&view, vcx, "end"); // caret to end of "  - foo"
     key(&view, vcx, "enter");
     key(&view, vcx, "x");
-    let line = view.update(vcx, |v, _| v.edit_mut().unwrap().editor.line_text_at_cursor());
+    let line = view.update(vcx, |v, _| {
+        v.edit_mut().unwrap().editor.line_text_at_cursor()
+    });
     assert_eq!(
         line.trim_end_matches('\n'),
         "  - x",
@@ -12964,7 +13973,9 @@ fn buffer_enter_continues_nested_list_at_same_indent(cx: &mut TestAppContext) {
 fn compose_enter_continues_nested_list_at_same_indent(cx: &mut TestAppContext) {
     let (view, vcx) = boot_worksheet_nav(cx);
     // `i` opens the tail You-block in Insert.
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("i"), w, cx)
+    });
     vcx.run_until_parked();
     // Seed an indented bullet with the caret at its end (avoids the keystroke
     // helper's inability to emit literal spaces).
@@ -12979,13 +13990,19 @@ fn compose_enter_continues_nested_list_at_same_indent(cx: &mut TestAppContext) {
             cur.col = "  - foo".chars().count();
         });
     });
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("enter"), w, cx));
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("x"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("enter"), w, cx)
+    });
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("x"), w, cx)
+    });
     let line = view.update(vcx, |v, cx| {
         use crate::EditOps;
         let id = v.focused_bound_session().expect("bound");
-        v.read_session(id, cx, |c| c.input_surface.compose().editor.line_text_at_cursor())
-            .expect("session")
+        v.read_session(id, cx, |c| {
+            c.input_surface.compose().editor.line_text_at_cursor()
+        })
+        .expect("session")
     });
     assert_eq!(
         line.trim_end_matches('\n'),
@@ -13064,15 +14081,25 @@ fn cmd_chord_does_not_type_into_edit_buffer(cx: &mut TestAppContext) {
     view.update(vcx, |v, _| v.test_open_edit("hi\n"));
     // Insert mode: cmd-g must not insert a 'g'.
     view.update_in(vcx, |v, w, cx| v.handle_edit_key(&ws_cmd_key("g"), w, cx));
-    let text = view.update(vcx, |v, _| v.edit_mut().unwrap().editor.line_text_at_cursor());
-    assert_eq!(text.trim_end(), "hi", "cmd-g inserts nothing in Insert mode");
+    let text = view.update(vcx, |v, _| {
+        v.edit_mut().unwrap().editor.line_text_at_cursor()
+    });
+    assert_eq!(
+        text.trim_end(),
+        "hi",
+        "cmd-g inserts nothing in Insert mode"
+    );
     // Normal mode: cmd-a must not run `insert-after` (which would flip to Insert).
     view.update(vcx, |v, _| {
         v.edit_mut().unwrap().mode = crate::EditMode::Normal;
     });
     view.update_in(vcx, |v, w, cx| v.handle_edit_key(&ws_cmd_key("a"), w, cx));
     let mode = view.update(vcx, |v, _| v.edit_mut().unwrap().mode);
-    assert_eq!(mode, crate::EditMode::Normal, "cmd-a does not fire insert-after");
+    assert_eq!(
+        mode,
+        crate::EditMode::Normal,
+        "cmd-a does not fire insert-after"
+    );
 }
 
 /// `focused_in_insert_mode` for the file BROWSER (`App::Buffer::Picking`): filter mode
@@ -13081,16 +14108,18 @@ fn cmd_chord_does_not_type_into_edit_buffer(cx: &mut TestAppContext) {
 #[gpui::test]
 fn focused_in_insert_mode_browser_arm(cx: &mut TestAppContext) {
     let (view, vcx) = boot_browser(cx);
-    let set_filter_read =
-        |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext, filter: bool| -> bool {
-            view.update(vcx, |v, cx| {
-                if let Some(b) = v.browser_mut() {
-                    b.fb.filter_mode = filter;
-                    b.fb.rename = None;
-                }
-                v.focused_in_insert_mode(cx)
-            })
-        };
+    let set_filter_read = |view: &gpui::Entity<YaldaGpuiView>,
+                           vcx: &mut gpui::VisualTestContext,
+                           filter: bool|
+     -> bool {
+        view.update(vcx, |v, cx| {
+            if let Some(b) = v.browser_mut() {
+                b.fb.filter_mode = filter;
+                b.fb.rename = None;
+            }
+            v.focused_in_insert_mode(cx)
+        })
+    };
     assert!(
         !set_filter_read(&view, vcx, false),
         "idle browser is navigation (leaders fire)"
@@ -13255,9 +14284,11 @@ fn rail_filter_bound_keys_type_into_query(cx: &mut TestAppContext) {
         });
     };
 
-    read_fb(&view, vcx, &|fb| assert!(fb.filter_mode, "`/` entered rail filter"));
-    let dir_before =
-        view.read_with(vcx, |v, _| match &v
+    read_fb(&view, vcx, &|fb| {
+        assert!(fb.filter_mode, "`/` entered rail filter")
+    });
+    let dir_before = view.read_with(vcx, |v, _| {
+        match &v
             .workspace
             .active_workspace()
             .and_then(|t| t.rail.as_ref())
@@ -13266,7 +14297,8 @@ fn rail_filter_bound_keys_type_into_query(cx: &mut TestAppContext) {
         {
             crate::workspace::RailContent::FileBrowser(fb) => fb.current_dir().to_path_buf(),
             _ => unreachable!(),
-        });
+        }
+    });
 
     // Type keys that ARE bound rail actions: `s`=RailCycleSort, `w`=RailWorktrees,
     // `-`=RailParent. Each must become query text, not fire its action.
@@ -13306,12 +14338,18 @@ fn worksheet_insert_opens_and_empty_esc_discards_you_block(cx: &mut TestAppConte
     });
 
     // `i` opens a You-block.
-    view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("i"), window, cx));
+    view.update_in(vcx, |v, window, cx| {
+        v.handle_claude_key(&ws_bare_key("i"), window, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
         assert!(c.you_block_open, "i opens a You-block");
-        assert_eq!(c.focus, crate::AgentFocus::Compose, "focus moves to the block");
+        assert_eq!(
+            c.focus,
+            crate::AgentFocus::Compose,
+            "focus moves to the block"
+        );
         assert_eq!(
             c.input_surface.compose().mode,
             crate::EditMode::Insert,
@@ -13321,14 +14359,23 @@ fn worksheet_insert_opens_and_empty_esc_discards_you_block(cx: &mut TestAppConte
 
     // Type only whitespace, then Esc Esc → drop to Normal, then leave → discard
     // (layered Esc: 1st = Normal in the block, 2nd = leave; empty ⇒ discard).
-    view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("space"), window, cx));
+    view.update_in(vcx, |v, window, cx| {
+        v.handle_claude_key(&ws_bare_key("space"), window, cx)
+    });
     vcx.run_until_parked();
-    view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("escape"), window, cx));
-    view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("escape"), window, cx));
+    view.update_in(vcx, |v, window, cx| {
+        v.handle_claude_key(&ws_bare_key("escape"), window, cx)
+    });
+    view.update_in(vcx, |v, window, cx| {
+        v.handle_claude_key(&ws_bare_key("escape"), window, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
-        assert!(!c.you_block_open, "empty Esc discards the You-block (rule 3)");
+        assert!(
+            !c.you_block_open,
+            "empty Esc discards the You-block (rule 3)"
+        );
         assert_eq!(c.focus, crate::AgentFocus::Transcript, "back to navigation");
         assert!(
             c.input_surface.compose().text().trim().is_empty(),
@@ -13349,29 +14396,53 @@ fn worksheet_insert_opens_and_empty_esc_discards_you_block(cx: &mut TestAppConte
 fn worksheet_nonempty_you_block_persists_after_esc(cx: &mut TestAppContext) {
     let (view, vcx) = boot_worksheet_nav(cx);
 
-    view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("i"), window, cx));
+    view.update_in(vcx, |v, window, cx| {
+        v.handle_claude_key(&ws_bare_key("i"), window, cx)
+    });
     vcx.run_until_parked();
     for k in ["h", "i"] {
-        view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key(k), window, cx));
+        view.update_in(vcx, |v, window, cx| {
+            v.handle_claude_key(&ws_bare_key(k), window, cx)
+        });
     }
     vcx.run_until_parked();
     // 1st Esc → Normal IN the block (edit-in-place); focus stays on the compose.
-    view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("escape"), window, cx));
+    view.update_in(vcx, |v, window, cx| {
+        v.handle_claude_key(&ws_bare_key("escape"), window, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
-        assert_eq!(c.focus, crate::AgentFocus::Compose, "1st Esc stays in the block");
-        assert_eq!(c.input_surface.compose().mode, crate::EditMode::Normal, "now Normal");
+        assert_eq!(
+            c.focus,
+            crate::AgentFocus::Compose,
+            "1st Esc stays in the block"
+        );
+        assert_eq!(
+            c.input_surface.compose().mode,
+            crate::EditMode::Normal,
+            "now Normal"
+        );
         assert!(c.you_block_open);
     });
     // 2nd Esc → leave to nav; the non-empty block persists (rule 4).
-    view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("escape"), window, cx));
+    view.update_in(vcx, |v, window, cx| {
+        v.handle_claude_key(&ws_bare_key("escape"), window, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
         assert!(c.you_block_open, "non-empty block persists (rule 4)");
-        assert_eq!(c.focus, crate::AgentFocus::Transcript, "2nd Esc returns to nav");
-        assert_eq!(c.input_surface.compose().text().trim(), "hi", "draft retained");
+        assert_eq!(
+            c.focus,
+            crate::AgentFocus::Transcript,
+            "2nd Esc returns to nav"
+        );
+        assert_eq!(
+            c.input_surface.compose().text().trim(),
+            "hi",
+            "draft retained"
+        );
     });
 
     // Re-entering Insert at the SAME anchor resumes the block, text kept.
@@ -13381,13 +14452,19 @@ fn worksheet_nonempty_you_block_persists_after_esc(cx: &mut TestAppContext) {
             v.agent_mut(cx).expect("agent").editor.cursor_mut().line = a;
         }
     });
-    view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("i"), window, cx));
+    view.update_in(vcx, |v, window, cx| {
+        v.handle_claude_key(&ws_bare_key("i"), window, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
         assert!(c.you_block_open);
         assert_eq!(c.focus, crate::AgentFocus::Compose);
-        assert_eq!(c.input_surface.compose().text().trim(), "hi", "same block, text kept");
+        assert_eq!(
+            c.input_surface.compose().text().trim(),
+            "hi",
+            "same block, text kept"
+        );
     });
 }
 
@@ -13398,31 +14475,54 @@ fn worksheet_nonempty_you_block_persists_after_esc(cx: &mut TestAppContext) {
 #[gpui::test]
 fn worksheet_block_normal_then_insert_again(cx: &mut TestAppContext) {
     let (view, vcx) = boot_worksheet_nav(cx);
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("i"), w, cx)
+    });
     for ch in ["h", "e", "l", "l", "o"] {
         view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(ch), w, cx));
     }
     vcx.run_until_parked();
     // 1st Esc → Normal IN the block (still the active surface).
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("escape"), w, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
-        assert_eq!(c.focus, crate::AgentFocus::Compose, "stay in the block, not nav");
+        assert_eq!(
+            c.focus,
+            crate::AgentFocus::Compose,
+            "stay in the block, not nav"
+        );
         assert_eq!(c.input_surface.compose().mode, crate::EditMode::Normal);
-        assert!(c.inline_you_block_active(), "block still the visible active surface");
+        assert!(
+            c.inline_you_block_active(),
+            "block still the visible active surface"
+        );
     });
     // A Helix motion edits within the reply (Normal-mode key routes to the compose).
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("b"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("b"), w, cx)
+    });
     vcx.run_until_parked();
     // `i` re-enters Insert into the SAME region (the reported bug: couldn't do this).
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("i"), w, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
         assert_eq!(c.focus, crate::AgentFocus::Compose);
-        assert_eq!(c.input_surface.compose().mode, crate::EditMode::Insert, "back in Insert");
-        assert_eq!(c.input_surface.compose().text().trim(), "hello", "same block, text intact");
+        assert_eq!(
+            c.input_surface.compose().mode,
+            crate::EditMode::Insert,
+            "back in Insert"
+        );
+        assert_eq!(
+            c.input_surface.compose().text().trim(),
+            "hello",
+            "same block, text intact"
+        );
         assert!(c.parked_you_blocks.is_empty(), "no spurious second block");
     });
 }
@@ -13436,11 +14536,19 @@ fn worksheet_compose_visibility_tracks_block_and_turn(cx: &mut TestAppContext) {
     let (view, vcx) = boot_worksheet_nav(cx);
 
     // Idle, navigating, no block → no inline block, no bottom box.
-    assert!(probe_dirty(&view, vcx, "you-block").is_none(), "idle nav: no inline block");
-    assert!(probe_dirty(&view, vcx, "compose-box").is_none(), "idle nav: no bottom box");
+    assert!(
+        probe_dirty(&view, vcx, "you-block").is_none(),
+        "idle nav: no inline block"
+    );
+    assert!(
+        probe_dirty(&view, vcx, "compose-box").is_none(),
+        "idle nav: no bottom box"
+    );
 
     // Open a You-block → it paints INLINE, not as the bottom box (rules 2/6).
-    view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("i"), window, cx));
+    view.update_in(vcx, |v, window, cx| {
+        v.handle_claude_key(&ws_bare_key("i"), window, cx)
+    });
     vcx.run_until_parked();
     assert!(
         probe_dirty(&view, vcx, "you-block").is_some(),
@@ -13452,10 +14560,17 @@ fn worksheet_compose_visibility_tracks_block_and_turn(cx: &mut TestAppContext) {
     );
 
     // Discard (Esc Esc: Normal then leave; empty ⇒ discard), then go mid-turn.
-    view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("escape"), window, cx));
-    view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("escape"), window, cx));
+    view.update_in(vcx, |v, window, cx| {
+        v.handle_claude_key(&ws_bare_key("escape"), window, cx)
+    });
+    view.update_in(vcx, |v, window, cx| {
+        v.handle_claude_key(&ws_bare_key("escape"), window, cx)
+    });
     vcx.run_until_parked();
-    assert!(probe_dirty(&view, vcx, "you-block").is_none(), "discarded → no inline block");
+    assert!(
+        probe_dirty(&view, vcx, "you-block").is_none(),
+        "discarded → no inline block"
+    );
     view.update(vcx, |v, cx| {
         let mut c = v.agent_mut(cx).expect("agent");
         c.turn_phase = crate::TurnPhase::begin(std::time::Instant::now());
@@ -13483,7 +14598,9 @@ fn worksheet_inline_typing_rerenders_transcript(cx: &mut TestAppContext) {
     let (view, vcx) = boot_worksheet_nav(cx);
 
     // Open a You-block, then settle one frame so the baseline excludes the open.
-    view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("i"), window, cx));
+    view.update_in(vcx, |v, window, cx| {
+        v.handle_claude_key(&ws_bare_key("i"), window, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
@@ -13491,7 +14608,9 @@ fn worksheet_inline_typing_rerenders_transcript(cx: &mut TestAppContext) {
 
     // Type into the inline block — each keystroke must bust the transcript cache.
     for k in ["h", "e", "l", "l", "o"] {
-        view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key(k), window, cx));
+        view.update_in(vcx, |v, window, cx| {
+            v.handle_claude_key(&ws_bare_key(k), window, cx)
+        });
         vcx.run_until_parked();
     }
     let after = crate::perf_render_count("transcript");
@@ -13503,7 +14622,12 @@ fn worksheet_inline_typing_rerenders_transcript(cx: &mut TestAppContext) {
     );
     view.update(vcx, |v, cx| {
         assert_eq!(
-            v.agent_mut(cx).expect("agent").input_surface.compose().text().trim(),
+            v.agent_mut(cx)
+                .expect("agent")
+                .input_surface
+                .compose()
+                .text()
+                .trim(),
             "hello",
             "the typed text landed in the compose draft"
         );
@@ -13541,16 +14665,17 @@ fn worksheet_you_block_anchors_at_cursor_not_tail(cx: &mut TestAppContext) {
 
     // Park the transcript caret on the FIRST line of the latest turn (an early,
     // legal anchor), then open a block there.
-    let (anchor, last_line) = view
-        .update(vcx, |v, cx| {
-            let mut c = v.agent_mut(cx).expect("agent");
-            let (s, _e) = c.latest_agent_turn_range().unwrap_or((0, 0));
-            c.editor.cursor_mut().line = s;
-            (s, c.editor.document().line_count().saturating_sub(1))
-        });
+    let (anchor, last_line) = view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        let (s, _e) = c.latest_agent_turn_range().unwrap_or((0, 0));
+        c.editor.cursor_mut().line = s;
+        (s, c.editor.document().line_count().saturating_sub(1))
+    });
     assert!(anchor < last_line, "anchor is genuinely above the tail");
 
-    view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("i"), window, cx));
+    view.update_in(vcx, |v, window, cx| {
+        v.handle_claude_key(&ws_bare_key("i"), window, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
@@ -13607,7 +14732,9 @@ fn worksheet_r_seeds_reply_quote_from_agent_line(cx: &mut TestAppContext) {
         c.editor.cursor_mut().line = s;
     });
 
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("r"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("r"), w, cx)
+    });
     vcx.run_until_parked();
 
     view.update(vcx, |v, cx| {
@@ -13665,7 +14792,9 @@ fn worksheet_r_first_paint_uses_transcript_width(cx: &mut TestAppContext) {
     let (_, _, viewport_w, _) =
         probe_dirty(&view, vcx, "transcript-viewport").expect("transcript viewport paints");
     crate::layout_probe_begin();
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("r"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("r"), w, cx)
+    });
     vcx.run_until_parked();
     let (_, _, block_w, block_h) =
         crate::layout_probe_get("you-block").expect("seeded You-block paints on first settle");
@@ -13721,7 +14850,9 @@ fn worksheet_v_line_select_feeds_r(cx: &mut TestAppContext) {
         c.editor.cursor_mut().col = 0;
     });
     // `V` selects the WHOLE current line.
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("V"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("V"), w, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
@@ -13737,7 +14868,9 @@ fn worksheet_v_line_select_feeds_r(cx: &mut TestAppContext) {
         );
     });
     // `r` quotes the SELECTION, not just the first sentence.
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("r"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("r"), w, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
@@ -13781,9 +14914,13 @@ fn worksheet_v_char_select_feeds_r(cx: &mut TestAppContext) {
         c.editor.cursor_mut().col = 0;
     });
     // `v` starts char-wise visual; five `l` extend the head to col 5 ⇒ "First".
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("v"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("v"), w, cx)
+    });
     for _ in 0..5 {
-        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("l"), w, cx));
+        view.update_in(vcx, |v, w, cx| {
+            v.handle_claude_key(&ws_bare_key("l"), w, cx)
+        });
     }
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
@@ -13794,7 +14931,9 @@ fn worksheet_v_char_select_feeds_r(cx: &mut TestAppContext) {
             "v + 5×l selected the first five chars"
         );
     });
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("r"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("r"), w, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
@@ -13851,8 +14990,12 @@ fn worksheet_r_replies_across_turn_boundary(cx: &mut TestAppContext) {
         c.editor.cursor_mut().col = 0;
     });
     // `V` selects the whole OLD line; `r` replies across the boundary.
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("V"), w, cx));
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("r"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("V"), w, cx)
+    });
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("r"), w, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
@@ -13908,8 +15051,12 @@ fn worksheet_v_then_j_extends_selection(cx: &mut TestAppContext) {
         c.editor.cursor_mut().line = s;
         c.editor.cursor_mut().col = 0;
     });
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("V"), w, cx));
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("j"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("V"), w, cx)
+    });
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("j"), w, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
@@ -13959,8 +15106,12 @@ fn worksheet_v_then_k_selects_whole_previous_line(cx: &mut TestAppContext) {
         c.editor.cursor_mut().set_pos(base + 1, 0);
     });
 
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("V"), w, cx));
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("k"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("V"), w, cx)
+    });
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("k"), w, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
@@ -14006,8 +15157,12 @@ fn worksheet_multiline_selection_quotes_per_line(cx: &mut TestAppContext) {
         c.editor.cursor_mut().col = 0;
     });
     // `V` `V` selects the first two lines line-wise.
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("V"), w, cx));
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("V"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("V"), w, cx)
+    });
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("V"), w, cx)
+    });
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
         assert_eq!(
@@ -14016,7 +15171,9 @@ fn worksheet_multiline_selection_quotes_per_line(cx: &mut TestAppContext) {
             "V V selected two whole lines"
         );
     });
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("r"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("r"), w, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
@@ -14059,8 +15216,12 @@ fn worksheet_esc_exits_extend_mode_stops_autohighlight(cx: &mut TestAppContext) 
         c.editor.cursor_mut().col = 0;
     });
     // Enter char-select and extend — extend mode is now ON.
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("v"), w, cx));
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("l"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("v"), w, cx)
+    });
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("l"), w, cx)
+    });
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
         assert!(c.editor.extend_mode(), "v turned extend mode on");
@@ -14070,7 +15231,9 @@ fn worksheet_esc_exits_extend_mode_stops_autohighlight(cx: &mut TestAppContext) 
         );
     });
     // Esc cancels the selection + exits extend mode.
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("escape"), w, cx)
+    });
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
         assert!(!c.editor.extend_mode(), "Esc exited extend mode");
@@ -14080,15 +15243,22 @@ fn worksheet_esc_exits_extend_mode_stops_autohighlight(cx: &mut TestAppContext) 
         );
     });
     // Now plain navigation must NOT auto-highlight.
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("j"), w, cx));
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("j"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("j"), w, cx)
+    });
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("j"), w, cx)
+    });
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
         let sel = c
             .editor
             .selection_range()
             .filter(|&((sl, sc), (el, ec))| (sl, sc) != (el, ec));
-        assert!(sel.is_none(), "navigating after Esc must not highlight; got {sel:?}");
+        assert!(
+            sel.is_none(),
+            "navigating after Esc must not highlight; got {sel:?}"
+        );
     });
 }
 
@@ -14122,14 +15292,18 @@ fn worksheet_reply_clears_extend_mode(cx: &mut TestAppContext) {
         c.editor.cursor_mut().line = s;
         c.editor.cursor_mut().col = 0;
     });
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("V"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("V"), w, cx)
+    });
     view.update(vcx, |v, cx| {
         assert!(
             v.agent_mut(cx).unwrap().editor.extend_mode(),
             "V turned extend mode on"
         );
     });
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("r"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("r"), w, cx)
+    });
     view.update(vcx, |v, cx| {
         assert!(
             !v.agent_mut(cx).unwrap().editor.extend_mode(),
@@ -14172,13 +15346,21 @@ fn worksheet_char_select_caret_is_beam(cx: &mut TestAppContext) {
         c.editor.cursor_mut().col = 0;
     });
     // Start a char-wise selection and extend it.
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("v"), w, cx));
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("l"), w, cx));
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("l"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("v"), w, cx)
+    });
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("l"), w, cx)
+    });
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("l"), w, cx)
+    });
     vcx.run_until_parked();
     // Reset the tap, extend once more to force a fresh paint of the cursor line.
     YaldaGpuiView::test_reset_doc_render_tap();
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("l"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("l"), w, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
@@ -14236,11 +15418,17 @@ fn worksheet_replied_to_source_shows_marker_when_not_typing(cx: &mut TestAppCont
         s
     });
     // `r` opens the reply, seeded + in Insert. WHILE TYPING the marker is hidden.
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("r"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("r"), w, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
-        assert_eq!(c.reply_source_range, Some((src, src + 1)), "source captured");
+        assert_eq!(
+            c.reply_source_range,
+            Some((src, src + 1)),
+            "source captured"
+        );
         assert_eq!(
             c.reply_marker_range(),
             None,
@@ -14249,7 +15437,9 @@ fn worksheet_replied_to_source_shows_marker_when_not_typing(cx: &mut TestAppCont
     });
     // `escape` drops the compose to Normal → NOT typing → the marker is shown.
     YaldaGpuiView::test_reset_doc_render_tap();
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("escape"), w, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
@@ -14267,11 +15457,16 @@ fn worksheet_replied_to_source_shows_marker_when_not_typing(cx: &mut TestAppCont
     );
     // `u` pops the reply (seeded baseline has no undo history) → marker clears.
     YaldaGpuiView::test_reset_doc_render_tap();
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("u"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("u"), w, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
-        assert_eq!(c.reply_source_range, None, "reply abandoned ⇒ source cleared");
+        assert_eq!(
+            c.reply_source_range, None,
+            "reply abandoned ⇒ source cleared"
+        );
         assert_eq!(c.reply_marker_range(), None, "marker gone after pop");
     });
     let tap = YaldaGpuiView::test_doc_render_tap();
@@ -14304,7 +15499,9 @@ fn worksheet_esc_u_backs_out_reply_block(cx: &mut TestAppContext) {
     view.update(vcx, |v, cx| {
         v.apply_server_batch(
             vec![
-                ev(ReplyEvent::Chunk("First sentence. Second sentence.\n".into())),
+                ev(ReplyEvent::Chunk(
+                    "First sentence. Second sentence.\n".into(),
+                )),
                 ev(ReplyEvent::TurnEnded { count: 1 }),
             ],
             cx,
@@ -14312,7 +15509,8 @@ fn worksheet_esc_u_backs_out_reply_block(cx: &mut TestAppContext) {
     });
     vcx.run_until_parked();
 
-    let park_on_agent_line = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+    let park_on_agent_line = |view: &gpui::Entity<YaldaGpuiView>,
+                              vcx: &mut gpui::VisualTestContext| {
         view.update(vcx, |v, cx| {
             let mut c = v.agent_mut(cx).expect("agent");
             let (s, _e) = c.latest_agent_turn_range().unwrap_or((0, 0));
@@ -14322,7 +15520,9 @@ fn worksheet_esc_u_backs_out_reply_block(cx: &mut TestAppContext) {
 
     // ── Common flow: r → Esc → u pops on the FIRST u ────────────────────────
     park_on_agent_line(&view, vcx);
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("r"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("r"), w, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
@@ -14334,7 +15534,9 @@ fn worksheet_esc_u_backs_out_reply_block(cx: &mut TestAppContext) {
         );
     });
     // 1st Esc: compose → Normal, still in the block.
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("escape"), w, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
@@ -14346,7 +15548,9 @@ fn worksheet_esc_u_backs_out_reply_block(cx: &mut TestAppContext) {
         );
     });
     // u: nothing to undo (committed baseline) → pop the block.
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("u"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("u"), w, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
@@ -14364,38 +15568,59 @@ fn worksheet_esc_u_backs_out_reply_block(cx: &mut TestAppContext) {
 
     // ── Layered case: undo the typing first, THEN pop ───────────────────────
     park_on_agent_line(&view, vcx);
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("r"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("r"), w, cx)
+    });
     vcx.run_until_parked();
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("escape"), w, cx)
+    });
     vcx.run_until_parked();
     // Re-enter Insert and type a character.
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("x"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("i"), w, cx)
+    });
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("x"), w, cx)
+    });
     vcx.run_until_parked();
     let typed = view.update(vcx, |v, cx| {
         v.agent_mut(cx).unwrap().input_surface.compose().text()
     });
     assert!(typed.contains('x'), "typed x is in the draft: {typed:?}");
     // Esc → Normal, then u: undoes the typing, block STAYS open.
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("escape"), w, cx)
+    });
     vcx.run_until_parked();
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("u"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("u"), w, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
-        assert!(c.you_block_open, "1st u undid the typing; the block stays open");
+        assert!(
+            c.you_block_open,
+            "1st u undid the typing; the block stays open"
+        );
         assert!(
             !c.input_surface.compose().text().contains('x'),
             "the typed x was undone"
         );
     });
     // 2nd u: nothing left to undo → pop.
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("u"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("u"), w, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
         assert!(!c.you_block_open, "2nd u popped the block");
-        assert_eq!(c.focus, crate::AgentFocus::Transcript, "back to transcript nav");
+        assert_eq!(
+            c.focus,
+            crate::AgentFocus::Transcript,
+            "back to transcript nav"
+        );
     });
 }
 
@@ -14429,8 +15654,12 @@ fn worksheet_count_r_quotes_n_sentences(cx: &mut TestAppContext) {
     });
 
     // `3` accumulates the count; `r` consumes it → the first THREE sentences.
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("3"), w, cx));
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("r"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("3"), w, cx)
+    });
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("r"), w, cx)
+    });
     vcx.run_until_parked();
 
     view.update(vcx, |v, cx| {
@@ -14473,19 +15702,27 @@ fn worksheet_r_noop_on_blank_line(cx: &mut TestAppContext) {
         let mut c = v.agent_mut(cx).expect("agent");
         let last = c.editor.document().line_count().saturating_sub(1);
         c.editor.cursor_mut().line = last;
-        assert!(c.you_block_anchor_is_legal(last), "the tail is a legal anchor");
+        assert!(
+            c.you_block_anchor_is_legal(last),
+            "the tail is a legal anchor"
+        );
         assert!(
             c.editor.document().line_text(last).trim().is_empty(),
             "the tail line is blank — nothing to quote"
         );
     });
 
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("r"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("r"), w, cx)
+    });
     vcx.run_until_parked();
 
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
-        assert!(!c.you_block_open, "r is a no-op when there is nothing to quote");
+        assert!(
+            !c.you_block_open,
+            "r is a no-op when there is nothing to quote"
+        );
     });
 }
 
@@ -14495,21 +15732,32 @@ fn worksheet_r_noop_on_blank_line(cx: &mut TestAppContext) {
 #[gpui::test]
 fn m_is_typeable_in_compose(cx: &mut TestAppContext) {
     let (view, vcx) = boot_worksheet_nav(cx);
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("i"), w, cx)
+    });
     for ch in ["m", "a", "p"] {
         view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(ch), w, cx));
     }
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         assert_eq!(
-            v.agent_mut(cx).expect("agent").input_surface.compose().text().trim(),
+            v.agent_mut(cx)
+                .expect("agent")
+                .input_surface
+                .compose()
+                .text()
+                .trim(),
             "map",
             "m types in the compose (Insert), not eaten by a mark chord"
         );
     });
     // Drop to compose-Normal (1st Esc), press m → still no mark chord started.
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("m"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("escape"), w, cx)
+    });
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("m"), w, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, _cx| {
         assert!(
@@ -14549,29 +15797,43 @@ fn worksheet_cursor_on_existing_block_resumes_it(cx: &mut TestAppContext) {
         s
     });
     // Block 1 "first" at s, Esc Esc to nav.
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("i"), w, cx)
+    });
     for ch in ["f", "i", "r", "s", "t"] {
         view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(ch), w, cx));
     }
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("escape"), w, cx)
+    });
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("escape"), w, cx)
+    });
     // Block 2 "second" at s+2, Esc Esc to nav (block 1 now parked).
     view.update(vcx, |v, cx| {
         v.agent_mut(cx).expect("agent").editor.cursor_mut().line = s + 2;
     });
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("i"), w, cx)
+    });
     for ch in ["s", "e", "c"] {
         view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(ch), w, cx));
     }
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("escape"), w, cx)
+    });
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("escape"), w, cx)
+    });
     vcx.run_until_parked();
 
     // Navigate BACK to block 1's anchor (s) and press i → RESUMES block 1, not a 3rd.
     view.update(vcx, |v, cx| {
         v.agent_mut(cx).expect("agent").editor.cursor_mut().line = s;
     });
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("i"), w, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
@@ -14618,18 +15880,26 @@ fn worksheet_multiple_insertion_points(cx: &mut TestAppContext) {
         c.editor.cursor_mut().line = s;
         s
     });
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("i"), w, cx)
+    });
     for ch in ["o", "n", "e"] {
         view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(ch), w, cx));
     }
     // Esc Esc back to nav (1st = Normal in block, 2nd = leave; block 1 persists),
     // navigate down, then `i` for a 2nd insertion point.
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("escape"), w, cx)
+    });
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("escape"), w, cx)
+    });
     view.update(vcx, |v, cx| {
         v.agent_mut(cx).expect("agent").editor.cursor_mut().line = s + 2;
     });
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("i"), w, cx)
+    });
     for ch in ["t", "w", "o"] {
         view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(ch), w, cx));
     }
@@ -14640,7 +15910,11 @@ fn worksheet_multiple_insertion_points(cx: &mut TestAppContext) {
     view.update(vcx, |v, cx| {
         let mut c = v.agent_mut(cx).expect("agent");
         // State: one parked ("one"), one active ("two").
-        assert_eq!(c.parked_you_blocks.len(), 1, "two insertion points (1 parked + active)");
+        assert_eq!(
+            c.parked_you_blocks.len(),
+            1,
+            "two insertion points (1 parked + active)"
+        );
         assert_eq!(c.parked_you_blocks[0].1.trim(), "one");
         assert_eq!(c.input_surface.compose().text().trim(), "two");
         // Render: two inline YouBlocks.
@@ -14656,7 +15930,10 @@ fn worksheet_multiple_insertion_points(cx: &mut TestAppContext) {
         assert_eq!(blocks.len(), 2, "gather returns both blocks");
         c.freeze_you_blocks(&blocks, 1);
         let full = c.editor.document().full_text();
-        assert!(full.contains("one") && full.contains("two"), "both frozen in place");
+        assert!(
+            full.contains("one") && full.contains("two"),
+            "both frozen in place"
+        );
     });
 }
 
@@ -14698,19 +15975,27 @@ fn worksheet_you_blocks_never_render_adjacent(cx: &mut TestAppContext) {
     view.update(vcx, |v, cx| {
         v.agent_mut(cx).expect("agent").move_cursor_to_tail();
     });
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("o"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("o"), w, cx)
+    });
     for ch in ["h", "i"] {
         view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(ch), w, cx));
     }
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("escape"), w, cx)
+    });
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("escape"), w, cx)
+    });
     vcx.run_until_parked();
 
     // Move the caret UP one legal line and press `o` — the exact reported gesture.
     view.update(vcx, |v, cx| {
         v.agent_mut(cx).expect("agent").editor.cursor_mut().line = 3;
     });
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("o"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("o"), w, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
@@ -14723,10 +16008,20 @@ fn worksheet_you_blocks_never_render_adjacent(cx: &mut TestAppContext) {
             matches!(w[0], crate::FlatItem::YouBlock { .. })
                 && matches!(w[1], crate::FlatItem::YouBlock { .. })
         });
-        assert!(!adjacent, "two You-blocks rendered adjacent (bug-0004): {items:?}");
+        assert!(
+            !adjacent,
+            "two You-blocks rendered adjacent (bug-0004): {items:?}"
+        );
         // And the "hi" reply was RESUMED (not orphaned into a hidden parked block).
-        assert!(c.parked_you_blocks.is_empty(), "no spurious second insertion point");
-        assert_eq!(c.input_surface.compose().text().trim(), "hi", "the existing reply is resumed");
+        assert!(
+            c.parked_you_blocks.is_empty(),
+            "no spurious second insertion point"
+        );
+        assert_eq!(
+            c.input_surface.compose().text().trim(),
+            "hi",
+            "the existing reply is resumed"
+        );
         let n_you = items
             .iter()
             .filter(|it| matches!(it, crate::FlatItem::YouBlock { .. }))
@@ -14767,13 +16062,19 @@ fn worksheet_reentering_insert_keeps_block_anchor(cx: &mut TestAppContext) {
         c.editor.cursor_mut().line = s;
         s
     });
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("i"), w, cx)
+    });
     for k in ["h", "i"] {
         view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(k), w, cx));
     }
     // Esc Esc → Normal then leave to nav (block persists, non-empty).
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("escape"), w, cx)
+    });
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("escape"), w, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
@@ -14786,7 +16087,9 @@ fn worksheet_reentering_insert_keeps_block_anchor(cx: &mut TestAppContext) {
     view.update(vcx, |v, cx| {
         v.agent_mut(cx).expect("agent").editor.cursor_mut().line = anchor_a + 2;
     });
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("i"), w, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
@@ -14795,19 +16098,32 @@ fn worksheet_reentering_insert_keeps_block_anchor(cx: &mut TestAppContext) {
             1,
             "the first block is parked as a second insertion point"
         );
-        assert_eq!(c.parked_you_blocks[0].0, Some(anchor_a), "parked at its ORIGINAL anchor");
-        assert_eq!(c.parked_you_blocks[0].1.trim(), "hi", "parked text kept, not dragged");
+        assert_eq!(
+            c.parked_you_blocks[0].0,
+            Some(anchor_a),
+            "parked at its ORIGINAL anchor"
+        );
+        assert_eq!(
+            c.parked_you_blocks[0].1.trim(),
+            "hi",
+            "parked text kept, not dragged"
+        );
         assert_ne!(
             c.you_block_anchor,
             Some(anchor_a),
             "the new active block is at the new line, not A"
         );
-        assert!(c.input_surface.compose().text().trim().is_empty(), "fresh active block");
+        assert!(
+            c.input_surface.compose().text().trim().is_empty(),
+            "fresh active block"
+        );
         assert_eq!(c.focus, crate::AgentFocus::Compose);
     });
 
     // Pressing `i` again at the SAME (new) anchor resumes in place (no third block).
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("i"), w, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         assert_eq!(
@@ -14832,10 +16148,7 @@ fn worksheet_stale_anchor_is_rejected(cx: &mut TestAppContext) {
         event: e,
     };
     view.update(vcx, |v, cx| {
-        v.apply_server_batch(
-            vec![ev(ReplyEvent::Chunk("aa\nbb\ncc\ndd\n".into()))],
-            cx,
-        );
+        v.apply_server_batch(vec![ev(ReplyEvent::Chunk("aa\nbb\ncc\ndd\n".into()))], cx);
     });
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
@@ -14883,7 +16196,9 @@ fn worksheet_stale_anchor_is_rejected(cx: &mut TestAppContext) {
 #[gpui::test]
 fn worksheet_replay_reopens_tail_block_stale_safe(cx: &mut TestAppContext) {
     let (view, vcx) = boot_worksheet_nav(cx);
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("i"), w, cx)
+    });
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         let mut c = v.agent_mut(cx).expect("agent");
@@ -14938,19 +16253,27 @@ fn worksheet_midturn_typing_routes_to_chatbox(cx: &mut TestAppContext) {
 #[gpui::test]
 fn worksheet_tall_you_block_grows_caret_painted_in_viewport(cx: &mut TestAppContext) {
     let (view, vcx) = boot_worksheet_nav(cx);
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("i"), w, cx)
+    });
     vcx.run_until_parked();
     // Co-author a LONG note — enough lines to far exceed any test viewport, so the
     // reveal is genuinely forced to scroll (a shorter block that just fits would make
     // the assertion vacuous). Caret ends at the tail.
     for _ in 0..90 {
-        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("x"), w, cx));
-        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("enter"), w, cx));
+        view.update_in(vcx, |v, w, cx| {
+            v.handle_claude_key(&ws_bare_key("x"), w, cx)
+        });
+        view.update_in(vcx, |v, w, cx| {
+            v.handle_claude_key(&ws_bare_key("enter"), w, cx)
+        });
     }
     vcx.run_until_parked();
     let n = view
         .update(vcx, |v, cx| {
-            v.agent_read(cx, |c| c.input_surface.compose().editor.document().line_count())
+            v.agent_read(cx, |c| {
+                c.input_surface.compose().editor.document().line_count()
+            })
         })
         .unwrap();
     assert!(n > 80, "block genuinely long ({n} lines)");
@@ -14958,7 +16281,8 @@ fn worksheet_tall_you_block_grows_caret_painted_in_viewport(cx: &mut TestAppCont
     // re-reveal by mutating the session (agent_mut notifies) and re-latching the caret
     // reveal — a bare root notify would skip the cached child. Lazy item measurement
     // means the reveal scroll lands only after several frames.
-    let bust_and_reveal = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+    let bust_and_reveal = |view: &gpui::Entity<YaldaGpuiView>,
+                           vcx: &mut gpui::VisualTestContext| {
         view.update(vcx, |v, cx| {
             if let Some(mut c) = v.agent_mut(cx) {
                 c.pending_reveal_cursor = true;
@@ -15010,7 +16334,10 @@ fn fresh_worksheet_session_shows_an_input(cx: &mut TestAppContext) {
         c.focus = crate::AgentFocus::Transcript;
         assert!(c.editor.document().is_empty(), "fresh transcript");
         c.settle_input_focus();
-        assert!(c.you_block_open, "a fresh session opens a VISIBLE tail input block");
+        assert!(
+            c.you_block_open,
+            "a fresh session opens a VISIBLE tail input block"
+        );
         assert!(c.inline_you_block_active(), "the input is visible");
         assert_eq!(
             c.focus,
@@ -15098,7 +16425,10 @@ fn menu_panel_floats_in_content_region(cx: &mut TestAppContext) {
     let (view, vcx) = boot_worksheet_nav(cx);
     view.update(vcx, |v, cx| {
         v.splash_until = None;
-        assert!(v.jump_panel_visible, "test assumes the jump panel is visible");
+        assert!(
+            v.jump_panel_visible,
+            "test assumes the jump panel is visible"
+        );
         cx.notify();
     });
     vcx.run_until_parked();
@@ -15119,7 +16449,10 @@ fn menu_panel_floats_in_content_region(cx: &mut TestAppContext) {
         "card width {cw} exceeds MENU_PANEL_MAX_W {}",
         crate::MENU_PANEL_MAX_W
     );
-    assert!(cw < rw - 100.0, "card ({cw}px) is not content-sized — spans the window ({rw}px)");
+    assert!(
+        cw < rw - 100.0,
+        "card ({cw}px) is not content-sized — spans the window ({rw}px)"
+    );
     // Left-anchored just past the jump panel + gutter (where the first tile renders).
     let expected_left = rx0 + crate::JUMP_PANEL_WIDTH + crate::MENU_PANEL_LEFT_PAD;
     assert!(
@@ -15155,11 +16488,23 @@ fn menu_panel_rows_and_sections_paint(cx: &mut TestAppContext) {
     let (cx0, cy0, cw, ch) = card;
     let (ex0, ey0, ew, eh) = entries;
     // Entries sit inside the card.
-    assert!(ex0 >= cx0 - 0.5 && ey0 >= cy0 - 0.5, "entries escape the card top-left");
-    assert!(ex0 + ew <= cx0 + cw + 0.5, "entries overflow the card right edge");
-    assert!(ey0 + eh <= cy0 + ch + 0.5, "entries overflow the card bottom edge");
+    assert!(
+        ex0 >= cx0 - 0.5 && ey0 >= cy0 - 0.5,
+        "entries escape the card top-left"
+    );
+    assert!(
+        ex0 + ew <= cx0 + cw + 0.5,
+        "entries overflow the card right edge"
+    );
+    assert!(
+        ey0 + eh <= cy0 + ch + 0.5,
+        "entries overflow the card bottom edge"
+    );
     // The agent menu is many rows tall — height must clear multiple 26px rows.
-    assert!(eh > 26.0 * 3.0, "entries height {eh} too short for a multi-row menu");
+    assert!(
+        eh > 26.0 * 3.0,
+        "entries height {eh} too short for a multi-row menu"
+    );
 }
 
 /// UXI-Menu-4: descending into a submenu never moves the card's top edge or LEFT
@@ -15193,7 +16538,10 @@ fn menu_panel_top_stable_across_descent(cx: &mut TestAppContext) {
 
     let (rx, ry, _rw, _rh) = card_root;
     let (sx, sy, _sw, _sh) = card_sub;
-    assert!((ry - sy).abs() < 0.5, "card top moved on descent: {ry} → {sy}");
+    assert!(
+        (ry - sy).abs() < 0.5,
+        "card top moved on descent: {ry} → {sy}"
+    );
     assert!(
         (rx - sx).abs() < 0.5,
         "card left edge moved on descent: {rx} → {sx}"
@@ -15216,7 +16564,10 @@ fn worksheet_restore_settles_focus_and_block(cx: &mut TestAppContext) {
         c.focus = crate::AgentFocus::Transcript; // as the constructor leaves it
         c.you_block_open = false;
         c.settle_input_focus();
-        assert!(c.you_block_open, "restored worksheet draft opens a tail block");
+        assert!(
+            c.you_block_open,
+            "restored worksheet draft opens a tail block"
+        );
         assert_eq!(c.you_block_anchor, None, "at the tail");
         assert_eq!(
             c.focus,
@@ -15230,7 +16581,8 @@ fn worksheet_restore_settles_focus_and_block(cx: &mut TestAppContext) {
     // history to navigate; a fresh/empty transcript would instead open a tail block).
     view.update(vcx, |v, cx| {
         let mut c = v.agent_mut(cx).expect("agent");
-        c.editor.append_llm_chunk(crate::TurnId::Llm(1), "an agent reply line\n");
+        c.editor
+            .append_llm_chunk(crate::TurnId::Llm(1), "an agent reply line\n");
         c.input_surface = crate::InputSurface::new(crate::InputModeKind::Worksheet);
         c.settle_input_focus();
         assert!(!c.you_block_open, "with content + empty draft, rest in nav");
@@ -15244,7 +16596,11 @@ fn worksheet_restore_settles_focus_and_block(cx: &mut TestAppContext) {
             crate::InputSurface::with_draft(crate::InputModeKind::Chatbox, "box draft");
         c.focus = crate::AgentFocus::Transcript;
         c.settle_input_focus();
-        assert_eq!(c.focus, crate::AgentFocus::Compose, "chatbox focuses its box");
+        assert_eq!(
+            c.focus,
+            crate::AgentFocus::Compose,
+            "chatbox focuses its box"
+        );
         assert!(!c.you_block_open, "chatbox has no inline block");
     });
 }
@@ -15272,7 +16628,12 @@ fn worksheet_focus_toggle_opens_visible_block(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         assert_eq!(
-            v.agent_mut(cx).expect("agent").input_surface.compose().text().trim(),
+            v.agent_mut(cx)
+                .expect("agent")
+                .input_surface
+                .compose()
+                .text()
+                .trim(),
             "ok"
         );
     });
@@ -15298,7 +16659,11 @@ fn worksheet_midturn_space_types_into_chatbox(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         assert_eq!(
-            v.agent_mut(cx).expect("agent").input_surface.compose().text(),
+            v.agent_mut(cx)
+                .expect("agent")
+                .input_surface
+                .compose()
+                .text(),
             "a b",
             "space must type into the mid-turn chatbox, not fire the leader menu"
         );
@@ -15317,7 +16682,8 @@ fn worksheet_turn_end_carries_over_draft_or_rests_in_nav(cx: &mut TestAppContext
         let cb = c.input_surface.compose_mut();
         let n = cb.editor.document().rope().len_chars();
         cb.editor.programmatic_insert(n, "carry");
-        let g = c.generation; c.finalize_agent_turn_idem(g, 1);
+        let g = c.generation;
+        c.finalize_agent_turn_idem(g, 1);
     });
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
@@ -15329,9 +16695,14 @@ fn worksheet_turn_end_carries_over_draft_or_rests_in_nav(cx: &mut TestAppContext
     let (view2, vcx2) = boot_worksheet_nav(cx);
     view2.update(vcx2, |v, cx| {
         let mut c = v.agent_mut(cx).expect("agent");
-        let g = c.generation; c.finalize_agent_turn_idem(g, 1);
+        let g = c.generation;
+        c.finalize_agent_turn_idem(g, 1);
         assert!(!c.you_block_open, "empty draft → no block");
-        assert_eq!(c.focus, crate::AgentFocus::Transcript, "rests in navigation");
+        assert_eq!(
+            c.focus,
+            crate::AgentFocus::Transcript,
+            "rests in navigation"
+        );
     });
 }
 
@@ -15361,7 +16732,8 @@ fn subagent_panes_paint_right_of_compose(cx: &mut TestAppContext) {
         tc.kind = ToolKind::Think;
         tc.raw_input = Some(serde_json::json!({"prompt": "map the code"}));
         let anchor = c.editor.anchor_for_line(0);
-        c.tools.register(crate::ToolCallKey::from_id(&id), tc, anchor);
+        c.tools
+            .register(crate::ToolCallKey::from_id(&id), tc, anchor);
     });
 
     // Settle, then probe a clean paint pass.
@@ -15374,8 +16746,9 @@ fn subagent_panes_paint_right_of_compose(cx: &mut TestAppContext) {
     vcx.run_until_parked();
 
     let panes = crate::layout_probe_get("subagent-panes");
-    let box_bounds =
-        view.update(vcx, |v, cx| v.agent_read(cx, |c| c.input_surface.compose().bounds.get()));
+    let box_bounds = view.update(vcx, |v, cx| {
+        v.agent_read(cx, |c| c.input_surface.compose().bounds.get())
+    });
     crate::layout_probe_end();
 
     let (box_x, _, box_w, box_h) = box_bounds.expect("compose box did not paint");
@@ -15413,9 +16786,11 @@ fn subagent_row_stacks_label_over_prompt(cx: &mut TestAppContext) {
         let id: ToolCallId = "task-stack".into();
         let mut tc = ToolCall::new(id.clone(), "Explore the repository layout".to_string());
         tc.kind = ToolKind::Think;
-        tc.raw_input = Some(serde_json::json!({"prompt": "map the code and report the module structure"}));
+        tc.raw_input =
+            Some(serde_json::json!({"prompt": "map the code and report the module structure"}));
         let anchor = c.editor.anchor_for_line(0);
-        c.tools.register(crate::ToolCallKey::from_id(&id), tc, anchor);
+        c.tools
+            .register(crate::ToolCallKey::from_id(&id), tc, anchor);
     });
 
     for _ in 0..4 {
@@ -15463,7 +16838,8 @@ fn plan_and_subagents_share_the_sidepanel(cx: &mut TestAppContext) {
         tc.kind = ToolKind::Think;
         tc.raw_input = Some(serde_json::json!({"prompt": "map the code"}));
         let anchor = c.editor.anchor_for_line(0);
-        c.tools.register(crate::ToolCallKey::from_id(&id), tc, anchor);
+        c.tools
+            .register(crate::ToolCallKey::from_id(&id), tc, anchor);
     });
 
     for _ in 0..4 {
@@ -15541,15 +16917,21 @@ fn cmd_b_hides_and_cmd_0_reshows_the_sidepanel(cx: &mut TestAppContext) {
 
     // 2) Cmd-B hides it — gone from paint though the plan content is UNCHANGED.
     view.update(vcx, |v, cx| v.toggle_agent_sidepanel(cx));
-    let (hidden, plan_still_there, tasklist_still_open) =
-        view.read_with(vcx, |v, cx| {
-            v.read_session(id, cx, |c| {
-                (c.sidepanel_hidden, c.current_plan.is_some(), c.tasklist_open)
-            })
-            .unwrap()
-        });
+    let (hidden, plan_still_there, tasklist_still_open) = view.read_with(vcx, |v, cx| {
+        v.read_session(id, cx, |c| {
+            (
+                c.sidepanel_hidden,
+                c.current_plan.is_some(),
+                c.tasklist_open,
+            )
+        })
+        .unwrap()
+    });
     assert!(hidden, "toggle set sidepanel_hidden");
-    assert!(plan_still_there && tasklist_still_open, "content is unchanged by hiding");
+    assert!(
+        plan_still_there && tasklist_still_open,
+        "content is unchanged by hiding"
+    );
     assert!(
         probe_sidepanel(&view, vcx).is_none(),
         "sidepanel must NOT paint while hidden, even with plan content",
@@ -15558,10 +16940,15 @@ fn cmd_b_hides_and_cmd_0_reshows_the_sidepanel(cx: &mut TestAppContext) {
     // 3) Cmd-0 (focus_agent_panel) un-hides AND focuses the panel.
     view.update(vcx, |v, cx| v.focus_agent_panel(cx));
     let (unhidden, focus) = view.read_with(vcx, |v, cx| {
-        v.read_session(id, cx, |c| (c.sidepanel_hidden, c.focus)).unwrap()
+        v.read_session(id, cx, |c| (c.sidepanel_hidden, c.focus))
+            .unwrap()
     });
     assert!(!unhidden, "Cmd-0 clears sidepanel_hidden");
-    assert_eq!(focus, crate::AgentFocus::Panel, "Cmd-0 lands in panel focus");
+    assert_eq!(
+        focus,
+        crate::AgentFocus::Panel,
+        "Cmd-0 lands in panel focus"
+    );
     assert!(
         probe_sidepanel(&view, vcx).is_some(),
         "sidepanel paints again after Cmd-0 un-hides it",
@@ -15754,7 +17141,7 @@ fn subagent_markdown_list_wraps_at_pane_width(cx: &mut TestAppContext) {
 /// "report is Markdown" assert.
 #[gpui::test]
 fn transcript_tool_body_renders_markdown_not_json(cx: &mut TestAppContext) {
-    use crate::{plan_tool_sections, SectionBody, SectionRole, ToolRenderPolicy};
+    use crate::{SectionBody, SectionRole, ToolRenderPolicy, plan_tool_sections};
     let (view, vcx, _id, _session) = boot_with_transcript(cx);
     view.update(vcx, |v, cx| {
         use yalda::acp_channel::{ToolCall, ToolCallId, ToolKind};
@@ -15771,7 +17158,8 @@ fn transcript_tool_body_renders_markdown_not_json(cx: &mut TestAppContext) {
             "content": [{"type": "text", "text": "## Report\n- found it\n- done"}]
         }));
         let anchor = c.editor.anchor_for_line(0);
-        c.tools.register(crate::ToolCallKey::from_id(&tid), tc, anchor);
+        c.tools
+            .register(crate::ToolCallKey::from_id(&tid), tc, anchor);
     });
     vcx.run_until_parked(); // renders the main transcript with the tool group (no panic)
 
@@ -15787,14 +17175,19 @@ fn transcript_tool_body_renders_markdown_not_json(cx: &mut TestAppContext) {
                 && matches!(s.body, SectionBody::Markdown { .. })),
             "the prompt renders as markdown in the main transcript"
         );
-        let report = sections.iter().find(|s| s.label == "report").expect("a report section");
+        let report = sections
+            .iter()
+            .find(|s| s.label == "report")
+            .expect("a report section");
         assert!(
             matches!(report.body, SectionBody::Markdown { .. }),
             "the report renders as markdown, not raw JSON, in the main transcript"
         );
         assert!(report.emphasis, "the report tile is emphasized");
         assert!(
-            !sections.iter().any(|s| matches!(s.body, SectionBody::Json(_))),
+            !sections
+                .iter()
+                .any(|s| matches!(s.body, SectionBody::Json(_))),
             "no raw-JSON section for a well-formed subagent tool call"
         );
     });
@@ -15874,7 +17267,10 @@ fn steering_submit_while_awaiting_sends_immediately(cx: &mut TestAppContext) {
         })
         .unwrap()
     });
-    assert!(awaiting, "the in-flight turn keeps running (steer rides it)");
+    assert!(
+        awaiting,
+        "the in-flight turn keeps running (steer rides it)"
+    );
     assert!(compose_empty, "compose is cleared after sending");
     assert!(
         in_transcript,
@@ -15912,7 +17308,10 @@ fn codex_normal_message_interrupts_in_flight_turn(cx: &mut TestAppContext) {
         .try_recv()
         .expect("first prompt reached channel");
     assert_eq!(first.text, "first codex prompt");
-    assert!(!controls.try_recv_cancel(), "idle Codex submit must not cancel");
+    assert!(
+        !controls.try_recv_cancel(),
+        "idle Codex submit must not cancel"
+    );
 
     // The turn is genuinely in flight through the production submit path.
     let awaiting = view
@@ -15952,7 +17351,10 @@ fn codex_normal_message_interrupts_in_flight_turn(cx: &mut TestAppContext) {
         })
         .expect("session");
     assert!(compose_empty, "successful replacement clears the compose");
-    assert!(committed, "successful replacement is committed as a user turn");
+    assert!(
+        committed,
+        "successful replacement is committed as a user turn"
+    );
 
     // CONTROL 2: provider specificity. Claude's normal mid-turn submit keeps
     // the established promptQueueing steer and must not emit a cancel.
@@ -16015,17 +17417,21 @@ fn stop_interrupts_only_when_in_flight(cx: &mut TestAppContext) {
     // No turn in flight ⇒ no-op.
     view.update(vcx, |v, cx| v.stop_agent_inner(cx));
     let still_idle = view.read_with(vcx, |v, cx| {
-        v.read_session(id, cx, |c| matches!(c.turn_phase, TurnPhase::Idle)).unwrap()
+        v.read_session(id, cx, |c| matches!(c.turn_phase, TurnPhase::Idle))
+            .unwrap()
     });
     assert!(still_idle, "stop with no turn in flight is a no-op");
 
     // Turn in flight ⇒ a stop is requested.
     view.update(vcx, |v, cx| {
-        v.with_session(id, cx, |c| c.turn_phase = TurnPhase::begin(std::time::Instant::now()));
+        v.with_session(id, cx, |c| {
+            c.turn_phase = TurnPhase::begin(std::time::Instant::now())
+        });
         v.stop_agent_inner(cx);
     });
     let requested = view.read_with(vcx, |v, cx| {
-        v.read_session(id, cx, |c| c.turn_phase.stop_requested()).unwrap()
+        v.read_session(id, cx, |c| c.turn_phase.stop_requested())
+            .unwrap()
     });
     assert!(requested, "stop while in flight requests an interrupt");
 }
@@ -16042,11 +17448,15 @@ fn steering_after_stop_request_supersedes_pending_cancel(cx: &mut TestAppContext
 
     // Turn in flight, then a graceful Stop → StopRequested.
     view.update(vcx, |v, cx| {
-        v.with_session(id, cx, |c| c.turn_phase = TurnPhase::begin(std::time::Instant::now()));
+        v.with_session(id, cx, |c| {
+            c.turn_phase = TurnPhase::begin(std::time::Instant::now())
+        });
         v.stop_agent_inner(cx);
     });
-    let pending = view
-        .read_with(vcx, |v, cx| v.read_session(id, cx, |c| c.turn_phase.stop_requested()).unwrap());
+    let pending = view.read_with(vcx, |v, cx| {
+        v.read_session(id, cx, |c| c.turn_phase.stop_requested())
+            .unwrap()
+    });
     assert!(pending, "precondition: a graceful stop is pending");
 
     // Submit a steer — should supersede the pending cancel.
@@ -16066,7 +17476,10 @@ fn steering_after_stop_request_supersedes_pending_cancel(cx: &mut TestAppContext
         })
         .unwrap()
     });
-    assert!(awaiting, "a steer after a stop-request begins a clean Awaiting turn");
+    assert!(
+        awaiting,
+        "a steer after a stop-request begins a clean Awaiting turn"
+    );
     assert!(
         !still_pending,
         "the pending cancel is superseded — the next Esc is graceful, not a hard restart"
@@ -16084,7 +17497,9 @@ fn esc_does_not_stop_in_flight_turn(cx: &mut TestAppContext) {
     let (view, vcx, id, _session) = boot_with_transcript(cx);
 
     view.update(vcx, |v, cx| {
-        v.with_session(id, cx, |c| c.turn_phase = TurnPhase::begin(std::time::Instant::now()));
+        v.with_session(id, cx, |c| {
+            c.turn_phase = TurnPhase::begin(std::time::Instant::now())
+        });
     });
     vcx.simulate_keystrokes("escape");
     vcx.run_until_parked();
@@ -16101,7 +17516,8 @@ fn esc_does_not_stop_in_flight_turn(cx: &mut TestAppContext) {
     view.update(vcx, |v, cx| v.stop_agent_inner(cx));
     vcx.run_until_parked();
     let requested2 = view.read_with(vcx, |v, cx| {
-        v.read_session(id, cx, |c| c.turn_phase.stop_requested()).unwrap()
+        v.read_session(id, cx, |c| c.turn_phase.stop_requested())
+            .unwrap()
     });
     assert!(requested2, "explicit stop (⌘.) still requests a cancel");
 }
@@ -16147,10 +17563,13 @@ fn steering_midturn_ordering_and_dedup(cx: &mut TestAppContext) {
     vcx.run_until_parked();
 
     let text = view.read_with(vcx, |v, cx| {
-        v.read_session(id, cx, |c| c.editor.document().full_text()).unwrap()
+        v.read_session(id, cx, |c| c.editor.document().full_text())
+            .unwrap()
     });
     let a = text.find("agent line A").expect("agent content present");
-    let s = text.find("STEER ONE").expect("steer committed to transcript");
+    let s = text
+        .find("STEER ONE")
+        .expect("steer committed to transcript");
     assert!(
         a < s,
         "the mid-turn steer lands AFTER the agent content that preceded it"
@@ -16217,10 +17636,11 @@ fn assert_agent_invariants(
             // while at least one bottom panel is open (the toggles auto-exit when
             // the last one closes). The selected row is clamped at render, so the
             // stored `panel_sel` never indexes a panic.
-            let focus_ok = matches!(
-                c.focus,
-                AgentFocus::Compose | AgentFocus::Transcript | AgentFocus::Panel
-            ) && (c.focus != AgentFocus::Panel || c.tasklist_open || c.subagents_open);
+            let focus_ok =
+                matches!(
+                    c.focus,
+                    AgentFocus::Compose | AgentFocus::Transcript | AgentFocus::Panel
+                ) && (c.focus != AgentFocus::Panel || c.tasklist_open || c.subagents_open);
             let stop_ok = !c.turn_phase.stop_requested() || c.turn_phase.is_awaiting();
             // UXI-AgentTile-11: a You-block exists ONLY in the worksheet (never chatbox
             // mode). The stored anchor is deliberately NOT asserted legal here — it
@@ -16230,7 +17650,9 @@ fn assert_agent_invariants(
             let block_mode_ok = (!c.you_block_open && c.parked_you_blocks.is_empty())
                 || !c.input_surface.is_chatbox();
             // The EFFECTIVE anchor (what consumers use) is always legal-or-None.
-            let eff_ok = c.effective_you_block_anchor().is_none_or(|a| c.you_block_anchor_is_legal(a));
+            let eff_ok = c
+                .effective_you_block_anchor()
+                .is_none_or(|a| c.you_block_anchor_is_legal(a));
             // focus==Compose ⇒ there is a VISIBLE editable surface (the bottom box in
             // chatbox/mid-turn, or the inline block) — never focus-into-the-void
             // (bug-hunt-2 B1/B4).
@@ -16248,8 +17670,14 @@ fn assert_agent_invariants(
         })
         .unwrap()
     });
-    assert!(caret_line_ok, "UXI-TextEditing-1: compose caret line out of range [{ctx}]");
-    assert!(caret_col_ok, "UXI-TextEditing-1: compose caret col past end of line [{ctx}]");
+    assert!(
+        caret_line_ok,
+        "UXI-TextEditing-1: compose caret line out of range [{ctx}]"
+    );
+    assert!(
+        caret_col_ok,
+        "UXI-TextEditing-1: compose caret col past end of line [{ctx}]"
+    );
     assert!(focus_ok, "focus is Compose or Transcript [{ctx}]");
     assert!(
         stop_ok,
@@ -16292,10 +17720,14 @@ fn agent_tile_statemachine_fuzz_holds_invariants(cx: &mut TestAppContext) {
             let op = next(&mut st) % 20;
             match op {
                 0 => view.update(vcx, |v, cx| {
-                    v.with_session(id, cx, |c| c.input_surface.compose_mut().editor.insert_char('x'));
+                    v.with_session(id, cx, |c| {
+                        c.input_surface.compose_mut().editor.insert_char('x')
+                    });
                 }),
                 1 => view.update(vcx, |v, cx| {
-                    v.with_session(id, cx, |c| c.input_surface.compose_mut().editor.insert_char('\n'));
+                    v.with_session(id, cx, |c| {
+                        c.input_surface.compose_mut().editor.insert_char('\n')
+                    });
                 }),
                 2 => view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx)),
                 3 => view.update(vcx, |v, cx| v.submit_compose(cx)),
@@ -16319,7 +17751,8 @@ fn agent_tile_statemachine_fuzz_holds_invariants(cx: &mut TestAppContext) {
                             tc.kind = ToolKind::Think;
                             tc.raw_input = Some(serde_json::json!({"prompt": "do x"}));
                             let anchor = c.editor.anchor_for_line(0);
-                            c.tools.register(crate::ToolCallKey::from_id(&tcid), tc, anchor);
+                            c.tools
+                                .register(crate::ToolCallKey::from_id(&tcid), tc, anchor);
                         }
                     });
                 }
@@ -16327,18 +17760,28 @@ fn agent_tile_statemachine_fuzz_holds_invariants(cx: &mut TestAppContext) {
                 10 => view.update(vcx, |v, cx| v.stop_agent_inner(cx)),
                 // UXI-AgentTile-11: drive the real You-block open / discard key paths so the
                 // fuzzer exercises the inline-edit lifecycle against the oracle.
-                11 => view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx)),
-                12 => {
-                    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx))
-                }
+                11 => view.update_in(vcx, |v, w, cx| {
+                    v.handle_claude_key(&ws_bare_key("i"), w, cx)
+                }),
+                12 => view.update_in(vcx, |v, w, cx| {
+                    v.handle_claude_key(&ws_bare_key("escape"), w, cx)
+                }),
                 13 => view.update(vcx, |v, cx| v.toggle_subagents(cx)),
                 // UXI-AgentTile-3: enter/leave panel focus and navigate it through the
                 // real Cmd-0 handler + key path, against the oracle.
                 14 => view.update(vcx, |v, cx| v.focus_agent_panel(cx)),
-                15 => view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("j"), w, cx)),
-                16 => view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("k"), w, cx)),
-                17 => view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("h"), w, cx)),
-                18 => view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("l"), w, cx)),
+                15 => view.update_in(vcx, |v, w, cx| {
+                    v.handle_claude_key(&ws_bare_key("j"), w, cx)
+                }),
+                16 => view.update_in(vcx, |v, w, cx| {
+                    v.handle_claude_key(&ws_bare_key("k"), w, cx)
+                }),
+                17 => view.update_in(vcx, |v, w, cx| {
+                    v.handle_claude_key(&ws_bare_key("h"), w, cx)
+                }),
+                18 => view.update_in(vcx, |v, w, cx| {
+                    v.handle_claude_key(&ws_bare_key("l"), w, cx)
+                }),
                 _ => view.update(vcx, |v, cx| {
                     v.with_session(id, cx, |c| {
                         c.turn_phase = TurnPhase::begin(std::time::Instant::now())
@@ -16355,7 +17798,11 @@ fn agent_tile_statemachine_fuzz_holds_invariants(cx: &mut TestAppContext) {
 /// Register a `Task` tool-call as a subagent (the structured signal the harness
 /// emits) so the bottom Subagents panel has a selectable row.
 #[cfg(test)]
-fn register_subagent(view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext, n: u64) {
+fn register_subagent(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+    n: u64,
+) {
     view.update(vcx, |v, cx| {
         use yalda::acp_channel::{ToolCall, ToolCallId, ToolKind};
         if let Some(mut c) = v.agent_mut(cx) {
@@ -16364,7 +17811,8 @@ fn register_subagent(view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualT
             tc.kind = ToolKind::Think;
             tc.raw_input = Some(serde_json::json!({"prompt": "do x"}));
             let anchor = c.editor.anchor_for_line(0);
-            c.tools.register(crate::ToolCallKey::from_id(&tcid), tc, anchor);
+            c.tools
+                .register(crate::ToolCallKey::from_id(&tcid), tc, anchor);
         }
         cx.notify();
     });
@@ -16381,8 +17829,8 @@ fn set_plan(view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContex
     let entries: Vec<_> = (0..n)
         .map(|i| serde_json::json!({"content": format!("step {i}"), "priority": "medium", "status": "pending"}))
         .collect();
-    let plan: Plan = serde_json::from_value(serde_json::json!({ "entries": entries }))
-        .expect("valid plan json");
+    let plan: Plan =
+        serde_json::from_value(serde_json::json!({ "entries": entries })).expect("valid plan json");
     view.update(vcx, |v, cx| {
         if let Some(mut c) = v.agent_mut(cx) {
             c.current_plan = Some(plan);
@@ -16406,23 +17854,48 @@ fn agent_panel_hl_switches_columns(cx: &mut TestAppContext) {
     // Both columns open → entry lands on the LEFT (Plan).
     let col = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
         view.read_with(vcx, |v, cx| {
-            v.read_session(id, cx, |c| (c.panel_col, c.panel_sel)).unwrap()
+            v.read_session(id, cx, |c| (c.panel_col, c.panel_sel))
+                .unwrap()
         })
     };
-    assert_eq!(col(&view, vcx), (PanelColumn::Tasklist, 0), "starts in Plan");
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("l"), w, cx));
-    assert_eq!(col(&view, vcx), (PanelColumn::Subagents, 0), "l → Subagents");
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("j"), w, cx));
-    assert_eq!(col(&view, vcx), (PanelColumn::Subagents, 1), "j moves within Subagents");
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("h"), w, cx));
+    assert_eq!(
+        col(&view, vcx),
+        (PanelColumn::Tasklist, 0),
+        "starts in Plan"
+    );
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("l"), w, cx)
+    });
+    assert_eq!(
+        col(&view, vcx),
+        (PanelColumn::Subagents, 0),
+        "l → Subagents"
+    );
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("j"), w, cx)
+    });
+    assert_eq!(
+        col(&view, vcx),
+        (PanelColumn::Subagents, 1),
+        "j moves within Subagents"
+    );
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("h"), w, cx)
+    });
     assert_eq!(
         col(&view, vcx),
         (PanelColumn::Tasklist, 1),
         "h → Plan, row clamped into the column"
     );
     // h again is a no-op (already leftmost).
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("h"), w, cx));
-    assert_eq!(col(&view, vcx).0, PanelColumn::Tasklist, "h at the left edge is a no-op");
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("h"), w, cx)
+    });
+    assert_eq!(
+        col(&view, vcx).0,
+        PanelColumn::Tasklist,
+        "h at the left edge is a no-op"
+    );
 }
 
 /// UXI-AgentTile-3: `Cmd-0` (here through `focus_agent_panel`) enters panel focus when
@@ -16438,7 +17911,9 @@ fn agent_panel_cmd0_enters_and_esc_restores(cx: &mut TestAppContext) {
     let focus = view.read_with(vcx, |v, cx| v.read_session(id, cx, |c| c.focus).unwrap());
     assert_eq!(focus, crate::AgentFocus::Panel, "Cmd-0 enters panel focus");
 
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("escape"), w, cx)
+    });
     let focus = view.read_with(vcx, |v, cx| v.read_session(id, cx, |c| c.focus).unwrap());
     assert_eq!(
         focus,
@@ -16457,19 +17932,33 @@ fn agent_panel_vim_moves_selection(cx: &mut TestAppContext) {
     }
     view.update(vcx, |v, cx| v.focus_agent_panel(cx));
     let sel = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
-        view.read_with(vcx, |v, cx| v.read_session(id, cx, |c| c.panel_sel).unwrap())
+        view.read_with(vcx, |v, cx| {
+            v.read_session(id, cx, |c| c.panel_sel).unwrap()
+        })
     };
     assert_eq!(sel(&view, vcx), 0, "selection starts at the top");
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("j"), w, cx));
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("j"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("j"), w, cx)
+    });
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("j"), w, cx)
+    });
     assert_eq!(sel(&view, vcx), 2, "j moves down");
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("j"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("j"), w, cx)
+    });
     assert_eq!(sel(&view, vcx), 2, "j clamps at the last row");
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("k"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("k"), w, cx)
+    });
     assert_eq!(sel(&view, vcx), 1, "k moves up");
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("g"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("g"), w, cx)
+    });
     assert_eq!(sel(&view, vcx), 0, "g jumps to the top");
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("G"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("G"), w, cx)
+    });
     assert_eq!(sel(&view, vcx), 2, "G jumps to the bottom");
 }
 
@@ -16481,7 +17970,9 @@ fn agent_panel_enter_focuses_subagent(cx: &mut TestAppContext) {
     register_subagent(&view, vcx, 1);
     register_subagent(&view, vcx, 2);
     view.update(vcx, |v, cx| v.focus_agent_panel(cx));
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("j"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("j"), w, cx)
+    });
     let want = view.read_with(vcx, |v, cx| {
         v.read_session(id, cx, |c| {
             match &c.panel_column_rows(c.panel_col)[c.panel_sel] {
@@ -16491,7 +17982,9 @@ fn agent_panel_enter_focuses_subagent(cx: &mut TestAppContext) {
         })
         .unwrap()
     });
-    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("enter"), w, cx));
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("enter"), w, cx)
+    });
     let (focused, focus) = view.read_with(vcx, |v, cx| {
         v.read_session(id, cx, |c| (c.focused_subagent.clone(), c.focus))
             .unwrap()
@@ -16669,18 +18162,17 @@ fn keymap_rebind_via_real_keystrokes(cx: &mut TestAppContext) {
     );
 
     // Precondition: the outline-rail toggle is at its default.
-    let keys_of = |view: &gpui::Entity<YaldaGpuiView>,
-                   vcx: &mut gpui::VisualTestContext,
-                   action: &str| {
-        view.read_with(vcx, |v, _| {
-            v.keymap_registry
-                .entries
-                .iter()
-                .find(|e| e.action == action)
-                .map(|e| e.keystrokes.clone())
-                .unwrap()
-        })
-    };
+    let keys_of =
+        |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext, action: &str| {
+            view.read_with(vcx, |v, _| {
+                v.keymap_registry
+                    .entries
+                    .iter()
+                    .find(|e| e.action == action)
+                    .map(|e| e.keystrokes.clone())
+                    .unwrap()
+            })
+        };
     assert_eq!(keys_of(&view, vcx, "ToggleOutlineRail"), "cmd-shift-o");
 
     // Filter down to the unique "outline" row (cursor lands on it), return to
@@ -16714,7 +18206,10 @@ fn keymap_body_is_cached_and_self_invalidates(cx: &mut TestAppContext) {
     view.update(vcx, |v, cx| v.open_keymap_inner(cx));
     vcx.run_until_parked();
     let base = crate::perf_render_count("keymap");
-    assert!(base >= 1, "the keymap body must paint once after the tile opens");
+    assert!(
+        base >= 1,
+        "the keymap body must paint once after the tile opens"
+    );
 
     // Moving the browse cursor (a body-owned mutation) busts the cached body —
     // the mutation-site notify is the only thing that re-renders it.
@@ -16790,7 +18285,10 @@ fn recap_summon_sets_generating(cx: &mut TestAppContext) {
         crate::RecapStatus::Generating,
         "summon must flip the panel to Generating"
     );
-    assert_eq!(label, sess_label, "recap targets the focused session's label");
+    assert_eq!(
+        label, sess_label,
+        "recap targets the focused session's label"
+    );
 }
 
 /// Summoning with an EMPTY transcript is a no-op with a status note — nothing to
@@ -16821,7 +18319,12 @@ fn recap_chunks_accumulate_and_finalize_ready(cx: &mut TestAppContext) {
     let token = view.update(vcx, |v, _| v.recaps.get(&id).unwrap().token);
 
     view.update(vcx, |v, cx| {
-        v.apply_recap_event(id, token, ReplyEvent::Chunk("- Working on the recap\n".into()), cx);
+        v.apply_recap_event(
+            id,
+            token,
+            ReplyEvent::Chunk("- Working on the recap\n".into()),
+            cx,
+        );
         v.apply_recap_event(id, token, ReplyEvent::Chunk("- Panel added\n".into()), cx);
     });
 
@@ -16844,7 +18347,11 @@ fn recap_chunks_accumulate_and_finalize_ready(cx: &mut TestAppContext) {
         let r = v.recaps.get(&id).unwrap();
         (r.text.clone(), r.status.clone())
     });
-    assert_eq!(status2, crate::RecapStatus::Ready, "non-empty run finalizes Ready");
+    assert_eq!(
+        status2,
+        crate::RecapStatus::Ready,
+        "non-empty run finalizes Ready"
+    );
     assert_eq!(text2, text, "finalize preserves the accumulated text");
 }
 
@@ -16874,7 +18381,10 @@ fn recap_dismiss_clears(cx: &mut TestAppContext) {
     let (view, vcx, id, session) = boot_with_transcript(cx);
     seed_recap_transcript(&session, vcx);
     view.update(vcx, |v, cx| v.dispatch_menu_command("recap-session", cx));
-    assert!(view.update(vcx, |v, _| v.recaps.contains_key(&id)), "recap pinned");
+    assert!(
+        view.update(vcx, |v, _| v.recaps.contains_key(&id)),
+        "recap pinned"
+    );
 
     view.update(vcx, |v, cx| v.dispatch_menu_command("recap-dismiss", cx));
     assert!(
@@ -16922,7 +18432,10 @@ fn recap_rerun_supersedes_stale_run(cx: &mut TestAppContext) {
         v.apply_recap_event(id, t2, ReplyEvent::Chunk("second run text\n".into()), cx);
     });
     let live = view.update(vcx, |v, _| v.recaps.get(&id).unwrap().text.clone());
-    assert!(live.contains("second run text"), "current run accepts its events");
+    assert!(
+        live.contains("second run text"),
+        "current run accepts its events"
+    );
 }
 
 /// The recap panel PAINTS inside the agent tile, ABOVE the compose box, when
@@ -16953,7 +18466,9 @@ fn recap_panel_paints_in_agent_tile(cx: &mut TestAppContext) {
     // Switch to the chatbox so the compose renders as a pinned box (in the
     // default worksheet state the compose is inline and paints no "compose-box"),
     // giving a stable anchor to prove the recap sits ABOVE it.
-    view.update(vcx, |v, cx| v.dispatch_menu_command("agent-input-toggle", cx));
+    view.update(vcx, |v, cx| {
+        v.dispatch_menu_command("agent-input-toggle", cx)
+    });
     // Settle geometry.
     for _ in 0..3 {
         view.update(vcx, |_, cx| cx.notify());
@@ -16970,7 +18485,10 @@ fn recap_panel_paints_in_agent_tile(cx: &mut TestAppContext) {
     let (_rx, ry, rw, rh) = recap.expect(
         "recap-panel did not paint — the pinned recap is invisible (UXI-AgentTile-15 violated)",
     );
-    assert!(rw > 1.0 && rh > 1.0, "recap panel painted with no area (w={rw}, h={rh})");
+    assert!(
+        rw > 1.0 && rh > 1.0,
+        "recap panel painted with no area (w={rw}, h={rh})"
+    );
     // It renders inside the tile, above the compose (its slot above the
     // subagents/tasks panels). The compose box always paints, so this is a real
     // placement check, not a vacuous one.
@@ -16999,7 +18517,9 @@ fn unresumable_session_shows_inline_notice_not_picker(cx: &mut TestAppContext) {
     let (view, vcx, _id, _session) = boot_with_transcript(cx);
 
     // The tile is Bound to session sid "S1" (bound by boot_with_transcript).
-    let win = view.update(vcx, |v, _cx| v.workspace.focused_window_id().expect("focused"));
+    let win = view.update(vcx, |v, _cx| {
+        v.workspace.focused_window_id().expect("focused")
+    });
 
     // The remembered session turned out gone server-side (the resuming attach-fail
     // path calls exactly this).
@@ -17014,14 +18534,24 @@ fn unresumable_session_shows_inline_notice_not_picker(cx: &mut TestAppContext) {
             if let Some(w) = wsp.layout.find_leaf(win)
                 && let App::Agent(t) = &w.content
             {
-                assert!(t.session().is_none(), "tile is unbound after the session went away");
+                assert!(
+                    t.session().is_none(),
+                    "tile is unbound after the session went away"
+                );
                 assert!(t.picker().is_none(), "must NOT drop to the picker");
-                assert!(t.unavailable_label().is_some(), "shows the inline unavailable notice");
+                assert!(
+                    t.unavailable_label().is_some(),
+                    "shows the inline unavailable notice"
+                );
                 // The Unavailable variant KEEPS the remembered sid so a later restart
                 // re-attempts the resume (ADR-0026: the state carries its own data).
                 match t {
                     crate::AgentTile::Unavailable { remembered, .. } => {
-                        assert_eq!(remembered.as_str(), "S1", "remembered id kept for re-attempt")
+                        assert_eq!(
+                            remembered.as_str(),
+                            "S1",
+                            "remembered id kept for re-attempt"
+                        )
                     }
                     _ => panic!("expected Unavailable state"),
                 }
@@ -17116,8 +18646,7 @@ fn workspace_cells_keep_fixed_size_when_the_window_resizes(cx: &mut TestAppConte
         "window resize must keep cell dimensions fixed; the view should simply cover fewer cells"
     );
     assert_eq!(
-        reconfigured,
-        initial,
+        reconfigured, initial,
         "changing the default new-tile span must not change the snap-cell size"
     );
 }
@@ -17207,8 +18736,10 @@ fn boot_desktop_two_tiles<'a>(
         wsp.view = crate::workspace::WorkspaceView::Plane;
         let leaves = wsp.layout.leaf_ids();
         wsp.desktop.reconcile(&leaves);
-        wsp.desktop.set_anchor(win_a, crate::workspace::Slot::new(0, 0));
-        wsp.desktop.set_anchor(win_b, crate::workspace::Slot::new(0, 100));
+        wsp.desktop
+            .set_anchor(win_a, crate::workspace::Slot::new(0, 0));
+        wsp.desktop
+            .set_anchor(win_b, crate::workspace::Slot::new(0, 100));
         // Focus A (the origin tile) and pin the reveal so auto-pan won't drag
         // the camera to wherever focus is — the camera rests at (0,0).
         wsp.focused = win_a;
@@ -17256,7 +18787,10 @@ fn plane_card_zoom_paints_placeholders_not_live_content(cx: &mut TestAppContext)
         "plane-card probe did NOT paint at Card zoom — the focused tile's card \
          placeholder is invisible (UXI-Workspace-4 violated)",
     );
-    assert!(w > 1.0 && h > 1.0, "card placeholder painted with no area (w={w}, h={h})");
+    assert!(
+        w > 1.0 && h > 1.0,
+        "card placeholder painted with no area (w={w}, h={h})"
+    );
     assert!(
         live.is_none(),
         "LIVE tile content painted at Card zoom (plane-tile-content-{focused_id}) — \
@@ -17348,7 +18882,10 @@ fn columns_view_arranges_tiles_side_by_side(cx: &mut TestAppContext) {
     let plane_a = crate::layout_probe_get(&format!("plane-tile-content-{focused_id}"));
     let plane_b = crate::layout_probe_get(&format!("plane-tile-content-{other_id}"));
     crate::layout_probe_end();
-    assert!(plane_a.is_some(), "sanity: focused tile A must paint on the plane");
+    assert!(
+        plane_a.is_some(),
+        "sanity: focused tile A must paint on the plane"
+    );
     assert!(
         plane_b.is_none(),
         "fixture broken: B must be culled off-viewport on the plane so the columns \
@@ -17419,8 +18956,8 @@ fn columns_view_arranges_tiles_side_by_side(cx: &mut TestAppContext) {
 /// → Enter → stable relocation, rather than calling the model directly.
 #[gpui::test]
 fn ctrl_w_send_and_send_follow_use_the_same_project_picker(cx: &mut TestAppContext) {
-    use crate::{App, LinearTile};
     use crate::workspace::{SplitDir, TileMembership};
+    use crate::{App, LinearTile};
     cx.update(crate::register_keymap);
     let (view, vcx) = boot_browser(cx);
     let moved = view.update(vcx, |v, _| {
@@ -17430,8 +18967,10 @@ fn ctrl_w_send_and_send_follow_use_the_same_project_picker(cx: &mut TestAppConte
             .unwrap();
         v.workspace
             .push_workspace_inheriting(App::Linear(LinearTile::new()));
-        v.workspace
-            .push_initial_workspace(App::Linear(LinearTile::new()), crate::project::ProjectId(999));
+        v.workspace.push_initial_workspace(
+            App::Linear(LinearTile::new()),
+            crate::project::ProjectId(999),
+        );
         v.workspace.set_active_workspace(0);
         v.workspace.workspaces[0].focused = moved;
         moved
@@ -17442,13 +18981,25 @@ fn ctrl_w_send_and_send_follow_use_the_same_project_picker(cx: &mut TestAppConte
     view.read_with(vcx, |v, _| {
         let picker = v.workspace_picker_ref().expect("send picker opened");
         assert_eq!(picker.targets, vec![0, 1]);
-        assert_eq!(picker.mode, crate::WorkspacePickerMode::Move { follow: false });
+        assert_eq!(
+            picker.mode,
+            crate::WorkspacePickerMode::Move { follow: false }
+        );
     });
     vcx.simulate_keystrokes("enter");
     vcx.run_until_parked();
     view.read_with(vcx, |v, _| {
-        assert_eq!(v.workspace.active_workspace, 0, "lowercase send stays at source");
-        assert_eq!(v.workspace.tile_membership(moved), Some(TileMembership::Bound { workspace: 1 }));
+        assert_eq!(
+            v.workspace.active_workspace, 0,
+            "lowercase send stays at source"
+        );
+        assert_eq!(
+            v.workspace.tile_membership(moved),
+            Some(TileMembership::Attached {
+                workspace: 1,
+                visibility: crate::workspace::AttachedVisibility::Visible
+            })
+        );
     });
 
     view.update(vcx, |v, _| {
@@ -17460,25 +19011,35 @@ fn ctrl_w_send_and_send_follow_use_the_same_project_picker(cx: &mut TestAppConte
     vcx.simulate_keystrokes("enter");
     vcx.run_until_parked();
     view.read_with(vcx, |v, _| {
-        assert_eq!(v.workspace.active_workspace, 0, "uppercase send follows destination");
-        assert_eq!(v.workspace.tile_membership(moved), Some(TileMembership::Bound { workspace: 0 }));
+        assert_eq!(
+            v.workspace.active_workspace, 0,
+            "uppercase send follows destination"
+        );
+        assert_eq!(
+            v.workspace.tile_membership(moved),
+            Some(TileMembership::Attached {
+                workspace: 0,
+                visibility: crate::workspace::AttachedVisibility::Visible
+            })
+        );
     });
 }
 
-/// UXI-Workspace-18/19: scratchpad and back-and-forth actions are wired at the
-/// shared tile wrapper, so the real chords work regardless of focused App kind.
+/// ADR-0034: hide/unhide and back-and-forth actions are wired at the shared
+/// tile wrapper, so the real chords work regardless of focused App kind.
 #[gpui::test]
-fn ctrl_w_scratchpad_and_workspace_back_and_forth_are_global(cx: &mut TestAppContext) {
-    use crate::{App, LinearTile};
+fn ctrl_w_hide_unhide_and_workspace_back_and_forth_are_global(cx: &mut TestAppContext) {
     use crate::workspace::{SplitDir, TileMembership};
+    use crate::{App, LinearTile};
     cx.update(crate::register_keymap);
     let (view, vcx) = boot_browser(cx);
-    let (scratch, previous_focus) = view.update(vcx, |v, _| {
+    let (hidden, previous_focus) = view.update(vcx, |v, _| {
         let id = v
             .workspace
             .split_focused(SplitDir::V, App::Linear(LinearTile::new()))
             .unwrap();
-        let previous_focus = v.workspace
+        let previous_focus = v
+            .workspace
             .push_workspace_inheriting(App::Linear(LinearTile::new()));
         v.workspace.set_active_workspace(0);
         v.workspace.workspaces[0].focused = id;
@@ -17488,25 +19049,83 @@ fn ctrl_w_scratchpad_and_workspace_back_and_forth_are_global(cx: &mut TestAppCon
     vcx.simulate_keystrokes("ctrl-w d");
     vcx.run_until_parked();
     view.read_with(vcx, |v, _| {
-        assert_eq!(v.workspace.tile_membership(scratch), Some(TileMembership::Unbound));
-        assert_eq!(v.workspace.scratchpad, vec![scratch]);
-        assert_eq!(v.workspace.directly_focused_unbound(), None);
+        assert_eq!(
+            v.workspace.tile_membership(hidden),
+            Some(TileMembership::Attached {
+                workspace: 0,
+                visibility: crate::workspace::AttachedVisibility::Hidden,
+            })
+        );
+        assert!(v.workspace.presented_tile().is_none());
     });
+    view.update(vcx, |v, _| assert!(v.workspace.focus_tile(hidden)));
     vcx.simulate_keystrokes("ctrl-w shift-d");
     vcx.run_until_parked();
-    assert_eq!(
-        view.read_with(vcx, |v, _| v.workspace.directly_focused_unbound()),
-        Some(scratch)
-    );
-    vcx.simulate_keystrokes("ctrl-w shift-d");
+    view.read_with(vcx, |v, _| {
+        assert_eq!(
+            v.workspace.tile_membership(hidden),
+            Some(TileMembership::Attached {
+                workspace: 0,
+                visibility: crate::workspace::AttachedVisibility::Visible,
+            })
+        );
+        assert_eq!(v.workspace.focused_window_id(), Some(hidden));
+        assert_eq!(v.workspace.active_workspace, 0);
+    });
+
+    // The discoverable menu route and the global actions converge on the same
+    // typed state machine. Exercise the actual dispatcher and shared listener,
+    // not model helpers, so tiles cannot capture or bypass these operations.
+    view.update(vcx, |v, cx| v.dispatch_menu_command("send-tile", cx));
+    view.read_with(vcx, |v, _| {
+        assert_eq!(
+            v.workspace_picker_ref().map(|picker| picker.mode),
+            Some(crate::WorkspacePickerMode::Move { follow: false })
+        );
+    });
+    vcx.simulate_keystrokes("escape");
     vcx.run_until_parked();
-    assert_eq!(
-        view.read_with(vcx, |v, _| v.workspace.directly_focused_unbound()),
-        None,
-        "cycling past the oldest scratchpad tile returns to the workspace"
-    );
-    vcx.simulate_keystrokes("ctrl-w shift-d");
+
+    vcx.simulate_keystrokes("ctrl-w shift-b");
     vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert_eq!(
+            v.workspace.tile_membership(hidden),
+            Some(TileMembership::Detached)
+        );
+    });
+    vcx.simulate_keystrokes("ctrl-w b");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert_eq!(
+            v.workspace.tile_membership(hidden),
+            Some(TileMembership::Attached {
+                workspace: 0,
+                visibility: crate::workspace::AttachedVisibility::Visible,
+            })
+        );
+    });
+
+    view.update(vcx, |v, cx| v.dispatch_menu_command("tile-hide", cx));
+    view.read_with(vcx, |v, _| {
+        assert_eq!(
+            v.workspace.tile_membership(hidden),
+            Some(TileMembership::Attached {
+                workspace: 0,
+                visibility: crate::workspace::AttachedVisibility::Hidden,
+            }),
+            "the system menu's Hide command changes visibility without detaching"
+        );
+    });
+    view.update(vcx, |v, cx| v.jump_to_tile(hidden, cx));
+    view.update(vcx, |v, cx| v.dispatch_menu_command("tile-detach", cx));
+    view.read_with(vcx, |v, _| {
+        assert_eq!(
+            v.workspace.tile_membership(hidden),
+            Some(TileMembership::Detached),
+            "detaching a hidden tile clears hidden state"
+        );
+    });
 
     vcx.simulate_keystrokes("ctrl-w backspace");
     vcx.run_until_parked();
@@ -17577,7 +19196,11 @@ fn ctrl_w_master_commands_change_columns_state_and_geometry(cx: &mut TestAppCont
     vcx.simulate_keystrokes("ctrl-w shift-n");
     vcx.run_until_parked();
     assert_eq!(
-        view.read_with(vcx, |v, _| v.workspace.active_workspace().unwrap().master_count),
+        view.read_with(vcx, |v, _| v
+            .workspace
+            .active_workspace()
+            .unwrap()
+            .master_count),
         1
     );
 }
@@ -17606,23 +19229,42 @@ fn ctrl_w_uppercase_swaps_footprints_in_plane_and_columns(cx: &mut TestAppContex
     vcx.run_until_parked();
     let before = view.read_with(vcx, |v, _| {
         let wsp = v.workspace.active_workspace().unwrap();
-        (wsp.desktop.rect_of(win_a), wsp.desktop.rect_of(win_b), wsp.focused)
+        (
+            wsp.desktop.rect_of(win_a),
+            wsp.desktop.rect_of(win_b),
+            wsp.focused,
+        )
     });
 
     vcx.simulate_keystrokes("ctrl-w shift-l");
     vcx.run_until_parked();
     view.read_with(vcx, |v, _| {
         let wsp = v.workspace.active_workspace().unwrap();
-        assert_eq!(wsp.desktop.rect_of(win_a), before.1, "A adopts B's complete footprint");
-        assert_eq!(wsp.desktop.rect_of(win_b), before.0, "B adopts A's complete footprint");
-        assert_eq!(wsp.focused, win_a, "stable focused id travels with its tile");
+        assert_eq!(
+            wsp.desktop.rect_of(win_a),
+            before.1,
+            "A adopts B's complete footprint"
+        );
+        assert_eq!(
+            wsp.desktop.rect_of(win_b),
+            before.0,
+            "B adopts A's complete footprint"
+        );
+        assert_eq!(
+            wsp.focused, win_a,
+            "stable focused id travels with its tile"
+        );
     });
 
     vcx.simulate_keystrokes("ctrl-w u");
     vcx.run_until_parked();
     let restored = view.read_with(vcx, |v, _| {
         let wsp = v.workspace.active_workspace().unwrap();
-        (wsp.desktop.rect_of(win_a), wsp.desktop.rect_of(win_b), wsp.focused)
+        (
+            wsp.desktop.rect_of(win_a),
+            wsp.desktop.rect_of(win_b),
+            wsp.focused,
+        )
     });
     assert_eq!(restored, before, "Ctrl-W u restores Plane placement");
 
@@ -17656,8 +19298,8 @@ fn ctrl_w_uppercase_swaps_footprints_in_plane_and_columns(cx: &mut TestAppContex
 /// disabled in the production handlers.
 #[gpui::test]
 fn ctrl_w_promote_and_rotate_three_tiles(cx: &mut TestAppContext) {
-    use crate::{AgentTile, App};
     use crate::workspace::{Slot, SplitDir};
+    use crate::{AgentTile, App};
     cx.update(crate::register_keymap);
     let (view, vcx, win_a, win_b) = boot_desktop_two_tiles(cx);
     let win_c = view.update(vcx, |v, cx| {
@@ -17795,7 +19437,8 @@ fn new_tile_lands_same_row_right_of_the_only_tile(cx: &mut TestAppContext) {
         let leaves = wsp.layout.leaf_ids();
         assert_eq!(leaves.len(), 1, "the fixture must start with ONE tile");
         wsp.desktop.reconcile(&leaves);
-        wsp.desktop.set_span(win_a, crate::workspace::Span::new(4, 4));
+        wsp.desktop
+            .set_span(win_a, crate::workspace::Span::new(4, 4));
         wsp.desktop.set_anchor(win_a, Slot::new(1, -1));
         wsp.focused = win_a;
         wsp.desktop.last_reveal = Some(win_a);
@@ -17860,8 +19503,12 @@ fn plane_pan_at_card_leaves_transcript_render_flat(cx: &mut TestAppContext) {
     let (view, vcx, _focused, _other) = boot_desktop_two_tiles(cx);
     // Zoom to Card and settle.
     view.update(vcx, |v, cx| {
-        v.workspace.active_workspace_mut().unwrap().desktop.camera.zoom =
-            crate::workspace::Detail::Card;
+        v.workspace
+            .active_workspace_mut()
+            .unwrap()
+            .desktop
+            .camera
+            .zoom = crate::workspace::Detail::Card;
         cx.notify();
     });
     for _ in 0..3 {
@@ -17873,7 +19520,11 @@ fn plane_pan_at_card_leaves_transcript_render_flat(cx: &mut TestAppContext) {
     // Pan the plane several times in slot units (the bare-scroll path).
     for _ in 0..5 {
         view.update(vcx, |v, cx| {
-            v.workspace.active_workspace_mut().unwrap().desktop.pan_by(0.5, 0.0);
+            v.workspace
+                .active_workspace_mut()
+                .unwrap()
+                .desktop
+                .pan_by(0.5, 0.0);
             cx.notify();
         });
         vcx.run_until_parked();
@@ -17908,7 +19559,12 @@ fn ctrl_w_reset_returns_camera_to_origin(cx: &mut TestAppContext) {
 
     // Snapshot the tile placement so we can prove the reset is view-only.
     let slots_before = view.update(vcx, |v, _| {
-        v.workspace.active_workspace().unwrap().desktop.slots.clone()
+        v.workspace
+            .active_workspace()
+            .unwrap()
+            .desktop
+            .slots
+            .clone()
     });
 
     // Pan AND zoom the camera AWAY from the origin — reset must undo BOTH. Zoom
@@ -17922,7 +19578,9 @@ fn ctrl_w_reset_returns_camera_to_origin(cx: &mut TestAppContext) {
         cx.notify();
     });
     vcx.run_until_parked();
-    let moved = view.update(vcx, |v, _| v.workspace.active_workspace().unwrap().desktop.camera);
+    let moved = view.update(vcx, |v, _| {
+        v.workspace.active_workspace().unwrap().desktop.camera
+    });
     assert_ne!(
         moved,
         crate::workspace::Camera::default(),
@@ -18010,7 +19668,7 @@ fn ctrl_w_zoom_steps_detail(cx: &mut TestAppContext) {
 /// `pan == (0,0)` assert fails.
 #[gpui::test]
 fn cmd_shift_drag_pans_the_plane(cx: &mut TestAppContext) {
-    use gpui::{point, px, Modifiers, MouseButton};
+    use gpui::{Modifiers, MouseButton, point, px};
     let (view, vcx, win_a, win_b) = boot_desktop_two_tiles(cx);
 
     let slots_before = view.read_with(vcx, |v, _| {
@@ -18057,7 +19715,7 @@ fn cmd_shift_drag_pans_the_plane(cx: &mut TestAppContext) {
 /// half of the guard: revert `&& modifiers.shift` and this test goes RED.
 #[gpui::test]
 fn cmd_only_drag_does_not_pan_the_plane(cx: &mut TestAppContext) {
-    use gpui::{point, px, Modifiers, MouseButton};
+    use gpui::{Modifiers, MouseButton, point, px};
     let (view, vcx, _win_a, _win_b) = boot_desktop_two_tiles(cx);
 
     // Cmd held, Shift NOT held — over the same empty canvas the Cmd+Shift test
@@ -18067,7 +19725,11 @@ fn cmd_only_drag_does_not_pan_the_plane(cx: &mut TestAppContext) {
         ..Default::default()
     };
     vcx.simulate_mouse_down(point(px(600.0), px(400.0)), MouseButton::Left, cmd_only);
-    vcx.simulate_mouse_move(point(px(450.0), px(320.0)), Some(MouseButton::Left), cmd_only);
+    vcx.simulate_mouse_move(
+        point(px(450.0), px(320.0)),
+        Some(MouseButton::Left),
+        cmd_only,
+    );
     vcx.simulate_mouse_up(point(px(450.0), px(320.0)), MouseButton::Left, cmd_only);
     vcx.run_until_parked();
 
@@ -18090,7 +19752,7 @@ fn cmd_only_drag_does_not_pan_the_plane(cx: &mut TestAppContext) {
 /// the release and the integral asserts fail.
 #[gpui::test]
 fn cmd_shift_pan_rests_view_cell_aligned(cx: &mut TestAppContext) {
-    use gpui::{point, px, Modifiers, MouseButton};
+    use gpui::{Modifiers, MouseButton, point, px};
     let (view, vcx, win_a, win_b) = boot_desktop_two_tiles(cx);
 
     let slots_before = view.read_with(vcx, |v, _| {
@@ -18128,8 +19790,16 @@ fn cmd_shift_pan_rests_view_cell_aligned(cx: &mut TestAppContext) {
         let d = &v.workspace.active_workspace().unwrap().desktop;
         (d.camera.pan, (d.slot_of(win_a), d.slot_of(win_b)))
     });
-    assert_eq!(pan_after.0.fract(), 0.0, "pan.0 rests on a whole slot (got {pan_after:?})");
-    assert_eq!(pan_after.1.fract(), 0.0, "pan.1 rests on a whole slot (got {pan_after:?})");
+    assert_eq!(
+        pan_after.0.fract(),
+        0.0,
+        "pan.0 rests on a whole slot (got {pan_after:?})"
+    );
+    assert_eq!(
+        pan_after.1.fract(),
+        0.0,
+        "pan.1 rests on a whole slot (got {pan_after:?})"
+    );
     assert_eq!(
         slots_before, slots_after,
         "the pan is view-only — no tile moves",
@@ -18150,7 +19820,11 @@ fn tile_drag_rests_view_cell_aligned(cx: &mut TestAppContext) {
     let (view, vcx, win_a, win_b) = boot_desktop_two_tiles(cx);
 
     let slot_b_before = view.read_with(vcx, |v, _| {
-        v.workspace.active_workspace().unwrap().desktop.slot_of(win_b)
+        v.workspace
+            .active_workspace()
+            .unwrap()
+            .desktop
+            .slot_of(win_b)
     });
 
     // Use the REAL painted canvas rect (boot's final paint sets it; a set here
@@ -18161,7 +19835,9 @@ fn tile_drag_rests_view_cell_aligned(cx: &mut TestAppContext) {
     // Grab tile A, then drag toward the bottom-right edge band so the edge
     // auto-pan fires (it only fires once the drag is ACTIVE, i.e. after the
     // threshold-crossing first move — so the near-edge moves come after).
-    view.update(vcx, |v, cx| v.desktop_grab(win_a, (cx0 + 50.0, cy0 + 50.0), cx));
+    view.update(vcx, |v, cx| {
+        v.desktop_grab(win_a, (cx0 + 50.0, cy0 + 50.0), cx)
+    });
     view.update(vcx, |v, cx| {
         v.desktop_pointer_move((cx0 + cw * 0.5, cy0 + ch * 0.5), cx)
     }); // activate
@@ -18187,8 +19863,16 @@ fn tile_drag_rests_view_cell_aligned(cx: &mut TestAppContext) {
         let d = &v.workspace.active_workspace().unwrap().desktop;
         (d.camera.pan, d.slot_of(win_b))
     });
-    assert_eq!(pan_after.0.fract(), 0.0, "pan.0 rests on a whole slot (got {pan_after:?})");
-    assert_eq!(pan_after.1.fract(), 0.0, "pan.1 rests on a whole slot (got {pan_after:?})");
+    assert_eq!(
+        pan_after.0.fract(),
+        0.0,
+        "pan.0 rests on a whole slot (got {pan_after:?})"
+    );
+    assert_eq!(
+        pan_after.1.fract(),
+        0.0,
+        "pan.1 rests on a whole slot (got {pan_after:?})"
+    );
     assert_eq!(
         slot_b_before, slot_b_after,
         "the un-dragged tile B never moves — the snap is view-only",
@@ -18308,6 +19992,7 @@ fn save_agent_ring_persists_session_id_to_workspace_json(cx: &mut TestAppContext
         let ws = load_persisted_workspace(&cwd).expect("workspace.json was written");
         fn collect(l: &PersistedLayout, out: &mut Vec<Option<String>>) {
             match l {
+                PersistedLayout::Empty => {}
                 PersistedLayout::Leaf(leaf) => {
                     if let PersistedKind::Agent { session_id } = &leaf.kind {
                         out.push(session_id.as_ref().map(|s| s.to_string()));
@@ -18363,7 +20048,11 @@ fn acp_persist_path_never_hits_real_home_in_tests() {
     let dir = tempfile::tempdir().expect("tempdir");
     let want = dir.path().join("acp_sessions.json");
     let got = with_acp_persist_path(want.clone(), acp_session_persist_path);
-    assert_eq!(got, Some(want), "with_acp_persist_path must redirect the path");
+    assert_eq!(
+        got,
+        Some(want),
+        "with_acp_persist_path must redirect the path"
+    );
     // The override is scoped: it clears again after the closure.
     assert_eq!(
         acp_session_persist_path(),
@@ -18406,7 +20095,10 @@ fn is_auto_claude_label_matches_only_generated_names() {
         "Codex-1",
         "the-claude-1",
     ] {
-        assert!(!is_auto_claude_label(custom), "{custom:?} should NOT be auto");
+        assert!(
+            !is_auto_claude_label(custom),
+            "{custom:?} should NOT be auto"
+        );
     }
 }
 
@@ -18501,11 +20193,11 @@ fn opened_session_recovers_lost_label_from_roster(cx: &mut TestAppContext) {
 /// tempdir, never `~/.yalda`.
 #[test]
 fn renamed_session_label_round_trips_unchanged() {
+    use crate::InputModeKind;
     use crate::persist::{
         SessionSnapshot, load_persisted_acp_sessions, save_persisted_acp_sessions,
         with_acp_persist_path,
     };
-    use crate::InputModeKind;
     let dir = tempfile::tempdir().expect("tempdir");
     let file = dir.path().join("acp_sessions.json");
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -18563,7 +20255,7 @@ fn renamed_session_label_round_trips_unchanged() {
 #[gpui::test]
 fn click_in_unfocused_tile_body_focuses_and_is_consumed(cx: &mut TestAppContext) {
     use crate::{AgentFocus, App};
-    use gpui::{point, px, Modifiers, MouseButton};
+    use gpui::{Modifiers, MouseButton, point, px};
     let (view, vcx, win_a, win_b) = boot_desktop_two_tiles(cx);
 
     // `boot_desktop_two_tiles` parks B at col 100 (~26000px off-viewport) to
@@ -18623,7 +20315,11 @@ fn click_in_unfocused_tile_body_focuses_and_is_consumed(cx: &mut TestAppContext)
     });
     vcx.run_until_parked();
     view.read_with(vcx, |v, _| {
-        assert_eq!(v.workspace.focused_window_id(), Some(win_a), "A starts focused");
+        assert_eq!(
+            v.workspace.focused_window_id(),
+            Some(win_a),
+            "A starts focused"
+        );
     });
 
     // A point over a REAL painted token inside B's transcript body (not the
@@ -18662,8 +20358,7 @@ fn click_in_unfocused_tile_body_focuses_and_is_consumed(cx: &mut TestAppContext)
     vcx.run_until_parked();
 
     // ── Non-vacuity: a press over B's repainted token reaches the content. ──
-    let tokens_after: Vec<crate::TokenHit> =
-        tv_b.update(vcx, |t, _| t.token_hits.borrow().clone());
+    let tokens_after: Vec<crate::TokenHit> = tv_b.update(vcx, |t, _| t.token_hits.borrow().clone());
     let token_after = tokens_after
         .iter()
         .find(|t| t.line_idx == 0)
@@ -18767,7 +20462,11 @@ fn close_session_requires_typed_yes_confirmation(cx: &mut TestAppContext) {
                 .unwrap_or_default(),
         )
     });
-    assert_eq!(bound, Some(id), "arming the confirm must NOT close the session");
+    assert_eq!(
+        bound,
+        Some(id),
+        "arming the confirm must NOT close the session"
+    );
     assert!(
         transcript.contains(YaldaGpuiView::CLOSE_CONFIRM_PROMPT),
         "the confirm prompt must be appended to the transcript, got: {transcript:?}"
@@ -18799,7 +20498,11 @@ fn close_session_requires_typed_yes_confirmation(cx: &mut TestAppContext) {
                 .unwrap_or_default(),
         )
     });
-    assert_eq!(bound, Some(id), "a non-`yes` answer must not close the session");
+    assert_eq!(
+        bound,
+        Some(id),
+        "a non-`yes` answer must not close the session"
+    );
     assert!(
         draft.contains("nope"),
         "the cancelled draft must be left in the compose, got: {draft:?}"
@@ -18833,7 +20536,10 @@ fn close_session_requires_typed_yes_confirmation(cx: &mut TestAppContext) {
         "the `yes` answer is never sent to the agent either"
     );
     let bound = view.update(vcx, |v, _| v.focused_bound_session());
-    assert_eq!(bound, None, "a typed `yes` closes the session (tile unbinds)");
+    assert_eq!(
+        bound, None,
+        "a typed `yes` closes the session (tile unbinds)"
+    );
 }
 
 /// bug-0013 (`UXI-AgentTile-8`, widened): a tool call that interrupts an OPEN run
@@ -18895,7 +20601,6 @@ fn tool_call_midsentence_does_not_split_agent_sentence(cx: &mut TestAppContext) 
         );
     });
 }
-
 
 /// bug-0015 (`UXI-Selection-1`): pressing the mouse inside a multiline code block
 /// must NOT move the block. The transcript's blank-line collapse protects the line
@@ -19068,9 +20773,8 @@ fn code_block_selection_is_painted_and_aligned(cx: &mut TestAppContext) {
     let tv = view
         .update(vcx, |v, _| v.transcript_views.get(&id).cloned())
         .expect("transcript view exists");
-    let hits = |vcx: &mut gpui::VisualTestContext| {
-        tv.update(vcx, |t, _| t.token_hits.borrow().clone())
-    };
+    let hits =
+        |vcx: &mut gpui::VisualTestContext| tv.update(vcx, |t, _| t.token_hits.borrow().clone());
 
     // (a) Hit bands land on the CONTENT lines from their own bounds — not on the
     // fence lines, and not the 4-band fence-inclusive even-split.
@@ -19204,7 +20908,11 @@ fn workspace_and_session_cwd_derive_from_project(cx: &mut TestAppContext) {
     // Repoint THAT project's cwd to B — the workspace's cwd follows LIVE, because
     // it is derived from the project (no cwd cached on the workspace).
     view.update(vcx, |v, _| {
-        let pid = v.workspace.active_workspace().expect("active workspace").project();
+        let pid = v
+            .workspace
+            .active_workspace()
+            .expect("active workspace")
+            .project();
         v.projects.set_cwd(pid, b.clone()).expect("repoint");
     });
     let at_b = view.read_with(vcx, |v, _| v.agent_base_cwd());
@@ -19213,7 +20921,6 @@ fn workspace_and_session_cwd_derive_from_project(cx: &mut TestAppContext) {
         "repointing the project moves the workspace's cwd — derived, not cached"
     );
 }
-
 
 /// UXI-Project-6 — a session↔tile bind is intra-project only. A free ROSTER
 /// session rooted in project B is NOT offered by an A-tile's selector
@@ -19380,7 +21087,11 @@ fn active_project_derives_from_focus(cx: &mut TestAppContext) {
         }
     });
     let at_a = view.read_with(vcx, |v, cx| v.active_project(cx));
-    assert_eq!(at_a, Some(a_pid), "active project = focused workspace's project (A)");
+    assert_eq!(
+        at_a,
+        Some(a_pid),
+        "active project = focused workspace's project (A)"
+    );
 
     // Jump the free B-session: its ephemeral workspace opens under project B, so
     // the derived active project follows focus to B.
@@ -19430,7 +21141,10 @@ fn delete_last_project_mints_a_fresh_default(cx: &mut TestAppContext) {
 
 /// Count the tiles (leaves) in the active workspace's layout.
 #[cfg(test)]
-fn active_tile_count(view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext) -> usize {
+fn active_tile_count(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+) -> usize {
     view.update(vcx, |v, _| {
         let mut n = 0;
         if let Some(wsp) = v.workspace.active_workspace() {
@@ -19477,12 +21191,12 @@ fn new_agent_adds_bound_or_unbound_tile_by_focus_domain(cx: &mut TestAppContext)
     let (workspaces_before, unbound_before, original) = view.update(vcx, |v, _| {
         let original = v
             .workspace
-            .directly_focused_unbound()
+            .presented_detached_tile_id()
             .expect("the jump directly focuses an unbound tile");
         assert_eq!(v.focused_bound_session(), Some(sid));
         (
             v.workspace.workspaces.len(),
-            v.workspace.unbound_tiles.len(),
+            v.workspace.detached_tiles.len(),
             original,
         )
     });
@@ -19497,13 +21211,13 @@ fn new_agent_adds_bound_or_unbound_tile_by_focus_domain(cx: &mut TestAppContext)
             "direct creation does not manufacture a workspace"
         );
         assert_eq!(
-            v.workspace.unbound_tiles.len(),
+            v.workspace.detached_tiles.len(),
             unbound_before + 1,
             "a second stable unbound tile is created"
         );
         let created = v
             .workspace
-            .directly_focused_unbound()
+            .presented_detached_tile_id()
             .expect("the new unbound tile is directly focused");
         assert_ne!(created, original, "new Agent preserves the original tile");
         assert!(
@@ -19511,10 +21225,12 @@ fn new_agent_adds_bound_or_unbound_tile_by_focus_domain(cx: &mut TestAppContext)
             "the new tile starts as an empty Agent picker"
         );
         assert_eq!(
-            v.workspace.tile(original).and_then(|window| match &window.content {
-                App::Agent(tile) => tile.session(),
-                _ => None,
-            }),
+            v.workspace
+                .tile(original)
+                .and_then(|window| match &window.content {
+                    App::Agent(tile) => tile.session(),
+                    _ => None,
+                }),
             Some(sid),
             "the original unbound tile retains its session"
         );
@@ -19534,7 +21250,7 @@ fn closing_session_keeps_same_unbound_tile_as_empty_picker(cx: &mut TestAppConte
     vcx.run_until_parked();
     let tile = view.update(vcx, |v, _| {
         v.workspace
-            .directly_focused_unbound()
+            .presented_detached_tile_id()
             .expect("session owns one directly focused unbound tile")
     });
 
@@ -19552,7 +21268,7 @@ fn closing_session_keeps_same_unbound_tile_as_empty_picker(cx: &mut TestAppConte
 
     view.update(vcx, |v, _| {
         assert_eq!(
-            v.workspace.directly_focused_unbound(),
+            v.workspace.presented_detached_tile_id(),
             Some(tile),
             "closing the session preserves direct focus on the same tile"
         );
@@ -19562,7 +21278,7 @@ fn closing_session_keeps_same_unbound_tile_as_empty_picker(cx: &mut TestAppConte
         ));
         assert!(
             v.workspace
-                .unbound_tiles
+                .detached_tiles
                 .iter()
                 .any(|entry| entry.window.id() == tile),
             "the empty Agent tile remains unbound"
@@ -19593,7 +21309,11 @@ fn arming_close_drops_into_insert_unless_a_draft_is_at_risk(cx: &mut TestAppCont
         let (view, vcx, id, _controls) = boot_worksheet_channel(cx);
         view.update(vcx, |v, cx| {
             v.with_session(id, cx, |c| {
-                assert_eq!(c.focus, crate::AgentFocus::Transcript, "worksheet rests in nav");
+                assert_eq!(
+                    c.focus,
+                    crate::AgentFocus::Transcript,
+                    "worksheet rests in nav"
+                );
                 assert!(c.input_surface.compose().text().is_empty(), "no draft");
             });
         });
@@ -19612,7 +21332,10 @@ fn arming_close_drops_into_insert_unless_a_draft_is_at_risk(cx: &mut TestAppCont
                     EditMode::Insert,
                     "…in INSERT, so `yes` can just be typed"
                 );
-                assert!(c.you_block_open, "the idle worksheet's typeable surface is a You-block");
+                assert!(
+                    c.you_block_open,
+                    "the idle worksheet's typeable surface is a You-block"
+                );
             });
         });
 
@@ -19755,7 +21478,7 @@ fn closing_session_preserves_unbound_tile_project(cx: &mut TestAppContext) {
     let tile = view.update(vcx, |v, _| {
         let tile = v
             .workspace
-            .directly_focused_unbound()
+            .presented_detached_tile_id()
             .expect("project-B session materializes an unbound tile");
         assert_eq!(v.workspace.tile_project(tile), Some(b_pid));
         tile
@@ -19765,7 +21488,7 @@ fn closing_session_preserves_unbound_tile_project(cx: &mut TestAppContext) {
 
     view.update(vcx, |v, _| {
         assert_eq!(
-            v.workspace.directly_focused_unbound(),
+            v.workspace.presented_detached_tile_id(),
             Some(tile),
             "session close leaves the same tile directly focused"
         );
@@ -19791,7 +21514,11 @@ fn closing_session_preserves_unbound_tile_project(cx: &mut TestAppContext) {
 /// opening exchange. Returns the view, its context, and the session's id.
 fn boot_armed_autoname_session(
     cx: &mut TestAppContext,
-) -> (gpui::Entity<YaldaGpuiView>, &mut gpui::VisualTestContext, crate::SessionId) {
+) -> (
+    gpui::Entity<YaldaGpuiView>,
+    &mut gpui::VisualTestContext,
+    crate::SessionId,
+) {
     use crate::{AgentSession, AgentState, AgentTile, App};
 
     let (view, vcx) = boot_browser(cx);
@@ -19807,7 +21534,9 @@ fn boot_armed_autoname_session(
             },
             cx,
         );
-        v.sessions.bind_sid(id, ServerSid::new("S1")).expect("S1 binds");
+        v.sessions
+            .bind_sid(id, ServerSid::new("S1"))
+            .expect("S1 binds");
         id
     });
     view.update(vcx, |v, cx| {
@@ -19859,7 +21588,9 @@ fn autoname_fires_once_on_first_turn_completion(cx: &mut TestAppContext) {
     let (view, vcx, id) = boot_armed_autoname_session(cx);
 
     // Before any turn: still owed, nothing requested.
-    let before = view.update(vcx, |v, cx| Some(v.sessions.get(id).unwrap().read(cx).state.autoname));
+    let before = view.update(vcx, |v, cx| {
+        Some(v.sessions.get(id).unwrap().read(cx).state.autoname)
+    });
     assert_eq!(
         before,
         Some(crate::AutonameState::Pending),
@@ -19867,7 +21598,9 @@ fn autoname_fires_once_on_first_turn_completion(cx: &mut TestAppContext) {
     );
 
     end_turn_for(&view, vcx, "S1", 1);
-    let after_first = view.update(vcx, |v, cx| Some(v.sessions.get(id).unwrap().read(cx).state.autoname));
+    let after_first = view.update(vcx, |v, cx| {
+        Some(v.sessions.get(id).unwrap().read(cx).state.autoname)
+    });
     assert_eq!(
         after_first,
         Some(crate::AutonameState::Requested),
@@ -19889,7 +21622,10 @@ fn autoname_fires_once_on_first_turn_completion(cx: &mut TestAppContext) {
     view.update(vcx, |v, cx| v.finish_autoname(id, None, cx));
     end_turn_for(&view, vcx, "S1", 2);
     let after_second = view.update(vcx, |v, cx| {
-        Some((v.sessions.get(id).unwrap().read(cx).state.autoname, v.sessions.get(id).unwrap().read(cx).state.autoname_due))
+        Some((
+            v.sessions.get(id).unwrap().read(cx).state.autoname,
+            v.sessions.get(id).unwrap().read(cx).state.autoname_due,
+        ))
     });
     assert_eq!(
         after_second,
@@ -20003,7 +21739,10 @@ fn autoname_result_renames_the_session(cx: &mut TestAppContext) {
             Some((s.label.clone(), s.state.summary.clone(), s.state.autoname))
         })
         .expect("session present");
-    assert_eq!(label, "payments adapter", "the derived name replaces claude-N");
+    assert_eq!(
+        label, "payments adapter",
+        "the derived name replaces claude-N"
+    );
     assert_eq!(
         summary.as_deref(),
         Some("Ripping out the payments adapter."),
@@ -20096,7 +21835,8 @@ fn autoname_summary_survives_a_gui_reload(cx: &mut TestAppContext) {
 
     // Session 2 ("reload"): a fresh view that loads the sidecar at construction
     // and knows S1 only from the server roster — nothing is bound to it.
-    let (view2, vcx2) = crate::persist::with_session_summaries_path(file.clone(), || boot_browser(cx));
+    let (view2, vcx2) =
+        crate::persist::with_session_summaries_path(file.clone(), || boot_browser(cx));
     let row_summary = view2.update(vcx2, |v, cx| {
         v.agent_roster.upsert(SessionInfo {
             session_id: "S1".into(),
@@ -20129,7 +21869,11 @@ fn autoname_summary_survives_a_gui_reload(cx: &mut TestAppContext) {
 #[cfg(test)]
 fn boot_pending_agent_tile<'a>(
     cx: &'a mut TestAppContext,
-) -> (gpui::Entity<YaldaGpuiView>, &'a mut gpui::VisualTestContext, u64) {
+) -> (
+    gpui::Entity<YaldaGpuiView>,
+    &'a mut gpui::VisualTestContext,
+    u64,
+) {
     use crate::{AgentSession, AgentState, AgentTile, App};
     let (view, vcx) = boot_browser(cx);
     let token = view.update(vcx, |v, cx| {
@@ -20369,7 +22113,9 @@ fn rename_latches_origin_and_blocks_autoname(cx: &mut TestAppContext) {
     });
     vcx.run_until_parked();
 
-    let origin = view.update(vcx, |v, cx| Some(v.sessions.get(id).unwrap().read(cx).state.name_origin));
+    let origin = view.update(vcx, |v, cx| {
+        Some(v.sessions.get(id).unwrap().read(cx).state.name_origin)
+    });
     assert_eq!(
         origin,
         Some(crate::NameOrigin::User),
@@ -20402,7 +22148,9 @@ fn rename_latches_origin_and_blocks_autoname(cx: &mut TestAppContext) {
 fn late_autoname_result_never_clobbers_a_user_rename(cx: &mut TestAppContext) {
     let (view, vcx, id) = boot_armed_autoname_session(cx);
     end_turn_for(&view, vcx, "S1", 1);
-    let armed = view.update(vcx, |v, cx| Some(v.sessions.get(id).unwrap().read(cx).state.autoname));
+    let armed = view.update(vcx, |v, cx| {
+        Some(v.sessions.get(id).unwrap().read(cx).state.autoname)
+    });
     assert_eq!(
         armed,
         Some(crate::AutonameState::Requested),
@@ -20471,9 +22219,10 @@ fn name_workspaces(
     view.update(vcx, |v, _| {
         let cwd = PathBuf::from(".");
         while v.workspace.workspaces.len() < names.len() {
-            v.workspace.push_workspace_inheriting(App::Buffer(BufferApp::Picking(
-                BrowserWindow::standalone(cwd.clone()),
-            )));
+            v.workspace
+                .push_workspace_inheriting(App::Buffer(BufferApp::Picking(
+                    BrowserWindow::standalone(cwd.clone()),
+                )));
         }
         for (i, n) in names.iter().enumerate() {
             v.workspace.workspaces[i].display_name = Some(n.clone());
@@ -20504,14 +22253,21 @@ fn jump_palette_cmd_p_opens_over_any_screen(cx: &mut TestAppContext) {
             v.overlay_is_jump_palette(),
             "cmd-p must open the jump palette on the focused screen"
         );
-        assert_eq!(v.jump_palette_ref().unwrap().query, "", "opens with an empty query");
+        assert_eq!(
+            v.jump_palette_ref().unwrap().query,
+            "",
+            "opens with an empty query"
+        );
     });
 
     // Re-pressing the chord: still open, still empty — not a toggle, not a `p`.
     vcx.simulate_keystrokes("cmd-p");
     vcx.run_until_parked();
     view.update(vcx, |v, _| {
-        assert!(v.overlay_is_jump_palette(), "cmd-p while open is a no-op, not a toggle");
+        assert!(
+            v.overlay_is_jump_palette(),
+            "cmd-p while open is a no-op, not a toggle"
+        );
         assert_eq!(
             v.jump_palette_ref().unwrap().query,
             "",
@@ -20543,34 +22299,43 @@ fn jump_palette_lists_workspaces_and_sessions_in_panel_order(cx: &mut TestAppCon
         )
     });
 
-    assert!(labels.contains(&"alpha".to_string()), "workspaces are candidates: {labels:?}");
-    assert!(labels.contains(&"beta".to_string()), "every workspace is a candidate: {labels:?}");
+    assert!(
+        labels.contains(&"alpha".to_string()),
+        "workspaces are candidates: {labels:?}"
+    );
+    assert!(
+        labels.contains(&"beta".to_string()),
+        "every workspace is a candidate: {labels:?}"
+    );
     assert!(
         labels.contains(&"gamma-session".to_string()),
         "agent sessions are candidates: {labels:?}"
     );
     // Panel order: a section's workspaces precede its sessions.
-    let first_agent = agents.iter().position(|a| *a).expect("at least one session row");
+    let first_agent = agents
+        .iter()
+        .position(|a| *a)
+        .expect("at least one session row");
     assert!(
         agents[..first_agent].iter().all(|a| !*a),
         "panel order puts a section's workspaces before its sessions: {agents:?}"
     );
 }
 
-/// ADR-0033 / UXI-JumpPanel-23: Cmd-P names an unbound *tile*, Enter opens that
-/// exact tile without binding it, and the explicit workspace command moves the
+/// ADR-0034 / UXI-JumpPanel-25: Cmd-P names a Detached *tile*, Enter opens that
+/// exact tile without attaching it, and the explicit workspace command moves the
 /// same id into the active workspace.
 #[gpui::test]
-fn jump_palette_opens_unbound_tile_then_binds_same_identity(cx: &mut TestAppContext) {
-    use crate::{App, LinearTile, PaletteTarget};
+fn jump_palette_opens_detached_tile_then_attaches_same_identity(cx: &mut TestAppContext) {
     use crate::workspace::TileMembership;
+    use crate::{App, LinearTile, PaletteTarget};
     cx.update(crate::register_keymap);
     let (view, vcx) = boot_browser(cx);
     let id = view.update(vcx, |v, _| {
         let project = v.workspace.active_workspace().expect("workspace").project();
         let mut tile = LinearTile::new();
         tile.title = "unique-unbound-linear".into();
-        v.workspace.push_unbound(App::Linear(tile), project)
+        v.workspace.push_detached(App::Linear(tile), project)
     });
 
     vcx.simulate_keystrokes("cmd-p");
@@ -20581,14 +22346,17 @@ fn jump_palette_opens_unbound_tile_then_binds_same_identity(cx: &mut TestAppCont
         let (items, ranked) = v.jump_palette_ranked(cx);
         let top = &items[*ranked.first().expect("unbound tile is a Cmd-P candidate")];
         assert_eq!(top.target, PaletteTarget::Tile(id));
-        assert!(top.detail.ends_with("Unbound"));
+        assert!(top.detail.ends_with("Detached"));
     });
 
     vcx.simulate_keystrokes("enter");
     vcx.run_until_parked();
     view.update(vcx, |v, _| {
-        assert_eq!(v.workspace.directly_focused_unbound(), Some(id));
-        assert_eq!(v.workspace.tile_membership(id), Some(TileMembership::Unbound));
+        assert_eq!(v.workspace.presented_detached_tile_id(), Some(id));
+        assert_eq!(
+            v.workspace.tile_membership(id),
+            Some(TileMembership::Detached)
+        );
     });
 
     vcx.simulate_keystrokes("ctrl-w b");
@@ -20596,12 +22364,15 @@ fn jump_palette_opens_unbound_tile_then_binds_same_identity(cx: &mut TestAppCont
     view.update(vcx, |v, _| {
         assert_eq!(
             v.workspace.tile_membership(id),
-            Some(TileMembership::Bound { workspace: 0 })
+            Some(TileMembership::Attached {
+                workspace: 0,
+                visibility: crate::workspace::AttachedVisibility::Visible
+            })
         );
         assert_eq!(v.workspace.focused_window_id(), Some(id));
         assert!(
             v.workspace
-                .unbound_tiles
+                .detached_tiles
                 .iter()
                 .all(|tile| tile.window.id() != id)
         );
@@ -20613,7 +22384,7 @@ fn jump_palette_opens_unbound_tile_then_binds_same_identity(cx: &mut TestAppCont
 /// the best match rather than the first list member that happened to match.
 #[gpui::test]
 fn jump_palette_ranks_best_match_first(_cx: &mut TestAppContext) {
-    use crate::{fuzzy_score, rank_palette_items, PaletteItem, PaletteTarget};
+    use crate::{PaletteItem, PaletteTarget, fuzzy_score, rank_palette_items};
     let item = |label: &str, i: usize| PaletteItem {
         target: PaletteTarget::Workspace(i),
         label: label.to_string(),
@@ -20630,7 +22401,10 @@ fn jump_palette_ranks_best_match_first(_cx: &mut TestAppContext) {
     ];
     let ranked = rank_palette_items(&items, "yal");
     assert_eq!(
-        ranked.iter().map(|&i| items[i].label.as_str()).collect::<Vec<_>>(),
+        ranked
+            .iter()
+            .map(|&i| items[i].label.as_str())
+            .collect::<Vec<_>>(),
         vec!["yal", "yalda-gpui", "the yalda archive"],
         "candidates must be ordered by match quality, best first"
     );
@@ -20661,7 +22435,10 @@ fn jump_palette_enter_jumps_to_top_match(cx: &mut TestAppContext) {
     view.update(vcx, |v, cx| {
         assert_eq!(v.jump_palette_ref().unwrap().query, "gam");
         let (items, ranked) = v.jump_palette_ranked(cx);
-        assert_eq!(items[ranked[0]].label, "gamma", "top match is the typed workspace");
+        assert_eq!(
+            items[ranked[0]].label, "gamma",
+            "top match is the typed workspace"
+        );
     });
 
     vcx.simulate_keystrokes("enter");
@@ -20697,7 +22474,11 @@ fn jump_palette_arrows_select_and_enter_activates_the_selection(cx: &mut TestApp
     vcx.simulate_keystrokes("down down");
     vcx.run_until_parked();
     view.update(vcx, |v, _| {
-        assert_eq!(v.jump_palette_ref().unwrap().selected, 2, "down moves the highlight");
+        assert_eq!(
+            v.jump_palette_ref().unwrap().selected,
+            2,
+            "down moves the highlight"
+        );
         assert_eq!(
             v.workspace.active_workspace, started_on,
             "moving the highlight must NOT navigate"
@@ -20708,7 +22489,9 @@ fn jump_palette_arrows_select_and_enter_activates_the_selection(cx: &mut TestApp
     vcx.run_until_parked();
     let landed = view.update(vcx, |v, _| {
         assert!(!v.overlay_is_jump_palette());
-        v.workspace.workspaces[v.workspace.active_workspace].display_label().to_string()
+        v.workspace.workspaces[v.workspace.active_workspace]
+            .display_label()
+            .to_string()
     });
     assert_eq!(
         landed, third_label,
@@ -20730,7 +22513,10 @@ fn jump_palette_no_match_enter_is_noop(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         assert_eq!(v.jump_palette_ref().unwrap().query, "zqx");
-        assert!(v.jump_palette_ranked(cx).1.is_empty(), "nothing matches 'zqx'");
+        assert!(
+            v.jump_palette_ranked(cx).1.is_empty(),
+            "nothing matches 'zqx'"
+        );
     });
 
     vcx.simulate_keystrokes("enter");
@@ -20749,7 +22535,11 @@ fn jump_palette_no_match_enter_is_noop(cx: &mut TestAppContext) {
     view.update(vcx, |v, cx| {
         let (items, ranked) = v.jump_palette_ranked(cx);
         assert_eq!(items[ranked[0]].label, "beta");
-        assert_eq!(v.jump_palette_ref().unwrap().selected, 0, "editing resets the highlight");
+        assert_eq!(
+            v.jump_palette_ref().unwrap().selected,
+            0,
+            "editing resets the highlight"
+        );
     });
 }
 
@@ -20784,6 +22574,7 @@ fn jump_palette_does_not_open_over_another_overlay(cx: &mut TestAppContext) {
 
     view.update(vcx, |v, cx| {
         v.open_overlay(ActiveOverlay::WorkspacePicker(WorkspacePicker {
+            project: v.workspace.inherited_project(),
             mode: WorkspacePickerMode::Move { follow: false },
             targets: vec![0, 1],
             selected: 0,
@@ -20793,7 +22584,10 @@ fn jump_palette_does_not_open_over_another_overlay(cx: &mut TestAppContext) {
             !v.overlay_is_jump_palette(),
             "cmd-p must not steal the overlay slot from another overlay"
         );
-        assert!(v.overlay_is_workspace(), "…and must leave that overlay intact");
+        assert!(
+            v.overlay_is_workspace(),
+            "…and must leave that overlay intact"
+        );
     });
 }
 
@@ -20875,7 +22669,9 @@ fn archive_toggle_announces_in_console_and_transcript(cx: &mut TestAppContext) {
                     .map(|i| {
                         (
                             c.editor.document().line_text(i),
-                            c.editor.anchor_for_line_opt(i).and_then(|a| turn_meta.get(a).copied()),
+                            c.editor
+                                .anchor_for_line_opt(i)
+                                .and_then(|a| turn_meta.get(a).copied()),
                         )
                     })
                     .find(|(text, _)| !text.trim().is_empty())
@@ -20911,12 +22707,19 @@ fn archive_toggle_announces_in_console_and_transcript(cx: &mut TestAppContext) {
         // ── Re-archiving is a no-op: it must announce NOTHING ───────────────
         let before = read_console();
         let lines_before = view
-            .update(vcx, |v, cx| v.read_session(id, cx, |c| c.editor.document().line_count()))
+            .update(vcx, |v, cx| {
+                v.read_session(id, cx, |c| c.editor.document().line_count())
+            })
             .expect("open session");
         view.update(vcx, |v, cx| v.set_session_archived("S1", true, cx));
-        assert_eq!(read_console(), before, "a no-op archive writes no console line");
         assert_eq!(
-            view.update(vcx, |v, cx| v.read_session(id, cx, |c| c.editor.document().line_count())),
+            read_console(),
+            before,
+            "a no-op archive writes no console line"
+        );
+        assert_eq!(
+            view.update(vcx, |v, cx| v
+                .read_session(id, cx, |c| c.editor.document().line_count())),
             Some(lines_before),
             "a no-op archive appends no transcript notice"
         );
@@ -21510,7 +23313,10 @@ fn cog_body_is_cached(cx: &mut TestAppContext) {
         vcx.run_until_parked();
     }
     let flat = crate::perf_render_count("cog");
-    assert_eq!(flat, base, "root notify must NOT re-render the cached cog body");
+    assert_eq!(
+        flat, base,
+        "root notify must NOT re-render the cached cog body"
+    );
 
     // A body payload change (mutation-site notify) busts the cache exactly once.
     cv.update(vcx, |c, cx| {
@@ -21519,7 +23325,11 @@ fn cog_body_is_cached(cx: &mut TestAppContext) {
     });
     vcx.run_until_parked();
     let after = crate::perf_render_count("cog");
-    assert_eq!(after, base + 1, "a body payload change re-renders the body once");
+    assert_eq!(
+        after,
+        base + 1,
+        "a body payload change re-renders the body once"
+    );
 }
 
 /// UXI-Cog-2/-3 (PAINT, non-vacuous): a node with tall detail paints a right-pane
@@ -21542,7 +23352,9 @@ fn cog_detail_paints_and_overflows(cx: &mut TestAppContext) {
         v.cog_apply(
             wid,
             req,
-            Ok(crate::CogFetch::Graph(Box::new(cog_test_bundle(vec![node])))),
+            Ok(crate::CogFetch::Graph(Box::new(cog_test_bundle(vec![
+                node,
+            ])))),
             cx,
         );
     });
@@ -21580,12 +23392,14 @@ fn cog_detail_pane_fills_width(cx: &mut TestAppContext) {
         v.cog_apply(
             wid,
             req,
-            Ok(crate::CogFetch::Graph(Box::new(cog_test_bundle(vec![cog_test_node(
-                "omega",
-                "omega",
-                "open",
-                serde_json::json!({"purpose": "confirm the seam"}),
-            )])))),
+            Ok(crate::CogFetch::Graph(Box::new(cog_test_bundle(vec![
+                cog_test_node(
+                    "omega",
+                    "omega",
+                    "open",
+                    serde_json::json!({"purpose": "confirm the seam"}),
+                ),
+            ])))),
             cx,
         );
     });
@@ -21709,7 +23523,10 @@ fn cog_click_node_selects(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     let (sel, focused_right) = cv.update(vcx, |c, _| (c.selected_index(), c.focused_right()));
     assert_eq!(sel, 2, "clicking node row 2 selects it");
-    assert!(!focused_right, "clicking a node row returns focus to the selector");
+    assert!(
+        !focused_right,
+        "clicking a node row returns focus to the selector"
+    );
 }
 
 /// UXI-Cog-5: clicking the right detail pane moves keyboard focus there so j/k
@@ -21722,9 +23539,9 @@ fn cog_click_right_pane_focuses_it(cx: &mut TestAppContext) {
         v.cog_apply(
             wid,
             req,
-            Ok(crate::CogFetch::Graph(Box::new(cog_test_bundle(vec![cog_tall_node(
-                "n1", "only", "done",
-            )])))),
+            Ok(crate::CogFetch::Graph(Box::new(cog_test_bundle(vec![
+                cog_tall_node("n1", "only", "done"),
+            ])))),
             cx,
         );
     });
@@ -21762,7 +23579,10 @@ fn cog_click_graph_row_opens(cx: &mut TestAppContext) {
         );
     });
     vcx.run_until_parked();
-    assert!(cv.update(vcx, |c, _| c.in_graphs()), "starts on the explorer");
+    assert!(
+        cv.update(vcx, |c, _| c.in_graphs()),
+        "starts on the explorer"
+    );
 
     // Click the second graph row. click_graph selects it then routes to the root
     // open path, which sets the tile to Loading synchronously (before the async
@@ -21775,7 +23595,10 @@ fn cog_click_graph_row_opens(cx: &mut TestAppContext) {
 }
 
 #[cfg(test)]
-fn cog_tile_watch_gen(view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext) -> u64 {
+fn cog_tile_watch_gen(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+) -> u64 {
     view.update(vcx, |v, _| match v.workspace.focused_content() {
         Some(crate::App::Cog(tile)) => tile.watch_gen,
         _ => panic!("expected a Cog tile"),
@@ -21794,12 +23617,9 @@ fn cog_events_stream_into_pane(cx: &mut TestAppContext) {
         v.cog_apply(
             wid,
             req,
-            Ok(crate::CogFetch::Graph(Box::new(cog_test_bundle(vec![cog_test_node(
-                "n1",
-                "only",
-                "done",
-                serde_json::json!({"purpose": "a"}),
-            )])))),
+            Ok(crate::CogFetch::Graph(Box::new(cog_test_bundle(vec![
+                cog_test_node("n1", "only", "done", serde_json::json!({"purpose": "a"})),
+            ])))),
             cx,
         );
     });
@@ -21808,11 +23628,25 @@ fn cog_events_stream_into_pane(cx: &mut TestAppContext) {
 
     let generation = cog_tile_watch_gen(&view, vcx);
     view.update(vcx, |v, cx| {
-        v.cog_push_event(wid, generation, r#"{"kind":"claimed","node":"n1"}"#.into(), cx);
-        v.cog_push_event(wid, generation, r#"{"ready":["n1"],"status":{"status":"open"}}"#.into(), cx);
+        v.cog_push_event(
+            wid,
+            generation,
+            r#"{"kind":"claimed","node":"n1"}"#.into(),
+            cx,
+        );
+        v.cog_push_event(
+            wid,
+            generation,
+            r#"{"ready":["n1"],"status":{"status":"open"}}"#.into(),
+            cx,
+        );
     });
     vcx.run_until_parked();
-    assert_eq!(cv.update(vcx, |c, _| c.events_len()), 2, "two events streamed in");
+    assert_eq!(
+        cv.update(vcx, |c, _| c.events_len()),
+        2,
+        "two events streamed in"
+    );
     assert_eq!(
         cv.update(vcx, |c, _| c.newest_event_seq()),
         Some(2),
@@ -21821,17 +23655,30 @@ fn cog_events_stream_into_pane(cx: &mut TestAppContext) {
 
     // A stale generation (a killed prior watcher) is dropped.
     view.update(vcx, |v, cx| {
-        v.cog_push_event(wid, generation.wrapping_sub(1), r#"{"stale":true}"#.into(), cx);
+        v.cog_push_event(
+            wid,
+            generation.wrapping_sub(1),
+            r#"{"stale":true}"#.into(),
+            cx,
+        );
     });
     vcx.run_until_parked();
-    assert_eq!(cv.update(vcx, |c, _| c.events_len()), 2, "stale-generation event dropped");
+    assert_eq!(
+        cv.update(vcx, |c, _| c.events_len()),
+        2,
+        "stale-generation event dropped"
+    );
 
     // Non-JSON is dropped, not panicked.
     view.update(vcx, |v, cx| {
         v.cog_push_event(wid, generation, "not json".into(), cx);
     });
     vcx.run_until_parked();
-    assert_eq!(cv.update(vcx, |c, _| c.events_len()), 2, "invalid JSON dropped");
+    assert_eq!(
+        cv.update(vcx, |c, _| c.events_len()),
+        2,
+        "invalid JSON dropped"
+    );
 }
 
 /// UXI-Cog-6: the events pane is the third column, present only in a graph, and
@@ -21868,12 +23715,9 @@ fn cog_events_pane_paints_and_focus_cycles(cx: &mut TestAppContext) {
         v.cog_apply(
             wid,
             req,
-            Ok(crate::CogFetch::Graph(Box::new(cog_test_bundle(vec![cog_test_node(
-                "n1",
-                "only",
-                "done",
-                serde_json::json!({"purpose": "a"}),
-            )])))),
+            Ok(crate::CogFetch::Graph(Box::new(cog_test_bundle(vec![
+                cog_test_node("n1", "only", "done", serde_json::json!({"purpose": "a"})),
+            ])))),
             cx,
         );
     });
@@ -21884,7 +23728,10 @@ fn cog_events_pane_paints_and_focus_cycles(cx: &mut TestAppContext) {
     assert!(w > 0.0 && h > 0.0, "events pane has real size ({w}x{h})");
 
     // Focus starts on the selector; Tab cycles selector → detail → events → selector.
-    assert!(cv.update(vcx, |c, _| c.focused_selector()), "focus starts on selector");
+    assert!(
+        cv.update(vcx, |c, _| c.focused_selector()),
+        "focus starts on selector"
+    );
     view.update(vcx, |v, cx| v.handle_cog_press(tab(), cx));
     vcx.run_until_parked();
     assert!(cv.update(vcx, |c, _| c.focused_right()), "tab → detail");
@@ -21893,11 +23740,17 @@ fn cog_events_pane_paints_and_focus_cycles(cx: &mut TestAppContext) {
     assert!(cv.update(vcx, |c, _| c.focused_events()), "tab → events");
     view.update(vcx, |v, cx| v.handle_cog_press(tab(), cx));
     vcx.run_until_parked();
-    assert!(cv.update(vcx, |c, _| c.focused_selector()), "tab → selector");
+    assert!(
+        cv.update(vcx, |c, _| c.focused_selector()),
+        "tab → selector"
+    );
 }
 
 #[cfg(test)]
-fn cog_tile_needs_load(view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext) -> bool {
+fn cog_tile_needs_load(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+) -> bool {
     view.update(vcx, |v, _| match v.workspace.focused_content() {
         Some(crate::App::Cog(tile)) => tile.needs_load,
         _ => panic!("expected a Cog tile"),
@@ -21919,7 +23772,10 @@ fn cog_restored_tile_kicks_load(cx: &mut TestAppContext) {
 }
 
 #[cfg(test)]
-fn cog_tile_refreshing(view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext) -> bool {
+fn cog_tile_refreshing(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+) -> bool {
     view.update(vcx, |v, _| match v.workspace.focused_content() {
         Some(crate::App::Cog(tile)) => tile.refreshing,
         _ => panic!("expected a Cog tile"),
@@ -21946,16 +23802,27 @@ fn cog_event_auto_refreshes_and_preserves_events(cx: &mut TestAppContext) {
         );
     });
     vcx.run_until_parked();
-    assert!(!cog_tile_refreshing(&view, vcx), "no refresh before any event");
+    assert!(
+        !cog_tile_refreshing(&view, vcx),
+        "no refresh before any event"
+    );
 
     // A live event both buffers AND triggers an auto-refresh (coalesced flag set).
     let generation = cog_tile_watch_gen(&view, vcx);
     view.update(vcx, |v, cx| {
-        v.cog_push_event(wid, generation, r#"{"kind":"claimed","node":"n1"}"#.into(), cx);
+        v.cog_push_event(
+            wid,
+            generation,
+            r#"{"kind":"claimed","node":"n1"}"#.into(),
+            cx,
+        );
     });
     vcx.run_until_parked();
     assert_eq!(cv.update(vcx, |c, _| c.events_len()), 1, "event buffered");
-    assert!(cog_tile_refreshing(&view, vcx), "a live event auto-refreshes the graph");
+    assert!(
+        cog_tile_refreshing(&view, vcx),
+        "a live event auto-refreshes the graph"
+    );
 
     // The refresh reload lands: a NEW 3-node bundle updates the node list in
     // place, and the events feed SURVIVES (not cleared like a graph change).
@@ -21964,14 +23831,23 @@ fn cog_event_auto_refreshes_and_preserves_events(cx: &mut TestAppContext) {
             wid,
             Ok(cog_test_bundle(vec![
                 cog_test_node("n1", "first", "done", serde_json::json!({"purpose": "a"})),
-                cog_test_node("n2", "second", "claimed", serde_json::json!({"purpose": "b"})),
+                cog_test_node(
+                    "n2",
+                    "second",
+                    "claimed",
+                    serde_json::json!({"purpose": "b"}),
+                ),
                 cog_test_node("n3", "third", "open", serde_json::json!({"purpose": "c"})),
             ])),
             cx,
         );
     });
     vcx.run_until_parked();
-    assert_eq!(cv.update(vcx, |c, _| c.list_len()), 3, "refresh updated the node set");
+    assert_eq!(
+        cv.update(vcx, |c, _| c.list_len()),
+        3,
+        "refresh updated the node set"
+    );
     assert_eq!(
         cv.update(vcx, |c, _| c.events_len()),
         1,
@@ -21996,8 +23872,14 @@ fn cog_node_sections_state_transitions_first(_cx: &mut TestAppContext) {
     // Without output → Output is omitted, transitions still first.
     let node2 = cog_test_node("n2", "y", "open", serde_json::json!({"purpose": "p"}));
     let titles = crate::node_section_titles(&node2);
-    assert_eq!(titles[0], "Status transitions", "State transitions must be first");
-    assert!(!titles.contains(&"Output"), "no Output section without output");
+    assert_eq!(
+        titles[0], "Status transitions",
+        "State transitions must be first"
+    );
+    assert!(
+        !titles.contains(&"Output"),
+        "no Output section without output"
+    );
 }
 
 /// UXI-Cog-11: node JSON (content/output/events) renders as a foldable tree-table
@@ -22016,9 +23898,9 @@ fn cog_json_tree_fold_collapses(cx: &mut TestAppContext) {
         v.cog_apply(
             wid,
             req,
-            Ok(crate::CogFetch::Graph(Box::new(cog_test_bundle(vec![cog_test_node(
-                "n1", "node", "done", content,
-            )])))),
+            Ok(crate::CogFetch::Graph(Box::new(cog_test_bundle(vec![
+                cog_test_node("n1", "node", "done", content),
+            ])))),
             cx,
         );
     });
@@ -22036,15 +23918,23 @@ fn cog_json_tree_fold_collapses(cx: &mut TestAppContext) {
     let (_, _, _, h_expanded) = expanded.expect("content tree paints expanded");
 
     // Fold "outer" (the real toggle the fold-row click invokes).
-    assert!(!cv.update(vcx, |c, _| c.json_folded("n:n1/content/outer")), "starts expanded");
+    assert!(
+        !cv.update(vcx, |c, _| c.json_folded("n:n1/content/outer")),
+        "starts expanded"
+    );
     crate::layout_probe_begin();
-    cv.update(vcx, |c, cx| c.toggle_json_fold("n:n1/content/outer".into(), cx));
+    cv.update(vcx, |c, cx| {
+        c.toggle_json_fold("n:n1/content/outer".into(), cx)
+    });
     vcx.run_until_parked();
     let folded = crate::layout_probe_get("cog-sec-1");
     crate::layout_probe_end();
     let (_, _, _, h_folded) = folded.expect("content tree paints folded");
 
-    assert!(cv.update(vcx, |c, _| c.json_folded("n:n1/content/outer")), "outer is now folded");
+    assert!(
+        cv.update(vcx, |c, _| c.json_folded("n:n1/content/outer")),
+        "outer is now folded"
+    );
     assert!(
         h_folded < h_expanded,
         "folding a nested key must hide its child rows (folded {h_folded}px < expanded {h_expanded}px)"
@@ -22065,8 +23955,14 @@ fn cog_stats_completion_times(_cx: &mut TestAppContext) {
         kind: "status_changed".into(),
         data: serde_json::json!({"to": to}),
     };
-    logs.insert("n1".to_string(), vec![tr("claimed", sec), tr("done", 3 * sec)]);
-    logs.insert("n2".to_string(), vec![tr("claimed", 10 * sec), tr("done", 15 * sec)]);
+    logs.insert(
+        "n1".to_string(),
+        vec![tr("claimed", sec), tr("done", 3 * sec)],
+    );
+    logs.insert(
+        "n2".to_string(),
+        vec![tr("claimed", 10 * sec), tr("done", 15 * sec)],
+    );
     let bundle = crate::CogBundle {
         graph: cog_test_graph("g", "G"),
         status: Default::default(),
@@ -22114,17 +24010,26 @@ fn cog_overview_reachable_and_toc_jumps(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     let ov = crate::layout_probe_get("cog-right-content");
     crate::layout_probe_end();
-    assert!(cv.update(vcx, |c, _| c.showing_overview()), "a graph opens on its Overview");
+    assert!(
+        cv.update(vcx, |c, _| c.showing_overview()),
+        "a graph opens on its Overview"
+    );
     let (_, _, w, h) = ov.expect("overview body paints");
     assert!(w > 0.0 && h > 0.0, "overview body has real size ({w}x{h})");
 
     // `j` down leaves Overview for a node; `k` up returns to it.
     view.update(vcx, |v, cx| v.cog_select(1, cx));
     vcx.run_until_parked();
-    assert!(!cv.update(vcx, |c, _| c.showing_overview()), "j down leaves the Overview");
+    assert!(
+        !cv.update(vcx, |c, _| c.showing_overview()),
+        "j down leaves the Overview"
+    );
     view.update(vcx, |v, cx| v.cog_select(-1, cx));
     vcx.run_until_parked();
-    assert!(cv.update(vcx, |c, _| c.showing_overview()), "k up returns to the Overview");
+    assert!(
+        cv.update(vcx, |c, _| c.showing_overview()),
+        "k up returns to the Overview"
+    );
 
     // Back to a node; a TOC click (section 2) scrolls the detail pane down.
     view.update(vcx, |v, cx| v.cog_select(1, cx)); // overview → node 0
@@ -22176,8 +24081,15 @@ fn cog_completion_without_claimed_counts(_cx: &mut TestAppContext) {
         render: String::new(),
     };
     let s = bundle.stats();
-    assert_eq!(s.completed, 1, "a claimed-less done node still counts as completed");
-    assert_eq!(s.quickest_ns, Some(2 * sec), "span = done − earliest log entry");
+    assert_eq!(
+        s.completed, 1,
+        "a claimed-less done node still counts as completed"
+    );
+    assert_eq!(
+        s.quickest_ns,
+        Some(2 * sec),
+        "span = done − earliest log entry"
+    );
 }
 
 /// UXI-Cog-10: the graph picker supports `/` search — typing filters the list and
@@ -22229,7 +24141,11 @@ fn cog_graph_picker_search_filters(cx: &mut TestAppContext) {
     // Esc clears the search back to the full list.
     view.update(vcx, |v, cx| v.handle_cog_press(kp('x'), cx)); // "bex" → no match
     vcx.run_until_parked();
-    assert_eq!(cv.update(vcx, |c, _| c.selected_graph_id()), None, "no matches → nothing selected");
+    assert_eq!(
+        cv.update(vcx, |c, _| c.selected_graph_id()),
+        None,
+        "no matches → nothing selected"
+    );
     view.update(vcx, |v, cx| {
         v.handle_cog_press(KeyPress::new(Key::Esc, KMods::NONE), cx)
     });

@@ -70,11 +70,11 @@ impl YaldaGpuiView {
     pub(crate) fn all_known_tags(&self) -> Vec<String> {
         let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for workspace in &self.workspace.workspaces {
-            workspace.layout.for_each_leaf(&mut |window| {
+            workspace.for_each_attached_window(&mut |window| {
                 set.extend(window.tags.iter().cloned());
             });
         }
-        for tile in &self.workspace.unbound_tiles {
+        for tile in &self.workspace.detached_tiles {
             set.extend(tile.window.tags.iter().cloned());
         }
         for tags in self.session_tags.values() {
@@ -98,14 +98,15 @@ impl YaldaGpuiView {
             c.dedup();
             c
         };
-        let on_session =
-            |t: &str| current.iter().any(|c| c.eq_ignore_ascii_case(t));
+        let on_session = |t: &str| current.iter().any(|c| c.eq_ignore_ascii_case(t));
         let typed = ov.input.trim();
         let q = typed.to_lowercase();
         let mut left: Vec<TagLeftRow> = Vec::new();
         // A "create" row when the typed text is a genuinely new tag.
-        let known_exact =
-            self.all_known_tags().iter().any(|k| k.eq_ignore_ascii_case(typed));
+        let known_exact = self
+            .all_known_tags()
+            .iter()
+            .any(|k| k.eq_ignore_ascii_case(typed));
         if !typed.is_empty() && !on_session(typed) && !known_exact {
             left.push(TagLeftRow::New(typed.to_string()));
         }
@@ -175,10 +176,7 @@ impl YaldaGpuiView {
     /// Add `tag` to the editor's session and reset the filter (so the list
     /// refreshes and the just-added tag hops to the right column).
     pub(crate) fn tag_editor_add(&mut self, tag: &str, cx: &mut Context<Self>) {
-        let Some((tile, sid)) = self
-            .tag_editor_ref()
-            .map(|o| (o.tile, o.sid.clone()))
-        else {
+        let Some((tile, sid)) = self.tag_editor_ref().map(|o| (o.tile, o.sid.clone())) else {
             return;
         };
         let tag = tag.trim();
@@ -199,10 +197,7 @@ impl YaldaGpuiView {
 
     /// Remove `tag` from the editor's session, clamping the Current highlight.
     pub(crate) fn tag_editor_remove(&mut self, tag: &str, cx: &mut Context<Self>) {
-        let Some((tile, sid)) = self
-            .tag_editor_ref()
-            .map(|o| (o.tile, o.sid.clone()))
-        else {
+        let Some((tile, sid)) = self.tag_editor_ref().map(|o| (o.tile, o.sid.clone())) else {
             return;
         };
         if let Some(window) = self.workspace.tile_mut(tile)
@@ -527,12 +522,10 @@ impl YaldaGpuiView {
         }
 
         // ── ON THIS SESSION (right) column rows.
-        let mut right_col = div()
-            .flex_1()
-            .min_w_0()
-            .flex()
-            .flex_col()
-            .child(col_head("ON THIS SESSION", focus == TagEditorColumn::Current));
+        let mut right_col = div().flex_1().min_w_0().flex().flex_col().child(col_head(
+            "ON THIS SESSION",
+            focus == TagEditorColumn::Current,
+        ));
         if model.current.is_empty() {
             right_col = right_col.child(
                 div()

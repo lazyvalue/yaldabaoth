@@ -1,6 +1,6 @@
 # ADR-0033 — Tiles have optional workspace ownership
 
-**Status:** accepted
+**Status:** superseded by ADR-0034
 **Date:** 2026-08-18
 **Supersedes:** ADR-0021 (ephemeral virtual workspaces), the free-session
 placement model in `spec-agent-session-ownership.md`, and the words “free
@@ -22,7 +22,7 @@ close behavior, Cmd-P, and the jump panel. It also makes a workspace look like
 the owner of application state even though users expect a tile to keep its state
 when it leaves a workspace.
 
-## Decision
+## Decision (historical)
 
 ### 1. A tile is the durable shell object
 
@@ -102,6 +102,14 @@ on the next save. No old leaf is duplicated into Unbound.
   focus has no workspace number.
 - Layout code continues to own bound placement geometry. The frame owns
   unbound ordering and direct focus.
+
+## Supersession
+
+ADR-0034 separates workspace attachment from workspace visibility. Its
+**Attached / Detached** vocabulary replaces **Bound / Unbound**, and its hidden
+attached state replaces the scratchpad-as-Unbound model added after this ADR.
+This document remains the historical record for stable tile identity, exclusive
+ownership, project-local attachment, and the removal of ephemeral workspaces.
 
 ## Alternatives rejected
 

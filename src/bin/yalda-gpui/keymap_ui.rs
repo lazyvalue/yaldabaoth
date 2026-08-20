@@ -19,10 +19,7 @@ impl YaldaGpuiView {
     }
 
     pub(crate) fn open_keymap_inner(&mut self, cx: &mut Context<Self>) {
-        if matches!(
-            self.workspace.focused_content().expect("no focused window"),
-            App::Keymap(_)
-        ) {
+        if matches!(self.workspace.focused_content(), Some(App::Keymap(_))) {
             return;
         }
         self.set_screen(App::Keymap(KeymapTile::new()));
@@ -101,7 +98,12 @@ impl YaldaGpuiView {
 
     /// Filter mode: type into the search box; Enter keeps the filter and returns
     /// to Browse; Esc clears the filter and returns to Browse.
-    fn keymap_filter_key(&mut self, view: &Entity<KeymapView>, press: KeyPress, cx: &mut Context<Self>) {
+    fn keymap_filter_key(
+        &mut self,
+        view: &Entity<KeymapView>,
+        press: KeyPress,
+        cx: &mut Context<Self>,
+    ) {
         match press.key {
             Key::Enter => view.update(cx, |kv, c| {
                 kv.set_mode(KeymapMode::Browse);
@@ -125,7 +127,12 @@ impl YaldaGpuiView {
     }
 
     /// Browse mode: vim navigation + rebind / reset commands.
-    fn keymap_browse_key(&mut self, view: &Entity<KeymapView>, press: KeyPress, cx: &mut Context<Self>) {
+    fn keymap_browse_key(
+        &mut self,
+        view: &Entity<KeymapView>,
+        press: KeyPress,
+        cx: &mut Context<Self>,
+    ) {
         match press.key {
             Key::Char('j') | Key::Down => {
                 let n = self.keymap_visible_count(view, cx);

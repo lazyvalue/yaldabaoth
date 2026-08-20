@@ -15,11 +15,7 @@ const FULL_PAGE_LINES: usize = 30;
 impl YaldaGpuiView {
     /// `Some(edit)` if currently editing, else `None`.
     pub(crate) fn edit_mut(&mut self) -> Option<&mut EditState> {
-        match self
-            .workspace
-            .focused_content_mut()
-            .expect("no focused window")
-        {
+        match self.workspace.focused_content_mut()? {
             App::Buffer(BufferApp::Editing(e)) => Some(e),
             _ => None,
         }
@@ -163,17 +159,16 @@ impl YaldaGpuiView {
     /// (Step-2 TODO: stash the EditorView cursor so re-entering Edit lands
     /// where the user left off; today the cursor resets to the top.)
     pub(crate) fn back_to_doc(&mut self, cx: &mut Context<Self>) {
-        let prev = self
-            .workspace
-            .replace_focused_content(
-                // Placeholder; overwritten in every match arm below.
-                App::Buffer(BufferApp::Viewing(DocState::viewing(
-                    Vec::new(),
-                    SharedString::new_static(""),
-                    None,
-                ))),
-            )
-            .expect("workspace has no focused window");
+        let Some(prev) = self.workspace.replace_focused_content(
+            // Placeholder; overwritten in every match arm below.
+            App::Buffer(BufferApp::Viewing(DocState::viewing(
+                Vec::new(),
+                SharedString::new_static(""),
+                None,
+            ))),
+        ) else {
+            return;
+        };
         match prev {
             App::Buffer(BufferApp::Editing(edit)) => {
                 let edit_path = PathBuf::from(edit.file_label.as_ref());
@@ -429,7 +424,8 @@ impl YaldaGpuiView {
             match press.key {
                 Key::Tab => {
                     if self.workspace.workspaces.len() > 1 {
-                        let next = (self.workspace.active_workspace + 1) % self.workspace.workspaces.len();
+                        let next =
+                            (self.workspace.active_workspace + 1) % self.workspace.workspaces.len();
                         self.switch_to_buffer(next);
                         cx.notify();
                     }
@@ -983,7 +979,9 @@ pub(crate) fn list_continuation_action<E: EditOps>(editor: &E) -> Option<ListCon
     if content.trim().is_empty() {
         return Some(ListContinuation::Terminate);
     }
-    Some(ListContinuation::Continue(format!("{indent}{continuation}")))
+    Some(ListContinuation::Continue(format!(
+        "{indent}{continuation}"
+    )))
 }
 
 /// Given the post-indent remainder of a line, recognize a leading list marker.

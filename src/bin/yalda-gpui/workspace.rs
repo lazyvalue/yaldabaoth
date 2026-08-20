@@ -877,6 +877,20 @@ impl DesktopState {
     pub fn rect_of(&self, id: WindowId) -> Option<(Slot, Span)> {
         self.slot_of(id).map(|s| (s, self.span_of(id)))
     }
+    /// Prefer a hidden tile's former footprint when it is still available.
+    /// The tile has already been normally reconciled, so failure deliberately
+    /// leaves the layout manager's ordinary insertion in place.
+    pub fn restore_placement_if_free(&mut self, id: WindowId, slot: Slot, span: Span) -> bool {
+        if self.slot_of(id).is_none() || !self.rect_free(slot, span, Some(id)) {
+            return false;
+        }
+        if let Some((_, current)) = self.slots.iter_mut().find(|(tile, _)| *tile == id) {
+            *current = slot;
+        }
+        self.set_span_raw(id, span);
+        self.sort();
+        true
+    }
 
     /// Commit a tile's span, keeping the map sparse (1 × 1 stores nothing).
     pub fn set_span(&mut self, id: WindowId, span: Span) {
@@ -1332,13 +1346,13 @@ pub fn slot_at(point: (f32, f32), tile: (f32, f32), gutter: f32) -> Slot {
 /// A set of user-assigned tag names.
 pub type TagSet = BTreeSet<String>;
 
-/// A tile outside every workspace. The tile keeps its project while unbound so
-/// binding can enforce the existing intra-project ownership rule.
-pub struct UnboundTile<C> {
+/// A tile outside every workspace. Detachment is a complete placement state;
+/// visibility is intentionally absent because a Detached tile cannot be hidden.
+pub struct DetachedTile<C> {
     pub window: Window<C>,
 }
 
-impl<C> UnboundTile<C> {
+impl<C> DetachedTile<C> {
     fn new(window: Window<C>) -> Self {
         Self { window }
     }
@@ -1348,17 +1362,66 @@ impl<C> UnboundTile<C> {
     }
 }
 
-/// The exclusive placement classification for a live tile (ADR-0033).
+/// A hidden tile remains owned by its workspace while its window is absent from
+/// the visible layout. The previous plane footprint is only a restoration hint:
+/// visible tiles may occupy it while this tile is hidden (ADR-0034).
+pub struct HiddenTile<C> {
+    pub window: Window<C>,
+    pub previous_placement: Option<(Slot, Span)>,
+}
+
+impl<C> HiddenTile<C> {
+    fn new(window: Window<C>, previous_placement: Option<(Slot, Span)>) -> Self {
+        Self {
+            window,
+            previous_placement,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachedVisibility {
+    Visible,
+    Hidden,
+}
+
+/// The exclusive placement classification for a live tile (ADR-0034).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TileMembership {
-    Bound { workspace: usize },
-    Unbound,
+    Attached {
+        workspace: usize,
+        visibility: AttachedVisibility,
+    },
+    Detached,
+}
+
+/// A temporary solo presentation can name only a tile whose normal owner does
+/// not currently paint it. The variant records why the tile is eligible; the
+/// ownership validator rejects a target whose live membership disagrees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SoloPresentation {
+    Detached(WindowId),
+    HiddenAttached(WindowId),
+}
+
+impl SoloPresentation {
+    pub fn window_id(self) -> WindowId {
+        match self {
+            Self::Detached(id) | Self::HiddenAttached(id) => id,
+        }
+    }
 }
 
 /// Rejection from a placement boundary. Callers cannot insert a second owner
 /// for an already-live stable tile id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaceWindowError {
+    WorkspaceNotFound(usize),
+    ProjectMismatch {
+        window: WindowId,
+        tile_project: ProjectId,
+        workspace_project: ProjectId,
+    },
     DuplicateWindowId(WindowId),
 }
 
@@ -1372,8 +1435,11 @@ pub enum OwnershipViolation {
         tile_project: ProjectId,
         workspace_project: ProjectId,
     },
-    DirectFocusIsNotUnbound(WindowId),
-    ScratchpadEntryIsNotUnbound(WindowId),
+    WorkspaceFocusIsNotVisible {
+        workspace: usize,
+        window: WindowId,
+    },
+    SoloPresentationMismatch(SoloPresentation),
 }
 
 /// One **Workspace** in the frame's workspace strip.
@@ -1388,6 +1454,10 @@ pub struct Workspace<C> {
     pub auto_name: String,
     /// User-set display name. `None` means render `auto_name`.
     pub display_name: Option<String>,
+    /// Attached tiles excluded from the visible layout. Keeping the complete
+    /// window here makes attachment structurally workspace-owned; there is no
+    /// boolean that could accidentally create a Detached + hidden tile.
+    pub hidden_tiles: Vec<HiddenTile<C>>,
     pub layout: Layout<C>,
     pub focused: WindowId,
     /// Persistent side column (spec-rail.md). `None` when no rail is open.
@@ -1434,6 +1504,24 @@ pub struct Workspace<C> {
 }
 
 impl<C> Workspace<C> {
+    /// Visit every tile attached to this workspace, regardless of visibility.
+    /// Workspace-wide identity/session operations must use this boundary rather
+    /// than walking `layout` directly, which intentionally excludes hidden tiles.
+    pub fn for_each_attached_window(&self, f: &mut impl FnMut(&Window<C>)) {
+        self.layout.for_each_leaf(f);
+        for hidden in &self.hidden_tiles {
+            f(&hidden.window);
+        }
+    }
+
+    /// Mutable counterpart to [`Workspace::for_each_attached_window`].
+    pub fn for_each_attached_window_mut(&mut self, f: &mut impl FnMut(&mut Window<C>)) {
+        self.layout.for_each_leaf_mut(f);
+        for hidden in &mut self.hidden_tiles {
+            f(&mut hidden.window);
+        }
+    }
+
     /// THE `Workspace` constructor (the project field is private, so this is the only
     /// way to build one outside this module). Requires a [`ProjectId`] — that is
     /// what makes a project-less workspace unrepresentable. Non-project fields
@@ -1448,13 +1536,15 @@ impl<C> Workspace<C> {
     ) -> Self {
         layout.for_each_leaf(&mut |tile| {
             assert_eq!(
-                tile.project(), project,
+                tile.project(),
+                project,
                 "a workspace cannot own a tile from another project"
             );
         });
         Self {
             auto_name,
             display_name: None,
+            hidden_tiles: Vec::new(),
             layout,
             focused,
             rail: None,
@@ -1499,7 +1589,11 @@ impl<C> Workspace<C> {
             return false;
         }
         let tile_count = self.layout.leaf_ids().len().max(1);
-        let next = self.master_count.clamp(1, tile_count).saturating_add(1).min(tile_count);
+        let next = self
+            .master_count
+            .clamp(1, tile_count)
+            .saturating_add(1)
+            .min(tile_count);
         if next == self.master_count {
             return false;
         }
@@ -1513,7 +1607,11 @@ impl<C> Workspace<C> {
             return false;
         }
         let tile_count = self.layout.leaf_ids().len().max(1);
-        let next = self.master_count.clamp(1, tile_count).saturating_sub(1).max(1);
+        let next = self
+            .master_count
+            .clamp(1, tile_count)
+            .saturating_sub(1)
+            .max(1);
         if next == self.master_count {
             return false;
         }
@@ -1594,7 +1692,11 @@ impl<C> Workspace<C> {
     #[cfg(test)]
     pub fn set_project(&mut self, project: ProjectId) {
         self.project = project;
-        self.layout.for_each_leaf_mut(&mut |tile| tile.project = project);
+        self.layout
+            .for_each_leaf_mut(&mut |tile| tile.project = project);
+        for tile in &mut self.hidden_tiles {
+            tile.window.project = project;
+        }
     }
 }
 
@@ -1628,14 +1730,12 @@ pub struct FileBuffer {
 pub struct Frame<C> {
     pub workspaces: Vec<Workspace<C>>,
     pub active_workspace: usize,
-    /// Stable tiles outside every workspace, in user-visible Unbound order.
-    pub unbound_tiles: Vec<UnboundTile<C>>,
-    /// A non-owning focus pointer into `unbound_tiles`. Direct viewing never
-    /// changes membership or creates a workspace.
-    pub direct_unbound: Option<WindowId>,
-    /// Persisted most-recent-first subset of Unbound tile ids. This is an
-    /// index over `unbound_tiles`, never a second owner (`UXI-Workspace-18`).
-    pub scratchpad: Vec<WindowId>,
+    /// Stable tiles associated with no workspace, in user-visible Detached order.
+    pub detached_tiles: Vec<DetachedTile<C>>,
+    /// Non-owning navigation state for a Detached or attached-hidden tile.
+    /// The enum makes the eligibility reason explicit and validation catches a
+    /// stale target after any ownership transition.
+    pub solo_presentation: Option<SoloPresentation>,
     pub file_buffers: HashMap<FileBufferId, FileBuffer>,
     /// Canonical path → buffer id, for pool lookups during open.
     pub path_index: HashMap<PathBuf, FileBufferId>,
@@ -1680,9 +1780,8 @@ impl<C> Frame<C> {
         Self {
             workspaces: Vec::new(),
             active_workspace: 0,
-            unbound_tiles: Vec::new(),
-            direct_unbound: None,
-            scratchpad: Vec::new(),
+            detached_tiles: Vec::new(),
+            solo_presentation: None,
             file_buffers: HashMap::new(),
             path_index: HashMap::new(),
             next_buffer_id: 1,
@@ -1699,10 +1798,10 @@ impl<C> Frame<C> {
     /// The project a new workspace should inherit: the active workspace's, else
     /// `default_project`.
     pub fn inherited_project(&self) -> ProjectId {
-        if let Some(id) = self.direct_unbound
-            && let Some(tile) = self.unbound_tiles.iter().find(|t| t.window.id == id)
-        {
-            return tile.project();
+        if let Some(presentation) = self.solo_presentation {
+            if let Some(tile) = self.tile(presentation.window_id()) {
+                return tile.project();
+            }
         }
         self.active_workspace()
             .map(|t| t.project())
@@ -1720,12 +1819,10 @@ impl<C> Frame<C> {
     /// Borrow the focused window's content (None if no wsp, or the workspace's
     /// focused id is missing from the layout — invariant violation).
     pub fn focused_content(&self) -> Option<&C> {
-        if let Some(id) = self.direct_unbound {
+        if let Some(presentation) = self.solo_presentation {
             return self
-                .unbound_tiles
-                .iter()
-                .find(|t| t.window.id == id)
-                .map(|t| &t.window.content);
+                .tile(presentation.window_id())
+                .map(|tile| &tile.content);
         }
         let wsp = self.active_workspace()?;
         wsp.layout.find_leaf(wsp.focused).map(|w| &w.content)
@@ -1733,12 +1830,10 @@ impl<C> Frame<C> {
 
     /// Mutably borrow the focused window's content.
     pub fn focused_content_mut(&mut self) -> Option<&mut C> {
-        if let Some(id) = self.direct_unbound {
+        if let Some(presentation) = self.solo_presentation {
             return self
-                .unbound_tiles
-                .iter_mut()
-                .find(|t| t.window.id == id)
-                .map(|t| &mut t.window.content);
+                .tile_mut(presentation.window_id())
+                .map(|tile| &mut tile.content);
         }
         let wsp = self.active_workspace_mut()?;
         let focused = wsp.focused;
@@ -1748,12 +1843,9 @@ impl<C> Frame<C> {
     /// Replace the focused window's content in place. Returns the old value
     /// (or None if there's no focused window).
     pub fn replace_focused_content(&mut self, content: C) -> Option<C> {
-        if let Some(id) = self.direct_unbound {
-            let tile = self
-                .unbound_tiles
-                .iter_mut()
-                .find(|t| t.window.id == id)?;
-            return Some(std::mem::replace(&mut tile.window.content, content));
+        if let Some(presentation) = self.solo_presentation {
+            let tile = self.tile_mut(presentation.window_id())?;
+            return Some(std::mem::replace(&mut tile.content, content));
         }
         let wsp = self.active_workspace_mut()?;
         let focused = wsp.focused;
@@ -1763,10 +1855,14 @@ impl<C> Frame<C> {
 
     /// The id of the focused window (or None if the workspace has no workspaces).
     pub fn focused_window_id(&self) -> Option<WindowId> {
-        if self.direct_unbound.is_some() {
-            return self.direct_unbound;
+        if let Some(presentation) = self.solo_presentation {
+            return Some(presentation.window_id());
         }
-        self.active_workspace().map(|t| t.focused)
+        let workspace = self.active_workspace()?;
+        workspace
+            .layout
+            .find_leaf(workspace.focused)
+            .map(Window::id)
     }
 
     /// Construct a workspace pre-populated with one workspace containing one
@@ -1798,7 +1894,7 @@ impl<C> Frame<C> {
             project,
         ));
         self.active_workspace = self.workspaces.len() - 1;
-        self.direct_unbound = None;
+        self.solo_presentation = None;
         self.previous_workspace = previous;
         id
     }
@@ -1812,8 +1908,8 @@ impl<C> Frame<C> {
         self.push_initial_workspace(content, project)
     }
 
-    /// Close the workspace at `idx`, moving every tile it owned into Unbound
-    /// without recreating it (ADR-0033). The sole durable workspace is a floor
+    /// Close the workspace at `idx`, moving every attached tile to Detached
+    /// without recreating it (ADR-0034). The sole durable workspace is a floor
     /// and cannot be closed.
     pub fn close_workspace(&mut self, idx: usize) {
         if idx >= self.workspaces.len() || self.workspaces.len() <= 1 {
@@ -1823,10 +1919,12 @@ impl<C> Frame<C> {
         let project = removed.project();
         let mut windows = Vec::new();
         removed.layout.into_leaves(&mut windows);
-        self.unbound_tiles.extend(windows.into_iter().map(|window| {
-            assert_eq!(window.project(), project);
-            UnboundTile::new(window)
-        }));
+        windows.extend(removed.hidden_tiles.into_iter().map(|tile| tile.window));
+        self.detached_tiles
+            .extend(windows.into_iter().map(|window| {
+                assert_eq!(window.project(), project);
+                DetachedTile::new(window)
+            }));
         if self.active_workspace >= self.workspaces.len() {
             self.active_workspace = self.workspaces.len().saturating_sub(1);
         } else if idx < self.active_workspace {
@@ -1863,7 +1961,7 @@ impl<C> Frame<C> {
             .map(|workspace| workspace.auto_name.clone());
         let target_name = self.workspaces[idx].auto_name.clone();
         let changes_workspace = old_name.as_deref() != Some(target_name.as_str());
-        self.direct_unbound = None;
+        self.solo_presentation = None;
         let cur = self.active_workspace;
         if cur != idx && self.is_ephemeral(cur) {
             self.workspaces.remove(cur);
@@ -1938,8 +2036,12 @@ impl<C> Frame<C> {
         let id = self.alloc_window_id();
         let name = auto_workspace_name(self.next_workspace_index);
         self.next_workspace_index += 1;
-        let mut wsp =
-            Workspace::with_layout(name, Layout::Leaf(Window::new(id, project, content)), id, project);
+        let mut wsp = Workspace::with_layout(
+            name,
+            Layout::Leaf(Window::new(id, project, content)),
+            id,
+            project,
+        );
         wsp.ephemeral = true;
         self.workspaces.push(wsp);
         self.active_workspace = self.workspaces.len() - 1;
@@ -1947,16 +2049,16 @@ impl<C> Frame<C> {
     }
 
     /// Create a stable tile outside every workspace and return its id.
-    pub fn push_unbound(&mut self, content: C, project: ProjectId) -> WindowId {
+    pub fn push_detached(&mut self, content: C, project: ProjectId) -> WindowId {
         let id = self.alloc_window_id();
-        self.unbound_tiles
-            .push(UnboundTile::new(Window::new(id, project, content)));
+        self.detached_tiles
+            .push(DetachedTile::new(Window::new(id, project, content)));
         id
     }
 
-    /// Restore a fully-formed stable tile into the Unbound ownership domain.
+    /// Restore a fully-formed stable tile into the Detached ownership domain.
     /// This is the only restore insertion boundary and refuses duplicate ids.
-    pub(crate) fn insert_restored_unbound(
+    pub(crate) fn insert_restored_detached(
         &mut self,
         window: Window<C>,
     ) -> Result<(), PlaceWindowError> {
@@ -1965,23 +2067,84 @@ impl<C> Frame<C> {
             return Err(PlaceWindowError::DuplicateWindowId(id));
         }
         self.next_window_id = self.next_window_id.max(id.saturating_add(1));
-        self.unbound_tiles.push(UnboundTile::new(window));
+        self.detached_tiles.push(DetachedTile::new(window));
         Ok(())
+    }
+
+    /// Restore a fully-formed tile as hidden under an existing workspace.
+    /// The workspace owns the project relationship, so a mismatched project is
+    /// rejected rather than silently rewritten.
+    pub(crate) fn insert_restored_hidden(
+        &mut self,
+        workspace: usize,
+        window: Window<C>,
+        previous_placement: Option<(Slot, Span)>,
+    ) -> Result<(), PlaceWindowError> {
+        let id = window.id;
+        if self.tile_membership(id).is_some() {
+            return Err(PlaceWindowError::DuplicateWindowId(id));
+        }
+        let Some(owner) = self.workspaces.get(workspace) else {
+            return Err(PlaceWindowError::WorkspaceNotFound(workspace));
+        };
+        if owner.project() != window.project() {
+            return Err(PlaceWindowError::ProjectMismatch {
+                window: id,
+                tile_project: window.project(),
+                workspace_project: owner.project(),
+            });
+        }
+        self.next_window_id = self.next_window_id.max(id.saturating_add(1));
+        self.workspaces[workspace]
+            .hidden_tiles
+            .push(HiddenTile::new(window, previous_placement));
+        Ok(())
+    }
+    /// Restore a persisted solo target only when its typed eligibility still
+    /// agrees with the reconstructed ownership graph.
+    pub(crate) fn restore_solo_presentation(&mut self, presentation: SoloPresentation) -> bool {
+        let valid = match presentation {
+            SoloPresentation::Detached(id) => {
+                self.tile_membership(id) == Some(TileMembership::Detached)
+            }
+            SoloPresentation::HiddenAttached(id) => matches!(
+                self.tile_membership(id),
+                Some(TileMembership::Attached {
+                    visibility: AttachedVisibility::Hidden,
+                    ..
+                })
+            ),
+        };
+        self.solo_presentation = valid.then_some(presentation);
+        valid
     }
 
     /// Classify a tile by its exclusive placement owner.
     pub fn tile_membership(&self, id: WindowId) -> Option<TileMembership> {
-        if let Some(workspace) = self.workspace_index_of_window(id) {
+        if let Some(workspace) = self.visible_workspace_index_of_window(id) {
             debug_assert!(
-                !self.unbound_tiles.iter().any(|t| t.window.id == id),
-                "tile {id} cannot be both bound and unbound"
+                !self.detached_tiles.iter().any(|t| t.window.id == id),
+                "tile {id} cannot be both attached and detached"
             );
-            return Some(TileMembership::Bound { workspace });
+            return Some(TileMembership::Attached {
+                workspace,
+                visibility: AttachedVisibility::Visible,
+            });
         }
-        self.unbound_tiles
+        if let Some(workspace) = self.hidden_workspace_index_of_window(id) {
+            debug_assert!(
+                !self.detached_tiles.iter().any(|t| t.window.id == id),
+                "tile {id} cannot be both attached and detached"
+            );
+            return Some(TileMembership::Attached {
+                workspace,
+                visibility: AttachedVisibility::Hidden,
+            });
+        }
+        self.detached_tiles
             .iter()
             .any(|t| t.window.id == id)
-            .then_some(TileMembership::Unbound)
+            .then_some(TileMembership::Detached)
     }
 
     /// Validate the complete exclusive-placement graph without relying on
@@ -1989,7 +2152,7 @@ impl<C> Frame<C> {
     /// or test-constructed state and deterministic about the first violation.
     pub fn validate_ownership(&self) -> Result<(), OwnershipViolation> {
         let mut ids = std::collections::HashSet::new();
-        for workspace in &self.workspaces {
+        for (workspace_index, workspace) in self.workspaces.iter().enumerate() {
             let mut violation = None;
             workspace.layout.for_each_leaf(&mut |tile| {
                 if violation.is_some() {
@@ -2008,26 +2171,47 @@ impl<C> Frame<C> {
             if let Some(violation) = violation {
                 return Err(violation);
             }
+            for tile in &workspace.hidden_tiles {
+                if !ids.insert(tile.window.id) {
+                    return Err(OwnershipViolation::DuplicateWindowId(tile.window.id));
+                }
+                if tile.window.project() != workspace.project() {
+                    return Err(OwnershipViolation::WorkspaceProjectMismatch {
+                        window: tile.window.id,
+                        tile_project: tile.window.project(),
+                        workspace_project: workspace.project(),
+                    });
+                }
+            }
+            let visible = workspace.layout.leaf_ids();
+            if !visible.is_empty() && !visible.contains(&workspace.focused) {
+                return Err(OwnershipViolation::WorkspaceFocusIsNotVisible {
+                    workspace: workspace_index,
+                    window: workspace.focused,
+                });
+            }
         }
-        let mut unbound_ids = std::collections::HashSet::new();
-        for tile in &self.unbound_tiles {
+        for tile in &self.detached_tiles {
             if !ids.insert(tile.window.id) {
                 return Err(OwnershipViolation::DuplicateWindowId(tile.window.id));
             }
-            unbound_ids.insert(tile.window.id);
         }
-        if let Some(id) = self.direct_unbound
-            && !unbound_ids.contains(&id)
-        {
-            return Err(OwnershipViolation::DirectFocusIsNotUnbound(id));
-        }
-        if let Some(id) = self
-            .scratchpad
-            .iter()
-            .copied()
-            .find(|id| !unbound_ids.contains(id))
-        {
-            return Err(OwnershipViolation::ScratchpadEntryIsNotUnbound(id));
+        if let Some(presentation) = self.solo_presentation {
+            let matches = match presentation {
+                SoloPresentation::Detached(id) => {
+                    self.tile_membership(id) == Some(TileMembership::Detached)
+                }
+                SoloPresentation::HiddenAttached(id) => matches!(
+                    self.tile_membership(id),
+                    Some(TileMembership::Attached {
+                        visibility: AttachedVisibility::Hidden,
+                        ..
+                    })
+                ),
+            };
+            if !matches {
+                return Err(OwnershipViolation::SoloPresentationMismatch(presentation));
+            }
         }
         Ok(())
     }
@@ -2036,9 +2220,16 @@ impl<C> Frame<C> {
     pub fn tile(&self, id: WindowId) -> Option<&Window<C>> {
         self.workspaces
             .iter()
-            .find_map(|wsp| wsp.layout.find_leaf(id))
+            .find_map(|wsp| {
+                wsp.layout.find_leaf(id).or_else(|| {
+                    wsp.hidden_tiles
+                        .iter()
+                        .find(|tile| tile.window.id == id)
+                        .map(|tile| &tile.window)
+                })
+            })
             .or_else(|| {
-                self.unbound_tiles
+                self.detached_tiles
                     .iter()
                     .find(|tile| tile.window.id == id)
                     .map(|tile| &tile.window)
@@ -2047,157 +2238,227 @@ impl<C> Frame<C> {
 
     /// Mutably find a tile across both ownership domains.
     pub fn tile_mut(&mut self, id: WindowId) -> Option<&mut Window<C>> {
-        if let Some(workspace) = self.workspace_index_of_window(id) {
+        if let Some(workspace) = self.visible_workspace_index_of_window(id) {
             return self.workspaces[workspace].layout.find_leaf_mut(id);
         }
-        self.unbound_tiles
+        if let Some(workspace) = self.hidden_workspace_index_of_window(id) {
+            return self.workspaces[workspace]
+                .hidden_tiles
+                .iter_mut()
+                .find(|tile| tile.window.id == id)
+                .map(|tile| &mut tile.window);
+        }
+        self.detached_tiles
             .iter_mut()
             .find(|tile| tile.window.id == id)
             .map(|tile| &mut tile.window)
     }
 
-    /// Project of a tile, derived from its workspace while bound and retained
-    /// explicitly while unbound.
+    /// Project of a tile, derived from its workspace while attached and retained
+    /// explicitly while Detached.
     pub fn tile_project(&self, id: WindowId) -> Option<ProjectId> {
         if let Some(workspace) = self.workspace_index_of_window(id) {
             return self.workspaces.get(workspace).map(Workspace::project);
         }
-        self.unbound_tiles
+        self.detached_tiles
             .iter()
             .find(|tile| tile.window.id == id)
-            .map(UnboundTile::project)
+            .map(DetachedTile::project)
     }
 
-    /// Directly focus an unbound tile without changing ownership.
-    pub fn focus_unbound(&mut self, id: WindowId) -> bool {
-        if !matches!(self.tile_membership(id), Some(TileMembership::Unbound)) {
-            return false;
-        }
-        self.direct_unbound = Some(id);
+    /// Present a Detached or attached-hidden tile alone without changing its state.
+    pub fn present_solo(&mut self, id: WindowId) -> bool {
+        self.solo_presentation = match self.tile_membership(id) {
+            Some(TileMembership::Detached) => Some(SoloPresentation::Detached(id)),
+            Some(TileMembership::Attached {
+                visibility: AttachedVisibility::Hidden,
+                ..
+            }) => Some(SoloPresentation::HiddenAttached(id)),
+            _ => return false,
+        };
         true
     }
 
     /// Focus a tile in whichever ownership domain contains it.
     pub fn focus_tile(&mut self, id: WindowId) -> bool {
         match self.tile_membership(id) {
-            Some(TileMembership::Bound { workspace }) => {
+            Some(TileMembership::Attached {
+                workspace,
+                visibility: AttachedVisibility::Visible,
+            }) => {
                 self.workspaces[workspace].focused = id;
                 self.set_active_workspace(workspace);
                 true
             }
-            Some(TileMembership::Unbound) => self.focus_unbound(id),
+            Some(TileMembership::Attached {
+                visibility: AttachedVisibility::Hidden,
+                ..
+            })
+            | Some(TileMembership::Detached) => self.present_solo(id),
             None => false,
         }
     }
 
-    /// Retire one Unbound tile through the ownership boundary. This updates
-    /// every auxiliary index atomically, so callers cannot leave stale direct
-    /// focus or scratchpad entries behind.
-    pub(crate) fn remove_unbound_window(&mut self, id: WindowId) -> Option<Window<C>> {
+    /// Retire one Detached tile through the ownership boundary, clearing any
+    /// solo presentation atomically.
+    pub(crate) fn remove_detached_window(&mut self, id: WindowId) -> Option<Window<C>> {
         let position = self
-            .unbound_tiles
+            .detached_tiles
             .iter()
             .position(|tile| tile.window.id == id)?;
-        let removed = self.unbound_tiles.remove(position).window;
-        self.scratchpad.retain(|candidate| *candidate != id);
-        if self.direct_unbound == Some(id) {
-            self.direct_unbound = None;
+        let removed = self.detached_tiles.remove(position).window;
+        if self.solo_presentation.map(SoloPresentation::window_id) == Some(id) {
+            self.solo_presentation = None;
         }
         Some(removed)
     }
 
-    pub fn clear_direct_unbound(&mut self) {
-        self.direct_unbound = None;
+    pub fn clear_solo_presentation(&mut self) {
+        self.solo_presentation = None;
     }
 
-    pub fn directly_focused_unbound(&self) -> Option<WindowId> {
-        self.direct_unbound
-            .filter(|&id| matches!(self.tile_membership(id), Some(TileMembership::Unbound)))
+    pub fn presented_tile(&self) -> Option<SoloPresentation> {
+        self.solo_presentation
+            .filter(|presentation| match *presentation {
+                SoloPresentation::Detached(id) => {
+                    self.tile_membership(id) == Some(TileMembership::Detached)
+                }
+                SoloPresentation::HiddenAttached(id) => matches!(
+                    self.tile_membership(id),
+                    Some(TileMembership::Attached {
+                        visibility: AttachedVisibility::Hidden,
+                        ..
+                    })
+                ),
+            })
     }
 
-    /// Move a bound tile into Unbound. A sole tile in the sole workspace cannot
-    /// be removed because the frame must retain one durable workspace.
-    pub fn unbind_window(&mut self, id: WindowId) -> Result<(), ()> {
-        let source = self.workspace_index_of_window(id).ok_or(())?;
-        let source_is_root = self.workspaces[source].layout.path_to(id) == Some(Vec::new());
-        if source_is_root && self.workspaces.len() == 1 {
-            return Err(());
-        }
+    /// Detach a tile from its workspace. Hidden state is cleared by moving the
+    /// complete window into the frame-owned Detached collection.
+    pub fn detach_window(&mut self, id: WindowId) -> Result<(), ()> {
+        let (source, visibility) = match self.tile_membership(id) {
+            Some(TileMembership::Attached {
+                workspace,
+                visibility,
+            }) => (workspace, visibility),
+            _ => return Err(()),
+        };
         let project = self.workspaces[source].project();
-        let old_active = self.active_workspace;
-        self.direct_unbound = None;
-        self.active_workspace = source;
-        self.workspaces[source].focused = id;
-        let (window, source_empty) = self.detach_focused()?;
-        if source_empty {
-            self.workspaces.remove(source);
-            self.active_workspace = if old_active == source {
-                source.min(self.workspaces.len().saturating_sub(1))
-            } else if source < old_active {
-                old_active - 1
-            } else {
-                old_active
-            };
-        } else {
+        self.solo_presentation = None;
+        let window = match visibility {
+            AttachedVisibility::Visible => {
+                let old_active = self.active_workspace;
+                self.active_workspace = source;
+                self.workspaces[source].focused = id;
+                let (window, source_empty) = self.detach_focused()?;
+                if source_empty {
+                    self.workspaces[source].focused = 0;
+                }
+                self.active_workspace = old_active;
+                window
+            }
+            AttachedVisibility::Hidden => {
+                let position = self.workspaces[source]
+                    .hidden_tiles
+                    .iter()
+                    .position(|tile| tile.window.id == id)
+                    .ok_or(())?;
+                self.workspaces[source].hidden_tiles.remove(position).window
+            }
+        };
+        if visibility == AttachedVisibility::Visible {
             let leaves = self.workspaces[source].layout.leaf_ids();
             self.workspaces[source].desktop.reconcile(&leaves);
-            self.active_workspace = old_active;
         }
         debug_assert!(self.tile_membership(id).is_none());
         debug_assert_eq!(window.project(), project);
-        self.unbound_tiles.push(UnboundTile::new(window));
-        self.direct_unbound = Some(id);
-        debug_assert_eq!(self.tile_membership(id), Some(TileMembership::Unbound));
+        self.detached_tiles.push(DetachedTile::new(window));
+        self.solo_presentation = Some(SoloPresentation::Detached(id));
+        debug_assert_eq!(self.tile_membership(id), Some(TileMembership::Detached));
         Ok(())
     }
 
-    /// Unbind `id`, seeding a replacement when it is the sole tile in the sole
-    /// workspace. Lifecycle transitions such as archive need to preserve the
-    /// stateful tile in Unbound without violating the frame's workspace floor.
-    pub fn unbind_window_with_replacement(
-        &mut self,
-        id: WindowId,
-        replacement: C,
-    ) -> Result<(), ()> {
-        let sole_root = self.workspaces.len() == 1
-            && self.workspaces[0].layout.path_to(id) == Some(Vec::new());
-        if !sole_root {
-            return self.unbind_window(id);
-        }
-        let project = self.workspaces[0].project();
-        let replacement_id = self.alloc_window_id();
-        let old = std::mem::replace(
-            &mut self.workspaces[0].layout,
-            Layout::Leaf(Window::new(replacement_id, project, replacement)),
-        );
-        let Layout::Leaf(window) = old else {
-            unreachable!("root path in a sole workspace must name its leaf")
+    /// Hide a visible attached tile while retaining its workspace owner.
+    pub fn hide_window(&mut self, id: WindowId) -> Result<(), ()> {
+        let Some(TileMembership::Attached {
+            workspace,
+            visibility: AttachedVisibility::Visible,
+        }) = self.tile_membership(id)
+        else {
+            return Err(());
         };
-        self.workspaces[0].focused = replacement_id;
-        self.workspaces[0].desktop.reconcile(&[replacement_id]);
-        debug_assert_eq!(window.project(), project);
-        self.unbound_tiles.push(UnboundTile::new(window));
-        self.direct_unbound = None;
+        let previous_placement = self.workspaces[workspace].desktop.rect_of(id);
+        let old_active = self.active_workspace;
+        self.solo_presentation = None;
+        self.active_workspace = workspace;
+        self.workspaces[workspace].focused = id;
+        let (window, empty) = self.detach_focused()?;
+        if empty {
+            self.workspaces[workspace].focused = 0;
+        }
+        let leaves = self.workspaces[workspace].layout.leaf_ids();
+        self.workspaces[workspace].desktop.reconcile(&leaves);
+        self.workspaces[workspace]
+            .hidden_tiles
+            .push(HiddenTile::new(window, previous_placement));
+        self.active_workspace = old_active;
+        debug_assert!(matches!(
+            self.tile_membership(id),
+            Some(TileMembership::Attached {
+                workspace: owner,
+                visibility: AttachedVisibility::Hidden,
+            }) if owner == workspace
+        ));
         Ok(())
     }
 
-    /// Move an unbound tile into a same-project workspace, preserving its
-    /// complete identity, content, and tags.
-    pub fn bind_unbound(&mut self, id: WindowId, workspace: usize) -> Result<(), ()> {
-        let target_project = self.workspaces.get(workspace).ok_or(())?.project();
-        let pos = self
-            .unbound_tiles
+    /// Unhide a tile into its owning workspace and follow/focus it.
+    pub fn unhide_window(&mut self, id: WindowId) -> Result<(), ()> {
+        let Some(TileMembership::Attached {
+            workspace,
+            visibility: AttachedVisibility::Hidden,
+        }) = self.tile_membership(id)
+        else {
+            return Err(());
+        };
+        let position = self.workspaces[workspace]
+            .hidden_tiles
             .iter()
             .position(|tile| tile.window.id == id)
             .ok_or(())?;
-        if self.unbound_tiles[pos].project() != target_project {
+        let hidden = self.workspaces[workspace].hidden_tiles.remove(position);
+        self.solo_presentation = None;
+        self.insert_leaf_into_workspace(workspace, hidden.window)?;
+        let leaves = self.workspaces[workspace].layout.leaf_ids();
+        self.workspaces[workspace]
+            .desktop
+            .reconcile_near(&leaves, Some(id));
+        if let Some((slot, span)) = hidden.previous_placement {
+            self.workspaces[workspace]
+                .desktop
+                .restore_placement_if_free(id, slot, span);
+        }
+        self.workspaces[workspace].focused = id;
+        self.set_active_workspace(workspace);
+        Ok(())
+    }
+
+    /// Move a Detached tile into a same-project workspace, preserving its
+    /// complete identity, content, and tags.
+    pub fn attach_detached(&mut self, id: WindowId, workspace: usize) -> Result<(), ()> {
+        let target_project = self.workspaces.get(workspace).ok_or(())?.project();
+        let pos = self
+            .detached_tiles
+            .iter()
+            .position(|tile| tile.window.id == id)
+            .ok_or(())?;
+        if self.detached_tiles[pos].project() != target_project {
             return Err(());
         }
         if self.workspace_index_of_window(id).is_some() {
             return Err(());
         }
-        let tile = self.unbound_tiles.remove(pos);
-        self.scratchpad.retain(|candidate| *candidate != id);
+        let tile = self.detached_tiles.remove(pos);
         // The target index was validated above and no structural mutation can
         // invalidate it between these lines.
         self.insert_leaf_into_workspace(workspace, tile.window)
@@ -2207,65 +2468,73 @@ impl<C> Frame<C> {
         self.set_active_workspace(workspace);
         debug_assert_eq!(
             self.tile_membership(id),
-            Some(TileMembership::Bound { workspace })
+            Some(TileMembership::Attached {
+                workspace,
+                visibility: AttachedVisibility::Visible,
+            })
         );
         Ok(())
     }
 
-    /// Replace one bound layout leaf with an existing unbound tile. This is the
-    /// placement primitive for choosing a durable unbound tile from a temporary
+    /// Replace one attached layout leaf with an existing Detached tile. This is the
+    /// placement primitive for choosing a durable Detached tile from a temporary
     /// in-workspace picker: the durable tile keeps its id, state, and tags while
     /// taking the picker's exact layout slot, and the temporary leaf is retired.
-    pub fn replace_bound_with_unbound(
+    pub fn replace_attached_with_detached(
         &mut self,
-        bound: WindowId,
-        unbound: WindowId,
+        attached: WindowId,
+        detached: WindowId,
     ) -> Result<(), ()> {
-        let workspace = self.workspace_index_of_window(bound).ok_or(())?;
+        let workspace = self.visible_workspace_index_of_window(attached).ok_or(())?;
         let target_project = self.workspaces.get(workspace).ok_or(())?.project();
         let pos = self
-            .unbound_tiles
+            .detached_tiles
             .iter()
-            .position(|tile| tile.window.id == unbound)
+            .position(|tile| tile.window.id == detached)
             .ok_or(())?;
-        if self.workspace_index_of_window(unbound).is_some()
-            || self.unbound_tiles[pos].project() != target_project
-            || self.workspaces[workspace].layout.path_to(bound).is_none()
+        if self.workspace_index_of_window(detached).is_some()
+            || self.detached_tiles[pos].project() != target_project
+            || self.workspaces[workspace]
+                .layout
+                .path_to(attached)
+                .is_none()
         {
             return Err(());
         }
 
-        let replacement = self.unbound_tiles.remove(pos).window;
+        let replacement = self.detached_tiles.remove(pos).window;
         let leaf = self.workspaces[workspace]
             .layout
-            .find_leaf_mut(bound)
-            .expect("validated bound leaf must remain present");
+            .find_leaf_mut(attached)
+            .expect("validated attached leaf must remain present");
         *leaf = replacement;
-        self.workspaces[workspace].focused = unbound;
+        self.workspaces[workspace].focused = detached;
         let leaves = self.workspaces[workspace].layout.leaf_ids();
         self.workspaces[workspace].desktop.reconcile(&leaves);
-        self.scratchpad.retain(|candidate| *candidate != unbound);
-        self.direct_unbound = None;
+        self.solo_presentation = None;
         self.set_active_workspace(workspace);
 
-        debug_assert!(self.tile_membership(bound).is_none());
+        debug_assert!(self.tile_membership(attached).is_none());
         debug_assert_eq!(
-            self.tile_membership(unbound),
-            Some(TileMembership::Bound { workspace })
+            self.tile_membership(detached),
+            Some(TileMembership::Attached {
+                workspace,
+                visibility: AttachedVisibility::Visible,
+            })
         );
         Ok(())
     }
 
-    /// Move a complete bound tile between same-project workspaces. When the
+    /// Move a complete attached tile between same-project workspaces. When the
     /// source's last tile moves, its workspace is removed and the destination
     /// necessarily becomes active even for a no-follow send.
-    pub fn move_bound_to_workspace(
+    pub fn move_attached_to_workspace(
         &mut self,
         id: WindowId,
         target: usize,
         follow: bool,
     ) -> Result<(), ()> {
-        let source = self.workspace_index_of_window(id).ok_or(())?;
+        let source = self.visible_workspace_index_of_window(id).ok_or(())?;
         let target_project = self.workspaces.get(target).ok_or(())?.project();
         if source == target || self.workspaces[source].project() != target_project {
             return Err(());
@@ -2273,12 +2542,13 @@ impl<C> Frame<C> {
 
         let old_active = self.active_workspace;
         let source_name = self.workspaces[source].auto_name.clone();
-        self.direct_unbound = None;
+        self.solo_presentation = None;
         self.active_workspace = source;
         self.workspaces[source].focused = id;
         let (window, source_empty) = self.detach_focused()?;
 
-        let target = if source_empty {
+        let remove_source = source_empty && self.workspaces[source].hidden_tiles.is_empty();
+        let target = if remove_source {
             self.workspaces.remove(source);
             if source < target { target - 1 } else { target }
         } else {
@@ -2290,7 +2560,7 @@ impl<C> Frame<C> {
         let leaves = self.workspaces[target].layout.leaf_ids();
         self.workspaces[target].desktop.reconcile(&leaves);
 
-        if follow || source_empty {
+        if follow || remove_source {
             self.active_workspace = target;
             self.previous_workspace = Some(source_name);
         } else {
@@ -2300,73 +2570,99 @@ impl<C> Frame<C> {
         }
         debug_assert_eq!(
             self.tile_membership(id),
-            Some(TileMembership::Bound { workspace: target })
+            Some(TileMembership::Attached {
+                workspace: target,
+                visibility: AttachedVisibility::Visible,
+            })
         );
         Ok(())
     }
 
-    /// Detach a bound tile into Unbound and remember it at the front of the
-    /// scratchpad MRU. Unlike ordinary unbind, stash leaves direct focus clear.
-    pub fn stash_window(&mut self, id: WindowId) -> Result<(), ()> {
-        self.unbind_window(id)?;
-        self.record_scratchpad_stash(id);
-        Ok(())
-    }
-
-    /// Stash a bound tile while preserving the durable-workspace floor. When
-    /// `id` is the sole tile in the sole workspace, `replacement` becomes the
-    /// workspace root and the original stable tile still moves to Unbound.
-    pub fn stash_window_with_replacement(
+    /// Send any live tile to a workspace through one exhaustive membership
+    /// transition. Hidden attachment is cleared at the destination; Detached
+    /// and hidden sends are validated before removing the source owner.
+    pub fn send_tile_to_workspace(
         &mut self,
         id: WindowId,
-        replacement: C,
+        target: usize,
+        follow: bool,
     ) -> Result<(), ()> {
-        self.unbind_window_with_replacement(id, replacement)?;
-        self.record_scratchpad_stash(id);
-        Ok(())
-    }
-
-    fn record_scratchpad_stash(&mut self, id: WindowId) {
-        self.scratchpad.retain(|candidate| *candidate != id);
-        self.scratchpad.insert(0, id);
-        self.direct_unbound = None;
-    }
-
-    /// Summon the next scratchpad tile, or hide after the oldest. Returns false
-    /// only when no live scratchpad tile exists.
-    pub fn cycle_scratchpad(&mut self) -> bool {
-        self.prune_scratchpad();
-        if self.scratchpad.is_empty() {
-            return false;
+        match self.tile_membership(id).ok_or(())? {
+            TileMembership::Attached {
+                workspace,
+                visibility: AttachedVisibility::Visible,
+            } if workspace == target => Ok(()),
+            TileMembership::Attached {
+                visibility: AttachedVisibility::Visible,
+                ..
+            } => self.move_attached_to_workspace(id, target, follow),
+            TileMembership::Detached => {
+                let old_active = self.active_workspace;
+                self.attach_detached(id, target)?;
+                if !follow {
+                    self.set_active_workspace(old_active);
+                }
+                Ok(())
+            }
+            TileMembership::Attached {
+                workspace: source,
+                visibility: AttachedVisibility::Hidden,
+            } => {
+                let source_project = self.workspaces.get(source).ok_or(())?.project();
+                if self.workspaces.get(target).ok_or(())?.project() != source_project {
+                    return Err(());
+                }
+                let position = self.workspaces[source]
+                    .hidden_tiles
+                    .iter()
+                    .position(|tile| tile.window.id == id)
+                    .ok_or(())?;
+                let old_active = self.active_workspace;
+                let hidden = self.workspaces[source].hidden_tiles.remove(position);
+                self.solo_presentation = None;
+                self.insert_leaf_into_workspace(target, hidden.window)?;
+                let leaves = self.workspaces[target].layout.leaf_ids();
+                self.workspaces[target]
+                    .desktop
+                    .reconcile_near(&leaves, Some(id));
+                if follow {
+                    self.set_active_workspace(target);
+                } else {
+                    self.set_active_workspace(old_active);
+                }
+                Ok(())
+            }
         }
-        let next = self
-            .directly_focused_unbound()
-            .and_then(|id| self.scratchpad.iter().position(|candidate| *candidate == id))
-            .map(|position| position + 1)
-            .unwrap_or(0);
-        if let Some(&id) = self.scratchpad.get(next) {
-            self.direct_unbound = Some(id);
-        } else {
-            self.direct_unbound = None;
-        }
-        true
     }
 
-    /// Keep only unique, live Unbound ids while preserving stored MRU order.
-    pub fn prune_scratchpad(&mut self) {
-        let live: HashSet<_> = self.unbound_tiles.iter().map(|tile| tile.window.id).collect();
-        let mut seen = HashSet::new();
-        self.scratchpad
-            .retain(|id| live.contains(id) && seen.insert(*id));
-    }
-
-    /// The index of the workspace whose layout contains `id`. `None` if no workspace
-    /// holds that window. Window ids are frame-wide unique, so this is the stable
-    /// way to name a workspace across an add/remove that shifts every index.
-    pub fn workspace_index_of_window(&self, id: WindowId) -> Option<usize> {
+    pub fn visible_workspace_index_of_window(&self, id: WindowId) -> Option<usize> {
         self.workspaces
             .iter()
-            .position(|w| w.layout.find_leaf(id).is_some())
+            .position(|workspace| workspace.layout.find_leaf(id).is_some())
+    }
+
+    pub fn hidden_workspace_index_of_window(&self, id: WindowId) -> Option<usize> {
+        self.workspaces.iter().position(|workspace| {
+            workspace
+                .hidden_tiles
+                .iter()
+                .any(|tile| tile.window.id == id)
+        })
+    }
+
+    /// The owning workspace for any attached tile, visible or hidden.
+    pub fn workspace_index_of_window(&self, id: WindowId) -> Option<usize> {
+        self.visible_workspace_index_of_window(id)
+            .or_else(|| self.hidden_workspace_index_of_window(id))
+    }
+
+    /// Legacy snapshot compatibility needs the direct Detached target without
+    /// conflating it with a hidden-attached solo presentation.
+    pub fn presented_detached_tile_id(&self) -> Option<WindowId> {
+        match self.presented_tile() {
+            Some(SoloPresentation::Detached(id)) => Some(id),
+            _ => None,
+        }
     }
 
     /// The workspace a dismissal should land on to STAY IN `project`
@@ -2380,7 +2676,11 @@ impl<C> Frame<C> {
     pub fn same_project_landing(&self, project: ProjectId) -> Option<usize> {
         self.ephemeral_origin
             .and_then(|w| self.workspace_index_of_window(w))
-            .filter(|&i| self.workspaces.get(i).is_some_and(|w| w.project() == project))
+            .filter(|&i| {
+                self.workspaces
+                    .get(i)
+                    .is_some_and(|w| w.project() == project)
+            })
             .or_else(|| {
                 self.workspaces
                     .iter()
@@ -2628,13 +2928,18 @@ impl<C> Frame<C> {
     /// new window. Returns the new window's id (or `None` if the workspace
     /// has no active workspace).
     pub fn split_focused(&mut self, dir: SplitDir, content: C) -> Option<WindowId> {
-        if self.direct_unbound.is_some() {
+        if self.solo_presentation.is_some() {
             return None;
         }
         let new_id = self.alloc_window_id();
         let project = self.active_workspace()?.project();
         let new_window = Window::new(new_id, project, content);
         let wsp = self.active_workspace_mut()?;
+        if matches!(wsp.layout, Layout::Empty) {
+            wsp.layout = Layout::Leaf(new_window);
+            wsp.focused = new_id;
+            return Some(new_id);
+        }
         let focused = wsp.focused;
         let path = wsp.layout.path_to(focused)?;
 
@@ -2683,24 +2988,42 @@ impl<C> Frame<C> {
     }
 
     /// Close the focused window. Returns:
-    /// - `Ok(Some(new_focus))` — close succeeded, focus moved to a sibling; for
-    ///   direct Unbound focus, the tile was removed and the workspace is revealed.
+    /// - `Ok(Some(new_focus))` — close succeeded and focus moved to a sibling;
+    ///   for a solo-presented tile, it was retired and the workspace is revealed.
     /// - `Ok(None)` — the focused window was the last in the workspace; the caller
     ///   should close the workspace (or replace it with a placeholder per spec
     ///   Behavior 2).
     /// - `Err(())` — no active workspace / no focused window.
     pub fn close_focused(&mut self) -> Result<Option<WindowId>, ()> {
-        if let Some(focused) = self.direct_unbound {
-            let reveal = self.active_workspace().map(|wsp| wsp.focused).ok_or(())?;
-            self.remove_unbound_window(focused).ok_or(())?;
-            return Ok(Some(reveal));
+        if let Some(presentation) = self.solo_presentation {
+            let focused = presentation.window_id();
+            match presentation {
+                SoloPresentation::Detached(_) => {
+                    self.remove_detached_window(focused).ok_or(())?;
+                }
+                SoloPresentation::HiddenAttached(_) => {
+                    let workspace = self.hidden_workspace_index_of_window(focused).ok_or(())?;
+                    let position = self.workspaces[workspace]
+                        .hidden_tiles
+                        .iter()
+                        .position(|tile| tile.window.id == focused)
+                        .ok_or(())?;
+                    self.workspaces[workspace].hidden_tiles.remove(position);
+                    self.solo_presentation = None;
+                }
+            }
+            return Ok(self.focused_window_id());
         }
         let wsp = self.active_workspace_mut().ok_or(())?;
         let focused = wsp.focused;
         let path = wsp.layout.path_to(focused).ok_or(())?;
 
         if path.is_empty() {
-            // Focused leaf IS the root. The workspace has nothing left.
+            // Focused leaf IS the root. Close the tile and leave a durable empty
+            // workspace; hidden attachments, if any, remain owned here.
+            wsp.layout = Layout::Empty;
+            wsp.focused = 0;
+            wsp.desktop.reconcile(&[]);
             return Ok(None);
         }
 
@@ -2757,7 +3080,7 @@ impl<C> Frame<C> {
     ///
     /// `Err(())` — no active workspace / no focused window.
     pub fn detach_focused(&mut self) -> Result<(Window<C>, bool), ()> {
-        if self.direct_unbound.is_some() {
+        if self.solo_presentation.is_some() {
             return Err(());
         }
         let wsp = self.active_workspace_mut().ok_or(())?;
@@ -2865,7 +3188,7 @@ impl<C> Frame<C> {
     /// focused leaf becomes the workspace's root. Returns `Err(())` if there is no
     /// focused window.
     pub fn only(&mut self) -> Result<(), ()> {
-        if self.direct_unbound.is_some() {
+        if self.solo_presentation.is_some() {
             return Err(());
         }
         let wsp = self.active_workspace_mut().ok_or(())?;
@@ -2893,7 +3216,7 @@ impl<C> Frame<C> {
     /// (spec-infinite-plane-workspace.md Behavior 5). No-op if the active workspace
     /// has fewer than 2 tiles.
     pub fn focus_next(&mut self) -> Result<(), ()> {
-        if self.direct_unbound.is_some() {
+        if self.solo_presentation.is_some() {
             return Err(());
         }
         let wsp = self.active_workspace_mut().ok_or(())?;
@@ -2905,7 +3228,7 @@ impl<C> Frame<C> {
 
     /// Cycle focus to the previous tile in the plane's row-major slot order.
     pub fn focus_prev(&mut self) -> Result<(), ()> {
-        if self.direct_unbound.is_some() {
+        if self.solo_presentation.is_some() {
             return Err(());
         }
         let wsp = self.active_workspace_mut().ok_or(())?;
@@ -2930,7 +3253,7 @@ impl<C> Frame<C> {
     ///
     /// No-op when there's no sibling in the requested direction.
     pub fn focus_motion(&mut self, dir: FocusDir) -> Result<(), ()> {
-        if self.direct_unbound.is_some() {
+        if self.solo_presentation.is_some() {
             return Err(());
         }
         let wsp = self.active_workspace_mut().ok_or(())?;
@@ -2952,9 +3275,7 @@ impl<C> Frame<C> {
 
     /// Find which workspace (by index) contains the window with the given id.
     pub fn workspace_containing(&self, id: WindowId) -> Option<usize> {
-        self.workspaces
-            .iter()
-            .position(|wsp| wsp.layout.find_leaf(id).is_some())
+        self.workspace_index_of_window(id)
     }
 
     /// Collect all window ids across all workspaces (for mark GC).
@@ -2963,9 +3284,10 @@ impl<C> Frame<C> {
         for wsp in &self.workspaces {
             wsp.layout.for_each_leaf(&mut |w| {
                 out.insert(w.id);
+                out.extend(wsp.hidden_tiles.iter().map(|tile| tile.window.id));
             });
         }
-        out.extend(self.unbound_tiles.iter().map(|tile| tile.window.id));
+        out.extend(self.detached_tiles.iter().map(|tile| tile.window.id));
         out
     }
 
@@ -3304,11 +3626,19 @@ mod desktop_tests {
         d.camera.pan = (2.73, -1.19);
         d.snap_camera_to_slots();
 
-        assert_eq!(d.camera.pan, (3.0, -1.0), "pan rounds to the nearest whole slot");
+        assert_eq!(
+            d.camera.pan,
+            (3.0, -1.0),
+            "pan rounds to the nearest whole slot"
+        );
         assert_eq!(d.camera.pan.0.fract(), 0.0, "pan.0 is integral");
         assert_eq!(d.camera.pan.1.fract(), 0.0, "pan.1 is integral");
         assert_eq!(d.slots, slots_before, "snap moves no tile (view-only)");
-        assert_eq!(d.span_of(2), span_before, "snap changes no span (view-only)");
+        assert_eq!(
+            d.span_of(2),
+            span_before,
+            "snap changes no span (view-only)"
+        );
     }
 
     /// Behavior 4: `seed_slot` walks the origin ring-spiral deterministically —
@@ -3478,10 +3808,7 @@ mod desktop_tests {
         };
         let d = DesktopState::restored(slots, spans.clone(), camera);
 
-        assert_eq!(
-            d.slots,
-            vec![(1, Slot::new(-1, 2)), (2, Slot::new(3, 4))]
-        );
+        assert_eq!(d.slots, vec![(1, Slot::new(-1, 2)), (2, Slot::new(3, 4))]);
         assert_eq!(d.spans, spans);
         assert_eq!(d.camera, camera);
         assert!(d.drag.is_none() && d.resize.is_none() && d.pan_drag.is_none());
@@ -3748,6 +4075,7 @@ mod tests {
         ws.workspaces.push(Workspace {
             auto_name: "workspace-1".into(),
             display_name: None,
+            hidden_tiles: Vec::new(),
             layout,
             focused,
             rail: None,
@@ -3761,7 +4089,12 @@ mod tests {
             project: ProjectId(0),
         });
         // Ensure window-id allocator skips past the ids we hand-rolled.
-        let max_id = ws.workspaces[0].layout.leaf_ids().into_iter().max().unwrap_or(0);
+        let max_id = ws.workspaces[0]
+            .layout
+            .leaf_ids()
+            .into_iter()
+            .max()
+            .unwrap_or(0);
         ws.next_window_id = max_id + 1;
         ws
     }
@@ -3884,16 +4217,14 @@ mod tests {
     }
 
     #[test]
-    fn close_focused_removes_direct_unbound_and_reveals_workspace() {
+    fn close_focused_removes_solo_detached_tile_and_reveals_workspace() {
         let mut frame = Frame::with_initial(TestContent("bound"), ProjectId(0));
-        let unbound = frame.push_unbound(TestContent("picker"), ProjectId(0));
-        frame.scratchpad.extend([unbound, unbound]);
-        assert!(frame.focus_unbound(unbound));
+        let detached = frame.push_detached(TestContent("picker"), ProjectId(0));
+        assert!(frame.present_solo(detached));
 
         assert_eq!(frame.close_focused(), Ok(Some(1)));
-        assert!(frame.tile(unbound).is_none());
-        assert_eq!(frame.directly_focused_unbound(), None);
-        assert!(frame.scratchpad.is_empty());
+        assert!(frame.tile(detached).is_none());
+        assert_eq!(frame.presented_detached_tile_id(), None);
         assert_eq!(frame.focused_window_id(), Some(1));
         assert_eq!(frame.workspaces.len(), 1);
     }
@@ -4066,6 +4397,7 @@ mod tests {
         ws.workspaces.push(Workspace {
             auto_name: "workspace-2".into(),
             display_name: None,
+            hidden_tiles: Vec::new(),
             layout: Layout::Empty,
             focused: 0,
             rail: None,
@@ -4093,6 +4425,7 @@ mod tests {
         ws.workspaces.push(Workspace {
             auto_name: "workspace-2".into(),
             display_name: None,
+            hidden_tiles: Vec::new(),
             layout: leaf(5, "x"),
             focused: 5,
             rail: None,
@@ -4129,6 +4462,7 @@ mod tests {
         ws.workspaces.push(Workspace {
             auto_name: "workspace-2".into(),
             display_name: None,
+            hidden_tiles: Vec::new(),
             layout: Layout::Empty,
             focused: 0,
             rail: None,
@@ -4154,7 +4488,7 @@ mod tests {
     // --- Optional workspace ownership (ADR-0033 / UXI-Workspace-16) -------
 
     #[test]
-    fn bound_unbound_bound_roundtrip_preserves_identity_state_project_and_tags() {
+    fn attached_detached_attached_roundtrip_preserves_identity_state_project_and_tags() {
         let layout = Layout::Split {
             dir: SplitDir::V,
             children: vec![(0.5, leaf(1, "a")), (0.5, leaf(2, "stateful"))],
@@ -4166,24 +4500,27 @@ mod tests {
             .tags
             .extend(["review".to_string(), "urgent".to_string()]);
 
-        frame.unbind_window(2).expect("tile can leave split");
-        assert_eq!(frame.tile_membership(2), Some(TileMembership::Unbound));
-        assert_eq!(frame.directly_focused_unbound(), Some(2));
+        frame.detach_window(2).expect("tile can leave split");
+        assert_eq!(frame.tile_membership(2), Some(TileMembership::Detached));
+        assert_eq!(frame.presented_detached_tile_id(), Some(2));
         assert_eq!(frame.focused_content(), Some(&TestContent("stateful")));
         assert_eq!(frame.tile_project(2), Some(ProjectId(0)));
         assert_eq!(
-            frame.tile(2).expect("unbound tile").tags,
+            frame.tile(2).expect("Detached tile").tags,
             TagSet::from(["review".to_string(), "urgent".to_string()])
         );
         assert_eq!(frame.workspaces[0].layout.leaf_ids(), vec![1]);
         assert_eq!(frame.all_window_ids(), HashSet::from([1, 2]));
 
-        frame.bind_unbound(2, 0).expect("same-project bind");
+        frame.attach_detached(2, 0).expect("same-project bind");
         assert_eq!(
             frame.tile_membership(2),
-            Some(TileMembership::Bound { workspace: 0 })
+            Some(TileMembership::Attached {
+                workspace: 0,
+                visibility: AttachedVisibility::Visible
+            })
         );
-        assert_eq!(frame.directly_focused_unbound(), None);
+        assert_eq!(frame.presented_detached_tile_id(), None);
         let rebound = frame.tile(2).expect("rebound tile");
         assert_eq!(rebound.id, 2);
         assert_eq!(rebound.content, TestContent("stateful"));
@@ -4192,21 +4529,21 @@ mod tests {
             TagSet::from(["review".to_string(), "urgent".to_string()])
         );
         assert_eq!(frame.workspaces[0].layout.leaf_ids(), vec![1, 2]);
-        assert!(frame.unbound_tiles.is_empty());
+        assert!(frame.detached_tiles.is_empty());
     }
 
     #[test]
-    fn replacing_picker_leaf_with_unbound_tile_preserves_slot_identity_state_and_tags() {
+    fn replacing_picker_leaf_with_detached_tile_preserves_slot_identity_state_and_tags() {
         let layout = Layout::Split {
             dir: SplitDir::V,
             children: vec![(0.5, leaf(1, "keep")), (0.5, leaf(2, "picker"))],
         };
         let mut frame = ws_with_layout(layout, 2);
-        let stable = frame.push_unbound(TestContent("agent-state"), ProjectId(0));
+        let stable = frame.push_detached(TestContent("agent-state"), ProjectId(0));
         frame.tile_mut(stable).unwrap().tags.insert("urgent".into());
 
         frame
-            .replace_bound_with_unbound(2, stable)
+            .replace_attached_with_detached(2, stable)
             .expect("same-project stable tile replaces picker leaf");
 
         assert_eq!(frame.workspaces[0].layout.leaf_ids(), vec![1, stable]);
@@ -4214,44 +4551,50 @@ mod tests {
         assert_eq!(frame.tile_membership(2), None);
         assert_eq!(
             frame.tile_membership(stable),
-            Some(TileMembership::Bound { workspace: 0 })
+            Some(TileMembership::Attached {
+                workspace: 0,
+                visibility: AttachedVisibility::Visible
+            })
         );
-        assert_eq!(frame.tile(stable).unwrap().content, TestContent("agent-state"));
+        assert_eq!(
+            frame.tile(stable).unwrap().content,
+            TestContent("agent-state")
+        );
         assert!(frame.tile(stable).unwrap().tags.contains("urgent"));
-        assert!(frame.unbound_tiles.is_empty());
+        assert!(frame.detached_tiles.is_empty());
     }
 
     #[test]
-    fn direct_unbound_focus_never_changes_membership_and_workspace_switch_clears_it() {
+    fn solo_detached_presentation_never_changes_membership_and_workspace_switch_clears_it() {
         let mut frame = Frame::with_initial(TestContent("bound"), ProjectId(0));
-        let id = frame.push_unbound(TestContent("unbound"), ProjectId(0));
+        let id = frame.push_detached(TestContent("detached"), ProjectId(0));
 
-        assert!(frame.focus_unbound(id));
+        assert!(frame.present_solo(id));
         assert_eq!(frame.focused_window_id(), Some(id));
-        assert_eq!(frame.focused_content(), Some(&TestContent("unbound")));
-        assert_eq!(frame.tile_membership(id), Some(TileMembership::Unbound));
+        assert_eq!(frame.focused_content(), Some(&TestContent("detached")));
+        assert_eq!(frame.tile_membership(id), Some(TileMembership::Detached));
         assert_eq!(frame.workspaces[0].layout.leaf_ids(), vec![1]);
 
         frame.set_active_workspace(0);
-        assert_eq!(frame.directly_focused_unbound(), None);
+        assert_eq!(frame.presented_detached_tile_id(), None);
         assert_eq!(frame.focused_window_id(), Some(1));
-        assert_eq!(frame.tile_membership(id), Some(TileMembership::Unbound));
+        assert_eq!(frame.tile_membership(id), Some(TileMembership::Detached));
     }
 
     #[test]
-    fn binding_is_project_local_and_failure_leaves_the_tile_unbound() {
+    fn attachment_is_project_local_and_failure_leaves_the_tile_detached() {
         let mut frame = Frame::with_initial(TestContent("p0"), ProjectId(0));
         frame.push_initial_workspace(TestContent("p1"), ProjectId(1));
-        let id = frame.push_unbound(TestContent("owned-by-p0"), ProjectId(0));
+        let id = frame.push_detached(TestContent("owned-by-p0"), ProjectId(0));
 
-        assert_eq!(frame.bind_unbound(id, 1), Err(()));
-        assert_eq!(frame.tile_membership(id), Some(TileMembership::Unbound));
+        assert_eq!(frame.attach_detached(id, 1), Err(()));
+        assert_eq!(frame.tile_membership(id), Some(TileMembership::Detached));
         assert_eq!(frame.tile_project(id), Some(ProjectId(0)));
         assert_eq!(frame.tile(id).unwrap().content, TestContent("owned-by-p0"));
     }
 
     #[test]
-    fn closing_workspace_unbinds_its_tiles_and_keeps_the_workspace_floor() {
+    fn closing_workspace_detaches_its_tiles_and_keeps_the_workspace_floor() {
         let mut frame = Frame::with_initial(TestContent("keep"), ProjectId(0));
         let moved = frame.push_initial_workspace(TestContent("survive"), ProjectId(0));
         frame
@@ -4262,7 +4605,7 @@ mod tests {
 
         frame.close_workspace(1);
         assert_eq!(frame.workspaces.len(), 1);
-        assert_eq!(frame.tile_membership(moved), Some(TileMembership::Unbound));
+        assert_eq!(frame.tile_membership(moved), Some(TileMembership::Detached));
         assert_eq!(frame.tile(moved).unwrap().content, TestContent("survive"));
         assert!(frame.tile(moved).unwrap().tags.contains("later"));
 
@@ -4272,14 +4615,12 @@ mod tests {
     }
 
     #[test]
-    fn sole_workspace_cannot_be_emptied_by_unbind() {
+    fn sole_workspace_can_be_empty_after_detach() {
         let mut frame = Frame::with_initial(TestContent("anchor"), ProjectId(0));
-        assert_eq!(frame.unbind_window(1), Err(()));
-        assert_eq!(
-            frame.tile_membership(1),
-            Some(TileMembership::Bound { workspace: 0 })
-        );
-        assert!(frame.unbound_tiles.is_empty());
+        frame.detach_window(1).unwrap();
+        assert_eq!(frame.tile_membership(1), Some(TileMembership::Detached));
+        assert!(matches!(frame.workspaces[0].layout, Layout::Empty));
+        assert_eq!(frame.workspaces[0].focused, 0);
     }
 
     #[test]
@@ -4293,7 +4634,7 @@ mod tests {
         frame.set_active_workspace(0);
 
         frame
-            .move_bound_to_workspace(moved, 1, false)
+            .move_attached_to_workspace(moved, 1, false)
             .expect("same-project send");
         assert_eq!(frame.active_workspace, 0, "send does not follow");
         assert_eq!(frame.workspace_index_of_window(moved), Some(1));
@@ -4302,7 +4643,7 @@ mod tests {
         assert!(frame.tile(moved).unwrap().tags.contains("keep"));
 
         frame
-            .move_bound_to_workspace(moved, 0, true)
+            .move_attached_to_workspace(moved, 0, true)
             .expect("send and follow");
         assert_eq!(frame.active_workspace, 0);
         assert_eq!(frame.workspace_index_of_window(moved), Some(0));
@@ -4315,7 +4656,7 @@ mod tests {
         let moved = frame.push_initial_workspace(TestContent("only"), ProjectId(0));
 
         frame
-            .move_bound_to_workspace(moved, 0, false)
+            .move_attached_to_workspace(moved, 0, false)
             .expect("last tile can move when another workspace survives");
         assert_eq!(frame.workspaces.len(), 1);
         assert_eq!(frame.active_workspace, 0);
@@ -4330,7 +4671,7 @@ mod tests {
         frame.set_active_workspace(0);
 
         frame
-            .move_bound_to_workspace(moved, 1, false)
+            .move_attached_to_workspace(moved, 1, false)
             .expect("earlier last-tile source can move to later destination");
         assert_eq!(frame.workspaces.len(), 1);
         assert_eq!(frame.active_workspace, 0);
@@ -4344,32 +4685,148 @@ mod tests {
         frame.push_initial_workspace(TestContent("p1"), ProjectId(1));
         frame.set_active_workspace(0);
 
-        assert_eq!(frame.move_bound_to_workspace(1, 0, false), Err(()));
-        assert_eq!(frame.move_bound_to_workspace(1, 1, false), Err(()));
+        assert_eq!(frame.move_attached_to_workspace(1, 0, false), Err(()));
+        assert_eq!(frame.move_attached_to_workspace(1, 1, false), Err(()));
         assert_eq!(frame.workspace_index_of_window(1), Some(0));
     }
 
     #[test]
-    fn scratchpad_stash_cycles_mru_then_returns_to_workspace() {
+    fn send_tile_transition_covers_visible_hidden_and_detached_membership() {
+        let mut frame = Frame::with_initial(TestContent("source"), ProjectId(0));
+        frame.push_initial_workspace(TestContent("target"), ProjectId(0));
+
+        frame.send_tile_to_workspace(1, 1, false).unwrap();
+        assert_eq!(
+            frame.tile_membership(1),
+            Some(TileMembership::Attached {
+                workspace: 0,
+                visibility: AttachedVisibility::Visible,
+            }),
+            "removing the earlier source adjusts the destination index"
+        );
+
+        let hidden = frame
+            .split_focused(SplitDir::V, TestContent("hidden"))
+            .unwrap();
+        frame.push_initial_workspace(TestContent("other"), ProjectId(0));
+        frame.set_active_workspace(0);
+        frame.hide_window(hidden).unwrap();
+        assert!(frame.present_solo(hidden));
+        frame.send_tile_to_workspace(hidden, 1, true).unwrap();
+        assert_eq!(
+            frame.tile_membership(hidden),
+            Some(TileMembership::Attached {
+                workspace: 1,
+                visibility: AttachedVisibility::Visible,
+            })
+        );
+        assert_eq!(frame.active_workspace, 1);
+        assert_eq!(frame.presented_tile(), None);
+
+        let detached = frame.push_detached(TestContent("detached"), ProjectId(0));
+        assert!(frame.present_solo(detached));
+        frame.send_tile_to_workspace(detached, 0, true).unwrap();
+        assert_eq!(
+            frame.tile_membership(detached),
+            Some(TileMembership::Attached {
+                workspace: 0,
+                visibility: AttachedVisibility::Visible,
+            })
+        );
+
+        let foreign = frame.push_detached(TestContent("foreign"), ProjectId(1));
+        assert_eq!(frame.send_tile_to_workspace(foreign, 0, true), Err(()));
+        assert_eq!(
+            frame.tile_membership(foreign),
+            Some(TileMembership::Detached)
+        );
+        assert_eq!(frame.tile(foreign).unwrap().project(), ProjectId(1));
+        assert_eq!(frame.validate_ownership(), Ok(()));
+    }
+
+    #[test]
+    fn hide_solo_visit_and_unhide_follow_preserve_identity_and_best_effort_placement() {
         let mut frame = Frame::with_initial(TestContent("anchor"), ProjectId(0));
-        let older = frame
-            .split_focused(SplitDir::V, TestContent("older"))
+        let hidden = frame
+            .split_focused(SplitDir::V, TestContent("stateful"))
             .unwrap();
-        let newer = frame
-            .split_focused(SplitDir::V, TestContent("newer"))
+        frame.workspaces[0].desktop.reconcile(&[1, hidden]);
+        let footprint = frame.workspaces[0].desktop.rect_of(hidden).unwrap();
+        frame.tile_mut(hidden).unwrap().tags.insert("keep".into());
+
+        frame.hide_window(hidden).unwrap();
+        assert_eq!(
+            frame.tile_membership(hidden),
+            Some(TileMembership::Attached {
+                workspace: 0,
+                visibility: AttachedVisibility::Hidden,
+            })
+        );
+        assert_eq!(frame.workspaces[0].layout.leaf_ids(), vec![1]);
+        assert!(frame.present_solo(hidden));
+        assert_eq!(
+            frame.presented_tile(),
+            Some(SoloPresentation::HiddenAttached(hidden))
+        );
+        assert_eq!(frame.focused_content(), Some(&TestContent("stateful")));
+
+        frame.unhide_window(hidden).unwrap();
+        assert_eq!(frame.active_workspace, 0);
+        assert_eq!(frame.focused_window_id(), Some(hidden));
+        assert_eq!(frame.workspaces[0].desktop.rect_of(hidden), Some(footprint));
+        assert!(frame.tile(hidden).unwrap().tags.contains("keep"));
+        assert_eq!(frame.presented_tile(), None);
+    }
+
+    #[test]
+    fn all_hidden_workspace_is_valid_and_detaching_hidden_clears_hidden_state() {
+        let mut frame = Frame::with_initial(TestContent("only"), ProjectId(0));
+        frame.workspaces[0].desktop.reconcile(&[1]);
+        frame.hide_window(1).unwrap();
+        assert!(matches!(frame.workspaces[0].layout, Layout::Empty));
+        assert_eq!(frame.workspaces[0].hidden_tiles.len(), 1);
+        assert_eq!(frame.validate_ownership(), Ok(()));
+        assert!(frame.present_solo(1));
+
+        frame.detach_window(1).unwrap();
+        assert!(frame.workspaces[0].hidden_tiles.is_empty());
+        assert_eq!(frame.tile_membership(1), Some(TileMembership::Detached));
+        assert_eq!(frame.presented_tile(), Some(SoloPresentation::Detached(1)));
+        assert_eq!(frame.validate_ownership(), Ok(()));
+    }
+
+    #[test]
+    fn unhide_uses_normal_placement_when_saved_footprint_was_taken() {
+        let mut frame = Frame::with_initial(TestContent("anchor"), ProjectId(0));
+        let hidden = frame
+            .split_focused(SplitDir::V, TestContent("hidden"))
             .unwrap();
+        frame.workspaces[0].desktop.reconcile(&[1, hidden]);
+        let (saved_slot, saved_span) = frame.workspaces[0].desktop.rect_of(hidden).unwrap();
+        frame.hide_window(hidden).unwrap();
+        assert!(frame.workspaces[0].desktop.free_drop(1, saved_slot));
 
-        frame.stash_window(older).unwrap();
-        frame.stash_window(newer).unwrap();
-        assert_eq!(frame.scratchpad, vec![newer, older]);
-        assert_eq!(frame.directly_focused_unbound(), None);
+        frame.unhide_window(hidden).unwrap();
+        let restored = frame.workspaces[0].desktop.rect_of(hidden).unwrap();
+        assert_ne!(
+            restored.0, saved_slot,
+            "occupied saved slot must not be reserved"
+        );
+        assert_eq!(restored.1, saved_span);
+        assert_ne!(frame.workspaces[0].desktop.slot_of(1), Some(restored.0));
+    }
 
-        assert!(frame.cycle_scratchpad());
-        assert_eq!(frame.directly_focused_unbound(), Some(newer));
-        assert!(frame.cycle_scratchpad());
-        assert_eq!(frame.directly_focused_unbound(), Some(older));
-        assert!(frame.cycle_scratchpad());
-        assert_eq!(frame.directly_focused_unbound(), None);
+    #[test]
+    fn close_retires_tile_without_hiding_or_detaching_it() {
+        let mut frame = Frame::with_initial(TestContent("keep"), ProjectId(0));
+        let closing = frame
+            .split_focused(SplitDir::V, TestContent("close"))
+            .unwrap();
+        assert_eq!(frame.close_focused(), Ok(Some(1)));
+        assert_eq!(frame.tile_membership(closing), None);
+        assert!(frame.workspaces[0].hidden_tiles.is_empty());
+        assert!(frame.detached_tiles.is_empty());
+        assert_eq!(frame.validate_ownership(), Ok(()));
     }
 
     #[test]
@@ -4380,29 +4837,37 @@ mod tests {
             .unwrap();
         assert_eq!(frame.validate_ownership(), Ok(()));
 
-        frame.stash_window(moving).unwrap();
+        frame.hide_window(moving).unwrap();
         assert_eq!(frame.validate_ownership(), Ok(()));
-        assert!(frame.cycle_scratchpad());
+        assert!(frame.present_solo(moving));
         assert_eq!(frame.validate_ownership(), Ok(()));
-        frame.bind_unbound(moving, 0).unwrap();
+        frame.unhide_window(moving).unwrap();
+        assert_eq!(frame.validate_ownership(), Ok(()));
+
+        frame.detach_window(moving).unwrap();
+        assert_eq!(frame.validate_ownership(), Ok(()));
+        frame.attach_detached(moving, 0).unwrap();
         assert_eq!(frame.validate_ownership(), Ok(()));
 
         frame.push_initial_workspace(TestContent("target"), ProjectId(0));
         frame.set_active_workspace(0);
-        frame.move_bound_to_workspace(moving, 1, false).unwrap();
+        frame.move_attached_to_workspace(moving, 1, false).unwrap();
         assert_eq!(frame.validate_ownership(), Ok(()));
         frame.close_workspace(1);
         assert_eq!(frame.validate_ownership(), Ok(()));
-        assert_eq!(frame.tile_membership(moving), Some(TileMembership::Unbound));
+        assert_eq!(
+            frame.tile_membership(moving),
+            Some(TileMembership::Detached)
+        );
 
-        frame.bind_unbound(moving, 0).unwrap();
+        frame.attach_detached(moving, 0).unwrap();
         assert_eq!(frame.validate_ownership(), Ok(()));
     }
 
     #[test]
     fn ownership_guard_rejects_each_illegal_domain_state() {
         let mut frame = Frame::with_initial(TestContent("anchor"), ProjectId(0));
-        frame.unbound_tiles.push(UnboundTile::new(Window::new(
+        frame.detached_tiles.push(DetachedTile::new(Window::new(
             1,
             ProjectId(0),
             TestContent("duplicate"),
@@ -4411,51 +4876,29 @@ mod tests {
             frame.validate_ownership(),
             Err(OwnershipViolation::DuplicateWindowId(1))
         );
-        frame.unbound_tiles.clear();
+        frame.detached_tiles.clear();
 
-        frame.workspaces[0]
-            .layout
-            .find_leaf_mut(1)
-            .unwrap()
-            .project = ProjectId(1);
+        frame.workspaces[0].layout.find_leaf_mut(1).unwrap().project = ProjectId(1);
         assert!(matches!(
             frame.validate_ownership(),
             Err(OwnershipViolation::WorkspaceProjectMismatch { window: 1, .. })
         ));
-        frame.workspaces[0]
-            .layout
-            .find_leaf_mut(1)
-            .unwrap()
-            .project = ProjectId(0);
+        frame.workspaces[0].layout.find_leaf_mut(1).unwrap().project = ProjectId(0);
 
-        frame.direct_unbound = Some(1);
+        frame.solo_presentation = Some(SoloPresentation::Detached(1));
         assert_eq!(
             frame.validate_ownership(),
-            Err(OwnershipViolation::DirectFocusIsNotUnbound(1))
+            Err(OwnershipViolation::SoloPresentationMismatch(
+                SoloPresentation::Detached(1)
+            ))
         );
-        frame.direct_unbound = None;
-        frame.scratchpad.push(1);
+        frame.solo_presentation = Some(SoloPresentation::HiddenAttached(1));
         assert_eq!(
             frame.validate_ownership(),
-            Err(OwnershipViolation::ScratchpadEntryIsNotUnbound(1))
+            Err(OwnershipViolation::SoloPresentationMismatch(
+                SoloPresentation::HiddenAttached(1)
+            ))
         );
-    }
-
-    #[test]
-    fn scratchpad_floor_bind_pruning_and_restore_pruning() {
-        let mut frame = Frame::with_initial(TestContent("anchor"), ProjectId(0));
-        assert_eq!(frame.stash_window(1), Err(()));
-
-        let scratch = frame
-            .split_focused(SplitDir::V, TestContent("scratch"))
-            .unwrap();
-        frame.stash_window(scratch).unwrap();
-        frame.scratchpad.extend([999, scratch]);
-        frame.prune_scratchpad();
-        assert_eq!(frame.scratchpad, vec![scratch]);
-
-        frame.bind_unbound(scratch, 0).unwrap();
-        assert!(frame.scratchpad.is_empty());
     }
 
     #[test]
@@ -4477,7 +4920,10 @@ mod tests {
 
         frame.set_active_workspace(0);
         frame.close_workspace(0);
-        assert!(!frame.workspace_back_and_forth(), "deleted stable name is a no-op");
+        assert!(
+            !frame.workspace_back_and_forth(),
+            "deleted stable name is a no-op"
+        );
     }
 
     #[test]

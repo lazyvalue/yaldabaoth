@@ -152,13 +152,12 @@ impl YaldaGpuiView {
             cx.notify();
             return;
         }
-        let underlying = match self
-            .workspace
-            .focused_content_mut()
-            .expect("no focused window")
-        {
-            App::Buffer(BufferApp::Picking(b)) => b.underlying.take(),
-            _ => return,
+        let underlying = match self.workspace.focused_content_mut() {
+            None => return,
+            Some(content) => match content {
+                App::Buffer(BufferApp::Picking(b)) => b.underlying.take(),
+                _ => return,
+            },
         };
         // B4: if the picker was opened over an existing Buffer view (Cmd-O /
         // inplace-buffer-pick), restore that stashed BufferApp mode in place —
