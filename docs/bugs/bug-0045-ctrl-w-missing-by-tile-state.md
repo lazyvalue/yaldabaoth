@@ -24,11 +24,11 @@ coverage check.
 The 2026-08-20 recurrence has a different cause. The central action router is
 present and dispatches reliably, but `Frame::focus_motion` always resolved the
 direction against retained two-dimensional Plane slots. Columns and Tiling
-flatten those slots into one painted horizontal reading-order row. A tile that
-is visibly left could therefore have a larger hidden Plane column, causing `h`
-to move right, `l` to move left, or either command to find no candidate. The
-first guard forced `WorkspaceView::Plane`, so it could not detect disagreement
-between the active arrangement and retained Plane geometry.
+derive different painted arrangements from the slots' reading order. A tile
+that is visibly left could therefore have a larger hidden Plane column, causing
+`h` to move right, `l` to move left, or either command to find no candidate.
+The first guard forced `WorkspaceView::Plane`, so it could not detect
+disagreement between the active arrangement and retained Plane geometry.
 
 ## Fix
 
@@ -64,8 +64,9 @@ the recurrence is layout target resolution, not timing or App capture.
 
 `Workspace::focus_target` is now the single view-aware resolver used by
 `Frame::focus_motion`. Plane retains two-dimensional spatial navigation.
-Columns and Tiling use their painted non-wrapping horizontal reading order, with
-`j`/`k` as no-ops because their tiles are full-height. Monocle maps `h`/`k`
+Columns use their painted non-wrapping horizontal reading order, with `j`/`k` as
+no-ops. Tiling follows its two painted vertical panes: `j`/`k` stay in a pane and
+`h`/`l` cross between primary and stack at the closest row. Monocle maps `h`/`k`
 backward and `l`/`j` forward through reading order so changing the sole presented
 tile is deterministic. The stale Buffer Edit handler for bare `Ctrl-W` was also
 removed; Code/WP remains available from the Buffer tile menu, leaving the prefix
@@ -73,6 +74,6 @@ exclusively owned by the shell. The common pre-App key interceptor now explicitl
 consumes bare Ctrl-W if GPUI ever delivers the unresolved prefix to raw handling.
 
 The real-path recurrence guard covers contradictory hidden Plane geometry under
-Columns and Tiling, painted x-order, Tiling's vertical no-ops, and all four
-Monocle directions. Restoring the old unconditional `desktop.spatial_neighbor`
-implementation reproduces the visibly inverted RED.
+Columns and Tiling, Columns x-order, Tiling's primary/vertical-stack geometry,
+and all four Monocle directions. Restoring the old unconditional
+`desktop.spatial_neighbor` implementation reproduces the visibly inverted RED.
