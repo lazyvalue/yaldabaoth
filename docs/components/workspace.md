@@ -6,8 +6,10 @@
 ## Description
 
 A **Workspace** (`Workspace<App>`, formerly `Tab<App>` — the `tab` vocabulary was
-eradicated in ADR-0028 §5 / T007) is a plane of **bound** tiles: it owns an n-ary **layout
-tree**, a focused-tile pointer, and a required-private **`project: ProjectId`**
+eradicated in ADR-0028 §5 / T007) is a plane of **attached** tiles. Visible attached
+tiles participate in its n-ary **layout tree**; hidden attached tiles retain the
+workspace as owner without participating in the layout. It also owns a focused-tile
+pointer and a required-private **`project: ProjectId`**
 foreign key into the `Projects` store. Interior nodes of the tree are **Splits**
 (`Layout::Split`) — a direction (`H` = stacked, `V` = side-by-side) plus weighted
 children — and each leaf is a **Tile** (`Window<App>`, a stable `WindowId` holding
@@ -19,7 +21,7 @@ directory is the project's, resolved at the point of use (`projects.cwd_of(
 workspace.project())`) and **never cached** (`UXI-Project-2`, ADR-0028 §3). A new
 workspace inherits the active one's project.
 
-The container that owns the list of workspaces and the **unbound tile**
+The container that owns the list of workspaces and the **Detached tile**
 collection (one per OS-level **Frame**) is
 **`Frame<App>`** (formerly the code's `Workspace<App>` — renamed in T007 so the
 type name matches the user-facing "workspace" = the plane). The frame carries the
@@ -28,10 +30,10 @@ next/prev, new/close, `ctrl-<n>` jump by number) and the buffer pool; the tag ba
 drives tile tags. Durable workspaces are numbered `1..N` in the jump panel
 (globally, across all projects), and those numbers are the jump targets.
 
-The full hierarchy is **`Frame` → `Project` → (`Workspace` → bound tiles) +
-unbound tiles**. Every stable tile is in exactly one of those two placement
-domains; direct unbound focus is not a third owner (ADR-0033,
-`UXI-Workspace-16`).
+The full hierarchy is **`Frame` → `Project` → (`Workspace` → attached tiles) +
+Detached tiles**. An attached tile is either visible or hidden. Every stable
+tile has exactly one owner; solo presentation is not a third owner (ADR-0034,
+`UXI-Workspace-24`).
 
 ## References
 
@@ -41,6 +43,9 @@ domains; direct unbound focus is not a third owner (ADR-0033,
   container→`Frame` rename (§5) this Description now reflects.
 - ADR-0033 — optional workspace ownership, tile-local tags, direct unbound
   focus, and removal of ephemeral virtual workspaces.
+- ADR-0034 — attachment independent of visibility; Attached/Detached
+  terminology, hidden workspace ownership, typed solo presentation, and Close
+  as an independent operation.
 - `docs/specs/spec-workspaces-and-splits.md` — the n-ary split/layout tree +
   persistence (retroactive spec of shipped behavior; workspace/frame vocabulary).
 - `docs/specs/spec-layout-patterns.md` — tile tags + automatic layout modes.
@@ -865,6 +870,10 @@ command-specific assertion before the production implementation was restored.
 
 ### UXI-Workspace-16 — Every tile is bound to one workspace or unbound
 
+> **Superseded by `UXI-Workspace-24` / ADR-0034.** Exclusive ownership remains,
+> but Attached-visible, Attached-hidden, and Detached replace this two-state
+> Bound/Unbound model.
+
 **Statement.** A stable tile has exactly one optional workspace owner:
 
 1. A **bound** tile is a leaf in exactly one workspace layout.
@@ -900,6 +909,10 @@ real Cmd-P and `Ctrl-W b` paths. The complete GUI and library suites pass, and
 targeted ownership mutants are caught (Cog graph `9k2`).
 
 ### UXI-Workspace-17 — Send a tile without following or send and follow
+
+> **Terminology amended by `UXI-Workspace-24` / ADR-0034.** The same destination
+> picker attaches a Detached tile or moves an already Attached tile. Hidden
+> attachment is not a separate destination.
 
 **Statement.** A bound tile can move to another workspace in the same project
 through the existing workspace picker:
@@ -938,6 +951,9 @@ excludes another project's workspace. Negative control: disabling follow on
 the uppercase handler made the guard RED at the active-workspace assertion.
 
 ### UXI-Workspace-18 — Scratchpad is an MRU subset of Unbound
+
+> **Superseded by `UXI-Workspace-24` / ADR-0034.** Hide keeps a tile attached;
+> the Detached scratchpad/MRU model and Stash/Summon operations are removed.
 
 **Statement.** Scratchpad tiles are ordinary stable Unbound tiles with an
 additional persisted MRU membership list:
@@ -1103,6 +1119,9 @@ the central declarative handler vocabulary.
 
 ### UXI-Workspace-23 — Closing a bound Agent tile stashes it
 
+> **Superseded by `UXI-Workspace-24` / ADR-0034.** Close is independent from
+> Hide and Detach; Scratchpad is removed.
+
 **Statement.** **Close Tile** on a bound Agent tile is a placement transition,
 not destruction. It performs the same ownership move as **Stash**: the complete
 stable tile moves from its workspace to Unbound, retains its `WindowId`, App
@@ -1135,3 +1154,55 @@ valid direct-focus / scratchpad indices after every placement transition and
 before persistence. `Window` keeps both `id` and `project` private and exposes
 read-only accessors; placement APIs move the complete value instead of allowing
 callers to rewrite either identity field.
+
+### UXI-Workspace-24 — Attachment, visibility, presentation, and close are independent
+
+**Statement.** Every stable tile has exactly one of three placement states:
+
+1. **Attached + visible** — owned by one workspace and present in its layout.
+2. **Attached + hidden** — owned by one workspace and absent from its layout.
+3. **Detached** — owned by the frame and associated with no workspace.
+
+There is no Detached + hidden state. Attach accepts a Detached tile and makes it
+visible in a same-project workspace. Detach accepts either attached state,
+clears hidden state, and places the unchanged tile in Detached. Hide accepts
+only Attached + visible and leaves the tile owned by that workspace. Unhide
+accepts only Attached + hidden, restores it through the current layout manager,
+selects its workspace, and focuses it. Close retires the tile shell and never
+dispatches any of those four placement transitions.
+
+Hiding records the tile's last plane footprint as a best-effort restoration
+preference. Other visible tiles may invalidate it. Unhide restores the footprint
+only if it is still valid and unoccupied; otherwise the current Plane/Columns
+arrangement inserts the tile by the same neighbor-seeding rules as a new tile.
+
+A workspace may have all of its tiles hidden. It remains durable and renders an
+explicit all-tiles-hidden empty state without creating a replacement. A hidden
+attached or Detached tile may be presented alone through a typed solo target;
+leaving that presentation changes neither ownership nor visibility. A visible
+attached tile cannot be a solo target.
+
+**Applies to.** `workspace.rs`: workspace-owned hidden tiles, typed
+membership/presentation enums, transition APIs, placement restoration, complete
+ownership validator; `main.rs` / `chrome.rs`: independent action handlers,
+all-hidden canvas, and solo presentation; `persist.rs`: visibility and migration.
+
+**Why.** Workspace association, layout visibility, temporary navigation, and
+tile lifetime are independent facts. Encoding them as separate legal states
+prevents Hide from silently detaching, Close from silently hiding, and a solo
+visit from silently changing ownership.
+
+**Status.** `implemented (headless)`.
+
+**Enforcement.** `workspace::tests::{hide_solo_visit_and_unhide_follow_preserve_identity_and_best_effort_placement,
+unhide_uses_normal_placement_when_saved_footprint_was_taken,
+all_hidden_workspace_is_valid_and_detaching_hidden_clears_hidden_state,
+close_retires_tile_without_hiding_or_detaching_it,
+send_tile_transition_covers_visible_hidden_and_detached_membership}` cover the
+typed transition matrix and layout fallback. `ownership_invariants_hold_across_placement_operation_sequence`
+and `ownership_guard_rejects_each_illegal_domain_state` guard the exclusive
+ownership graph. Production-path guards
+`ctrl_w_hide_unhide_and_workspace_back_and_forth_are_global`,
+`hidden_tile_navigation_is_solo_until_explicit_unhide`, and
+`close_bound_agent_tile_retires_tile_without_hiding_or_detaching` exercise the shared
+shell actions, solo visit/Unhide-follow, and independent Close behavior.

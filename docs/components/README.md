@@ -43,13 +43,13 @@ holds the detail for a slice. The UXI ids stay owned by the component, not the f
 - [buffer.md](buffer.md) — `Buffer` (Picking / Viewing / Editing).
 - [linear.md](linear.md) — `Linear`.
 - [cog.md](cog.md) — `Cog` (read-only Cog graph explorer tile). `UXI-Cog-1..11`.
-- [jump-panel.md](jump-panel.md) — `JumpPanel`. `UXI-JumpPanel-1..23` (the
+- [jump-panel.md](jump-panel.md) — `JumpPanel`. `UXI-JumpPanel-1..25` (the
   sidebar navigator, its `Cmd-P` fuzzy palette `UXI-JumpPanel-9`, and the
-  bound-workspace / tag-grouped Unbound tree in `UXI-JumpPanel-23`).
+  workspace-attached / tag-grouped Detached tree in `UXI-JumpPanel-23/-25`).
 - [workspace.md](workspace.md) — `Workspace` (the infinite-plane model: signed
   all-directions slot grid + pan/semantic-zoom camera + reset-to-origin;
-  layout-mode/split surface retired; optional tile ownership; workspace close
-  unbinds tiles and never quits). `UXI-Workspace-1..20`.
+  layout-mode/split surface retired; attachment independent of visibility;
+  workspace close detaches tiles and never quits). `UXI-Workspace-1..24`.
 - [project.md](project.md) — `Project` (top-level org primitive: name+cwd-keyed
   store, workspaces/sessions hold a `ProjectId` FK, `Frame → Project → Workspace →
   Window`). `UXI-Project-1..8` — all implemented (ADR-0028).
@@ -66,19 +66,22 @@ holds the detail for a slice. The UXI ids stay owned by the component, not the f
 The vocabulary component specs are written in. These are the user's words — prefer
 them in specs, code comments, and UI copy over ad-hoc synonyms.
 
-- **bound tile** — a durable tile owned by exactly one workspace layout.
-- **unbound tile** — a durable tile outside every workspace. It keeps its
+- **attached tile** — a durable tile owned by exactly one workspace. It is
+  either **visible** in that workspace's layout or **hidden** while retaining
+  its workspace association.
+- **Detached tile** — a durable tile outside every workspace. It keeps its
   `WindowId`, App state, project, and tags; it is directly reachable from the
-  jump panel and Cmd-P and can later be bound without recreation. “Unbound”
-  describes workspace membership only (ADR-0033).
+  jump panel and Cmd-P and can later be attached without recreation (ADR-0034).
 - **empty Agent tile** — an Agent tile with no session selected (the picker).
   This replaces the old overloaded phrase “unbound Agent tile.”
-- **direct unbound view** — focusing an unbound tile in the content area without
-  binding it. It is ordinary focus state, not an ephemeral workspace.
+- **solo tile presentation** — focusing a Detached or attached-hidden tile in
+  the content area without changing attachment or visibility. It is navigation
+  state, not an ephemeral workspace.
 
-The old terms **free session** and **bare agent view** are retired. Agent
+The old terms **bound tile**, **unbound tile**, **direct unbound view**,
+**scratchpad**, **stash**, **free session**, and **bare agent view** are retired. Agent
 sessions remain project-owned runtime entities, but every navigable roster
-session is represented by either a bound or unbound Agent tile.
+session is represented by one stable Agent tile, either Attached or Detached.
 
 ## Format of a component spec
 

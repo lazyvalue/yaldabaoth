@@ -13,7 +13,7 @@ O(workspaces + tiles)), not cached. Primary code home:
 `jump_panel_view.rs`.
 
 **Palette.** Two header tiers, distinct hues: top-level section headers
-("SYSTEM CONSOLE" / "WORKSPACES" / "UNBOUND") are **red** (`DetailStyle.err`,
+("SYSTEM CONSOLE" / "WORKSPACES" / "DETACHED") are **red** (`DetailStyle.err`,
 `0xff6b6b`, bold uppercase); per-cwd subheaders are **electric blue** (`0x3b9eff`,
 real path casing). Operational state uses two literal hues: **orange = working**
 and **green = ready for input**. The "you are here" active mark and selected tabs
@@ -35,38 +35,40 @@ Sections:
   overlay (`UXI-SystemConsole-1`). It replaces the former empty Pinned
   placeholder.
 - **Workspaces** — one collapsible folder per durable workspace, containing one
-  row per bound tile (`UXI-JumpPanel-23`).
+  row per attached tile, including hidden tiles (`UXI-JumpPanel-25`).
   - The folder badge shows the **1-based workspace number** — the digit
     `ctrl-<n>` jumps to (INV-UX-11).
-  - Folder click folds/unfolds. Bound-tile click selects its workspace and
-    focuses that tile.
-- **Unbound** — only tiles outside every workspace, retaining the existing
+  - Folder click folds/unfolds. A visible-tile click selects its workspace and
+    focuses that tile; a hidden-tile click presents it alone without unhiding it.
+- **Detached** — only tiles outside every workspace, retaining the existing
   activity tabs, tag folders, status, provider, ordering, and archive signals
   where the tile is an Agent.
-  - **＋ New agent session** creates an unbound Agent tile and session.
+  - **＋ New agent session** creates a Detached Agent tile and session.
   - **Status dot** = what the AGENT is doing (INV-UX-10, UXI-JumpPanel-6) — the
     shape + color are one signal, not binding:
     - **● orange** — working (a reply is in flight).
     - **● green** — connected and idle → **ready for input / your turn**.
     - **○ dim** — disconnected or connecting. The whole row is also dimmed.
-  - Click → directly focuses the unbound tile without binding it.
-  - The row bound to the **focused tile** carries a left accent bar
+  - Click → presents the Detached tile alone without attaching it.
+  - The row corresponding to the **focused tile** carries a left accent bar
     (`UXI-JumpPanel-5`) — "this is where you are."
 
 ## References
 
-- `docs/components/README.md` § Terminology — bound/unbound tile ownership and
-  direct unbound focus.
+- `docs/components/README.md` § Terminology — attached/detached ownership,
+  attached visibility, and solo presentation.
 - `docs/specs/spec-jump-panel.md` — deeper design doc.
 - ADR-0033 — optional workspace ownership; supersedes ADR-0021's ephemeral
   virtual-workspace navigation.
+- ADR-0034 — attachment independent of visibility; Attached/Detached vocabulary
+  and typed solo presentation.
 - Migrated from `docs/ux-invariants.md` INV-UX-10, INV-UX-18. Those entries are
   now `→ migrated here`.
 
 **Terminology migration.** Older implemented-invariant evidence below may name
 “free sessions,” “bare views,” or ephemeral workspaces. Those are historical
 descriptions of the code being replaced, not current product terms or behavior;
-ADR-0033 and `UXI-JumpPanel-23` override them.
+ADR-0034 and `UXI-JumpPanel-25` override them.
 
 ## UX invariants
 
@@ -1379,6 +1381,9 @@ the trailing mark returned the guard to green.
 
 ### UXI-JumpPanel-23 — Workspaces are tile folders; Unbound is the out-of-workspace list
 
+> **Superseded by `UXI-JumpPanel-25` / ADR-0034.** Workspace folders now include
+> visible and hidden Attached tiles, while Detached replaces Unbound.
+
 **Statement.** The jump panel and Cmd-P project the frame's exclusive tile
 ownership:
 
@@ -1441,3 +1446,43 @@ rows.
 drives the production tagged and untagged Unbound paint paths, compares their
 real bounds to the standard jump navigation row, then changes document zoom and
 proves all of those chrome heights remain fixed.
+
+### UXI-JumpPanel-25 — Workspace folders include hidden tiles; Detached is separate
+
+**Statement.** The jump panel and Cmd-P project attachment and visibility from
+the same typed source:
+
+1. A workspace folder contains every tile attached to it, including hidden
+   tiles, in the workspace's deterministic reading/restoration order.
+2. Hidden rows are visibly distinguishable from visible rows but retain the
+   ordinary fixed chrome typography and tile metadata.
+3. **Detached** contains exactly Detached tiles. Detached tiles retain the tag
+   folder organization formerly used by Unbound.
+4. Activating an attached visible tile selects its workspace and focuses it.
+5. Activating an attached hidden tile presents it alone without unhiding it.
+6. Activating a Detached tile presents it alone without attaching it.
+7. Unhide is a separate command: it makes the hidden tile visible, follows to
+   its owning workspace, and focuses it.
+
+Mouse activation and Cmd-P/keyboard activation dispatch one typed target and
+therefore cannot disagree about any of these cases. An all-hidden workspace and
+all of its tile rows remain present and navigable.
+
+**Applies to.** `jump_panel_view.rs`: attached/hidden/Detached projections,
+row state, clicks, and all-hidden folders; `jump_palette.rs`: the same typed
+targets and activation; `main.rs`: common navigation dispatcher.
+
+**Why.** The navigator must reveal where a tile belongs independently from
+whether the workspace currently lays it out. Shared typed dispatch prevents the
+mouse/Enter divergence class and prevents navigation from mutating placement.
+
+**Status.** `implemented (headless)`.
+
+**Enforcement.** `hidden_tile_navigation_is_solo_until_explicit_unhide` drives
+the production jump-panel projection and Cmd-P target list, verifies that a
+hidden tile remains under its owning workspace and outside Detached, navigates
+to the typed solo presentation, then dispatches the real Unhide menu command and
+asserts workspace-follow plus visible focus. Existing
+`jump_panel_workspace_folders_and_unbound_rows_are_tile_native` and
+`jump_palette_opens_detached_tile_then_attaches_same_identity` cover visible and
+Detached activation, stable identity, tag grouping, and attachment.

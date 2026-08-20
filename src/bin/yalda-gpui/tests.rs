@@ -1,9 +1,7 @@
 //! Unit tests for the GPUI app (moved out of main.rs, split-gpui-main).
 
 use super::*;
-use crate::chrome::{
-    DESKTOP_CELL_H, DESKTOP_CELL_W, DESKTOP_GUTTER,
-};
+use crate::chrome::{DESKTOP_CELL_H, DESKTOP_CELL_W, DESKTOP_GUTTER};
 
 /// UXI-Workspace-22: every shipped `Ctrl-W …` command is shell-owned and is
 /// wired at the common tile ancestor. This exact-set assertion is the change
@@ -40,11 +38,27 @@ fn nightfox_jump_panel_colors_are_art_directed() {
     use yalda::style::Color;
     use yalda::theme::AgentTheme;
     let nf = AgentTheme::nightfox();
-    assert_eq!(nf.jump_header, Color::Rgb(0xc9, 0x4f, 0x6d), "Nightfox red header");
-    assert_eq!(nf.jump_subheader, Color::Rgb(0x71, 0x9c, 0xd6), "Nightfox blue subheader");
-    assert_eq!(nf.jump_working, Color::Rgb(0xf4, 0xa2, 0x61), "Nightfox orange working star");
+    assert_eq!(
+        nf.jump_header,
+        Color::Rgb(0xc9, 0x4f, 0x6d),
+        "Nightfox red header"
+    );
+    assert_eq!(
+        nf.jump_subheader,
+        Color::Rgb(0x71, 0x9c, 0xd6),
+        "Nightfox blue subheader"
+    );
+    assert_eq!(
+        nf.jump_working,
+        Color::Rgb(0xf4, 0xa2, 0x61),
+        "Nightfox orange working star"
+    );
     // Distinct from the legacy theme-neutral constants the other themes fall back to.
-    assert_ne!(nf.jump_header, Color::Rgb(0xff, 0x6b, 0x6b), "not the legacy #ff6b6b header");
+    assert_ne!(
+        nf.jump_header,
+        Color::Rgb(0xff, 0x6b, 0x6b),
+        "not the legacy #ff6b6b header"
+    );
     let dr = AgentTheme::dracula();
     assert_eq!(
         dr.jump_header,
@@ -65,11 +79,11 @@ fn detect_block_ranges_bounds_fence_to_turn() {
     // Turn 1 = frozen (0,2): a stray open ``` that never closes in the turn.
     // Turn 2 = frozen (3,5): its own ```. Line 2 is a user line between them.
     let ls: Vec<String> = [
-        "```",             // 0  turn 1 stray fence
-        "agent text",      // 1  turn 1
-        "user reply",      // 2  (between turns)
-        "```",             // 3  turn 2 fence
-        "more",            // 4  turn 2
+        "```",        // 0  turn 1 stray fence
+        "agent text", // 1  turn 1
+        "user reply", // 2  (between turns)
+        "```",        // 3  turn 2 fence
+        "more",       // 4  turn 2
     ]
     .iter()
     .map(|s| s.to_string())
@@ -126,7 +140,10 @@ fn blockquote_lines_prefixes_every_line() {
 fn first_n_sentences_splits_and_respects_abbrevs() {
     // Count + single-space join.
     assert_eq!(first_n_sentences("One. Two. Three. Four.", 1), "One.");
-    assert_eq!(first_n_sentences("One. Two. Three. Four.", 3), "One. Two. Three.");
+    assert_eq!(
+        first_n_sentences("One. Two. Three. Four.", 3),
+        "One. Two. Three."
+    );
     // Clamp: more requested than available → all of them, no error.
     assert_eq!(first_n_sentences("One. Two.", 9), "One. Two.");
     // Abbreviation dot does not split.
@@ -135,7 +152,10 @@ fn first_n_sentences_splits_and_respects_abbrevs() {
         "Use foo, e.g. bar, here."
     );
     // Decimal dot does not split (followed by a digit, not whitespace).
-    assert_eq!(first_n_sentences("It is 3.5 now. Next.", 1), "It is 3.5 now.");
+    assert_eq!(
+        first_n_sentences("It is 3.5 now. Next.", 1),
+        "It is 3.5 now."
+    );
     // `?` and `!` also terminate.
     assert_eq!(first_n_sentences("Really? Yes! Ok.", 2), "Really? Yes!");
     // No terminator at all → the whole text is one sentence.
@@ -166,7 +186,10 @@ fn first_n_sentences_terminates_through_closing_markup() {
     assert_eq!(first_n_sentences("_Emph._ Next.", 1), "_Emph._");
     assert_eq!(first_n_sentences("`code.` Next.", 1), "`code.`");
     assert_eq!(first_n_sentences("(Aside.) Next.", 1), "(Aside.)");
-    assert_eq!(first_n_sentences("He said \"go.\" Then left.", 1), "He said \"go.\"");
+    assert_eq!(
+        first_n_sentences("He said \"go.\" Then left.", 1),
+        "He said \"go.\""
+    );
     // Counting still works ACROSS emphasised sentences.
     assert_eq!(
         first_n_sentences("*One.* Two. Three.", 2),
@@ -177,8 +200,14 @@ fn first_n_sentences_terminates_through_closing_markup() {
     assert_eq!(first_n_sentences("*Only one.*", 1), "*Only one.*");
     // A closer must still be followed by whitespace/EOT — `*` mid-word doesn't
     // fabricate a boundary, and decimals are untouched.
-    assert_eq!(first_n_sentences("a.*b continues here", 1), "a.*b continues here");
-    assert_eq!(first_n_sentences("It is 3.5 now. Next.", 1), "It is 3.5 now.");
+    assert_eq!(
+        first_n_sentences("a.*b continues here", 1),
+        "a.*b continues here"
+    );
+    assert_eq!(
+        first_n_sentences("It is 3.5 now. Next.", 1),
+        "It is 3.5 now."
+    );
 }
 
 /// UXI-Blockquote-1: the classification seam behind italicising `>` text on the
@@ -259,20 +288,32 @@ fn heading_line_with_markers_prepends_markers() {
 #[test]
 fn user_turn_item_indices_picks_only_user_headers() {
     let items = vec![
-        FlatItem::TurnHeader { role: TurnRole::User }, // 0
-        FlatItem::Line(0),                              // 1
-        FlatItem::TurnHeader { role: TurnRole::Claude }, // 2
-        FlatItem::Line(1),                              // 3
-        FlatItem::TurnHeader { role: TurnRole::User }, // 4
-        FlatItem::Line(2),                              // 5
-        FlatItem::TurnHeader { role: TurnRole::User }, // 6
+        FlatItem::TurnHeader {
+            role: TurnRole::User,
+        }, // 0
+        FlatItem::Line(0), // 1
+        FlatItem::TurnHeader {
+            role: TurnRole::Claude,
+        }, // 2
+        FlatItem::Line(1), // 3
+        FlatItem::TurnHeader {
+            role: TurnRole::User,
+        }, // 4
+        FlatItem::Line(2), // 5
+        FlatItem::TurnHeader {
+            role: TurnRole::User,
+        }, // 6
     ];
     let idx = user_turn_item_indices(&items);
     assert_eq!(idx, vec![0, 4, 6], "only user TurnHeaders, in order");
     // The Nth-user-turn resolution `build_body` performs: ordinal → flat index.
     assert_eq!(idx.get(0).copied(), Some(0), "first user turn");
     assert_eq!(idx.get(2).copied(), Some(6), "last user turn");
-    assert_eq!(idx.get(3).copied(), None, "out-of-range ordinal yields no reveal");
+    assert_eq!(
+        idx.get(3).copied(),
+        None,
+        "out-of-range ordinal yields no reveal"
+    );
 
     // No user turns → empty (the handler's "no user turns yet" guard).
     assert!(user_turn_item_indices(&[FlatItem::Line(0)]).is_empty());
@@ -292,7 +333,11 @@ fn next_jump_ord_steps_and_clamps() {
     // to_last ignores delta → most recent.
     assert_eq!(next_jump_ord(0, 3, 0, true), 2, "to_last → last turn");
     // A stale ordinal (turns removed/replayed) clamps to the live range first.
-    assert_eq!(next_jump_ord(9, 3, -1, false), 1, "stale cur clamps to last, then steps");
+    assert_eq!(
+        next_jump_ord(9, 3, -1, false),
+        1,
+        "stale cur clamps to last, then steps"
+    );
     // Single turn: every step stays put.
     assert_eq!(next_jump_ord(0, 1, 1, false), 0);
     assert_eq!(next_jump_ord(0, 1, -1, false), 0);
@@ -314,13 +359,16 @@ fn build_nav_stops_per_frozen_prose_line() {
         .collect();
     let frozen = [(0usize, 4usize)]; // lines 0,1,2,3 frozen
     let flat = vec![
-        FlatItem::Line(0),                                  // frozen prose → stop
-        FlatItem::Line(1),                                  // frozen prose → stop (its own block)
-        FlatItem::Line(2),                                  // blank frozen padding → skip
-        FlatItem::ToolGroup { anchor_line: 2, ids: vec![] }, // crossed → skip
-        FlatItem::Line(3),                                  // frozen prose → stop
-        FlatItem::Line(4),                                  // editable → stop
-        FlatItem::Line(5),                                  // editable → stop
+        FlatItem::Line(0), // frozen prose → stop
+        FlatItem::Line(1), // frozen prose → stop (its own block)
+        FlatItem::Line(2), // blank frozen padding → skip
+        FlatItem::ToolGroup {
+            anchor_line: 2,
+            ids: vec![],
+        }, // crossed → skip
+        FlatItem::Line(3), // frozen prose → stop
+        FlatItem::Line(4), // editable → stop
+        FlatItem::Line(5), // editable → stop
     ];
     let stops = crate::build_nav_stops(&flat, &lines, &frozen);
     assert_eq!(
@@ -344,12 +392,19 @@ fn fold_header_line_is_single_short_line() {
     let heredoc = "python3 - <<'PY'\np='x.rs'\ns=open(p).read()\nPY";
     let h = fold_header_line(heredoc);
     assert!(!h.contains('\n'), "header has no newlines: {h:?}");
-    assert!(h.starts_with("python3 - <<'PY'"), "keeps the first line: {h:?}");
+    assert!(
+        h.starts_with("python3 - <<'PY'"),
+        "keeps the first line: {h:?}"
+    );
     assert!(h.ends_with('…'), "shows a truncation cue: {h:?}");
     // Very long single line: capped.
     let long = "git ".to_string() + &"a".repeat(300);
     let c = fold_header_line(&long);
-    assert!(c.chars().count() <= 124, "capped (~120 + ' …'): {} chars", c.chars().count());
+    assert!(
+        c.chars().count() <= 124,
+        "capped (~120 + ' …'): {} chars",
+        c.chars().count()
+    );
     assert!(c.ends_with('…'));
     // Empty title: empty, no panic.
     assert_eq!(fold_header_line(""), "");
@@ -367,8 +422,15 @@ fn tool_inline_detail_truncates_unicode_without_splitting_a_character() {
         "command": "cd /Users/scott/ws/yaldabaoth; grep -rn \"pending_images\\|🖼\\|pending_image\\|chip\" src/bin/yalda-gpui/screens.rs src/bin/yalda-gpui/agent.rs src/bin/yalda-gpui/transcript_view.rs | head -30"
     }));
     let detail = tool_inline_detail(&command).expect("command detail");
-    assert_eq!(detail.chars().count(), 61, "60 characters plus the ellipsis");
-    assert!(detail.contains('🖼'), "the boundary-crossing emoji remains intact: {detail:?}");
+    assert_eq!(
+        detail.chars().count(),
+        61,
+        "60 characters plus the ellipsis"
+    );
+    assert!(
+        detail.contains('🖼'),
+        "the boundary-crossing emoji remains intact: {detail:?}"
+    );
     assert!(detail.ends_with('…'));
 
     let mut search = ToolCall::new(ToolCallId::from("unicode-pattern"), "Grep".to_string());
@@ -392,11 +454,21 @@ fn tool_inline_detail_truncates_unicode_without_splitting_a_character() {
 #[test]
 fn clear_resets_worksheet_to_a_typeable_block() {
     let mut st = AgentState::new_server_managed(None);
-    assert!(st.editor.document().is_empty(), "fresh transcript after clear");
-    assert!(!st.input_surface.is_chatbox(), "default placement is worksheet");
+    assert!(
+        st.editor.document().is_empty(),
+        "fresh transcript after clear"
+    );
+    assert!(
+        !st.input_surface.is_chatbox(),
+        "default placement is worksheet"
+    );
     st.settle_input_focus();
     assert!(st.you_block_open, "clear opens a VISIBLE tail You-block");
-    assert_eq!(st.focus, AgentFocus::Compose, "focused so typing lands immediately");
+    assert_eq!(
+        st.focus,
+        AgentFocus::Compose,
+        "focused so typing lands immediately"
+    );
     assert_eq!(
         st.input_surface.compose().mode,
         EditMode::Insert,
@@ -433,15 +505,30 @@ fn snap_nav_stop_none_when_no_stop_in_direction() {
 #[test]
 fn jump_lands_at_page_end_only_on_j_at_newest() {
     // 3 turns (ordinals 0,1,2). At the last, a `j` that can't advance → page end.
-    assert!(jump_lands_at_page_end(2, 2, 3, 1, false), "j at newest → page end");
+    assert!(
+        jump_lands_at_page_end(2, 2, 3, 1, false),
+        "j at newest → page end"
+    );
     // Mid-list `j` advances to a header, not the page end.
-    assert!(!jump_lands_at_page_end(1, 2, 3, 1, false), "j mid-list → header");
+    assert!(
+        !jump_lands_at_page_end(1, 2, 3, 1, false),
+        "j mid-list → header"
+    );
     // `k` (older) never lands at the page end, even at the last turn.
-    assert!(!jump_lands_at_page_end(2, 2, 3, -1, false), "k never page-ends");
+    assert!(
+        !jump_lands_at_page_end(2, 2, 3, -1, false),
+        "k never page-ends"
+    );
     // toggle-on ("jump to last") parks on the last header, not the page end.
-    assert!(!jump_lands_at_page_end(2, 2, 3, 0, true), "to_last → header");
+    assert!(
+        !jump_lands_at_page_end(2, 2, 3, 0, true),
+        "to_last → header"
+    );
     // Single turn: a `j` there (already newest) goes to the page end.
-    assert!(jump_lands_at_page_end(0, 0, 1, 1, false), "lone turn: j → page end");
+    assert!(
+        jump_lands_at_page_end(0, 0, 1, 1, false),
+        "lone turn: j → page end"
+    );
 }
 
 /// 5c / ADR-0007: a theme switch re-renders Doc blocks via `re_render_one_doc`.
@@ -567,9 +654,18 @@ fn preferences_round_trip_with_text_scale() {
     assert_eq!(back.window_width_px, Some(1110.0));
     assert_eq!(back.window_height_px, Some(770.0));
     assert_eq!(back.jump_panel_visible, Some(false));
-    assert_eq!(back.jump_cwd_order.as_deref(), Some(&["/work/beta".into(), "/work/alpha".into()][..]));
-    assert_eq!(back.jump_session_order.as_deref(), Some(&["sid-2".into(), "sid-1".into()][..]));
-    assert_eq!(back.jump_archived_sessions.as_deref(), Some(&["sid-old".into()][..]));
+    assert_eq!(
+        back.jump_cwd_order.as_deref(),
+        Some(&["/work/beta".into(), "/work/alpha".into()][..])
+    );
+    assert_eq!(
+        back.jump_session_order.as_deref(),
+        Some(&["sid-2".into(), "sid-1".into()][..])
+    );
+    assert_eq!(
+        back.jump_archived_sessions.as_deref(),
+        Some(&["sid-old".into()][..])
+    );
     assert_eq!(back.desktop_grid_cols, Some(100));
     assert_eq!(back.desktop_grid_rows, Some(30));
     assert_eq!(back.desktop_grid_defaults_version, Some(2));
@@ -583,7 +679,10 @@ fn preferences_round_trip_with_text_scale() {
     );
     // UXI-JumpPanel-21: per-project tag order + folded-tag keys round-trip.
     assert_eq!(
-        back.jump_tag_order.as_ref().and_then(|m| m.get("Yaldabaoth")).map(|v| v.as_slice()),
+        back.jump_tag_order
+            .as_ref()
+            .and_then(|m| m.get("Yaldabaoth"))
+            .map(|v| v.as_slice()),
         Some(&["urgent".to_string(), "frontend".to_string()][..])
     );
     assert_eq!(
@@ -635,11 +734,7 @@ fn default_tile_span_migrations_reach_four_by_four_without_overriding_later_choi
         "the original persisted default still migrates"
     );
     assert_eq!(
-        restore_desktop_grid(
-            Some(2),
-            Some(2),
-            Some(DESKTOP_GRID_DEFAULTS_VERSION),
-        ),
+        restore_desktop_grid(Some(2), Some(2), Some(DESKTOP_GRID_DEFAULTS_VERSION),),
         (2, 2),
         "a post-migration explicit 2×2 choice stays intact"
     );
@@ -900,11 +995,14 @@ fn worksheet_rebuild_reuses_parsed_blocks_by_identity() {
 #[test]
 fn you_block_anchor_guard_restricts_to_latest_turn() {
     let mut st = AgentState::new_for_test();
-    st.editor.append_llm_chunk(TurnId::Llm(1), "old turn line\n");
+    st.editor
+        .append_llm_chunk(TurnId::Llm(1), "old turn line\n");
     st.editor
         .append_llm_chunk(TurnId::Llm(2), "new line a\nnew line b\n");
 
-    let (s, _e) = st.latest_agent_turn_range().expect("an agent turn is tagged");
+    let (s, _e) = st
+        .latest_agent_turn_range()
+        .expect("an agent turn is tagged");
     assert!(
         !st.you_block_anchor_is_legal(0),
         "a line in the OLDER turn is not a legal You-block anchor"
@@ -942,8 +1040,7 @@ fn streamed_shift_reuses_parses_by_content() {
     let mut lines2 = vec!["new streamed prose".to_string()];
     lines2.extend(lines.iter().cloned());
     let frozen2 = vec![(0usize, frozen_len + 1)];
-    let (flat2, _) =
-        rebuild_agent_view_model(&mut st, &lines2, &frozen2, &theme, 2);
+    let (flat2, _) = rebuild_agent_view_model(&mut st, &lines2, &frozen2, &theme, 2);
     assert_eq!(
         blocks1,
         block_ptrs(&flat2),
@@ -1124,7 +1221,8 @@ fn rebuild_seeds_atomic_blocks_and_blocks_interior_insert() {
     let theme = Theme::default();
     let mut st = AgentState::new_for_test();
     st.input_surface = InputSurface::new(InputModeKind::Worksheet);
-    st.editor.programmatic_insert(0, "intro\n```\ncode\n```\n\n");
+    st.editor
+        .programmatic_insert(0, "intro\n```\ncode\n```\n\n");
     for l in 0..4usize {
         st.editor.add_frozen_lines(l, l + 1);
         let a = st.editor.anchor_for_line(l);
@@ -1169,7 +1267,8 @@ fn rebuild_blank_gap_between_claude_turns_has_no_you_header() {
     let mut st = AgentState::new_for_test();
     st.input_surface = InputSurface::new(InputModeKind::Worksheet);
     st.mode = EditMode::Normal; // content-driven: a blank gap must not self-header
-    st.editor.programmatic_insert(0, "answer one\n\nanswer two\n");
+    st.editor
+        .programmatic_insert(0, "answer one\n\nanswer two\n");
     for (l, turn) in [(0usize, TurnId::Llm(1)), (2usize, TurnId::Llm(2))] {
         st.editor.add_frozen_lines(l, l + 1);
         let a = st.editor.anchor_for_line(l);
@@ -1188,9 +1287,12 @@ fn rebuild_blank_gap_between_claude_turns_has_no_you_header() {
     let frozen_len: usize = frozen.iter().map(|(s, e)| e - s).sum();
     let (flat, _) = rebuild_agent_view_model(&mut st, &lines, &frozen, &theme, 1);
     assert!(
-        !flat
-            .iter()
-            .any(|f| matches!(f, FlatItem::TurnHeader { role: TurnRole::User })),
+        !flat.iter().any(|f| matches!(
+            f,
+            FlatItem::TurnHeader {
+                role: TurnRole::User
+            }
+        )),
         "a blank gap between two Claude turns must not emit a phantom You header"
     );
 }
@@ -1202,7 +1304,8 @@ fn rebuild_text_gap_between_claude_turns_gets_you_header() {
     let theme = Theme::default();
     let mut st = AgentState::new_for_test();
     st.input_surface = InputSurface::new(InputModeKind::Worksheet);
-    st.editor.programmatic_insert(0, "answer one\nmy note\nanswer two\n");
+    st.editor
+        .programmatic_insert(0, "answer one\nmy note\nanswer two\n");
     for (l, turn) in [(0usize, TurnId::Llm(1)), (2usize, TurnId::Llm(2))] {
         st.editor.add_frozen_lines(l, l + 1);
         let a = st.editor.anchor_for_line(l);
@@ -1221,8 +1324,12 @@ fn rebuild_text_gap_between_claude_turns_gets_you_header() {
     let frozen_len: usize = frozen.iter().map(|(s, e)| e - s).sum();
     let (flat, _) = rebuild_agent_view_model(&mut st, &lines, &frozen, &theme, 1);
     assert!(
-        flat.iter()
-            .any(|f| matches!(f, FlatItem::TurnHeader { role: TurnRole::User })),
+        flat.iter().any(|f| matches!(
+            f,
+            FlatItem::TurnHeader {
+                role: TurnRole::User
+            }
+        )),
         "a real text interjection between Claude turns must get a You header"
     );
 }
@@ -1244,8 +1351,14 @@ fn flat_of(st: &mut AgentState) -> std::rc::Rc<Vec<FlatItem>> {
 }
 
 fn has_user_header(flat: &[FlatItem]) -> bool {
-    flat.iter()
-        .any(|f| matches!(f, FlatItem::TurnHeader { role: TurnRole::User }))
+    flat.iter().any(|f| {
+        matches!(
+            f,
+            FlatItem::TurnHeader {
+                role: TurnRole::User
+            }
+        )
+    })
 }
 
 /// REGRESSION (live screenshot: the transcript showed a stack of EMPTY
@@ -1293,7 +1406,10 @@ fn rebuild_drops_empty_turn_headers() {
         .iter()
         .filter(|it| matches!(it, FlatItem::TurnHeader { .. }))
         .count();
-    assert_eq!(headers, 3, "expected 3 headers, got {headers}\nflat: {flat:?}");
+    assert_eq!(
+        headers, 3,
+        "expected 3 headers, got {headers}\nflat: {flat:?}"
+    );
 }
 
 /// Content-driven half (NORMAL mode): with the caret parked in Normal mode, the
@@ -1388,8 +1504,7 @@ fn rebuild_strips_trailing_blank_editable_tail() {
     let flat = flat_of(&mut st);
     let blank_tail = (0..st.editor.document().line_count())
         .rfind(|&l| {
-            !st.editor.is_frozen_line(l)
-                && st.editor.document().line_text(l).trim().is_empty()
+            !st.editor.is_frozen_line(l) && st.editor.document().line_text(l).trim().is_empty()
         })
         .expect("there is a trailing blank editable line in the doc");
     assert!(
@@ -1487,7 +1602,10 @@ fn floored_first_chunk_never_merges_into_draft() {
         .iter()
         .position(|l| l.contains("Let me look."))
         .expect("the chunk must be present");
-    assert!(chunk_line < draft_line, "agent content stays above the draft");
+    assert!(
+        chunk_line < draft_line,
+        "agent content stays above the draft"
+    );
     assert!(
         !lines[chunk_line].contains("my draft"),
         "the chunk must not be fused onto the draft line: {lines:?}"
@@ -1601,7 +1719,8 @@ fn floored_tools_and_text_stay_in_order_above_draft() {
 fn worksheet_turn_end_moves_caret_to_tail() {
     let mut st = AgentState::new_for_test();
     st.input_surface = InputSurface::new(InputModeKind::Worksheet);
-    st.editor.append_llm_chunk(TurnId::Llm(1), "a long\nmulti-line\nreply");
+    st.editor
+        .append_llm_chunk(TurnId::Llm(1), "a long\nmulti-line\nreply");
     // Caret parked up in the transcript (as if the user scrolled to read).
     st.editor.cursor_mut().line = 0;
     st.editor.cursor_mut().col = 0;
@@ -1624,7 +1743,8 @@ fn worksheet_turn_end_moves_caret_to_tail() {
 #[test]
 fn chatbox_turn_end_leaves_caret_put() {
     let mut st = AgentState::new_for_test(); // defaults to Chatbox
-    st.editor.append_llm_chunk(TurnId::Llm(1), "a long\nmulti-line\nreply");
+    st.editor
+        .append_llm_chunk(TurnId::Llm(1), "a long\nmulti-line\nreply");
     st.editor.cursor_mut().line = 0;
     st.editor.cursor_mut().col = 0;
     assert!(st.finalize_agent_turn_idem(0, 1), "first finalize runs");
@@ -1661,13 +1781,20 @@ fn wrap_line_cols_word_wraps_and_covers_every_char() {
     assert_eq!(w("ab", 1), vec!["a", "b"]);
 
     // Coverage: every wrapped row is contiguous and the rows tile the line.
-    for (s, width) in [("the quick brown fox jumped", 7), ("loooooong", 3), ("a b c", 1)] {
+    for (s, width) in [
+        ("the quick brown fox jumped", 7),
+        ("loooooong", 3),
+        ("a b c", 1),
+    ] {
         let chars: Vec<char> = s.chars().collect();
         let rows = wrap_line_cols(&chars, width);
         assert_eq!(rows.first().unwrap().0, 0, "first row starts at 0");
         assert_eq!(rows.last().unwrap().1, chars.len(), "last row ends at EOL");
         for pair in rows.windows(2) {
-            assert_eq!(pair[0].1, pair[1].0, "rows are contiguous (no dropped char)");
+            assert_eq!(
+                pair[0].1, pair[1].0,
+                "rows are contiguous (no dropped char)"
+            );
         }
         for &(a, b) in &rows {
             assert!(b > a || chars.is_empty(), "each row makes progress");
@@ -1685,7 +1812,11 @@ fn caret_visual_row_places_caret_on_a_rendered_row() {
     let rows = wrap_line_cols(&chars, 9); // [(0,4),(4,10),(10,15)]
     assert_eq!(caret_visual_row(&rows, 0), 0, "col 0 → first row");
     assert_eq!(caret_visual_row(&rows, 3), 0, "mid first row");
-    assert_eq!(caret_visual_row(&rows, 4), 1, "row-boundary col → next row's start");
+    assert_eq!(
+        caret_visual_row(&rows, 4),
+        1,
+        "row-boundary col → next row's start"
+    );
     assert_eq!(caret_visual_row(&rows, 10), 2, "next boundary → third row");
     assert_eq!(caret_visual_row(&rows, 15), 2, "end-of-line → last row");
 
@@ -1715,7 +1846,10 @@ fn compose_wrapped_caret_never_below_the_fold() {
 
     let (_, total, per_line) = compose_visual_metrics(&lines, 0, 0, width);
     // The draft must actually exceed the box (so this exercises the scrolling path).
-    assert!(total > visible, "test draft must wrap beyond the visible window");
+    assert!(
+        total > visible,
+        "test draft must wrap beyond the visible window"
+    );
 
     let mut prev_top = 0usize;
     for (li, line) in lines.iter().enumerate() {
@@ -1781,7 +1915,11 @@ fn chatbox_caret_cell_stays_in_window_for_every_edit_path() {
 
     // Type a single VERY long line — the caret rides off the right edge unless
     // the horizontal window scrolls (the reported "text goes off screen").
-    for ch in "the quick brown fox jumps over the lazy dog ".chars().cycle().take(400) {
+    for ch in "the quick brown fox jumps over the lazy dog "
+        .chars()
+        .cycle()
+        .take(400)
+    {
         cb.editor.insert_char(ch);
     }
     assert_contained(&cb, "long-line-EOL");
@@ -1894,12 +2032,19 @@ fn wp_code_bg_contrasts_with_folio_syntax_tokens() {
 
     let folio = Theme::folio();
     let bg = wp_code_block_bg_rgb(&folio);
-    assert_ne!(bg, 0x21222c, "WP code bg must not be the hardcoded dark swatch");
+    assert_ne!(
+        bg, 0x21222c,
+        "WP code bg must not be the hardcoded dark swatch"
+    );
 
     // Darkest token the real Folio highlighter emits on a representative line.
     let hl = Highlighter::with_syntect_theme(folio.name.syntect_theme());
     let darkest = hl
-        .highlight_line_stateless("rust", "pub fn add(x: usize) -> u8 { 42 }", Style::default())
+        .highlight_line_stateless(
+            "rust",
+            "pub fn add(x: usize) -> u8 { 42 }",
+            Style::default(),
+        )
         .expect("rust highlighting")
         .into_iter()
         .filter(|(t, _)| !t.trim().is_empty())
@@ -1985,7 +2130,10 @@ fn reveal_index_mirrors_flat_items_and_is_o1() {
             checked += 1;
         }
     }
-    assert!(checked > 0, "transcript must contain Line items to validate");
+    assert!(
+        checked > 0,
+        "transcript must contain Line items to validate"
+    );
 
     // (a') The desync vector: Block items dropped their source range, so the
     // map must re-pair them with `resolved`. Verify every doc line resolves
@@ -1995,7 +2143,10 @@ fn reveal_index_mirrors_flat_items_and_is_o1() {
     let mut lines_on_a_block = 0usize;
     for line in 0..lines.len() {
         let idx = st.view_model.item_for_line(line);
-        assert!(idx < flat.len(), "line {line} resolved out of range ({idx})");
+        assert!(
+            idx < flat.len(),
+            "line {line} resolved out of range ({idx})"
+        );
         if matches!(flat[idx], FlatItem::Block(_)) {
             lines_on_a_block += 1;
         }
@@ -2046,9 +2197,9 @@ fn view_model_memoization_fast_skip() {
 
     // Cold cache: miss → rebuild at the call site, then `store`.
     assert!(st.view_model.cached(fp1).is_none(), "cold cache must miss");
-    let (flat1, gut1) = st
-        .view_model
-        .store(fp1, vec![FlatItem::Line(0)], vec![None], vec![0], vec![0]);
+    let (flat1, gut1) =
+        st.view_model
+            .store(fp1, vec![FlatItem::Line(0)], vec![None], vec![0], vec![0]);
     assert_eq!(
         VIEW_MODEL_REBUILDS.with(|n| n.get()),
         1,
@@ -2091,9 +2242,13 @@ fn view_model_memoization_fast_skip() {
         st.view_model.cached(fp2).is_none(),
         "changed fingerprint must miss"
     );
-    let (flat3, _gut3) = st
-        .view_model
-        .store(fp2, vec![FlatItem::ThinkingIndicator], vec![None], vec![0], vec![]);
+    let (flat3, _gut3) = st.view_model.store(
+        fp2,
+        vec![FlatItem::ThinkingIndicator],
+        vec![None],
+        vec![0],
+        vec![],
+    );
     assert_eq!(
         VIEW_MODEL_REBUILDS.with(|n| n.get()),
         2,
@@ -2237,15 +2392,24 @@ fn reconcile_list_keeps_count_in_sync_and_reports_growth() {
     assert_eq!(sc.list_item_count, 0);
 
     // Growth: count rises, reports grew=true, splices.
-    assert!(sc.reconcile_list(false, &lines(5), 0), "0 -> 5 must report growth");
+    assert!(
+        sc.reconcile_list(false, &lines(5), 0),
+        "0 -> 5 must report growth"
+    );
     assert_eq!(sc.list_item_count, 5, "count tracks the requested length");
 
     // No change: same count, reports grew=false, count unchanged.
-    assert!(!sc.reconcile_list(false, &lines(5), 0), "5 -> 5 is not growth");
+    assert!(
+        !sc.reconcile_list(false, &lines(5), 0),
+        "5 -> 5 is not growth"
+    );
     assert_eq!(sc.list_item_count, 5);
 
     // Shrink: count falls, reports grew=false, resets.
-    assert!(!sc.reconcile_list(false, &lines(2), 0), "5 -> 2 is not growth");
+    assert!(
+        !sc.reconcile_list(false, &lines(2), 0),
+        "5 -> 2 is not growth"
+    );
     assert_eq!(sc.list_item_count, 2, "count tracks a shrink too");
 
     // With block ranges active, growth now SPLICES (preserving the prefix's
@@ -2279,10 +2443,16 @@ fn worksheet_reconcile_splices_structural_edits_keeping_parity() {
         sc.reconcile_list(true, &after_insert, 2),
         "structural growth reports grew=true",
     );
-    assert_eq!(sc.list_item_count, 41, "count parity after a mid-list insert");
+    assert_eq!(
+        sc.list_item_count, 41,
+        "count parity after a mid-list insert"
+    );
 
     // Delete it again → shrink, parity holds.
-    assert!(!sc.reconcile_list(true, &lines(40), 3), "shrink is not growth");
+    assert!(
+        !sc.reconcile_list(true, &lines(40), 3),
+        "shrink is not growth"
+    );
     assert_eq!(sc.list_item_count, 40);
 }
 
@@ -2458,12 +2628,14 @@ fn classify_subagent_detects_the_harness_task_shape() {
     );
 
     // Plain tools are not subagents.
-    assert!(classify_subagent(&mk(
-        "Read",
-        ToolKind::Read,
-        Some(serde_json::json!({"path": "x"}))
-    ))
-    .is_none());
+    assert!(
+        classify_subagent(&mk(
+            "Read",
+            ToolKind::Read,
+            Some(serde_json::json!({"path": "x"}))
+        ))
+        .is_none()
+    );
 
     // Name fallback still works for adapters that only title it.
     assert!(classify_subagent(&mk("Task: foo", ToolKind::Other, None)).is_some());
@@ -2510,10 +2682,7 @@ fn codex_subagent_activity_is_classified_by_child_thread() {
     .cloned();
 
     let subagent = classify_subagent(&tc).expect("Codex activity is a subagent");
-    assert_eq!(
-        subagent.key,
-        SubAgentKey::CodexThread("019c-child".into())
-    );
+    assert_eq!(subagent.key, SubAgentKey::CodexThread("019c-child".into()));
     assert_eq!(subagent.label, "review_maintainability");
     assert_eq!(subagent.status, ToolCallStatus::InProgress);
 }
@@ -2522,7 +2691,11 @@ fn codex_subagent_activity_is_classified_by_child_thread() {
 fn codex_subagent_lifecycle_folds_to_one_row() {
     use yalda::acp_channel::{ToolCall, ToolCallId, ToolCallStatus};
     let mut state = AgentState::new_for_test();
-    for (id, activity) in [("start", "started"), ("interact", "interacted"), ("stop", "interrupted")] {
+    for (id, activity) in [
+        ("start", "started"),
+        ("interact", "interacted"),
+        ("stop", "interrupted"),
+    ] {
         let tool_id: ToolCallId = id.into();
         let mut tc = ToolCall::new(tool_id.clone(), format!("{activity} subagent review"));
         tc.raw_input = Some(serde_json::json!({
@@ -2564,9 +2737,11 @@ fn codex_child_replay_reducer_preserves_roles_and_tools() {
         &transcript.items[1],
         SubAgentTranscriptItem::Agent(text) if text == "first answer"
     ));
-    assert!(transcript
-        .tools
-        .contains_key(&ToolCallKey::from_id(&tool_id)));
+    assert!(
+        transcript
+            .tools
+            .contains_key(&ToolCallKey::from_id(&tool_id))
+    );
 }
 
 #[test]
@@ -2823,11 +2998,9 @@ fn apply_selection_bg_full_segment_gets_bg() {
 fn transcript_whole_line_selection_unifies_bullet_and_prose_color() {
     let theme = Theme::default();
     let line = "- selected prose".to_string();
-    let mut segs = yalda::md_highlight::highlight_markdown_lines_stripped(
-        std::slice::from_ref(&line),
-        &theme,
-    )
-    .remove(0);
+    let mut segs =
+        yalda::md_highlight::highlight_markdown_lines_stripped(std::slice::from_ref(&line), &theme)
+            .remove(0);
     for (_, style) in &mut segs {
         if *style == theme.paragraph {
             *style = style.fg(theme.agent.agent_tint);
@@ -2869,7 +3042,11 @@ fn stripped_bullet_marker_maps_back_to_raw_marker() {
     let map = stripped_to_raw_cols("- selected", "• selected");
     assert_eq!(map[0], 0, "rendered bullet maps to the raw dash");
     assert_eq!(map[1], 1, "space after the bullet keeps its raw column");
-    assert_eq!(raw_to_stripped_col(&map, 2), 2, "prose begins at rendered col 2");
+    assert_eq!(
+        raw_to_stripped_col(&map, 2),
+        2,
+        "prose begins at rendered col 2"
+    );
     assert_eq!(
         map.last().copied(),
         Some("- selected".chars().count()),
@@ -2924,7 +3101,11 @@ fn transcript_selection_style_changes_only_requested_span() {
     let selected = apply_selection_style(&segs, 1, 2, NColor::Blue, NColor::LightBlue);
 
     assert_eq!(seg_text(&selected), "abc");
-    assert_eq!(selected.len(), 3, "selection boundaries split the source run");
+    assert_eq!(
+        selected.len(),
+        3,
+        "selection boundaries split the source run"
+    );
     assert_eq!(selected[0], ("a".to_string(), segs[0].1));
     assert_eq!(selected[1].0, "b");
     assert_eq!(selected[1].1.bg, Some(NColor::Blue));
@@ -3074,7 +3255,6 @@ fn classify_wp_line_paragraph_fallback() {
     );
 }
 
-
 // ---- Menu rendering helpers ----
 
 #[test]
@@ -3158,8 +3338,9 @@ fn gpui_menu_has_required_entries() {
         "workspace-back-and-forth",
         "send-tile-follow",
         "also-show-tile",
-        "scratchpad-stash",
-        "scratchpad-summon",
+        "tile-detach",
+        "tile-hide",
+        "tile-unhide",
         "master-grow",
         "master-shrink",
         "master-count-increase",
@@ -3243,7 +3424,10 @@ fn agent_menu_root_and_view_are_the_approved_items() {
             ("v".into(), "view"),
         ]
     );
-    let view = menu.iter().find(|node| node.label == "view").expect("view submenu");
+    let view = menu
+        .iter()
+        .find(|node| node.label == "view")
+        .expect("view submenu");
     let MenuAction::Submenu(children) = &view.action else {
         panic!("view must be a submenu");
     };
@@ -3251,7 +3435,10 @@ fn agent_menu_root_and_view_are_the_approved_items() {
         .iter()
         .map(|node| (format_menu_key(&node.key), node.label.as_str()))
         .collect();
-    assert_eq!(children, vec![("a".into(), "agents"), ("t".into(), "tasks")]);
+    assert_eq!(
+        children,
+        vec![("a".into(), "agents"), ("t".into(), "tasks")]
+    );
 
     for (key, expected) in [
         ('w', "agent-input-toggle"),
@@ -3328,7 +3515,11 @@ fn menu_trail_crumbs_tracks_descent() {
     let mut state = MenuState::new();
     state.open();
     let (crumbs, label) = menu_trail_crumbs(&menu, &state.path, "␣", "DOC");
-    assert_eq!(crumbs, vec!["␣".to_string()], "root shows only the leader glyph");
+    assert_eq!(
+        crumbs,
+        vec!["␣".to_string()],
+        "root shows only the leader glyph"
+    );
     assert_eq!(label, "DOC", "root level label is the scope");
 
     // Descend into the `n` → "navigate" submenu: crumb `n` is appended and the
@@ -3341,10 +3532,16 @@ fn menu_trail_crumbs_tracks_descent() {
         vec!["␣".to_string(), "n".to_string()],
         "descended key is appended to the trail"
     );
-    assert_eq!(label, "navigate", "level label is the submenu label after descent");
+    assert_eq!(
+        label, "navigate",
+        "level label is the submenu label after descent"
+    );
     // Negative control: a `current_label`-only breadcrumb would drop the `n`
     // crumb — asserting the descended key survives is what the trail adds.
-    assert!(crumbs.contains(&"n".to_string()), "trail must carry the descended key");
+    assert!(
+        crumbs.contains(&"n".to_string()),
+        "trail must carry the descended key"
+    );
 }
 
 #[test]
@@ -3431,7 +3628,10 @@ fn agent_local_m_opens_model_submenu() {
     let menu = agent_local_menu();
     let cmd = state.process_key(KeyPress::new(Key::Char('m'), KMods::NONE), &menu);
     assert_eq!(cmd, None);
-    assert!(state.is_active(), "model submenu remains open on its placeholder");
+    assert!(
+        state.is_active(),
+        "model submenu remains open on its placeholder"
+    );
 }
 
 #[test]
@@ -3471,10 +3671,7 @@ fn agent_local_shift_c_is_absent_clear_is_lowercase() {
     let mut state = MenuState::new();
     state.open();
     let menu = agent_local_menu();
-    let cmd = state.process_key(
-        KeyPress::new(Key::Char('C'), KMods::NONE),
-        &menu,
-    );
+    let cmd = state.process_key(KeyPress::new(Key::Char('C'), KMods::NONE), &menu);
     assert_eq!(cmd, None);
     assert!(state.is_active());
 }
@@ -3725,7 +3922,14 @@ fn whitespace_only_line_fully_selected_gets_highlight_placeholder() {
 fn blank_line_at_selection_end_is_not_highlighted() {
     // Selection ends at the start of the blank line (col 0) — its newline is
     // NOT selected, so it stays un-highlighted (matches vim).
-    let out = apply_line_selection(&[], "", ((0, 0), (1, 0)), 1, NStyle::default(), NColor::Rgb(1, 2, 3));
+    let out = apply_line_selection(
+        &[],
+        "",
+        ((0, 0), (1, 0)),
+        1,
+        NStyle::default(),
+        NColor::Rgb(1, 2, 3),
+    );
     assert!(out.is_empty(), "unchanged empty input → no placeholder");
 }
 
@@ -3733,7 +3937,14 @@ fn blank_line_at_selection_end_is_not_highlighted() {
 fn line_outside_selection_is_unchanged() {
     let style = NStyle::default();
     let segs = vec![("text".to_string(), style)];
-    let out = apply_line_selection(&segs, "text", ((0, 0), (0, 4)), 3, style, NColor::Rgb(1, 2, 3));
+    let out = apply_line_selection(
+        &segs,
+        "text",
+        ((0, 0), (0, 4)),
+        3,
+        style,
+        NColor::Rgb(1, 2, 3),
+    );
     assert_eq!(out, segs, "line 3 is outside a line-0 selection");
 }
 
@@ -3850,7 +4061,10 @@ fn inline_you_block_active_truth_table() {
         st.you_block_open = true;
         st // open + idle + worksheet (focus defaults to Transcript)
     };
-    assert!(base().inline_you_block_active(), "open + idle + worksheet ⇒ active");
+    assert!(
+        base().inline_you_block_active(),
+        "open + idle + worksheet ⇒ active"
+    );
 
     // Each conjunct flipped in isolation must turn it OFF.
     let mut closed = base();
@@ -3863,11 +4077,17 @@ fn inline_you_block_active_truth_table() {
 
     let mut awaiting = base();
     awaiting.turn_phase = TurnPhase::begin(std::time::Instant::now());
-    assert!(!awaiting.inline_you_block_active(), "mid-turn (awaiting) ⇒ inactive");
+    assert!(
+        !awaiting.inline_you_block_active(),
+        "mid-turn (awaiting) ⇒ inactive"
+    );
 
     let mut chatbox = base();
     chatbox.input_surface = InputSurface::new(InputModeKind::Chatbox);
-    assert!(!chatbox.inline_you_block_active(), "chatbox placement ⇒ inactive");
+    assert!(
+        !chatbox.inline_you_block_active(),
+        "chatbox placement ⇒ inactive"
+    );
 
     // UXI-AgentTile-12: the `|| focus==Compose` clause. "The hole" — focus on the compose
     // in an idle worksheet with the block CLOSED — must be ACTIVE (else keystrokes
@@ -4146,7 +4366,8 @@ fn inv_order_interleaved_turns_stay_chronological() {
     };
     let stream = |st: &mut AgentState, k: usize, body: &str| {
         let floor = agent_tail_floor_char(&st.editor);
-        st.editor.append_llm_chunk_floored(TurnId::Llm(k), body, floor);
+        st.editor
+            .append_llm_chunk_floored(TurnId::Llm(k), body, floor);
     };
 
     submit(&mut st, "q1");
@@ -4170,7 +4391,10 @@ fn inv_order_interleaved_turns_stay_chronological() {
     let mut last = 0usize;
     for tok in ["q1", "a1", "q2", "a2", "q3", "a3"] {
         let at = text.find(tok).unwrap_or_else(|| panic!("missing {tok}"));
-        assert!(at >= last, "out-of-order: {tok} at {at} precedes {last}\n{text}");
+        assert!(
+            at >= last,
+            "out-of-order: {tok} at {at} precedes {last}\n{text}"
+        );
         last = at;
     }
     assert_eq!(
@@ -4195,26 +4419,24 @@ fn agent_tile_persists_session_identity_not_index() {
     // Two Bound tiles (ADR-0026 enum); each carries a local SessionId. The durable
     // server id is resolved from the store via the SidResolver (single source of
     // truth — no cached resume_sid).
-    let t1 = AgentTile::Bound { session: SessionId(1), reopening: None };
-    let t2 = AgentTile::Bound { session: SessionId(2), reopening: None };
+    let t1 = AgentTile::Bound {
+        session: SessionId(1),
+        reopening: None,
+    };
+    let t2 = AgentTile::Bound {
+        session: SessionId(2),
+        reopening: None,
+    };
     let layout: workspace::Layout<App> = workspace::Layout::Split {
         dir: workspace::SplitDir::V,
         children: vec![
             (
                 1.0,
-                workspace::Layout::Leaf(workspace::Window::new(
-                    10,
-                    ProjectId(0),
-                    App::Agent(t1),
-                )),
+                workspace::Layout::Leaf(workspace::Window::new(10, ProjectId(0), App::Agent(t1))),
             ),
             (
                 1.0,
-                workspace::Layout::Leaf(workspace::Window::new(
-                    20,
-                    ProjectId(0),
-                    App::Agent(t2),
-                )),
+                workspace::Layout::Leaf(workspace::Window::new(20, ProjectId(0), App::Agent(t2))),
             ),
         ],
     };
@@ -4246,7 +4468,7 @@ fn agent_tile_persists_session_identity_not_index() {
 }
 
 #[test]
-fn bound_and_unbound_tiles_snapshot_with_identity_tags_direct_focus_and_next_id() {
+fn attached_hidden_and_detached_tiles_snapshot_with_identity_tags_and_solo_focus() {
     let mut projects = Projects::new();
     let cwd = std::env::temp_dir();
     let project = projects.ensure_at_cwd(cwd.clone(), "tmp");
@@ -4257,12 +4479,24 @@ fn bound_and_unbound_tiles_snapshot_with_identity_tags_direct_focus_and_next_id(
         }),
         project,
     );
+    frame.tile_mut(1).unwrap().tags.insert("bound-tag".into());
+    let hidden = frame
+        .split_focused(
+            workspace::SplitDir::V,
+            App::Agent(AgentTile::Bound {
+                session: SessionId(3),
+                reopening: None,
+            }),
+        )
+        .unwrap();
+    frame.workspaces[0].desktop.reconcile(&[1, hidden]);
     frame
-        .tile_mut(1)
+        .tile_mut(hidden)
         .unwrap()
         .tags
-        .insert("bound-tag".into());
-    let unbound = frame.push_unbound(
+        .insert("hidden-tag".into());
+    assert!(frame.hide_window(hidden).is_ok());
+    let unbound = frame.push_detached(
         App::Agent(AgentTile::Bound {
             session: SessionId(2),
             reopening: None,
@@ -4274,25 +4508,36 @@ fn bound_and_unbound_tiles_snapshot_with_identity_tags_direct_focus_and_next_id(
         .unwrap()
         .tags
         .extend(["alpha".to_string(), "beta".to_string()]);
-    frame.scratchpad = vec![unbound];
-    assert!(frame.focus_unbound(unbound));
+    assert!(frame.present_solo(unbound));
 
     let resolve = |id: SessionId| match id {
         SessionId(1) => Some(ServerSid::new("SID-A")),
+        SessionId(3) => Some(ServerSid::new("SID-HIDDEN")),
         SessionId(2) => Some(ServerSid::new("SID-B")),
         _ => None,
     };
     let snap = snapshot_workspace(&frame, &projects, &resolve);
     assert!(snap.tile_tags_migrated);
     assert_eq!(snap.direct_unbound, Some(unbound));
-    assert_eq!(snap.scratchpad, vec![unbound]);
-    assert_eq!(snap.unbound_tiles.len(), 1);
-    assert_eq!(snap.unbound_tiles[0].tile.id, unbound);
     assert_eq!(
-        snap.unbound_tiles[0].tile.tags,
+        snap.solo_presentation,
+        Some(PersistedSoloPresentation::Detached(unbound))
+    );
+    assert!(snap.scratchpad.is_empty());
+    assert_eq!(snap.workspaces[0].hidden_tiles.len(), 1);
+    assert_eq!(snap.workspaces[0].hidden_tiles[0].tile.id, hidden);
+    assert!(
+        snap.workspaces[0].hidden_tiles[0]
+            .previous_placement
+            .is_some()
+    );
+    assert_eq!(snap.detached_tiles.len(), 1);
+    assert_eq!(snap.detached_tiles[0].tile.id, unbound);
+    assert_eq!(
+        snap.detached_tiles[0].tile.tags,
         workspace::TagSet::from(["alpha".to_string(), "beta".to_string()])
     );
-    match &snap.unbound_tiles[0].tile.kind {
+    match &snap.detached_tiles[0].tile.kind {
         PersistedKind::Agent { session_id } => {
             assert_eq!(session_id.as_ref().map(ServerSid::as_str), Some("SID-B"));
         }
@@ -4308,13 +4553,13 @@ fn bound_and_unbound_tiles_snapshot_with_identity_tags_direct_focus_and_next_id(
     let json = serde_json::to_string(&snap).expect("serialize frame");
     let mut back: PersistedFrame = serde_json::from_str(&json).expect("deserialize frame");
     let mut restored = workspace::Frame::new(project);
-    let (layout, max_bound, bound_agents) =
-        restore_layout(
-            &mut restored,
-            &Theme::default(),
-            back.workspaces.remove(0).layout,
-            project,
-        );
+    let persisted_workspace = back.workspaces.remove(0);
+    let (layout, max_bound, bound_agents) = restore_layout(
+        &mut restored,
+        &Theme::default(),
+        persisted_workspace.layout,
+        project,
+    );
     restored.workspaces.push(workspace::Workspace::with_layout(
         "workspace-1".into(),
         layout,
@@ -4322,19 +4567,33 @@ fn bound_and_unbound_tiles_snapshot_with_identity_tags_direct_focus_and_next_id(
         project,
     ));
     restored.next_window_id = max_bound + 1;
-    let persisted_unbound = back.unbound_tiles.remove(0);
-    let (window, unbound_agent) =
-        restore_leaf(
-            &mut restored,
-            &Theme::default(),
-            persisted_unbound.tile,
-            project,
-        );
+    let persisted_hidden = persisted_workspace.hidden_tiles.into_iter().next().unwrap();
+    let hidden_placement = persisted_hidden.previous_placement.map(|placement| {
+        (
+            workspace::Slot::new(placement.row, placement.col),
+            workspace::Span::new(placement.rows, placement.cols),
+        )
+    });
+    let (hidden_window, hidden_agent) = restore_leaf(
+        &mut restored,
+        &Theme::default(),
+        persisted_hidden.tile,
+        project,
+    );
+    restored
+        .insert_restored_hidden(0, hidden_window, hidden_placement)
+        .unwrap();
+    let persisted_unbound = back.detached_tiles.remove(0);
+    let (window, unbound_agent) = restore_leaf(
+        &mut restored,
+        &Theme::default(),
+        persisted_unbound.tile,
+        project,
+    );
     restored.next_window_id = restored.next_window_id.max(window.id() + 1);
-    restored.insert_restored_unbound(window).unwrap();
-    restored.scratchpad = back.scratchpad;
-    restored.prune_scratchpad();
-    restored.focus_unbound(back.direct_unbound.unwrap());
+    restored.insert_restored_detached(window).unwrap();
+    assert!(back.scratchpad.is_empty());
+    restored.present_solo(back.direct_unbound.unwrap());
 
     assert_eq!(
         bound_agents,
@@ -4346,14 +4605,51 @@ fn bound_and_unbound_tiles_snapshot_with_identity_tags_direct_focus_and_next_id(
         Some(Some(ServerSid::new("SID-B"))),
         "unbound Agent identity survives"
     );
-    assert_eq!(restored.directly_focused_unbound(), Some(unbound));
-    assert_eq!(restored.scratchpad, vec![unbound]);
+    assert_eq!(
+        hidden_agent,
+        Some(Some(ServerSid::new("SID-HIDDEN"))),
+        "hidden Agent identity survives"
+    );
+    assert_eq!(
+        restored.tile_membership(hidden),
+        Some(workspace::TileMembership::Attached {
+            workspace: 0,
+            visibility: workspace::AttachedVisibility::Hidden,
+        })
+    );
+    assert_eq!(restored.presented_detached_tile_id(), Some(unbound));
     assert!(restored.tile(1).unwrap().tags.contains("bound-tag"));
     assert!(restored.tile(unbound).unwrap().tags.contains("beta"));
     assert!(
         restored.alloc_window_id() > unbound,
         "allocator advances beyond both ownership domains"
     );
+}
+#[test]
+fn all_hidden_workspace_persists_as_empty_without_inventing_a_tile() {
+    let mut projects = Projects::new();
+    let project = projects.ensure_at_cwd(std::env::temp_dir(), "tmp");
+    let mut frame = workspace::Frame::with_initial(
+        App::Buffer(BufferApp::Picking(BrowserWindow::standalone(
+            std::env::temp_dir(),
+        ))),
+        project,
+    );
+    assert!(frame.hide_window(1).is_ok());
+
+    let snapshot = snapshot_workspace(&frame, &projects, &|_| None);
+    assert!(matches!(
+        snapshot.workspaces[0].layout,
+        PersistedLayout::Empty
+    ));
+    assert_eq!(snapshot.workspaces[0].hidden_tiles.len(), 1);
+    let json = serde_json::to_string(&snapshot).unwrap();
+    let restored: PersistedFrame = serde_json::from_str(&json).unwrap();
+    assert!(matches!(
+        restored.workspaces[0].layout,
+        PersistedLayout::Empty
+    ));
+    assert_eq!(restored.workspaces[0].hidden_tiles[0].tile.id, 1);
 }
 
 #[test]
@@ -4370,26 +4666,22 @@ fn persisted_duplicate_agent_identity_keeps_session_cwd_project() {
         correct_project,
     );
     let sid = ServerSid::new("SID-CROSS-PROJECT");
-    let wrong = frame.push_unbound(App::Agent(AgentTile::dormant(sid.clone())), wrong_project);
-    let correct = frame.push_unbound(App::Agent(AgentTile::dormant(sid.clone())), correct_project);
+    let wrong = frame.push_detached(App::Agent(AgentTile::dormant(sid.clone())), wrong_project);
+    let correct = frame.push_detached(App::Agent(AgentTile::dormant(sid.clone())), correct_project);
     let mut persisted = snapshot_workspace(&frame, &projects, &|_| None);
     // Corruption may duplicate both the durable session and the stable tile id.
     // Canonicalization therefore keys the concrete persisted occurrence, not id.
-    persisted.unbound_tiles[0].tile.id = correct;
+    persisted.detached_tiles[0].tile.id = correct;
     let authoritative = HashMap::from([(sid.to_string(), correct_cwd.clone())]);
 
-    let repair = heal_persisted_agent_ownership(
-        &mut persisted,
-        &authoritative,
-        &correct_cwd,
-    );
+    let repair = heal_persisted_agent_ownership(&mut persisted, &authoritative, &correct_cwd);
 
-    assert_eq!(repair.removed_unbound_duplicates, 1);
-    assert_eq!(persisted.unbound_tiles.len(), 1);
-    assert_eq!(persisted.unbound_tiles[0].tile.id, correct);
-    assert_ne!(persisted.unbound_tiles[0].tile.id, wrong);
+    assert_eq!(repair.removed_detached_duplicates, 1);
+    assert_eq!(persisted.detached_tiles.len(), 1);
+    assert_eq!(persisted.detached_tiles[0].tile.id, correct);
+    assert_ne!(persisted.detached_tiles[0].tile.id, wrong);
     assert_eq!(
-        persisted.unbound_tiles[0].project_cwd.as_deref(),
+        persisted.detached_tiles[0].project_cwd.as_deref(),
         Some(correct_cwd.to_string_lossy().as_ref())
     );
 }
@@ -4398,26 +4690,69 @@ fn persisted_duplicate_agent_identity_keeps_session_cwd_project() {
 fn unbound_restore_rejects_duplicate_window_and_agent_identity() {
     let mut ids = std::collections::HashSet::from([10]);
     let mut sids = std::collections::HashSet::from(["SID-A".to_string()]);
-    assert!(!accept_unbound_restore(
+    assert!(!accept_tile_restore(
         10,
         Some(&ServerSid::new("SID-B")),
         &mut ids,
         &mut sids,
     ));
-    assert!(!accept_unbound_restore(
+    assert!(!accept_tile_restore(
         20,
         Some(&ServerSid::new("SID-A")),
         &mut ids,
         &mut sids,
     ));
     assert!(
-        accept_unbound_restore(
-            20,
-            Some(&ServerSid::new("SID-B")),
-            &mut ids,
-            &mut sids,
-        ),
+        accept_tile_restore(20, Some(&ServerSid::new("SID-B")), &mut ids, &mut sids,),
         "sid rejection rolls back the id reservation"
+    );
+}
+
+#[test]
+fn persisted_leaf_reservation_classifies_identity_and_rejects_duplicates_atomically() {
+    let agent = PersistedLeaf {
+        id: 20,
+        tags: workspace::TagSet::new(),
+        kind: PersistedKind::Agent {
+            session_id: Some(ServerSid::new("SID-A")),
+        },
+    };
+    let same_sid = PersistedLeaf {
+        id: 21,
+        tags: workspace::TagSet::new(),
+        kind: PersistedKind::Agent {
+            session_id: Some(ServerSid::new("SID-A")),
+        },
+    };
+    let non_agent = PersistedLeaf {
+        id: 22,
+        tags: workspace::TagSet::new(),
+        kind: PersistedKind::Linear {},
+    };
+    let mut ids = std::collections::HashSet::new();
+    let mut sids = std::collections::HashSet::new();
+
+    assert_eq!(
+        reserve_persisted_leaf(&agent, &mut ids, &mut sids),
+        Some(PersistedTileIdentity::Agent(ServerSid::new("SID-A")))
+    );
+    assert_eq!(
+        reserve_persisted_leaf(&same_sid, &mut ids, &mut sids),
+        None,
+        "one durable Agent session cannot be reserved twice"
+    );
+    assert!(
+        !ids.contains(&same_sid.id),
+        "a rejected sid must roll back its WindowId reservation"
+    );
+    assert_eq!(
+        reserve_persisted_leaf(&non_agent, &mut ids, &mut sids),
+        Some(PersistedTileIdentity::NonAgent)
+    );
+    assert_eq!(
+        reserve_persisted_leaf(&non_agent, &mut ids, &mut sids),
+        None,
+        "a WindowId cannot occur in two ownership domains"
     );
 }
 
@@ -4439,6 +4774,7 @@ fn plane_persist_test_workspace() -> PersistedWorkspace {
             tags: Default::default(),
             kind: PersistedKind::Agent { session_id: None },
         }),
+        hidden_tiles: Vec::new(),
         rail: None,
         layout_mode: workspace::LayoutMode::Plane,
         master_ratio: default_master_ratio(),
@@ -4470,7 +4806,10 @@ fn plane_persist_round_trips_signed_slots_and_camera() {
     let json = serde_json::to_string(&wsp).expect("serialize");
     let back: PersistedWorkspace = serde_json::from_str(&json).expect("deserialize");
 
-    assert_eq!(back.desktop_slots, wsp.desktop_slots, "signed slots survive");
+    assert_eq!(
+        back.desktop_slots, wsp.desktop_slots,
+        "signed slots survive"
+    );
     assert_eq!(back.desktop_spans, wsp.desktop_spans, "spans survive");
     assert_eq!(back.camera, wsp.camera, "camera (pan + zoom) survives");
     // Explicitly pin the signed slot: a naive u32 tuple would have refused to
@@ -4491,19 +4830,22 @@ fn workspace_view_round_trips_and_unknown_defaults_columns() {
     let mut wsp = plane_persist_test_workspace();
     wsp.view = workspace::WorkspaceView::Columns;
     let json = serde_json::to_string(&wsp).expect("serialize");
-    assert!(json.contains("\"columns\""), "view serializes as a string: {json}");
+    assert!(
+        json.contains("\"columns\""),
+        "view serializes as a string: {json}"
+    );
     let back: PersistedWorkspace = serde_json::from_str(&json).expect("deserialize");
-    assert_eq!(back.view, workspace::WorkspaceView::Columns, "columns survives");
+    assert_eq!(
+        back.view,
+        workspace::WorkspaceView::Columns,
+        "columns survives"
+    );
 
     // Explicit Plane remains an honored persisted preference.
     wsp.view = workspace::WorkspaceView::Plane;
     let json = serde_json::to_string(&wsp).expect("serialize plane");
     let back: PersistedWorkspace = serde_json::from_str(&json).expect("deserialize plane");
-    assert_eq!(
-        back.view,
-        workspace::WorkspaceView::Plane,
-        "plane survives"
-    );
+    assert_eq!(back.view, workspace::WorkspaceView::Plane, "plane survives");
 
     // Absent field (old snapshot) ⇒ Columns via #[serde(default)].
     let old = r#"{
@@ -4612,7 +4954,15 @@ fn old_workspace_json_frame_loads_with_pre_rename_keys() {
                 "cwd": "/tmp"
             }
         ],
-        "active_tab": 0
+        "active_tab": 0,
+        "unbound_tiles": [
+            {
+                "project_cwd": "/tmp",
+                "tile": { "id": 2, "kind": "claude", "data": { "session_id": null } }
+            }
+        ],
+        "direct_unbound": 2,
+        "scratchpad": [2]
     }"#;
 
     let frame: PersistedFrame = serde_json::from_str(old)
@@ -4627,8 +4977,16 @@ fn old_workspace_json_frame_loads_with_pre_rename_keys() {
         frame.active_workspace, 0,
         "the `active_tab` on-disk key maps to the renamed `active_workspace` field"
     );
-    assert!(frame.unbound_tiles.is_empty(), "legacy snapshots start with no unbound tiles");
-    assert_eq!(frame.direct_unbound, None);
+    assert_eq!(
+        frame.detached_tiles.len(),
+        1,
+        "legacy unbound tiles migrate to Detached"
+    );
+    assert_eq!(frame.detached_tiles[0].tile.id, 2);
+    assert_eq!(frame.direct_unbound, Some(2));
+    assert_eq!(frame.scratchpad, vec![2]);
+    assert!(frame.solo_presentation.is_none());
+    assert!(frame.workspaces[0].hidden_tiles.is_empty());
     assert!(
         !frame.tile_tags_migrated,
         "missing migration flag triggers one-time legacy tag import"
@@ -4651,7 +5009,11 @@ fn unknown_detail_zoom_falls_back_to_full() {
     let cam: PersistedCamera =
         serde_json::from_str(json).expect("unknown zoom must fall back, not error");
     assert_eq!(cam.zoom, workspace::Detail::Full, "unknown zoom ⇒ Full");
-    assert_eq!(cam.pan, (1.0, 2.0), "pan is unaffected by the zoom fallback");
+    assert_eq!(
+        cam.pan,
+        (1.0, 2.0),
+        "pan is unaffected by the zoom fallback"
+    );
 
     // Direct `Detail` parse, mirroring the LayoutMode fallback test.
     let d: workspace::Detail = serde_json::from_str("\"hyper\"").expect("unknown detail string");
@@ -4782,14 +5144,25 @@ fn mk_tc(
 fn extract_output_text_pulls_text_from_common_shapes() {
     use crate::extract_output_text;
     use serde_json::json;
-    assert_eq!(extract_output_text(&json!("hello")).as_deref(), Some("hello"));
     assert_eq!(
-        extract_output_text(&json!({"content":[{"type":"text","text":"# Title"},{"type":"text","text":"body"}]}))
-            .as_deref(),
+        extract_output_text(&json!("hello")).as_deref(),
+        Some("hello")
+    );
+    assert_eq!(
+        extract_output_text(
+            &json!({"content":[{"type":"text","text":"# Title"},{"type":"text","text":"body"}]})
+        )
+        .as_deref(),
         Some("# Title\n\nbody")
     );
-    assert_eq!(extract_output_text(&json!({"output":"ran ok"})).as_deref(), Some("ran ok"));
-    assert_eq!(extract_output_text(&json!({"result":"done"})).as_deref(), Some("done"));
+    assert_eq!(
+        extract_output_text(&json!({"output":"ran ok"})).as_deref(),
+        Some("ran ok")
+    );
+    assert_eq!(
+        extract_output_text(&json!({"result":"done"})).as_deref(),
+        Some("done")
+    );
     // No clean text → None (caller falls back to JSON).
     assert_eq!(extract_output_text(&json!({"count": 3, "ok": true})), None);
     assert_eq!(extract_output_text(&json!(null)), None);
@@ -4831,12 +5204,14 @@ fn extract_output_text_handles_bare_content_block_array() {
 /// `SectionBody::Json` → the "report is Markdown" assert fails.
 #[test]
 fn plan_tool_sections_subagent_prompt_and_report_are_markdown() {
-    use crate::{plan_tool_sections, SectionBody, SectionRole, ToolRenderPolicy};
+    use crate::{SectionBody, SectionRole, ToolRenderPolicy, plan_tool_sections};
     use serde_json::json;
     let tc = mk_tc(
         "Explore the repo",
         yalda::acp_channel::ToolKind::Think,
-        Some(json!({"subagent_type":"Explore","description":"map the code","prompt":"# Task\nFind all the **things**."})),
+        Some(
+            json!({"subagent_type":"Explore","description":"map the code","prompt":"# Task\nFind all the **things**."}),
+        ),
         Some(json!({"content":[{"type":"text","text":"## Report\n- found it\n- done"}]})),
         vec![],
     );
@@ -4845,15 +5220,25 @@ fn plan_tool_sections_subagent_prompt_and_report_are_markdown() {
     assert!(sections.iter().any(|s| s.label == "agent"
         && matches!(&s.body, SectionBody::Chips(c) if c.iter().any(|(k,v)| k=="agent" && v=="Explore"))));
     // description as prose
-    assert!(sections.iter().any(|s| s.label == "task" && matches!(s.body, SectionBody::Prose(_))));
+    assert!(
+        sections
+            .iter()
+            .any(|s| s.label == "task" && matches!(s.body, SectionBody::Prose(_)))
+    );
     // prompt as MARKDOWN (input side)
     assert!(sections.iter().any(|s| s.label == "prompt"
         && s.role == SectionRole::Input
-        && matches!(s.body, SectionBody::Markdown{..})));
+        && matches!(s.body, SectionBody::Markdown { .. })));
     // report as MARKDOWN, emphasized (output side) — the star.
-    let report = sections.iter().find(|s| s.label == "report").expect("a report section");
+    let report = sections
+        .iter()
+        .find(|s| s.label == "report")
+        .expect("a report section");
     assert_eq!(report.role, SectionRole::Output);
-    assert!(matches!(report.body, SectionBody::Markdown{..}), "report renders as markdown, not json");
+    assert!(
+        matches!(report.body, SectionBody::Markdown { .. }),
+        "report renders as markdown, not json"
+    );
     assert!(report.emphasis, "the subagent report is emphasized");
 }
 
@@ -4868,7 +5253,7 @@ fn plan_tool_sections_subagent_prompt_and_report_are_markdown() {
 /// asserts fail.
 #[test]
 fn plan_tool_sections_bare_array_output_is_markdown_not_json() {
-    use crate::{plan_tool_sections, SectionBody, ToolRenderPolicy};
+    use crate::{SectionBody, ToolRenderPolicy, plan_tool_sections};
     use serde_json::json;
     let tc = mk_tc(
         "Explore the repo",
@@ -4888,7 +5273,9 @@ fn plan_tool_sections_bare_array_output_is_markdown_not_json() {
         "the bare-array output renders as markdown, not raw JSON"
     );
     assert!(
-        !sections.iter().any(|s| matches!(s.body, SectionBody::Json(_))),
+        !sections
+            .iter()
+            .any(|s| matches!(s.body, SectionBody::Json(_))),
         "no raw-JSON section for a bare content-block array output"
     );
 }
@@ -4897,7 +5284,7 @@ fn plan_tool_sections_bare_array_output_is_markdown_not_json() {
 /// monospace (a leading `#` must not become an H1).
 #[test]
 fn plan_tool_sections_bash_is_code_not_markdown() {
-    use crate::{plan_tool_sections, SectionBody, ToolRenderPolicy};
+    use crate::{SectionBody, ToolRenderPolicy, plan_tool_sections};
     use serde_json::json;
     let tc = mk_tc(
         "Bash",
@@ -4907,18 +5294,30 @@ fn plan_tool_sections_bash_is_code_not_markdown() {
         vec![],
     );
     let sections = plan_tool_sections(&tc, ToolRenderPolicy::Full);
-    assert!(sections.iter().any(|s| s.label == "command" && matches!(s.body, SectionBody::Code{..})));
+    assert!(
+        sections
+            .iter()
+            .any(|s| s.label == "command" && matches!(s.body, SectionBody::Code { .. }))
+    );
     // terminal output is Code, never Markdown.
-    assert!(sections.iter().any(|s| s.label == "output" && matches!(s.body, SectionBody::Code{..})));
-    assert!(!sections.iter().any(|s| matches!(s.body, SectionBody::Markdown{..})),
-        "bash output must not be markdown-rendered");
+    assert!(
+        sections
+            .iter()
+            .any(|s| s.label == "output" && matches!(s.body, SectionBody::Code { .. }))
+    );
+    assert!(
+        !sections
+            .iter()
+            .any(|s| matches!(s.body, SectionBody::Markdown { .. })),
+        "bash output must not be markdown-rendered"
+    );
 }
 
 /// An Edit synthesizes a diff from old/new when `content` carries none, and does
 /// NOT dump old_string/new_string as JSON.
 #[test]
 fn plan_tool_sections_edit_synthesizes_diff() {
-    use crate::{plan_tool_sections, SectionBody, ToolRenderPolicy};
+    use crate::{SectionBody, ToolRenderPolicy, plan_tool_sections};
     use serde_json::json;
     let tc = mk_tc(
         "Edit",
@@ -4928,12 +5327,28 @@ fn plan_tool_sections_edit_synthesizes_diff() {
         vec![],
     );
     let sections = plan_tool_sections(&tc, ToolRenderPolicy::Full);
-    let diff = sections.iter().find(|s| matches!(s.body, SectionBody::Diff{..})).expect("a diff section");
-    let SectionBody::Diff { text, .. } = &diff.body else { unreachable!() };
-    assert!(text.contains("- let x = 1;") && text.contains("+ let x = 2;"), "synthesized +/- diff");
+    let diff = sections
+        .iter()
+        .find(|s| matches!(s.body, SectionBody::Diff { .. }))
+        .expect("a diff section");
+    let SectionBody::Diff { text, .. } = &diff.body else {
+        unreachable!()
+    };
+    assert!(
+        text.contains("- let x = 1;") && text.contains("+ let x = 2;"),
+        "synthesized +/- diff"
+    );
     // path is a chip, not raw json; no Json section for the edit input.
-    assert!(sections.iter().any(|s| s.label == "path" && matches!(s.body, SectionBody::Chips(_))));
-    assert!(!sections.iter().any(|s| matches!(s.body, SectionBody::Json(_))));
+    assert!(
+        sections
+            .iter()
+            .any(|s| s.label == "path" && matches!(s.body, SectionBody::Chips(_)))
+    );
+    assert!(
+        !sections
+            .iter()
+            .any(|s| matches!(s.body, SectionBody::Json(_)))
+    );
 }
 
 /// When `content` and `raw_output` carry the SAME text (Claude Code mirrors
@@ -4941,28 +5356,35 @@ fn plan_tool_sections_edit_synthesizes_diff() {
 /// old UI showed (content + JSON-escaped output).
 #[test]
 fn plan_tool_sections_dedups_content_and_output() {
-    use crate::{plan_tool_sections, SectionBody, ToolRenderPolicy};
+    use crate::{SectionBody, ToolRenderPolicy, plan_tool_sections};
     use serde_json::json;
     let tc = mk_tc(
         "Task",
         yalda::acp_channel::ToolKind::Think,
         Some(json!({"prompt":"do it","subagent_type":"general"})),
         Some(json!({"content":[{"type":"text","text":"the one and only report"}]})),
-        vec![yalda::acp_channel::ToolCallContent::from("the one and only report".to_string())],
+        vec![yalda::acp_channel::ToolCallContent::from(
+            "the one and only report".to_string(),
+        )],
     );
     let sections = plan_tool_sections(&tc, ToolRenderPolicy::Full);
     let report_like = sections
         .iter()
-        .filter(|s| matches!(s.body, SectionBody::Markdown{ref text} if text.contains("one and only")))
+        .filter(
+            |s| matches!(s.body, SectionBody::Markdown{ref text} if text.contains("one and only")),
+        )
         .count();
-    assert_eq!(report_like, 1, "content/output dedup: the shared report is shown once, not twice");
+    assert_eq!(
+        report_like, 1,
+        "content/output dedup: the shared report is shown once, not twice"
+    );
 }
 
 /// An unknown tool with a long multiline string field renders it as a readable
 /// code section (real newlines), not a `\n`-riddled JSON blob.
 #[test]
 fn plan_tool_sections_unknown_multiline_is_code() {
-    use crate::{plan_tool_sections, SectionBody, ToolRenderPolicy};
+    use crate::{SectionBody, ToolRenderPolicy, plan_tool_sections};
     use serde_json::json;
     let big = "line one\nline two\nline three\nline four which is here";
     let tc = mk_tc(
@@ -4973,10 +5395,18 @@ fn plan_tool_sections_unknown_multiline_is_code() {
         vec![],
     );
     let sections = plan_tool_sections(&tc, ToolRenderPolicy::Full);
-    assert!(sections.iter().any(|s| matches!(&s.body, SectionBody::Code{text,..} if text.contains("line two"))),
-        "multiline string becomes a code section");
+    assert!(
+        sections
+            .iter()
+            .any(|s| matches!(&s.body, SectionBody::Code{text,..} if text.contains("line two"))),
+        "multiline string becomes a code section"
+    );
     // the scalar `n` is a chip.
-    assert!(sections.iter().any(|s| matches!(&s.body, SectionBody::Chips(c) if c.iter().any(|(k,_)| k=="n"))));
+    assert!(
+        sections
+            .iter()
+            .any(|s| matches!(&s.body, SectionBody::Chips(c) if c.iter().any(|(k,_)| k=="n")))
+    );
 }
 
 // ── Projects: persistence + migration (T002, UXI-Project-8) ─────────────────
@@ -5000,14 +5430,28 @@ fn migration_maps_known_cwds_and_basename_fallback() {
     ];
     let ps = migrate_cwds_to_projects(cwds);
 
-    assert_eq!(ps.len(), 3, "three distinct cwds → three projects (dup folded)");
+    assert_eq!(
+        ps.len(),
+        3,
+        "three distinct cwds → three projects (dup folded)"
+    );
     // The two user-named projects fall out of the basename rule.
-    assert!(ps.by_name("Yaldabaoth").is_some(), "ws/yaldabaoth → Yaldabaoth");
+    assert!(
+        ps.by_name("Yaldabaoth").is_some(),
+        "ws/yaldabaoth → Yaldabaoth"
+    );
     assert!(ps.by_name("Fulcrum").is_some(), "ws/fulcrum → Fulcrum");
     // The fallback names any other cwd from its basename.
-    assert!(ps.by_name("Archon").is_some(), "ws/archon → Archon (basename)");
+    assert!(
+        ps.by_name("Archon").is_some(),
+        "ws/archon → Archon (basename)"
+    );
     // Totality: every cwd resolves back to a project (nothing dropped).
-    for c in ["/home/scott/ws/yaldabaoth", "/home/scott/ws/fulcrum", "/home/scott/ws/archon"] {
+    for c in [
+        "/home/scott/ws/yaldabaoth",
+        "/home/scott/ws/fulcrum",
+        "/home/scott/ws/archon",
+    ] {
         assert!(
             ps.by_cwd(&std::path::PathBuf::from(c)).is_some(),
             "cwd {c} maps to a project"
@@ -5019,8 +5463,14 @@ fn migration_maps_known_cwds_and_basename_fallback() {
 #[test]
 fn project_name_for_cwd_capitalizes_basename() {
     use std::path::Path;
-    assert_eq!(project_name_for_cwd(Path::new("/home/scott/ws/yaldabaoth")), "Yaldabaoth");
-    assert_eq!(project_name_for_cwd(Path::new("/home/scott/ws/fulcrum")), "Fulcrum");
+    assert_eq!(
+        project_name_for_cwd(Path::new("/home/scott/ws/yaldabaoth")),
+        "Yaldabaoth"
+    );
+    assert_eq!(
+        project_name_for_cwd(Path::new("/home/scott/ws/fulcrum")),
+        "Fulcrum"
+    );
     assert_eq!(project_name_for_cwd(Path::new("/x/archon")), "Archon");
     assert_eq!(project_name_for_cwd(Path::new("/")), "Project"); // rootless fallback
 }
@@ -5035,10 +5485,17 @@ fn projects_persist_round_trips_via_disk() {
 
     let mut ps = Projects::new();
     let yalda = ps
-        .create("Yaldabaoth".into(), std::path::PathBuf::from("/ws/yaldabaoth"))
+        .create(
+            "Yaldabaoth".into(),
+            std::path::PathBuf::from("/ws/yaldabaoth"),
+        )
         .unwrap();
-    ps.get_mut(yalda).unwrap().params.insert("model".into(), "opus".into());
-    ps.create("Fulcrum".into(), std::path::PathBuf::from("/ws/fulcrum")).unwrap();
+    ps.get_mut(yalda)
+        .unwrap()
+        .params
+        .insert("model".into(), "opus".into());
+    ps.create("Fulcrum".into(), std::path::PathBuf::from("/ws/fulcrum"))
+        .unwrap();
 
     crate::persist::with_projects_path(file.clone(), || save_persisted_projects(&ps));
     let doc = crate::persist::with_projects_path(file.clone(), || {
@@ -5048,9 +5505,17 @@ fn projects_persist_round_trips_via_disk() {
 
     assert_eq!(restored.len(), 2);
     let ry = restored.by_name("Yaldabaoth").expect("Yaldabaoth restored");
-    assert_eq!(restored.cwd_of(ry), Some(std::path::Path::new("/ws/yaldabaoth")));
     assert_eq!(
-        restored.get(ry).unwrap().params.get("model").map(String::as_str),
+        restored.cwd_of(ry),
+        Some(std::path::Path::new("/ws/yaldabaoth"))
+    );
+    assert_eq!(
+        restored
+            .get(ry)
+            .unwrap()
+            .params
+            .get("model")
+            .map(String::as_str),
         Some("opus"),
         "params round-trip"
     );
@@ -5064,12 +5529,18 @@ fn projects_persist_round_trips_via_disk() {
 
 #[test]
 fn sanitize_name_enforces_shape_and_cap() {
-    use crate::agent_naming::{sanitize_name, MAX_NAME_CHARS};
+    use crate::agent_naming::{MAX_NAME_CHARS, sanitize_name};
 
     // The happy path passes through, lowercased.
-    assert_eq!(sanitize_name("Payments Refactor").as_deref(), Some("payments refactor"));
+    assert_eq!(
+        sanitize_name("Payments Refactor").as_deref(),
+        Some("payments refactor")
+    );
     // Quotes, trailing punctuation, and stray markdown are stripped.
-    assert_eq!(sanitize_name("\"flaky test hunt\".").as_deref(), Some("flaky test hunt"));
+    assert_eq!(
+        sanitize_name("\"flaky test hunt\".").as_deref(),
+        Some("flaky test hunt")
+    );
     // At most three words — a model that writes a sentence gets truncated, not
     // installed verbatim.
     assert_eq!(
@@ -5090,7 +5561,7 @@ fn sanitize_name_enforces_shape_and_cap() {
 
 #[test]
 fn sanitize_summary_keeps_two_sentences_and_flattens() {
-    use crate::agent_naming::{sanitize_summary, MAX_SUMMARY_CHARS};
+    use crate::agent_naming::{MAX_SUMMARY_CHARS, sanitize_summary};
 
     // Newlines collapse — the jump panel renders one small italic line.
     assert_eq!(
@@ -5105,16 +5576,21 @@ fn sanitize_summary_keeps_two_sentences_and_flattens() {
     // A rambling single "sentence" is capped on a word boundary with an ellipsis.
     let long = "word ".repeat(200);
     let capped = sanitize_summary(&long).unwrap();
-    assert!(capped.chars().count() <= MAX_SUMMARY_CHARS + 1, "got {} chars", capped.chars().count());
-    assert!(capped.ends_with('…'), "a truncated summary is marked: {capped:?}");
+    assert!(
+        capped.chars().count() <= MAX_SUMMARY_CHARS + 1,
+        "got {} chars",
+        capped.chars().count()
+    );
+    assert!(
+        capped.ends_with('…'),
+        "a truncated summary is marked: {capped:?}"
+    );
     assert_eq!(sanitize_summary("   "), None);
 }
 
 #[test]
 fn naming_summary_is_topic_only_short_and_has_a_user_turn_fallback() {
-    use crate::agent_naming::{
-        fallback_topic_summary, naming_system_prompt, MAX_SUMMARY_CHARS,
-    };
+    use crate::agent_naming::{MAX_SUMMARY_CHARS, fallback_topic_summary, naming_system_prompt};
 
     assert_eq!(MAX_SUMMARY_CHARS, 140, "jump summaries stay glanceable");
     let prompt = naming_system_prompt();
@@ -5154,7 +5630,10 @@ fn jump_supporting_text_is_cool_and_readable_in_everyday_themes() {
         Color::Rgb(0x2d, 0x3d, 0x4e),
         "Folio uses deep steel, not gold/tan"
     );
-    assert_ne!(crate::jump_supporting_text_color(&nightfox), nightfox.warm_accent);
+    assert_ne!(
+        crate::jump_supporting_text_color(&nightfox),
+        nightfox.warm_accent
+    );
     assert_ne!(crate::jump_supporting_text_color(&folio), folio.warm_accent);
 }
 
@@ -5202,22 +5681,31 @@ fn parse_naming_reply_tolerates_real_model_output() {
     use crate::agent_naming::parse_naming_reply;
 
     // The contract shape.
-    let clean = parse_naming_reply(r#"{"name": "payments refactor", "summary": "Ripping out the adapter."}"#);
+    let clean = parse_naming_reply(
+        r#"{"name": "payments refactor", "summary": "Ripping out the adapter."}"#,
+    );
     assert_eq!(clean.name.as_deref(), Some("payments refactor"));
     assert_eq!(clean.summary.as_deref(), Some("Ripping out the adapter."));
 
     // Wrapped in a code fence (a very common deviation).
-    let fenced = parse_naming_reply("```json\n{\"name\": \"flaky tests\", \"summary\": \"Hunting a flake.\"}\n```");
+    let fenced = parse_naming_reply(
+        "```json\n{\"name\": \"flaky tests\", \"summary\": \"Hunting a flake.\"}\n```",
+    );
     assert_eq!(fenced.name.as_deref(), Some("flaky tests"));
 
     // With a preamble the instruction told it not to write.
-    let chatty = parse_naming_reply("Sure! Here you go:\n{\"name\": \"jump panel\", \"summary\": \"Panel work.\"}");
+    let chatty = parse_naming_reply(
+        "Sure! Here you go:\n{\"name\": \"jump panel\", \"summary\": \"Panel work.\"}",
+    );
     assert_eq!(chatty.name.as_deref(), Some("jump panel"));
 
     // No JSON at all: the first line is salvaged as the name.
     let bare = parse_naming_reply("payments refactor\nWe are ripping out the adapter.");
     assert_eq!(bare.name.as_deref(), Some("payments refactor"));
-    assert_eq!(bare.summary.as_deref(), Some("We are ripping out the adapter."));
+    assert_eq!(
+        bare.summary.as_deref(),
+        Some("We are ripping out the adapter.")
+    );
 
     // Total garbage yields nothing installable, so the caller keeps `claude-N`.
     assert!(parse_naming_reply("   ").is_empty());

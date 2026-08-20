@@ -923,16 +923,40 @@ pub(crate) struct PersistedLeaf {
 /// One tile outside every workspace (ADR-0033). Project is persisted by cwd,
 /// matching workspace membership's self-healing project migration.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct PersistedUnboundTile {
+pub(crate) struct PersistedDetachedTile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) project_cwd: Option<String>,
     pub(crate) tile: PersistedLeaf,
 }
 
-/// Reserve one restored unbound tile's stable identities. Rejects duplicate
+/// One tile that remains attached to a workspace but is excluded from its
+/// visible layout (ADR-0034). The footprint is a best-effort restoration hint.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PersistedHiddenTile {
+    pub(crate) tile: PersistedLeaf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) previous_placement: Option<PersistedPlacement>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PersistedPlacement {
+    pub(crate) row: i32,
+    pub(crate) col: i32,
+    pub(crate) rows: u32,
+    pub(crate) cols: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "tile")]
+pub(crate) enum PersistedSoloPresentation {
+    Detached(workspace::WindowId),
+    HiddenAttached(workspace::WindowId),
+}
+
+/// Reserve one restored tile's stable identities. Rejects duplicate
 /// WindowIds and duplicate durable Agent sids, rolling back the id reservation
 /// when the sid conflicts.
-pub(crate) fn accept_unbound_restore(
+pub(crate) fn accept_tile_restore(
     id: workspace::WindowId,
     agent_sid: Option<&ServerSid>,
     placed_ids: &mut std::collections::HashSet<workspace::WindowId>,
@@ -950,9 +974,40 @@ pub(crate) fn accept_unbound_restore(
     true
 }
 
+/// The durable identity reserved for one accepted persisted tile. Keeping the
+/// Agent case typed prevents restore callers from separately (and
+/// inconsistently) deciding whether a leaf participates in the global
+/// one-session/one-tile invariant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PersistedTileIdentity {
+    NonAgent,
+    Agent(ServerSid),
+}
+
+/// Atomically classify and reserve a persisted leaf. `None` means either its
+/// stable WindowId or its durable Agent sid is already owned elsewhere.
+pub(crate) fn reserve_persisted_leaf(
+    leaf: &PersistedLeaf,
+    placed_ids: &mut std::collections::HashSet<workspace::WindowId>,
+    placed_agent_sids: &mut std::collections::HashSet<String>,
+) -> Option<PersistedTileIdentity> {
+    let identity = match &leaf.kind {
+        PersistedKind::Agent {
+            session_id: Some(sid),
+        } => PersistedTileIdentity::Agent(sid.clone()),
+        _ => PersistedTileIdentity::NonAgent,
+    };
+    let sid = match &identity {
+        PersistedTileIdentity::Agent(sid) => Some(sid),
+        PersistedTileIdentity::NonAgent => None,
+    };
+    accept_tile_restore(leaf.id, sid, placed_ids, placed_agent_sids).then_some(identity)
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PersistedLayout {
+    Empty,
     Leaf(PersistedLeaf),
     Split {
         dir: workspace::SplitDir,
@@ -1012,6 +1067,10 @@ pub(crate) struct PersistedWorkspace {
     pub(crate) auto_name: String,
     pub(crate) display_name: Option<String>,
     pub(crate) focused_window: workspace::WindowId,
+    /// Attached tiles excluded from the visible layout. Absent in snapshots
+    /// written before ADR-0034, where every attached tile was visible.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) hidden_tiles: Vec<PersistedHiddenTile>,
     pub(crate) layout: PersistedLayout,
     /// Optional rail (spec-rail.md §14). Absent in old snapshots → no rail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1084,13 +1143,19 @@ pub(crate) struct PersistedFrame {
     #[serde(rename = "active_tab")]
     pub(crate) active_workspace: usize,
     /// Stable tiles outside every workspace. Absent in legacy snapshots.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) unbound_tiles: Vec<PersistedUnboundTile>,
-    /// Restore the direct view only when it still names an unbound tile.
+    #[serde(
+        default,
+        alias = "unbound_tiles",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub(crate) detached_tiles: Vec<PersistedDetachedTile>,
+    /// Temporary presentation of a tile whose normal owner does not paint it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) solo_presentation: Option<PersistedSoloPresentation>,
+    /// Legacy direct-Unbound focus; restored only when it names a Detached tile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) direct_unbound: Option<workspace::WindowId>,
-    /// Most-recent-first ids of scratchpad members. Membership is validated
-    /// against restored Unbound tiles before the frame becomes live.
+    /// Legacy scratchpad MRU, retained only for additive deserialization.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) scratchpad: Vec<workspace::WindowId>,
     /// False/missing means import the legacy session/buffer tag sidecars into
@@ -1111,13 +1176,13 @@ pub(crate) struct PersistedFrame {
 /// live ownership graph.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PersistedAgentOwnershipRepair {
-    pub(crate) cleared_bound_duplicates: usize,
-    pub(crate) removed_unbound_duplicates: usize,
+    pub(crate) cleared_attached_duplicates: usize,
+    pub(crate) removed_detached_duplicates: usize,
 }
 
 impl PersistedAgentOwnershipRepair {
     pub(crate) fn changed(self) -> bool {
-        self.cleared_bound_duplicates != 0 || self.removed_unbound_duplicates != 0
+        self.cleared_attached_duplicates != 0 || self.removed_detached_duplicates != 0
     }
 }
 
@@ -1126,7 +1191,7 @@ struct PersistedAgentCandidate {
     sid: String,
     id: workspace::WindowId,
     project_cwd: PathBuf,
-    bound: bool,
+    attached: bool,
     order: usize,
 }
 
@@ -1137,6 +1202,7 @@ fn collect_persisted_agent_candidates(
     out: &mut Vec<PersistedAgentCandidate>,
 ) {
     match layout {
+        PersistedLayout::Empty => {}
         PersistedLayout::Leaf(PersistedLeaf {
             id,
             kind: PersistedKind::Agent {
@@ -1148,7 +1214,7 @@ fn collect_persisted_agent_candidates(
                 sid: sid.to_string(),
                 id: *id,
                 project_cwd: project_cwd.to_path_buf(),
-                bound: true,
+                attached: true,
                 order: *order,
             });
             *order += 1;
@@ -1168,6 +1234,7 @@ fn clear_noncanonical_bound_agent_sids(
     order: &mut usize,
 ) -> usize {
     match layout {
+        PersistedLayout::Empty => 0,
         PersistedLayout::Leaf(PersistedLeaf {
             kind: PersistedKind::Agent { session_id },
             ..
@@ -1196,10 +1263,51 @@ fn clear_noncanonical_bound_agent_sids(
             .sum(),
     }
 }
+fn collect_hidden_agent_candidate(
+    hidden: &PersistedHiddenTile,
+    project_cwd: &std::path::Path,
+    order: usize,
+    out: &mut Vec<PersistedAgentCandidate>,
+) {
+    if let PersistedKind::Agent {
+        session_id: Some(sid),
+    } = &hidden.tile.kind
+        && !sid.as_str().is_empty()
+    {
+        out.push(PersistedAgentCandidate {
+            sid: sid.to_string(),
+            id: hidden.tile.id,
+            project_cwd: project_cwd.to_path_buf(),
+            attached: true,
+            order,
+        });
+    }
+}
+
+fn clear_noncanonical_hidden_agent_sid(
+    hidden: &mut PersistedHiddenTile,
+    canonical: &HashMap<String, usize>,
+    order: usize,
+) -> usize {
+    let PersistedKind::Agent { session_id } = &mut hidden.tile.kind else {
+        return 0;
+    };
+    let duplicate = session_id.as_ref().is_some_and(|sid| {
+        canonical
+            .get(sid.as_str())
+            .is_some_and(|canonical_order| *canonical_order != order)
+    });
+    if duplicate {
+        *session_id = None;
+        1
+    } else {
+        0
+    }
+}
 
 /// Heal duplicate durable Agent identities before constructing live tiles.
 /// Session cwd is authoritative for project membership; within that project a
-/// bound tile wins over an Unbound tile, then stable id/order break ties.
+/// attached tile wins over a Detached tile, then stable id/order break ties.
 pub(crate) fn heal_persisted_agent_ownership(
     frame: &mut PersistedFrame,
     authoritative_cwds: &HashMap<String, PathBuf>,
@@ -1220,8 +1328,12 @@ pub(crate) fn heal_persisted_agent_ownership(
             &mut order,
             &mut candidates,
         );
+        for hidden in &persisted.hidden_tiles {
+            collect_hidden_agent_candidate(hidden, &project_cwd, order, &mut candidates);
+            order += 1;
+        }
     }
-    for persisted in &frame.unbound_tiles {
+    for persisted in &frame.detached_tiles {
         let PersistedKind::Agent {
             session_id: Some(sid),
         } = &persisted.tile.kind
@@ -1238,7 +1350,7 @@ pub(crate) fn heal_persisted_agent_ownership(
                     .as_deref()
                     .map(PathBuf::from)
                     .unwrap_or_else(|| fallback_cwd.to_path_buf()),
-                bound: false,
+                attached: false,
                 order,
             });
         }
@@ -1253,7 +1365,7 @@ pub(crate) fn heal_persisted_agent_ownership(
             .is_some_and(|cwd| cwd_match_key(cwd) == cwd_match_key(&candidate.project_cwd));
         let candidate_rank = (
             u8::from(!correct_project),
-            u8::from(!candidate.bound),
+            u8::from(!candidate.attached),
             candidate.id,
             candidate.order,
         );
@@ -1269,13 +1381,18 @@ pub(crate) fn heal_persisted_agent_ownership(
     let mut repair = PersistedAgentOwnershipRepair::default();
     let mut repair_order = 0;
     for persisted in &mut frame.workspaces {
-        repair.cleared_bound_duplicates += clear_noncanonical_bound_agent_sids(
+        repair.cleared_attached_duplicates += clear_noncanonical_bound_agent_sids(
             &mut persisted.layout,
             &canonical,
             &mut repair_order,
         );
+        for hidden in &mut persisted.hidden_tiles {
+            repair.cleared_attached_duplicates +=
+                clear_noncanonical_hidden_agent_sid(hidden, &canonical, repair_order);
+            repair_order += 1;
+        }
     }
-    frame.unbound_tiles.retain(|persisted| {
+    frame.detached_tiles.retain(|persisted| {
         let candidate_order = repair_order;
         repair_order += 1;
         let keep = match &persisted.tile.kind {
@@ -1287,7 +1404,7 @@ pub(crate) fn heal_persisted_agent_ownership(
             _ => true,
         };
         if !keep {
-            repair.removed_unbound_duplicates += 1;
+            repair.removed_detached_duplicates += 1;
         }
         keep
     });
@@ -1342,15 +1459,7 @@ pub(crate) fn snapshot_layout(
     resolve: SidResolver,
 ) -> PersistedLayout {
     match layout {
-        workspace::Layout::Empty => PersistedLayout::Leaf(PersistedLeaf {
-            id: 0,
-            tags: workspace::TagSet::new(),
-            kind: PersistedKind::Buffer {
-                mode: PersistedBufferMode::Picking {
-                    dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                },
-            },
-        }),
+        workspace::Layout::Empty => PersistedLayout::Empty,
         workspace::Layout::Leaf(win) => PersistedLayout::Leaf(PersistedLeaf {
             id: win.id(),
             tags: win.tags.clone(),
@@ -1437,15 +1546,12 @@ pub(crate) fn restore_layout(
     Vec<(workspace::WindowId, Option<ServerSid>)>,
 ) {
     match layout {
+        PersistedLayout::Empty => (workspace::Layout::Empty, 0, Vec::new()),
         PersistedLayout::Leaf(leaf) => {
             let (window, agent_sid) = restore_leaf(ws, theme, leaf, project);
             let id = window.id();
             let agents = agent_sid.map(|sid| vec![(id, sid)]).unwrap_or_default();
-            (
-                workspace::Layout::Leaf(window),
-                id,
-                agents,
-            )
+            (workspace::Layout::Leaf(window), id, agents)
         }
         PersistedLayout::Split { dir, children } => {
             let mut max_id: workspace::WindowId = 0;
@@ -1472,7 +1578,7 @@ pub(crate) fn restore_layout(
 }
 
 /// Restore one persisted tile while preserving its stable id and tile-local
-/// tags. Shared by workspace layouts and the Unbound collection.
+/// tags. Shared by workspace layouts and the Detached collection.
 pub(crate) fn restore_leaf(
     ws: &mut workspace::Frame<App>,
     theme: &Theme,
@@ -1583,6 +1689,25 @@ pub(crate) fn snapshot_workspace(
                 auto_name: t.auto_name.clone(),
                 display_name: t.display_name.clone(),
                 focused_window: t.focused,
+                hidden_tiles: t
+                    .hidden_tiles
+                    .iter()
+                    .map(|hidden| PersistedHiddenTile {
+                        tile: PersistedLeaf {
+                            id: hidden.window.id(),
+                            tags: hidden.window.tags.clone(),
+                            kind: snapshot_content(&hidden.window.content, resolve),
+                        },
+                        previous_placement: hidden.previous_placement.map(|(slot, span)| {
+                            PersistedPlacement {
+                                row: slot.row,
+                                col: slot.col,
+                                rows: span.rows,
+                                cols: span.cols,
+                            }
+                        }),
+                    })
+                    .collect(),
                 layout: snapshot_layout(&t.layout, resolve),
                 rail: t.rail.as_ref().map(snapshot_rail),
                 layout_mode: t.layout_mode,
@@ -1616,15 +1741,17 @@ pub(crate) fn snapshot_workspace(
                 // the project now, so we resolve `t.project()` through the store.
                 // Restore re-points the workspace at whatever project roots this
                 // cwd (self-heal); project *names* survive via `projects.json`.
-                cwd: projects.cwd_of(t.project()).map(|p| p.display().to_string()),
+                cwd: projects
+                    .cwd_of(t.project())
+                    .map(|p| p.display().to_string()),
                 legacy_kv: HashMap::new(),
             })
             .collect(),
         active_workspace: ws.active_workspace.min(non_ephemeral.saturating_sub(1)),
-        unbound_tiles: ws
-            .unbound_tiles
+        detached_tiles: ws
+            .detached_tiles
             .iter()
-            .map(|tile| PersistedUnboundTile {
+            .map(|tile| PersistedDetachedTile {
                 project_cwd: projects
                     .cwd_of(tile.project())
                     .map(|path| path.display().to_string()),
@@ -1635,8 +1762,16 @@ pub(crate) fn snapshot_workspace(
                 },
             })
             .collect(),
-        direct_unbound: ws.directly_focused_unbound(),
-        scratchpad: ws.scratchpad.clone(),
+        solo_presentation: ws.presented_tile().map(|presentation| match presentation {
+            workspace::SoloPresentation::Detached(id) => PersistedSoloPresentation::Detached(id),
+            workspace::SoloPresentation::HiddenAttached(id) => {
+                PersistedSoloPresentation::HiddenAttached(id)
+            }
+        }),
+        direct_unbound: ws.presented_detached_tile_id(),
+        // ADR-0034 removed scratchpad membership. Keep the legacy field empty
+        // for additive snapshot compatibility until the schema version retires it.
+        scratchpad: Vec::new(),
         tile_tags_migrated: true,
         marks: ws.marks.all_marks().into_iter().collect(),
         tag_shortcuts: ws.tag_shortcuts.clone(),
@@ -2012,10 +2147,7 @@ pub(crate) fn save_persisted_acp_sessions(cwd: &std::path::Path, snaps: &[Sessio
         .map(|snap| {
             let mut obj = serde_json::Map::new();
             // Wire boundary: write the `ServerSid` back out as a bare string.
-            obj.insert(
-                "id".into(),
-                serde_json::Value::String(snap.id.to_string()),
-            );
+            obj.insert("id".into(), serde_json::Value::String(snap.id.to_string()));
             obj.insert(
                 "label".into(),
                 serde_json::Value::String(snap.label.clone()),
@@ -2072,10 +2204,7 @@ pub(crate) fn save_persisted_acp_sessions(cwd: &std::path::Path, snaps: &[Sessio
             // italic line survives a restart. Same downgrade contract as the
             // fields above — only written when present.
             if let Some(summary) = snap.summary.as_ref().filter(|s| !s.is_empty()) {
-                obj.insert(
-                    "summary".into(),
-                    serde_json::Value::String(summary.clone()),
-                );
+                obj.insert("summary".into(), serde_json::Value::String(summary.clone()));
             }
             serde_json::Value::Object(obj)
         })

@@ -24,10 +24,7 @@ impl YaldaGpuiView {
     /// already on a Cog tile. Does NOT fetch — the caller kicks the graph load.
     /// Split out so tests can install a tile without the live `cog` subprocess.
     pub(crate) fn install_cog_tile(&mut self, cx: &mut Context<Self>) -> bool {
-        if matches!(
-            self.workspace.focused_content().expect("no focused window"),
-            App::Cog(_)
-        ) {
+        if matches!(self.workspace.focused_content(), Some(App::Cog(_))) {
             return false;
         }
         self.set_screen(App::Cog(CogTile::new()));
@@ -41,7 +38,7 @@ impl YaldaGpuiView {
     pub(crate) fn cog_reconcile_loads(&mut self, cx: &mut Context<Self>) {
         let mut targets: Vec<workspace::WindowId> = Vec::new();
         for wsp in self.workspace.workspaces.iter() {
-            wsp.layout.for_each_leaf(&mut |w| {
+            wsp.for_each_attached_window(&mut |w| {
                 if let App::Cog(tile) = &w.content
                     && tile.needs_load
                 {
@@ -123,7 +120,8 @@ impl YaldaGpuiView {
         };
         let sel = self.cog_focused_tile_view().and_then(|v| {
             let cv = v.read(cx);
-            cv.selected_graph_id().map(|id| (id, cv.selected_graph_label()))
+            cv.selected_graph_id()
+                .map(|id| (id, cv.selected_graph_label()))
         });
         let Some((id, label)) = sel else {
             return;
@@ -195,7 +193,7 @@ impl YaldaGpuiView {
         let vid = view.entity_id();
         let mut target = None;
         for wsp in self.workspace.workspaces.iter() {
-            wsp.layout.for_each_leaf(&mut |w| {
+            wsp.for_each_attached_window(&mut |w| {
                 if let App::Cog(tile) = &w.content
                     && tile.view.as_ref().map(|v| v.entity_id()) == Some(vid)
                 {
@@ -236,14 +234,25 @@ impl YaldaGpuiView {
                 self.cog_set_view(
                     target,
                     // Open a graph on its Overview (graph render + stats).
-                    CogViewState::Graph { bundle, selected: 0, overview: true },
+                    CogViewState::Graph {
+                        bundle,
+                        selected: 0,
+                        overview: true,
+                    },
                     cx,
                 );
                 self.cog_start_watch(target, id, cx);
             }
             Ok(CogFetch::Graphs(graphs)) => {
                 self.cog_stop_watch(target);
-                self.cog_set_view(target, CogViewState::Graphs { graphs, selected: 0 }, cx);
+                self.cog_set_view(
+                    target,
+                    CogViewState::Graphs {
+                        graphs,
+                        selected: 0,
+                    },
+                    cx,
+                );
             }
             Err(e) => {
                 self.cog_stop_watch(target);
@@ -339,7 +348,11 @@ impl YaldaGpuiView {
     /// auto-refresh path fired by a live event and by manual `r`. Coalesces a
     /// burst into one in-flight reload plus one queued (`refresh_pending`), and
     /// leaves the live watcher untouched.
-    pub(crate) fn cog_refresh_bundle(&mut self, target: workspace::WindowId, cx: &mut Context<Self>) {
+    pub(crate) fn cog_refresh_bundle(
+        &mut self,
+        target: workspace::WindowId,
+        cx: &mut Context<Self>,
+    ) {
         let Some(id) = self
             .cog_tile_by_id_mut(target)
             .and_then(|t| t.view.clone())
@@ -478,7 +491,7 @@ impl YaldaGpuiView {
     pub(crate) fn notify_cog_views(&mut self, reason: MissReason, cx: &mut Context<Self>) {
         let mut views: Vec<Entity<CogView>> = Vec::new();
         for wsp in self.workspace.workspaces.iter() {
-            wsp.layout.for_each_leaf(&mut |w| {
+            wsp.for_each_attached_window(&mut |w| {
                 if let App::Cog(tile) = &w.content
                     && let Some(v) = &tile.view
                 {
@@ -522,15 +535,10 @@ impl YaldaGpuiView {
     }
 
     fn cog_tile_by_id_mut(&mut self, id: workspace::WindowId) -> Option<&mut CogTile> {
-        for wsp in self.workspace.workspaces.iter_mut() {
-            if let Some(w) = wsp.layout.find_leaf_mut(id) {
-                return match &mut w.content {
-                    App::Cog(tile) => Some(tile),
-                    _ => None,
-                };
-            }
+        match &mut self.workspace.tile_mut(id)?.content {
+            App::Cog(tile) => Some(tile),
+            _ => None,
         }
-        None
     }
 
     /// Move keyboard focus in the focused Cog tile's view. `to_right = true`
@@ -596,7 +604,12 @@ impl YaldaGpuiView {
             .cog_focused_tile_view()
             .map(|v| {
                 let cv = v.read(cx);
-                (cv.in_graphs(), cv.focused_right(), cv.focused_events(), cv.is_filtering())
+                (
+                    cv.in_graphs(),
+                    cv.focused_right(),
+                    cv.focused_events(),
+                    cv.is_filtering(),
+                )
             })
             .unwrap_or((false, false, false, false));
 
