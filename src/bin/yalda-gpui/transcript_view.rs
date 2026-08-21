@@ -1649,7 +1649,8 @@ impl TranscriptView {
                         // read-only from its stored text. Draft text always lives
                         // OUTSIDE the transcript (Model C). Word-wrapped (UXI-AgentTile-9);
                         // active caret on its visual row, windowed (UXI-TextEditing-1).
-                        let accent = cursor_color;
+                        let accent = cursor_color; // RED — the block caret
+                        let ws_accent = nc(at_snap.warm_accent); // TEAL — border + label
                         let fg = self_editor_fg;
                         let sel_bg = nc(at_snap.selection_bg);
                         // (lines, caret_line, caret_col, mode, focused, selection, anchor_line)
@@ -1722,9 +1723,12 @@ impl TranscriptView {
                         // so it's unmistakable you're editing THIS block (vs Insert,
                         // vs the nav-focus tint). Insert keeps the plain `You`.
                         let scoped_normal = focused && mode == EditMode::Normal;
-                        let row_bg: Hsla = if scoped_normal {
-                            let mut h = accent;
-                            h.a = 0.12;
+                        let row_bg: Hsla = if active && focused {
+                            // Light TEAL wash behind the live draft — slighter while
+                            // typing (Insert) than at rest (Normal). Decoupled from the
+                            // RED block caret so it never bleeds pink (was `accent`@0.12).
+                            let mut h = crate::screens::worksheet_wash_teal();
+                            h.a = crate::screens::worksheet_backdrop_alpha(mode);
                             h
                         } else if cursor_line == anchor_line {
                             let mut h = nc(at_snap.dim);
@@ -1747,13 +1751,13 @@ impl TranscriptView {
                             .pb_2()
                             .pl_2()
                             .border_l_2()
-                            .border_color(accent)
+                            .border_color(ws_accent)
                             .bg(row_bg)
                             .child(
                                 div()
                                     .text_size(px(11.0))
                                     .font_weight(FontWeight::BOLD)
-                                    .text_color(accent)
+                                    .text_color(ws_accent)
                                     .font_family(code_font_snap.clone())
                                     .child(label),
                             );
