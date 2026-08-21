@@ -1699,6 +1699,12 @@ same-project reorder assertion returned `[1, 2, 3]` instead of `[3, 1, 2]`.
 
 ### UXI-JumpPanel-30 — A workspace folder marks that it contains a working agent
 
+> **Superseded by `UXI-JumpPanel-31` (2026-08-21).** The dedicated `◆` working
+> dot was **removed** — "a working agent inside" is now conveyed by the folder's
+> **orange identity color**, one of the three state colors in `UXI-JumpPanel-31`.
+> The `has_working_agent` derivation below is retained verbatim (it now feeds the
+> color instead of a dot); only the separate dot glyph is gone.
+
 **Statement.** A workspace folder header carries a warm `◆` status dot exactly
 when at least one agent tile the workspace owns binds a session that is currently
 **working** (a reply in flight, `AgentActivity::Working`). The dot renders on the
@@ -1733,3 +1739,59 @@ detail (gap #1). The dot's PAINT is probe-taggable (`jump-ws-working-<idx>`).
 is false; the REAL `SessionBusy` reducer flips the session to working → the flag
 is true; settling it → false again. Negative control observed RED by forcing
 `has_working_agent = false` at its construction site.
+
+### UXI-JumpPanel-31 — A workspace folder's identity color reflects the state of its sessions
+
+**Statement.** A workspace folder's identity color (the `⊞` glyph, fold caret,
+count pill, rail, outline, and background wash — everything derived from the
+folder's one identity color via `jump_workspace_group_style`) is chosen from the
+aggregate state of the sessions the folder owns, in this strict precedence:
+
+1. **Red** (`agent.jump_header` / `st.err`) — at least one owned session is
+   **unread** (`AgentRow.unread`, i.e. `AgentState.unread`: a finished turn whose
+   output the user has not looked at, `UXI` accounting per the row field). Wins
+   over every other state.
+2. **Orange** (`agent.jump_working` / `working_orange`) — else at least one owned
+   session is **working** (`has_working_agent`, `AgentActivity::Working`; the same
+   `UXI-JumpPanel-30` derivation).
+3. **Blue** (`agent.jump_subheader` / `electric`) — else idle: no unread, nothing
+   working. This is the resting workspace identity color.
+
+The flags aggregate over the folder's `tiles` (the same set `UXI-JumpPanel-30`
+uses — hidden and attached tiles count; detached tiles are not part of a folder),
+so a session driven from elsewhere (`UXI-JumpPanel-12` union-of-authorities) and a
+session unread from a turn that ended while unfocused both tint the folder. A
+workspace with no agent tiles is idle → blue. There is **no** separate `◆` working
+dot on the folder header any more (it was redundant with the orange color;
+`UXI-JumpPanel-30` amended).
+
+**Applies to.** `jump_panel_view.rs` — `JumpWorkspaceFolder::{has_unread,
+has_working_agent}` (computed in `jump_panel_sections_with_tab`), the pure
+`jump_workspace_state_color(has_unread, has_working, red, orange, blue)` selector,
+and its single call site in `render_jump_panel` feeding
+`jump_workspace_group_style`. Colors are theme-owned (`UXI-JumpPanel-7`); the
+Folio `jump_subheader` was restored to muted denim `#5a7fa8` (its pre-red value)
+so idle workspaces read blue, not red, in Folio.
+
+**Why.** A single always-on workspace color (red, in Folio) carried no
+information — every workspace looked the same regardless of what its agents were
+doing. Encoding unread / working / idle in the identity color makes the jump panel
+scannable at the workspace level: red = needs your attention, orange = busy, blue
+= quiet. It also subsumes the collapsed-folder working dot, so activity shows even
+when the folder is folded, with one fewer glyph.
+
+**Status.** `implemented` — headless for the SELECTION (the pure color selector's
+precedence) and the two DERIVATIONS (`has_unread` / `has_working_agent` through the
+REAL `jump_panel_sections`). The exact hue/glyph is a paint detail (gap #1).
+
+**Enforcement.**
+`verify_harness.rs::jump_workspace_color_precedence_red_over_orange_over_blue` —
+the pure selector returns red when unread (even if also working), orange when
+working-not-unread, blue when neither; negative control observed RED by inverting
+the unread/working precedence.
+`verify_harness.rs::workspace_folder_marks_contained_unread_session` — a bound
+agent tile in the active workspace, read → the owning folder's `has_unread` is
+false; setting the REAL `AgentState.unread` → true; clearing it → false. Negative
+control observed RED by forcing `has_unread = false` at its construction site.
+Working derivation stays covered by
+`workspace_folder_marks_contained_working_agent` (`UXI-JumpPanel-30`).

@@ -23671,6 +23671,93 @@ fn workspace_folder_marks_contained_working_agent(cx: &mut TestAppContext) {
     );
 }
 
+/// UXI-JumpPanel-31: the pure workspace-folder identity-color selector obeys the
+/// strict precedence red (unread) > orange (working) > blue (idle). Distinct
+/// sentinel colors make each arm observable; the unread+working case proves red
+/// wins over orange, not merely "unread picks red when nothing else is true".
+///
+/// Negative control (observed RED): swap the first two arms of
+/// `jump_workspace_state_color` (working before unread) → the unread+working case
+/// returns orange and the first assertion fails.
+#[gpui::test]
+fn jump_workspace_color_precedence_red_over_orange_over_blue(_cx: &mut TestAppContext) {
+    let red = gpui::hsla(0.00, 1.0, 0.5, 1.0);
+    let orange = gpui::hsla(0.08, 1.0, 0.5, 1.0);
+    let blue = gpui::hsla(0.60, 1.0, 0.5, 1.0);
+    let pick = |unread, working| {
+        crate::jump_workspace_state_color(unread, working, red, orange, blue)
+    };
+    assert_eq!(
+        pick(true, true),
+        red,
+        "unread wins over working — red beats orange"
+    );
+    assert_eq!(pick(true, false), red, "unread alone is red");
+    assert_eq!(pick(false, true), orange, "working, not unread, is orange");
+    assert_eq!(pick(false, false), blue, "idle is blue");
+}
+
+/// UXI-JumpPanel-31: a workspace folder aggregates the **unread** state of the
+/// sessions it owns (`AgentRow.unread` = `AgentState.unread`), driving the
+/// highest-precedence red identity color. Drives the REAL folder projection
+/// (`jump_panel_sections`) over a REAL agent tile in the active workspace, toggling
+/// the REAL `AgentState.unread` field the turn-end path writes.
+///
+/// Negative control (observed RED): force `has_unread = false` at its construction
+/// site in `jump_panel_sections_with_tab` → the unread assertion fails.
+#[gpui::test]
+fn workspace_folder_marks_contained_unread_session(cx: &mut TestAppContext) {
+    // boot_with_transcript installs an agent tile bound to S1 in the active
+    // workspace, so that workspace's folder owns the tile.
+    let (view, vcx, id, session) = boot_with_transcript(cx);
+    vcx.run_until_parked();
+
+    let any_folder_unread =
+        |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+            view.update(vcx, |v, cx| {
+                v.jump_panel_sections(cx)
+                    .0
+                    .iter()
+                    .flat_map(|s| &s.workspace_folders)
+                    .any(|f| f.has_unread)
+            })
+        };
+    // Guard the setup is non-vacuous: a folder actually owns the S1 tile.
+    assert!(
+        view.update(vcx, |v, cx| {
+            v.jump_panel_sections(cx)
+                .0
+                .iter()
+                .flat_map(|s| &s.workspace_folders)
+                .flat_map(|f| &f.tiles)
+                .any(|t| t.agent.is_some())
+        }),
+        "a workspace folder must own the bound agent tile (setup non-vacuous)"
+    );
+
+    assert!(
+        !any_folder_unread(&view, vcx),
+        "a freshly-booted session is read ⇒ no folder marked unread"
+    );
+
+    // A turn ended while unfocused elsewhere sets AgentState.unread — the same
+    // field agent.rs turn-end writes. (The projection reads it directly; the
+    // focus-clear path is separate and not triggered here.)
+    let _ = id;
+    session.update(vcx, |s, _| s.state.unread = true);
+    assert!(
+        any_folder_unread(&view, vcx),
+        "an unread session inside the workspace marks its folder unread"
+    );
+
+    // Clearing unread (the user looked at the output) drops the folder mark.
+    session.update(vcx, |s, _| s.state.unread = false);
+    assert!(
+        !any_folder_unread(&view, vcx),
+        "the folder mark clears when the contained session is read"
+    );
+}
+
 /// bug-0021 / `UXI-AgentTile-27` property 1 (amended): the one-shot autoname is armed
 /// by SESSION IDENTITY, not by which constructor built the state. A session that
 /// arrives by ATTACH (created free from the jump panel, `/clear`ed, or restored)

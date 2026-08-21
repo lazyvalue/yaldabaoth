@@ -13,6 +13,20 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Jump-panel workspace color = session state** — `NEEDS-RUNTIME` (2026-08-21
+  via `/new-ux`; `UXI-JumpPanel-31` new, `UXI-JumpPanel-30` amended). Shipped: a
+  workspace folder's identity color is state-driven — **red** (`jump_header`) if
+  any owned session is unread (`AgentState.unread`), else **orange**
+  (`jump_working`) if any is working, else **blue** (`jump_subheader`); strict
+  precedence red > orange > blue via the pure `jump_workspace_state_color`
+  selector. The separate `◆` working dot on the folder header was removed (orange
+  now carries it). Folio `jump_subheader` restored to denim `#5a7fa8` (idle blue).
+  Headless guards: `jump_workspace_color_precedence_red_over_orange_over_blue`
+  (both negative controls observed RED) + `workspace_folder_marks_contained_unread_session`;
+  working derivation stays on `workspace_folder_marks_contained_working_agent`.
+  681 gpui tests pass (2 pre-existing session-server env failures unrelated).
+  Runtime-open: exact rendered hue/contrast per theme (paint, gap #1).
+
 - **Leader-menu restructure: tile menu + system menu + layout modes** —
   `NEEDS-RUNTIME` (2026-08-19 via `/new-ux`; graph 896; branch `menu-updates`;
   `UXI-Menu-8`/`UXI-Menu-9` amended, `UXI-Workspace-26` new). Captured verbatim:

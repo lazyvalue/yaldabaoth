@@ -60,6 +60,19 @@ art-directs its own palette-native set (see its `AgentTheme::nightfox`).
 Binding (in-use vs free) is no longer shown by the dot — the dot is purely an
 activity signal.
 
+### Workspace folder identity (UXI-JumpPanel-31)
+A workspace folder's identity color (glyph `⊞`, fold caret, count pill, rail,
+outline, wash — all via `jump_workspace_group_style`) is state-driven, not fixed:
+
+| Folder state | Color | Token |
+|--------------|-------|-------|
+| Any owned session **unread** | red | `st.err` (`agent.jump_header`) |
+| else any owned session **working** | orange | `working_orange` (`agent.jump_working`) |
+| else idle | blue | `electric` (`agent.jump_subheader`) |
+
+Precedence is strict red > orange > blue. The former collapsed-folder `◆` working
+dot is gone — orange now carries "working inside" (`UXI-JumpPanel-30` amended).
+
 ### Placeholders
 - "No sessions." — `st.dim`, mono (not italic).
 

@@ -314,6 +314,27 @@ pub(crate) fn jump_workspace_group_style(
     }
 }
 
+/// UXI-JumpPanel-31: pick a workspace folder's identity color from the aggregate
+/// state of the sessions it owns, in strict precedence **red > orange > blue**:
+/// `unread_red` when any owned session is unread, else `working_orange` when any
+/// is working, else `idle_blue`. Pure so the precedence is headless-testable
+/// independent of paint.
+pub(crate) fn jump_workspace_state_color(
+    has_unread: bool,
+    has_working: bool,
+    unread_red: Hsla,
+    working_orange: Hsla,
+    idle_blue: Hsla,
+) -> Hsla {
+    if has_unread {
+        unread_red
+    } else if has_working {
+        working_orange
+    } else {
+        idle_blue
+    }
+}
+
 pub(crate) fn jump_workspace_membership_label(tile_count: usize) -> String {
     format!(
         "{tile_count} {}",
@@ -704,6 +725,12 @@ pub(crate) struct JumpWorkspaceFolder {
     /// agent inside it is busy. Derived from the folder's `tiles` so it uses the
     /// same per-session `AgentActivity` the rows do — one source of truth.
     pub(crate) has_working_agent: bool,
+    /// UXI-JumpPanel-31: at least one agent tile this workspace owns binds a
+    /// session that is **unread** (`AgentRow.unread` = `AgentState.unread`, a
+    /// finished turn whose output the user has not looked at). Drives the
+    /// highest-precedence (red) workspace identity color. Derived from the same
+    /// `tiles` as `has_working_agent`, one source of truth.
+    pub(crate) has_unread: bool,
 }
 
 /// One rendered project section in the jump panel (UXI-Project-3): a project's
@@ -848,6 +875,13 @@ impl YaldaGpuiView {
                             .as_ref()
                             .is_some_and(|row| row.activity() == AgentActivity::Working)
                     });
+                    // UXI-JumpPanel-31: the folder is "unread" if any tile it owns
+                    // binds a session with a finished-but-unlooked-at turn. Reuses
+                    // the row's `unread` (= `AgentState.unread`), so it tracks the
+                    // exact per-session unread ledger the tiles do.
+                    let has_unread = tiles
+                        .iter()
+                        .any(|t| t.agent.as_ref().is_some_and(|row| row.unread));
                     JumpWorkspaceFolder {
                         index,
                         key: Self::workspace_fold_key(&p.name, &wsp.auto_name),
@@ -856,6 +890,7 @@ impl YaldaGpuiView {
                             && self.workspace.active_workspace == index,
                         tiles,
                         has_working_agent,
+                        has_unread,
                     }
                 })
                 .collect();
@@ -1863,9 +1898,19 @@ impl YaldaGpuiView {
                 let label = folder.label.clone();
                 let drag_label: SharedString = label.clone().into();
                 let tile_count = folder.tiles.len();
-                let has_working = folder.has_working_agent;
                 let count_label = jump_workspace_membership_label(tile_count);
-                let group_style = jump_workspace_group_style(folder.active, st.fg, electric);
+                // UXI-JumpPanel-31: the folder's identity color reflects the state
+                // of the sessions it owns — red (unread) > orange (working) > blue
+                // (idle). `st.err` is the panel red (`jump_header`), `working_orange`
+                // the working star hue, `electric` the resting subheader blue.
+                let ws_color = jump_workspace_state_color(
+                    folder.has_unread,
+                    folder.has_working_agent,
+                    st.err,
+                    working_orange,
+                    electric,
+                );
+                let group_style = jump_workspace_group_style(folder.active, st.fg, ws_color);
                 let header = div()
                     .id(SharedString::from(format!("jump-ws-{idx}")))
                     .flex()
@@ -1937,20 +1982,9 @@ impl YaldaGpuiView {
                                 },
                             ),
                     )
-                    // UXI-JumpPanel-30: a warm ◆ when any agent tile inside this
-                    // workspace is working, so a collapsed folder still shows it.
-                    .children(has_working.then(|| {
-                        probe_bounds_dyn(
-                            format!("jump-ws-working-{idx}"),
-                            div()
-                                .flex_none()
-                                .mr_1()
-                                .text_color(working_orange)
-                                .font_family(st.mono.clone())
-                                .child(SharedString::new_static("◆"))
-                                .into_any_element(),
-                        )
-                    }))
+                    // UXI-JumpPanel-31: "a working agent inside" is now conveyed by
+                    // the folder's orange identity color (`ws_color`), not a separate
+                    // ◆ dot (UXI-JumpPanel-30 amended — dot removed).
                     .child(probe_bounds_dyn(
                         format!("jump-workspace-count-{idx}"),
                         compact_status_mark(
