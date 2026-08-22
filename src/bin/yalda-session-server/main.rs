@@ -908,6 +908,30 @@ struct ResumeJob {
     cwd: PathBuf,
     provider: AgentProvider,
     acp_session_id: String,
+    expected_generation: u64,
+}
+
+/// Resolve the canonical stream position for the first channel published after
+/// durable recovery. This is kept at the recovery boundary so the seed state,
+/// watch channels, and resume worker cannot choose different generations.
+fn recovered_stream_position(event_log: &[Notification]) -> (u64, u64) {
+    let generation = event_log
+        .iter()
+        .filter_map(|note| match note {
+            Notification::Agent { event } => Some(event.generation),
+            _ => None,
+        })
+        .max()
+        .map(|generation| {
+            generation
+                .checked_add(1)
+                .expect("durable channel generation exhausted")
+        })
+        .unwrap_or(0);
+    // `AgentEvent.seq` is per generation. A recovered server channel is a new
+    // generation, so its first `ChannelOpened` must start at seq 0 rather than
+    // continuing the maximum seq from an older generation.
+    (generation, 0)
 }
 
 /// The single-writer actor state: it OWNS the sessions map (no Mutex). Mutated
@@ -1205,20 +1229,7 @@ fn restore_seed_from_disk(
             }
         };
 
-        // Phase-8 Stage A: resume the agent seq one past the highest persisted
-        // `Agent` seq on this (generation-0) recovered log, so post-restore
-        // agent events extend the durable seq space monotonically (spec §2/§5 —
-        // turn/seq forwarded verbatim, then continue).
-        let agent_seq = rs
-            .event_log
-            .iter()
-            .filter_map(|n| match n {
-                Notification::Agent { event } => Some(event.seq),
-                _ => None,
-            })
-            .max()
-            .map(|m| m + 1)
-            .unwrap_or(0);
+        let (channel_generation, agent_seq) = recovered_stream_position(&rs.event_log);
         // Stage B: recovery always starts from `log_base == 0` — the on-disk WAL
         // is never trimmed, so the restored transcript is a faithful append-
         // ordered prefix from seq 0 (spec §6 / ringbuffer note: on restart
@@ -1237,9 +1248,9 @@ fn restore_seed_from_disk(
         // Seed the watch with the recovered log so the first tail sees history.
         let (log_tx, _) = watch::channel(LogSnapshot {
             log: event_log.clone(),
-            generation: 0,
+            generation: channel_generation,
         });
-        let (gen_watch, _) = watch::channel(0u64);
+        let (gen_watch, _) = watch::channel(channel_generation);
         let session = ManagedSession {
             id: sid.clone(),
             label: rs.label.clone(),
@@ -1248,7 +1259,7 @@ fn restore_seed_from_disk(
             acp_session_id: acp_session_id.clone(),
             archived: rs.archived,
             channel: None,
-            channel_generation: 0,
+            channel_generation,
             gen_watch,
             turns: rs.turns,
             permission_mode: rs.permission_mode,
@@ -1288,6 +1299,7 @@ fn restore_seed_from_disk(
                 cwd: rs.cwd,
                 provider: rs.provider,
                 acp_session_id,
+                expected_generation: channel_generation,
             });
         }
     });
@@ -1306,6 +1318,7 @@ fn spawn_resume_worker(
         cwd,
         provider,
         acp_session_id,
+        expected_generation,
     } = job;
     std::thread::Builder::new()
         .name(format!(
@@ -1326,18 +1339,22 @@ fn spawn_resume_worker(
                 YaldaFrontend::Gpui,
             ) {
                 Ok(client) => {
-                    // Resume from disk → is_respawn=false (generation stays 0).
+                    // Resume from disk → is_respawn=false. Recovery already
+                    // selected the committed generation, so publish against that
+                    // exact seed without incrementing it a second time.
                     //
-                    // MINOR (5): `apply_channel_state` then records a ChannelOpened
-                    // at generation 0 — but the RECOVERED log may ALREADY contain a
-                    // gen-0 ChannelOpened from the original session, so the restored
-                    // transcript can carry TWO gen-0 ChannelOpened events. This is
-                    // HARMLESS for the §4 generation-delta rebaseline: a consumer
-                    // rebaselines only on a STRICTLY-newer generation, and both are
-                    // gen 0, so the second is an idempotent no-op (its
-                    // `reset_for_replay` would just rebuild the same prefix). Noted
-                    // so a future reader doesn't treat the duplicate as a bug.
-                    publish_channel(&cmd_tx, &session_id, client, 0, false, true);
+                    // The recovered generation is strictly newer than every
+                    // durable Agent event. The new ChannelOpened is therefore an
+                    // unambiguous rebaseline signal even when an older hard
+                    // restart already left generation-1 history in the WAL.
+                    publish_channel(
+                        &cmd_tx,
+                        &session_id,
+                        client,
+                        expected_generation,
+                        false,
+                        true,
+                    );
                 }
                 Err(e) => {
                     tracing::error!(
@@ -1347,7 +1364,7 @@ fn spawn_resume_worker(
                     );
                     let _ = cmd_tx.send(Command::SpawnFailed {
                         sid: session_id,
-                        expected_generation: 0,
+                        expected_generation,
                         reason: format!("resume failed: {e}"),
                     });
                 }
@@ -3376,6 +3393,80 @@ async fn main() -> io::Result<()> {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    /// Regression (bug-0053): a server restart is a new channel generation.
+    /// The durable WAL may already contain generation 1 from an earlier hard
+    /// session restart; restarting the whole server must therefore seed the
+    /// resumed channel at generation 2 with a fresh per-generation sequence.
+    /// Otherwise the GUI replays generation 1, then rejects every live
+    /// generation-0 response as stale while the backend completes it normally.
+    #[test]
+    fn recovered_wal_resumes_strictly_after_its_highest_agent_generation() {
+        use yalda::agent_event::{AgentEvent, AgentEventKind};
+
+        let dir = tempfile::tempdir().expect("WAL tempdir");
+        let mut wal = yalda::session_wal::SessionWal::create_for_provider(
+            dir.path(),
+            "recovered-generation",
+            "recovered generation",
+            std::path::Path::new("/tmp/project"),
+            PermissionMode::ReadOnly,
+            AgentProvider::Codex,
+        )
+        .expect("create WAL");
+        let path = wal.path().to_path_buf();
+        wal.append(
+            &Notification::SessionAttached {
+                session_id: "recovered-generation".into(),
+                acp_session_id: Some("acp-recovered-generation".into()),
+            },
+            false,
+        )
+        .expect("append resume identity");
+        wal.append(
+            &Notification::Agent {
+                event: AgentEvent::new(
+                    "recovered-generation".into(),
+                    1,
+                    7,
+                    41,
+                    AgentEventKind::ChannelOpened { resumed: true },
+                ),
+            },
+            false,
+        )
+        .expect("append prior generation");
+        drop(wal);
+
+        let recovered = yalda::session_wal::recover_one(&path)
+            .expect("read WAL")
+            .expect("recover session");
+        assert_eq!(
+            recovered_stream_position(&recovered.event_log),
+            (2, 0),
+            "the first post-restart channel must be newer than durable history, \
+             and its per-generation sequence must restart at zero"
+        );
+        assert_eq!(
+            recovered_stream_position(&[]),
+            (0, 0),
+            "a legacy/empty WAL keeps brand-new generation-zero behavior"
+        );
+        let fresh = new_managed_session(
+            "fresh-generation".into(),
+            "fresh generation".into(),
+            PathBuf::from("/tmp/project"),
+            AgentProvider::Codex,
+            PermissionMode::ReadOnly,
+            None,
+            None,
+        );
+        assert_eq!(
+            (fresh.channel_generation, fresh.agent_seq),
+            (0, 0),
+            "brand-new sessions still start at generation zero, sequence zero"
+        );
+    }
 
     /// Recovery must apply the same cap to active and archived WAL images
     /// before either can be attached.  Archived sessions never produce the
