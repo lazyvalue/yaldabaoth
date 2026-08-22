@@ -2584,6 +2584,23 @@ impl YaldaGpuiView {
         leaves: &[(workspace::WindowId, Option<ServerSid>)],
         cx: &mut Context<Self>,
     ) {
+        // UXI-JumpPanel-16: archived sessions are cold storage.  Their durable
+        // tile identity survives restart, but they must not materialize a local
+        // AgentSession or join the eager attach batch.  The Archived-tab roster
+        // activation already knows how to turn this Dormant tile into a Bound
+        // read-only transcript on explicit demand.
+        let mut live_leaves = Vec::with_capacity(leaves.len());
+        for (leaf_id, remembered) in leaves {
+            if let Some(sid) = remembered
+                && self.jump_archived_sessions.contains(sid.as_str())
+            {
+                self.install_agent_tile(*leaf_id, AgentTile::dormant(sid.clone()));
+                continue;
+            }
+            live_leaves.push((*leaf_id, remembered.clone()));
+        }
+        let leaves = live_leaves.as_slice();
+
         let proc_cwd = process_cwd();
         let persisted = load_persisted_acp_sessions(&proc_cwd);
 
