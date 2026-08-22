@@ -1650,7 +1650,15 @@ impl TranscriptView {
                         // OUTSIDE the transcript (Model C). Word-wrapped (UXI-AgentTile-9);
                         // active caret on its visual row, windowed (UXI-TextEditing-1).
                         let accent = cursor_color; // RED — the block caret
-                        let ws_accent = nc(at_snap.warm_accent); // TEAL — border + label
+                        // The ACTIVE (live-compose) block reads RED — border + label +
+                        // wash — so an in-progress turn is visually distinct from the
+                        // SENT turns above it, which keep the teal accent. A parked
+                        // (read-only) insertion block stays teal.
+                        let ws_accent = crate::screens::you_block_accent(
+                            parked.is_none(),
+                            cursor_color,          // deep red (at.cursor / jump_header)
+                            nc(at_snap.warm_accent), // TEAL — sent/parked border + label
+                        );
                         let fg = self_editor_fg;
                         let sel_bg = nc(at_snap.selection_bg);
                         // (lines, caret_line, caret_col, mode, focused, selection, anchor_line)
@@ -1724,10 +1732,11 @@ impl TranscriptView {
                         // vs the nav-focus tint). Insert keeps the plain `You`.
                         let scoped_normal = focused && mode == EditMode::Normal;
                         let row_bg: Hsla = if active && focused {
-                            // Light TEAL wash behind the live draft — slighter while
-                            // typing (Insert) than at rest (Normal). Decoupled from the
-                            // RED block caret so it never bleeds pink (was `accent`@0.12).
-                            let mut h = crate::screens::worksheet_wash_teal();
+                            // Light RED wash behind the live draft — slighter while
+                            // typing (Insert) than at rest (Normal). Marks the ACTIVE
+                            // block; sent blocks above stay teal. (Was teal; reverted to
+                            // red per request — a brighter red than the deep border red.)
+                            let mut h = crate::screens::worksheet_wash_red();
                             h.a = crate::screens::worksheet_backdrop_alpha(mode);
                             h
                         } else if cursor_line == anchor_line {

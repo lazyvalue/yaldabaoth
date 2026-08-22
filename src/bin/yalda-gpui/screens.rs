@@ -22,6 +22,22 @@ pub(crate) fn worksheet_wash_teal() -> Hsla {
     gpui::rgb(0x2f9084).into()
 }
 
+/// The red used for the ACTIVE (live-compose) You-block backdrop wash. Sent
+/// blocks stay teal (their turn headers); only the block being typed goes red.
+/// Brighter/more saturated than the deeper `cursor`/`jump_header` red used for
+/// the border + label, so it still reads clearly RED at the low wash alphas.
+pub(crate) fn worksheet_wash_red() -> Hsla {
+    gpui::rgb(0xd6414c).into()
+}
+
+/// Accent (border + label) for an inline You-block. The ACTIVE (live-compose)
+/// block reads RED so an in-progress turn stands apart from the SENT turns above
+/// it, which keep the teal accent; a parked (read-only) block also stays teal.
+/// Pinned by `you_block_active_accent_is_red`.
+pub(crate) fn you_block_accent(active: bool, active_red: Hsla, resting_teal: Hsla) -> Hsla {
+    if active { active_red } else { resting_teal }
+}
+
 /// Test-only record of the source text and syntax background that the real
 /// virtualized Buffer edit renderer handed to GPUI for a visible line.
 #[cfg(test)]

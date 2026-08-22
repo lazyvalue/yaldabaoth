@@ -5945,6 +5945,31 @@ fn folio_jump_and_caret_colors() {
     assert_ne!(at.cursor, at.warm_accent, "caret (red) is decoupled from the teal accent");
 }
 
+/// The ACTIVE (live-compose) You-block reads RED — border + label via
+/// `you_block_accent`, and a brighter-red wash — so an in-progress turn is
+/// visually distinct from the SENT turns above it, which keep the teal accent.
+/// A parked (read-only) block also stays teal.
+#[test]
+fn you_block_active_accent_is_red() {
+    use gpui::Hsla;
+    let red: Hsla = gpui::rgb(0xd6_4f_5a).into(); // cursor / jump_header deep red
+    let teal: Hsla = gpui::rgb(0x40_67_64).into(); // warm_accent
+    // Active block → red accent; parked/sent → teal.
+    assert_eq!(crate::screens::you_block_accent(true, red, teal), red);
+    assert_eq!(crate::screens::you_block_accent(false, red, teal), teal);
+    // The wash behind the active draft is red-dominant (r > g and r > b) and
+    // distinct from the teal wash used before.
+    let wash: gpui::Rgba = crate::screens::worksheet_wash_red().into();
+    let teal_wash: gpui::Rgba = crate::screens::worksheet_wash_teal().into();
+    assert!(wash.r > wash.g && wash.r > wash.b, "active wash reads red");
+    assert!(teal_wash.g > teal_wash.r, "teal wash reads teal (sent stays teal)");
+    assert_ne!(
+        crate::screens::worksheet_wash_red(),
+        crate::screens::worksheet_wash_teal(),
+        "active wash is no longer the teal wash"
+    );
+}
+
 #[test]
 fn parse_naming_reply_tolerates_real_model_output() {
     use crate::agent_naming::parse_naming_reply;
