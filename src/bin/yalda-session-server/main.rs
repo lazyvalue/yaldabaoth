@@ -439,6 +439,65 @@ struct ManagedSession {
 /// every session (live + recovered) so all of a session's transcript streams.
 type BridgeTx = tokio::sync::mpsc::UnboundedSender<(ServerSessionId, Notification)>;
 
+/// Apply the Stage-B in-memory bound to one event log, including the honest
+/// `CompactedSummary` marker required by spec §6.  This is shared by the live
+/// append path and WAL recovery: recovery must compact *before* publishing the
+/// first watch snapshot, otherwise a client can attach to the unbounded WAL
+/// image and pin it before the first live event gets a chance to trim it.
+fn compact_event_log(
+    event_log: &mut yalda::event_log::EventLog,
+    session_id: &str,
+    generation: u64,
+    cap: usize,
+    floor: u64,
+) -> Option<usize> {
+    // Low-water mark: ¾ of the cap, leaving a slot for the prepended marker
+    // and headroom so the next several pushes don't re-trim.
+    let target = (cap * 3 / 4).max(1).min(cap.saturating_sub(1));
+    let trim = event_log.trim(cap, target, floor)?;
+
+    // The marker reuses the LAST-DROPPED slot: `prepend` decrements `log_base`
+    // by one so survivor seqs remain stable.
+    let through_turn = trim.through_turn.unwrap_or(0);
+    let marker_seq = trim.new_base.saturating_sub(1);
+    let marker = yalda::agent_event::AgentEvent::new(
+        session_id.to_string(),
+        generation,
+        through_turn,
+        marker_seq,
+        yalda::agent_event::AgentEventKind::CompactedSummary {
+            through_turn,
+            summary: format!(
+                "history compacted: {} earlier event(s) trimmed (through turn {through_turn})",
+                trim.dropped
+            ),
+        },
+    );
+    event_log.prepend(Notification::Agent { event: marker });
+    Some(trim.dropped)
+}
+
+/// Rebuild and immediately bound one WAL transcript.  Keeping construction and
+/// compaction behind one function makes it impossible for recovery callers to
+/// accidentally publish the raw, unbounded `Vec` again.
+fn event_log_from_recovery(
+    entries: Vec<Notification>,
+    session_id: &str,
+    generation: u64,
+    cap: usize,
+) -> (yalda::event_log::EventLog, usize) {
+    let mut event_log = yalda::event_log::EventLog::from_recovered(entries, 0);
+    let dropped = compact_event_log(
+        &mut event_log,
+        session_id,
+        generation,
+        cap,
+        u64::MAX,
+    )
+    .unwrap_or(0);
+    (event_log, dropped)
+}
+
 impl ManagedSession {
     fn info(&self) -> SessionInfo {
         SessionInfo {
@@ -505,41 +564,18 @@ impl ManagedSession {
         }
         self.event_log.push(note);
         let cap = yalda::event_log::event_log_cap();
-        // Low-water mark: ¾ of the cap, leaving a slot for the prepended marker
-        // and headroom so the next several pushes don't re-trim.
-        let target = (cap * 3 / 4).max(1).min(cap.saturating_sub(1));
         // Disconnect-before-gap (spec §6): evict any forwarder whose backlog has
         // crossed the high-water bound, so the floor below is not pinned by a
         // wedged consumer and the trim can bound growth.
         self.enforce_high_water();
         let floor = self.compaction_floor();
-        if let Some(trim) = self.event_log.trim(cap, target, floor) {
-            // Splice a CompactedSummary marker at the NEW front carrying the new
-            // base seq, so a from-base rebuild begins with "history compacted
-            // through turn N" rather than an unexplained jump (spec §6/§7).
-            //
-            // Bug 2: the marker reuses the LAST-DROPPED slot — `prepend` decrements
-            // `log_base` by one so survivor seqs stay stable. The marker's own seq
-            // must therefore be `new_base - 1` (the decremented base), so that after
-            // the prepend `marker.seq == log_base` and the seq space is contiguous.
-            let through_turn = trim.through_turn.unwrap_or(0);
-            let marker_seq = trim.new_base.saturating_sub(1);
-            let marker = yalda::agent_event::AgentEvent::new(
-                self.id.clone(),
-                self.channel_generation,
-                through_turn,
-                marker_seq,
-                yalda::agent_event::AgentEventKind::CompactedSummary {
-                    through_turn,
-                    summary: format!(
-                        "history compacted: {} earlier event(s) trimmed (through turn {through_turn})",
-                        trim.dropped
-                    ),
-                },
-            );
-            self.event_log
-                .prepend(Notification::Agent { event: marker });
-        }
+        compact_event_log(
+            &mut self.event_log,
+            &self.id,
+            self.channel_generation,
+            cap,
+            floor,
+        );
         self.publish_snapshot();
     }
 
@@ -1141,8 +1177,7 @@ fn restore_seed_from_disk(
     let Some(dir) = session_wal_dir() else {
         return (sessions, jobs);
     };
-    let recovered = yalda::session_wal::recover_all(&dir);
-    for rs in recovered {
+    yalda::session_wal::recover_each(&dir, |rs| {
         let sid = rs.server_session_id.clone();
         let acp_session_id = rs.acp_session_id.clone();
         if !rs.archived && acp_session_id.is_none() {
@@ -1151,7 +1186,7 @@ fn restore_seed_from_disk(
                 "discarding recovered session: no acp_session_id to resume"
             );
             let _ = std::fs::remove_file(&rs.path);
-            continue;
+            return;
         }
 
         let wal = if rs.archived {
@@ -1188,7 +1223,17 @@ fn restore_seed_from_disk(
         // is never trimmed, so the restored transcript is a faithful append-
         // ordered prefix from seq 0 (spec §6 / ringbuffer note: on restart
         // log_base resets to the seq of the first recovered event, which is 0).
-        let event_log = yalda::event_log::EventLog::from_recovered(rs.event_log, 0);
+        // Recovery previously exposed the entire WAL image until the first live
+        // append.  A fast GUI attach could install a floor at seq 0 first,
+        // preventing the trim and replaying hundreds of thousands of events.
+        // Compact while there are no subscribers, before the watch/actor/accept
+        // loop can publish this session.  The durable WAL remains untouched.
+        let (event_log, recovered_dropped) = event_log_from_recovery(
+            rs.event_log,
+            &sid,
+            0,
+            yalda::event_log::event_log_cap(),
+        );
         // Seed the watch with the recovered log so the first tail sees history.
         let (log_tx, _) = watch::channel(LogSnapshot {
             log: event_log.clone(),
@@ -1227,6 +1272,7 @@ fn restore_seed_from_disk(
         tracing::info!(
             session_id = %&sid[..8.min(sid.len())],
             events = session.event_log.len(),
+            recovered_dropped,
             turns = rs.turns,
             acp_session_id = %acp_session_id.as_deref().unwrap_or("<none>"),
             archived = rs.archived,
@@ -1244,7 +1290,7 @@ fn restore_seed_from_disk(
                 acp_session_id,
             });
         }
-    }
+    });
     (sessions, jobs)
 }
 
@@ -3330,6 +3376,50 @@ async fn main() -> io::Result<()> {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    /// Recovery must apply the same cap to active and archived WAL images
+    /// before either can be attached.  Archived sessions never produce the
+    /// later live append that used to trigger trimming, so covering both states
+    /// pins the production failure rather than only its active-session face.
+    #[test]
+    fn recovery_compacts_oversized_active_and_archived_logs_before_attach() {
+        use yalda::agent_event::{AgentEvent, AgentEventKind, ChunkRole};
+
+        for archived in [false, true] {
+            let sid = if archived { "archived" } else { "active" };
+            let mut entries = Vec::new();
+            for seq in 0..20 {
+                entries.push(Notification::Agent {
+                    event: AgentEvent::new(
+                        sid.into(),
+                        0,
+                        seq / 2,
+                        seq,
+                        AgentEventKind::Chunk {
+                            text: format!("chunk-{seq}"),
+                            role: ChunkRole::Message,
+                        },
+                    ),
+                });
+            }
+            let (log, dropped) = event_log_from_recovery(entries, sid, 0, 8);
+
+            assert_eq!(dropped, 14, "20 entries compact to the ¾-cap target");
+            assert_eq!(log.len(), 7, "six survivors plus one honest marker");
+            assert!(log.len() <= 8, "recovered log is bounded before attach");
+            assert_eq!(log.tip_seq(), 20, "compaction keeps the logical tip stable");
+            match &log.tail_from(0)[0] {
+                Notification::Agent { event } => match &event.kind {
+                    AgentEventKind::CompactedSummary { summary, .. } => {
+                        assert!(summary.contains("14 earlier event(s) trimmed"));
+                        assert_eq!(event.seq, log.log_base());
+                    }
+                    other => panic!("first recovered entry must be summary, got {other:?}"),
+                },
+                other => panic!("first recovered entry must be Agent marker, got {other:?}"),
+            }
+        }
+    }
 
     /// Regression (bug-0036 recurrence): two Codex questions submitted while a
     /// turn is active must remain FIFO native-steering requests. A later,

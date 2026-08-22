@@ -12033,6 +12033,78 @@ fn archive_detaches_tile_and_direct_jump_reopens_the_transcript(cx: &mut TestApp
     });
 }
 
+/// UXI-JumpPanel-16 restart boundary: a persisted archived leaf is restored as
+/// a lightweight Dormant identity, not a local AgentSession.  This is the real
+/// `restore_agent_leaves` entry point that previously put every archived sid in
+/// `spawn_attach_sessions`, producing the 119-session eager replay storm.
+#[gpui::test]
+fn archived_workspace_leaf_restores_dormant_without_eager_session(cx: &mut TestAppContext) {
+    use crate::{AgentTile, App, JumpTarget};
+    use yalda::session_proto::SessionInfo;
+
+    let (view, vcx) = boot_browser(cx);
+    let leaf = view.read_with(vcx, |v, _| {
+        v.workspace.focused_window_id().expect("focused leaf")
+    });
+    view.update(vcx, |v, cx| {
+        v.jump_archived_sessions.insert("S-archived".into());
+        v.restore_agent_leaves(
+            &[(leaf, Some(ServerSid::new("S-archived")))],
+            cx,
+        );
+    });
+
+    view.read_with(vcx, |v, _| {
+        assert!(
+            v.sessions
+                .locate(&ServerSid::new("S-archived"))
+                .is_none(),
+            "cold archived identity must not materialize an eager AgentSession"
+        );
+        assert!(matches!(
+            &v.workspace.tile(leaf).expect("restored leaf").content,
+            App::Agent(AgentTile::Dormant { remembered })
+                if remembered.as_str() == "S-archived"
+        ));
+    });
+
+    // Cold does not mean inaccessible: an explicit Archived-tab activation
+    // materializes the existing durable identity through the ordinary roster
+    // attach choke.
+    view.update(vcx, |v, cx| {
+        let pid = v.workspace.active_workspace().expect("workspace").project();
+        let cwd = v.projects.cwd_of(pid).expect("project cwd").to_path_buf();
+        v.agent_roster.upsert(SessionInfo {
+            session_id: "S-archived".into(),
+            acp_session_id: Some("acp-archived".into()),
+            label: "archived transcript".into(),
+            cwd,
+            provider: yalda::acp_channel::AgentProvider::Claude,
+            turns: 1,
+            connected: false,
+            permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+            busy: false,
+            archived: true,
+        });
+        crate::with_server_roster_jump_branch(|| {
+            v.jump_to_agent(JumpTarget::Roster("S-archived".into()), cx)
+        });
+    });
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert!(
+            v.sessions
+                .locate(&ServerSid::new("S-archived"))
+                .is_some(),
+            "an explicit Archived-tab visit materializes the local transcript view"
+        );
+        assert!(matches!(
+            &v.workspace.tile(leaf).expect("activated leaf").content,
+            App::Agent(AgentTile::Bound { .. })
+        ));
+    });
+}
+
 /// bug-0026 / UXI-JumpPanel-16: archiving an idle session through the real
 /// jump-row context menu removes it from the currently selected Waiting tab.
 ///

@@ -236,18 +236,27 @@ pub struct RecoveredSession {
 /// that can't be opened or whose header is unreadable is skipped with a log
 /// line rather than aborting the whole recovery.
 pub fn recover_all(dir: &Path) -> Vec<RecoveredSession> {
+    let mut out = Vec::new();
+    recover_each(dir, |session| out.push(session));
+    out
+}
+
+/// Recover session WALs one at a time, releasing each replay buffer before the
+/// next file is opened when the caller does not retain it.  Startup uses this
+/// form so a directory of long transcripts does not require all replay images
+/// to coexist in memory before per-session compaction.
+pub fn recover_each(dir: &Path, mut visit: impl FnMut(RecoveredSession)) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return Vec::new(), // no dir yet
+        Err(_) => return, // no dir yet
     };
-    let mut out = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("log") {
             continue;
         }
         match recover_one(&path) {
-            Ok(Some(s)) => out.push(s),
+            Ok(Some(s)) => visit(s),
             Ok(None) => {
                 eprintln!(
                     "[session-wal] skipping {}: empty or headerless",
@@ -259,7 +268,6 @@ pub fn recover_all(dir: &Path) -> Vec<RecoveredSession> {
             }
         }
     }
-    out
 }
 
 /// Replay a single WAL file. Returns `Ok(None)` if the file has no valid
