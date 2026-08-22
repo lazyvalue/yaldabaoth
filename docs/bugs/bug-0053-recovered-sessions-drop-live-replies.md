@@ -1,6 +1,6 @@
 # bug-0053: recovered-sessions-drop-live-replies
 
-**Status:** IN PROGRESS
+**Status:** FIXED
 **First seen:** 2026-08-22
 **Component:** session-server durable recovery / Agent Tile generation rebaseline
 
@@ -46,6 +46,15 @@ GUI's replayed high-water generation.
 - Guard the real WAL recovery boundary with a generation-1 transcript whose
   first post-restart stream position must be `(generation 2, seq 0)`.
 
+## Fix as shipped
+
+`recovered_stream_position` now derives one canonical recovery seed from the
+durable Agent stream: `max(event.generation) + 1` with per-generation sequence
+zero, or `(0, 0)` when no Agent history exists. `restore_seed_from_disk` uses
+that value for `ManagedSession.channel_generation`, `LogSnapshot`, `gen_watch`,
+and `ResumeJob.expected_generation`; `spawn_resume_worker` publishes against
+the same seed instead of a hard-coded zero.
+
 ## Approaches already tried
 
 - Restarting only the affected session is a valid immediate recovery but not a
@@ -69,3 +78,16 @@ GUI's replayed high-water generation.
 - Force-restarted only `integration meta planner`; it reattached at generation
   1, remained at 145 turns, and preserved its ACP session.
 
+### 2026-08-22 — monotonic recovery shipped and activated
+
+- Required negative control: the WAL-backed guard failed on the old recovery
+  behavior with `(0, 42)` instead of `(2, 0)`.
+- Fixed guard: green; all 51 `yalda-session-server` tests and the server build
+  passed.
+- Mutation gate: 5 generated mutations, 4 caught, 1 unviable, 0 missed.
+- Merged to `main` as `46746fd`, built the release server, and restarted the
+  runtime without deleting any WALs.
+- Runtime verification: 142 durable sessions = 121 archived + 21 live; all 21
+  live sessions connected and subscribed. `integration meta planner` retained
+  145 turns and recovered at channel generation 2, strictly above its durable
+  generation-1 history.
