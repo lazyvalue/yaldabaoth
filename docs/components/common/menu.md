@@ -255,8 +255,9 @@ level's keys are unique.
 
 > **Amended (menu restructure).** The shell root no longer holds tile verbs
 > (Close, Send) — those moved to the tile menu (`UXI-Menu-9`). It gained a
-> `layout` submenu (`UXI-Workspace-26`) and flattened the former `system`
-> submenu to the root. The Agent root gained the shared tile-menu tail + an
+> `layout` submenu (`UXI-Workspace-26`). New/Rename Workspace are direct root
+> commands, while rebuild actions live under Workspace → System. The Agent root
+> gained the shared tile-menu tail + an
 > Agent-only Archive.
 
 **Statement.** The Agent tile menu (`space`) leads with exactly five App-specific
@@ -270,12 +271,13 @@ and marks the currently visible choice. Advertised model choices use `1..9,0` so
 changing provider model names cannot create key collisions.
 
 The shell menu (`.`) contains these root entries, in this order: `n` New Tile,
-`t` Theme, `j` Toggle Jump Panel, `s` Show hidden tile, `l` Layout, `w`
-Workspace, `r` Rebuild and Restart GUI, `R` Rebuild and Restart All, and `` ` ``
-System Console. The Layout
+`t` Theme, `j` Toggle Jump Panel, `s` Show hidden tile, `l` Layout, `N` New
+Workspace, `r` Rename Workspace, `w` Workspace, and `` ` `` System Console.
+The Layout
 submenu carries the three arrangement modes (`c` columns, `t` tiling, `m`
-monocle) plus the primary-area adjustments; the Workspace submenu holds new /
-rename / close workspace, new project, and back-and-forth. Top-level Show
+monocle) plus the primary-area adjustments. The Workspace submenu holds close
+workspace, new project, back-and-forth, and `s` System; System contains `r`
+Rebuild and Restart GUI and `R` Rebuild and Restart All. Top-level Show
 (`UXI-Workspace-27`) stays present but is contextually dimmed when focus is on a
 solo-presented hidden or Detached tile rather than inside a workspace.
 Commands removed from these roots are not deleted; tile verbs live on the tile

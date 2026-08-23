@@ -3356,9 +3356,9 @@ fn gpui_menu_has_required_entries() {
     let mut leaf_actions: Vec<&str> = Vec::new();
     collect_leaves(&menu, &mut leaf_actions);
     // UXI-Menu-8 / UXI-Workspace-26: the shell root holds new-tile, theme,
-    // toggle-jump, Show, the layout-modes submenu, workspace ops, and the
-    // flattened system/dev commands. Tile-scoped verbs moved to the `<space>`
-    // tile menu.
+    // toggle-jump, Show, the layout-modes submenu, direct new/rename workspace
+    // commands, and the remaining workspace ops (including nested System).
+    // Tile-scoped verbs moved to the `<space>` tile menu.
     let expected = [
         "new-agent-tile",
         "new-buffer-tile",
@@ -3377,13 +3377,14 @@ fn gpui_menu_has_required_entries() {
         "primary-shrink",
         "primary-count-increase",
         "primary-count-decrease",
-        // workspace submenu
+        // direct workspace commands
         "new-workspace",
         "rename-workspace",
+        // workspace submenu
         "close-workspace",
         "new-project",
         "workspace-back-and-forth",
-        // flattened system/dev
+        // Workspace → System submenu
         "dev-restart-gui",
         "dev-restart-all",
         "open-system-console",
@@ -3440,21 +3441,70 @@ fn shell_menu_root_is_the_approved_items() {
             ("j".into(), "toggle jump panel"),
             ("s".into(), "show hidden tile"),
             ("l".into(), "layout"),
+            ("N".into(), "new workspace"),
+            ("r".into(), "rename workspace"),
             ("w".into(), "workspace"),
-            ("r".into(), "rebuild and restart gui"),
-            ("R".into(), "rebuild and restart all"),
             ("`".into(), "system console"),
         ],
         "the shell root is an exact contract; tile verbs belong on the tile menu"
     );
-    // The flattened system commands dispatch straight from the root.
-    for (key, expected) in [('r', "dev-restart-gui"), ('R', "dev-restart-all")] {
+
+    let workspace = menu
+        .iter()
+        .find(|node| node.label == "workspace")
+        .and_then(|node| match &node.action {
+            yalda::menu::MenuAction::Submenu(children) => Some(children),
+            _ => None,
+        })
+        .expect("Workspace submenu");
+    let workspace_items: Vec<(String, &str)> = workspace
+        .iter()
+        .filter(|node| {
+            matches!(node.kind(), MenuNodeKind::Command | MenuNodeKind::Submenu)
+        })
+        .map(|node| (format_menu_key(&node.key), node.label.as_str()))
+        .collect();
+    assert_eq!(
+        workspace_items,
+        vec![
+            ("x".into(), "close workspace"),
+            ("p".into(), "new project"),
+            ("b".into(), "back and forth"),
+            ("s".into(), "system"),
+        ],
+        "New/Rename belong at shell root; Workspace retains lifecycle/project ops and System"
+    );
+
+    // New/Rename dispatch straight from the root. `n` remains the New Tile
+    // submenu, so New Workspace uses the unambiguous uppercase `N`.
+    for (key, expected) in [('N', "new-workspace"), ('r', "rename-workspace")] {
         let mut state = MenuState::new();
         state.open();
         assert_eq!(
             state.process_key(KeyPress::new(Key::Char(key), KMods::NONE), &menu),
             Some(expected.to_string()),
             "root {key} must dispatch {expected}"
+        );
+    }
+
+    // Rebuild commands are nested at Workspace → System.
+    for (key, expected) in [('r', "dev-restart-gui"), ('R', "dev-restart-all")] {
+        let mut state = MenuState::new();
+        state.open();
+        assert_eq!(
+            state.process_key(KeyPress::new(Key::Char('w'), KMods::NONE), &menu),
+            None,
+            "w opens Workspace"
+        );
+        assert_eq!(
+            state.process_key(KeyPress::new(Key::Char('s'), KMods::NONE), &menu),
+            None,
+            "w s opens System"
+        );
+        assert_eq!(
+            state.process_key(KeyPress::new(Key::Char(key), KMods::NONE), &menu),
+            Some(expected.to_string()),
+            "w s {key} must dispatch {expected}"
         );
     }
 }
