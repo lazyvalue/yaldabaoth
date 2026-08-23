@@ -3094,23 +3094,15 @@ impl YaldaGpuiView {
                             // A strictly-newer generation is the §4 rebaseline
                             // signal — the respawned channel's `ChannelOpened` is
                             // its first event (session-server publishes it before
-                            // any content). It MUST be applied the instant it is
-                            // observed, even pre-gate: `apply_agent_event` runs
-                            // `reset_for_replay` on the bump. If instead we DEFER
-                            // it (skip pre-gate non-boundary events) the reset
-                            // lands on the new generation's first *boundary* — by
-                            // which point the legacy stream has rendered the whole
-                            // replayed history for the intervening generation(s),
-                            // and `reset_for_replay` wipes it. The gated reducer
-                            // skipped the Agent-stream copies, so that history can
-                            // never be rebuilt → on restore the transcript loses
-                            // everything up to the last live turn (bug-0002).
-                            // Rebaselining HERE resets only strictly-older
-                            // (superseded) content; the new generation's replay
-                            // then renders via the legacy stream and survives (no
-                            // later same-generation reset). `ChannelOpened` is
-                            // content-free, so applying it pre-gate cannot
-                            // double-apply against the legacy stream.
+                            // any content). Apply it immediately, even pre-gate,
+                            // so generation-scoped ledgers reset before any new
+                            // event is folded. The durable transcript is preserved:
+                            // the server replay fence suppresses duplicate ACP
+                            // history, so ChannelOpened is followed by ReplayEnd,
+                            // not by replacement content (bug-0002 activation
+                            // regression). `ChannelOpened` is content-free, so
+                            // applying it pre-gate cannot double-apply against the
+                            // legacy stream.
                             let is_rebaseline = event.generation > claude.generation;
                             if authoritative_before || is_boundary || is_rebaseline {
                                 let effect = Self::apply_agent_event(claude, event);
@@ -3759,11 +3751,12 @@ impl YaldaGpuiView {
     /// ## Rebaseline (spec §4)
     ///
     /// The uniform generation rule lives HERE: any event whose `generation` is
-    /// strictly greater than `claude.generation` runs `reset_for_replay` FIRST,
-    /// then advances `claude.generation`. `ChannelOpened` guarantees the bump
-    /// arrives as the channel's first event, but the rule is idempotent if a
-    /// later event is first-observed (a stray older-generation event after the
-    /// bump is ignored — its `generation < claude.generation`).
+    /// strictly greater than `claude.generation` resets generation-scoped
+    /// bookkeeping, while preserving the durable transcript already streamed by
+    /// the session server, then advances `claude.generation`. `ChannelOpened`
+    /// guarantees the bump arrives as the channel's first event, but the rule is
+    /// idempotent if a later event is first-observed (a stray older-generation
+    /// event after the bump is ignored — its `generation < claude.generation`).
     ///
     /// ## Additive gate (spec §9)
     ///
@@ -3780,12 +3773,15 @@ impl YaldaGpuiView {
         use yalda::agent_event::{AgentEventKind, ChunkRole, TurnOutcome};
 
         // ── Uniform rebaseline rule (spec §4) ───────────────────────────────
-        // A strictly-newer generation means a respawned channel; rebuild from
-        // scratch BEFORE applying this (the channel's first) event, then adopt
-        // the new generation. Idempotent: equal/older generations skip it, and
-        // an older-than-current event after a bump is dropped below.
+        // A strictly-newer generation means a respawned channel.  The server's
+        // durable log is already the transcript source of truth and its replay
+        // fence suppresses the resumed agent's duplicate history, so a channel
+        // boundary must NOT clear the editor: nothing after ChannelOpened would
+        // rebuild it.  Reset only generation-scoped ledgers, then adopt the new
+        // generation.  A full socket reconnect explicitly calls
+        // reset_for_replay BEFORE re-attach, where clearing is correct.
         if event.generation > claude.generation {
-            claude.reset_for_replay();
+            claude.begin_server_generation();
             claude.generation = event.generation;
         } else if event.generation < claude.generation {
             // A late straggler from a superseded channel — ignore it so it
@@ -3804,9 +3800,10 @@ impl YaldaGpuiView {
 
         match &event.kind {
             AgentEventKind::ChannelOpened { resumed: _ } => {
-                // The rebaseline already ran above (this is the channel's first
-                // event); nothing more to mutate. The status line is owned by
-                // the attach/reconnect path, so this arm is a near-no-op.
+                // The generation bookkeeping rebaseline already ran above (this
+                // is the channel's first event); nothing more to mutate. The
+                // durable transcript stays intact and the status line is owned
+                // by the attach/reconnect path.
                 AgentEventEffect::None
             }
             AgentEventKind::Chunk { text, role } => {

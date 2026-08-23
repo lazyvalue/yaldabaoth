@@ -4962,6 +4962,33 @@ impl AgentState {
         true
     }
 
+    /// Adopt a newer server channel generation without erasing the durable
+    /// transcript already folded into the editor.
+    ///
+    /// The session server owns transcript replay.  A full GUI re-attach starts
+    /// by calling [`Self::reset_for_replay`] and then streams its WAL from the
+    /// beginning.  A later `ChannelOpened` in that stream is only a channel
+    /// epoch boundary: the server's replay fence suppresses the resumed agent's
+    /// duplicate history, so there is no replacement transcript after it.  The
+    /// old `apply_agent_event` path called `reset_for_replay` again here and
+    /// erased everything the WAL had just rebuilt.
+    ///
+    /// Reset only state whose identity is generation-scoped.  Transcript
+    /// content, tool cards, render caches, plans, and usage remain authoritative
+    /// until newer durable events update them.  `settle_input_focus` retains the
+    /// historyless `/clear` invariant: a fresh worksheet is typeable as soon as
+    /// its channel opens.
+    pub(crate) fn begin_server_generation(&mut self) {
+        self.turn_phase = TurnPhase::Idle;
+        self.replay_turns = yalda::acp_channel::ReplayTurns::default();
+        self.reconciler.reset();
+        self.user_turn_ks.clear();
+        self.finalized.clear();
+        self.replay_prefix_finalized = false;
+        self.agent_stream_authoritative = false;
+        self.settle_input_focus();
+    }
+
     /// Reset all transcript-derived state to the empty baseline so that a
     /// server re-attach — which replays the session's full `event_log` — can
     /// rebuild the transcript from scratch without duplicating what's already
