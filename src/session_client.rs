@@ -61,6 +61,55 @@ fn fail_all_pending(
     }
 }
 
+/// Register and retire a blocking request's response slot in the caller's
+/// thread. Keeping this lifecycle out of the asynchronous writer closes two
+/// races: a very short timeout can no longer fire before registration, and a
+/// late response can never resurrect an already-timed-out entry.
+fn request_response(
+    request_tx: &std_mpsc::Sender<(Frame, Option<std_mpsc::Sender<Response>>)>,
+    connected: &Arc<AtomicBool>,
+    next_id: &Arc<AtomicU64>,
+    pending: &Arc<Mutex<std::collections::HashMap<u64, std_mpsc::Sender<Response>>>>,
+    req: Request,
+    timeout: Duration,
+) -> io::Result<Response> {
+    if !connected.load(Ordering::SeqCst) {
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "session server disconnected",
+        ));
+    }
+
+    let id = next_id.fetch_add(1, Ordering::SeqCst);
+    let (resp_tx, resp_rx) = std_mpsc::channel();
+    pending.lock().unwrap().insert(id, resp_tx);
+
+    let frame = Frame::Request { id, req };
+    if request_tx.send((frame, None)).is_err() {
+        pending.lock().unwrap().remove(&id);
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "writer thread gone",
+        ));
+    }
+
+    match resp_rx.recv_timeout(timeout) {
+        Ok(response) => Ok(response),
+        Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+            pending.lock().unwrap().remove(&id);
+            connected.store(false, Ordering::SeqCst);
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "session server disconnected",
+            ))
+        }
+        Err(std_mpsc::RecvTimeoutError::Timeout) => {
+            pending.lock().unwrap().remove(&id);
+            Err(io::Error::new(io::ErrorKind::TimedOut, "request timed out"))
+        }
+    }
+}
+
 impl SessionServerClient {
     /// Connect to the session server. Auto-launches it if not running.
     pub fn connect() -> io::Result<Self> {
@@ -231,7 +280,8 @@ impl SessionServerClient {
                 fail_all_pending(&pending_r);
             })?;
 
-        // Writer thread: sends outbound requests and registers pending slots.
+        // Writer thread: sends outbound frames. Blocking request callers
+        // register their own pending slots before enqueueing the frame.
         let connected_w = Arc::clone(&connected);
         let pending_w = Arc::clone(&pending);
         let writer = std::thread::Builder::new()
@@ -331,34 +381,18 @@ impl SessionServerClient {
 
     /// Send a request and wait for the response (blocking).
     fn request(&self, req: Request) -> io::Result<Response> {
-        if !self.is_connected() {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "session server disconnected",
-            ));
-        }
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let (resp_tx, resp_rx) = std_mpsc::channel();
-        let frame = Frame::Request { id, req };
-        self.request_tx
-            .send((frame, Some(resp_tx)))
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer thread gone"))?;
+        self.request_with_timeout(req, Duration::from_secs(30))
+    }
 
-        resp_rx
-            .recv_timeout(Duration::from_secs(30))
-            .map_err(|e| match e {
-                // The reader/writer thread dropped our pending sender on
-                // disconnect — fail fast as BrokenPipe so callers can
-                // distinguish "server gone" (→ reconnect) from a genuine
-                // 30s stall on a live connection.
-                std_mpsc::RecvTimeoutError::Disconnected => {
-                    self.connected.store(false, Ordering::SeqCst);
-                    io::Error::new(io::ErrorKind::BrokenPipe, "session server disconnected")
-                }
-                std_mpsc::RecvTimeoutError::Timeout => {
-                    io::Error::new(io::ErrorKind::TimedOut, "request timed out")
-                }
-            })
+    fn request_with_timeout(&self, req: Request, timeout: Duration) -> io::Result<Response> {
+        request_response(
+            &self.request_tx,
+            &self.connected,
+            &self.next_id,
+            &self.pending,
+            req,
+            timeout,
+        )
     }
 
     /// Send a request without waiting for a response (fire-and-forget).
@@ -686,30 +720,18 @@ impl SessionServerHandle {
     /// Blocking request/response — identical semantics to
     /// [`SessionServerClient::request`] but callable off-thread.
     fn request(&self, req: Request) -> io::Result<Response> {
-        if !self.is_connected() {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "session server disconnected",
-            ));
-        }
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let (resp_tx, resp_rx) = std_mpsc::channel();
-        let frame = Frame::Request { id, req };
-        self.request_tx
-            .send((frame, Some(resp_tx)))
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer thread gone"))?;
+        self.request_with_timeout(req, Duration::from_secs(30))
+    }
 
-        resp_rx
-            .recv_timeout(Duration::from_secs(30))
-            .map_err(|e| match e {
-                std_mpsc::RecvTimeoutError::Disconnected => {
-                    self.connected.store(false, Ordering::SeqCst);
-                    io::Error::new(io::ErrorKind::BrokenPipe, "session server disconnected")
-                }
-                std_mpsc::RecvTimeoutError::Timeout => {
-                    io::Error::new(io::ErrorKind::TimedOut, "request timed out")
-                }
-            })
+    fn request_with_timeout(&self, req: Request, timeout: Duration) -> io::Result<Response> {
+        request_response(
+            &self.request_tx,
+            &self.connected,
+            &self.next_id,
+            &self.pending,
+            req,
+            timeout,
+        )
     }
 
     pub fn list_sessions(&self) -> io::Result<Vec<SessionInfo>> {
@@ -828,5 +850,116 @@ impl SessionServerHandle {
             Response::Ok { .. } => Ok(()),
             Response::Error { message } => Err(io::Error::other(message)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timed_out_client_request_does_not_leak_pending_sender() {
+        let (client_stream, _server_stream) = UnixStream::pair().expect("socket pair");
+        let client = SessionServerClient::from_stream(client_stream).expect("client");
+
+        let err = client
+            .request_with_timeout(Request::Ping, Duration::from_millis(20))
+            .expect_err("silent peer must time out");
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            client.pending.lock().unwrap().is_empty(),
+            "timed-out client request must remove its pending sender"
+        );
+    }
+
+    #[test]
+    fn timed_out_handle_request_does_not_leak_pending_sender() {
+        let (client_stream, _server_stream) = UnixStream::pair().expect("socket pair");
+        let client = SessionServerClient::from_stream(client_stream).expect("client");
+        let handle = client.handle();
+
+        let err = handle
+            .request_with_timeout(Request::Ping, Duration::from_millis(20))
+            .expect_err("silent peer must time out");
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            handle.pending.lock().unwrap().is_empty(),
+            "timed-out handle request must remove its pending sender"
+        );
+    }
+
+    #[test]
+    fn late_response_after_timeout_is_ignored_without_poisoning_connection() {
+        let (client_stream, server_stream) = UnixStream::pair().expect("socket pair");
+        let client = SessionServerClient::from_stream(client_stream).expect("client");
+
+        let server = std::thread::spawn(move || {
+            let mut reader = io::BufReader::new(server_stream.try_clone().expect("clone peer"));
+            let mut writer = server_stream;
+
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("first request");
+            let first_id = match serde_json::from_str::<Frame>(&line).expect("first frame") {
+                Frame::Request { id, .. } => id,
+                other => panic!("expected request, got {other:?}"),
+            };
+            std::thread::sleep(Duration::from_millis(40));
+            writeln!(
+                writer,
+                "{}",
+                serde_json::to_string(&Frame::Response {
+                    id: first_id,
+                    result: Response::Ok {
+                        data: ResponseData::Pong,
+                    },
+                })
+                .unwrap()
+            )
+            .expect("late response");
+            writer.flush().expect("flush late response");
+
+            line.clear();
+            reader.read_line(&mut line).expect("second request");
+            let second_id = match serde_json::from_str::<Frame>(&line).expect("second frame") {
+                Frame::Request { id, .. } => id,
+                other => panic!("expected request, got {other:?}"),
+            };
+            writeln!(
+                writer,
+                "{}",
+                serde_json::to_string(&Frame::Response {
+                    id: second_id,
+                    result: Response::Ok {
+                        data: ResponseData::Pong,
+                    },
+                })
+                .unwrap()
+            )
+            .expect("second response");
+            writer.flush().expect("flush second response");
+        });
+
+        let err = client
+            .request_with_timeout(Request::Ping, Duration::from_millis(10))
+            .expect_err("first request must time out");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(
+            client.is_connected(),
+            "late response must not disconnect client"
+        );
+        assert!(matches!(
+            client
+                .request_with_timeout(Request::Ping, Duration::from_millis(100))
+                .expect("second response"),
+            Response::Ok {
+                data: ResponseData::Pong
+            }
+        ));
+        assert!(client.pending.lock().unwrap().is_empty());
+        server.join().expect("server thread");
     }
 }
