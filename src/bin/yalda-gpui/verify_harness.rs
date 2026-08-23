@@ -3823,9 +3823,9 @@ fn agent_reducer_finalize_is_idempotent_on_generation_turn(cx: &mut TestAppConte
     );
 }
 
-/// §4 generation rebaseline: a strictly-newer generation wipes the transcript
-/// FIRST, then adopts the new generation; a stray OLDER-generation event after
-/// the bump is ignored.
+/// §4 generation rebaseline: a strictly-newer server generation preserves the
+/// durable transcript, resets the new channel's ledgers, and ignores a stray
+/// OLDER-generation event after the bump.
 #[gpui::test]
 fn agent_reducer_rebaselines_on_newer_generation(cx: &mut TestAppContext) {
     use yalda::agent_event::{AgentEventKind as K, ChunkRole, TurnOutcome};
@@ -3860,9 +3860,9 @@ fn agent_reducer_rebaselines_on_newer_generation(cx: &mut TestAppContext) {
     });
     assert!(active_transcript_text(&view, vcx).contains("GEN1-CONTENT"));
 
-    // Gen 2 ChannelOpened: must reset_for_replay (wipe GEN1-CONTENT) and adopt
-    // gen 2. The gate resets too (a fresh channel), so the gen-2 chunk before
-    // the gen-2 boundary is NOT applied — matching the §9 first-turn rule.
+    // Gen 2 ChannelOpened adopts gen 2 without wiping GEN1-CONTENT. The gate
+    // resets (a fresh channel), so the gen-2 chunk before the gen-2 boundary is
+    // NOT applied — matching the §9 first-turn rule.
     view.update(vcx, |v, cx| {
         let batch = vec![
             agent_note("S1", 2, 1, 0, K::ChannelOpened { resumed: true }),
@@ -3903,8 +3903,8 @@ fn agent_reducer_rebaselines_on_newer_generation(cx: &mut TestAppContext) {
         assert_eq!(c.generation, 2, "adopted the newer generation");
         let text = c.editor.document().full_text();
         assert!(
-            !text.contains("GEN1-CONTENT"),
-            "the newer generation must wipe the old transcript; got:\n{text}"
+            text.contains("GEN1-CONTENT"),
+            "the newer server generation must preserve durable history; got:\n{text}"
         );
         assert!(text.contains("GEN2-CONTENT"), "gen-2 content rebuilt");
     });
@@ -3941,12 +3941,12 @@ fn agent_reducer_rebaselines_on_newer_generation(cx: &mut TestAppContext) {
 /// starts closed, so the legacy stream renders the replayed history while the
 /// reducer only observes boundaries. The bug: the generation bump's rebaseline
 /// was DEFERRED (pre-gate non-boundary Agent events skipped) until the new
-/// generation's `ReplayEnd` boundary — and `reset_for_replay` there wiped the
+/// generation's `ReplayEnd` boundary — and the old transcript reset there wiped
 /// legacy-rendered history that the reducer had skipped, so it vanished.
 ///
-/// The fix applies the rebaseline the instant the newer generation is observed
-/// (its `ChannelOpened`), which only wipes the superseded older generation; the
-/// new generation's replay then survives. Assert the replayed answer is present.
+/// The current server suppresses resumed duplicate history. This older mixed-log
+/// shape is retained as a compatibility guard: both the crashed partial prefix
+/// and the later recovered answer remain durable rather than being erased.
 #[gpui::test]
 fn restore_keeps_replayed_history_across_a_gate_closed_generation_bump(cx: &mut TestAppContext) {
     use yalda::acp_channel::ReplyEvent;
@@ -4026,12 +4026,143 @@ fn restore_keeps_replayed_history_across_a_gate_closed_generation_bump(cx: &mut 
         "the replayed history must survive a gate-closed generation bump on \
          restore (bug-0002); transcript was:\n{text}"
     );
-    // The crashed generation-0 attempt is correctly superseded by the respawn's
-    // replay — it must NOT linger alongside the recovered history.
+    // Both entries are in this synthetic durable log. A channel boundary is not
+    // allowed to silently delete either one; current servers avoid the duplicate
+    // shape by fencing ACP replay before it reaches the WAL.
     assert!(
-        !text.contains("GEN0-PARTIAL-then-crash"),
-        "the superseded (older-generation) crashed attempt must be wiped; \
+        text.contains("GEN0-PARTIAL-then-crash"),
+        "a channel boundary must not erase an earlier durable partial turn; \
          transcript was:\n{text}"
+    );
+}
+
+/// bug-0002 activation regression — the session server's durable log is the
+/// transcript source of truth.  On resume it records a newer-generation
+/// `ChannelOpened`, but its replay fence deliberately suppresses the agent's
+/// duplicate history; only `ReplayEnd` and metadata follow.  Replaying that WAL
+/// into a fresh GUI must therefore keep the already-folded durable history.
+#[gpui::test]
+fn restore_keeps_durable_history_when_resume_duplicates_are_fenced(cx: &mut TestAppContext) {
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::agent_event::{AgentEventKind as K, ChunkRole, TurnOutcome};
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let (view, vcx) = boot_with_bound_slot(cx, "S1");
+
+    // A settled durable turn from the pre-restart channel.  The first boundary
+    // flips the canonical-stream gate; the following chunk is therefore folded
+    // exactly as it is during a full WAL attach.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                agent_note("S1", 1, 0, 0, K::ChannelOpened { resumed: false }),
+                agent_note(
+                    "S1",
+                    1,
+                    0,
+                    1,
+                    K::TurnEnded {
+                        outcome: TurnOutcome::Completed,
+                    },
+                ),
+                agent_note(
+                    "S1",
+                    1,
+                    1,
+                    2,
+                    K::Chunk {
+                        text: "DURABLE-HISTORY-MUST-SURVIVE".into(),
+                        role: ChunkRole::Message,
+                    },
+                ),
+                agent_note(
+                    "S1",
+                    1,
+                    1,
+                    3,
+                    K::TurnEnded {
+                        outcome: TurnOutcome::Completed,
+                    },
+                ),
+            ],
+            cx,
+        );
+    });
+    assert!(
+        active_transcript_text(&view, vcx).contains("DURABLE-HISTORY-MUST-SURVIVE"),
+        "sanity: the recovered WAL prefix rendered before the resume boundary"
+    );
+
+    // Exact production tail after a server restart: the resumed channel opens,
+    // duplicate ACP history is discarded server-side, and only the replay-end
+    // marker reaches the durable log.  There is no replacement transcript after
+    // ChannelOpened, so treating it as an editor reset empties the tile.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                agent_note("S1", 2, 2, 0, K::ChannelOpened { resumed: true }),
+                agent_note(
+                    "S1",
+                    2,
+                    2,
+                    1,
+                    K::TurnEnded {
+                        outcome: TurnOutcome::ReplayEnd,
+                    },
+                ),
+                ServerNotification::ReplyEvent {
+                    session_id: "S1".into(),
+                    event: ReplyEvent::ReplayComplete,
+                },
+            ],
+            cx,
+        );
+    });
+
+    let text = active_transcript_text(&view, vcx);
+    assert!(
+        text.contains("DURABLE-HISTORY-MUST-SURVIVE"),
+        "a resumed generation with fenced duplicate replay must preserve the durable transcript; \
+         got:\n{text}"
+    );
+
+    // ReplayEnd flips the new generation's canonical gate. A following live
+    // event arrives in both additive streams but must render exactly once.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                agent_note(
+                    "S1",
+                    2,
+                    2,
+                    2,
+                    K::Chunk {
+                        text: "LIVE-AFTER-RESUME".into(),
+                        role: ChunkRole::Message,
+                    },
+                ),
+                ServerNotification::ReplyEvent {
+                    session_id: "S1".into(),
+                    event: ReplyEvent::Chunk("LIVE-AFTER-RESUME".into()),
+                },
+                agent_note(
+                    "S1",
+                    2,
+                    2,
+                    3,
+                    K::TurnEnded {
+                        outcome: TurnOutcome::Completed,
+                    },
+                ),
+            ],
+            cx,
+        );
+    });
+    let text = active_transcript_text(&view, vcx);
+    assert_eq!(
+        text.matches("LIVE-AFTER-RESUME").count(),
+        1,
+        "post-resume live output must apply exactly once; got:\n{text}"
     );
 }
 
@@ -14714,7 +14845,7 @@ fn repro_clear_worksheet_typed_text_repaints_simulated(cx: &mut TestAppContext) 
 
 /// REPRO B — THE REAL REDUCER PATH. After `/clear` the fresh server session's
 /// channel opens, which the reducer sees as a `ChannelOpened` that rebaselines
-/// the generation → `reset_for_replay` → `settle`. That is the exact step no
+/// generation-scoped state and re-settles input. That is the exact step no
 /// prior `/clear` test ran BEFORE the user types. We feed it to the ALREADY-bound
 /// session (the bind/attach dance can't run headlessly without a server — the
 /// deferred `spawn_attach_sessions` unbinds with no server; that's gap #2, not the
@@ -14738,8 +14869,8 @@ fn repro_clear_worksheet_typed_text_repaints_real_path(cx: &mut TestAppContext) 
     });
     vcx.run_until_parked();
 
-    // The fresh channel opens: ChannelOpened rebaselines gen → reset_for_replay →
-    // settle. THE UNTESTED TAIL — driven through the REAL reducer.
+    // The fresh channel opens: ChannelOpened rebaselines generation bookkeeping
+    // and settles input. THE UNTESTED TAIL — driven through the REAL reducer.
     view.update(vcx, |v, cx| {
         v.apply_server_batch(
             vec![agent_note(
