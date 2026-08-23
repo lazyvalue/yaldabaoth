@@ -1,7 +1,7 @@
 # Agent Tile — Compose
 
 Facet of the [Agent Tile](README.md) component. Owns `UXI-AgentTile-9..14`, `-21`,
-`-24`, `-35`, `-36`.
+`-24`, `-35`, `-36`, `-41`.
 
 ## Description
 
@@ -690,3 +690,48 @@ line, and asserts `r` opens the reply, quotes the older text, and
 `effective_you_block_anchor() == None` (tail). NC observed RED: restore the
 `if !you_block_anchor_is_legal(l) { return false }` guard ⇒ `r` no-ops on the
 older line.
+
+### UXI-AgentTile-41 — Up/Down recall previously-sent compose messages (shell-style)
+
+**Statement.** The compose keeps a per-session ring of previously-**sent** messages
+and browses it shell-style with the arrow keys, in **Insert** mode:
+
+1. **Up on the TOP logical line** walks BACK through sent history. On the first
+   step it **stashes the current unsent draft**; each further Up shows an older
+   entry; Up at the oldest entry stays put.
+2. **Down on the BOTTOM logical line** walks FORWARD; **past the newest entry it
+   restores the stashed unsent draft** and ends browsing. Down when not browsing
+   is ordinary caret motion.
+3. **Anywhere else Up/Down are ordinary caret motion** — in a multi-line draft the
+   arrows move the caret between rows; recall triggers only at the top (Up) /
+   bottom (Down) logical line, so vertical editing is never lost.
+4. A recalled entry replaces the draft as a **committed baseline** (caret at end,
+   no undo history); **editing it or leaving Insert ends browsing** (the recalled
+   text becomes the working line; a later Up re-stashes it).
+5. The ring is fed on **every successful submit** (both the chatbox/tail path and
+   the worksheet You-block path), trimmed, with an immediate duplicate of the
+   newest entry skipped, capped at `HISTORY_CAP` (200). It is **in-memory only**
+   (not persisted across restart).
+
+**Applies to.** `agent.rs`: `AgentState::{sent_history, history_nav}`, `HistoryNav`,
+`history_push`/`history_up`/`history_down`/`history_reset`, `Compose::set_recalled`.
+`agent_ui.rs`: the Up/Down recall interception in `handle_claude_key`'s compose
+dispatch (before `dispatch_insert_core`) + the browse-reset on edit, and the
+`history_push` calls at the two submit success branches (`submit_compose`,
+`submit_worksheet_blocks`).
+
+**Why.** Re-sending or tweaking a message you just sent meant retyping it. Up/Down
+recall is the ubiquitous shell/chat affordance; keying it off the top/bottom
+logical line keeps the existing compose caret-motion behavior intact.
+
+**Status.** `implemented`.
+
+**Enforcement.** Headless in `verify_harness.rs` (REAL `handle_claude_key` + REAL
+submit): `compose_up_down_recalls_sent_history` (Up walks back + stashes, Down walks
+forward + restores; NC-RED with the interception reverted),
+`compose_arrows_move_caret_in_multiline_draft` (arrows still move the caret; recall
+only at the top/bottom row — also NC-guards the `line == 0` gate), and
+`worksheet_real_submit_populates_history_ring` (`--features test-support`: a real
+worksheet submit lands in the ring; NC-RED with the `history_push` removed). Pure:
+`tests.rs::history_ring_push_recall_semantics` (trim / skip-empty / skip-dup / cap /
+stash-restore walk). NCs observed RED.

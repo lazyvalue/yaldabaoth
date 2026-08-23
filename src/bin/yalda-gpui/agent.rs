@@ -2688,6 +2688,35 @@ impl Compose {
         c.editor.cursor_mut().col = col;
         c
     }
+
+    /// Replace the draft with a recalled history entry (UXI-AgentTile-41): a
+    /// committed baseline (no undo history) with the caret at the very end, in
+    /// Insert mode. Only the TEXT is swapped — staged image attachments and the
+    /// scroll/window state are left intact, so browsing history doesn't drop a
+    /// pasted image.
+    pub(crate) fn set_recalled(&mut self, text: &str) {
+        self.editor = Editor::new(text.to_string(), std::path::PathBuf::from("*compose*"));
+        let last = self.editor.document().line_count().saturating_sub(1);
+        let col = self.editor.document().line_len_chars(last);
+        self.editor.cursor_mut().line = last;
+        self.editor.cursor_mut().col = col;
+        self.mode = EditMode::Insert;
+    }
+}
+
+/// Cap on `AgentState::sent_history` — the compose message-recall ring
+/// (UXI-AgentTile-41). Old entries drop off the front past this.
+pub(crate) const HISTORY_CAP: usize = 200;
+
+/// Shell-style compose message-recall browse state (UXI-AgentTile-41). Present
+/// only while the user is walking Up/Down through `AgentState::sent_history`.
+/// `idx` points into that ring (0 = oldest); `stash` is the unsent draft
+/// captured when browsing began, restored when the user walks forward past the
+/// newest entry.
+#[derive(Clone, Debug)]
+pub(crate) struct HistoryNav {
+    pub(crate) idx: usize,
+    pub(crate) stash: String,
 }
 
 /// The agent turn lifecycle as one explicit state (Finding 9). Replaces the
@@ -3610,6 +3639,15 @@ pub(crate) struct AgentState {
     /// buffer + the placement (`Worksheet` inline / `Chatbox` pinned). New
     /// sessions start in `Chatbox`; `Ctrl-Alt-Enter` toggles placement.
     pub(crate) input_surface: InputSurface,
+    /// Ring of previously-SENT compose messages, oldest first / newest last
+    /// (UXI-AgentTile-41). Fed on every successful submit; browsed shell-style
+    /// with Up/Down in the compose. Capped at `HISTORY_CAP`; in-memory only
+    /// (not persisted across restart).
+    pub(crate) sent_history: Vec<String>,
+    /// Active Up/Down history browse (UXI-AgentTile-41), or `None` when not
+    /// browsing. Holds the cursor into `sent_history` and the unsent draft
+    /// stashed when browsing began (restored on walking forward past newest).
+    pub(crate) history_nav: Option<HistoryNav>,
     /// Which surface holds keyboard focus (Model C — `design-c.md` §4.5).
     /// `Compose` (default): keystrokes edit the draft. `Transcript`: keystrokes
     /// drive read-only navigation/selection over the committed transcript, and
@@ -3978,6 +4016,70 @@ impl AgentState {
             .collect()
     }
 
+    /// Record a SENT compose message into the recall ring (UXI-AgentTile-41).
+    /// Trims; skips empties and an immediate duplicate of the newest entry;
+    /// caps the ring at `HISTORY_CAP`; always ends any active browse.
+    pub(crate) fn history_push(&mut self, text: &str) {
+        let t = text.trim();
+        self.history_nav = None;
+        if t.is_empty() || self.sent_history.last().map(String::as_str) == Some(t) {
+            return;
+        }
+        self.sent_history.push(t.to_string());
+        if self.sent_history.len() > HISTORY_CAP {
+            let overflow = self.sent_history.len() - HISTORY_CAP;
+            self.sent_history.drain(0..overflow);
+        }
+    }
+
+    /// Up-arrow recall (UXI-AgentTile-41): walk one step BACK through sent
+    /// history and return the entry to show. On the first step it stashes the
+    /// current unsent draft (`current`) so Down can restore it. `None` when
+    /// there is nothing to recall (empty history) — the caller then treats Up
+    /// as ordinary caret motion.
+    pub(crate) fn history_up(&mut self, current: &str) -> Option<String> {
+        if self.sent_history.is_empty() {
+            return None;
+        }
+        let idx = if let Some(nav) = self.history_nav.as_mut() {
+            nav.idx = nav.idx.saturating_sub(1);
+            nav.idx
+        } else {
+            let idx = self.sent_history.len() - 1;
+            self.history_nav = Some(HistoryNav {
+                idx,
+                stash: current.to_string(),
+            });
+            idx
+        };
+        Some(self.sent_history[idx].clone())
+    }
+
+    /// Down-arrow recall (UXI-AgentTile-41): walk one step FORWARD through sent
+    /// history; past the newest entry, restore the stashed unsent draft and end
+    /// browsing. `None` when not currently browsing — the caller then treats
+    /// Down as ordinary caret motion.
+    pub(crate) fn history_down(&mut self) -> Option<String> {
+        let len = self.sent_history.len();
+        let nav = self.history_nav.as_mut()?;
+        if nav.idx + 1 < len {
+            nav.idx += 1;
+            let idx = nav.idx;
+            Some(self.sent_history[idx].clone())
+        } else {
+            let stash = std::mem::take(&mut nav.stash);
+            self.history_nav = None;
+            Some(stash)
+        }
+    }
+
+    /// Leave history-browse mode (UXI-AgentTile-41): the current draft becomes
+    /// the working line; a later Up re-stashes it. Called whenever the compose
+    /// text is edited or the user leaves Insert.
+    pub(crate) fn history_reset(&mut self) {
+        self.history_nav = None;
+    }
+
     /// Re-seat panel focus after a panel open/close (UXI-AgentTile-3). If the active
     /// column is no longer focusable, hop to another open column; if none
     /// remain, leave panel focus (restoring the captured focus). No-op unless
@@ -4126,6 +4228,8 @@ impl AgentState {
             // exercise both placements explicitly; PRODUCTION defaults to Worksheet
             // (the two real constructors — stage 3 / bug-hunt-2 B3).
             input_surface: InputSurface::new(InputModeKind::Chatbox),
+            sent_history: Vec::new(),
+            history_nav: None,
             focus: AgentFocus::default(),
             you_block_open: false,
             you_block_anchor: None,
@@ -4212,6 +4316,8 @@ impl AgentState {
             lines_cache_seq: u64::MAX,
             highlight_cache: HighlightCache::new(),
             input_surface: InputSurface::new(InputModeKind::Worksheet),
+            sent_history: Vec::new(),
+            history_nav: None,
             focus: AgentFocus::Transcript,
             you_block_open: false,
             you_block_anchor: None,
