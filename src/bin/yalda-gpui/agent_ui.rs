@@ -3199,6 +3199,10 @@ impl YaldaGpuiView {
                         let msg = format!("detached: {reason}");
                         Self::append_system_notice(&mut slot.state, &msg);
                         slot.state.status = Some(msg.into());
+                        // A detached transport cannot still own an in-flight
+                        // local turn. Leaving Awaiting set here strands the tile
+                        // on "thinking" after the server has terminalized it.
+                        slot.state.turn_phase = TurnPhase::Idle;
                     });
                     warn_unrouted(routed, &session_id);
                 }
@@ -3294,6 +3298,10 @@ impl YaldaGpuiView {
                         let msg = format!("✗ message NOT delivered: {reason}");
                         Self::append_system_notice(&mut slot.state, &msg);
                         slot.state.status = Some(msg.into());
+                        // Rejection is terminal for the optimistic turn. The
+                        // restored draft is retryable, but no agent work is in
+                        // flight until that retry succeeds.
+                        slot.state.turn_phase = TurnPhase::Idle;
                         if let Some(cb) = slot.state.input_surface.chatbox_mut()
                             && cb.text().trim().is_empty()
                         {
@@ -5062,6 +5070,24 @@ impl YaldaGpuiView {
         let Some(id) = self.focused_bound_session() else {
             return;
         };
+
+        // Archived sessions are durable, read-only transcripts. A tile can
+        // remain open while archive state changes elsewhere, so reject here at
+        // the shared submit boundary before either worksheet or chatbox can
+        // optimistically commit a user turn.
+        if server_sid
+            .as_ref()
+            .is_some_and(|sid| self.jump_archived_sessions.contains(sid))
+        {
+            self.with_session(id, cx, |claude| {
+                claude.turn_phase = TurnPhase::Idle;
+                claude.status = Some(
+                    "session is archived — unarchive it before sending a message".into(),
+                );
+            });
+            cx.notify();
+            return;
+        }
 
         // UXI-AgentTile-22: an armed close confirm swallows the NEXT submit on
         // EITHER surface, so this sits above the worksheet/chatbox branch. The
