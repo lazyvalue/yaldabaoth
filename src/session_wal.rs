@@ -9,12 +9,11 @@
 //! ## Layout
 //!
 //! One append-only NDJSON file per session, `<dir>/<server_session_id>.log`.
-//! The first line is a [`WalRecord::Header`] (the session metadata that does
-//! NOT live in the event stream — label, cwd, permission mode); every
-//! subsequent line is a [`WalRecord::Event`] wrapping one [`Notification`] in
-//! `event_log` order. Recovery replays the file: header → session metadata,
-//! events → `event_log`. The `acp_session_id` needed to `--resume` the agent is
-//! re-derived from the last `SessionAttached` event, so the log is
+//! The first line is a [`WalRecord::Header`] (creation-time metadata); later
+//! records contain transcript events, last-write-wins metadata changes, and
+//! prompt intent/terminal pairs. Recovery replays the file into both the event
+//! log and the current session state. The `acp_session_id` needed to `--resume`
+//! the agent is re-derived from the last `SessionAttached` event, so the log is
 //! self-describing.
 //!
 //! ## Durability contract (ADR-0009)
@@ -22,10 +21,12 @@
 //! - Every event is `write()`-n immediately to the OS (no userspace buffering),
 //!   so a *process* crash loses nothing — the kernel still flushes its page
 //!   cache to disk.
-//! - `fsync` (`sync_data`) is issued only at **turn boundaries** (`UserPrompt`,
-//!   `TurnEnded`) — never per streamed token. Guarantee: **never lose a
-//!   completed turn or a sent prompt**; the worst case on power loss is an
-//!   in-flight stream tail (some `Chunk`s of an unfinished turn) truncating.
+//! - `fsync` (`sync_data`) is issued at **turn boundaries** (`UserPrompt`,
+//!   `TurnEnded`) and for lifecycle/metadata/prompt-intent transitions — never
+//!   per streamed token. Guarantee: **never lose a completed turn, admitted
+//!   prompt, or acknowledged session setting**; the worst case on power loss
+//!   is an in-flight stream tail (some `Chunk`s of an unfinished turn)
+//!   truncating.
 //! - Recovery tolerates a torn final line (a partial write interrupted by power
 //!   loss): it is skipped rather than aborting the whole replay.
 //!
@@ -39,7 +40,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::acp_channel::{AgentProvider, PermissionMode};
+use crate::acp_channel::{AgentProvider, ImageAttachment, PermissionMode, PromptPayload};
 use crate::session_proto::Notification;
 
 /// One line in a session WAL file.
@@ -69,11 +70,43 @@ enum WalRecord {
     /// rename over the header label. Older binaries that don't know this variant
     /// skip it on the `serde` error path and fall back to the header label
     /// (graceful downgrade), so no version bump is needed.
-    Rename { label: String },
+    Rename {
+        label: String,
+    },
     /// Durable cold-storage lifecycle flag. Last record wins. Separate from
     /// the transcript event stream so archive bookkeeping never paints as an
     /// agent turn and survives event-log compaction.
-    Archive { archived: bool },
+    Archive {
+        archived: bool,
+    },
+    /// Last permission selection. Metadata records are last-write-wins so a
+    /// safety-sensitive Yolo selection cannot silently revert after recovery.
+    Permission {
+        mode: PermissionMode,
+    },
+    /// Desired model selection, re-applied to every replacement transport.
+    Model {
+        model_id: String,
+    },
+    /// Durable prompt intent. A matching terminal record removes it from the
+    /// recovery queue; an unmatched intent is retried after a crash.
+    PromptIntent {
+        id: u64,
+        text: String,
+        images: Vec<ImageAttachment>,
+    },
+    PromptTerminal {
+        id: u64,
+        outcome: PromptOutcome,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptOutcome {
+    Delivered,
+    Rejected,
+    Cancelled,
 }
 
 /// On-disk WAL format version.
@@ -189,14 +222,48 @@ impl SessionWal {
         self.file.sync_data()
     }
 
+    pub fn append_permission_mode(&mut self, mode: PermissionMode) -> std::io::Result<()> {
+        self.write_record(&WalRecord::Permission { mode })?;
+        self.file.sync_data()
+    }
+
+    pub fn append_model(&mut self, model_id: &str) -> std::io::Result<()> {
+        self.write_record(&WalRecord::Model {
+            model_id: model_id.to_string(),
+        })?;
+        self.file.sync_data()
+    }
+
+    pub fn append_prompt_intent(
+        &mut self,
+        id: u64,
+        payload: &PromptPayload,
+    ) -> std::io::Result<()> {
+        self.write_record(&WalRecord::PromptIntent {
+            id,
+            text: payload.text.clone(),
+            images: payload.images.clone(),
+        })?;
+        self.file.sync_data()
+    }
+
+    pub fn append_prompt_terminal(
+        &mut self,
+        id: u64,
+        outcome: PromptOutcome,
+    ) -> std::io::Result<()> {
+        self.write_record(&WalRecord::PromptTerminal { id, outcome })?;
+        self.file.sync_data()
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
 
     /// Delete the WAL file — the session was explicitly closed, so its
     /// transcript should not be recovered on the next start.
-    pub fn remove(self) {
-        let _ = std::fs::remove_file(&self.path);
+    pub fn remove(self) -> std::io::Result<()> {
+        std::fs::remove_file(&self.path)
     }
 
     fn write_record(&mut self, rec: &WalRecord) -> std::io::Result<()> {
@@ -219,6 +286,8 @@ pub struct RecoveredSession {
     pub label: String,
     pub cwd: PathBuf,
     pub permission_mode: PermissionMode,
+    /// Last durable model selection, if the user chose one.
+    pub model_id: Option<String>,
     pub provider: AgentProvider,
     /// The replayed transcript, in order.
     pub event_log: Vec<Notification>,
@@ -230,6 +299,16 @@ pub struct RecoveredSession {
     pub turns: usize,
     /// Last durable archive marker; false for pre-archive WALs.
     pub archived: bool,
+    /// Intents without a terminal record, in original submission order.
+    pub pending_prompts: Vec<RecoveredPrompt>,
+    /// Next durable prompt identity (strictly greater than every seen id).
+    pub next_prompt_id: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecoveredPrompt {
+    pub id: u64,
+    pub payload: PromptPayload,
 }
 
 /// Recover every session WAL in `dir`. Missing dir → empty (first run). A file
@@ -284,6 +363,11 @@ pub fn recover_one(path: &Path) -> std::io::Result<Option<RecoveredSession>> {
     // than reverting to the creation-time label.
     let mut renamed_label: Option<String> = None;
     let mut archived = false;
+    let mut permission_override: Option<PermissionMode> = None;
+    let mut model_id: Option<String> = None;
+    let mut prompt_intents: Vec<RecoveredPrompt> = Vec::new();
+    let mut prompt_terminal = std::collections::HashSet::new();
+    let mut max_prompt_id: Option<u64> = None;
 
     for line in reader.lines() {
         let line = match line {
@@ -334,14 +418,34 @@ pub fn recover_one(path: &Path) -> std::io::Result<Option<RecoveredSession>> {
             WalRecord::Event(note) => event_log.push(note),
             WalRecord::Rename { label } => renamed_label = Some(label),
             WalRecord::Archive { archived: value } => archived = value,
+            WalRecord::Permission { mode } => permission_override = Some(mode),
+            WalRecord::Model { model_id: value } => model_id = Some(value),
+            WalRecord::PromptIntent { id, text, images } => {
+                max_prompt_id = Some(max_prompt_id.map_or(id, |seen| seen.max(id)));
+                prompt_intents.push(RecoveredPrompt {
+                    id,
+                    payload: PromptPayload { text, images },
+                });
+            }
+            WalRecord::PromptTerminal { id, .. } => {
+                max_prompt_id = Some(max_prompt_id.map_or(id, |seen| seen.max(id)));
+                prompt_terminal.insert(id);
+            }
         }
     }
 
-    let Some((server_session_id, header_label, cwd, permission_mode, provider)) = header else {
+    let Some((server_session_id, header_label, cwd, header_permission_mode, provider)) = header
+    else {
         return Ok(None);
     };
     // Last rename wins over the creation-time header label.
     let label = renamed_label.unwrap_or(header_label);
+    let permission_mode = permission_override.unwrap_or(header_permission_mode);
+    let pending_prompts = prompt_intents
+        .into_iter()
+        .filter(|intent| !prompt_terminal.contains(&intent.id))
+        .collect();
+    let next_prompt_id = max_prompt_id.map_or(1, |id| id.saturating_add(1));
 
     // Re-derive the agent resume id from the last SessionAttached. KEPT as a
     // control variant in the collapse (spec §1) precisely so this recovery
@@ -389,11 +493,14 @@ pub fn recover_one(path: &Path) -> std::io::Result<Option<RecoveredSession>> {
         label,
         cwd,
         permission_mode,
+        model_id,
         provider,
         event_log,
         acp_session_id,
         turns,
         archived,
+        pending_prompts,
+        next_prompt_id,
     }))
 }
 
@@ -521,9 +628,14 @@ mod tests {
         // label is used unchanged.
         let dir = tmp_dir("no-rename");
         {
-            let mut wal =
-                SessionWal::create(&dir, "s9", "keep-me", Path::new("/tmp"), PermissionMode::Yolo)
-                    .unwrap();
+            let mut wal = SessionWal::create(
+                &dir,
+                "s9",
+                "keep-me",
+                Path::new("/tmp"),
+                PermissionMode::Yolo,
+            )
+            .unwrap();
             wal.append(&chunk("x"), false).unwrap();
         }
         let recovered = recover_all(&dir);
@@ -770,11 +882,57 @@ mod tests {
     }
 
     #[test]
+    fn metadata_and_unsettled_prompt_intents_survive_recovery() {
+        let dir = tmp_dir("metadata-prompts");
+        let path = {
+            let mut wal = SessionWal::create_for_provider(
+                &dir,
+                "durable-state",
+                "durable state",
+                Path::new("/tmp/work"),
+                PermissionMode::ReadOnly,
+                AgentProvider::Codex,
+            )
+            .unwrap();
+            wal.append_permission_mode(PermissionMode::Yolo).unwrap();
+            wal.append_model("gpt-durable").unwrap();
+            wal.append_prompt_intent(
+                7,
+                &PromptPayload {
+                    text: "retry after crash".into(),
+                    images: vec![ImageAttachment {
+                        data: "aW1hZ2U=".into(),
+                        mime_type: "image/png".into(),
+                    }],
+                },
+            )
+            .unwrap();
+            wal.append_prompt_intent(8, &PromptPayload::text("already delivered"))
+                .unwrap();
+            wal.append_prompt_terminal(8, PromptOutcome::Delivered)
+                .unwrap();
+            wal.path().to_path_buf()
+        };
+
+        let recovered = recover_one(&path).unwrap().unwrap();
+        assert_eq!(recovered.permission_mode, PermissionMode::Yolo);
+        assert_eq!(recovered.model_id.as_deref(), Some("gpt-durable"));
+        assert_eq!(recovered.pending_prompts.len(), 1);
+        assert_eq!(recovered.pending_prompts[0].id, 7);
+        assert_eq!(
+            recovered.pending_prompts[0].payload.text,
+            "retry after crash"
+        );
+        assert_eq!(recovered.pending_prompts[0].payload.images.len(), 1);
+        assert_eq!(recovered.next_prompt_id, 9);
+    }
+
+    #[test]
     fn remove_deletes_file() {
         let dir = tmp_dir("remove");
         let wal =
             SessionWal::create(&dir, "s4", "l", Path::new("/tmp"), PermissionMode::Yolo).unwrap();
-        wal.remove();
+        wal.remove().unwrap();
         assert!(recover_all(&dir).is_empty());
     }
 }

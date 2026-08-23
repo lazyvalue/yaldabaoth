@@ -14,8 +14,8 @@ use std::collections::HashMap;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -335,6 +335,25 @@ enum Subcmd {
 
 // ── Managed session ────────────────────────────────────────────────
 
+/// Runtime lifecycle is intentionally separate from `channel: Option<_>`.
+/// `None` alone cannot distinguish a handshake that will publish shortly from
+/// a terminally disconnected process, and treating both alike is what allowed
+/// prompts to queue forever after a failed spawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionLifecycle {
+    Spawning,
+    Live,
+    Restarting,
+    Disconnected,
+    Archived,
+}
+
+#[derive(Debug, Clone)]
+struct PendingPrompt {
+    id: u64,
+    payload: PromptPayload,
+}
+
 struct ManagedSession {
     id: ServerSessionId,
     label: String,
@@ -346,6 +365,9 @@ struct ManagedSession {
     /// Durable lifecycle state. Archived sessions retain transcript metadata
     /// but own neither a transport nor an open WAL handle.
     archived: bool,
+    /// Explicit runtime state. The transport option remains the data-bearing
+    /// handle; this field owns the policy for prompt/cancel/retry behavior.
+    lifecycle: SessionLifecycle,
     /// The live ACP transport surface — the Send sub-handles of the
     /// `AcpChannelClient` whose `reply_rx` is owned by the pump thread. `None`
     /// while the subprocess is being spawned. The actor never holds the client
@@ -361,6 +383,8 @@ struct ManagedSession {
     gen_watch: watch::Sender<u64>,
     turns: usize,
     permission_mode: PermissionMode,
+    /// Desired model selection, persisted and re-applied after every spawn.
+    model_id: Option<String>,
     /// A turn is in flight (bug-0022). Set when a prompt is accepted by the
     /// channel, cleared when the turn completes (`TurnCount`) or a channel is
     /// (re)spawned — a respawn kills whatever was running, so a stale `true`
@@ -383,7 +407,9 @@ struct ManagedSession {
     forwarder: Option<ForwarderProgress>,
     /// Prompts that arrived before the ACP subprocess finished spawning.
     /// Drained in submission order once `channel` becomes `Some`.
-    pending_prompts: Vec<PromptPayload>,
+    pending_prompts: Vec<PendingPrompt>,
+    /// Monotonic identity for prompt intent/terminal WAL records.
+    next_prompt_id: u64,
     /// Every notification ever broadcast for this session, so a
     /// re-attaching GUI can replay the full transcript.
     ///
@@ -487,14 +513,8 @@ fn event_log_from_recovery(
     cap: usize,
 ) -> (yalda::event_log::EventLog, usize) {
     let mut event_log = yalda::event_log::EventLog::from_recovered(entries, 0);
-    let dropped = compact_event_log(
-        &mut event_log,
-        session_id,
-        generation,
-        cap,
-        u64::MAX,
-    )
-    .unwrap_or(0);
+    let dropped =
+        compact_event_log(&mut event_log, session_id, generation, cap, u64::MAX).unwrap_or(0);
     (event_log, dropped)
 }
 
@@ -729,6 +749,32 @@ impl ManagedSession {
         }
     }
 
+    fn begin_prompt_intent(&mut self, payload: PromptPayload) -> Result<PendingPrompt, String> {
+        let id = self.next_prompt_id;
+        if let Some(wal) = self.wal.as_mut() {
+            wal.append_prompt_intent(id, &payload)
+                .map_err(|error| format!("could not persist prompt before delivery: {error}"))?;
+        }
+        self.next_prompt_id = self.next_prompt_id.saturating_add(1);
+        Ok(PendingPrompt { id, payload })
+    }
+
+    fn finish_prompt_intent(&mut self, id: u64, outcome: yalda::session_wal::PromptOutcome) {
+        if let Some(wal) = self.wal.as_mut()
+            && let Err(error) = wal.append_prompt_terminal(id, outcome)
+        {
+            // Delivery has already happened (or terminal rejection/cancel was
+            // already decided). Keep serving live traffic but make the
+            // at-least-once recovery risk explicit in the log.
+            tracing::error!(
+                session_id = %&self.id[..8.min(self.id.len())],
+                prompt_id = id,
+                %error,
+                "WAL prompt terminal append failed; recovery may retry this intent"
+            );
+        }
+    }
+
     /// Publish a freshly-spawned channel's `TransportHandle` as this session's
     /// live transport, running the full attach choreography atomically under the
     /// caller's lock. The single chokepoint for create / restore / restart (9′)
@@ -770,17 +816,30 @@ impl ManagedSession {
         resumed: bool,
     ) -> Vec<(String, String)> {
         handle.set_permission_mode(self.permission_mode);
+        if let Some(model_id) = &self.model_id {
+            handle.set_model(model_id);
+        }
         let mut undelivered: Vec<(String, String)> = Vec::new();
         // bug-0022: a (re)spawn kills whatever turn was running, so the in-flight
         // flag starts false and is re-raised only by a queued prompt that
         // actually flushes onto the new channel. Without the reset a session
         // whose agent was restarted mid-turn would show "working" forever.
         self.busy = false;
-        for payload in std::mem::take(&mut self.pending_prompts) {
-            let text = payload.text.clone();
-            match handle.send_payload(payload) {
-                Ok(()) => self.busy = true, // a queued turn is now really running
+        for pending in std::mem::take(&mut self.pending_prompts) {
+            let text = pending.payload.text.clone();
+            match handle.send_payload(pending.payload) {
+                Ok(()) => {
+                    self.finish_prompt_intent(
+                        pending.id,
+                        yalda::session_wal::PromptOutcome::Delivered,
+                    );
+                    self.busy = true;
+                }
                 Err(e) => {
+                    self.finish_prompt_intent(
+                        pending.id,
+                        yalda::session_wal::PromptOutcome::Rejected,
+                    );
                     tracing::error!(error = %e, "queued prompt failed to flush — notifying submitter");
                     undelivered.push((
                         text,
@@ -819,6 +878,7 @@ impl ManagedSession {
         }
         handle.generation = self.channel_generation;
         self.channel = Some(handle);
+        self.lifecycle = SessionLifecycle::Live;
         // Arm (or disarm) the replay fence for THIS channel. A resumed channel
         // re-emits `self.turns` turns of history that are already in
         // `event_log` — the pump suppresses them until the worker's
@@ -883,15 +943,18 @@ fn new_managed_session(
         provider,
         acp_session_id: None,
         archived: false,
+        lifecycle: SessionLifecycle::Spawning,
         channel: None,
         channel_generation: 0,
         gen_watch,
         turns: 0,
         permission_mode,
+        model_id: None,
         busy: false,
         log_tx,
         forwarder: None,
         pending_prompts: Vec::new(),
+        next_prompt_id: 1,
         event_log,
         replay_fence: 0,
         wal,
@@ -907,7 +970,7 @@ struct ResumeJob {
     session_id: ServerSessionId,
     cwd: PathBuf,
     provider: AgentProvider,
-    acp_session_id: String,
+    acp_session_id: Option<String>,
     expected_generation: u64,
 }
 
@@ -1204,15 +1267,6 @@ fn restore_seed_from_disk(
     yalda::session_wal::recover_each(&dir, |rs| {
         let sid = rs.server_session_id.clone();
         let acp_session_id = rs.acp_session_id.clone();
-        if !rs.archived && acp_session_id.is_none() {
-            tracing::warn!(
-                session_id = %&sid[..8.min(sid.len())],
-                "discarding recovered session: no acp_session_id to resume"
-            );
-            let _ = std::fs::remove_file(&rs.path);
-            return;
-        }
-
         let wal = if rs.archived {
             None
         } else {
@@ -1239,12 +1293,8 @@ fn restore_seed_from_disk(
         // preventing the trim and replaying hundreds of thousands of events.
         // Compact while there are no subscribers, before the watch/actor/accept
         // loop can publish this session.  The durable WAL remains untouched.
-        let (event_log, recovered_dropped) = event_log_from_recovery(
-            rs.event_log,
-            &sid,
-            0,
-            yalda::event_log::event_log_cap(),
-        );
+        let (event_log, recovered_dropped) =
+            event_log_from_recovery(rs.event_log, &sid, 0, yalda::event_log::event_log_cap());
         // Seed the watch with the recovered log so the first tail sees history.
         let (log_tx, _) = watch::channel(LogSnapshot {
             log: event_log.clone(),
@@ -1258,17 +1308,31 @@ fn restore_seed_from_disk(
             provider: rs.provider,
             acp_session_id: acp_session_id.clone(),
             archived: rs.archived,
+            lifecycle: if rs.archived {
+                SessionLifecycle::Archived
+            } else {
+                SessionLifecycle::Spawning
+            },
             channel: None,
             channel_generation,
             gen_watch,
             turns: rs.turns,
             permission_mode: rs.permission_mode,
+            model_id: rs.model_id.clone(),
             // A recovered session has no live turn — whatever was running died
             // with the previous process (bug-0022).
             busy: false,
             log_tx,
             forwarder: None,
-            pending_prompts: Vec::new(),
+            pending_prompts: rs
+                .pending_prompts
+                .iter()
+                .map(|pending| PendingPrompt {
+                    id: pending.id,
+                    payload: pending.payload.clone(),
+                })
+                .collect(),
+            next_prompt_id: rs.next_prompt_id,
             event_log,
             replay_fence: rs.turns,
             wal,
@@ -1291,9 +1355,7 @@ fn restore_seed_from_disk(
         );
 
         sessions.insert(sid.clone(), session);
-        if !rs.archived
-            && let Some(acp_session_id) = acp_session_id
-        {
+        if !rs.archived {
             jobs.push(ResumeJob {
                 session_id: sid,
                 cwd: rs.cwd,
@@ -1313,6 +1375,7 @@ fn spawn_resume_worker(
     job: ResumeJob,
     spawner: Arc<dyn AgentSpawner>,
 ) {
+    let failure_tx = cmd_tx.clone();
     let ResumeJob {
         session_id,
         cwd,
@@ -1320,7 +1383,8 @@ fn spawn_resume_worker(
         acp_session_id,
         expected_generation,
     } = job;
-    std::thread::Builder::new()
+    let failure_sid = session_id.clone();
+    let spawn_result = std::thread::Builder::new()
         .name(format!(
             "acp-resume-{}",
             &session_id[..8.min(session_id.len())]
@@ -1335,11 +1399,11 @@ fn spawn_resume_worker(
                 provider,
                 &cmd,
                 Some(cwd),
-                Some(acp_session_id),
+                acp_session_id.clone(),
                 YaldaFrontend::Gpui,
             ) {
                 Ok(client) => {
-                    // Resume from disk → is_respawn=false. Recovery already
+                    // Resume/fresh recovery → is_respawn=false. Recovery already
                     // selected the committed generation, so publish against that
                     // exact seed without incrementing it a second time.
                     //
@@ -1353,7 +1417,7 @@ fn spawn_resume_worker(
                         client,
                         expected_generation,
                         false,
-                        true,
+                        acp_session_id.is_some(),
                     );
                 }
                 Err(e) => {
@@ -1369,8 +1433,14 @@ fn spawn_resume_worker(
                     });
                 }
             }
-        })
-        .ok();
+        });
+    if let Err(error) = spawn_result {
+        let _ = failure_tx.send(Command::SpawnFailed {
+            sid: failure_sid,
+            expected_generation,
+            reason: format!("could not start resume worker: {error}"),
+        });
+    }
 }
 
 // ── Manager actor task ─────────────────────────────────────────────
@@ -1491,9 +1561,7 @@ impl Manager {
                 reply,
             } => {
                 let (published, undelivered, busy_now) = match self.sessions.get_mut(&sid) {
-                    Some(s)
-                        if !s.archived && s.channel_generation == expected_generation =>
-                    {
+                    Some(s) if !s.archived && s.channel_generation == expected_generation => {
                         let undelivered = s.apply_channel_state(handle, is_respawn, resumed);
                         (
                             Some((
@@ -1542,20 +1610,7 @@ impl Manager {
                 expected_generation,
                 reason,
             } => {
-                if let Some(s) = self.sessions.get_mut(&sid)
-                    && !s.archived
-                    && s.channel_generation == expected_generation
-                {
-                    s.record(Notification::SessionDetached {
-                        session_id: sid.clone(),
-                        reason,
-                    });
-                    // bug-0027: the spawn that `SessionCreated` promised never
-                    // arrived. Confirm the still-false state explicitly so a
-                    // GUI is not left guessing whether the handshake is simply
-                    // slow.
-                    self.broadcast_connected(&sid, false);
-                }
+                self.handle_spawn_failed(&sid, expected_generation, reason);
             }
             Command::Record {
                 sid,
@@ -1650,23 +1705,50 @@ impl Manager {
                 s.replay_fence = 0;
             }
             Command::AgentDisconnected { sid, generation } => {
-                let Some(s) = self.sessions.get_mut(&sid) else {
-                    return;
-                };
-                if generation != s.channel_generation {
-                    return; // stale reader (superseded by a restart)
-                }
-                s.record(Notification::SessionDetached {
-                    session_id: sid.clone(),
-                    reason: "agent disconnected".into(),
-                });
-                s.channel = None;
-                // bug-0027: `SessionDetached` is a per-session RECORDED event —
-                // it only reaches subscribers. Connectivity has to reach every
-                // GUI, including ones that never attached.
-                self.broadcast_connected(&sid, false);
+                self.handle_spawn_failed(&sid, generation, "agent disconnected".into());
             }
         }
+    }
+
+    /// Terminalize a failed handshake or a dead live pump. Every deferred
+    /// prompt receives an explicit rejection and the busy flag is cleared, so
+    /// neither the server roster nor an attached GUI can remain "thinking"
+    /// forever after there is no process capable of doing the work.
+    fn handle_spawn_failed(&mut self, session_id: &str, expected_generation: u64, reason: String) {
+        let was_busy = {
+            let Some(session) = self.sessions.get_mut(session_id) else {
+                return;
+            };
+            if session.archived || session.channel_generation != expected_generation {
+                return; // archived or stale worker/pump
+            }
+
+            let was_busy = session.busy;
+            session.lifecycle = SessionLifecycle::Disconnected;
+            session.channel = None;
+            session.busy = false;
+            session.replay_fence = 0;
+            for pending in std::mem::take(&mut session.pending_prompts) {
+                session
+                    .finish_prompt_intent(pending.id, yalda::session_wal::PromptOutcome::Rejected);
+                session.record(Notification::PromptRejected {
+                    session_id: session_id.to_string(),
+                    reason: reason.clone(),
+                    text: pending.payload.text,
+                });
+            }
+            session.record(Notification::SessionDetached {
+                session_id: session_id.to_string(),
+                reason,
+            });
+            was_busy
+        };
+
+        if was_busy {
+            self.broadcast_busy(session_id, false);
+        }
+        // `SessionDetached` is per-session; connectivity is roster-wide.
+        self.broadcast_connected(session_id, false);
     }
 
     fn do_create(
@@ -1702,7 +1784,7 @@ impl Manager {
         let cmd_tx = self.cmd_tx.clone();
         let spawner = Arc::clone(&self.spawner);
         let session_id = id.clone();
-        std::thread::Builder::new()
+        let spawn_result = std::thread::Builder::new()
             .name(format!("acp-spawn-{}", &id[..8]))
             .spawn(move || {
                 // SAFETY: dedicated spawn thread; single-purpose server.
@@ -1733,42 +1815,59 @@ impl Manager {
                         });
                     }
                 }
-            })
-            .ok();
+            });
+        if let Err(error) = spawn_result {
+            self.handle_spawn_failed(
+                &id,
+                0,
+                format!("could not start agent spawn worker: {error}"),
+            );
+        }
 
         info
     }
 
     fn do_close(&mut self, session_id: &str) -> Result<(), String> {
-        match self.sessions.get(session_id) {
-            Some(_) => {
-                // Removing the session drops its TransportHandle (prompt_tx
-                // clone). The owning pump observes the close (inlet still open
-                // but no map entry → its generation check / disconnect breaks it)
-                // and drops its client off-actor. Bump gen_watch so any owning
-                // pump wakes immediately to self-terminate.
-                let session = self.sessions.remove(session_id);
-                if let Some(s) = &session {
-                    let _ = s
-                        .gen_watch
-                        .send_replace(s.channel_generation.wrapping_add(1));
-                }
-                // Explicit close = intentional end of life: delete the durable
-                // WAL so this session is NOT recovered on the next start.
-                if let Some(session) = session {
-                    if let Some(wal) = session.wal {
-                        wal.remove();
-                    } else if let Some(path) = session.wal_path {
-                        let _ = std::fs::remove_file(path);
+        // Delete durable identity BEFORE removing live state. If deletion
+        // fails, closing anyway guarantees the session resurrects from its WAL
+        // on the next daemon start — a much worse result than a visible close
+        // error with the current session left intact.
+        let delete_result = {
+            let session = self
+                .sessions
+                .get_mut(session_id)
+                .ok_or_else(|| format!("no such session: {session_id}"))?;
+            if let Some(wal) = session.wal.take() {
+                let path = wal.path().to_path_buf();
+                match wal.remove() {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        session.wal = yalda::session_wal::SessionWal::reopen(path).ok();
+                        Err(error)
                     }
                 }
-                let _ = self.events.send(Notification::SessionClosed {
-                    session_id: session_id.to_string(),
-                });
+            } else if let Some(path) = &session.wal_path {
+                match std::fs::remove_file(path) {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(error),
+                }
+            } else {
                 Ok(())
             }
-            None => Err(format!("no such session: {session_id}")),
-        }
+        };
+        delete_result.map_err(|error| format!("could not delete session WAL: {error}"))?;
+
+        // Only after durable deletion succeeds may the actor drop the live
+        // transport and announce closure.
+        let session = self.sessions.remove(session_id).expect("checked above");
+        let _ = session
+            .gen_watch
+            .send_replace(session.channel_generation.wrapping_add(1));
+        let _ = self.events.send(Notification::SessionClosed {
+            session_id: session_id.to_string(),
+        });
+        Ok(())
     }
 
     // type alias would hurt readability here more than help
@@ -1814,12 +1913,13 @@ impl Manager {
         // seq of the FIRST not-yet-sent entry == `log_base + initial_vec_index`.
         let initial_sent_seq = session.event_log.seq_of(initial_vec_index);
 
-        // Register the single forwarder's progress handle (Bug 1b): one clone
+        // Register the latest forwarder's progress handle (Bug 1b): one clone
         // goes to the forwarder task (returned), one is retained on the session
-        // so the trim floor sees it. Seed it at the initial `sent_seq`. Strict
-        // 1:1: a fresh attach replaces any prior forwarder handle (a reconnect
-        // before the old forwarder task noticed EOF) — the old task drains and
-        // exits on its own.
+        // so the trim floor sees it. Seed it at the initial `sent_seq`. Do not
+        // release the prior handle here: a separate connection may legitimately
+        // observe the same session, and killing it would also kill the healthy
+        // owner when an observer attaches. Duplicate Attach on ONE connection
+        // is cleaned up by that connection's `subscribed.insert` task swap.
         let progress: ForwarderProgress = Arc::new(ForwarderHandle::new(initial_sent_seq));
         session.forwarder = Some(Arc::clone(&progress));
 
@@ -1856,38 +1956,73 @@ impl Manager {
             .sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("no such session: {session_id}"))?;
-        if session.archived {
+        if session.lifecycle == SessionLifecycle::Archived {
             return Err(format!(
                 "session {session_id} is archived; unarchive it before steering"
             ));
         }
+        if session.lifecycle == SessionLifecycle::Disconnected {
+            return Err(format!(
+                "session {session_id} is disconnected; restart it before steering"
+            ));
+        }
 
-        session.log_only(Notification::UserPrompt {
-            session_id: session_id.to_string(),
-            text: text.to_string(),
-        });
-        session.record_agent(yalda::agent_event::AgentEventKind::UserMessage {
-            text: text.to_string(),
-        });
-        let payload = PromptPayload {
+        let pending = session.begin_prompt_intent(PromptPayload {
             text: text.to_string(),
             images,
-        };
+        })?;
+        let prompt_id = pending.id;
         let was_busy = session.busy;
         session.busy = true;
-        let result = match session.channel.as_ref() {
-            Some(channel) => channel
-                .steer_or_replace_payload(payload)
-                .map_err(|e| format!("steer failed: {e}")),
-            // A channel that is still spawning has no active turn to steer.
-            // Queue an ordinary prompt; apply_channel_state drains it in order.
-            None => {
-                session.pending_prompts.push(payload);
+        let result = match (session.lifecycle, session.channel.as_ref()) {
+            (SessionLifecycle::Live, Some(channel)) => {
+                match channel.steer_or_replace_payload(pending.payload) {
+                    Ok(()) => {
+                        session.finish_prompt_intent(
+                            prompt_id,
+                            yalda::session_wal::PromptOutcome::Delivered,
+                        );
+                        Ok(())
+                    }
+                    Err(error) => {
+                        session.finish_prompt_intent(
+                            prompt_id,
+                            yalda::session_wal::PromptOutcome::Rejected,
+                        );
+                        Err(format!("steer failed: {error}"))
+                    }
+                }
+            }
+            // A channel that is still spawning/restarting has no active turn
+            // to steer. Queue an ordinary prompt; publish drains it in order.
+            (SessionLifecycle::Spawning | SessionLifecycle::Restarting, None) => {
+                session.pending_prompts.push(pending);
                 Ok(())
             }
+            _ => {
+                session
+                    .finish_prompt_intent(prompt_id, yalda::session_wal::PromptOutcome::Rejected);
+                Err(format!(
+                    "session {session_id} has inconsistent lifecycle state; restart it"
+                ))
+            }
         };
-        if result.is_err() {
-            self.set_busy(session_id, false);
+        if result.is_ok() {
+            session.log_only(Notification::UserPrompt {
+                session_id: session_id.to_string(),
+                text: text.to_string(),
+            });
+            session.record_agent(yalda::agent_event::AgentEventKind::UserMessage {
+                text: text.to_string(),
+            });
+        }
+        let failure = result
+            .as_ref()
+            .err()
+            .cloned()
+            .map(|reason| (session.channel_generation, reason));
+        if let Some((generation, reason)) = failure {
+            self.handle_spawn_failed(session_id, generation, reason);
         } else if !was_busy {
             self.broadcast_busy(session_id, true);
         }
@@ -1908,47 +2043,77 @@ impl Manager {
             .sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("no such session: {session_id}"))?;
-        if session.archived {
+        if session.lifecycle == SessionLifecycle::Archived {
             return Err(format!(
                 "session {session_id} is archived; unarchive it before sending a prompt"
             ));
         }
-        // Log the user's prompt so re-attaching GUIs can replay it (and so it
-        // survives a crash — UserPrompt is a turn boundary that fsyncs). Only
-        // appended to event_log + WAL, not broadcast.
-        session.log_only(Notification::UserPrompt {
-            session_id: session_id.to_string(),
-            text: text.to_string(),
-        });
-        // ADDITIVE (spec §9): the canonical AgentEvent for the user's prompt —
-        // `UserMessage` folds both the live submit and the replay echo, deduped
-        // by identity (session, generation, turn) per spec §2/§5. Recorded
-        // alongside the legacy UserPrompt; the GUI reducer ignores the Agent
-        // stream this pass.
-        session.record_agent(yalda::agent_event::AgentEventKind::UserMessage {
-            text: text.to_string(),
-        });
-        let payload = PromptPayload {
+        if session.lifecycle == SessionLifecycle::Disconnected {
+            return Err(format!(
+                "session {session_id} is disconnected; restart it before sending"
+            ));
+        }
+        let pending = session.begin_prompt_intent(PromptPayload {
             text: text.to_string(),
             images,
-        };
+        })?;
+        let prompt_id = pending.id;
         // bug-0022: a prompt (sent OR queued for a still-spawning agent) means a
         // turn is now owed — the session is working from the user's point of
         // view, which is what the status marks report.
         let was_busy = session.busy;
         session.busy = true;
-        let result = match session.channel.as_ref() {
-            Some(channel) => channel
-                .send_payload(payload)
-                .map_err(|e| format!("send failed: {e}")),
-            None => {
-                session.pending_prompts.push(payload);
+        let result = match (session.lifecycle, session.channel.as_ref()) {
+            (SessionLifecycle::Live, Some(channel)) => {
+                match channel.send_payload(pending.payload) {
+                    Ok(()) => {
+                        session.finish_prompt_intent(
+                            prompt_id,
+                            yalda::session_wal::PromptOutcome::Delivered,
+                        );
+                        Ok(())
+                    }
+                    Err(error) => {
+                        session.finish_prompt_intent(
+                            prompt_id,
+                            yalda::session_wal::PromptOutcome::Rejected,
+                        );
+                        Err(format!("send failed: {error}"))
+                    }
+                }
+            }
+            (SessionLifecycle::Spawning | SessionLifecycle::Restarting, None) => {
+                session.pending_prompts.push(pending);
                 Ok(())
             }
+            _ => {
+                session
+                    .finish_prompt_intent(prompt_id, yalda::session_wal::PromptOutcome::Rejected);
+                Err(format!(
+                    "session {session_id} has inconsistent lifecycle state; restart it"
+                ))
+            }
         };
-        if result.is_err() {
-            // The send failed outright — nothing is running.
-            self.set_busy(session_id, false);
+        if result.is_ok() {
+            // Publish the optimistic transcript fact only after the prompt was
+            // either handed to a live worker or durably admitted to the spawn
+            // queue. A rejected live send therefore cannot recover as a phantom
+            // user turn.
+            session.log_only(Notification::UserPrompt {
+                session_id: session_id.to_string(),
+                text: text.to_string(),
+            });
+            session.record_agent(yalda::agent_event::AgentEventKind::UserMessage {
+                text: text.to_string(),
+            });
+        }
+        let failure = result
+            .as_ref()
+            .err()
+            .cloned()
+            .map(|reason| (session.channel_generation, reason));
+        if let Some((generation, reason)) = failure {
+            self.handle_spawn_failed(session_id, generation, reason);
         } else if !was_busy {
             self.broadcast_busy(session_id, true);
         }
@@ -1989,18 +2154,47 @@ impl Manager {
     }
 
     fn do_cancel(&mut self, session_id: &str) -> Result<(), String> {
-        let session = self
-            .sessions
-            .get_mut(session_id)
-            .ok_or_else(|| format!("no such session: {session_id}"))?;
-        if let Some(channel) = session.channel.as_ref() {
-            channel.cancel();
+        let cleared_queued = {
+            let session = self
+                .sessions
+                .get_mut(session_id)
+                .ok_or_else(|| format!("no such session: {session_id}"))?;
+            if let Some(channel) = session.channel.as_ref() {
+                channel.cancel();
+            }
+            if matches!(
+                session.lifecycle,
+                SessionLifecycle::Spawning
+                    | SessionLifecycle::Restarting
+                    | SessionLifecycle::Disconnected
+            ) {
+                let queued = std::mem::take(&mut session.pending_prompts);
+                let had_work = session.busy || !queued.is_empty();
+                session.busy = false;
+                for pending in queued {
+                    session.finish_prompt_intent(
+                        pending.id,
+                        yalda::session_wal::PromptOutcome::Cancelled,
+                    );
+                    session.record(Notification::PromptRejected {
+                        session_id: session_id.to_string(),
+                        reason: "cancelled before agent delivery".into(),
+                        text: pending.payload.text,
+                    });
+                }
+                had_work
+            } else {
+                false
+            }
+        };
+        if cleared_queued {
+            self.broadcast_busy(session_id, false);
         }
         Ok(())
     }
 
     fn do_restart(&mut self, session_id: &str) -> Result<(), String> {
-        let (cwd, provider, resume_id, expected_generation) = {
+        let (cwd, provider, resume_id, expected_generation, was_busy) = {
             let session = self
                 .sessions
                 .get_mut(session_id)
@@ -2010,19 +2204,43 @@ impl Manager {
                     "session {session_id} is archived; unarchive it before restarting"
                 ));
             }
-            let resume = session.channel.as_ref().and_then(|c| c.session_id());
+            // A dead transport has no session id, but the durable identity from
+            // its last successful attach is still the correct resume target.
+            let resume = session
+                .channel
+                .as_ref()
+                .and_then(|c| c.session_id())
+                .or_else(|| session.acp_session_id.clone());
+            let was_busy = session.busy;
+            // Fence and drop the old transport BEFORE the blocking replacement
+            // handshake begins. Keeping it live until PublishChannel allowed a
+            // prompt to race onto the doomed generation during restart.
+            session.channel_generation = session.channel_generation.wrapping_add(1);
+            session.agent_seq = 0;
+            session.replay_fence = 0;
+            session.busy = false;
+            session.lifecycle = SessionLifecycle::Restarting;
+            let _ = session.gen_watch.send_replace(session.channel_generation);
+            session.channel = None;
             (
                 session.cwd.clone(),
                 session.provider,
                 resume,
                 session.channel_generation,
+                was_busy,
             )
         };
+
+        if was_busy {
+            self.broadcast_busy(session_id, false);
+        }
+        self.broadcast_connected(session_id, false);
 
         let cmd_tx = self.cmd_tx.clone();
         let spawner = Arc::clone(&self.spawner);
         let sid = session_id.to_string();
-        std::thread::Builder::new()
+        let failure_sid = sid.clone();
+        let spawn_result = std::thread::Builder::new()
             .name(format!("acp-restart-{}", &sid[..8.min(sid.len())]))
             .spawn(move || {
                 // SAFETY: dedicated spawn thread; see do_create.
@@ -2031,27 +2249,11 @@ impl Manager {
                 }
                 let cmd = configured_agent_command(provider);
                 let resumed = resume_id.is_some();
-                match spawner.spawn(
-                    provider,
-                    &cmd,
-                    Some(cwd),
-                    resume_id,
-                    YaldaFrontend::Gpui,
-                ) {
+                match spawner.spawn(provider, &cmd, Some(cwd), resume_id, YaldaFrontend::Gpui) {
                     Ok(client) => {
-                        // is_respawn=true bumps generation + gen_watch so the OLD
-                        // pump self-terminates and drops its client off-actor.
-                        // A restart-with-resume replays history already in the
-                        // log → arm the fence (suppress until the marker) so a
-                        // force-restart doesn't double-record the transcript.
-                        publish_channel(
-                            &cmd_tx,
-                            &sid,
-                            client,
-                            expected_generation,
-                            true,
-                            resumed,
-                        );
+                        // The generation was bumped synchronously before this
+                        // worker began, so publish it without a second bump.
+                        publish_channel(&cmd_tx, &sid, client, expected_generation, false, resumed);
                     }
                     Err(e) => {
                         let _ = cmd_tx.send(Command::SpawnFailed {
@@ -2061,8 +2263,12 @@ impl Manager {
                         });
                     }
                 }
-            })
-            .ok();
+            });
+        if let Err(error) = spawn_result {
+            let reason = format!("could not start restart worker: {error}");
+            self.handle_spawn_failed(&failure_sid, expected_generation, reason.clone());
+            return Err(reason);
+        }
         Ok(())
     }
 
@@ -2108,65 +2314,88 @@ impl Manager {
     fn do_set_archived(&mut self, session_id: &str, archived: bool) -> Result<(), String> {
         let mut resume: Option<(PathBuf, AgentProvider, Option<String>, u64)> = None;
         let busy_was_true;
+        let archive_changed;
         {
             let session = self
                 .sessions
                 .get_mut(session_id)
                 .ok_or_else(|| format!("no such session: {session_id}"))?;
             if session.archived == archived {
-                return Ok(());
-            }
-            busy_was_true = session.busy;
-
-            if archived {
-                let wal = session
-                    .wal
-                    .as_mut()
-                    .ok_or_else(|| format!("session {session_id} has no open durable WAL"))?;
-                wal.append_archived(true)
-                    .map_err(|e| format!("could not persist archive state: {e}"))?;
-
-                if let Some(channel) = session.channel.as_ref() {
-                    channel.cancel();
+                // An earlier unarchive may have persisted `false` but then
+                // failed its worker/handshake. Repeating unarchive is a retry,
+                // not a no-op, while the explicit lifecycle is Disconnected.
+                if !archived && session.lifecycle == SessionLifecycle::Disconnected {
+                    session.lifecycle = SessionLifecycle::Spawning;
+                    busy_was_true = session.busy;
+                    archive_changed = false;
+                    resume = Some((
+                        session.cwd.clone(),
+                        session.provider,
+                        session.acp_session_id.clone(),
+                        session.channel_generation,
+                    ));
+                } else {
+                    return Ok(());
                 }
-                session.archived = true;
-                session.busy = false;
-                session.pending_prompts.clear();
-                session.replay_fence = 0;
-                session.channel_generation = session.channel_generation.wrapping_add(1);
-                session.agent_seq = 0;
-                let _ = session
-                    .gen_watch
-                    .send_replace(session.channel_generation);
-                session.channel = None;
-                if let Some(forwarder) = session.forwarder.take() {
-                    // bug-0028: `released`, NOT `evicted`. `evicted` is the
-                    // high-water kill flag, and its handler shuts down the
-                    // per-CONNECTION write half — so archiving one session used
-                    // to tear down the GUI's whole socket and force every other
-                    // session to reconnect from base. Archiving one session must
-                    // stop exactly one forwarder.
-                    forwarder.released.store(true, Ordering::Release);
-                }
-                session.publish_snapshot();
-                drop(session.wal.take());
             } else {
-                let path = session
-                    .wal_path
-                    .clone()
-                    .ok_or_else(|| format!("session {session_id} has no durable WAL path"))?;
-                let mut wal = yalda::session_wal::SessionWal::reopen(path)
-                    .map_err(|e| format!("could not reopen archived WAL: {e}"))?;
-                wal.append_archived(false)
-                    .map_err(|e| format!("could not persist unarchive state: {e}"))?;
-                session.wal = Some(wal);
-                session.archived = false;
-                resume = Some((
-                    session.cwd.clone(),
-                    session.provider,
-                    session.acp_session_id.clone(),
-                    session.channel_generation,
-                ));
+                busy_was_true = session.busy;
+                archive_changed = true;
+
+                if archived {
+                    let wal = session
+                        .wal
+                        .as_mut()
+                        .ok_or_else(|| format!("session {session_id} has no open durable WAL"))?;
+                    wal.append_archived(true)
+                        .map_err(|e| format!("could not persist archive state: {e}"))?;
+
+                    if let Some(channel) = session.channel.as_ref() {
+                        channel.cancel();
+                    }
+                    session.archived = true;
+                    session.lifecycle = SessionLifecycle::Archived;
+                    session.busy = false;
+                    for pending in std::mem::take(&mut session.pending_prompts) {
+                        session.finish_prompt_intent(
+                            pending.id,
+                            yalda::session_wal::PromptOutcome::Cancelled,
+                        );
+                    }
+                    session.replay_fence = 0;
+                    session.channel_generation = session.channel_generation.wrapping_add(1);
+                    session.agent_seq = 0;
+                    let _ = session.gen_watch.send_replace(session.channel_generation);
+                    session.channel = None;
+                    if let Some(forwarder) = session.forwarder.take() {
+                        // bug-0028: `released`, NOT `evicted`. `evicted` is the
+                        // high-water kill flag, and its handler shuts down the
+                        // per-CONNECTION write half — so archiving one session used
+                        // to tear down the GUI's whole socket and force every other
+                        // session to reconnect from base. Archiving one session must
+                        // stop exactly one forwarder.
+                        forwarder.released.store(true, Ordering::Release);
+                    }
+                    session.publish_snapshot();
+                    drop(session.wal.take());
+                } else {
+                    let path = session
+                        .wal_path
+                        .clone()
+                        .ok_or_else(|| format!("session {session_id} has no durable WAL path"))?;
+                    let mut wal = yalda::session_wal::SessionWal::reopen(path)
+                        .map_err(|e| format!("could not reopen archived WAL: {e}"))?;
+                    wal.append_archived(false)
+                        .map_err(|e| format!("could not persist unarchive state: {e}"))?;
+                    session.wal = Some(wal);
+                    session.archived = false;
+                    session.lifecycle = SessionLifecycle::Spawning;
+                    resume = Some((
+                        session.cwd.clone(),
+                        session.provider,
+                        session.acp_session_id.clone(),
+                        session.channel_generation,
+                    ));
+                }
             }
         }
 
@@ -2176,20 +2405,25 @@ impl Manager {
         if archived {
             self.broadcast_connected(session_id, false);
         }
-        let _ = self.events.send(Notification::SessionArchived {
-            session_id: session_id.to_string(),
-            archived,
-        });
+        if archive_changed {
+            let _ = self.events.send(Notification::SessionArchived {
+                session_id: session_id.to_string(),
+                archived,
+            });
+        }
 
         if let Some((cwd, provider, resume_id, expected_generation)) = resume {
-            self.spawn_channel(
+            if let Err(error) = self.spawn_channel(
                 session_id.to_string(),
                 cwd,
                 provider,
                 resume_id,
                 expected_generation,
                 false,
-            )?;
+            ) {
+                self.handle_spawn_failed(session_id, expected_generation, error.clone());
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -2213,13 +2447,7 @@ impl Manager {
                 }
                 let cmd = configured_agent_command(provider);
                 let resumed = resume_id.is_some();
-                match spawner.spawn(
-                    provider,
-                    &cmd,
-                    Some(cwd),
-                    resume_id,
-                    YaldaFrontend::Gpui,
-                ) {
+                match spawner.spawn(provider, &cmd, Some(cwd), resume_id, YaldaFrontend::Gpui) {
                     Ok(client) => {
                         publish_channel(
                             &cmd_tx,
@@ -2252,6 +2480,15 @@ impl Manager {
             .sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("no such session: {session_id}"))?;
+        let persist = if let Some(wal) = session.wal.as_mut() {
+            wal.append_permission_mode(mode)
+        } else if let Some(path) = session.wal_path.clone() {
+            yalda::session_wal::SessionWal::reopen(path)
+                .and_then(|mut wal| wal.append_permission_mode(mode))
+        } else {
+            Ok(())
+        };
+        persist.map_err(|error| format!("could not persist permission mode: {error}"))?;
         session.permission_mode = mode;
         if let Some(channel) = &session.channel {
             channel.set_permission_mode(mode);
@@ -2269,16 +2506,23 @@ impl Manager {
                 "session {session_id} is archived; unarchive it before switching models"
             ));
         }
-        // No live channel ⇒ the agent isn't spawned yet; the switch can't be
-        // delivered (unlike permission mode, there's no persisted field to
-        // re-apply on spawn). Surface it rather than silently dropping.
-        match &session.channel {
-            Some(channel) => {
-                channel.set_model(model_id);
-                Ok(())
-            }
-            None => Err(format!("session {session_id} has no live agent to switch")),
+        let persist = if let Some(wal) = session.wal.as_mut() {
+            wal.append_model(model_id)
+        } else if let Some(path) = session.wal_path.clone() {
+            yalda::session_wal::SessionWal::reopen(path)
+                .and_then(|mut wal| wal.append_model(model_id))
+        } else {
+            Ok(())
+        };
+        persist.map_err(|error| format!("could not persist model selection: {error}"))?;
+        session.model_id = Some(model_id.to_string());
+        if let Some(channel) = &session.channel {
+            channel.set_model(model_id);
         }
+        // If the channel is spawning/restarting/disconnected, the desired
+        // model is still accepted and apply_channel_state replays it when the
+        // replacement transport publishes.
+        Ok(())
     }
 
     fn do_admin_status(&self) -> AdminSnapshot {
@@ -2704,7 +2948,9 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
                             initial_sent_seq,
                             progress,
                         ));
-                        subscribed.insert(session_id, handle);
+                        if let Some(previous) = subscribed.insert(session_id, handle) {
+                            previous.abort();
+                        }
                         Response::Ok {
                             data: ResponseData::Attached,
                         }
@@ -2863,9 +3109,7 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
                 session_id,
                 archived,
             } => {
-                if archived
-                    && let Some(handle) = subscribed.remove(&session_id)
-                {
+                if archived && let Some(handle) = subscribed.remove(&session_id) {
                     handle.abort();
                 }
                 match manager.send_set_archived(&session_id, archived).await {
@@ -3372,18 +3616,18 @@ async fn main() -> io::Result<()> {
         // so a "reconnect" surfaces here as conn_id > 1 and/or pre-existing
         // sessions — the session count is what tells you the client rejoined
         // live state rather than starting cold.
-        let active_sessions = manager.send_session_count().await;
+        let stored_sessions = manager.send_session_count().await;
         if conn_id == 1 {
             tracing::info!(
                 conn_id,
-                active_sessions,
-                "client connected (conn {conn_id}); {active_sessions} active session(s)"
+                stored_sessions,
+                "client connected (conn {conn_id}); {stored_sessions} stored session(s)"
             );
         } else {
             tracing::info!(
                 conn_id,
-                active_sessions,
-                "client reconnected (conn {conn_id}); {active_sessions} active session(s)"
+                stored_sessions,
+                "client reconnected (conn {conn_id}); {stored_sessions} stored session(s)"
             );
         }
         tokio::spawn(handle_connection(stream, mgr, conn_id));
@@ -3534,6 +3778,7 @@ mod lifecycle_tests {
             None,
         );
         session.channel = Some(transport.handle());
+        session.lifecycle = SessionLifecycle::Live;
         session.busy = true;
 
         let (events, _) = broadcast::channel(16);
@@ -3604,6 +3849,7 @@ mod lifecycle_tests {
             None,
         );
         session.channel = Some(transport.handle());
+        session.lifecycle = SessionLifecycle::Live;
         session.busy = true;
 
         let (events, _) = broadcast::channel(16);
@@ -3704,9 +3950,7 @@ mod lifecycle_tests {
         );
         // ...but it must NOT take the shared connection with it.
         assert!(
-            !forwarder
-                .evicted
-                .load(std::sync::atomic::Ordering::Acquire),
+            !forwarder.evicted.load(std::sync::atomic::Ordering::Acquire),
             "archive must not set the high-water kill flag — its handler shuts \
              down the per-connection write half, disconnecting every OTHER \
              session on this socket"
@@ -3760,10 +4004,10 @@ mod lifecycle_tests {
             acp_session_id: session.acp_session_id.clone(),
         });
         session.busy = true;
-        session.pending_prompts.push(PromptPayload {
-            text: "queued".into(),
-            images: Vec::new(),
-        });
+        let pending = session
+            .begin_prompt_intent(PromptPayload::text("queued"))
+            .unwrap();
+        session.pending_prompts.push(pending);
 
         let (events, _) = broadcast::channel(16);
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
@@ -3782,9 +4026,15 @@ mod lifecycle_tests {
 
         let session = manager.sessions.get("cold-1").unwrap();
         assert!(session.archived);
-        assert!(session.channel.is_none(), "transport handle must be released");
+        assert!(
+            session.channel.is_none(),
+            "transport handle must be released"
+        );
         assert!(session.forwarder.is_none(), "forwarder must be released");
-        assert!(session.wal.is_none(), "archive must close the WAL descriptor");
+        assert!(
+            session.wal.is_none(),
+            "archive must close the WAL descriptor"
+        );
         assert!(!session.busy);
         assert!(session.pending_prompts.is_empty());
         assert_eq!(session.acp_session_id.as_deref(), Some("acp-cold-1"));
@@ -3793,15 +4043,455 @@ mod lifecycle_tests {
         let admin = manager.do_admin_status();
         assert!(admin.sessions[0].archived);
         assert!(!admin.sessions[0].wal_open);
-        assert!(manager
-            .enqueue_prompt("cold-1", "must fail", Vec::new())
-            .unwrap_err()
-            .contains("archived"));
+        assert!(
+            manager
+                .enqueue_prompt("cold-1", "must fail", Vec::new())
+                .unwrap_err()
+                .contains("archived")
+        );
 
         let recovered = yalda::session_wal::recover_one(&wal_path)
             .expect("recover WAL")
             .expect("recovered session");
         assert!(recovered.archived);
         assert_eq!(recovered.acp_session_id.as_deref(), Some("acp-cold-1"));
+    }
+
+    fn manager_with_session(session: ManagedSession) -> Manager {
+        let sid = session.id.clone();
+        let (events, _) = broadcast::channel(32);
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        Manager {
+            sessions: HashMap::from([(sid, session)]),
+            events,
+            default_permission_mode: PermissionMode::ReadOnly,
+            cmd_tx,
+            spawner: Arc::new(RealAgentSpawner),
+            bridge_tx: None,
+        }
+    }
+
+    #[test]
+    fn disconnected_session_rejects_prompt_instead_of_queueing_forever() {
+        let mut session = new_managed_session(
+            "dead-prompt".into(),
+            "dead prompt".into(),
+            PathBuf::from("/tmp/project"),
+            AgentProvider::Codex,
+            PermissionMode::ReadOnly,
+            None,
+            None,
+        );
+        session.lifecycle = SessionLifecycle::Disconnected;
+        let mut manager = manager_with_session(session);
+
+        let error = manager
+            .enqueue_prompt("dead-prompt", "never queue me", Vec::new())
+            .expect_err("terminal disconnect must reject prompts");
+        assert!(error.contains("disconnected"), "unexpected error: {error}");
+        let session = manager.sessions.get("dead-prompt").unwrap();
+        assert!(session.pending_prompts.is_empty());
+        assert!(!session.busy);
+    }
+
+    #[test]
+    fn spawn_failure_terminalizes_busy_and_rejects_every_queued_prompt() {
+        let mut session = new_managed_session(
+            "spawn-failure".into(),
+            "spawn failure".into(),
+            PathBuf::from("/tmp/project"),
+            AgentProvider::Codex,
+            PermissionMode::ReadOnly,
+            None,
+            None,
+        );
+        session.busy = true;
+        let pending = session
+            .begin_prompt_intent(PromptPayload::text("queued during spawn"))
+            .unwrap();
+        session.pending_prompts.push(pending);
+        let mut manager = manager_with_session(session);
+
+        manager.apply(Command::SpawnFailed {
+            sid: "spawn-failure".into(),
+            expected_generation: 0,
+            reason: "handshake failed".into(),
+        });
+
+        let session = manager.sessions.get("spawn-failure").unwrap();
+        assert_eq!(session.lifecycle, SessionLifecycle::Disconnected);
+        assert!(!session.busy);
+        assert!(session.pending_prompts.is_empty());
+        assert!(session.event_log.tail_from(0).iter().any(|note| matches!(
+            note,
+            Notification::PromptRejected { text, .. } if text == "queued during spawn"
+        )));
+    }
+
+    #[test]
+    fn cancel_while_spawning_removes_work_that_could_run_later() {
+        let mut session = new_managed_session(
+            "cancel-spawn".into(),
+            "cancel spawn".into(),
+            PathBuf::from("/tmp/project"),
+            AgentProvider::Codex,
+            PermissionMode::ReadOnly,
+            None,
+            None,
+        );
+        session.busy = true;
+        let pending = session
+            .begin_prompt_intent(PromptPayload::text("cancel this"))
+            .unwrap();
+        session.pending_prompts.push(pending);
+        let mut manager = manager_with_session(session);
+
+        manager.do_cancel("cancel-spawn").expect("cancel");
+
+        let session = manager.sessions.get("cancel-spawn").unwrap();
+        assert!(session.pending_prompts.is_empty());
+        assert!(!session.busy);
+    }
+
+    #[test]
+    fn observer_attach_does_not_release_prior_connection_forwarder() {
+        let session = new_managed_session(
+            "attach-replace".into(),
+            "attach replace".into(),
+            PathBuf::from("/tmp/project"),
+            AgentProvider::Codex,
+            PermissionMode::ReadOnly,
+            None,
+            None,
+        );
+        let mut manager = manager_with_session(session);
+
+        let (_, _, first) = manager.do_attach("attach-replace", None).unwrap();
+        let (_, _, second) = manager.do_attach("attach-replace", None).unwrap();
+
+        assert!(
+            !first.released.load(Ordering::Acquire),
+            "the actor cannot assume an attach came from the same connection"
+        );
+        assert!(!second.released.load(Ordering::Acquire));
+    }
+
+    struct CaptureFailSpawner {
+        resume_tx: std::sync::mpsc::Sender<Option<String>>,
+    }
+
+    impl AgentSpawner for CaptureFailSpawner {
+        fn spawn(
+            &self,
+            _provider: AgentProvider,
+            _command: &str,
+            _cwd: Option<PathBuf>,
+            resume: Option<String>,
+            _frontend: YaldaFrontend,
+        ) -> io::Result<Box<dyn AgentTransport>> {
+            let _ = self.resume_tx.send(resume);
+            Err(io::Error::other("injected handshake failure"))
+        }
+    }
+
+    #[test]
+    fn restart_fences_old_generation_and_uses_saved_resume_identity() {
+        let mut session = new_managed_session(
+            "restart-fence".into(),
+            "restart fence".into(),
+            PathBuf::from("/tmp/project"),
+            AgentProvider::Codex,
+            PermissionMode::ReadOnly,
+            None,
+            None,
+        );
+        session.lifecycle = SessionLifecycle::Disconnected;
+        session.channel_generation = 7;
+        session.busy = true;
+        session.acp_session_id = Some("durable-acp-id".into());
+
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (events, _) = broadcast::channel(16);
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let mut manager = Manager {
+            sessions: HashMap::from([("restart-fence".into(), session)]),
+            events,
+            default_permission_mode: PermissionMode::ReadOnly,
+            cmd_tx,
+            spawner: Arc::new(CaptureFailSpawner { resume_tx }),
+            bridge_tx: None,
+        };
+
+        manager.do_restart("restart-fence").expect("start restart");
+
+        let session = manager.sessions.get("restart-fence").unwrap();
+        assert_eq!(session.lifecycle, SessionLifecycle::Restarting);
+        assert_eq!(session.channel_generation, 8);
+        assert!(session.channel.is_none());
+        assert!(!session.busy);
+        assert_eq!(
+            resume_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("restart worker called spawner"),
+            Some("durable-acp-id".into()),
+            "restart must fall back to the saved ACP id after a dead channel"
+        );
+    }
+
+    #[test]
+    fn repeated_unarchive_retries_a_disconnected_handshake() {
+        let mut session = new_managed_session(
+            "retry-unarchive".into(),
+            "retry unarchive".into(),
+            PathBuf::from("/tmp/project"),
+            AgentProvider::Codex,
+            PermissionMode::ReadOnly,
+            None,
+            None,
+        );
+        // This is the state left after the durable archived=false transition
+        // succeeded but the asynchronous handshake failed.
+        session.archived = false;
+        session.lifecycle = SessionLifecycle::Disconnected;
+        session.acp_session_id = Some("retry-acp-id".into());
+
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (events, _) = broadcast::channel(16);
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let mut manager = Manager {
+            sessions: HashMap::from([("retry-unarchive".into(), session)]),
+            events,
+            default_permission_mode: PermissionMode::ReadOnly,
+            cmd_tx,
+            spawner: Arc::new(CaptureFailSpawner { resume_tx }),
+            bridge_tx: None,
+        };
+
+        manager
+            .do_set_archived("retry-unarchive", false)
+            .expect("retry worker starts");
+
+        assert_eq!(
+            manager.sessions["retry-unarchive"].lifecycle,
+            SessionLifecycle::Spawning
+        );
+        assert_eq!(
+            resume_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("retry called spawner"),
+            Some("retry-acp-id".into())
+        );
+    }
+
+    #[test]
+    fn permission_and_model_selection_survive_server_recovery() {
+        let dir = tempfile::tempdir().expect("WAL tempdir");
+        let wal = yalda::session_wal::SessionWal::create_for_provider(
+            dir.path(),
+            "durable-settings",
+            "durable settings",
+            std::path::Path::new("/tmp/project"),
+            PermissionMode::ReadOnly,
+            AgentProvider::Codex,
+        )
+        .expect("create WAL");
+        let path = wal.path().to_path_buf();
+        let session = new_managed_session(
+            "durable-settings".into(),
+            "durable settings".into(),
+            PathBuf::from("/tmp/project"),
+            AgentProvider::Codex,
+            PermissionMode::ReadOnly,
+            Some(wal),
+            None,
+        );
+        let mut manager = manager_with_session(session);
+
+        manager
+            .do_set_permission_mode("durable-settings", PermissionMode::Yolo)
+            .expect("persist permission mode");
+        manager
+            .do_set_model("durable-settings", "gpt-durable")
+            .expect("persist model");
+        drop(manager);
+
+        let recovered = yalda::session_wal::recover_one(&path)
+            .expect("read WAL")
+            .expect("recover session");
+        assert_eq!(recovered.permission_mode, PermissionMode::Yolo);
+        assert_eq!(recovered.model_id.as_deref(), Some("gpt-durable"));
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn replacement_channel_reapplies_durable_permission_and_model() {
+        let (transport, controls) = yalda::acp_channel::FakeTransport::new();
+        let mut session = new_managed_session(
+            "reapply-settings".into(),
+            "reapply settings".into(),
+            PathBuf::from("/tmp/project"),
+            AgentProvider::Codex,
+            PermissionMode::Yolo,
+            None,
+            None,
+        );
+        session.model_id = Some("gpt-durable".into());
+
+        let undelivered = session.apply_channel_state(transport.handle(), true, true);
+
+        assert!(undelivered.is_empty());
+        assert_eq!(controls.permission_mode(), PermissionMode::Yolo);
+        assert_eq!(
+            controls
+                .set_model_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("model replayed to replacement channel"),
+            "gpt-durable"
+        );
+    }
+
+    #[test]
+    fn prompt_admitted_while_spawning_survives_recovery_with_attachments() {
+        let dir = tempfile::tempdir().expect("WAL tempdir");
+        let wal = yalda::session_wal::SessionWal::create_for_provider(
+            dir.path(),
+            "durable-prompt",
+            "durable prompt",
+            std::path::Path::new("/tmp/project"),
+            PermissionMode::ReadOnly,
+            AgentProvider::Codex,
+        )
+        .expect("create WAL");
+        let path = wal.path().to_path_buf();
+        let session = new_managed_session(
+            "durable-prompt".into(),
+            "durable prompt".into(),
+            PathBuf::from("/tmp/project"),
+            AgentProvider::Codex,
+            PermissionMode::ReadOnly,
+            Some(wal),
+            None,
+        );
+        let mut manager = manager_with_session(session);
+        let images = vec![ImageAttachment {
+            data: "cGl4ZWxz".into(),
+            mime_type: "image/png".into(),
+        }];
+
+        manager
+            .enqueue_prompt("durable-prompt", "remember me", images.clone())
+            .expect("durably admit prompt");
+        drop(manager);
+
+        let recovered = yalda::session_wal::recover_one(&path)
+            .expect("read WAL")
+            .expect("recover session");
+        assert_eq!(recovered.pending_prompts.len(), 1);
+        assert_eq!(recovered.pending_prompts[0].payload.text, "remember me");
+        assert_eq!(recovered.pending_prompts[0].payload.images, images);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn failed_live_send_is_terminal_without_a_phantom_user_turn() {
+        let dir = tempfile::tempdir().expect("WAL tempdir");
+        let wal = yalda::session_wal::SessionWal::create_for_provider(
+            dir.path(),
+            "failed-send",
+            "failed send",
+            std::path::Path::new("/tmp/project"),
+            PermissionMode::ReadOnly,
+            AgentProvider::Codex,
+        )
+        .expect("create WAL");
+        let path = wal.path().to_path_buf();
+        let (transport, controls) = yalda::acp_channel::FakeTransport::new();
+        let mut session = new_managed_session(
+            "failed-send".into(),
+            "failed send".into(),
+            PathBuf::from("/tmp/project"),
+            AgentProvider::Codex,
+            PermissionMode::ReadOnly,
+            Some(wal),
+            None,
+        );
+        session.channel = Some(transport.handle());
+        session.lifecycle = SessionLifecycle::Live;
+        controls.disconnect();
+        let mut manager = manager_with_session(session);
+
+        manager
+            .enqueue_prompt("failed-send", "must not reappear", Vec::new())
+            .expect_err("dead channel must reject send");
+        let session = &manager.sessions["failed-send"];
+        assert_eq!(session.lifecycle, SessionLifecycle::Disconnected);
+        assert!(!session.busy);
+        assert!(!session.event_log.tail_from(0).iter().any(|note| matches!(
+            note,
+            Notification::UserPrompt { text, .. } if text == "must not reappear"
+        )));
+        drop(manager);
+
+        let recovered = yalda::session_wal::recover_one(&path)
+            .expect("read WAL")
+            .expect("recover session");
+        assert!(
+            recovered.pending_prompts.is_empty(),
+            "a rejected intent must not be retried after restart"
+        );
+    }
+
+    #[test]
+    fn close_keeps_live_session_when_durable_delete_fails() {
+        let dir = tempfile::tempdir().expect("WAL tempdir");
+        let mut session = new_managed_session(
+            "close-failure".into(),
+            "close failure".into(),
+            PathBuf::from("/tmp/project"),
+            AgentProvider::Codex,
+            PermissionMode::ReadOnly,
+            None,
+            None,
+        );
+        session.wal_path = Some(dir.path().to_path_buf());
+        let mut manager = manager_with_session(session);
+
+        manager
+            .do_close("close-failure")
+            .expect_err("a directory cannot be removed as a WAL file");
+        assert!(
+            manager.sessions.contains_key("close-failure"),
+            "failed durable deletion must leave the live session recoverable"
+        );
+    }
+
+    #[test]
+    fn successful_close_deletes_wal_before_dropping_live_session() {
+        let dir = tempfile::tempdir().expect("WAL tempdir");
+        let wal = yalda::session_wal::SessionWal::create_for_provider(
+            dir.path(),
+            "close-success",
+            "close success",
+            std::path::Path::new("/tmp/project"),
+            PermissionMode::ReadOnly,
+            AgentProvider::Codex,
+        )
+        .expect("create WAL");
+        let path = wal.path().to_path_buf();
+        let session = new_managed_session(
+            "close-success".into(),
+            "close success".into(),
+            PathBuf::from("/tmp/project"),
+            AgentProvider::Codex,
+            PermissionMode::ReadOnly,
+            Some(wal),
+            None,
+        );
+        let mut manager = manager_with_session(session);
+
+        manager.do_close("close-success").expect("close session");
+
+        assert!(!path.exists());
+        assert!(!manager.sessions.contains_key("close-success"));
     }
 }
