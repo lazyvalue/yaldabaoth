@@ -1865,6 +1865,7 @@ fn cog_local_menu() -> Vec<MenuNode> {
     with_tile_commands(vec![
         MenuNode::entry("g", "back to graph list", "cog-graphs"),
         MenuNode::entry("r", "refresh", "cog-refresh"),
+        MenuNode::entry("e", "hide/show live events", "cog-toggle-events"),
     ])
 }
 
@@ -5825,6 +5826,7 @@ impl YaldaGpuiView {
             "linear-copy-url" => self.linear_copy_url(cx),
             "cog-graphs" => self.cog_load_graphs(cx),
             "cog-refresh" => self.cog_refresh_focused(cx),
+            "cog-toggle-events" => self.cog_toggle_events(cx),
             "keymap-filter" => self.keymap_menu_filter(cx),
             "keymap-rebind" => self.keymap_menu_rebind(cx),
             "keymap-reset" => self.keymap_menu_reset(cx),

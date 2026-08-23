@@ -25592,6 +25592,77 @@ fn cog_events_pane_paints_and_focus_cycles(cx: &mut TestAppContext) {
     );
 }
 
+/// UXI-Cog-12: the `cog-toggle-events` tile menu command hides/shows the live
+/// events strip. Drives the REAL menu dispatch path (`dispatch_menu_command`),
+/// and asserts on PAINT (the `cog-events` strip disappears from / reappears in
+/// the layout), not just state. Hiding while the strip has focus moves focus off
+/// it. Negative control: gate the strip render on `in_graph()` instead of
+/// `events_pane_visible()` and this goes RED (the strip keeps painting when
+/// hidden).
+#[gpui::test]
+fn cog_toggle_events_hides_and_shows_strip(cx: &mut TestAppContext) {
+    use crate::{KMods, Key, KeyPress};
+    let tab = || KeyPress::new(Key::Tab, KMods::NONE);
+
+    let (view, vcx, cv, wid) = boot_with_cog(cx);
+
+    // Load a graph so the strip exists — probe the paint of the resulting frame.
+    let req = cog_tile_req(&view, vcx);
+    crate::layout_probe_begin();
+    view.update(vcx, |v, cx| {
+        v.cog_apply(
+            wid,
+            req,
+            Ok(crate::CogFetch::Graph(Box::new(cog_test_bundle(vec![
+                cog_test_node("n1", "only", "done", serde_json::json!({"purpose": "a"})),
+            ])))),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    let shown = crate::layout_probe_get("cog-events");
+    crate::layout_probe_end();
+
+    // Strip visible + painting to start.
+    assert!(
+        cv.update(vcx, |c, _| c.events_pane_visible()),
+        "strip visible in a loaded graph"
+    );
+    let (_, _, w, h) = shown.expect("events strip paints before hide");
+    assert!(w > 0.0 && h > 0.0, "strip has real size ({w}x{h})");
+
+    // Move focus to the strip, then hide via the REAL menu command.
+    view.update(vcx, |v, cx| v.handle_cog_press(tab(), cx)); // → detail
+    view.update(vcx, |v, cx| v.handle_cog_press(tab(), cx)); // → events
+    vcx.run_until_parked();
+    assert!(cv.update(vcx, |c, _| c.focused_events()), "focus on strip");
+
+    crate::layout_probe_begin();
+    view.update(vcx, |v, cx| v.dispatch_menu_command("cog-toggle-events", cx));
+    vcx.run_until_parked();
+    let hidden = crate::layout_probe_get("cog-events");
+    crate::layout_probe_end();
+    assert!(hidden.is_none(), "strip does NOT paint after hide");
+    assert!(cv.update(vcx, |c, _| c.events_hidden()), "state marked hidden");
+    assert!(
+        !cv.update(vcx, |c, _| c.focused_events()),
+        "focus left the hidden strip"
+    );
+
+    // Toggle again → strip reappears and paints.
+    crate::layout_probe_begin();
+    view.update(vcx, |v, cx| v.dispatch_menu_command("cog-toggle-events", cx));
+    vcx.run_until_parked();
+    let reshown = crate::layout_probe_get("cog-events");
+    crate::layout_probe_end();
+    let (_, _, w2, h2) = reshown.expect("events strip paints again after show");
+    assert!(w2 > 0.0 && h2 > 0.0, "strip real size again ({w2}x{h2})");
+    assert!(
+        !cv.update(vcx, |c, _| c.events_hidden()),
+        "state marked shown"
+    );
+}
+
 #[cfg(test)]
 fn cog_tile_needs_load(
     view: &gpui::Entity<YaldaGpuiView>,
