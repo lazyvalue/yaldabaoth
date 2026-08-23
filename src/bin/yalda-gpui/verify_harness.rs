@@ -14068,6 +14068,27 @@ fn worksheet_real_submit(
     vcx.run_until_parked();
 }
 
+/// UXI-AgentTile-41 (population, REAL submit path): a message sent through the
+/// production worksheet submit (`handle_claude_key(i)` → type → `submit_agent` →
+/// `submit_worksheet_blocks` → `channel.send_payload`) lands in the recall ring.
+///
+/// Negative control: drop the `c.history_push(&combined)` call in
+/// `submit_worksheet_blocks` and the `sent_history == ["hello ring"]` assert fails.
+#[cfg(feature = "test-support")]
+#[gpui::test]
+fn worksheet_real_submit_populates_history_ring(cx: &mut TestAppContext) {
+    let (view, vcx, id, _controls) = boot_worksheet_channel(cx);
+    worksheet_real_submit(&view, vcx, "hello ring");
+    let ring = view.read_with(vcx, |v, cx| {
+        v.read_session(id, cx, |c| c.sent_history.clone()).unwrap()
+    });
+    assert_eq!(
+        ring,
+        vec!["hello ring".to_string()],
+        "the sent message enters the Up/Down recall ring"
+    );
+}
+
 /// UXI-AgentTile-14 (end-to-end, real submit path): a pasted image staged on the
 /// compose rides a REAL worksheet submit — it reaches the channel as a
 /// `PromptPayload` carrying the image attachment, the transcript records a
@@ -18383,6 +18404,107 @@ fn subagent_panes_paint_right_of_compose(cx: &mut TestAppContext) {
         "subagent panes left {panes_x} is NOT right of the compose right {} — not in the sidepanel",
         box_x + box_w,
     );
+}
+
+/// UXI-AgentTile-41: shell-style Up/Down message-history recall in the compose.
+/// Drives the REAL `handle_claude_key` Up/Down over a chatbox compose that has a
+/// seeded sent-message ring plus a partial UNSENT draft: Up walks back through
+/// the ring (stashing the draft on entry), Up at the oldest entry stays put, Down
+/// walks forward, and Down past the newest restores the stashed unsent draft.
+///
+/// Negative control: revert the Up/Down recall interception in `handle_claude_key`
+/// (Up falls through to `dispatch_insert_core`'s caret motion) → the first
+/// "second msg" assert fails RED.
+#[gpui::test]
+fn compose_up_down_recalls_sent_history(cx: &mut TestAppContext) {
+    use crate::agent::{AgentFocus, InputSurface};
+    let (view, vcx, id, _s) = boot_with_transcript(cx);
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| {
+            c.sent_history = vec!["first msg".into(), "second msg".into()];
+            c.input_surface =
+                InputSurface::with_draft(crate::InputModeKind::Chatbox, "partial");
+            c.focus = AgentFocus::Compose;
+        });
+    });
+    let text = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.read_with(vcx, |v, cx| {
+            v.read_session(id, cx, |c| c.input_surface.compose().text())
+                .unwrap()
+        })
+    };
+    let up = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("up"), w, cx));
+    };
+    let down = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("down"), w, cx));
+    };
+
+    up(&view, vcx);
+    assert_eq!(text(&view, vcx), "second msg", "Up recalls the newest sent message");
+    up(&view, vcx);
+    assert_eq!(text(&view, vcx), "first msg", "Up again walks one step back");
+    up(&view, vcx);
+    assert_eq!(text(&view, vcx), "first msg", "Up at the oldest entry stays put");
+    down(&view, vcx);
+    assert_eq!(text(&view, vcx), "second msg", "Down walks one step forward");
+    down(&view, vcx);
+    assert_eq!(
+        text(&view, vcx),
+        "partial",
+        "Down past the newest restores the stashed unsent draft"
+    );
+}
+
+/// UXI-AgentTile-41 (no regression of the compose arrows): in a MULTI-LINE draft
+/// Up/Down still move the caret vertically — recall triggers ONLY at the top
+/// (Up) / bottom (Down) logical line — so vertical editing is preserved even with
+/// sent history present. Also negative-controls the `line == 0` gate: dropping it
+/// (Up always recalls) would fail the first "caret moved to row 1, text unchanged"
+/// assert.
+#[gpui::test]
+fn compose_arrows_move_caret_in_multiline_draft(cx: &mut TestAppContext) {
+    use crate::agent::{AgentFocus, InputSurface};
+    let (view, vcx, id, _s) = boot_with_transcript(cx);
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| {
+            c.sent_history = vec!["prev".into()]; // history present, but arrows edit
+            c.input_surface =
+                InputSurface::with_draft(crate::InputModeKind::Chatbox, "line1\nline2\nline3");
+            c.focus = AgentFocus::Compose;
+        });
+    });
+    let snap = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.read_with(vcx, |v, cx| {
+            v.read_session(id, cx, |c| {
+                (
+                    c.input_surface.compose().editor.cursor().line,
+                    c.input_surface.compose().text(),
+                    c.history_nav.is_some(),
+                )
+            })
+            .unwrap()
+        })
+    };
+    let up = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("up"), w, cx));
+    };
+
+    // Caret starts on the last line (row 2). Up moves to row 1 — caret motion, not
+    // recall; the text is untouched and history browse never started.
+    up(&view, vcx);
+    let (row, body, browsing) = snap(&view, vcx);
+    assert_eq!(row, 1, "Up in a multi-line draft moves the caret up a row");
+    assert_eq!(body, "line1\nline2\nline3", "caret motion did not change the draft");
+    assert!(!browsing, "caret motion mid-draft does not start history browse");
+
+    // Up again → row 0 (still caret motion).
+    up(&view, vcx);
+    assert_eq!(snap(&view, vcx).0, 0, "Up moves to the top row");
+
+    // Now at the top row, Up recalls the sent message.
+    up(&view, vcx);
+    assert_eq!(snap(&view, vcx).1, "prev", "Up at the top row recalls history");
 }
 
 /// UXI-AgentTile-20 (summon-only): the sidepanel is HIDDEN by default and does NOT

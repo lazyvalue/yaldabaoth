@@ -2418,6 +2418,8 @@ impl YaldaGpuiView {
             lines_cache_seq: u64::MAX,
             highlight_cache: HighlightCache::new(),
             input_surface: InputSurface::new(InputModeKind::Worksheet),
+            sent_history: Vec::new(),
+            history_nav: None,
             focus: AgentFocus::Transcript,
             you_block_open: false,
             you_block_anchor: None,
@@ -5212,6 +5214,9 @@ impl YaldaGpuiView {
             .flatten();
         if self.send_prompt_to_session(id, &text, &images, anchor, steer_codex, cx) {
             self.with_session(id, cx, |claude| {
+                // Record the sent message in the Up/Down recall ring (UXI-AgentTile-41)
+                // BEFORE the compose is reset below.
+                claude.history_push(&text);
                 // Reset the compose, PRESERVING placement (Model C §4.1).
                 let mode = claude.input_surface.mode;
                 claude.input_surface = InputSurface::new(mode);
@@ -5316,6 +5321,9 @@ impl YaldaGpuiView {
         }
         if sent {
             self.with_session(id, cx, |c| {
+                // Record the combined sent text in the Up/Down recall ring
+                // (UXI-AgentTile-41) before the compose is reset below.
+                c.history_push(&combined);
                 // Mint ONE turn for the whole submit; freeze each block in place
                 // under it (the reconciler suppresses the combined echo).
                 if let Some(k) = c.register_user_turn(
@@ -6486,8 +6494,48 @@ impl YaldaGpuiView {
         // transcript-reveal is needed for typing.)
         let Some(outcome) = self.with_session_silent(focused_id, cx, |claude| {
             claude.status = None;
+
+            // UXI-AgentTile-41: shell-style Up/Down message-history recall in the
+            // compose (Insert mode only). Up on the TOP logical line walks back
+            // through sent messages (stashing the current unsent draft on entry);
+            // Down on the BOTTOM logical line walks forward and, past the newest,
+            // restores the stashed draft. Anywhere else Up/Down are ordinary caret
+            // motion, so a multi-line draft still navigates vertically.
+            let (mode, line, last_row) = {
+                let cb = claude.input_surface.compose();
+                (
+                    cb.mode,
+                    cb.editor.cursor().line,
+                    cb.editor.document().line_count().saturating_sub(1),
+                )
+            };
+            if mode == EditMode::Insert && press.modifiers.is_empty() {
+                let recalled = match press.key {
+                    Key::Up if line == 0 => {
+                        let draft = claude.input_surface.compose().text();
+                        claude.history_up(&draft)
+                    }
+                    Key::Down if line == last_row => claude.history_down(),
+                    _ => None,
+                };
+                if let Some(text) = recalled {
+                    claude.input_surface.compose_mut().set_recalled(&text);
+                    return NormalOutcome::Handled;
+                }
+            }
+
+            // Not a recall gesture → dispatch normally, and leave history-browse
+            // mode if this keystroke actually edits the draft or exits Insert
+            // (the recalled text then becomes the working line; a later Up
+            // re-stashes it).
+            let browsing = claude.history_nav.is_some();
+            let text_before = if browsing {
+                claude.input_surface.compose().text()
+            } else {
+                String::new()
+            };
             let cb = claude.input_surface.compose_mut();
-            match cb.mode {
+            let outcome = match cb.mode {
                 EditMode::Insert => {
                     Self::dispatch_insert_core(&mut cb.editor, &mut cb.mode, press);
                     NormalOutcome::Handled
@@ -6498,7 +6546,15 @@ impl YaldaGpuiView {
                     &mut claude.keybinds,
                     press,
                 ),
+            };
+            if browsing {
+                let edited = claude.input_surface.compose().text() != text_before
+                    || claude.input_surface.compose().mode != EditMode::Insert;
+                if edited {
+                    claude.history_reset();
+                }
             }
+            outcome
         }) else {
             return;
         };

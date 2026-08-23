@@ -6086,3 +6086,54 @@ fn system_console_log_is_bounded_and_classifies_build_output() {
     assert!(persisted.contains("CMD\tcargo build --release"));
     assert!(persisted.contains("ERROR\tbuild failed"));
 }
+
+/// UXI-AgentTile-41 (pure ring semantics): `AgentState::history_push` /
+/// `history_up` / `history_down` — trim, skip-empty, skip-immediate-duplicate,
+/// cap at `HISTORY_CAP`, and the Up-stashes / Down-restores browse walk.
+#[test]
+fn history_ring_push_recall_semantics() {
+    use crate::agent::{AgentState, HISTORY_CAP};
+    let mut s = AgentState::new_for_test();
+    assert!(s.sent_history.is_empty());
+
+    // Empty / whitespace pushes are ignored; text is trimmed.
+    s.history_push("   ");
+    s.history_push("");
+    assert!(s.sent_history.is_empty(), "blank sends are not recorded");
+    s.history_push("  hello  ");
+    assert_eq!(s.sent_history, vec!["hello".to_string()], "text is trimmed");
+
+    // An immediate duplicate of the newest entry is skipped.
+    s.history_push("hello");
+    assert_eq!(s.sent_history, vec!["hello".to_string()], "no consecutive dup");
+    s.history_push("world");
+    assert_eq!(s.sent_history, vec!["hello".to_string(), "world".to_string()]);
+
+    // Up stashes the current draft and walks back; Down walks forward and past
+    // the newest restores the stash.
+    assert_eq!(s.history_up("draft").as_deref(), Some("world"));
+    assert_eq!(s.history_up("draft").as_deref(), Some("hello"));
+    assert_eq!(s.history_up("draft").as_deref(), Some("hello"), "clamps at oldest");
+    assert_eq!(s.history_down().as_deref(), Some("world"));
+    assert_eq!(s.history_down().as_deref(), Some("draft"), "restores the stash");
+    assert!(s.history_nav.is_none(), "browse ends after restoring the draft");
+    assert!(s.history_down().is_none(), "Down with no browse is a no-op");
+
+    // A push ends any active browse.
+    s.history_up("d");
+    assert!(s.history_nav.is_some());
+    s.history_push("again");
+    assert!(s.history_nav.is_none(), "push ends browse");
+
+    // Cap: pushing past HISTORY_CAP drops the oldest.
+    for i in 0..HISTORY_CAP + 5 {
+        s.history_push(&format!("m{i}"));
+    }
+    assert_eq!(s.sent_history.len(), HISTORY_CAP, "ring is capped");
+    assert_eq!(
+        s.sent_history.last().map(String::as_str),
+        Some(format!("m{}", HISTORY_CAP + 4).as_str()),
+        "newest is retained",
+    );
+    assert!(!s.sent_history.contains(&"m0".to_string()), "oldest dropped");
+}
