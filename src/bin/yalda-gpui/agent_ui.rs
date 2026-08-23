@@ -2430,6 +2430,8 @@ impl YaldaGpuiView {
             agent_model: None,
             available_models: Vec::new(),
             available_commands: Vec::new(),
+            slash_popup_sel: 0,
+            slash_popup_dismissed: false,
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             usage: None,
             focused_subagent: None,
@@ -6509,6 +6511,42 @@ impl YaldaGpuiView {
         let Some(outcome) = self.with_session_silent(focused_id, cx, |claude| {
             claude.status = None;
 
+            // n3b (UXI-AgentTile-42): the slash-command popup owns the navigation
+            // keys FIRST — before history recall and before the editor. Only while
+            // the popup is actually open (a bare `/token` draft with matches).
+            let popup_rows = claude.slash_popup_rows();
+            if !popup_rows.is_empty() && press.modifiers.is_empty() {
+                match press.key {
+                    Key::Up => {
+                        claude.slash_popup_sel = claude.slash_popup_sel.saturating_sub(1);
+                        return NormalOutcome::Handled;
+                    }
+                    Key::Down => {
+                        claude.slash_popup_sel =
+                            (claude.slash_popup_sel + 1).min(popup_rows.len() - 1);
+                        return NormalOutcome::Handled;
+                    }
+                    Key::Tab | Key::Enter => {
+                        // Accept the highlighted command: fill `/name` in and close
+                        // the popup. A second Enter (popup now closed) submits.
+                        let sel = claude.slash_popup_sel.min(popup_rows.len() - 1);
+                        let name = popup_rows[sel].name.clone();
+                        claude
+                            .input_surface
+                            .compose_mut()
+                            .set_recalled(&format!("/{name}"));
+                        claude.slash_popup_dismissed = true;
+                        claude.history_reset();
+                        return NormalOutcome::Handled;
+                    }
+                    Key::Esc => {
+                        claude.slash_popup_dismissed = true;
+                        return NormalOutcome::Handled;
+                    }
+                    _ => {}
+                }
+            }
+
             // UXI-AgentTile-41: shell-style Up/Down message-history recall in the
             // compose (Insert mode only). Up on the TOP logical line walks back
             // through sent messages (stashing the current unsent draft on entry);
@@ -6543,11 +6581,7 @@ impl YaldaGpuiView {
             // (the recalled text then becomes the working line; a later Up
             // re-stashes it).
             let browsing = claude.history_nav.is_some();
-            let text_before = if browsing {
-                claude.input_surface.compose().text()
-            } else {
-                String::new()
-            };
+            let text_before = claude.input_surface.compose().text();
             let cb = claude.input_surface.compose_mut();
             let outcome = match cb.mode {
                 EditMode::Insert => {
@@ -6561,12 +6595,17 @@ impl YaldaGpuiView {
                     press,
                 ),
             };
-            if browsing {
-                let edited = claude.input_surface.compose().text() != text_before
-                    || claude.input_surface.compose().mode != EditMode::Insert;
-                if edited {
-                    claude.history_reset();
-                }
+            let text_after = claude.input_surface.compose().text();
+            let edited = text_after != text_before;
+            if browsing && (edited || claude.input_surface.compose().mode != EditMode::Insert) {
+                claude.history_reset();
+            }
+            // Editing the compose changes the slash query — reset the popup
+            // selection and un-dismiss so typing/backspacing re-filters
+            // (UXI-AgentTile-42).
+            if edited {
+                claude.slash_popup_sel = 0;
+                claude.slash_popup_dismissed = false;
             }
             outcome
         }) else {

@@ -6162,3 +6162,51 @@ fn agent_event_available_commands_maps_and_roundtrips() {
     let back: AgentEventKind = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(kind, back, "AvailableCommands round-trips through the WAL mirror");
 }
+
+/// UXI-AgentTile-42 (pure): slash_query recognizes a bare `/token`; slash_popup_rows
+/// filters slash_commands() by prefix and honors the Insert-mode / dismissed gates.
+#[test]
+fn slash_query_and_popup_rows_filter() {
+    use crate::agent::AgentState;
+    use crate::EditMode;
+    use yalda::acp_channel::AgentCommand;
+
+    let mut s = AgentState::new_for_test();
+    s.available_commands = vec![
+        AgentCommand { name: "compact".into(), description: "c".into() },
+        AgentCommand { name: "review".into(), description: "r".into() },
+    ];
+    let set = |s: &mut AgentState, text: &str| {
+        s.input_surface.compose_mut().set_recalled(text); // Insert + cursor at end
+    };
+
+    // slash_query: bare token only.
+    set(&mut s, "/co");
+    assert_eq!(s.slash_query().as_deref(), Some("co"));
+    set(&mut s, "/");
+    assert_eq!(s.slash_query().as_deref(), Some(""));
+    set(&mut s, "/co bar"); // has a space
+    assert_eq!(s.slash_query(), None);
+    set(&mut s, "hello");
+    assert_eq!(s.slash_query(), None);
+    set(&mut s, "a/b");
+    assert_eq!(s.slash_query(), None);
+
+    // Rows: prefix filter over local /clear + agent commands.
+    set(&mut s, "/c");
+    let names: Vec<String> = s.slash_popup_rows().iter().map(|c| c.name.clone()).collect();
+    assert_eq!(names, vec!["clear".to_string(), "compact".to_string()]);
+    set(&mut s, "/rev");
+    let names: Vec<String> = s.slash_popup_rows().iter().map(|c| c.name.clone()).collect();
+    assert_eq!(names, vec!["review".to_string()]);
+    set(&mut s, "/zzz"); // no match
+    assert!(s.slash_popup_rows().is_empty());
+
+    // Gates: dismissed hides it; Normal mode hides it.
+    set(&mut s, "/c");
+    s.slash_popup_dismissed = true;
+    assert!(s.slash_popup_rows().is_empty(), "Esc-dismiss hides the popup");
+    s.slash_popup_dismissed = false;
+    s.input_surface.compose_mut().mode = EditMode::Normal;
+    assert!(s.slash_popup_rows().is_empty(), "no popup outside Insert mode");
+}

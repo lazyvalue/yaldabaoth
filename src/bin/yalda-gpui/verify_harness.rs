@@ -18406,6 +18406,142 @@ fn subagent_panes_paint_right_of_compose(cx: &mut TestAppContext) {
     );
 }
 
+/// UXI-AgentTile-42 (n3b): typing `/` opens the slash-command popup; it filters by
+/// the typed prefix, Up/Down move the selection (out-prioritizing the n2 history
+/// recall), and Tab/Enter accept the highlighted command into the draft + close it.
+/// Drives the REAL `handle_claude_key` throughout.
+///
+/// Negative control: revert the popup key interception in `handle_claude_key`
+/// (Down falls through to caret motion / history) → the `sel == 1` assert fails.
+#[gpui::test]
+fn slash_popup_filters_navigates_and_accepts(cx: &mut TestAppContext) {
+    use crate::agent::{AgentFocus, InputSurface};
+    use yalda::acp_channel::AgentCommand;
+
+    let (view, vcx, id, _s) = boot_with_transcript(cx);
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| {
+            c.available_commands = vec![
+                AgentCommand { name: "compact".into(), description: "Compact".into() },
+                AgentCommand { name: "review".into(), description: "Review".into() },
+            ];
+            // A sent-message ring is present: Down must drive the POPUP, not recall.
+            c.sent_history = vec!["an old message".into()];
+            c.input_surface = InputSurface::with_draft(crate::InputModeKind::Chatbox, "");
+            c.focus = AgentFocus::Compose;
+        });
+    });
+    let key = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext, k: &str| {
+        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(k), w, cx));
+    };
+    let rows = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.read_with(vcx, |v, cx| {
+            v.read_session(id, cx, |c| {
+                c.slash_popup_rows()
+                    .iter()
+                    .map(|r| r.name.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap()
+        })
+    };
+    let sel = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.read_with(vcx, |v, cx| v.read_session(id, cx, |c| c.slash_popup_sel).unwrap())
+    };
+    let draft = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.read_with(vcx, |v, cx| {
+            v.read_session(id, cx, |c| c.input_surface.compose().text())
+                .unwrap()
+        })
+    };
+
+    // Type "/c" → query "c" → matches the local /clear + agent /compact.
+    key(&view, vcx, "/");
+    key(&view, vcx, "c");
+    assert_eq!(
+        rows(&view, vcx),
+        vec!["clear".to_string(), "compact".to_string()],
+        "popup filters to commands starting with the typed prefix",
+    );
+    assert_eq!(sel(&view, vcx), 0, "selection starts at the top");
+
+    // Down/Up move the popup selection (NOT the history ring), and clamp.
+    key(&view, vcx, "down");
+    assert_eq!(sel(&view, vcx), 1, "Down moves the popup selection");
+    assert_eq!(draft(&view, vcx), "/c", "Down drove the popup, not history recall");
+    key(&view, vcx, "down");
+    assert_eq!(sel(&view, vcx), 1, "Down clamps at the last row");
+    key(&view, vcx, "up");
+    assert_eq!(sel(&view, vcx), 0, "Up moves the popup selection back");
+
+    // Enter accepts the highlighted command → draft becomes "/clear", popup closes.
+    key(&view, vcx, "enter");
+    assert_eq!(draft(&view, vcx), "/clear", "Enter fills the highlighted command in");
+    assert!(rows(&view, vcx).is_empty(), "popup closes after accept");
+}
+
+/// UXI-AgentTile-42 (n3b, PAINT): the slash popup paints ABOVE the compose box when
+/// the draft is a bare slash token, and is absent when it isn't. Layout probe.
+///
+/// Negative control: revert the `show_slash_popup` render gate in `render_agent`
+/// → the `slash-popup` probe is absent even with a `/` draft, so step 1 fails.
+#[gpui::test]
+fn slash_popup_paints_above_compose(cx: &mut TestAppContext) {
+    use crate::agent::{AgentFocus, InputSurface};
+    use yalda::acp_channel::AgentCommand;
+
+    let (view, vcx, id, _s) = boot_with_transcript(cx);
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| {
+            c.available_commands = vec![AgentCommand {
+                name: "compact".into(),
+                description: "Compact the conversation".into(),
+            }];
+            c.input_surface = InputSurface::with_draft(crate::InputModeKind::Chatbox, "/co");
+            c.focus = AgentFocus::Compose;
+        });
+    });
+
+    let probe = |view: &gpui::Entity<YaldaGpuiView>,
+                 vcx: &mut gpui::VisualTestContext,
+                 tag: &str| {
+        for _ in 0..3 {
+            view.update(vcx, |_, cx| cx.notify());
+            vcx.run_until_parked();
+        }
+        crate::layout_probe_begin();
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+        let b = crate::layout_probe_get(tag);
+        crate::layout_probe_end();
+        b
+    };
+
+    // 1) With a `/co` draft the popup paints, above the compose box.
+    let popup = probe(&view, vcx, "slash-popup");
+    let compose = probe(&view, vcx, "compose-box");
+    let (_, pop_y, _, pop_h) = popup.expect("slash popup must paint for a /token draft");
+    let (_, box_y, _, _) = compose.expect("compose box paints");
+    assert!(pop_h > 1.0, "popup has height ({pop_h})");
+    assert!(
+        pop_y + pop_h <= box_y + 2.0,
+        "popup bottom {} must sit at/above the compose top {box_y}",
+        pop_y + pop_h,
+    );
+
+    // 2) Change the draft to ordinary text → the popup is gone.
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| {
+            c.input_surface = InputSurface::with_draft(crate::InputModeKind::Chatbox, "hello");
+            c.focus = AgentFocus::Compose;
+        });
+    });
+    assert!(
+        probe(&view, vcx, "slash-popup").is_none(),
+        "popup does not paint for a non-slash draft",
+    );
+}
+
 /// UXI-AgentTile-42 (n3a): the agent's advertised slash commands
 /// (`AvailableCommandsUpdate`, previously a parked no-op) reach the session model
 /// through the REAL reducer (`apply_server_batch` → `apply_reply_events`), and

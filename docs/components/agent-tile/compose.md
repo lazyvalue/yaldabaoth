@@ -1,7 +1,7 @@
 # Agent Tile — Compose
 
 Facet of the [Agent Tile](README.md) component. Owns `UXI-AgentTile-9..14`, `-21`,
-`-24`, `-35`, `-36`, `-41`.
+`-24`, `-35`, `-36`, `-41`, `-42`.
 
 ## Description
 
@@ -735,3 +735,56 @@ only at the top/bottom row — also NC-guards the `line == 0` gate), and
 worksheet submit lands in the ring; NC-RED with the `history_push` removed). Pure:
 `tests.rs::history_ring_push_recall_semantics` (trim / skip-empty / skip-dup / cap /
 stash-restore walk). NCs observed RED.
+
+### UXI-AgentTile-42 — Slash-command autocomplete popup in the compose
+
+**Statement.** When the compose draft is a bare slash token (`/` followed by a run
+of non-whitespace, single line — `slash_query`), a **completion popup** appears
+pinned directly ABOVE the compose input, in **both** placements (the inline
+worksheet You-block and the bottom chatbox):
+
+1. **Command source.** The list is the agent's advertised commands
+   (`AvailableCommandsUpdate` → `AgentState::available_commands`, see
+   [n3a](#references)) merged with the local commands (`/clear`), deduped by name
+   with the local winning (`slash_commands()`).
+2. **Filter.** Rows are `slash_commands()` whose name **starts with** the query
+   after `/` (case-insensitive). `/` alone lists everything; a query with a space
+   or a non-leading `/` closes it. Empty matches ⇒ no popup.
+3. **Keys (popup nav out-prioritizes everything else).** While the popup is open,
+   in the compose dispatch: `Up`/`Down` move the selection (clamped) — **ahead of
+   the `UXI-AgentTile-41` history recall**; `Tab`/`Enter` **accept** the highlighted
+   command (fill `/name` in, close the popup — a second `Enter` then submits);
+   `Esc` **dismisses** for the current query. Any edit to the draft re-filters and
+   un-dismisses (`slash_popup_sel` resets, `slash_popup_dismissed` clears).
+4. **Render.** One row per match (`/name` bold + dimmed description), the selected
+   row accent-washed; shown only when the compose is the focused/active input
+   (`focus == Compose` or the bottom box shows), never during read-only transcript
+   navigation. Chrome-class: native size (not text-scaled).
+
+**Applies to.** `agent.rs`: `AgentState::{available_commands, slash_popup_sel,
+slash_popup_dismissed}`, `slash_query`/`slash_commands`/`local_slash_commands`/
+`slash_popup_rows`. `agent_ui.rs`: the popup key interception at the top of the
+compose dispatch in `handle_claude_key` (before recall) + the reset-on-edit.
+`screens.rs::render_agent`: the `slash-popup` element in `main_col`, gated on
+`show_slash_popup`. The agent-command data layer is
+[ADR-linked](#references) via `ReplyEvent::AvailableCommands` /
+`AgentEventKind::AvailableCommands`.
+
+**Why.** The agent (and yalda) expose slash commands, but there was no way to
+discover or complete them — every non-`/clear` command was typed blind and
+forwarded as text. Autocomplete makes them discoverable and one keystroke to fill.
+
+**Status.** `implemented` (headless — key nav/accept, filter, and PAINT placement;
+exact glyphs/colors are harness gap #1). The popup is anchored above the compose in
+both placements; when the inline worksheet You-block sits mid-transcript the popup
+still pins above the bottom compose region (acceptable — a fresh `/` message is at
+the tail).
+
+**Enforcement.** `verify_harness.rs`: `slash_popup_filters_navigates_and_accepts`
+(REAL `handle_claude_key`: type `/c` → filter, `Down`/`Up` move the selection while
+a sent-message ring is present — proving popup nav beats recall — `Enter` fills
+`/clear` and closes; NC-RED with the interception disabled) and
+`slash_popup_paints_above_compose` (layout probe: popup paints above `compose-box`
+for a `/` draft, absent for plain text; NC-RED with the render gate disabled).
+Pure: `tests.rs::slash_query_and_popup_rows_filter` (query recognition, prefix
+filter, dismissed / Normal-mode gates). NCs observed RED.

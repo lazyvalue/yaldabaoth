@@ -1357,6 +1357,15 @@ impl YaldaGpuiView {
             .collect();
 
         let show_compose = c.input_surface.is_chatbox() || c.turn_phase.is_awaiting();
+        // n3b (UXI-AgentTile-42): slash-command autocomplete rows. Computed here
+        // (before the mutable compose borrow) and rendered above the compose in
+        // `main_col`, so it works in BOTH placements — the inline worksheet
+        // You-block (focus==Compose) and the bottom box (show_compose) — but never
+        // during read-only transcript navigation.
+        let slash_rows = c.slash_popup_rows();
+        let slash_sel = c.slash_popup_sel.min(slash_rows.len().saturating_sub(1));
+        let show_slash_popup =
+            !slash_rows.is_empty() && (c.focus == AgentFocus::Compose || show_compose);
         let compose_panel = if !show_compose {
             None
         } else {
@@ -2204,6 +2213,59 @@ impl YaldaGpuiView {
         // (no `Context<Self>` here).
         if let Some(recap_el) = self.render_agent_recap(id, weak_self.clone()) {
             main_col = main_col.child(recap_el);
+        }
+        // n3b (UXI-AgentTile-42): the slash-command autocomplete popup, pinned just
+        // ABOVE the compose in either placement. One row per filtered command
+        // (`/name` + description); the selected row is accent-washed.
+        if show_slash_popup {
+            let mut hl = nc(at.warm_accent);
+            hl.a = 0.20;
+            let mut pop = div()
+                .id("slash-popup")
+                .flex()
+                .flex_col()
+                .flex_none()
+                .w_full()
+                .max_h(px(180.0))
+                .overflow_y_scroll()
+                .border_t_1()
+                .border_color(dim_fg)
+                .bg(compose_panel_bg)
+                .text_size(px(12.0))
+                .font_family(self.code_font.clone());
+            for (i, cmd) in slash_rows.iter().enumerate() {
+                let selected = i == slash_sel;
+                let name = format!("/{}", cmd.name);
+                let mut row = div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .w_full()
+                    .px_2()
+                    .py(px(1.0));
+                if selected {
+                    row = row.bg(hl);
+                }
+                pop = pop.child(
+                    row.child(
+                        div()
+                            .flex_none()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(compose_fg)
+                            .child(SharedString::from(name)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(dim_fg)
+                            .child(SharedString::from(cmd.description.clone())),
+                    ),
+                );
+            }
+            main_col = main_col.child(probe_bounds("slash-popup", pop.into_any_element()));
         }
         if let Some(panel) = compose_panel {
             main_col = main_col.child(panel);

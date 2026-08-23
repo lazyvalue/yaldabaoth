@@ -3712,6 +3712,14 @@ pub(crate) struct AgentState {
     /// Drives the compose slash-command autocomplete popup (UXI-AgentTile-42);
     /// `slash_commands()` merges in the local commands (`/clear`).
     pub(crate) available_commands: Vec<yalda::acp_channel::AgentCommand>,
+    /// Compose slash-command autocomplete popup (UXI-AgentTile-42): the selected
+    /// row index. Clamped to the visible rows at use. Transient UI state (not
+    /// persisted).
+    pub(crate) slash_popup_sel: usize,
+    /// The slash popup was dismissed with Esc for the CURRENT query
+    /// (UXI-AgentTile-42). Reset to `false` whenever the compose text (hence the
+    /// query) changes, so editing the query re-opens the popup.
+    pub(crate) slash_popup_dismissed: bool,
     /// The session's permission mode, as session state sourced from the
     /// server. In session-server mode the agent/channel live in the server
     /// (not the GUI), so `channel` is `None` and the live `AcpChannelClient`
@@ -4109,6 +4117,40 @@ impl AgentState {
         out
     }
 
+    /// The slash-command QUERY the compose draft currently represents
+    /// (UXI-AgentTile-42), or `None` when the draft is not a bare slash token.
+    /// The draft must be exactly `/` followed by a run of non-whitespace (a
+    /// single line, no space/newline) — e.g. `/co` ⇒ `Some("co")`, `/` ⇒
+    /// `Some("")`, `hello` / `/co x` / `a/b` ⇒ `None`.
+    pub(crate) fn slash_query(&self) -> Option<String> {
+        let text = self.input_surface.compose().text();
+        let rest = text.strip_prefix('/')?;
+        if rest.chars().any(char::is_whitespace) {
+            return None;
+        }
+        Some(rest.to_string())
+    }
+
+    /// The filtered slash-command rows to show in the popup (UXI-AgentTile-42):
+    /// empty (⇒ popup hidden) unless the compose is in Insert mode, the draft is
+    /// a bare slash token, the popup was not Esc-dismissed for this query, and at
+    /// least one command name starts with the query (case-insensitive).
+    pub(crate) fn slash_popup_rows(&self) -> Vec<yalda::acp_channel::AgentCommand> {
+        if self.slash_popup_dismissed
+            || self.input_surface.compose().mode != EditMode::Insert
+        {
+            return Vec::new();
+        }
+        let Some(query) = self.slash_query() else {
+            return Vec::new();
+        };
+        let q = query.to_ascii_lowercase();
+        self.slash_commands()
+            .into_iter()
+            .filter(|c| c.name.to_ascii_lowercase().starts_with(&q))
+            .collect()
+    }
+
     /// Re-seat panel focus after a panel open/close (UXI-AgentTile-3). If the active
     /// column is no longer focusable, hop to another open column; if none
     /// remain, leave panel focus (restoring the captured focus). No-op unless
@@ -4269,6 +4311,8 @@ impl AgentState {
             agent_model: None,
             available_models: Vec::new(),
             available_commands: Vec::new(),
+            slash_popup_sel: 0,
+            slash_popup_dismissed: false,
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             usage: None,
             focused_subagent: None,
@@ -4358,6 +4402,8 @@ impl AgentState {
             agent_model: None,
             available_models: Vec::new(),
             available_commands: Vec::new(),
+            slash_popup_sel: 0,
+            slash_popup_dismissed: false,
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             usage: None,
             focused_subagent: None,
