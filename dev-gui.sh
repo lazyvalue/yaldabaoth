@@ -35,9 +35,35 @@ echo "▸ building yalda-gpui  (${PROFILE})…"
 cargo build "${CARGO_PROFILE_FLAG[@]}" --bin yalda-gpui
 
 echo "▸ stopping any running yalda gui (server left alone — agents survive)…"
-pkill -f 'target/debug/yalda-gpui'   2>/dev/null || true
-pkill -f 'target/release/yalda-gpui' 2>/dev/null || true
-sleep 0.3   # let the old window's teardown settle before the new one attaches
+GUI_PROCESS_PATTERN='(^|/)target/(debug|release)/yalda-gpui([[:space:]]|$)'
+pkill -TERM -f "${GUI_PROCESS_PATTERN}" 2>/dev/null || true
+
+# GPUI can take longer than one paint cycle to honor TERM.  Launching anyway
+# leaves the old windows alive beside the replacement (and attaches two GUI
+# connections to every session), which makes a successful restart look broken.
+# Give graceful teardown a bounded window, then kill ONLY repo-built GUI
+# processes.  The session server has a different executable name and is never
+# matched; its agents and WAL remain untouched.
+for _ in {1..30}; do
+  if ! pgrep -f "${GUI_PROCESS_PATTERN}" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.1
+done
+if pgrep -f "${GUI_PROCESS_PATTERN}" >/dev/null 2>&1; then
+  echo "▸ gui did not exit after TERM; forcing stale windows closed…"
+  pkill -KILL -f "${GUI_PROCESS_PATTERN}" 2>/dev/null || true
+  for _ in {1..10}; do
+    if ! pgrep -f "${GUI_PROCESS_PATTERN}" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.1
+  done
+fi
+if pgrep -f "${GUI_PROCESS_PATTERN}" >/dev/null 2>&1; then
+  echo "error: stale yalda GUI process is still running; refusing to launch a duplicate" >&2
+  exit 1
+fi
 
 echo "▸ launching fresh gui (${PROFILE}; reconnecting to the existing server)…"
 exec "./target/${PROFILE}/yalda-gpui" "$@"
