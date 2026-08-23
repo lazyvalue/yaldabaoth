@@ -14,11 +14,108 @@
 
 use super::*;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CogSourceTab {
+    Topics,
+    Agents,
+}
+
+pub(crate) enum CogTopicDetailState {
+    Empty,
+    Loading(String),
+    Loaded {
+        address: String,
+        detail: CogTopicDetail,
+    },
+    Error {
+        address: String,
+        message: String,
+    },
+}
+
+pub(crate) enum CogAgentDetailState {
+    Empty,
+    Loading(String),
+    Loaded(Box<CogAgentDetail>),
+}
+
+pub(crate) struct CogHomeState {
+    pub(crate) topics: CogTopicTree,
+    pub(crate) agents: Vec<CogAgentAddress>,
+    pub(crate) agent_presence: std::collections::BTreeMap<String, String>,
+    pub(crate) tab: CogSourceTab,
+    pub(crate) topic_selected: usize,
+    pub(crate) agent_selected: usize,
+    pub(crate) topic_detail: CogTopicDetailState,
+    pub(crate) agent_detail: CogAgentDetailState,
+}
+
+impl CogHomeState {
+    pub(crate) fn new(data: CogHomeData) -> Self {
+        Self {
+            topics: data.topics,
+            agents: data.agents,
+            agent_presence: data.agent_presence,
+            tab: CogSourceTab::Topics,
+            topic_selected: 0,
+            agent_selected: 0,
+            topic_detail: CogTopicDetailState::Empty,
+            agent_detail: CogAgentDetailState::Empty,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) enum CogTopicRow {
+    Folder {
+        label: String,
+        path: String,
+        depth: usize,
+    },
+    Binding {
+        binding: CogTopicBinding,
+        depth: usize,
+    },
+}
+
+fn flatten_topic_nodes(
+    nodes: &[CogTopicNode],
+    depth: usize,
+    collapsed: &std::collections::HashSet<String>,
+    out: &mut Vec<CogTopicRow>,
+) {
+    for node in nodes {
+        match node {
+            CogTopicNode::Folder {
+                label,
+                path,
+                children,
+            } => {
+                out.push(CogTopicRow::Folder {
+                    label: label.clone(),
+                    path: path.clone(),
+                    depth,
+                });
+                if !collapsed.contains(path) {
+                    flatten_topic_nodes(children, depth + 1, collapsed, out);
+                }
+            }
+            CogTopicNode::Binding(binding) => out.push(CogTopicRow::Binding {
+                binding: binding.clone(),
+                depth,
+            }),
+        }
+    }
+}
+
 /// The loaded content a Cog tile's body shows.
 pub(crate) enum CogViewState {
     /// A fetch is in flight; the string is the status line.
     Loading(String),
     Error(String),
+    /// Primary topic/address browser. The right pane renders the selected typed
+    /// target while the left hierarchy remains stable.
+    Home(Box<CogHomeState>),
     /// The graph explorer — pick a graph. `selected` is the highlighted row.
     Graphs {
         graphs: Vec<CogGraph>,
@@ -67,6 +164,11 @@ pub(crate) struct CogView {
     /// Collapsed JSON tree paths (folded rows). Keyed by a stable path id
     /// (`surface/key/idx…`); absent = expanded. Cleared on graph change.
     collapsed: std::collections::HashSet<String>,
+    /// Collapsed Topic folder paths. Separate from JSON folding and preserved
+    /// while entering a graph and returning to the browser.
+    topic_collapsed: std::collections::HashSet<String>,
+    /// The browser state parked while a graph leaf is open.
+    home_backstack: Option<Box<CogHomeState>>,
     /// Whether the live-events strip is hidden (tile menu toggle). Sticky across
     /// graph changes — a tile preference, not per-graph state (so `set_state`
     /// does not reset it). Default `false` (shown).
@@ -87,7 +189,7 @@ fn graph_matches(g: &CogGraph, filter: &str) -> bool {
 impl CogView {
     pub(crate) fn new(root: WeakEntity<YaldaGpuiView>) -> Self {
         CogView {
-            state: CogViewState::Loading("loading graphs…".into()),
+            state: CogViewState::Loading("loading topics…".into()),
             left_scroll: ScrollHandle::new(),
             right_scroll: ScrollHandle::new(),
             events: Vec::new(),
@@ -97,6 +199,8 @@ impl CogView {
             graph_filter: String::new(),
             filtering: false,
             collapsed: std::collections::HashSet::new(),
+            topic_collapsed: std::collections::HashSet::new(),
+            home_backstack: None,
             events_hidden: false,
             root,
             perf_label: "cog",
@@ -118,6 +222,101 @@ impl CogView {
         self.graph_filter.clear();
         self.filtering = false;
         self.collapsed.clear();
+    }
+
+    pub(crate) fn enter_graph(&mut self, bundle: Box<CogBundle>) {
+        if matches!(self.state, CogViewState::Home(_)) {
+            let previous = std::mem::replace(
+                &mut self.state,
+                CogViewState::Loading("opening graph…".into()),
+            );
+            if let CogViewState::Home(home) = previous {
+                self.home_backstack = Some(home);
+            }
+        }
+        self.set_state(CogViewState::Graph {
+            bundle,
+            selected: 0,
+            overview: true,
+        });
+    }
+
+    pub(crate) fn return_home(&mut self) -> bool {
+        let Some(home) = self.home_backstack.take() else {
+            return false;
+        };
+        self.set_state(CogViewState::Home(home));
+        true
+    }
+
+    pub(crate) fn topic_rows(&self) -> Vec<CogTopicRow> {
+        let mut rows = Vec::new();
+        if let CogViewState::Home(home) = &self.state {
+            flatten_topic_nodes(&home.topics.roots, 0, &self.topic_collapsed, &mut rows);
+        }
+        rows
+    }
+
+    pub(crate) fn selected_topic_binding(&self) -> Option<CogTopicBinding> {
+        let CogViewState::Home(home) = &self.state else {
+            return None;
+        };
+        let row = self.topic_rows().get(home.topic_selected)?.clone();
+        match row {
+            CogTopicRow::Binding { binding, .. } => Some(binding),
+            CogTopicRow::Folder { .. } => None,
+        }
+    }
+
+    pub(crate) fn set_topic_loading(&mut self, address: String) {
+        if let CogViewState::Home(home) = &mut self.state {
+            home.topic_detail = CogTopicDetailState::Loading(address);
+            self.right_scroll.set_offset(gpui::point(px(0.0), px(0.0)));
+        }
+    }
+
+    pub(crate) fn apply_topic_detail(
+        &mut self,
+        address: String,
+        result: Result<CogTopicDetail, String>,
+    ) {
+        let CogViewState::Home(home) = &mut self.state else {
+            return;
+        };
+        let still_selected = matches!(
+            &home.topic_detail,
+            CogTopicDetailState::Loading(current) if current == &address
+        );
+        if !still_selected {
+            return;
+        }
+        home.topic_detail = match result {
+            Ok(detail) => CogTopicDetailState::Loaded { address, detail },
+            Err(message) => CogTopicDetailState::Error { address, message },
+        };
+    }
+
+    pub(crate) fn toggle_topic_folder(&mut self, path: &str) {
+        if !self.topic_collapsed.remove(path) {
+            self.topic_collapsed.insert(path.to_string());
+        }
+        let len = self.topic_rows().len();
+        if let CogViewState::Home(home) = &mut self.state {
+            home.topic_selected = home.topic_selected.min(len.saturating_sub(1));
+        }
+    }
+
+    pub(crate) fn toggle_selected_topic_folder(&mut self) -> bool {
+        let CogViewState::Home(home) = &self.state else {
+            return false;
+        };
+        let Some(CogTopicRow::Folder { path, .. }) =
+            self.topic_rows().get(home.topic_selected).cloned()
+        else {
+            return false;
+        };
+        self.toggle_topic_folder(&path);
+        true
     }
 
     // ── JSON tree folding ────────────────────────────────────────────────────
@@ -224,7 +423,13 @@ impl CogView {
     /// Append a live event (newest first), bounded to the most recent 300.
     pub(crate) fn push_event(&mut self, raw: serde_json::Value) {
         self.event_seq += 1;
-        self.events.insert(0, CogEvent { seq: self.event_seq, raw });
+        self.events.insert(
+            0,
+            CogEvent {
+                seq: self.event_seq,
+                raw,
+            },
+        );
         self.events.truncate(300);
     }
 
@@ -316,6 +521,10 @@ impl CogView {
     /// Number of selectable rows in the active left list.
     fn len(&self) -> usize {
         match &self.state {
+            CogViewState::Home(home) => match home.tab {
+                CogSourceTab::Topics => self.topic_rows().len(),
+                CogSourceTab::Agents => home.agents.len(),
+            },
             CogViewState::Graphs { graphs, .. } => graphs.len(),
             CogViewState::Graph { bundle, .. } => bundle.nodes.len(),
             _ => 0,
@@ -325,6 +534,21 @@ impl CogView {
     /// Move the left selection by `delta` rows, wrapping. Changing the selected
     /// node resets the right pane to the top (a fresh node starts at its header).
     pub(crate) fn select_move(&mut self, delta: i32) {
+        if matches!(self.state, CogViewState::Home(_)) {
+            let n = self.len() as i32;
+            if n == 0 {
+                return;
+            }
+            if let CogViewState::Home(home) = &mut self.state {
+                let selected = match home.tab {
+                    CogSourceTab::Topics => &mut home.topic_selected,
+                    CogSourceTab::Agents => &mut home.agent_selected,
+                };
+                *selected = (*selected as i32 + delta).rem_euclid(n) as usize;
+            }
+            self.right_scroll.set_offset(gpui::point(px(0.0), px(0.0)));
+            return;
+        }
         // Explorer selection ranges over the FILTERED list.
         if matches!(self.state, CogViewState::Graphs { .. }) {
             let n = self.filtered_graph_indices().len() as i32;
@@ -364,8 +588,17 @@ impl CogView {
         matches!(self.state, CogViewState::Graphs { .. })
     }
 
+    pub(crate) fn in_home(&self) -> bool {
+        matches!(self.state, CogViewState::Home(_))
+    }
+
     /// The id of the highlighted graph in the (filtered) explorer, if any.
     pub(crate) fn selected_graph_id(&self) -> Option<String> {
+        if let Some(binding) = self.selected_topic_binding()
+            && binding.kind == CogTopicKind::Graph
+        {
+            return Some(binding.object);
+        }
         let idx = *self.filtered_graph_indices().get(self.graph_sel())?;
         match &self.state {
             CogViewState::Graphs { graphs, .. } => graphs.get(idx).map(|g| g.id.clone()),
@@ -391,6 +624,15 @@ impl CogView {
 
     /// The label of the highlighted graph (for the tile title on open).
     pub(crate) fn selected_graph_label(&self) -> Option<String> {
+        if let Some(binding) = self.selected_topic_binding()
+            && binding.kind == CogTopicKind::Graph
+        {
+            return Some(if binding.name.trim().is_empty() {
+                topic_leaf_label(&binding)
+            } else {
+                binding.name
+            });
+        }
         let idx = *self.filtered_graph_indices().get(self.graph_sel())?;
         match &self.state {
             CogViewState::Graphs { graphs, .. } => graphs.get(idx).map(|g| g.label()),
@@ -423,6 +665,432 @@ impl CogView {
         if let Some(root) = self.root.upgrade() {
             root.update(cx, |r, rcx| r.cog_open_graph_for(view, id, label, rcx));
         }
+    }
+
+    pub(crate) fn click_topic(&mut self, i: usize, cx: &mut Context<Self>) {
+        let Some(row) = self.topic_rows().get(i).cloned() else {
+            return;
+        };
+        if let CogViewState::Home(home) = &mut self.state {
+            home.topic_selected = i;
+        }
+        match row {
+            CogTopicRow::Folder { path, .. } => {
+                self.toggle_topic_folder(&path);
+                cx.notify();
+            }
+            CogTopicRow::Binding { binding, .. } => {
+                self.set_topic_loading(binding.address.clone());
+                cx.notify();
+                let view = cx.entity();
+                if let Some(root) = self.root.upgrade() {
+                    root.update(cx, |r, rcx| r.cog_fetch_topic_for(view, binding, rcx));
+                }
+            }
+        }
+    }
+
+    pub(crate) fn set_source_tab(&mut self, tab: CogSourceTab, cx: &mut Context<Self>) {
+        let mut agent = None;
+        if let CogViewState::Home(home) = &mut self.state {
+            if home.tab == tab {
+                return;
+            }
+            home.tab = tab;
+            if tab == CogSourceTab::Agents {
+                agent = home.agents.get(home.agent_selected).cloned();
+                if let Some(address) = &agent {
+                    home.agent_detail = CogAgentDetailState::Loading(address.id.clone());
+                }
+            }
+        } else {
+            return;
+        }
+        self.focus = CogFocus::Selector;
+        self.reset_scrolls();
+        cx.notify();
+        if let Some(address) = agent {
+            let view = cx.entity();
+            if let Some(root) = self.root.upgrade() {
+                root.update(cx, |r, rcx| r.cog_fetch_agent_for(view, address, rcx));
+            }
+        }
+    }
+
+    pub(crate) fn selected_agent(&self) -> Option<CogAgentAddress> {
+        match &self.state {
+            CogViewState::Home(home) if home.tab == CogSourceTab::Agents => {
+                home.agents.get(home.agent_selected).cloned()
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn set_agent_loading(&mut self, address: String) {
+        if let CogViewState::Home(home) = &mut self.state {
+            home.agent_detail = CogAgentDetailState::Loading(address);
+            self.right_scroll.set_offset(gpui::point(px(0.0), px(0.0)));
+        }
+    }
+
+    pub(crate) fn apply_agent_detail(&mut self, address: String, detail: CogAgentDetail) {
+        if let CogViewState::Home(home) = &mut self.state
+            && matches!(&home.agent_detail, CogAgentDetailState::Loading(id) if id == &address)
+        {
+            if let Ok(delivery) = &detail.delivery {
+                home.agent_presence
+                    .insert(address.clone(), delivery.presence.clone());
+            }
+            home.agent_detail = CogAgentDetailState::Loaded(Box::new(detail));
+            self.right_scroll.set_offset(gpui::point(px(0.0), px(0.0)));
+        }
+    }
+
+    pub(crate) fn click_agent(&mut self, i: usize, cx: &mut Context<Self>) {
+        let address = match &mut self.state {
+            CogViewState::Home(home) => {
+                let Some(address) = home.agents.get(i).cloned() else {
+                    return;
+                };
+                home.agent_selected = i;
+                home.agent_detail = CogAgentDetailState::Loading(address.id.clone());
+                address
+            }
+            _ => return,
+        };
+        self.right_scroll.set_offset(gpui::point(px(0.0), px(0.0)));
+        cx.notify();
+        let view = cx.entity();
+        if let Some(root) = self.root.upgrade() {
+            root.update(cx, |r, rcx| r.cog_fetch_agent_for(view, address, rcx));
+        }
+    }
+
+    fn topic_collapsed_row(&self, row: &CogTopicRow) -> bool {
+        matches!(row, CogTopicRow::Folder { path, .. } if self.topic_collapsed.contains(path))
+    }
+
+    fn topic_detail_body(
+        &self,
+        detail: &CogTopicDetailState,
+        st: &DetailStyle,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        match detail {
+            CogTopicDetailState::Empty => div()
+                .child(section_heading("Topics", st))
+                .child(dim_line("Select a note, graph, or mailing list.", st)),
+            CogTopicDetailState::Loading(address) => div()
+                .child(section_heading("Loading", st))
+                .child(dim_line(address, st)),
+            CogTopicDetailState::Error { address, message } => div()
+                .child(section_heading("Could not load topic", st))
+                .child(kv_row("Address", address.clone(), st))
+                .child(multiline_text(message, st.err, &st.mono, st.base))
+                .child(dim_line("Press r to retry.", st)),
+            CogTopicDetailState::Loaded { address, detail } => match detail {
+                CogTopicDetail::Graph(graph) => div()
+                    .child(topic_type_heading("GRAPH", address, st))
+                    .child(graph_preview(graph, st)),
+                CogTopicDetail::Note(mail) => self.mail_detail_body("NOTE", address, mail, st, cx),
+                CogTopicDetail::MailingList(list) => {
+                    self.mailing_list_detail_body(address, list, st, cx)
+                }
+            },
+        }
+    }
+
+    fn agent_detail_body(
+        &self,
+        detail: &CogAgentDetailState,
+        st: &DetailStyle,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        match detail {
+            CogAgentDetailState::Empty => div().child(section_heading("Agents", st)).child(
+                dim_line("Select a registered agent to inspect its mail.", st),
+            ),
+            CogAgentDetailState::Loading(address) => div()
+                .child(section_heading("Loading agent", st))
+                .child(dim_line(address, st)),
+            CogAgentDetailState::Loaded(detail) => {
+                let address = &detail.address;
+                let mut col = div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .gap_2()
+                    .child(topic_type_heading("AGENT", &address.id, st))
+                    .child(title_line(address.label(), &address.id, st))
+                    .child(section_heading("Binding", st))
+                    .child(kv_row(
+                        "State",
+                        if address.is_retired() {
+                            "retired".into()
+                        } else {
+                            "active".into()
+                        },
+                        st,
+                    ))
+                    .child(kv_row("Provider", display_or_dash(&address.provider), st))
+                    .child(kv_row("Session", display_or_dash(&address.session), st))
+                    .child(kv_row("Working dir", display_or_dash(&address.cwd), st))
+                    .child(section_heading("Delivery", st));
+                match &detail.delivery {
+                    Ok(delivery) => {
+                        col = col
+                            .child(kv_row("Presence", display_or_dash(&delivery.presence), st))
+                            .child(kv_row("State", display_or_dash(&delivery.state), st))
+                            .child(kv_row("Cursor", delivery.cursor.to_string(), st))
+                            .child(kv_row("Retries", delivery.retry_attempt.to_string(), st));
+                        if let Some(error) = &delivery.blocked_error {
+                            col = col.child(multiline_text(error, st.err, &st.mono, st.base));
+                        }
+                    }
+                    Err(error) => {
+                        col = col.child(multiline_text(error, st.err, &st.mono, st.base));
+                    }
+                }
+                col.child(probe_bounds(
+                    "cog-agent-mail",
+                    self.agent_mail_body(detail, st, cx).into_any_element(),
+                ))
+            }
+        }
+    }
+
+    fn agent_mail_body(
+        &self,
+        detail: &CogAgentDetail,
+        st: &DetailStyle,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let inbox_count = detail.inbox.as_ref().map_or(0, Vec::len);
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .gap_2()
+            .child(section_heading(
+                &format!("Mail · {inbox_count} inbox entries"),
+                st,
+            ));
+        match &detail.threads {
+            Ok(threads) if !threads.is_empty() => {
+                for mail in threads {
+                    col = col
+                        .child(title_line(&mail.name, &mail.id, st))
+                        .child(kv_row("Participants", mail.participants.join(", "), st));
+                    if mail.entries.is_empty() {
+                        col = col.child(dim_line("No entries in this thread.", st));
+                    }
+                    for entry in &mail.entries {
+                        col = col.child(probe_bounds(
+                            "cog-agent-mail-entry",
+                            self.communication_card(
+                                &format!("agent:{}:{}", mail.id, entry.event_id),
+                                &entry.from,
+                                entry.at,
+                                entry.event_id,
+                                &entry.content,
+                                &entry.references,
+                                st,
+                                cx,
+                            )
+                            .into_any_element(),
+                        ));
+                    }
+                }
+            }
+            Ok(_) => match &detail.inbox {
+                Ok(inbox) if inbox.is_empty() => {
+                    col = col.child(dim_line("No mail for this agent.", st));
+                }
+                Ok(inbox) => {
+                    for item in inbox {
+                        col = col
+                            .child(section_heading(
+                                &format!("{} · {}", item.mail_name, item.mail),
+                                st,
+                            ))
+                            .child(self.communication_card(
+                                &format!("inbox:{}:{}", item.mail, item.entry.event_id),
+                                &item.entry.from,
+                                item.entry.at,
+                                item.entry.event_id,
+                                &item.entry.content,
+                                &item.entry.references,
+                                st,
+                                cx,
+                            ));
+                    }
+                }
+                Err(error) => {
+                    col = col.child(multiline_text(error, st.err, &st.mono, st.base));
+                }
+            },
+            Err(error) => {
+                col = col
+                    .child(multiline_text(error, st.err, &st.mono, st.base))
+                    .child(dim_line("Direct mail threads could not be loaded.", st));
+                if let Ok(inbox) = &detail.inbox {
+                    for item in inbox {
+                        col = col
+                            .child(section_heading(
+                                &format!("{} · {}", item.mail_name, item.mail),
+                                st,
+                            ))
+                            .child(probe_bounds(
+                                "cog-agent-mail-entry",
+                                self.communication_card(
+                                    &format!("inbox:{}:{}", item.mail, item.entry.event_id),
+                                    &item.entry.from,
+                                    item.entry.at,
+                                    item.entry.event_id,
+                                    &item.entry.content,
+                                    &item.entry.references,
+                                    st,
+                                    cx,
+                                )
+                                .into_any_element(),
+                            ));
+                    }
+                }
+            }
+        }
+        col
+    }
+
+    fn mail_detail_body(
+        &self,
+        kind: &str,
+        address: &str,
+        mail: &CogMail,
+        st: &DetailStyle,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .gap_2()
+            .child(topic_type_heading(kind, address, st))
+            .child(title_line(&mail.name, &mail.id, st))
+            .child(kv_row(
+                "Participants",
+                if mail.participants.is_empty() {
+                    "bulletin".into()
+                } else {
+                    mail.participants.join(", ")
+                },
+                st,
+            ))
+            .child(section_heading(
+                &format!("Entries ({})", mail.entries.len()),
+                st,
+            ));
+        if mail.entries.is_empty() {
+            return col.child(dim_line("No entries.", st));
+        }
+        for entry in &mail.entries {
+            col = col.child(self.communication_card(
+                &format!("mail:{}:{}", mail.id, entry.event_id),
+                &entry.from,
+                entry.at,
+                entry.event_id,
+                &entry.content,
+                &entry.references,
+                st,
+                cx,
+            ));
+        }
+        col
+    }
+
+    fn mailing_list_detail_body(
+        &self,
+        address: &str,
+        list: &CogMailingList,
+        st: &DetailStyle,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .gap_2()
+            .child(topic_type_heading("MAILING LIST", address, st))
+            .child(title_line(&list.name, &list.id, st))
+            .child(kv_row("Creator", list.creator.clone(), st))
+            .child(kv_row(
+                "Subscribers",
+                if list.subscribers.is_empty() {
+                    "none".into()
+                } else {
+                    list.subscribers.join(", ")
+                },
+                st,
+            ))
+            .child(section_heading(
+                &format!("Archive ({})", list.entries.len()),
+                st,
+            ));
+        if list.entries.is_empty() {
+            return col.child(dim_line("No published entries.", st));
+        }
+        for entry in &list.entries {
+            col = col.child(self.communication_card(
+                &format!("list:{}:{}", list.id, entry.event_id),
+                &entry.from,
+                entry.at,
+                entry.event_id,
+                &entry.content,
+                &entry.references,
+                st,
+                cx,
+            ));
+        }
+        col
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn communication_card(
+        &self,
+        prefix: &str,
+        from: &str,
+        at: i64,
+        event_id: i64,
+        content: &serde_json::Value,
+        references: &[CogReference],
+        st: &DetailStyle,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let mut body = card(st)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .w_full()
+                    .text_color(st.dim)
+                    .font_family(st.mono.clone())
+                    .text_size(px(st.pt * 0.82))
+                    .child(SharedString::from(from.to_string()))
+                    .child(SharedString::from(format!(
+                        "#{} · {}",
+                        event_id,
+                        fmt_epoch_ns(at)
+                    ))),
+            )
+            .child(self.json_body(prefix, content, st, cx));
+        if !references.is_empty() {
+            let mut refs = div().flex().flex_row().flex_wrap().gap_1().w_full();
+            for reference in references {
+                refs = refs.child(reference_badge(reference, st));
+            }
+            body = body.child(refs);
+        }
+        body
     }
 
     /// Click a node row: select it (its detail fills the right pane) and put
@@ -507,6 +1175,10 @@ impl CogView {
     /// The active left-list selection index (0 outside a list state).
     pub(crate) fn selected_index(&self) -> usize {
         match &self.state {
+            CogViewState::Home(home) => match home.tab {
+                CogSourceTab::Topics => home.topic_selected,
+                CogSourceTab::Agents => home.agent_selected,
+            },
             CogViewState::Graphs { selected, .. } => *selected,
             CogViewState::Graph { selected, .. } => *selected,
             _ => 0,
@@ -570,7 +1242,10 @@ impl Render for CogView {
             _ => {}
         }
 
-        let left = self.left_pane(&st, border, self.focused_selector(), cx);
+        let left = probe_bounds(
+            "cog-left",
+            self.left_pane(&st, border, self.focused_selector(), cx),
+        );
         let right = self.right_pane(&st, self.focused_right(), cx);
 
         // Top: selector | detail. Bottom (in a loaded graph): a full-width live
@@ -617,7 +1292,12 @@ fn focus_tint(st: &DetailStyle) -> Hsla {
 /// leaving a clean grey that adapts to light/dark by lightness. Use this for
 /// every structural fill/border in the tile so the pane reads light and clean.
 fn neutral(lightness: f32, alpha: f32) -> Hsla {
-    Hsla { h: 0.0, s: 0.0, l: lightness, a: alpha }
+    Hsla {
+        h: 0.0,
+        s: 0.0,
+        l: lightness,
+        a: alpha,
+    }
 }
 
 impl CogView {
@@ -650,6 +1330,99 @@ impl CogView {
 
         let fidx = self.filtered_graph_indices();
         match &self.state {
+            CogViewState::Home(home) => {
+                let tabs = div()
+                    .flex()
+                    .flex_row()
+                    .w_full()
+                    .gap_1()
+                    .pb_2()
+                    .child(
+                        compact_tab(
+                            "cog-tab-topics",
+                            "Topics",
+                            None,
+                            home.tab == CogSourceTab::Topics,
+                            nav_sel_bg(st),
+                            st,
+                        )
+                        .cursor_pointer()
+                        .on_click(cx.listener(|view, _ev, _w, cx| {
+                            view.set_source_tab(CogSourceTab::Topics, cx)
+                        })),
+                    )
+                    .child(
+                        compact_tab(
+                            "cog-tab-agents",
+                            "Agents",
+                            Some(
+                                compact_count_indicator(
+                                    "cog-agent-count",
+                                    home.agents.len(),
+                                    st.accent,
+                                    st,
+                                )
+                                .into_any_element(),
+                            ),
+                            home.tab == CogSourceTab::Agents,
+                            nav_sel_bg(st),
+                            st,
+                        )
+                        .cursor_pointer()
+                        .on_click(cx.listener(|view, _ev, _w, cx| {
+                            view.set_source_tab(CogSourceTab::Agents, cx)
+                        })),
+                    );
+                list = list.child(tabs);
+                match home.tab {
+                    CogSourceTab::Topics => {
+                        let rows = self.topic_rows();
+                        list = list.child(left_header(
+                            &format!("Topic bindings ({})", count_topic_bindings(&home.topics)),
+                            st,
+                        ));
+                        if rows.is_empty() {
+                            list = list.child(dim_line("No topics registered.", st));
+                        }
+                        for (i, row) in rows.iter().enumerate() {
+                            list = list.child(
+                                topic_row(
+                                    row,
+                                    i == home.topic_selected,
+                                    self.topic_collapsed_row(row),
+                                    st,
+                                )
+                                .id(SharedString::from(format!("cog-topic-{i}")))
+                                .cursor_pointer()
+                                .on_click(cx.listener(
+                                    move |view, _ev, _w, cx| {
+                                        view.click_topic(i, cx);
+                                    },
+                                )),
+                            );
+                        }
+                        self.left_scroll.scroll_to_item(home.topic_selected + 2);
+                    }
+                    CogSourceTab::Agents => {
+                        list = list.child(left_header("Registered agents", st));
+                        if home.agents.is_empty() {
+                            list = list.child(dim_line("No registered agents.", st));
+                        }
+                        for (i, address) in home.agents.iter().enumerate() {
+                            let presence = home.agent_presence.get(&address.id).map(String::as_str);
+                            list = list.child(
+                                agent_row(address, presence, i == home.agent_selected, st)
+                                    .id(SharedString::from(format!("cog-agent-{i}")))
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |view, _ev, _w, cx| {
+                                        view.click_agent(i, cx);
+                                    })),
+                            );
+                        }
+                        self.left_scroll.scroll_to_item(home.agent_selected + 2);
+                    }
+                }
+            }
             CogViewState::Graphs { graphs, selected } => {
                 // Header shows the search filter (the `/` pattern) when active.
                 let hdr = if self.filtering || !self.graph_filter.is_empty() {
@@ -734,6 +1507,18 @@ impl CogView {
             .py_3();
 
         match &self.state {
+            CogViewState::Home(home) => match home.tab {
+                CogSourceTab::Topics => {
+                    let body = self.topic_detail_body(&home.topic_detail, st, cx);
+                    scroll =
+                        scroll.child(probe_bounds("cog-topic-detail", body.into_any_element()));
+                }
+                CogSourceTab::Agents => {
+                    let body = self.agent_detail_body(&home.agent_detail, st, cx);
+                    scroll =
+                        scroll.child(probe_bounds("cog-agent-detail", body.into_any_element()));
+                }
+            },
             // A selected node: header + Table of Contents + ordered sections as
             // DIRECT children so a TOC click's `scroll_to_item` lines up.
             CogViewState::Graph {
@@ -774,8 +1559,7 @@ impl CogView {
                     }
                 }
                 None => {
-                    scroll =
-                        scroll.child(single_inner("Select a node on the left.", st.dim, st));
+                    scroll = scroll.child(single_inner("Select a node on the left.", st.dim, st));
                 }
             },
             // The Overview: graph render + stats.
@@ -844,7 +1628,10 @@ impl CogView {
             .px_3()
             .py_2()
             .gap_1()
-            .child(left_header(&format!("Live events ({})", self.events.len()), st))
+            .child(left_header(
+                &format!("Live events ({})", self.events.len()),
+                st,
+            ))
             .child(feed);
         probe_bounds("cog-events", strip.into_any_element())
     }
@@ -1178,12 +1965,7 @@ fn graph_row(g: &CogGraph, is_sel: bool, st: &DetailStyle) -> gpui::Div {
                 .gap_2()
                 .items_center()
                 .w_full()
-                .child(truncating_label(
-                    g.label(),
-                    st.fg,
-                    name_size,
-                    st,
-                ))
+                .child(truncating_label(g.label(), st.fg, name_size, st))
                 .child(
                     div()
                         .flex_none()
@@ -1205,6 +1987,225 @@ fn graph_row(g: &CogGraph, is_sel: bool, st: &DetailStyle) -> gpui::Div {
         )
 }
 
+fn count_topic_bindings(tree: &CogTopicTree) -> usize {
+    fn count(nodes: &[CogTopicNode]) -> usize {
+        nodes
+            .iter()
+            .map(|node| match node {
+                CogTopicNode::Folder { children, .. } => count(children),
+                CogTopicNode::Binding(_) => 1,
+            })
+            .sum()
+    }
+    count(&tree.roots)
+}
+
+fn topic_row(row: &CogTopicRow, selected: bool, collapsed: bool, st: &DetailStyle) -> gpui::Div {
+    let transparent: Hsla = rgba(0x00000000).into();
+    let (depth, glyph, label, badge) = match row {
+        CogTopicRow::Folder { label, depth, .. } => (
+            *depth,
+            if collapsed { "▸" } else { "▾" },
+            label.clone(),
+            None,
+        ),
+        CogTopicRow::Binding { binding, depth } => (
+            *depth,
+            match binding.kind {
+                CogTopicKind::Graph => "◇",
+                CogTopicKind::Bulletin => "✎",
+                CogTopicKind::MailingList => "✉",
+            },
+            topic_leaf_label(binding),
+            Some(binding.kind.label()),
+        ),
+    };
+    let mut line = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .w_full()
+        .pl(px(8.0 + depth as f32 * 16.0))
+        .pr_2()
+        .py_1()
+        .bg(if selected {
+            nav_sel_bg(st)
+        } else {
+            transparent
+        })
+        .font_family(st.mono.clone())
+        .text_size(px(st.pt * 0.86))
+        .child(
+            div()
+                .flex_none()
+                .w(px(14.0))
+                .text_color(if matches!(row, CogTopicRow::Folder { .. }) {
+                    st.accent
+                } else {
+                    st.dim
+                })
+                .child(SharedString::from(glyph)),
+        )
+        .child(truncating_label(label, st.fg, px(st.pt * 0.86), st));
+    if let Some(badge) = badge {
+        line = line.child(
+            div()
+                .flex_none()
+                .px_1()
+                .rounded_sm()
+                .bg(neutral(0.5, 0.12))
+                .text_color(st.dim)
+                .text_size(px(st.pt * 0.68))
+                .child(SharedString::from(badge)),
+        );
+    }
+    line
+}
+
+fn agent_row(
+    address: &CogAgentAddress,
+    presence: Option<&str>,
+    selected: bool,
+    st: &DetailStyle,
+) -> gpui::Div {
+    let transparent: Hsla = rgba(0x00000000).into();
+    let state = if address.is_retired() {
+        "retired"
+    } else {
+        presence
+            .filter(|value| !value.is_empty())
+            .unwrap_or("active")
+    };
+    div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .px_2()
+        .py_1()
+        .bg(if selected {
+            nav_sel_bg(st)
+        } else {
+            transparent
+        })
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .w_full()
+                .child(truncating_label(
+                    address.label().to_string(),
+                    st.fg,
+                    px(st.pt * 0.88),
+                    st,
+                ))
+                .child(
+                    div()
+                        .flex_none()
+                        .font_family(st.mono.clone())
+                        .text_size(px(st.pt * 0.72))
+                        .text_color(if state == "online" { st.accent } else { st.dim })
+                        .child(SharedString::from(state.to_string())),
+                ),
+        )
+        .child(
+            div()
+                .w_full()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .font_family(st.mono.clone())
+                .text_color(st.dim)
+                .text_size(px(st.pt * 0.74))
+                .child(SharedString::from(format!(
+                    "{} · {}",
+                    display_or_dash(&address.provider),
+                    address.id
+                ))),
+        )
+}
+
+fn topic_type_heading(kind: &str, address: &str, st: &DetailStyle) -> gpui::Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .w_full()
+        .child(
+            div()
+                .flex_none()
+                .px_2()
+                .rounded_sm()
+                .bg(neutral(0.5, 0.14))
+                .text_color(st.accent)
+                .font_family(st.mono.clone())
+                .font_weight(FontWeight::BOLD)
+                .text_size(px(st.pt * 0.78))
+                .child(SharedString::from(kind.to_string())),
+        )
+        .child(truncating_label(
+            address.to_string(),
+            st.dim,
+            px(st.pt * 0.82),
+            st,
+        ))
+}
+
+fn title_line(name: &str, id: &str, st: &DetailStyle) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .gap_1()
+        .child(
+            div()
+                .font_family(st.prose.clone())
+                .font_weight(FontWeight::BOLD)
+                .text_color(st.fg)
+                .text_size(px(st.pt * 1.4))
+                .child(SharedString::from(if name.trim().is_empty() {
+                    id.to_string()
+                } else {
+                    name.to_string()
+                })),
+        )
+        .child(
+            div()
+                .font_family(st.mono.clone())
+                .text_color(st.dim)
+                .text_size(px(st.pt * 0.82))
+                .child(SharedString::from(id.to_string())),
+        )
+}
+
+fn display_or_dash(value: &str) -> String {
+    if value.trim().is_empty() {
+        "—".into()
+    } else {
+        value.into()
+    }
+}
+
+fn reference_badge(reference: &CogReference, st: &DetailStyle) -> gpui::Div {
+    div()
+        .flex_none()
+        .px_2()
+        .py(px(2.0))
+        .rounded_sm()
+        .border_1()
+        .border_color(card_border(st))
+        .text_color(st.dim)
+        .font_family(st.mono.clone())
+        .text_size(px(st.pt * 0.74))
+        .child(SharedString::from(format!(
+            "{}:{} · {}",
+            reference.kind, reference.id, reference.state
+        )))
+}
+
 fn node_row(n: &CogNode, eff: EffStatus, is_sel: bool, st: &DetailStyle) -> gpui::Div {
     let transparent: Hsla = rgba(0x00000000).into();
     let name = if n.name.trim().is_empty() {
@@ -1221,12 +2222,7 @@ fn node_row(n: &CogNode, eff: EffStatus, is_sel: bool, st: &DetailStyle) -> gpui
         .px_2()
         .py_1()
         .bg(if is_sel { nav_sel_bg(st) } else { transparent })
-        .child(truncating_label(
-            name,
-            st.fg,
-            px(st.pt * 0.88),
-            st,
-        ))
+        .child(truncating_label(name, st.fg, px(st.pt * 0.88), st))
         .child(status_badge(eff, st))
 }
 
@@ -1450,7 +2446,11 @@ impl CogView {
             match kind {
                 "Status transitions" => {
                     let empty: &[CogLogEntry] = &[];
-                    let log = bundle.logs.get(&n.id).map(|l| l.as_slice()).unwrap_or(empty);
+                    let log = bundle
+                        .logs
+                        .get(&n.id)
+                        .map(|l| l.as_slice())
+                        .unwrap_or(empty);
                     let mut transitions: Vec<&CogLogEntry> =
                         log.iter().filter(|e| e.kind == "status_changed").collect();
                     transitions.sort_by_key(|e| e.seq);
@@ -1595,10 +2595,18 @@ fn note_card(note: &CogNote, st: &DetailStyle) -> gpui::Div {
                 .child(SharedString::from(t)),
         );
     }
-    left = left.child(div().flex_none().text_color(st.dim).child(SharedString::from(author)));
-    head = head
-        .child(left)
-        .child(div().flex_none().text_color(st.dim).child(SharedString::from(when)));
+    left = left.child(
+        div()
+            .flex_none()
+            .text_color(st.dim)
+            .child(SharedString::from(author)),
+    );
+    head = head.child(left).child(
+        div()
+            .flex_none()
+            .text_color(st.dim)
+            .child(SharedString::from(when)),
+    );
 
     card(st)
         .child(head)

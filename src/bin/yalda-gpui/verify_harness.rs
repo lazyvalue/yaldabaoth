@@ -9149,7 +9149,10 @@ fn workspace_show_picker_unhides_active_hidden_tile_and_disables_outside_workspa
             .hidden_tile_picker_ref()
             .expect("Show opens the hidden-tile picker");
         assert_eq!(picker.workspace_index, 0);
-        assert!(picker.targets.is_empty(), "empty means empty, not unavailable");
+        assert!(
+            picker.targets.is_empty(),
+            "empty means empty, not unavailable"
+        );
     });
     crate::layout_probe_begin();
     view.update(vcx, |_, cx| cx.notify());
@@ -9263,11 +9266,12 @@ fn workspace_show_picker_unhides_active_hidden_tile_and_disables_outside_workspa
     vcx.simulate_keystrokes(".");
     vcx.run_until_parked();
     view.read_with(vcx, |v, _| {
-        assert!(v
-            .menu_ref()
-            .expect("shell menu over Detached tile")
-            .disabled
-            .contains("show-hidden-tiles"));
+        assert!(
+            v.menu_ref()
+                .expect("shell menu over Detached tile")
+                .disabled
+                .contains("show-hidden-tiles")
+        );
     });
     vcx.simulate_keystrokes("s");
     vcx.run_until_parked();
@@ -12441,17 +12445,12 @@ fn archived_workspace_leaf_restores_dormant_without_eager_session(cx: &mut TestA
     });
     view.update(vcx, |v, cx| {
         v.jump_archived_sessions.insert("S-archived".into());
-        v.restore_agent_leaves(
-            &[(leaf, Some(ServerSid::new("S-archived")))],
-            cx,
-        );
+        v.restore_agent_leaves(&[(leaf, Some(ServerSid::new("S-archived")))], cx);
     });
 
     view.read_with(vcx, |v, _| {
         assert!(
-            v.sessions
-                .locate(&ServerSid::new("S-archived"))
-                .is_none(),
+            v.sessions.locate(&ServerSid::new("S-archived")).is_none(),
             "cold archived identity must not materialize an eager AgentSession"
         );
         assert!(matches!(
@@ -12486,9 +12485,7 @@ fn archived_workspace_leaf_restores_dormant_without_eager_session(cx: &mut TestA
     vcx.run_until_parked();
     view.read_with(vcx, |v, _| {
         assert!(
-            v.sessions
-                .locate(&ServerSid::new("S-archived"))
-                .is_some(),
+            v.sessions.locate(&ServerSid::new("S-archived")).is_some(),
             "an explicit Archived-tab visit materializes the local transcript view"
         );
         assert!(matches!(
@@ -12786,7 +12783,7 @@ fn jump_tile_reorder_move_semantics() {
 /// fails (the projected order stays in layout order after the reorder).
 #[gpui::test]
 fn jump_tile_reorder_applies_within_folder_and_gates_by_folder(cx: &mut TestAppContext) {
-    use crate::{App, AgentTile};
+    use crate::{AgentTile, App};
     let (view, vcx) = cx.add_window_view(hermetic_browser_view);
     vcx.run_until_parked();
 
@@ -18422,8 +18419,14 @@ fn slash_popup_filters_navigates_and_accepts(cx: &mut TestAppContext) {
     view.update(vcx, |v, cx| {
         v.with_session(id, cx, |c| {
             c.available_commands = vec![
-                AgentCommand { name: "compact".into(), description: "Compact".into() },
-                AgentCommand { name: "review".into(), description: "Review".into() },
+                AgentCommand {
+                    name: "compact".into(),
+                    description: "Compact".into(),
+                },
+                AgentCommand {
+                    name: "review".into(),
+                    description: "Review".into(),
+                },
             ];
             // A sent-message ring is present: Down must drive the POPUP, not recall.
             c.sent_history = vec!["an old message".into()];
@@ -18446,7 +18449,9 @@ fn slash_popup_filters_navigates_and_accepts(cx: &mut TestAppContext) {
         })
     };
     let sel = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
-        view.read_with(vcx, |v, cx| v.read_session(id, cx, |c| c.slash_popup_sel).unwrap())
+        view.read_with(vcx, |v, cx| {
+            v.read_session(id, cx, |c| c.slash_popup_sel).unwrap()
+        })
     };
     let draft = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
         view.read_with(vcx, |v, cx| {
@@ -18468,7 +18473,11 @@ fn slash_popup_filters_navigates_and_accepts(cx: &mut TestAppContext) {
     // Down/Up move the popup selection (NOT the history ring), and clamp.
     key(&view, vcx, "down");
     assert_eq!(sel(&view, vcx), 1, "Down moves the popup selection");
-    assert_eq!(draft(&view, vcx), "/c", "Down drove the popup, not history recall");
+    assert_eq!(
+        draft(&view, vcx),
+        "/c",
+        "Down drove the popup, not history recall"
+    );
     key(&view, vcx, "down");
     assert_eq!(sel(&view, vcx), 1, "Down clamps at the last row");
     key(&view, vcx, "up");
@@ -18476,7 +18485,11 @@ fn slash_popup_filters_navigates_and_accepts(cx: &mut TestAppContext) {
 
     // Enter accepts the highlighted command → draft becomes "/clear", popup closes.
     key(&view, vcx, "enter");
-    assert_eq!(draft(&view, vcx), "/clear", "Enter fills the highlighted command in");
+    assert_eq!(
+        draft(&view, vcx),
+        "/clear",
+        "Enter fills the highlighted command in"
+    );
     assert!(rows(&view, vcx).is_empty(), "popup closes after accept");
 }
 
@@ -18502,20 +18515,19 @@ fn slash_popup_paints_above_compose(cx: &mut TestAppContext) {
         });
     });
 
-    let probe = |view: &gpui::Entity<YaldaGpuiView>,
-                 vcx: &mut gpui::VisualTestContext,
-                 tag: &str| {
-        for _ in 0..3 {
+    let probe =
+        |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext, tag: &str| {
+            for _ in 0..3 {
+                view.update(vcx, |_, cx| cx.notify());
+                vcx.run_until_parked();
+            }
+            crate::layout_probe_begin();
             view.update(vcx, |_, cx| cx.notify());
             vcx.run_until_parked();
-        }
-        crate::layout_probe_begin();
-        view.update(vcx, |_, cx| cx.notify());
-        vcx.run_until_parked();
-        let b = crate::layout_probe_get(tag);
-        crate::layout_probe_end();
-        b
-    };
+            let b = crate::layout_probe_get(tag);
+            crate::layout_probe_end();
+            b
+        };
 
     // 1) With a `/co` draft the popup paints, above the compose box.
     let popup = probe(&view, vcx, "slash-popup");
@@ -18616,8 +18628,7 @@ fn compose_up_down_recalls_sent_history(cx: &mut TestAppContext) {
     view.update(vcx, |v, cx| {
         v.with_session(id, cx, |c| {
             c.sent_history = vec!["first msg".into(), "second msg".into()];
-            c.input_surface =
-                InputSurface::with_draft(crate::InputModeKind::Chatbox, "partial");
+            c.input_surface = InputSurface::with_draft(crate::InputModeKind::Chatbox, "partial");
             c.focus = AgentFocus::Compose;
         });
     });
@@ -18628,20 +18639,40 @@ fn compose_up_down_recalls_sent_history(cx: &mut TestAppContext) {
         })
     };
     let up = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
-        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("up"), w, cx));
+        view.update_in(vcx, |v, w, cx| {
+            v.handle_claude_key(&ws_bare_key("up"), w, cx)
+        });
     };
     let down = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
-        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("down"), w, cx));
+        view.update_in(vcx, |v, w, cx| {
+            v.handle_claude_key(&ws_bare_key("down"), w, cx)
+        });
     };
 
     up(&view, vcx);
-    assert_eq!(text(&view, vcx), "second msg", "Up recalls the newest sent message");
+    assert_eq!(
+        text(&view, vcx),
+        "second msg",
+        "Up recalls the newest sent message"
+    );
     up(&view, vcx);
-    assert_eq!(text(&view, vcx), "first msg", "Up again walks one step back");
+    assert_eq!(
+        text(&view, vcx),
+        "first msg",
+        "Up again walks one step back"
+    );
     up(&view, vcx);
-    assert_eq!(text(&view, vcx), "first msg", "Up at the oldest entry stays put");
+    assert_eq!(
+        text(&view, vcx),
+        "first msg",
+        "Up at the oldest entry stays put"
+    );
     down(&view, vcx);
-    assert_eq!(text(&view, vcx), "second msg", "Down walks one step forward");
+    assert_eq!(
+        text(&view, vcx),
+        "second msg",
+        "Down walks one step forward"
+    );
     down(&view, vcx);
     assert_eq!(
         text(&view, vcx),
@@ -18681,7 +18712,9 @@ fn compose_arrows_move_caret_in_multiline_draft(cx: &mut TestAppContext) {
         })
     };
     let up = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
-        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("up"), w, cx));
+        view.update_in(vcx, |v, w, cx| {
+            v.handle_claude_key(&ws_bare_key("up"), w, cx)
+        });
     };
 
     // Caret starts on the last line (row 2). Up moves to row 1 — caret motion, not
@@ -18689,8 +18722,14 @@ fn compose_arrows_move_caret_in_multiline_draft(cx: &mut TestAppContext) {
     up(&view, vcx);
     let (row, body, browsing) = snap(&view, vcx);
     assert_eq!(row, 1, "Up in a multi-line draft moves the caret up a row");
-    assert_eq!(body, "line1\nline2\nline3", "caret motion did not change the draft");
-    assert!(!browsing, "caret motion mid-draft does not start history browse");
+    assert_eq!(
+        body, "line1\nline2\nline3",
+        "caret motion did not change the draft"
+    );
+    assert!(
+        !browsing,
+        "caret motion mid-draft does not start history browse"
+    );
 
     // Up again → row 0 (still caret motion).
     up(&view, vcx);
@@ -18698,7 +18737,11 @@ fn compose_arrows_move_caret_in_multiline_draft(cx: &mut TestAppContext) {
 
     // Now at the top row, Up recalls the sent message.
     up(&view, vcx);
-    assert_eq!(snap(&view, vcx).1, "prev", "Up at the top row recalls history");
+    assert_eq!(
+        snap(&view, vcx).1,
+        "prev",
+        "Up at the top row recalls history"
+    );
 }
 
 /// UXI-AgentTile-20 (summon-only): the sidepanel is HIDDEN by default and does NOT
@@ -18748,7 +18791,10 @@ fn sidepanel_hidden_by_default_until_summoned(cx: &mut TestAppContext) {
         })
         .expect("agent");
     assert!(!open, "subagents_open must default false (summon-only)");
-    assert!(has_sub, "a subagent exists — the panel is gated by the flag, not content");
+    assert!(
+        has_sub,
+        "a subagent exists — the panel is gated by the flag, not content"
+    );
 
     // 1) Un-summoned: the sidepanel must NOT paint even though a subagent exists.
     assert!(
@@ -21233,16 +21279,14 @@ fn send_picker_paints_compact_hierarchy_and_click_moves_tile(cx: &mut TestAppCon
     view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
     let card = crate::layout_probe_get("workspace-picker-card").expect("picker card paints");
-    let header =
-        crate::layout_probe_get("workspace-picker-header").expect("picker header paints");
+    let header = crate::layout_probe_get("workspace-picker-header").expect("picker header paints");
     let options =
         crate::layout_probe_get("workspace-picker-options").expect("picker options paint");
     let row0 = crate::layout_probe_get("workspace-picker-row-0").expect("source row paints");
     let selected =
         crate::layout_probe_get("workspace-picker-row-1").expect("selected target row paints");
     let last = crate::layout_probe_get("workspace-picker-row-2").expect("last target row paints");
-    let create =
-        crate::layout_probe_get("workspace-picker-new-row").expect("creation row paints");
+    let create = crate::layout_probe_get("workspace-picker-new-row").expect("creation row paints");
     crate::layout_probe_end();
 
     let (card_x, card_y, card_w, card_h) = card;
@@ -21434,7 +21478,10 @@ fn ctrl_w_primary_commands_change_columns_state_and_geometry(cx: &mut TestAppCon
     let after_stack = crate::layout_probe_get(&format!("columns-tile-{stack_id}"))
         .expect("stack paints after adjustment");
     crate::layout_probe_end();
-    assert!(after_primary.2 > before_primary.2, "grow makes primary wider");
+    assert!(
+        after_primary.2 > before_primary.2,
+        "grow makes primary wider"
+    );
     assert!(after_stack.2 < before_stack.2, "grow makes stack narrower");
 
     vcx.simulate_keystrokes("ctrl-w shift-f");
@@ -24463,16 +24510,16 @@ fn workspace_folder_marks_contained_working_agent(cx: &mut TestAppContext) {
     });
     vcx.run_until_parked();
 
-    let any_folder_working =
-        |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
-            view.update(vcx, |v, cx| {
-                v.jump_panel_sections(cx)
-                    .0
-                    .iter()
-                    .flat_map(|s| &s.workspace_folders)
-                    .any(|f| f.has_working_agent)
-            })
-        };
+    let any_folder_working = |view: &gpui::Entity<YaldaGpuiView>,
+                              vcx: &mut gpui::VisualTestContext| {
+        view.update(vcx, |v, cx| {
+            v.jump_panel_sections(cx)
+                .0
+                .iter()
+                .flat_map(|s| &s.workspace_folders)
+                .any(|f| f.has_working_agent)
+        })
+    };
     // Guard the setup is non-vacuous: a folder actually owns the S1 tile.
     assert!(
         view.update(vcx, |v, cx| {
@@ -24535,9 +24582,8 @@ fn jump_workspace_color_precedence_red_over_orange_over_blue(_cx: &mut TestAppCo
     let red = gpui::hsla(0.00, 1.0, 0.5, 1.0);
     let orange = gpui::hsla(0.08, 1.0, 0.5, 1.0);
     let blue = gpui::hsla(0.60, 1.0, 0.5, 1.0);
-    let pick = |unread, working| {
-        crate::jump_workspace_state_color(unread, working, red, orange, blue)
-    };
+    let pick =
+        |unread, working| crate::jump_workspace_state_color(unread, working, red, orange, blue);
     assert_eq!(
         pick(true, true),
         red,
@@ -24563,16 +24609,16 @@ fn workspace_folder_marks_contained_unread_session(cx: &mut TestAppContext) {
     let (view, vcx, id, session) = boot_with_transcript(cx);
     vcx.run_until_parked();
 
-    let any_folder_unread =
-        |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
-            view.update(vcx, |v, cx| {
-                v.jump_panel_sections(cx)
-                    .0
-                    .iter()
-                    .flat_map(|s| &s.workspace_folders)
-                    .any(|f| f.has_unread)
-            })
-        };
+    let any_folder_unread = |view: &gpui::Entity<YaldaGpuiView>,
+                             vcx: &mut gpui::VisualTestContext| {
+        view.update(vcx, |v, cx| {
+            v.jump_panel_sections(cx)
+                .0
+                .iter()
+                .flat_map(|s| &s.workspace_folders)
+                .any(|f| f.has_unread)
+        })
+    };
     // Guard the setup is non-vacuous: a folder actually owns the S1 tile.
     assert!(
         view.update(vcx, |v, cx| {
@@ -25760,6 +25806,287 @@ fn cog_test_graph(id: &str, name: &str) -> crate::CogGraph {
 }
 
 #[cfg(test)]
+fn cog_test_topic(
+    address: &str,
+    kind: crate::CogTopicKind,
+    object: &str,
+    name: &str,
+) -> crate::CogTopicBinding {
+    crate::CogTopicBinding {
+        address: address.into(),
+        kind,
+        object: object.into(),
+        name: name.into(),
+        created_at: 1,
+    }
+}
+
+#[cfg(test)]
+fn cog_test_home(bindings: Vec<crate::CogTopicBinding>) -> crate::CogHomeData {
+    crate::CogHomeData {
+        topics: crate::CogTopicTree::from_bindings(bindings),
+        agents: vec![],
+        agent_presence: Default::default(),
+    }
+}
+
+/// UXI-Cog-13/-14: the REAL Cog reducer opens on Topics, the cached body paints
+/// a hierarchical file-explorer + typed right pane, and the real folder click
+/// collapses/restores descendants without invalid selection.
+///
+/// Negative control: skip `flatten_topic_nodes(children, …)` in `cog_view.rs`;
+/// the initial six-row assertion fails because descendants never appear.
+#[gpui::test]
+fn cog_topic_browser_hierarchy_collapses_and_renders_typed_detail(cx: &mut TestAppContext) {
+    let (view, vcx, cv, wid) = boot_with_cog(cx);
+    let req = cog_tile_req(&view, vcx);
+    view.update(vcx, |v, cx| {
+        v.cog_apply(
+            wid,
+            req,
+            Ok(crate::CogFetch::Home(Box::new(cog_test_home(vec![
+                cog_test_topic(
+                    "work/migrations::plan",
+                    crate::CogTopicKind::Graph,
+                    "g1",
+                    "Migration plan",
+                ),
+                cog_test_topic(
+                    "work::bulletin",
+                    crate::CogTopicKind::Bulletin,
+                    "m1",
+                    "Status note",
+                ),
+                cog_test_topic(
+                    "personal::team",
+                    crate::CogTopicKind::MailingList,
+                    "l1",
+                    "Friends",
+                ),
+            ])))),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    assert!(cv.update(vcx, |c, _| c.in_home()), "Topics is home");
+    assert_eq!(
+        cv.update(vcx, |c, _| c.topic_rows().len()),
+        6,
+        "two root folders + nested folder + three typed leaves"
+    );
+
+    crate::layout_probe_begin();
+    cv.update(vcx, |_, cx| cx.notify());
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let left = crate::layout_probe_get("cog-left");
+    let right = crate::layout_probe_get("cog-topic-detail");
+    crate::layout_probe_end();
+    assert!(left.is_some(), "topic explorer pane paints");
+    assert!(right.is_some(), "typed detail pane paints");
+
+    // `personal` is the first sorted root folder. Real click collapses its leaf.
+    cv.update(vcx, |c, cx| c.click_topic(0, cx));
+    vcx.run_until_parked();
+    assert_eq!(cv.update(vcx, |c, _| c.topic_rows().len()), 5);
+    cv.update(vcx, |c, cx| c.click_topic(0, cx));
+    vcx.run_until_parked();
+    assert_eq!(cv.update(vcx, |c, _| c.topic_rows().len()), 6);
+
+    // Select the list leaf via the REAL row click; under cfg(test) its async
+    // fetch is deliberately not spawned, so feed the production reducer.
+    cv.update(vcx, |c, cx| c.click_topic(1, cx));
+    let detail_req = cog_tile_req(&view, vcx);
+    view.update(vcx, |v, cx| {
+        v.cog_apply(
+            wid,
+            detail_req,
+            Ok(crate::CogFetch::TopicDetail {
+                address: "personal::team".into(),
+                result: Ok(crate::CogTopicDetail::MailingList(crate::CogMailingList {
+                    id: "l1".into(),
+                    name: "Friends".into(),
+                    creator: "a1".into(),
+                    created_at: 1,
+                    topics: vec!["personal::team".into()],
+                    subscribers: vec!["a1".into()],
+                    entries: vec![crate::CogMailingListEntry {
+                        id: "le1".into(),
+                        event_id: 9,
+                        mailing_list: "l1".into(),
+                        from: "a1".into(),
+                        at: 1_786_989_281_753_564_000,
+                        actor: "agent".into(),
+                        content: serde_json::json!({"status":"hello"}),
+                        references: vec![],
+                    }],
+                })),
+            }),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    crate::layout_probe_begin();
+    cv.update(vcx, |_, cx| cx.notify());
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let (_, _, _, height) =
+        crate::layout_probe_get("cog-topic-detail").expect("mailing-list detail did not paint");
+    crate::layout_probe_end();
+    assert!(height > 80.0, "typed list detail is non-trivial: {height}");
+}
+
+/// UXI-Cog-15: the real Agents tab selects a registered address, folds delivery
+/// state and ordered direct-mail threads through the production reducer, and
+/// paints readable cards in the cached right pane.
+///
+/// Negative control: suppress the `communication_card` loop in
+/// `agent_mail_body`; the mail probe height assertion fails.
+#[gpui::test]
+fn cog_agents_tab_reads_delivery_and_mail(cx: &mut TestAppContext) {
+    let (view, vcx, cv, wid) = boot_with_cog(cx);
+    let agent = crate::CogAgentAddress {
+        id: "addr-1".into(),
+        name: "Builder".into(),
+        provider: "codex".into(),
+        session: "session-1".into(),
+        cwd: "/work".into(),
+        created_at: 1,
+        retired_at: None,
+        retired_reason: None,
+    };
+    let req = cog_tile_req(&view, vcx);
+    view.update(vcx, |v, cx| {
+        v.cog_apply(
+            wid,
+            req,
+            Ok(crate::CogFetch::Home(Box::new(crate::CogHomeData {
+                topics: crate::CogTopicTree::default(),
+                agents: vec![agent.clone()],
+                agent_presence: [("addr-1".into(), "online".into())].into(),
+            }))),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    // The real tab click path enters Loading and issues a request (the process
+    // spawn is intentionally suppressed under cfg(test)).
+    cv.update(vcx, |c, cx| {
+        c.set_source_tab(crate::CogSourceTab::Agents, cx)
+    });
+    vcx.run_until_parked();
+    assert_eq!(cv.update(vcx, |c, _| c.list_len()), 1);
+    assert_eq!(
+        cv.update(vcx, |c, _| c.selected_agent().map(|a| a.id)),
+        Some("addr-1".into())
+    );
+
+    let detail_req = cog_tile_req(&view, vcx);
+    view.update(vcx, |v, cx| {
+        v.cog_apply(
+            wid,
+            detail_req,
+            Ok(crate::CogFetch::AgentDetail {
+                address: "addr-1".into(),
+                detail: Box::new(crate::CogAgentDetail {
+                    address: agent.clone(),
+                    delivery: Ok(crate::CogDeliveryStatus {
+                        address: "addr-1".into(),
+                        presence: "online".into(),
+                        state: "delivering".into(),
+                        cursor: 42,
+                        ..Default::default()
+                    }),
+                    inbox: Ok(vec![]),
+                    threads: Ok(vec![crate::CogMail {
+                        id: "mail-1".into(),
+                        name: "Migration handoff".into(),
+                        participants: vec!["addr-1".into(), "addr-2".into()],
+                        entries: vec![crate::CogMailEntry {
+                            id: "entry-1".into(),
+                            event_id: 42,
+                            mail: "mail-1".into(),
+                            from: "addr-2".into(),
+                            at: 1_786_989_281_753_564_000,
+                            actor: "agent".into(),
+                            content: serde_json::json!({"message":"ready for review"}),
+                            references: vec![],
+                        }],
+                        created_at: 1,
+                    }]),
+                }),
+            }),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    crate::layout_probe_begin();
+    cv.update(vcx, |_, cx| cx.notify());
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let (_, _, _, detail_height) =
+        crate::layout_probe_get("cog-agent-detail").expect("agent detail did not paint");
+    let (_, _, _, mail_height) =
+        crate::layout_probe_get("cog-agent-mail").expect("agent mail did not paint");
+    let mail_entry = crate::layout_probe_get("cog-agent-mail-entry");
+    crate::layout_probe_end();
+    assert!(detail_height > 180.0, "agent detail is non-trivial: {detail_height}");
+    assert!(mail_height > 80.0, "mail cards are readable: {mail_height}");
+    assert!(mail_entry.is_some(), "a readable mail-entry card paints");
+
+    // Empty mail and an empty directory remain explicit, distinct states.
+    cv.update(vcx, |c, cx| c.click_agent(0, cx));
+    let empty_req = cog_tile_req(&view, vcx);
+    view.update(vcx, |v, cx| {
+        v.cog_apply(
+            wid,
+            empty_req,
+            Ok(crate::CogFetch::AgentDetail {
+                address: "addr-1".into(),
+                detail: Box::new(crate::CogAgentDetail {
+                    address: agent,
+                    delivery: Ok(crate::CogDeliveryStatus::default()),
+                    inbox: Ok(vec![]),
+                    threads: Ok(vec![]),
+                }),
+            }),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    crate::layout_probe_begin();
+    cv.update(vcx, |_, cx| cx.notify());
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let (_, _, _, empty_mail_height) =
+        crate::layout_probe_get("cog-agent-mail").expect("empty-mail state did not paint");
+    crate::layout_probe_end();
+    assert!(empty_mail_height > 20.0, "friendly no-mail state paints");
+    assert!(empty_mail_height < mail_height, "empty mail is distinct from a thread");
+
+    view.update(vcx, |v, cx| {
+        v.cog_apply(
+            wid,
+            empty_req,
+            Ok(crate::CogFetch::Home(Box::new(crate::CogHomeData {
+                topics: crate::CogTopicTree::default(),
+                agents: vec![],
+                agent_presence: Default::default(),
+            }))),
+            cx,
+        );
+    });
+    cv.update(vcx, |c, cx| {
+        c.set_source_tab(crate::CogSourceTab::Agents, cx)
+    });
+    vcx.run_until_parked();
+    assert_eq!(cv.update(vcx, |c, _| c.list_len()), 0);
+    assert!(cv.update(vcx, |c, _| c.selected_agent()).is_none());
+}
+
+#[cfg(test)]
 fn cog_test_node(id: &str, name: &str, status: &str, content: serde_json::Value) -> crate::CogNode {
     crate::CogNode {
         id: id.into(),
@@ -26417,12 +26744,17 @@ fn cog_toggle_events_hides_and_shows_strip(cx: &mut TestAppContext) {
     assert!(cv.update(vcx, |c, _| c.focused_events()), "focus on strip");
 
     crate::layout_probe_begin();
-    view.update(vcx, |v, cx| v.dispatch_menu_command("cog-toggle-events", cx));
+    view.update(vcx, |v, cx| {
+        v.dispatch_menu_command("cog-toggle-events", cx)
+    });
     vcx.run_until_parked();
     let hidden = crate::layout_probe_get("cog-events");
     crate::layout_probe_end();
     assert!(hidden.is_none(), "strip does NOT paint after hide");
-    assert!(cv.update(vcx, |c, _| c.events_hidden()), "state marked hidden");
+    assert!(
+        cv.update(vcx, |c, _| c.events_hidden()),
+        "state marked hidden"
+    );
     assert!(
         !cv.update(vcx, |c, _| c.focused_events()),
         "focus left the hidden strip"
@@ -26430,7 +26762,9 @@ fn cog_toggle_events_hides_and_shows_strip(cx: &mut TestAppContext) {
 
     // Toggle again → strip reappears and paints.
     crate::layout_probe_begin();
-    view.update(vcx, |v, cx| v.dispatch_menu_command("cog-toggle-events", cx));
+    view.update(vcx, |v, cx| {
+        v.dispatch_menu_command("cog-toggle-events", cx)
+    });
     vcx.run_until_parked();
     let reshown = crate::layout_probe_get("cog-events");
     crate::layout_probe_end();

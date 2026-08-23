@@ -3428,9 +3428,7 @@ fn shell_menu_root_is_the_approved_items() {
     let menu = gpui_menu();
     let actual: Vec<(String, &str)> = menu
         .iter()
-        .filter(|node| {
-            matches!(node.kind(), MenuNodeKind::Command | MenuNodeKind::Submenu)
-        })
+        .filter(|node| matches!(node.kind(), MenuNodeKind::Command | MenuNodeKind::Submenu))
         .map(|node| (format_menu_key(&node.key), node.label.as_str()))
         .collect();
     assert_eq!(
@@ -3514,12 +3512,7 @@ fn agent_menu_root_and_view_are_the_approved_items() {
     let menu = agent_local_menu();
     let actual: Vec<(String, &str)> = menu
         .iter()
-        .filter(|node| {
-            matches!(
-                node.kind(),
-                MenuNodeKind::Command | MenuNodeKind::Submenu
-            )
-        })
+        .filter(|node| matches!(node.kind(), MenuNodeKind::Command | MenuNodeKind::Submenu))
         .map(|node| (format_menu_key(&node.key), node.label.as_str()))
         .collect();
     assert_eq!(
@@ -3622,24 +3615,22 @@ fn every_tile_menu_has_shared_tile_commands() {
         .find(|n| n.label == "archive")
         .expect("agent menu must carry archive");
     assert_eq!(format_menu_key(&archive.key), "a");
-    assert!(
-        matches!(&archive.action, MenuAction::Command(c) if c == "archive-session"),
-    );
+    assert!(matches!(&archive.action, MenuAction::Command(c) if c == "archive-session"),);
     let rename = agent
         .iter()
         .find(|n| n.label == "rename session")
         .expect("agent menu must carry rename session");
     assert_eq!(format_menu_key(&rename.key), "r");
-    assert!(
-        matches!(&rename.action, MenuAction::Command(c) if c == "claude-rename"),
-    );
+    assert!(matches!(&rename.action, MenuAction::Command(c) if c == "claude-rename"),);
     for (name, menu) in [
         ("doc", doc_local_menu()),
         ("edit", edit_local_menu()),
         ("browser", browser_local_menu()),
     ] {
         assert!(
-            !menu.iter().any(|n| n.label == "archive" || n.label == "rename session"),
+            !menu
+                .iter()
+                .any(|n| n.label == "archive" || n.label == "rename session"),
             "{name} menu must NOT carry session-only verbs"
         );
     }
@@ -5061,14 +5052,26 @@ fn primary_area_serde_reads_legacy_master_keys() {
     }"#;
     let back: PersistedWorkspace =
         serde_json::from_str(legacy).expect("legacy master_* snapshot must load");
-    assert!((back.primary_ratio - 0.35).abs() < 0.001, "master_ratio alias");
+    assert!(
+        (back.primary_ratio - 0.35).abs() < 0.001,
+        "master_ratio alias"
+    );
     assert_eq!(back.primary_count, 3, "master_count alias");
 
     // New snapshots serialize with the new keys.
     let json = serde_json::to_string(&plane_persist_test_workspace()).expect("serialize");
-    assert!(json.contains("\"primary_ratio\""), "writes primary_ratio: {json}");
-    assert!(json.contains("\"primary_count\""), "writes primary_count: {json}");
-    assert!(!json.contains("\"master_ratio\""), "no legacy master_ratio key");
+    assert!(
+        json.contains("\"primary_ratio\""),
+        "writes primary_ratio: {json}"
+    );
+    assert!(
+        json.contains("\"primary_count\""),
+        "writes primary_count: {json}"
+    );
+    assert!(
+        !json.contains("\"master_ratio\""),
+        "no legacy master_ratio key"
+    );
 }
 
 /// UXI-Workspace-26: the UI arrangements (`view`) round-trip, retired `"plane"`
@@ -5872,6 +5875,116 @@ fn naming_summary_is_topic_only_short_and_has_a_user_turn_fallback() {
 }
 
 #[test]
+fn cog_topic_tree_is_sorted_deduplicated_and_hierarchical() {
+    use crate::{CogTopicBinding, CogTopicKind, CogTopicNode, CogTopicTree};
+
+    let binding = |address: &str, kind, name: &str| CogTopicBinding {
+        address: address.into(),
+        kind,
+        object: format!("id-{name}"),
+        name: name.into(),
+        created_at: 1,
+    };
+    let tree = CogTopicTree::from_bindings(vec![
+        binding("work/migrations::zeta", CogTopicKind::MailingList, "Zeta"),
+        binding("personal::journal", CogTopicKind::Bulletin, "Journal"),
+        binding("work/migrations::alpha", CogTopicKind::Graph, "Alpha"),
+        // Immutable addresses should already be unique, but a repeated server
+        // row must never produce a duplicate explorer leaf.
+        binding("work/migrations::alpha", CogTopicKind::Graph, "Alpha"),
+    ]);
+
+    assert_eq!(tree.roots.len(), 2, "two top-level folders");
+    let CogTopicNode::Folder {
+        label: first,
+        children: personal,
+        ..
+    } = &tree.roots[0]
+    else {
+        panic!("first root must be a folder")
+    };
+    assert_eq!(first, "personal", "folders sort case-insensitively");
+    assert!(matches!(
+        personal.as_slice(),
+        [CogTopicNode::Binding(CogTopicBinding { address, .. })]
+            if address == "personal::journal"
+    ));
+    let CogTopicNode::Folder { children: work, .. } = &tree.roots[1] else {
+        panic!("second root must be work")
+    };
+    let CogTopicNode::Folder {
+        label: migrations,
+        children,
+        ..
+    } = &work[0]
+    else {
+        panic!("work must contain its migrations folder")
+    };
+    assert_eq!(migrations, "migrations");
+    assert_eq!(children.len(), 2, "duplicate binding was removed");
+    assert!(matches!(
+        &children[0],
+        CogTopicNode::Binding(CogTopicBinding { address, .. })
+            if address == "work/migrations::alpha"
+    ));
+}
+
+#[test]
+fn cog_new_cli_payloads_deserialize_without_optional_fields() {
+    let topic: crate::CogTopicBinding = serde_json::from_value(serde_json::json!({
+        "address": "work::plan",
+        "kind": "graph",
+        "object": "g1",
+        "name": "Plan",
+        "created_at": 7
+    }))
+    .expect("topic summary payload");
+    assert_eq!(topic.kind, crate::CogTopicKind::Graph);
+
+    let address: crate::CogAgentAddress = serde_json::from_value(serde_json::json!({
+        "id": "a1",
+        "name": "worker",
+        "provider": "codex",
+        "session": "thread-1",
+        "cwd": "/tmp/work",
+        "created_at": 9
+    }))
+    .expect("active address payload");
+    assert!(!address.is_retired());
+
+    let mail: crate::CogMail = serde_json::from_value(serde_json::json!({
+        "id": "m1",
+        "name": "review",
+        "participants": ["a1", "a2"],
+        "created_at": 10,
+        "entries": [{
+            "id": "e1",
+            "event_id": 12,
+            "mail": "m1",
+            "from": "a2",
+            "at": 11,
+            "actor": "agent",
+            "content": {"status": "ready"},
+            "references": [{"kind": "graph", "id": "g1", "state": "live"}]
+        }]
+    }))
+    .expect("mail payload with resolved reference lacking object");
+    assert_eq!(mail.entries[0].references[0].state, "live");
+
+    let list: crate::CogMailingList = serde_json::from_value(serde_json::json!({
+        "id": "l1",
+        "name": "migration team",
+        "creator": "a1",
+        "created_at": 13,
+        "topics": ["work::team"],
+        "subscribers": ["a1", "a2"],
+        "entries": []
+    }))
+    .expect("mailing list payload");
+    assert!(list.entries.is_empty());
+}
+
+#[test]
 fn jump_supporting_text_is_cool_and_readable_in_everyday_themes() {
     use yalda::style::Color;
     use yalda::theme::AgentTheme;
@@ -5972,13 +6085,20 @@ fn folio_bone_surfaces_and_nightfox_steel_accent() {
 
     // --- Nightfox Steel: the overlay key is steel-blue, never the old purple. ---
     let nf = OverlayTheme::nightfox();
-    assert_eq!(nf.key, Color::Rgb(0x7a, 0xa7, 0xd6), "Nightfox key is steel");
+    assert_eq!(
+        nf.key,
+        Color::Rgb(0x7a, 0xa7, 0xd6),
+        "Nightfox key is steel"
+    );
     assert_ne!(
         nf.key,
         Color::Rgb(0x9d, 0x79, 0xd6),
         "the retired Nightfox purple must be gone"
     );
-    assert_eq!(nf.input, nf.key, "Nightfox caret follows the steel key, not yellow");
+    assert_eq!(
+        nf.input, nf.key,
+        "Nightfox caret follows the steel key, not yellow"
+    );
 }
 
 /// Worksheet backdrop is fainter while typing (Insert) than at rest (Normal),
@@ -5988,7 +6108,10 @@ fn worksheet_backdrop_fainter_in_insert() {
     let insert = crate::screens::worksheet_backdrop_alpha(EditMode::Insert);
     let normal = crate::screens::worksheet_backdrop_alpha(EditMode::Normal);
     assert!(insert > 0.0 && normal > 0.0, "the wash is always present");
-    assert!(insert < normal, "typing (Insert) is fainter than resting (Normal)");
+    assert!(
+        insert < normal,
+        "typing (Insert) is fainter than resting (Normal)"
+    );
 }
 
 /// Folio jump-panel + worksheet accent colors: the neon blue/red are toned
@@ -5997,13 +6120,31 @@ fn worksheet_backdrop_fainter_in_insert() {
 fn folio_jump_and_caret_colors() {
     use yalda::style::Color;
     let at = yalda::theme::AgentTheme::folio();
-    assert_eq!(at.jump_header, Color::Rgb(0xd6, 0x4f, 0x5a), "deep red, not neon coral");
+    assert_eq!(
+        at.jump_header,
+        Color::Rgb(0xd6, 0x4f, 0x5a),
+        "deep red, not neon coral"
+    );
     // UXI-JumpPanel-31: jump_subheader is the IDLE (blue) workspace identity — the
     // unread/working states supply the red/orange. Restored to the pre-red denim.
-    assert_eq!(at.jump_subheader, Color::Rgb(0x5a, 0x7f, 0xa8), "muted denim idle workspace identity");
-    assert_eq!(at.cursor, at.jump_header, "block caret matches the deep red");
-    assert_eq!(at.warm_accent, Color::Rgb(0x40, 0x67, 0x64), "teal stays the agent accent");
-    assert_ne!(at.cursor, at.warm_accent, "caret (red) is decoupled from the teal accent");
+    assert_eq!(
+        at.jump_subheader,
+        Color::Rgb(0x5a, 0x7f, 0xa8),
+        "muted denim idle workspace identity"
+    );
+    assert_eq!(
+        at.cursor, at.jump_header,
+        "block caret matches the deep red"
+    );
+    assert_eq!(
+        at.warm_accent,
+        Color::Rgb(0x40, 0x67, 0x64),
+        "teal stays the agent accent"
+    );
+    assert_ne!(
+        at.cursor, at.warm_accent,
+        "caret (red) is decoupled from the teal accent"
+    );
 }
 
 /// The ACTIVE (live-compose) You-block reads RED — border + label via
@@ -6023,7 +6164,10 @@ fn you_block_active_accent_is_red() {
     let wash: gpui::Rgba = crate::screens::worksheet_wash_red().into();
     let teal_wash: gpui::Rgba = crate::screens::worksheet_wash_teal().into();
     assert!(wash.r > wash.g && wash.r > wash.b, "active wash reads red");
-    assert!(teal_wash.g > teal_wash.r, "teal wash reads teal (sent stays teal)");
+    assert!(
+        teal_wash.g > teal_wash.r,
+        "teal wash reads teal (sent stays teal)"
+    );
     assert_ne!(
         crate::screens::worksheet_wash_red(),
         crate::screens::worksheet_wash_teal(),
@@ -6155,18 +6299,36 @@ fn history_ring_push_recall_semantics() {
 
     // An immediate duplicate of the newest entry is skipped.
     s.history_push("hello");
-    assert_eq!(s.sent_history, vec!["hello".to_string()], "no consecutive dup");
+    assert_eq!(
+        s.sent_history,
+        vec!["hello".to_string()],
+        "no consecutive dup"
+    );
     s.history_push("world");
-    assert_eq!(s.sent_history, vec!["hello".to_string(), "world".to_string()]);
+    assert_eq!(
+        s.sent_history,
+        vec!["hello".to_string(), "world".to_string()]
+    );
 
     // Up stashes the current draft and walks back; Down walks forward and past
     // the newest restores the stash.
     assert_eq!(s.history_up("draft").as_deref(), Some("world"));
     assert_eq!(s.history_up("draft").as_deref(), Some("hello"));
-    assert_eq!(s.history_up("draft").as_deref(), Some("hello"), "clamps at oldest");
+    assert_eq!(
+        s.history_up("draft").as_deref(),
+        Some("hello"),
+        "clamps at oldest"
+    );
     assert_eq!(s.history_down().as_deref(), Some("world"));
-    assert_eq!(s.history_down().as_deref(), Some("draft"), "restores the stash");
-    assert!(s.history_nav.is_none(), "browse ends after restoring the draft");
+    assert_eq!(
+        s.history_down().as_deref(),
+        Some("draft"),
+        "restores the stash"
+    );
+    assert!(
+        s.history_nav.is_none(),
+        "browse ends after restoring the draft"
+    );
     assert!(s.history_down().is_none(), "Down with no browse is a no-op");
 
     // A push ends any active browse.
@@ -6185,7 +6347,10 @@ fn history_ring_push_recall_semantics() {
         Some(format!("m{}", HISTORY_CAP + 4).as_str()),
         "newest is retained",
     );
-    assert!(!s.sent_history.contains(&"m0".to_string()), "oldest dropped");
+    assert!(
+        !s.sent_history.contains(&"m0".to_string()),
+        "oldest dropped"
+    );
 }
 
 /// UXI-AgentTile-42 (n3a wire): a promoted `AvailableCommands` reply maps to the
@@ -6195,36 +6360,59 @@ fn history_ring_push_recall_semantics() {
 #[test]
 fn agent_event_available_commands_maps_and_roundtrips() {
     use yalda::acp_channel::{AgentCommand, ReplyEvent};
-    use yalda::agent_event::{agent_kind_from_reply, AgentEventKind};
+    use yalda::agent_event::{AgentEventKind, agent_kind_from_reply};
 
     let cmds = vec![
-        AgentCommand { name: "compact".into(), description: "Compact".into() },
-        AgentCommand { name: "review".into(), description: "Review".into() },
+        AgentCommand {
+            name: "compact".into(),
+            description: "Compact".into(),
+        },
+        AgentCommand {
+            name: "review".into(),
+            description: "Review".into(),
+        },
     ];
     // ReplyEvent → canonical AgentEventKind (rides the durable stream).
     let kind = agent_kind_from_reply(&ReplyEvent::AvailableCommands(cmds.clone()))
         .expect("AvailableCommands maps to an AgentEventKind");
-    assert_eq!(kind, AgentEventKind::AvailableCommands { commands: cmds.clone() });
+    assert_eq!(
+        kind,
+        AgentEventKind::AvailableCommands {
+            commands: cmds.clone()
+        }
+    );
 
     // WAL serde mirror round-trip (KnownKind, tag = "available_commands").
     let json = serde_json::to_string(&kind).expect("serialize");
-    assert!(json.contains("available_commands"), "wire tag present: {json}");
+    assert!(
+        json.contains("available_commands"),
+        "wire tag present: {json}"
+    );
     let back: AgentEventKind = serde_json::from_str(&json).expect("deserialize");
-    assert_eq!(kind, back, "AvailableCommands round-trips through the WAL mirror");
+    assert_eq!(
+        kind, back,
+        "AvailableCommands round-trips through the WAL mirror"
+    );
 }
 
 /// UXI-AgentTile-42 (pure): slash_query recognizes a bare `/token`; slash_popup_rows
 /// filters slash_commands() by prefix and honors the Insert-mode / dismissed gates.
 #[test]
 fn slash_query_and_popup_rows_filter() {
-    use crate::agent::AgentState;
     use crate::EditMode;
+    use crate::agent::AgentState;
     use yalda::acp_channel::AgentCommand;
 
     let mut s = AgentState::new_for_test();
     s.available_commands = vec![
-        AgentCommand { name: "compact".into(), description: "c".into() },
-        AgentCommand { name: "review".into(), description: "r".into() },
+        AgentCommand {
+            name: "compact".into(),
+            description: "c".into(),
+        },
+        AgentCommand {
+            name: "review".into(),
+            description: "r".into(),
+        },
     ];
     let set = |s: &mut AgentState, text: &str| {
         s.input_surface.compose_mut().set_recalled(text); // Insert + cursor at end
@@ -6244,10 +6432,18 @@ fn slash_query_and_popup_rows_filter() {
 
     // Rows: prefix filter over local /clear + agent commands.
     set(&mut s, "/c");
-    let names: Vec<String> = s.slash_popup_rows().iter().map(|c| c.name.clone()).collect();
+    let names: Vec<String> = s
+        .slash_popup_rows()
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
     assert_eq!(names, vec!["clear".to_string(), "compact".to_string()]);
     set(&mut s, "/rev");
-    let names: Vec<String> = s.slash_popup_rows().iter().map(|c| c.name.clone()).collect();
+    let names: Vec<String> = s
+        .slash_popup_rows()
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
     assert_eq!(names, vec!["review".to_string()]);
     set(&mut s, "/zzz"); // no match
     assert!(s.slash_popup_rows().is_empty());
@@ -6255,8 +6451,14 @@ fn slash_query_and_popup_rows_filter() {
     // Gates: dismissed hides it; Normal mode hides it.
     set(&mut s, "/c");
     s.slash_popup_dismissed = true;
-    assert!(s.slash_popup_rows().is_empty(), "Esc-dismiss hides the popup");
+    assert!(
+        s.slash_popup_rows().is_empty(),
+        "Esc-dismiss hides the popup"
+    );
     s.slash_popup_dismissed = false;
     s.input_surface.compose_mut().mode = EditMode::Normal;
-    assert!(s.slash_popup_rows().is_empty(), "no popup outside Insert mode");
+    assert!(
+        s.slash_popup_rows().is_empty(),
+        "no popup outside Insert mode"
+    );
 }
