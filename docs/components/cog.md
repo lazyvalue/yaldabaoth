@@ -5,26 +5,28 @@
 
 ## Description
 
-`App::Cog(CogTile)` — a read-only tile that explores a [Cog](../../../cog) planning
-graph (opened with `Cmd-G` / `Ctrl-G`, the `.` → new → cog menu, or the macOS File
-menu). It shells out to the local `cog` CLI (which talks to `cogd` over HTTP,
-honoring `COG_ADDR`) and renders the returned JSON. There is no writing — it only
-reads.
+`App::Cog(CogTile)` — a read-only tile that browses the [Cog](../../../cog)
+information space (opened with `Cmd-G` / `Ctrl-G`, the `.` → new → cog menu, or
+the macOS File menu). It shells out to the local `cog` CLI (which talks to `cogd`
+over HTTP, honoring `COG_ADDR`) and renders the returned JSON. There is no
+writing — it only reads.
 
-The tile has two panes:
+The tile has two panes and a small source tab bar:
 
-- **Left (selector).** First a **graph explorer** — the list of every graph
-  (`cog graph list`), one selectable row each (name + id + sealed/prototype marks).
-  Opening a graph swaps the left pane for that graph's **node list** — one
-  selectable row per node (name + a coloured status badge). `j`/`k` (or ↑/↓) move
-  the selection, which always stays in view; `Enter`/`o`/`l` opens the highlighted
-  graph; `Esc`/`h` returns to the graph list; `r` refreshes.
+- **Left (selector).** The default **Topics** tab is an expandable file-explorer
+  tree assembled from `cog topic list ""`: topic path segments are folders and
+  typed bindings are leaves. The peer **Agents** tab lists registered agent
+  addresses. Selecting a graph leaf enters the graph's existing Overview + node
+  selector in the same left pane; Back returns to the topic tree. `j`/`k` (or
+  ↑/↓) move the visible selection, `Enter`/`o`/`l` activates or expands it,
+  `Esc`/`h` returns one level, and `r` refreshes the active source.
 - **Right (detail, scrollable).** For a highlighted graph: its id, sealed/prototype,
-  omega, and description. For a highlighted node: its name + id + status badge, its
-  **content**, its **output** (when present), its **status-transition timeline** (from
-  `cog node log`, one row per `status_changed`, showing the new status + actor +
-  time), and its **notes** (from `cog graph read-node-notes`, topic + prose + actor +
-  time). Scrolls with `d`/`u` (half-page) and PageDown/PageUp.
+  omega, description, Overview, nodes, and live graph state. For a bulletin/note:
+  its immutable mail entries and references. For a mailing list: metadata,
+  subscribers, and its replayable entry archive. For an agent: registration,
+  delivery state, and readable addressed mail. A selected graph node retains its
+  content, output, transitions, and notes detail. The pane scrolls with `d`/`u`
+  (half-page) and PageDown/PageUp.
 
 Every node carries an **effective status**: the stored status (`done`, `claimed`,
 `failed`, `abandoned`) as-is, but an `open` node is split into `ready` (all
@@ -50,6 +52,105 @@ cached two-pane body `CogView`).
 
 ## UX invariants
 
+### UXI-Cog-13 — The Cog tile opens as a hierarchical Topics browser
+
+**Statement.** Opening or restoring a Cog tile lands on the **Topics** tab. The
+left pane behaves like a file explorer over all live bindings returned by
+`cog topic list ""`: slash-separated path components render once as expandable
+folders; the address key renders as a typed leaf labelled graph, note, or list.
+Folders are initially expanded so the first draft exposes the whole hierarchy;
+clicking or pressing `Enter` toggles a folder, and the visible-row selection
+remains valid when a folder collapses. Empty data renders one non-selectable
+"No topics registered" state. A fetch failure replaces the explorer body with a
+readable error and `r` retries. Topics are sorted by folder, then leaf label,
+case-insensitively. The surface is read-only.
+
+Activating a graph leaf loads that graph into the existing Overview + node
+selector. `Esc`/`h` from graph Overview returns to the same Topics tree with its
+folder expansion and selection preserved. This invariant supersedes
+UXI-Cog-1's graph-list entry screen; the existing graph renderer and UXI-Cog-2..12
+continue to apply after a graph leaf is opened.
+
+**Applies to.** `CogHome`, `CogTopicTree`, `CogTopicRow`, and topic load/selection
+methods (`cog.rs`, `cog_view.rs`, `cog_ui.rs`); `render_cog` (`screens.rs`).
+
+**Why.** The `/new-ux` requirement: "Change the main cog view to browser
+hierarchial topics. Left side is a file explorer."
+
+**Status.** implemented
+
+**Enforcement.** `tests.rs::cog_topic_tree_is_sorted_deduplicated_and_hierarchical`
+asserts deterministic hierarchy construction. The headless production-path guard
+`verify_harness.rs::cog_topic_browser_hierarchy_collapses_and_renders_typed_detail`
+applies Home through the real reducer, asserts the default visible hierarchy,
+drives real collapse/expand and leaf-click handlers, and probes both panes. It was
+observed RED with descendant flattening disabled (2 rows painted instead of 6).
+
+### UXI-Cog-14 — Topic leaves select a typed right-pane renderer
+
+**Statement.** Selecting a topic leaf renders its current target in the right pane
+without replacing the topic tree. A graph leaf shows a compact graph preview and
+offers activation into the existing full graph Overview/node view. A bulletin
+(the topic-addressable Cog note object) shows its name, participants/timestamps,
+immutable entries in event order, structured content through the existing
+foldable JSON tree, and typed object references. A mailing-list leaf shows its
+name/id, current subscribers, and complete replayable entry archive in event
+order, including content and references. Each renderer has an explicit empty
+state; a target-specific load error stays attached to the selected leaf and does
+not discard the tree. Changing selection resets only the right-pane scroll.
+
+**Applies to.** Typed topic target/fetch models (`cog.rs`), `CogDetail` selection
+and `right_pane` renderer (`cog_view.rs`), and background fetch/reducer routing
+(`cog_ui.rs`).
+
+**Why.** The `/new-ux` requirement: "Right side can render either notes, graphs,
+or mailing lists." Cog calls topic-addressable zero-recipient notes Bulletins, so
+the UI labels that type **Note** while preserving its bulletin identity in detail.
+
+**Status.** implemented
+
+**Enforcement.** `tests.rs::cog_new_cli_payloads_deserialize_without_optional_fields`
+covers the new typed CLI payloads. The production-path hierarchy guard above
+selects a Mailing List via the real row handler, folds it through
+`CogFetch::TopicDetail`, and probes a non-trivial archive; the graph and note arms
+share the existing graph/mail renderers and compile under the full GUI suite.
+
+### UXI-Cog-15 — The Agents tab lists registered agents and exposes readable mail
+
+**Statement.** The left-pane source tabs are **Topics** and **Agents**. The home
+load bundles `cog address list`; clicking Agents reveals active addresses before
+retired ones and then by name, with the first row selected. Each
+row shows name, provider, and an online/offline/retired state derived from
+`cog address delivery-status`; retired entries remain visible. The right pane
+shows immutable address binding metadata, delivery cursor/retry/block state, and
+all globally readable mail involving that address. Threads are newest-first;
+entries within a thread remain oldest-first and render sender, time, structured
+content, and typed references. Mail includes addressed inbox items and threads
+from `cog mail list` in which the selected address is a participant, deduplicated
+by mail id. Empty agents and empty mail have distinct friendly states; per-agent
+delivery/mail errors remain visible without hiding the agent list. This surface
+is read-only: it does not retry, skip, retire, send, or publish.
+
+Switching back to Topics restores its prior tree expansion/selection. `j`/`k`,
+click, right-pane focus, scrolling, refresh, and cached-body behavior match the
+Topics source. A source change resets right-pane focus and scroll.
+
+**Applies to.** Address/delivery/mail models and fetches (`cog.rs`), source-tab and
+agent selection state (`cog_view.rs`), background load/reducer/key routing
+(`cog_ui.rs`), and the Cog cached body (`screens.rs`).
+
+**Why.** The `/new-ux` requirement: "Add a tab that shows registered agents.
+Shoudl be able to read their mail."
+
+**Status.** implemented
+
+**Enforcement.** `verify_harness.rs::cog_agents_tab_reads_delivery_and_mail`
+switches tabs through the production handler, applies synthetic address,
+delivery, and Mail through the real reducer, and probes agent detail plus a
+mail-entry card. It also drives the no-mail and no-agents states. The existing
+`cog_body_is_cached` guard covers the shared cached surface. The mail guard was
+observed RED with the populated entry loop suppressed.
+
 ### UXI-Cog-1 — A Cog tile opens on the graph explorer
 
 **Statement.** Opening a Cog tile (`OpenCog` / `Cmd-G` / new-cog-tile / File menu)
@@ -63,7 +164,8 @@ graph.
 **Why.** The requirement: "A new tile should have a file explorer view that lets me
 pick which graph I want to explore." Without this the tile has no entry point.
 
-**Status.** implemented
+**Status.** superseded by UXI-Cog-13 (the graph explorer remains a legacy test
+state and the full graph renderer is entered from a graph Topic leaf)
 
 **Enforcement.** `verify_harness.rs::cog_opens_on_graph_explorer` (drives the real
 `open_cog_inner` + `cog_apply` with a synthetic graph list, asserts the view state is

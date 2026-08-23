@@ -1,5 +1,5 @@
-//! Cog explorer App methods on `YaldaGpuiView`: open the tile, fetch the graph
-//! list / a graph bundle off the paint thread, fold the result into the tile's
+//! Cog explorer App methods on `YaldaGpuiView`: open the tile, fetch the Topic
+//! browser / a graph bundle off the paint thread, fold the result into the tile's
 //! cached [`CogView`], drive left selection + right-pane scroll, and the
 //! per-tile key handler. The body render lives in `cog_view.rs`; the subprocess
 //! client + data model in `cog.rs`.
@@ -8,7 +8,7 @@ use super::*;
 
 impl YaldaGpuiView {
     /// Open a Cog explorer tile. Replaces the focused tile's content with a
-    /// fresh `App::Cog` and kicks off the graph-list fetch. No-op if already
+    /// fresh `App::Cog` and kicks off the Topic-browser fetch. No-op if already
     /// on a Cog tile.
     pub(crate) fn open_cog(&mut self, _: &OpenCog, _w: &mut Window, cx: &mut Context<Self>) {
         self.open_cog_inner(cx);
@@ -60,7 +60,7 @@ impl YaldaGpuiView {
         }
     }
 
-    /// Fetch the graph explorer list into the focused Cog tile.
+    /// Fetch the Topic hierarchy + address directory into the focused Cog tile.
     pub(crate) fn cog_load_graphs(&mut self, cx: &mut Context<Self>) {
         let Some(target) = self.workspace.focused_window_id() else {
             return;
@@ -68,7 +68,7 @@ impl YaldaGpuiView {
         self.cog_load_graphs_into(target, cx);
     }
 
-    /// Fetch the graph explorer list into a SPECIFIC Cog tile (by window id) —
+    /// Fetch the primary Cog browser into a SPECIFIC Cog tile (by window id) —
     /// used by the reconcile kick, which must target the restored tile, not
     /// whatever is focused.
     pub(crate) fn cog_load_graphs_into(
@@ -88,7 +88,7 @@ impl YaldaGpuiView {
         };
         if let Some(v) = &view {
             v.update(cx, |cv, vcx| {
-                cv.set_state(CogViewState::Loading("loading graphs…".into()));
+                cv.set_state(CogViewState::Loading("loading topics…".into()));
                 vcx.notify();
             });
         }
@@ -102,7 +102,7 @@ impl YaldaGpuiView {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { cog::list_graphs().map(CogFetch::Graphs) })
+                .spawn(async move { cog::load_home().map(|home| CogFetch::Home(Box::new(home))) })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.cog_apply(target, req, result, cx);
@@ -212,6 +212,147 @@ impl YaldaGpuiView {
         self.cog_fetch_graph(target, id, label, cx);
     }
 
+    /// Load a Topic target selected by a mouse row without re-borrowing the
+    /// currently-mutating cached view.
+    pub(crate) fn cog_fetch_topic_for(
+        &mut self,
+        view: Entity<CogView>,
+        binding: CogTopicBinding,
+        cx: &mut Context<Self>,
+    ) {
+        let vid = view.entity_id();
+        let mut target = None;
+        for workspace in self.workspace.workspaces.iter() {
+            workspace.for_each_attached_window(&mut |window| {
+                if let App::Cog(tile) = &window.content
+                    && tile.view.as_ref().map(|item| item.entity_id()) == Some(vid)
+                {
+                    target = Some(window.id());
+                }
+            });
+            if target.is_some() {
+                break;
+            }
+        }
+        if let Some(target) = target {
+            self.cog_fetch_topic(target, binding, cx);
+        }
+    }
+
+    fn cog_fetch_topic(
+        &mut self,
+        target: workspace::WindowId,
+        binding: CogTopicBinding,
+        cx: &mut Context<Self>,
+    ) {
+        let req = {
+            let Some(tile) = self.cog_tile_by_id_mut(target) else {
+                return;
+            };
+            tile.req += 1;
+            tile.req
+        };
+        if cfg!(test) {
+            return;
+        }
+        let address = binding.address.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { cog::load_topic_detail(&binding) })
+                .await;
+            let fetch = CogFetch::TopicDetail { address, result };
+            let _ = this.update(cx, |this, cx| {
+                this.cog_apply(target, req, Ok(fetch), cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Load an address selected by a mouse row without re-borrowing the
+    /// currently-mutating cached view.
+    pub(crate) fn cog_fetch_agent_for(
+        &mut self,
+        view: Entity<CogView>,
+        address: CogAgentAddress,
+        cx: &mut Context<Self>,
+    ) {
+        let vid = view.entity_id();
+        let mut target = None;
+        for workspace in self.workspace.workspaces.iter() {
+            workspace.for_each_attached_window(&mut |window| {
+                if let App::Cog(tile) = &window.content
+                    && tile.view.as_ref().map(|item| item.entity_id()) == Some(vid)
+                {
+                    target = Some(window.id());
+                }
+            });
+            if target.is_some() {
+                break;
+            }
+        }
+        if let Some(target) = target {
+            self.cog_fetch_agent(target, address, cx);
+        }
+    }
+
+    fn cog_fetch_agent(
+        &mut self,
+        target: workspace::WindowId,
+        address: CogAgentAddress,
+        cx: &mut Context<Self>,
+    ) {
+        let req = {
+            let Some(tile) = self.cog_tile_by_id_mut(target) else {
+                return;
+            };
+            tile.req += 1;
+            tile.req
+        };
+        if cfg!(test) {
+            return;
+        }
+        let address_id = address.id.clone();
+        cx.spawn(async move |this, cx| {
+            let detail = cx
+                .background_executor()
+                .spawn(async move { cog::load_agent_detail(address) })
+                .await;
+            let fetch = CogFetch::AgentDetail {
+                address: address_id,
+                detail: Box::new(detail),
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.cog_apply(target, req, Ok(fetch), cx);
+            });
+        })
+        .detach();
+    }
+
+    fn cog_return_home(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(target) = self.workspace.focused_window_id() else {
+            return false;
+        };
+        let Some(view) = self.cog_focused_tile_view() else {
+            return false;
+        };
+        let returned = view.update(cx, |cv, vcx| {
+            let returned = cv.return_home();
+            if returned {
+                vcx.notify();
+            }
+            returned
+        });
+        if returned {
+            self.cog_stop_watch(target);
+            if let Some(tile) = self.cog_tile_by_id_mut(target) {
+                tile.title = "Cog".into();
+            }
+            cx.notify();
+        }
+        returned
+    }
+
     /// Fold a completed fetch into the tile that requested it (by stable
     /// `WindowId`). Discards if the tile is gone, isn't a Cog tile, or has
     /// issued a newer request.
@@ -231,17 +372,24 @@ impl YaldaGpuiView {
                 // Set the view (clears any prior events), then start watching this
                 // graph's live event stream into the fresh events pane.
                 let id = bundle.graph.id.clone();
+                let view = self
+                    .cog_tile_by_id_mut(target)
+                    .and_then(|tile| tile.view.clone());
+                if let Some(view) = view {
+                    view.update(cx, |cv, vcx| {
+                        cv.enter_graph(bundle);
+                        vcx.notify();
+                    });
+                }
+                self.cog_start_watch(target, id, cx);
+            }
+            Ok(CogFetch::Home(home)) => {
+                self.cog_stop_watch(target);
                 self.cog_set_view(
                     target,
-                    // Open a graph on its Overview (graph render + stats).
-                    CogViewState::Graph {
-                        bundle,
-                        selected: 0,
-                        overview: true,
-                    },
+                    CogViewState::Home(Box::new(CogHomeState::new(*home))),
                     cx,
                 );
-                self.cog_start_watch(target, id, cx);
             }
             Ok(CogFetch::Graphs(graphs)) => {
                 self.cog_stop_watch(target);
@@ -253,6 +401,28 @@ impl YaldaGpuiView {
                     },
                     cx,
                 );
+            }
+            Ok(CogFetch::TopicDetail { address, result }) => {
+                let view = self
+                    .cog_tile_by_id_mut(target)
+                    .and_then(|tile| tile.view.clone());
+                if let Some(view) = view {
+                    view.update(cx, |cv, vcx| {
+                        cv.apply_topic_detail(address, result);
+                        vcx.notify();
+                    });
+                }
+            }
+            Ok(CogFetch::AgentDetail { address, detail }) => {
+                let view = self
+                    .cog_tile_by_id_mut(target)
+                    .and_then(|tile| tile.view.clone());
+                if let Some(view) = view {
+                    view.update(cx, |cv, vcx| {
+                        cv.apply_agent_detail(address, *detail);
+                        vcx.notify();
+                    });
+                }
             }
             Err(e) => {
                 self.cog_stop_watch(target);
@@ -437,11 +607,31 @@ impl YaldaGpuiView {
 
     /// Move the left selection in the focused Cog tile.
     pub(crate) fn cog_select(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let Some(target) = self.workspace.focused_window_id() else {
+            return;
+        };
         if let Some(v) = self.cog_focused_tile_view() {
             v.update(cx, |cv, vcx| {
                 cv.select_move(delta);
                 vcx.notify();
             });
+            let selected = v.read(cx).selected_topic_binding();
+            if let Some(binding) = selected {
+                v.update(cx, |cv, vcx| {
+                    cv.set_topic_loading(binding.address.clone());
+                    vcx.notify();
+                });
+                self.cog_fetch_topic(target, binding, cx);
+                return;
+            }
+            let selected = v.read(cx).selected_agent();
+            if let Some(address) = selected {
+                v.update(cx, |cv, vcx| {
+                    cv.set_agent_loading(address.id.clone());
+                    vcx.notify();
+                });
+                self.cog_fetch_agent(target, address, cx);
+            }
         }
     }
 
@@ -608,18 +798,19 @@ impl YaldaGpuiView {
     ///
     /// `r` reloads in both states.
     pub(crate) fn handle_cog_press(&mut self, press: KeyPress, cx: &mut Context<Self>) {
-        let (in_graphs, focused_right, focused_events, filtering) = self
+        let (in_graphs, in_home, focused_right, focused_events, filtering) = self
             .cog_focused_tile_view()
             .map(|v| {
                 let cv = v.read(cx);
                 (
                     cv.in_graphs(),
+                    cv.in_home(),
                     cv.focused_right(),
                     cv.focused_events(),
                     cv.is_filtering(),
                 )
             })
-            .unwrap_or((false, false, false, false));
+            .unwrap_or((false, false, false, false, false));
 
         // Graph-explorer search sub-mode: printable keys type into the filter;
         // arrows move within matches; Enter opens; Esc exits.
@@ -647,6 +838,31 @@ impl YaldaGpuiView {
             Key::Enter | Key::Char('o') | Key::Char('l') | Key::Right => {
                 if in_graphs {
                     self.cog_open_selected_graph(cx);
+                } else if in_home {
+                    let binding = self
+                        .cog_focused_tile_view()
+                        .and_then(|view| view.read(cx).selected_topic_binding());
+                    match binding {
+                        Some(binding) if binding.kind == CogTopicKind::Graph => {
+                            self.cog_open_selected_graph(cx)
+                        }
+                        Some(_) => self.cog_set_focus(true, cx),
+                        None => {
+                            let agent_selected = self
+                                .cog_focused_tile_view()
+                                .and_then(|view| view.read(cx).selected_agent())
+                                .is_some();
+                            if agent_selected {
+                                self.cog_set_focus(true, cx);
+                            } else if let Some(view) = self.cog_focused_tile_view() {
+                                view.update(cx, |cv, vcx| {
+                                    if cv.toggle_selected_topic_folder() {
+                                        vcx.notify();
+                                    }
+                                });
+                            }
+                        }
+                    }
                 } else {
                     self.cog_set_focus(true, cx);
                 }
@@ -658,6 +874,7 @@ impl YaldaGpuiView {
                     // nothing above the explorer
                 } else if focused_right || focused_events {
                     self.cog_set_focus(false, cx);
+                } else if self.cog_return_home(cx) {
                 } else {
                     self.cog_load_graphs(cx);
                 }
@@ -690,7 +907,7 @@ impl YaldaGpuiView {
             Key::PageUp => self.cog_scroll_active(-440.0, focused_events, cx),
 
             Key::Char('r') => {
-                if in_graphs {
+                if in_graphs || in_home {
                     self.cog_load_graphs(cx);
                 } else {
                     self.cog_reload_current(cx);
@@ -703,11 +920,14 @@ impl YaldaGpuiView {
     /// Refresh the focused Cog tile from the local menu: reload the open graph,
     /// or the graph list if none is open.
     pub(crate) fn cog_refresh_focused(&mut self, cx: &mut Context<Self>) {
-        let in_graphs = self
+        let in_browser = self
             .cog_focused_tile_view()
-            .map(|v| v.read(cx).in_graphs())
+            .map(|v| {
+                let view = v.read(cx);
+                view.in_graphs() || view.in_home()
+            })
             .unwrap_or(true);
-        if in_graphs {
+        if in_browser {
             self.cog_load_graphs(cx);
         } else {
             self.cog_reload_current(cx);

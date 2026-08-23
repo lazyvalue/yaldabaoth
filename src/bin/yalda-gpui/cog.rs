@@ -15,7 +15,7 @@
 use super::*;
 
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 // ── Data model (mirrors the `cog` CLI JSON shapes) ───────────────────────────
 
@@ -124,6 +124,312 @@ pub(crate) struct CogNote {
     pub(crate) topic: Option<String>,
     #[serde(default)]
     pub(crate) data: serde_json::Value,
+}
+
+/// A live hierarchical Topic binding (`cog topic list`). Cog calls its
+/// topic-addressable note object a Bulletin; the UI presents that kind as Note.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub(crate) struct CogTopicBinding {
+    pub(crate) address: String,
+    pub(crate) kind: CogTopicKind,
+    pub(crate) object: String,
+    #[serde(default)]
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) created_at: i64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CogTopicKind {
+    Graph,
+    Bulletin,
+    MailingList,
+}
+
+impl CogTopicKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Graph => "graph",
+            Self::Bulletin => "note",
+            Self::MailingList => "list",
+        }
+    }
+}
+
+/// One node in the topic file-explorer tree. Folders precede bindings and both
+/// are sorted case-insensitively, so a server response order never leaks into
+/// the UI.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CogTopicNode {
+    Folder {
+        label: String,
+        path: String,
+        children: Vec<CogTopicNode>,
+    },
+    Binding(CogTopicBinding),
+}
+
+#[derive(Default)]
+struct TopicFolderBuilder {
+    folders: BTreeMap<String, TopicFolderBuilder>,
+    bindings: Vec<CogTopicBinding>,
+}
+
+impl TopicFolderBuilder {
+    fn finish(self, parent: &str) -> Vec<CogTopicNode> {
+        let mut nodes = Vec::new();
+        let mut folders: Vec<_> = self.folders.into_iter().collect();
+        folders.sort_by(|(a, _), (b, _)| a.to_lowercase().cmp(&b.to_lowercase()));
+        for (label, folder) in folders {
+            let path = if parent.is_empty() {
+                label.clone()
+            } else {
+                format!("{parent}/{label}")
+            };
+            nodes.push(CogTopicNode::Folder {
+                label,
+                children: folder.finish(&path),
+                path,
+            });
+        }
+        let mut bindings = self.bindings;
+        bindings.sort_by(|a, b| {
+            topic_leaf_label(a)
+                .to_lowercase()
+                .cmp(&topic_leaf_label(b).to_lowercase())
+        });
+        nodes.extend(bindings.into_iter().map(CogTopicNode::Binding));
+        nodes
+    }
+}
+
+/// A deterministic hierarchy assembled from flat `topic/path::leaf` bindings.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CogTopicTree {
+    pub(crate) roots: Vec<CogTopicNode>,
+}
+
+impl CogTopicTree {
+    pub(crate) fn from_bindings(bindings: Vec<CogTopicBinding>) -> Self {
+        let mut root = TopicFolderBuilder::default();
+        let mut seen = BTreeSet::new();
+        for binding in bindings {
+            if !seen.insert(binding.address.clone()) {
+                continue;
+            }
+            let Some((path, _)) = binding.address.split_once("::") else {
+                continue;
+            };
+            let mut folder = &mut root;
+            for component in path.split('/').filter(|part| !part.is_empty()) {
+                folder = folder.folders.entry(component.to_string()).or_default();
+            }
+            folder.bindings.push(binding);
+        }
+        Self {
+            roots: root.finish(""),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.roots.is_empty()
+    }
+}
+
+pub(crate) fn topic_leaf_label(binding: &CogTopicBinding) -> String {
+    let key = binding
+        .address
+        .split_once("::")
+        .map(|(_, key)| key)
+        .unwrap_or(binding.address.as_str());
+    if binding.name.trim().is_empty() || binding.name == key {
+        key.to_string()
+    } else {
+        format!("{key}  ·  {}", binding.name)
+    }
+}
+
+/// One registered durable agent route (`cog address list`).
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub(crate) struct CogAgentAddress {
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) provider: String,
+    #[serde(default)]
+    pub(crate) session: String,
+    #[serde(default)]
+    pub(crate) cwd: String,
+    #[serde(default)]
+    pub(crate) created_at: i64,
+    #[serde(default)]
+    pub(crate) retired_at: Option<i64>,
+    #[serde(default)]
+    pub(crate) retired_reason: Option<String>,
+}
+
+impl CogAgentAddress {
+    pub(crate) fn label(&self) -> &str {
+        if self.name.trim().is_empty() {
+            &self.id
+        } else {
+            &self.name
+        }
+    }
+
+    pub(crate) fn is_retired(&self) -> bool {
+        self.retired_at.is_some()
+    }
+}
+
+/// Presence and broker cursor state (`cog address delivery-status`).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub(crate) struct CogDeliveryStatus {
+    #[serde(default)]
+    pub(crate) address: String,
+    #[serde(default)]
+    pub(crate) presence: String,
+    #[serde(default)]
+    pub(crate) lease_expires_at: Option<i64>,
+    #[serde(default)]
+    pub(crate) cursor: i64,
+    #[serde(default)]
+    pub(crate) state: String,
+    #[serde(default)]
+    pub(crate) retry_attempt: u32,
+    #[serde(default)]
+    pub(crate) retry_at: Option<i64>,
+    #[serde(default)]
+    pub(crate) blocked_event_id: Option<i64>,
+    #[serde(default)]
+    pub(crate) blocked_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub(crate) struct CogReference {
+    #[serde(default)]
+    pub(crate) kind: String,
+    #[serde(default)]
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) state: String,
+    #[serde(default)]
+    pub(crate) object: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub(crate) struct CogMailEntry {
+    #[serde(default)]
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) event_id: i64,
+    #[serde(default)]
+    pub(crate) mail: String,
+    #[serde(default)]
+    pub(crate) from: String,
+    #[serde(default)]
+    pub(crate) at: i64,
+    #[serde(default)]
+    pub(crate) actor: String,
+    #[serde(default)]
+    pub(crate) content: serde_json::Value,
+    #[serde(default)]
+    pub(crate) references: Vec<CogReference>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub(crate) struct CogMail {
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) participants: Vec<String>,
+    #[serde(default)]
+    pub(crate) entries: Vec<CogMailEntry>,
+    #[serde(default)]
+    pub(crate) created_at: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub(crate) struct CogMailSummary {
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) participants: Vec<String>,
+    #[serde(default)]
+    pub(crate) created_at: i64,
+    #[serde(default)]
+    pub(crate) latest_event_id: i64,
+    #[serde(default)]
+    pub(crate) bulletin: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub(crate) struct CogMailFeedEntry {
+    #[serde(default)]
+    pub(crate) mail: String,
+    #[serde(default)]
+    pub(crate) mail_name: String,
+    pub(crate) entry: CogMailEntry,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub(crate) struct CogMailingList {
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) creator: String,
+    #[serde(default)]
+    pub(crate) created_at: i64,
+    #[serde(default)]
+    pub(crate) topics: Vec<String>,
+    #[serde(default)]
+    pub(crate) subscribers: Vec<String>,
+    #[serde(default)]
+    pub(crate) entries: Vec<CogMailingListEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub(crate) struct CogMailingListEntry {
+    #[serde(default)]
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) event_id: i64,
+    #[serde(default)]
+    pub(crate) mailing_list: String,
+    #[serde(default)]
+    pub(crate) from: String,
+    #[serde(default)]
+    pub(crate) at: i64,
+    #[serde(default)]
+    pub(crate) actor: String,
+    #[serde(default)]
+    pub(crate) content: serde_json::Value,
+    #[serde(default)]
+    pub(crate) references: Vec<CogReference>,
+}
+
+pub(crate) enum CogTopicDetail {
+    Graph(CogGraph),
+    Note(CogMail),
+    MailingList(CogMailingList),
+}
+
+pub(crate) struct CogAgentDetail {
+    pub(crate) address: CogAgentAddress,
+    pub(crate) delivery: Result<CogDeliveryStatus, String>,
+    pub(crate) inbox: Result<Vec<CogMailFeedEntry>, String>,
+    pub(crate) threads: Result<Vec<CogMail>, String>,
+}
+
+pub(crate) struct CogHomeData {
+    pub(crate) topics: CogTopicTree,
+    pub(crate) agents: Vec<CogAgentAddress>,
+    pub(crate) agent_presence: BTreeMap<String, String>,
 }
 
 impl CogNote {
@@ -315,10 +621,22 @@ impl EffStatus {
 
 /// The result of a background fetch, folded back onto the tile in `cog_ui.rs`.
 pub(crate) enum CogFetch {
+    /// Topic hierarchy + registered-address directory for the primary browser.
+    Home(Box<CogHomeData>),
     /// The graph explorer list (opening the tile / going back).
     Graphs(Vec<CogGraph>),
     /// A fully-loaded graph.
     Graph(Box<CogBundle>),
+    /// A right-pane topic target; failures remain local to the selected leaf.
+    TopicDetail {
+        address: String,
+        result: Result<CogTopicDetail, String>,
+    },
+    /// A selected registered address's delivery and mail detail.
+    AgentDetail {
+        address: String,
+        detail: Box<CogAgentDetail>,
+    },
 }
 
 // ── The tile ─────────────────────────────────────────────────────────────────
@@ -400,7 +718,11 @@ fn run_cog(args: &[&str]) -> Result<String, String> {
         let err = String::from_utf8_lossy(&out.stderr);
         let err = err.trim();
         return Err(if err.is_empty() {
-            format!("`cog {}` failed (exit {:?})", args.join(" "), out.status.code())
+            format!(
+                "`cog {}` failed (exit {:?})",
+                args.join(" "),
+                out.status.code()
+            )
         } else {
             format!("`cog {}`: {err}", args.join(" "))
         });
@@ -420,6 +742,107 @@ pub(crate) fn list_graphs() -> Result<Vec<CogGraph>, String> {
     let mut graphs: Vec<CogGraph> = cog_json(&["graph", "list"])?;
     graphs.sort_by(|a, b| a.label().to_lowercase().cmp(&b.label().to_lowercase()));
     Ok(graphs)
+}
+
+/// List every live hierarchical Topic binding. The empty prefix is the public
+/// root-browser contract documented by Cog; `--limit 1000` matches the server's
+/// maximum page size for a dense first-draft explorer.
+pub(crate) fn list_topics() -> Result<CogTopicTree, String> {
+    let bindings: Vec<CogTopicBinding> = cog_json(&["topic", "list", "", "--limit", "1000"])?;
+    Ok(CogTopicTree::from_bindings(bindings))
+}
+
+pub(crate) fn load_home() -> Result<CogHomeData, String> {
+    // Agent discovery is independent of Topics. Older Cog deployments simply
+    // produce an empty directory, while a current deployment enriches every
+    // active row with its broker presence before the first paint.
+    let agents = list_agents().unwrap_or_default();
+    let agent_presence = agents
+        .iter()
+        .filter(|address| !address.is_retired())
+        .filter_map(|address| {
+            cog_json::<CogDeliveryStatus>(&["address", "delivery-status", &address.id])
+                .ok()
+                .map(|status| (address.id.clone(), status.presence))
+        })
+        .collect();
+    Ok(CogHomeData {
+        topics: list_topics()?,
+        agents,
+        agent_presence,
+    })
+}
+
+/// Load the typed target behind one Topic leaf. Graph selection first paints a
+/// compact record; activation separately enters the existing full graph loader.
+pub(crate) fn load_topic_detail(binding: &CogTopicBinding) -> Result<CogTopicDetail, String> {
+    match binding.kind {
+        CogTopicKind::Graph => {
+            cog_json(&["graph", "get", &binding.object]).map(CogTopicDetail::Graph)
+        }
+        CogTopicKind::Bulletin => {
+            cog_json(&["mail", "get", &binding.object]).map(CogTopicDetail::Note)
+        }
+        CogTopicKind::MailingList => {
+            cog_json(&["mailing-list", "get", &binding.object]).map(CogTopicDetail::MailingList)
+        }
+    }
+}
+
+/// The installation-wide address directory, active routes first and then by
+/// human label. Retired routes remain visible for historical mail inspection.
+pub(crate) fn list_agents() -> Result<Vec<CogAgentAddress>, String> {
+    let mut agents: Vec<CogAgentAddress> = cog_json(&["address", "list"])?;
+    agents.sort_by(|a, b| {
+        a.is_retired()
+            .cmp(&b.is_retired())
+            .then_with(|| a.label().to_lowercase().cmp(&b.label().to_lowercase()))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    Ok(agents)
+}
+
+/// Load a selected address's broker state, incoming feed, and all direct Mail
+/// threads in which it participates. The three reads are intentionally partial:
+/// one unsupported/failed Cog endpoint does not hide the immutable address or
+/// other readable data.
+pub(crate) fn load_agent_detail(address: CogAgentAddress) -> CogAgentDetail {
+    let delivery = cog_json(&["address", "delivery-status", &address.id]);
+    let inbox = cog_json(&[
+        "mail",
+        "inbox",
+        &address.id,
+        "--since",
+        "0",
+        "--limit",
+        "1000",
+    ]);
+    let threads = (|| {
+        let summaries: Vec<CogMailSummary> = cog_json(&["mail", "list"])?;
+        let mut relevant: Vec<_> = summaries
+            .into_iter()
+            .filter(|mail| mail.participants.iter().any(|id| id == &address.id))
+            .collect();
+        relevant.sort_by(|a, b| {
+            b.latest_event_id
+                .cmp(&a.latest_event_id)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        let mut mails = Vec::with_capacity(relevant.len());
+        for summary in relevant {
+            let mut mail = cog_json::<CogMail>(&["mail", "get", &summary.id])?;
+            mail.entries
+                .sort_by(|a, b| a.event_id.cmp(&b.event_id).then_with(|| a.id.cmp(&b.id)));
+            mails.push(mail);
+        }
+        Ok(mails)
+    })();
+    CogAgentDetail {
+        address,
+        delivery,
+        inbox,
+        threads,
+    }
 }
 
 /// Load a graph and everything needed to render it: the graph record, derived

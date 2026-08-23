@@ -13,6 +13,26 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Browse Cog by hierarchical topics and inspect agents' mail** — `NEEDS-RUNTIME`
+  (2026-08-23 via `/new-ux`; `UXI-Cog-13..15`; Cog graph `q3u`). Shipped as a
+  headlessly verified first draft on `main`. Captured
+  verbatim: *"Change the main cog view to browser hierarchial topics. Left side
+  is a file explorer. Right side can render either notes, graphs, or mailing
+  lists. Add a tab that shows registered agents. Shoudl be able to read their
+  mail."* Design settled autonomously per the request: the Cog tile opens on a
+  Topics tab; its left pane is an expandable topic-path tree whose typed leaves
+  select graph, bulletin/note, or mailing-list detail in the right pane. A peer
+  Agents tab lists registered addresses and renders the selected agent's
+  immutable registration, delivery state, and readable mail. The surface stays
+  read-only and preserves the existing graph/node detail and live-event viewer.
+  Verification: 704 GUI tests pass (2 ignored), both new guards were observed
+  RED and restored GREEN, and the debug GUI builds. Runtime is specifically
+  pending pixel/layout review in the native GPUI app. Live data is additionally
+  blocked until the installed `cog`/`cogd` expose the README's new commands and
+  accept root discovery: the current installed CLI lacks topic/address/mail,
+  while the sibling debug CLI/server rejects `cog topic list ""` as an invalid
+  `TopicPath` despite the documented recursive-root contract.
+
 - **Hide the Cog live-events strip from the tile menu** — `NEEDS-RUNTIME`
   (2026-08-22 via `/new-ux`; `UXI-Cog-12`; on `main`). Captured verbatim: *"Want
   to be able to hide the live event stream pane of the cog tile. Should be a tile
