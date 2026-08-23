@@ -88,8 +88,9 @@ frontier 5: omega [done] (omega)
 
 ## Open / unresolved
 
-- The release binaries still need activation after the documentation merge;
-  runtime session counts and reconnect state will be appended before handoff.
+- No lifecycle repair or activation work remains open. The runtime snapshot after
+  release activation reports 123 archived and 30 live sessions; all 30 live
+  sessions are connected and subscribed.
 - Existing compiler warnings and repository-wide rustfmt drift are outside this
   lifecycle repair.
 
@@ -116,10 +117,19 @@ frontier 5: omega [done] (omega)
   --baseline skip --jobs 2`: **3 mutants tested, 3 caught**.
 - Server/client/durability fixes additionally have eight observed-RED manual
   negative controls on their exact predicates.
+- Both release binaries were built and activated from source HEAD `6532cd7`.
+  The fresh GUI restored 30 agent leaves and the fresh server reported 153
+  **stored** sessions. A read-only `admin_status` snapshot resolved that total
+  to **123 archived + 30 live**, with **30/30 live connected**, **30/30 live
+  subscribed**, **0 disconnected live**, and **0 archived WAL handles open**.
+- The example session `integration meta planner` is unarchived, connected,
+  subscribed, and WAL-backed on channel generation 3. Its compacted transcript
+  resumed with logical `log_base` 280587; the fresh server log contains no
+  warnings, errors, spawn failures, panics, disconnects, or timeouts after its
+  `2026-08-23T01:30:54Z` startup.
 - `scripts/check-cog-worklog.sh docs/worklog/2026-08-22-session-lifecycle-hardening.md`:
   passes.
 
 ## Next
 
-- Build and activate both release binaries, confirm the GUI reconnects, and
-  inspect live/archived session counts without deleting any WAL.
+- Monitor normal use; no release activation or session-data cleanup remains.
