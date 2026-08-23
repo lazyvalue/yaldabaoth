@@ -94,6 +94,13 @@ frontier 5: omega [done] (omega)
 - Existing compiler warnings and repository-wide rustfmt drift are outside this
   lifecycle repair.
 
+The first activation conclusion above was invalidated later on 2026-08-22 when
+the user reported empty restored tile windows. Follow-up graph `od4` localized
+and repaired the recurrence in bug-0002 and the stale-GUI activation defect in
+bug-0058. See
+`docs/worklog/2026-08-22-restore-generation-history-regression.md`; no known
+lifecycle repair remains open after that correction.
+
 ## Decisions
 
 - Lifecycle is explicit server state; absence of a channel is not itself a state.
@@ -129,6 +136,16 @@ frontier 5: omega [done] (omega)
   `2026-08-23T01:30:54Z` startup.
 - `scripts/check-cog-worklog.sh docs/worklog/2026-08-22-session-lifecycle-hardening.md`:
   passes.
+
+## Activation correction
+
+- Main merges `8d39a01` and `e20446e` preserve the WAL-built transcript across
+  resumed channel generations and guarantee `dev-gui.sh` removes stale GUI
+  processes before replacement launch.
+- The corrected release activation has one GUI process, 30/30 live sessions
+  connected/subscribed, and `integration meta planner` attached with 37,509
+  resident events on generation 3.
+- Full GUI suite after correction: **691 passed, 0 failed, 2 ignored**.
 
 ## Next
 
