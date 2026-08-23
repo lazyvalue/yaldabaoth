@@ -18343,6 +18343,8 @@ fn subagent_panes_paint_right_of_compose(cx: &mut TestAppContext) {
     view.update(vcx, |v, cx| {
         use yalda::acp_channel::{ToolCall, ToolCallId, ToolKind};
         let mut c = v.agent_mut(cx).expect("agent");
+        // Sidepanes are hidden by default (UXI-AgentTile-20) — summon Subagents.
+        c.subagents_open = true;
         let id: ToolCallId = "task-pane".into();
         let mut tc = ToolCall::new(id.clone(), "Explore repo".to_string());
         tc.kind = ToolKind::Think;
@@ -18383,6 +18385,69 @@ fn subagent_panes_paint_right_of_compose(cx: &mut TestAppContext) {
     );
 }
 
+/// UXI-AgentTile-20 (summon-only): the sidepanel is HIDDEN by default and does NOT
+/// pop open just because a subagent (or plan) arrives — it appears only after the
+/// user summons it (Cmd-2 / `toggle_subagents`). Asserts on PAINT (the
+/// `agent-sidepanel` probe absent while a subagent EXISTS but is un-summoned, then
+/// present after the summon), so a state-only pass can't fake it.
+///
+/// Negative control: revert the `subagents_open` default to `true` in the AgentState
+/// constructors and step 1 fails RED (the sidepanel paints with no summon).
+#[gpui::test]
+fn sidepanel_hidden_by_default_until_summoned(cx: &mut TestAppContext) {
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+
+    // A subagent EXISTS (subagents() non-empty) but nothing summoned the panel.
+    view.update(vcx, |v, cx| {
+        use yalda::acp_channel::{ToolCall, ToolCallId, ToolKind};
+        let mut c = v.agent_mut(cx).expect("agent");
+        let id: ToolCallId = "task-default-hidden".into();
+        let mut tc = ToolCall::new(id.clone(), "Explore repo".to_string());
+        tc.kind = ToolKind::Think;
+        tc.raw_input = Some(serde_json::json!({"prompt": "map the code"}));
+        let anchor = c.editor.anchor_for_line(0);
+        c.tools
+            .register(crate::ToolCallKey::from_id(&id), tc, anchor);
+    });
+
+    let probe_sidepanel = |view: &gpui::Entity<YaldaGpuiView>,
+                           vcx: &mut gpui::VisualTestContext| {
+        for _ in 0..3 {
+            view.update(vcx, |_, cx| cx.notify());
+            vcx.run_until_parked();
+        }
+        crate::layout_probe_begin();
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+        let side = crate::layout_probe_get("agent-sidepanel");
+        crate::layout_probe_end();
+        side
+    };
+
+    // The flag is off by default and the subagent genuinely exists — so the panel is
+    // gated by the summon flag, not merely by empty content.
+    let (open, has_sub) = view
+        .read_with(vcx, |v, cx| {
+            v.agent_read(cx, |c| (c.subagents_open, !c.subagents().is_empty()))
+        })
+        .expect("agent");
+    assert!(!open, "subagents_open must default false (summon-only)");
+    assert!(has_sub, "a subagent exists — the panel is gated by the flag, not content");
+
+    // 1) Un-summoned: the sidepanel must NOT paint even though a subagent exists.
+    assert!(
+        probe_sidepanel(&view, vcx).is_none(),
+        "sidepanel must NOT paint until summoned, even with a subagent present",
+    );
+
+    // 2) Summon Subagents (the Cmd-2 handler) → it paints.
+    view.update(vcx, |v, cx| v.toggle_subagents(cx));
+    assert!(
+        probe_sidepanel(&view, vcx).is_some(),
+        "sidepanel must paint once Subagents is summoned",
+    );
+}
+
 /// UXI-AgentTile-17 (PAINT proof): a subagent row STACKS its label over its prompt
 /// snippet — two lines, not two side-by-side columns. Register a Task subagent WITH
 /// a prompt, drive a real paint, and assert (via the layout probe) that the prompt
@@ -18399,6 +18464,8 @@ fn subagent_row_stacks_label_over_prompt(cx: &mut TestAppContext) {
     view.update(vcx, |v, cx| {
         use yalda::acp_channel::{ToolCall, ToolCallId, ToolKind};
         let mut c = v.agent_mut(cx).expect("agent");
+        // Sidepanes are hidden by default (UXI-AgentTile-20) — summon Subagents.
+        c.subagents_open = true;
         let id: ToolCallId = "task-stack".into();
         let mut tc = ToolCall::new(id.clone(), "Explore the repository layout".to_string());
         tc.kind = ToolKind::Think;
@@ -18449,6 +18516,8 @@ fn plan_and_subagents_share_the_sidepanel(cx: &mut TestAppContext) {
         use yalda::acp_channel::{ToolCall, ToolCallId, ToolKind};
         let mut c = v.agent_mut(cx).expect("agent");
         c.tasklist_open = true;
+        // Sidepanes are hidden by default (UXI-AgentTile-20) — summon Subagents too.
+        c.subagents_open = true;
         let id: ToolCallId = "task-share".into();
         let mut tc = ToolCall::new(id.clone(), "Explore repo".to_string());
         tc.kind = ToolKind::Think;
@@ -19539,6 +19608,7 @@ fn agent_panel_hl_switches_columns(cx: &mut TestAppContext) {
     register_subagent(&view, vcx, 1);
     register_subagent(&view, vcx, 2);
     view.update(vcx, |v, cx| v.toggle_tasklist(cx)); // open the Plan column
+    view.update(vcx, |v, cx| v.toggle_subagents(cx)); // summon Subagents (summon-only default)
     view.update(vcx, |v, cx| v.focus_agent_panel(cx));
     // Both columns open → entry lands on the LEFT (Plan).
     let col = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {

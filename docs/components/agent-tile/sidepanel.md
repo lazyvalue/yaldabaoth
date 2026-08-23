@@ -12,6 +12,13 @@ non-empty); with one open it fills the sidepanel height. Built in
 `screens.rs::render_agent`: the `agent-sidepanel` container holds the
 `tasklist-panel` and `subagent-panes` segments.
 
+**Summon-only (2026-08-23).** Both `*_open` flags default **false** in every
+`AgentState` constructor — a new session shows **no** sidepanel, and neither a new
+plan entry nor a newly-detected subagent pops it open. The panel appears **only** on
+an explicit summon: `Cmd-2` (`ToggleSubagents`), `Cmd-1` (`ToggleTasklist`), `Cmd-0`
+(`FocusAgentPanel`, un-hides + focuses), or the agent-view menu commands. This is the
+summon-only semantics of `UXI-AgentTile-20` below.
+
 ## References
 
 - Migrated from `docs/ux-invariants.md` INV-UX-12 (panel focus) + INV-UX-5
@@ -147,10 +154,20 @@ The hidden flag **persists per session** across restart (alongside the §35
 `AgentView`); `persist.rs` `PersistedSlot`/`SessionSnapshot` gain a `sidepanel_hidden`
 field with the same missing-key-defaults-false migration as the §35 fields.
 
-**Why.** The sidepanel is otherwise purely content-driven — it appears whenever Plan
-or Subagents is non-empty and there was no gesture to force it away; a user who wants
-the transcript full-width had no way to reclaim the ~280px. This gives one dedicated
-toggle instead of remembering which of `Cmd-1`/`Cmd-2` were open.
+**Why.** Historically the sidepanel was content-driven — it appeared whenever Plan
+or Subagents became non-empty and there was no gesture to force it away; a user who
+wanted the transcript full-width had no way to reclaim the ~280px. `Cmd-B` gave one
+dedicated hide toggle.
+
+**Summon-only revision (2026-08-23).** The content-driven default is retired: both
+`tasklist_open` and `subagents_open` now default **false**, so the sidepanel is
+hidden until the user summons a segment (`Cmd-1`/`Cmd-2`/`Cmd-0`/menu). A new plan
+entry or subagent no longer forces the panel open. `Cmd-B`
+(`sidepanel_hidden`) remains the wholesale hide of an *already-summoned* panel and is
+orthogonal to the per-segment `*_open` flags. Enforced by
+`verify_harness.rs::sidepanel_hidden_by_default_until_summoned` (a subagent EXISTS,
+the panel does NOT paint until `toggle_subagents`; NC-RED with the `subagents_open`
+default reverted to `true`).
 
 **Status.** `implemented` (headless; real `cmd-b` chord firing is the one
 `NEEDS-RUNTIME` gap).
