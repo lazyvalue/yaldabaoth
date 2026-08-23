@@ -6137,3 +6137,28 @@ fn history_ring_push_recall_semantics() {
     );
     assert!(!s.sent_history.contains(&"m0".to_string()), "oldest dropped");
 }
+
+/// UXI-AgentTile-42 (n3a wire): a promoted `AvailableCommands` reply maps to the
+/// canonical `AgentEventKind` and round-trips through the WAL serde mirror — so a
+/// command list re-advertised after the session is `agent_stream_authoritative`
+/// still reaches the model via the AgentEvent path (not only the legacy ReplyEvent).
+#[test]
+fn agent_event_available_commands_maps_and_roundtrips() {
+    use yalda::acp_channel::{AgentCommand, ReplyEvent};
+    use yalda::agent_event::{agent_kind_from_reply, AgentEventKind};
+
+    let cmds = vec![
+        AgentCommand { name: "compact".into(), description: "Compact".into() },
+        AgentCommand { name: "review".into(), description: "Review".into() },
+    ];
+    // ReplyEvent → canonical AgentEventKind (rides the durable stream).
+    let kind = agent_kind_from_reply(&ReplyEvent::AvailableCommands(cmds.clone()))
+        .expect("AvailableCommands maps to an AgentEventKind");
+    assert_eq!(kind, AgentEventKind::AvailableCommands { commands: cmds.clone() });
+
+    // WAL serde mirror round-trip (KnownKind, tag = "available_commands").
+    let json = serde_json::to_string(&kind).expect("serialize");
+    assert!(json.contains("available_commands"), "wire tag present: {json}");
+    let back: AgentEventKind = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(kind, back, "AvailableCommands round-trips through the WAL mirror");
+}
