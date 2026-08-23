@@ -475,6 +475,14 @@ impl YaldaGpuiView {
         }
     }
 
+    /// Toggle the focused Cog tile's live-events strip hidden/shown (the
+    /// `cog-toggle-events` tile menu command).
+    pub(crate) fn cog_toggle_events(&mut self, cx: &mut Context<Self>) {
+        if let Some(v) = self.cog_focused_tile_view() {
+            v.update(cx, |cv, vcx| cv.toggle_events(vcx));
+        }
+    }
+
     /// Scroll whichever scroll pane is focused — the events pane when
     /// `to_events`, else the detail pane.
     fn cog_scroll_active(&mut self, down: f32, to_events: bool, cx: &mut Context<Self>) {

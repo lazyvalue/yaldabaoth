@@ -1520,6 +1520,15 @@ struct WorkspacePicker {
     selected: usize,
 }
 
+/// `.` → Workspace → Show (`UXI-Workspace-27`). Captures the active
+/// workspace and its hidden stable tile ids when opened. The target list may be
+/// empty; that is a real picker state, not a rejected command.
+struct HiddenTilePicker {
+    workspace_index: usize,
+    targets: Vec<workspace::WindowId>,
+    selected: usize,
+}
+
 /// Active-workspace tile chooser for `Ctrl-W x` (UXI-Workspace-15). Targets
 /// are stable WindowIds captured in signed reading order. The source workspace
 /// and focused id are retained so a stale overlay can only cancel, never swap a
@@ -1608,6 +1617,7 @@ enum ActiveOverlay {
     Menu(MenuOverlay),
     BufferSwitcher(BufferSwitcher),
     WorkspacePicker(WorkspacePicker),
+    HiddenTilePicker(HiddenTilePicker),
     TileSwapPicker(TileSwapPicker),
     Rename(RenameOverlay),
     TagInput(TagInputOverlay),
@@ -1722,6 +1732,7 @@ fn gpui_menu() -> Vec<MenuNode> {
                 MenuNode::entry("x", "close workspace", "close-workspace"),
                 MenuNode::entry("p", "new project", "new-project"),
                 MenuNode::entry("b", "back and forth", "workspace-back-and-forth"),
+                MenuNode::entry("s", "show hidden tile", "show-hidden-tiles"),
             ],
         ),
         // System / dev — flattened up from the former `s` submenu to the root.
@@ -1865,6 +1876,7 @@ fn cog_local_menu() -> Vec<MenuNode> {
     with_tile_commands(vec![
         MenuNode::entry("g", "back to graph list", "cog-graphs"),
         MenuNode::entry("r", "refresh", "cog-refresh"),
+        MenuNode::entry("e", "hide/show live events", "cog-toggle-events"),
     ])
 }
 
@@ -5249,6 +5261,9 @@ impl YaldaGpuiView {
     fn overlay_is_workspace(&self) -> bool {
         matches!(self.active_overlay, ActiveOverlay::WorkspacePicker(_))
     }
+    fn overlay_is_hidden_tile_picker(&self) -> bool {
+        matches!(self.active_overlay, ActiveOverlay::HiddenTilePicker(_))
+    }
     fn overlay_is_tile_swap(&self) -> bool {
         matches!(self.active_overlay, ActiveOverlay::TileSwapPicker(_))
     }
@@ -5370,6 +5385,20 @@ impl YaldaGpuiView {
             None
         }
     }
+    fn hidden_tile_picker_ref(&self) -> Option<&HiddenTilePicker> {
+        if let ActiveOverlay::HiddenTilePicker(p) = &self.active_overlay {
+            Some(p)
+        } else {
+            None
+        }
+    }
+    fn hidden_tile_picker_mut(&mut self) -> Option<&mut HiddenTilePicker> {
+        if let ActiveOverlay::HiddenTilePicker(p) = &mut self.active_overlay {
+            Some(p)
+        } else {
+            None
+        }
+    }
     fn tile_swap_picker_ref(&self) -> Option<&TileSwapPicker> {
         if let ActiveOverlay::TileSwapPicker(p) = &self.active_overlay {
             Some(p)
@@ -5454,10 +5483,11 @@ impl YaldaGpuiView {
     /// kind are disabled (dimmed, non-dispatching) rather than hidden, so the
     /// menu layout stays spatially stable.
     fn global_menu_disabled(&self) -> HashSet<String> {
-        // Every workspace-scoped command (set cwd, new agent/buffer, theme,
-        // rebuild, mark tile) applies regardless of the focused content kind,
-        // so nothing is context-disabled in the pruned menu.
-        HashSet::new()
+        let mut disabled = HashSet::new();
+        if !self.focused_on_active_workspace() {
+            disabled.insert("show-hidden-tiles".to_string());
+        }
+        disabled
     }
 
     /// <space> — open the content-kind-specific local menu (spec-menu-scopes.md
@@ -5825,6 +5855,7 @@ impl YaldaGpuiView {
             "linear-copy-url" => self.linear_copy_url(cx),
             "cog-graphs" => self.cog_load_graphs(cx),
             "cog-refresh" => self.cog_refresh_focused(cx),
+            "cog-toggle-events" => self.cog_toggle_events(cx),
             "keymap-filter" => self.keymap_menu_filter(cx),
             "keymap-rebind" => self.keymap_menu_rebind(cx),
             "keymap-reset" => self.keymap_menu_reset(cx),
@@ -5941,6 +5972,7 @@ impl YaldaGpuiView {
                 self.open_workspace_picker(WorkspacePickerMode::Move { follow: true }, cx)
             }
             "also-show-tile" => self.open_workspace_picker(WorkspacePickerMode::AlsoShow, cx),
+            "show-hidden-tiles" => self.open_hidden_tile_picker(cx),
             "tile-detach" => {
                 self.detach_focused_tile_inner(cx);
             }
@@ -6355,6 +6387,27 @@ impl YaldaGpuiView {
             self.workspace.focused_content(),
             Some(App::Buffer(BufferApp::Viewing(_))) | Some(App::Buffer(BufferApp::Editing(_)))
         )
+    }
+
+    /// `UXI-Workspace-27` availability predicate: ordinary focus inside the
+    /// active workspace, never a solo-presented hidden/Detached tile.
+    fn focused_on_active_workspace(&self) -> bool {
+        if self.workspace.presented_tile().is_some() {
+            return false;
+        }
+        let active = self.workspace.active_workspace;
+        self.workspace
+            .focused_window_id()
+            .and_then(|id| self.workspace.tile_membership(id))
+            .is_some_and(|membership| {
+                matches!(
+                    membership,
+                    workspace::TileMembership::Attached {
+                        workspace,
+                        visibility: workspace::AttachedVisibility::Visible,
+                    } if workspace == active
+                )
+            })
     }
 
     /// Open the workspace picker overlay. For `AlsoShow`, reject non-file
@@ -6777,6 +6830,253 @@ impl YaldaGpuiView {
                 "workspace-picker-card",
                 card.into_any_element(),
             ))
+    }
+
+    /// Open the active workspace's hidden-tile chooser. An empty target list is
+    /// intentional: the picker opens and explains that there is nothing hidden.
+    fn open_hidden_tile_picker(&mut self, cx: &mut Context<Self>) {
+        if self.has_overlay() || !self.focused_on_active_workspace() {
+            return;
+        }
+        let workspace_index = self.workspace.active_workspace;
+        let targets = self
+            .workspace
+            .workspaces
+            .get(workspace_index)
+            .map(|workspace| {
+                workspace
+                    .hidden_tiles
+                    .iter()
+                    .map(|tile| tile.window.id())
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.transient_status = None;
+        self.open_overlay(ActiveOverlay::HiddenTilePicker(HiddenTilePicker {
+            workspace_index,
+            targets,
+            selected: 0,
+        }));
+        cx.notify();
+    }
+
+    fn handle_hidden_tile_picker_key(
+        &mut self,
+        ev: &KeyDownEvent,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let press = keystroke_to_keypress(&ev.keystroke);
+        let (selected, count) = match self.hidden_tile_picker_ref() {
+            Some(picker) => (picker.selected, picker.targets.len()),
+            None => return,
+        };
+        match press.key {
+            Key::Esc | Key::Char('q') => self.clear_overlay(),
+            Key::Char('j') | Key::Down if count > 0 => {
+                if let Some(picker) = self.hidden_tile_picker_mut() {
+                    picker.selected = (picker.selected + 1) % count;
+                }
+            }
+            Key::Char('k') | Key::Up if count > 0 => {
+                if let Some(picker) = self.hidden_tile_picker_mut() {
+                    picker.selected = (picker.selected + count - 1) % count;
+                }
+            }
+            Key::Enter | Key::Char('l') => {
+                if let Some(id) = self
+                    .hidden_tile_picker_ref()
+                    .and_then(|picker| picker.targets.get(selected))
+                    .copied()
+                {
+                    self.commit_hidden_tile_picker(id, cx);
+                }
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    /// Resolve the stable id at event time and use the existing typed Unhide
+    /// transition. This follows/focuses the owning workspace and restores the
+    /// saved footprint when it is still available (`UXI-Workspace-24`).
+    fn commit_hidden_tile_picker(
+        &mut self,
+        id: workspace::WindowId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace_index) = self.hidden_tile_picker_ref().and_then(|picker| {
+            picker
+                .targets
+                .contains(&id)
+                .then_some(picker.workspace_index)
+        }) else {
+            return;
+        };
+        let still_hidden_here = matches!(
+            self.workspace.tile_membership(id),
+            Some(workspace::TileMembership::Attached {
+                workspace,
+                visibility: workspace::AttachedVisibility::Hidden,
+            }) if workspace == workspace_index
+        );
+        if !still_hidden_here {
+            return;
+        }
+        self.clear_overlay();
+        if self.workspace.unhide_window(id).is_ok() {
+            self.save_workspace_state();
+        }
+        cx.notify();
+    }
+
+    fn render_hidden_tile_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let picker = self
+            .hidden_tile_picker_ref()
+            .expect("hidden-tile picker render without overlay");
+        let ov = &self.theme.overlay;
+        let popup_bg: Hsla = nc(ov.bg);
+        let popup_border: Hsla = nc(ov.border);
+        let dim_fg: Hsla = nc(ov.label);
+        let normal_fg: Hsla = nc(ov.fg);
+        let accent: Hsla = nc(ov.accent);
+        let selected_bg: Hsla = nc(ov.selected_bg);
+        let workspace_label = self
+            .workspace
+            .workspaces
+            .get(picker.workspace_index)
+            .map(workspace::Workspace::display_label)
+            .unwrap_or("Workspace")
+            .to_string();
+
+        let header = div()
+            .flex()
+            .flex_col()
+            .gap(px(3.0))
+            .px(px(18.0))
+            .pt(px(15.0))
+            .pb(px(12.0))
+            .border_b_1()
+            .border_color(popup_border)
+            .font_family(self.body_font.clone())
+            .child(
+                div()
+                    .text_size(px(15.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(normal_fg)
+                    .child("Show hidden tile"),
+            )
+            .child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(dim_fg)
+                    .child(SharedString::from(format!(
+                        "Choose a hidden tile in {workspace_label}."
+                    ))),
+            );
+
+        let mut options = div()
+            .id("hidden-tile-picker-options")
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .px(px(8.0))
+            .py(px(8.0))
+            .max_h(px(504.0))
+            .overflow_y_scroll();
+        if picker.targets.is_empty() {
+            options = options.child(probe_bounds(
+                "hidden-tile-picker-empty",
+                div()
+                    .px(px(10.0))
+                    .py(px(16.0))
+                    .font_family(self.code_font.clone())
+                    .text_size(px(12.0))
+                    .text_color(dim_fg)
+                    .child("No hidden tiles in this workspace")
+                    .into_any_element(),
+            ));
+        } else {
+            for (index, id) in picker.targets.iter().copied().enumerate() {
+                let Some(window) = self.workspace.tile(id) else {
+                    continue;
+                };
+                let title = Self::desktop_tile_title(&self.sessions, &window.content, cx);
+                let row = picker_option_row(
+                    SharedString::from(format!("hidden-tile-picker-option-{id}")),
+                    "▣",
+                    &title,
+                    Some(("Hidden", dim_fg)),
+                    index == picker.selected,
+                    accent,
+                    normal_fg,
+                    selected_bg,
+                    &self.body_font,
+                    &self.code_font,
+                )
+                .on_click(cx.listener(move |this, _ev, _w, cx| {
+                    this.commit_hidden_tile_picker(id, cx)
+                }))
+                .on_hover(cx.listener(move |this, hovered: &bool, _w, cx| {
+                    if *hovered
+                        && let Some(picker) = this.hidden_tile_picker_mut()
+                    {
+                        picker.selected = index;
+                        cx.notify();
+                    }
+                }));
+                options = options.child(probe_bounds_dyn(
+                    format!("hidden-tile-picker-row-{index}"),
+                    row.into_any_element(),
+                ));
+            }
+        }
+
+        let footer = div()
+            .flex()
+            .flex_row()
+            .gap(px(16.0))
+            .px(px(18.0))
+            .py(px(9.0))
+            .border_t_1()
+            .border_color(popup_border)
+            .font_family(self.code_font.clone())
+            .text_size(px(10.5))
+            .text_color(dim_fg)
+            .child("↑↓  Navigate")
+            .child("↵  Show")
+            .child("Esc  Cancel");
+
+        let card = div()
+            .occlude()
+            .w(px(560.0))
+            .max_w_full()
+            .bg(popup_bg)
+            .border_2()
+            .border_color(popup_border)
+            .rounded(px(9.0))
+            .shadow_lg()
+            .overflow_hidden()
+            .child(header)
+            .child(options)
+            .child(footer);
+
+        probe_bounds(
+            "hidden-tile-picker",
+            div()
+                .absolute()
+                .top(px(80.0))
+                .left_0()
+                .right_0()
+                .flex()
+                .flex_row()
+                .justify_center()
+                .child(probe_bounds(
+                    "hidden-tile-picker-card",
+                    card.into_any_element(),
+                ))
+                .into_any_element(),
+        )
     }
 
     fn handle_tile_swap_picker_key(
@@ -9202,6 +9502,22 @@ impl Render for YaldaGpuiView {
                 }))
                 .child(screen_view)
                 .child(self.render_workspace_picker(cx))
+                .into_any_element();
+        }
+
+        // `.` → Workspace → Show (`UXI-Workspace-27`). The active-workspace
+        // hidden-tile chooser keeps the underlying screen visible like Cmd-P.
+        if self.overlay_is_hidden_tile_picker() {
+            return div()
+                .track_focus(&self.focus_handle)
+                .key_context("HiddenTilePickerView")
+                .size_full()
+                .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
+                    this.handle_hidden_tile_picker_key(ev, w, cx);
+                    cx.stop_propagation();
+                }))
+                .child(screen_view)
+                .child(self.render_hidden_tile_picker(cx))
                 .into_any_element();
         }
 

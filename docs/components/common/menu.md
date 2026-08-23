@@ -274,16 +274,19 @@ The shell menu (`.`) contains these root entries, in this order: `n` New Tile,
 Restart GUI, `R` Rebuild and Restart All, and `` ` `` System Console. The Layout
 submenu carries the three arrangement modes (`c` columns, `t` tiling, `m`
 monocle) plus the primary-area adjustments; the Workspace submenu holds new /
-rename / close workspace, new project, and back-and-forth. Commands removed from
-these roots are not deleted; tile verbs live on the tile menu, and retired ones
-(plane view, set cwd, also-show) are simply gone.
+rename / close workspace, new project, back-and-forth, and `s` Show hidden tile
+(`UXI-Workspace-27`). Show stays present but is contextually dimmed when focus is
+on a solo-presented hidden or Detached tile rather than inside a workspace.
+Commands removed from these roots are not deleted; tile verbs live on the tile
+menu, and retired ones (plane view, set cwd, also-show) are simply gone.
 
 Buffer and other App-specific tile menus are unchanged until their vocabularies
 are separately specified, except that every tile menu carries the same shared
 tile-menu tail required by UXI-Menu-9.
 
 **Applies to.** `agent_local_menu`, `agent_local_menu_dynamic`, `gpui_menu`,
-`with_tile_commands`, `dispatch_menu_command`, and `open_workspace_picker`
+`with_tile_commands`, `dispatch_menu_command`, `open_workspace_picker`, and
+`open_hidden_tile_picker`
 (`main.rs`).
 
 **Why.** A leader menu is useful only when its choices are predictable enough to
@@ -298,7 +301,8 @@ tile lifecycle with workspace and system operations.
 keys; `tests.rs::shell_layout_submenu_selects_modes` covers the layout submenu;
 `verify_harness.rs::agent_menu_lists_advertised_models_and_marks_current`
 checks the live model submenu; workspace-picker harness tests exercise the real
-bound and unbound send path.
+bound and unbound send path; the `UXI-Workspace-27` guard exercises the Show
+disabled state and hidden-tile picker through the real shell-menu key path.
 
 ### UXI-Menu-9 — the tile menu tail is universal and contextual
 

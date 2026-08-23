@@ -8989,6 +8989,176 @@ fn hidden_tile_navigation_is_solo_until_explicit_unhide(cx: &mut TestAppContext)
     });
 }
 
+/// UXI-Workspace-27: `.` → Workspace → Show is a real active-workspace
+/// operation. It opens even when empty, projects only that workspace's hidden
+/// stable ids, unhides/follows through both keyboard and click activation, and
+/// remains dimmed while focus is on a solo Detached tile.
+#[gpui::test]
+fn workspace_show_picker_unhides_active_hidden_tile_and_disables_outside_workspace(
+    cx: &mut TestAppContext,
+) {
+    use crate::workspace::{AttachedVisibility, SplitDir, TileMembership};
+    use crate::{App, LinearTile};
+
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_browser(cx);
+
+    // The command is available with ordinary workspace focus even when there
+    // are no hidden tiles; the resulting picker paints an explicit empty state.
+    vcx.simulate_keystrokes(".");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        let menu = v.menu_ref().expect("shell menu opened");
+        assert!(!menu.disabled.contains("show-hidden-tiles"));
+    });
+    vcx.simulate_keystrokes("w");
+    vcx.simulate_keystrokes("s");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        let picker = v
+            .hidden_tile_picker_ref()
+            .expect("Show opens the hidden-tile picker");
+        assert_eq!(picker.workspace_index, 0);
+        assert!(picker.targets.is_empty(), "empty means empty, not unavailable");
+    });
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    assert!(
+        crate::layout_probe_get("hidden-tile-picker-card").is_some(),
+        "the Cmd-P-like card paints"
+    );
+    assert!(
+        crate::layout_probe_get("hidden-tile-picker-empty").is_some(),
+        "an active workspace with no hidden tiles paints its empty message"
+    );
+    crate::layout_probe_end();
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+
+    // Hide one named tile in workspace 0 and one in workspace 1. The picker
+    // must capture only workspace 0's target even though both are live.
+    let (hidden_here, hidden_elsewhere, visible_here) = view.update(vcx, |v, _| {
+        let visible_here = v.workspace.focused_window_id().unwrap();
+        let mut local = LinearTile::new();
+        local.title = "Active hidden".into();
+        let hidden_here = v
+            .workspace
+            .split_focused(SplitDir::V, App::Linear(local))
+            .unwrap();
+        v.workspace.hide_window(hidden_here).unwrap();
+
+        let mut foreign_visible = LinearTile::new();
+        foreign_visible.title = "Other visible".into();
+        v.workspace
+            .push_workspace_inheriting(App::Linear(foreign_visible));
+        let mut foreign_hidden = LinearTile::new();
+        foreign_hidden.title = "Other hidden".into();
+        let hidden_elsewhere = v
+            .workspace
+            .split_focused(SplitDir::V, App::Linear(foreign_hidden))
+            .unwrap();
+        v.workspace.hide_window(hidden_elsewhere).unwrap();
+
+        v.workspace.set_active_workspace(0);
+        v.workspace.workspaces[0].focused = visible_here;
+        (hidden_here, hidden_elsewhere, visible_here)
+    });
+
+    vcx.simulate_keystrokes(".");
+    vcx.simulate_keystrokes("w");
+    vcx.simulate_keystrokes("s");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert_eq!(
+            v.hidden_tile_picker_ref().unwrap().targets,
+            vec![hidden_here],
+            "Show lists only hidden tiles owned by the active workspace"
+        );
+        assert!(matches!(
+            v.workspace.tile_membership(hidden_elsewhere),
+            Some(TileMembership::Attached {
+                workspace: 1,
+                visibility: AttachedVisibility::Hidden,
+            })
+        ));
+    });
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert!(!v.overlay_is_hidden_tile_picker());
+        assert_eq!(v.workspace.active_workspace, 0);
+        assert_eq!(v.workspace.focused_window_id(), Some(hidden_here));
+        assert_eq!(
+            v.workspace.tile_membership(hidden_here),
+            Some(TileMembership::Attached {
+                workspace: 0,
+                visibility: AttachedVisibility::Visible,
+            })
+        );
+    });
+
+    // Re-hide and activate the same stable row through its real painted click
+    // target, proving mouse and keyboard dispatch converge.
+    view.update(vcx, |v, _| v.workspace.hide_window(hidden_here).unwrap());
+    vcx.simulate_keystrokes(".");
+    vcx.simulate_keystrokes("w");
+    vcx.simulate_keystrokes("s");
+    vcx.run_until_parked();
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let row = crate::layout_probe_get("hidden-tile-picker-row-0")
+        .expect("hidden tile row paints a click target");
+    crate::layout_probe_end();
+    let at = point(px(row.0 + row.2 / 2.0), px(row.1 + row.3 / 2.0));
+    vcx.simulate_mouse_move(at, None, gpui::Modifiers::default());
+    vcx.simulate_click(at, gpui::Modifiers::default());
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert_eq!(v.workspace.focused_window_id(), Some(hidden_here));
+        assert!(matches!(
+            v.workspace.tile_membership(hidden_here),
+            Some(TileMembership::Attached {
+                visibility: AttachedVisibility::Visible,
+                ..
+            })
+        ));
+    });
+
+    // Solo Detached focus is explicitly outside a workspace. Show is still
+    // discoverable but dimmed, and pressing `s` cannot replace the menu.
+    view.update(vcx, |v, _| {
+        assert!(v.workspace.focus_tile(visible_here));
+        v.workspace.detach_window(visible_here).unwrap();
+    });
+    vcx.simulate_keystrokes(".");
+    vcx.simulate_keystrokes("w");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert!(v
+            .menu_ref()
+            .expect("shell menu over Detached tile")
+            .disabled
+            .contains("show-hidden-tiles"));
+    });
+    vcx.simulate_keystrokes("s");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert!(v.overlay_is_menu(), "disabled Show keeps the menu open");
+        assert!(!v.overlay_is_hidden_tile_picker());
+        assert_eq!(
+            v.workspace.focused_window_id(),
+            Some(visible_here),
+            "disabled Show cannot move focus away from the Detached tile"
+        );
+        assert_eq!(
+            v.workspace.tile_membership(visible_here),
+            Some(TileMembership::Detached)
+        );
+    });
+}
+
 /// UXI-Menu-9: Hide and Unhide are the shared suffix of the real tile menu,
 /// and applicability follows the focused tile's typed membership. A disabled
 /// key is inert: it neither invokes the command nor closes the menu.
@@ -25685,6 +25855,77 @@ fn cog_events_pane_paints_and_focus_cycles(cx: &mut TestAppContext) {
     assert!(
         cv.update(vcx, |c, _| c.focused_selector()),
         "tab → selector"
+    );
+}
+
+/// UXI-Cog-12: the `cog-toggle-events` tile menu command hides/shows the live
+/// events strip. Drives the REAL menu dispatch path (`dispatch_menu_command`),
+/// and asserts on PAINT (the `cog-events` strip disappears from / reappears in
+/// the layout), not just state. Hiding while the strip has focus moves focus off
+/// it. Negative control: gate the strip render on `in_graph()` instead of
+/// `events_pane_visible()` and this goes RED (the strip keeps painting when
+/// hidden).
+#[gpui::test]
+fn cog_toggle_events_hides_and_shows_strip(cx: &mut TestAppContext) {
+    use crate::{KMods, Key, KeyPress};
+    let tab = || KeyPress::new(Key::Tab, KMods::NONE);
+
+    let (view, vcx, cv, wid) = boot_with_cog(cx);
+
+    // Load a graph so the strip exists — probe the paint of the resulting frame.
+    let req = cog_tile_req(&view, vcx);
+    crate::layout_probe_begin();
+    view.update(vcx, |v, cx| {
+        v.cog_apply(
+            wid,
+            req,
+            Ok(crate::CogFetch::Graph(Box::new(cog_test_bundle(vec![
+                cog_test_node("n1", "only", "done", serde_json::json!({"purpose": "a"})),
+            ])))),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    let shown = crate::layout_probe_get("cog-events");
+    crate::layout_probe_end();
+
+    // Strip visible + painting to start.
+    assert!(
+        cv.update(vcx, |c, _| c.events_pane_visible()),
+        "strip visible in a loaded graph"
+    );
+    let (_, _, w, h) = shown.expect("events strip paints before hide");
+    assert!(w > 0.0 && h > 0.0, "strip has real size ({w}x{h})");
+
+    // Move focus to the strip, then hide via the REAL menu command.
+    view.update(vcx, |v, cx| v.handle_cog_press(tab(), cx)); // → detail
+    view.update(vcx, |v, cx| v.handle_cog_press(tab(), cx)); // → events
+    vcx.run_until_parked();
+    assert!(cv.update(vcx, |c, _| c.focused_events()), "focus on strip");
+
+    crate::layout_probe_begin();
+    view.update(vcx, |v, cx| v.dispatch_menu_command("cog-toggle-events", cx));
+    vcx.run_until_parked();
+    let hidden = crate::layout_probe_get("cog-events");
+    crate::layout_probe_end();
+    assert!(hidden.is_none(), "strip does NOT paint after hide");
+    assert!(cv.update(vcx, |c, _| c.events_hidden()), "state marked hidden");
+    assert!(
+        !cv.update(vcx, |c, _| c.focused_events()),
+        "focus left the hidden strip"
+    );
+
+    // Toggle again → strip reappears and paints.
+    crate::layout_probe_begin();
+    view.update(vcx, |v, cx| v.dispatch_menu_command("cog-toggle-events", cx));
+    vcx.run_until_parked();
+    let reshown = crate::layout_probe_get("cog-events");
+    crate::layout_probe_end();
+    let (_, _, w2, h2) = reshown.expect("events strip paints again after show");
+    assert!(w2 > 0.0 && h2 > 0.0, "strip real size again ({w2}x{h2})");
+    assert!(
+        !cv.update(vcx, |c, _| c.events_hidden()),
+        "state marked shown"
     );
 }
 

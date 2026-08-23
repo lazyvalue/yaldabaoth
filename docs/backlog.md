@@ -13,6 +13,15 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Hide the Cog live-events strip from the tile menu** — `NEEDS-RUNTIME`
+  (2026-08-22 via `/new-ux`; `UXI-Cog-12`; on `main`). Captured verbatim: *"Want
+  to be able to hide the live event stream pane of the cog tile. Should be a tile
+  menu command."* Shipped: `cog-toggle-events` (menu key `e`, "hide/show live
+  events") flips `CogView.events_hidden`; the strip stops rendering, `Tab` skips
+  it, focus leaves it on hide; sticky per tile, defaults shown, in-memory only.
+  Guard: `cog_toggle_events_hides_and_shows_strip` (layout-probe, NC RED). Runtime
+  check: menu entry + strip paints/vanishes in the live app.
+
 - **Jump-panel workspace color = session state** — `NEEDS-RUNTIME` (2026-08-21
   via `/new-ux`; `UXI-JumpPanel-31` new, `UXI-JumpPanel-30` amended). Shipped: a
   workspace folder's identity color is state-driven — **red** (`jump_header`) if

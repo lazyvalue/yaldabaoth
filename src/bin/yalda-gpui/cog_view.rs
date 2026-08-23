@@ -67,6 +67,10 @@ pub(crate) struct CogView {
     /// Collapsed JSON tree paths (folded rows). Keyed by a stable path id
     /// (`surface/key/idx…`); absent = expanded. Cleared on graph change.
     collapsed: std::collections::HashSet<String>,
+    /// Whether the live-events strip is hidden (tile menu toggle). Sticky across
+    /// graph changes — a tile preference, not per-graph state (so `set_state`
+    /// does not reset it). Default `false` (shown).
+    events_hidden: bool,
     root: WeakEntity<YaldaGpuiView>,
     perf_label: &'static str,
 }
@@ -93,6 +97,7 @@ impl CogView {
             graph_filter: String::new(),
             filtering: false,
             collapsed: std::collections::HashSet::new(),
+            events_hidden: false,
             root,
             perf_label: "cog",
         }
@@ -245,9 +250,33 @@ impl CogView {
         self.focus == CogFocus::Detail
     }
 
-    /// Is the live-events (right) pane focused? Only ever true in a loaded graph.
+    /// Is the live-events (right) pane focused? Only ever true when the strip is
+    /// actually visible (a loaded graph, and not hidden by the tile toggle).
     pub(crate) fn focused_events(&self) -> bool {
-        self.focus == CogFocus::Events && self.in_graph()
+        self.focus == CogFocus::Events && self.events_pane_visible()
+    }
+
+    /// Whether the live-events strip is currently on screen: a loaded graph AND
+    /// not hidden by the tile menu toggle. The single gate for rendering the
+    /// strip and for routing focus/scroll to it.
+    pub(crate) fn events_pane_visible(&self) -> bool {
+        self.in_graph() && !self.events_hidden
+    }
+
+    /// Whether the live-events strip is hidden by the tile toggle (test accessor).
+    pub(crate) fn events_hidden(&self) -> bool {
+        self.events_hidden
+    }
+
+    /// Toggle the live-events strip hidden/shown (the `cog-toggle-events` tile
+    /// menu command). When hiding while the strip has keyboard focus, move focus
+    /// back to the detail pane so `j`/`k` never drive an off-screen pane.
+    pub(crate) fn toggle_events(&mut self, cx: &mut Context<Self>) {
+        self.events_hidden = !self.events_hidden;
+        if self.events_hidden && self.focus == CogFocus::Events {
+            self.focus = CogFocus::Detail;
+        }
+        cx.notify();
     }
 
     /// Move keyboard focus to the detail pane.
@@ -260,19 +289,20 @@ impl CogView {
         self.focus = CogFocus::Selector;
     }
 
-    /// Move keyboard focus to the live-events pane (no-op outside a graph).
+    /// Move keyboard focus to the live-events pane (no-op when the strip is not
+    /// visible — outside a graph, or hidden by the tile toggle).
     pub(crate) fn focus_events(&mut self) {
-        if self.in_graph() {
+        if self.events_pane_visible() {
             self.focus = CogFocus::Events;
         }
     }
 
-    /// Cycle focus Selector → Detail → Events → Selector (Events only in a
-    /// graph). Bound to Tab.
+    /// Cycle focus Selector → Detail → Events → Selector (Events only when the
+    /// strip is visible). Bound to Tab.
     pub(crate) fn toggle_focus(&mut self) {
         self.focus = match self.focus {
             CogFocus::Selector => CogFocus::Detail,
-            CogFocus::Detail if self.in_graph() => CogFocus::Events,
+            CogFocus::Detail if self.events_pane_visible() => CogFocus::Events,
             CogFocus::Detail => CogFocus::Selector,
             CogFocus::Events => CogFocus::Selector,
         };
@@ -567,7 +597,7 @@ impl Render for CogView {
             .bg(editor_bg)
             .text_color(st.fg)
             .child(top);
-        if self.in_graph() {
+        if self.events_pane_visible() {
             col = col.child(self.events_pane(&st, border, self.focused_events(), cx));
         }
         col.into_any_element()

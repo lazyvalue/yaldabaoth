@@ -3381,6 +3381,7 @@ fn gpui_menu_has_required_entries() {
         "close-workspace",
         "new-project",
         "workspace-back-and-forth",
+        "show-hidden-tiles",
         // flattened system/dev
         "dev-restart-gui",
         "dev-restart-all",
@@ -3661,6 +3662,18 @@ fn shell_menu_close_tile_at_root_close_workspace_under_w() {
         ws.process_key(KeyPress::new(Key::Char('x'), KMods::NONE), &menu),
         Some("close-workspace".to_string()),
         "w x closes the workspace"
+    );
+
+    let mut show = MenuState::new();
+    show.open();
+    assert_eq!(
+        show.process_key(KeyPress::new(Key::Char('w'), KMods::NONE), &menu),
+        None,
+    );
+    assert_eq!(
+        show.process_key(KeyPress::new(Key::Char('s'), KMods::NONE), &menu),
+        Some("show-hidden-tiles".to_string()),
+        "w s opens the active workspace hidden-tile picker"
     );
 }
 

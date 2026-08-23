@@ -177,7 +177,8 @@ reloads in place (coalesced: one reload in flight + one queued) so the node list
 detail / stats track the change — and the **events feed persists across that refresh**
 (and manual `r`); only a graph change clears it. Keyboard focus reaches the strip via
 `Tab` (Selector → Detail → Events → Selector); `j`/`k`/`d`/`u`/PageUp/Down scroll the
-focused pane; clicking it focuses it. The strip exists only in a loaded graph.
+focused pane; clicking it focuses it. The strip exists only in a loaded graph, and
+can be hidden from the tile menu (UXI-Cog-12).
 
 **Applies to.** `CogView::events` / `push_event` / `events_pane` / `event_card` /
 `scroll_events` / `focus_events` / `toggle_focus`, `CogFocus::Events` (`cog_view.rs`);
@@ -305,6 +306,36 @@ none selected, `Esc` restores — negative-control verified RED by disabling the
   flex-sized ancestor (columns workspace arrangement) from collapsing the detail
   pane to ~1 char (`cog_detail_pane_fills_width`); the exact columns-mode repro is a
   runtime confirm (couldn't be reproduced at the harness window size).
+
+### UXI-Cog-12 — The live-events strip can be hidden from the tile menu
+
+**Statement.** The Cog tile menu has a **hide/show live events** command
+(`cog-toggle-events`, key `e`) that toggles the live-events strip (UXI-Cog-6)
+off/on. When hidden, the strip does not render — the top selector/detail row fills
+the tile — and keyboard focus never rests on it (`Tab` skips Events; hiding while
+the strip has focus moves focus to the detail pane). The toggle is a per-tile
+preference: it is sticky across graph changes (not reset by `set_state`) and
+defaults to shown. It is in-memory only (not persisted across restart).
+
+**Applies to.** `CogView::{events_hidden, events_pane_visible, toggle_events,
+focus_events, toggle_focus, focused_events}`, the render gate in `CogView::render`
+(`cog_view.rs`); `YaldaGpuiView::cog_toggle_events` (`cog_ui.rs`); the
+`cog_local_menu` entry + the `"cog-toggle-events"` arm of `dispatch_menu_command`
+(`main.rs`).
+
+**Why.** The `/new-ux` request: "Want to be able to hide the live event stream pane
+of the cog tile. Should be a tile menu command." The strip is a tall bottom panel;
+when reviewing a graph structure it can be unwanted screen real estate.
+
+**Status.** implemented
+
+**Enforcement.** `verify_harness.rs::cog_toggle_events_hides_and_shows_strip`
+(drives the REAL `dispatch_menu_command("cog-toggle-events")`: the `cog-events`
+strip paints, disappears from the layout after hide, and reappears after a second
+toggle — layout-probe, non-vacuous real-size assert; also asserts focus leaves the
+hidden strip — negative-control verified RED by gating the render on `in_graph()`
+instead of `events_pane_visible()`). The live watch subprocess is unaffected
+(runtime gap #2 per UXI-Cog-6).
 
 ### UXI-Cog-11 — JSON renders as a foldable tree-table
 
