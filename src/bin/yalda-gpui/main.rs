@@ -1721,6 +1721,8 @@ fn gpui_menu() -> Vec<MenuNode> {
                 MenuNode::entry("N", "decrease primary count", "primary-count-decrease"),
             ],
         ),
+        MenuNode::entry("N", "new workspace", "new-workspace"),
+        MenuNode::entry("r", "rename workspace", "rename-workspace"),
         // Workspace + project ops. The root stays learnably small; tile-scoped
         // verbs (close, send, hide/unhide, detach) now live on the `<space>` tile
         // menu instead.
@@ -1728,16 +1730,19 @@ fn gpui_menu() -> Vec<MenuNode> {
             "w",
             "workspace",
             vec![
-                MenuNode::entry("n", "new workspace", "new-workspace"),
-                MenuNode::entry("r", "rename workspace", "rename-workspace"),
                 MenuNode::entry("x", "close workspace", "close-workspace"),
                 MenuNode::entry("p", "new project", "new-project"),
                 MenuNode::entry("b", "back and forth", "workspace-back-and-forth"),
+                MenuNode::submenu(
+                    "s",
+                    "system",
+                    vec![
+                        MenuNode::entry("r", "rebuild and restart gui", "dev-restart-gui"),
+                        MenuNode::entry("R", "rebuild and restart all", "dev-restart-all"),
+                    ],
+                ),
             ],
         ),
-        // System / dev — flattened up from the former `s` submenu to the root.
-        MenuNode::entry("r", "rebuild and restart gui", "dev-restart-gui"),
-        MenuNode::entry("R", "rebuild and restart all", "dev-restart-all"),
         MenuNode::entry("`", "system console", "open-system-console"),
     ]
 }

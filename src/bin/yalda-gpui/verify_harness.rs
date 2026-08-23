@@ -8115,8 +8115,8 @@ fn focused_in_insert_mode_tracks_compose_not_transcript(cx: &mut TestAppContext)
 
 /// ADR-0032 (UXI-Menu-6): the numbered workspace list is NO LONGER a menu entry
 /// — it must work while typing, so it lives on the `ctrl-1..0` direct chords, not
-/// a leader menu. The `.` shell menu keeps the workspace *ops* (`new`/`rename`)
-/// under its `w` submenu, and the `goto-workspace-N` DISPATCH still switches the
+/// a leader menu. The `.` shell menu keeps workspace New/Rename as direct root
+/// commands, and the `goto-workspace-N` DISPATCH still switches the
 /// active workspace when invoked directly.
 #[gpui::test]
 fn shell_menu_offers_workspace_ops_and_goto_still_switches(cx: &mut TestAppContext) {
@@ -8139,8 +8139,8 @@ fn shell_menu_offers_workspace_ops_and_goto_still_switches(cx: &mut TestAppConte
             .push_workspace_inheriting(crate::App::Linear(crate::LinearTile::new()));
     });
 
-    // The shell menu carries the workspace OPS (under `w`), but NOT the numbered
-    // goto list (that is ctrl-1..0, a direct chord — UXI-Menu-6).
+    // The shell menu carries the workspace ops, but NOT the numbered goto list
+    // (that is ctrl-1..0, a direct chord — UXI-Menu-6).
     let cmds = shell_menu_commands();
     for expect in ["rename-workspace", "new-workspace"] {
         assert!(
