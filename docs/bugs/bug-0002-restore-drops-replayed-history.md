@@ -95,3 +95,32 @@ against the legacy stream.
   so a human runtime confirm — crash/respawn a session on its first turn, restart
   the GUI, verify the history is fully restored — is still worth doing before
   closing the loop, but the drop is reproduced + fixed on the code the pump runs.
+
+### 2026-08-22 20:40 — recurrence: eager rebaseline erased fenced resume history
+
+- Recurrence: after release activation, restarting the GUI restored all 30 tile
+  identities but left their transcript windows empty. The production
+  `integration meta planner` WAL proved the server data was intact: its tail was
+  `ChannelOpened(gen 3) → SessionAttached → ReplayEnd → ReplayComplete → model
+  metadata`, with 37,509 resident events and 158 settled turns.
+- Corrected root cause: the 2026-07-15 fix assumed a newer channel would replay
+  replacement content after `ChannelOpened`. The server replay fence intentionally
+  suppresses that duplicate ACP history because the WAL is already authoritative.
+  Eager `reset_for_replay` therefore erased the WAL prefix and had nothing with
+  which to rebuild it.
+- Fix: `AgentState::begin_server_generation` resets only generation-scoped turn,
+  reconciliation, finalization, and stream-gate state. It preserves the editor,
+  tool cards, plans, usage, and render state. Explicit socket reconnect remains
+  responsible for the one correct full clear immediately before re-attaching and
+  replaying the WAL.
+- Guard: `restore_keeps_durable_history_when_resume_duplicates_are_fenced`
+  drives the exact production sequence, asserts durable history survives, then
+  sends canonical + legacy live output and proves it renders once.
+- Negative control: with the old `reset_for_replay` generation branch intact,
+  the guard failed with an empty transcript (`got:` followed by a blank buffer).
+- Verification: focused restore/generation/`/clear` tests passed; full
+  `cargo test --bin yalda-gpui` passed **691 tests, 2 ignored**. Release GUI
+  activation restored 30 `BOUND+resume` leaves; read-only admin status showed
+  30/30 live sessions connected and subscribed, including `integration meta
+  planner` with `event_log_len=37509`, generation 3, subscriber count 1.
+- Commits: repair `f0e34e4`; main merge `8d39a01`. Cog graph `od4`.
