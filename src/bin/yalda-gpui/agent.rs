@@ -4140,9 +4140,11 @@ impl AgentState {
             focused_subagent: None,
             subagent_transcripts: std::collections::HashMap::new(),
             tasklist_open: false,
-            // Subagent panes auto-appear at the tile bottom when subagents exist;
-            // Cmd-2 (ToggleSubagents) collapses them.
-            subagents_open: true,
+            // Both sidepanes are HIDDEN until the user summons them (UXI-AgentTile-20):
+            // Cmd-2 (ToggleSubagents) opens Subagents, Cmd-1 (ToggleTasklist) opens Plan.
+            // The panel is no longer content-driven — a new subagent/plan entry does not
+            // pop it open.
+            subagents_open: false,
             sidepanel_hidden: false,
             close_confirm_armed: false,
             drag_protect_line: None,
@@ -4224,9 +4226,11 @@ impl AgentState {
             focused_subagent: None,
             subagent_transcripts: std::collections::HashMap::new(),
             tasklist_open: false,
-            // Subagent panes auto-appear at the tile bottom when subagents exist;
-            // Cmd-2 (ToggleSubagents) collapses them.
-            subagents_open: true,
+            // Both sidepanes are HIDDEN until the user summons them (UXI-AgentTile-20):
+            // Cmd-2 (ToggleSubagents) opens Subagents, Cmd-1 (ToggleTasklist) opens Plan.
+            // The panel is no longer content-driven — a new subagent/plan entry does not
+            // pop it open.
+            subagents_open: false,
             sidepanel_hidden: false,
             close_confirm_armed: false,
             drag_protect_line: None,

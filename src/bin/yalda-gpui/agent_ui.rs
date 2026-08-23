@@ -4622,6 +4622,18 @@ impl YaldaGpuiView {
                 // Entering panel focus un-hides a force-hidden sidepanel
                 // (UXI-AgentTile-20: Cmd-0 is never a dead end).
                 c.sidepanel_hidden = false;
+                // Summon-only (UXI-AgentTile-20): the sidepanes default hidden and
+                // Cmd-0 is itself a summon. If nothing is currently open, open the
+                // segments that actually HAVE content so the panel can be focused
+                // instead of dead-ending on the "nothing open" hint.
+                if c.panel_open_columns().is_empty() {
+                    if c.current_plan.as_ref().is_some_and(|p| !p.entries.is_empty()) {
+                        c.tasklist_open = true;
+                    }
+                    if !c.subagents().is_empty() {
+                        c.subagents_open = true;
+                    }
+                }
                 let cols = c.panel_open_columns();
                 if cols.is_empty() {
                     c.status = Some("no panel to focus — open Plan/Subagents".into());
