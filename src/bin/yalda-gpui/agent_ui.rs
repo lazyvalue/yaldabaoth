@@ -2429,6 +2429,7 @@ impl YaldaGpuiView {
             agent_mode: None,
             agent_model: None,
             available_models: Vec::new(),
+            available_commands: Vec::new(),
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             usage: None,
             focused_subagent: None,
@@ -3670,6 +3671,13 @@ impl YaldaGpuiView {
                     claude.agent_model = Some(current);
                     claude.available_models = options;
                 }
+                ReplyEvent::AvailableCommands(commands) => {
+                    // Full snapshot of the agent's advertised slash commands
+                    // (UXI-AgentTile-42). Replaces the previous list; the
+                    // autocomplete popup merges local commands via
+                    // `slash_commands()`.
+                    claude.available_commands = commands;
+                }
                 ReplyEvent::UsageUpdated(snap) => {
                     claude.usage = Some(snap);
                 }
@@ -3885,6 +3893,12 @@ impl YaldaGpuiView {
             AgentEventKind::ModelsAvailable { current, options } => {
                 claude.agent_model = Some(current.clone());
                 claude.available_models = options.clone();
+                AgentEventEffect::None
+            }
+            AgentEventKind::AvailableCommands { commands } => {
+                // Full snapshot of the agent's advertised slash commands
+                // (UXI-AgentTile-42) — drives the compose autocomplete popup.
+                claude.available_commands = commands.clone();
                 AgentEventEffect::None
             }
             AgentEventKind::UsageUpdated(snap) => {

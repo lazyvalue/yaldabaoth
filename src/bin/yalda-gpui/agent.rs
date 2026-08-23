@@ -2345,6 +2345,7 @@ impl SubAgentTranscript {
                 | ReplyEvent::ModeChanged(_)
                 | ReplyEvent::ModelChanged(_)
                 | ReplyEvent::ModelsAvailable { .. }
+                | ReplyEvent::AvailableCommands(_)
                 | ReplyEvent::UsageUpdated(_)
                 | ReplyEvent::Notice(_)
                 | ReplyEvent::ReplayComplete
@@ -3706,6 +3707,11 @@ pub(crate) struct AgentState {
     /// Empty until the first `ModelsAvailable` reply lands. Drives the model
     /// switcher; the current selection is `agent_model`.
     pub(crate) available_models: Vec<yalda::acp_channel::ModelOption>,
+    /// The agent's advertised slash commands (ACP `AvailableCommandsUpdate`, a
+    /// full snapshot). Empty until the first `AvailableCommands` reply lands.
+    /// Drives the compose slash-command autocomplete popup (UXI-AgentTile-42);
+    /// `slash_commands()` merges in the local commands (`/clear`).
+    pub(crate) available_commands: Vec<yalda::acp_channel::AgentCommand>,
     /// The session's permission mode, as session state sourced from the
     /// server. In session-server mode the agent/channel live in the server
     /// (not the GUI), so `channel` is `None` and the live `AcpChannelClient`
@@ -4080,6 +4086,29 @@ impl AgentState {
         self.history_nav = None;
     }
 
+    /// Local (yalda-handled) slash commands, always available regardless of the
+    /// agent's advertised list (UXI-AgentTile-42). `/clear` mints a fresh
+    /// server session (`clear_agent_session`).
+    pub(crate) fn local_slash_commands() -> Vec<yalda::acp_channel::AgentCommand> {
+        vec![yalda::acp_channel::AgentCommand {
+            name: "clear".into(),
+            description: "Clear the conversation and start a fresh session".into(),
+        }]
+    }
+
+    /// The full slash-command list for the compose autocomplete popup
+    /// (UXI-AgentTile-42): the local commands (`/clear`) followed by the agent's
+    /// advertised `available_commands`, de-duplicated by name (local wins).
+    pub(crate) fn slash_commands(&self) -> Vec<yalda::acp_channel::AgentCommand> {
+        let mut out = Self::local_slash_commands();
+        for c in &self.available_commands {
+            if !out.iter().any(|e| e.name == c.name) {
+                out.push(c.clone());
+            }
+        }
+        out
+    }
+
     /// Re-seat panel focus after a panel open/close (UXI-AgentTile-3). If the active
     /// column is no longer focusable, hop to another open column; if none
     /// remain, leave panel focus (restoring the captured focus). No-op unless
@@ -4239,6 +4268,7 @@ impl AgentState {
             agent_mode: None,
             agent_model: None,
             available_models: Vec::new(),
+            available_commands: Vec::new(),
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             usage: None,
             focused_subagent: None,
@@ -4327,6 +4357,7 @@ impl AgentState {
             agent_mode: None,
             agent_model: None,
             available_models: Vec::new(),
+            available_commands: Vec::new(),
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             usage: None,
             focused_subagent: None,

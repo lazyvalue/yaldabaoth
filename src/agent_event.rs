@@ -57,7 +57,8 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::acp_channel::{
-    ModelOption, Plan, ReplyEvent, SessionModeId, ToolCall, ToolCallUpdate, UsageSnapshot,
+    AgentCommand, ModelOption, Plan, ReplyEvent, SessionModeId, ToolCall, ToolCallUpdate,
+    UsageSnapshot,
 };
 use crate::session_proto::ServerSessionId;
 
@@ -185,6 +186,13 @@ pub enum AgentEventKind {
         current: String,
         options: Vec<ModelOption>,
     },
+    /// The agent's advertised slash-command list, mirrored from
+    /// [`ReplyEvent::AvailableCommands`]. Rides the canonical AgentEvent stream
+    /// (not just the legacy ReplyEvent) so a re-advertised command list still
+    /// reaches the GUI after the session becomes `agent_stream_authoritative`.
+    AvailableCommands {
+        commands: Vec<AgentCommand>,
+    },
     UsageUpdated(UsageSnapshot),
     /// Transient status ONLY (spec §1) — terminal failure is `TurnEnded`.
     Notice {
@@ -269,6 +277,9 @@ enum KnownKind {
         current: String,
         options: Vec<ModelOption>,
     },
+    AvailableCommands {
+        commands: Vec<AgentCommand>,
+    },
     UsageUpdated(UsageSnapshot),
     // `kind` is the internal enum tag, so the Notice severity rides the wire as
     // `level` to avoid colliding with it.
@@ -313,6 +324,9 @@ impl AgentEventKind {
                 current: current.clone(),
                 options: options.clone(),
             },
+            AgentEventKind::AvailableCommands { commands } => KnownKind::AvailableCommands {
+                commands: commands.clone(),
+            },
             AgentEventKind::UsageUpdated(s) => KnownKind::UsageUpdated(s.clone()),
             AgentEventKind::Notice { kind, msg } => KnownKind::Notice {
                 kind: *kind,
@@ -346,6 +360,9 @@ impl AgentEventKind {
             KnownKind::ModelChanged { model } => AgentEventKind::ModelChanged(model),
             KnownKind::ModelsAvailable { current, options } => {
                 AgentEventKind::ModelsAvailable { current, options }
+            }
+            KnownKind::AvailableCommands { commands } => {
+                AgentEventKind::AvailableCommands { commands }
             }
             KnownKind::UsageUpdated(s) => AgentEventKind::UsageUpdated(s),
             KnownKind::Notice { kind, msg } => AgentEventKind::Notice { kind, msg },
@@ -538,6 +555,9 @@ pub fn agent_kind_from_reply(reply: &ReplyEvent) -> Option<AgentEventKind> {
         ReplyEvent::ModelsAvailable { current, options } => AgentEventKind::ModelsAvailable {
             current: current.clone(),
             options: options.clone(),
+        },
+        ReplyEvent::AvailableCommands(commands) => AgentEventKind::AvailableCommands {
+            commands: commands.clone(),
         },
         ReplyEvent::UsageUpdated(s) => AgentEventKind::UsageUpdated(s.clone()),
         ReplyEvent::Notice(msg) => AgentEventKind::Notice {

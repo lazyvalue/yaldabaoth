@@ -18406,6 +18406,64 @@ fn subagent_panes_paint_right_of_compose(cx: &mut TestAppContext) {
     );
 }
 
+/// UXI-AgentTile-42 (n3a): the agent's advertised slash commands
+/// (`AvailableCommandsUpdate`, previously a parked no-op) reach the session model
+/// through the REAL reducer (`apply_server_batch` → `apply_reply_events`), and
+/// `slash_commands()` merges the local `/clear` (deduping the agent's own).
+///
+/// Negative control: revert the `claude.available_commands = commands` reducer arm
+/// → `available_commands` stays empty and the `["compact","clear"]` assert fails.
+#[gpui::test]
+fn available_commands_reach_model_and_merge_local_clear(cx: &mut TestAppContext) {
+    use yalda::acp_channel::{AgentCommand, ReplyEvent};
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let (view, vcx) = boot_browser(cx);
+    install_agent_slot(&view, &mut *vcx, Some("S1"));
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![ServerNotification::ReplyEvent {
+                session_id: "S1".into(),
+                event: ReplyEvent::AvailableCommands(vec![
+                    AgentCommand {
+                        name: "compact".into(),
+                        description: "Compact the conversation".into(),
+                    },
+                    AgentCommand {
+                        name: "clear".into(),
+                        description: "agent-provided clear".into(),
+                    },
+                ]),
+            }],
+            cx,
+        );
+    });
+
+    let (stored, merged) = view
+        .read_with(vcx, |v, cx| {
+            v.agent_read(cx, |c| (c.available_commands.clone(), c.slash_commands()))
+        })
+        .expect("agent");
+
+    // The agent list lands on the model verbatim (was dropped before promotion).
+    assert_eq!(
+        stored.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        vec!["compact", "clear"],
+        "agent commands reach the model"
+    );
+    // slash_commands() prepends the local /clear and drops the agent's duplicate.
+    let names: Vec<&str> = merged.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["clear", "compact"],
+        "local /clear first, agent's own 'clear' deduped"
+    );
+    assert_eq!(
+        merged[0].description, "Clear the conversation and start a fresh session",
+        "the local /clear description wins over the agent's",
+    );
+}
+
 /// UXI-AgentTile-41: shell-style Up/Down message-history recall in the compose.
 /// Drives the REAL `handle_claude_key` Up/Down over a chatbox compose that has a
 /// seeded sent-message ring plus a partial UNSENT draft: Up walks back through

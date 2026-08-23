@@ -327,6 +327,17 @@ pub struct ModelOption {
     pub label: String,
 }
 
+/// One agent-advertised slash command (from ACP `AvailableCommand`), reduced to
+/// the fields the compose autocomplete popup needs. Serializable because it
+/// rides `ReplyEvent::AvailableCommands` across the session-server boundary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AgentCommand {
+    /// Command name WITHOUT the leading slash (e.g. `compact`, `create_plan`).
+    pub name: String,
+    /// Human-readable description of what the command does.
+    pub description: String,
+}
+
 /// Events drained by the App from the ACP worker. Replaces the previous
 /// "stream of text chunks" channel so we can also report tool-call
 /// activity (announcements + status/output updates) in chronological
@@ -337,6 +348,12 @@ pub enum ReplyEvent {
     /// Streamed text from `AgentMessageChunk`. Splice into the *claude*
     /// buffer the same way as before.
     Chunk(String),
+    /// The agent's advertised slash-command list (`AvailableCommandsUpdate`).
+    /// A full snapshot (not a delta). Recorded on the session model
+    /// (`AgentState::available_commands`) and consumed by the compose
+    /// slash-command autocomplete popup (UXI-AgentTile-42). No transcript /
+    /// AgentEvent mapping — it replays harmlessly on reconnect.
+    AvailableCommands(Vec<AgentCommand>),
     /// New tool call announced by the agent. The App stores it keyed by
     /// `tool_call_id`; later `ToolCallUpdated` events merge into the same
     /// entry.
@@ -2424,13 +2441,28 @@ async fn worker_async(
                             let _ = event_tx_for_handlers.send(WorkerEvent::Reply(ev));
                         }
                     }
+                    // The agent advertises (or re-advertises) its slash-command
+                    // list. Forward it as a full snapshot for the compose
+                    // autocomplete popup (UXI-AgentTile-42), dropping the ACP
+                    // `input`/`_meta` the popup doesn't use.
+                    SessionUpdate::AvailableCommandsUpdate(upd) => {
+                        let cmds = upd
+                            .available_commands
+                            .iter()
+                            .map(|c| AgentCommand {
+                                name: c.name.clone(),
+                                description: c.description.clone(),
+                            })
+                            .collect();
+                        let _ = event_tx_for_handlers
+                            .send(WorkerEvent::Reply(ReplyEvent::AvailableCommands(cmds)));
+                    }
                     // Parked: explicit no-op arms — promotion is a one-arm
                     // change. AgentMessageChunk's and UserMessageChunk's
                     // non-text content variants (images, etc.) fall through to
                     // the catchall below.
                     SessionUpdate::AgentMessageChunk(_)
                     | SessionUpdate::AgentThoughtChunk(_)
-                    | SessionUpdate::AvailableCommandsUpdate(_)
                     | SessionUpdate::SessionInfoUpdate(_) => {}
                     // Future variants added by upstream — drop them rather
                     // than failing to compile, since the enum is
