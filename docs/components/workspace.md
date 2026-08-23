@@ -1342,7 +1342,7 @@ membership change).
 
 ### UXI-Workspace-27 — Show unhides a chosen tile in the active workspace
 
-**Statement.** The shell command panel's **`.` → Workspace → Show** command
+**Statement.** The shell command panel's top-level **`.` → Show** command
 opens a compact picker over exactly the hidden tiles owned by the active
 workspace. The command is available only while an ordinary visible tile in that
 workspace is focused; a solo-presented hidden or Detached tile is not “focused
@@ -1373,8 +1373,8 @@ preserving the distinction between navigation and visibility.
 
 **Status.** `implemented (headless)`.
 
-**Enforcement.** A production-path GPUI guard opens the real `.` menu, descends
-through Workspace → Show, proves the empty state paints, then hides tiles in two
+**Enforcement.** A production-path GPUI guard opens the real `.` menu, invokes
+top-level Show, proves the empty state paints, then hides tiles in two
 workspaces and proves only the active workspace's stable tile is offered and
 unhidden/focused by the real picker key handler. The same guard presents a
 Detached tile and proves Show is dimmed and does not replace the menu overlay.

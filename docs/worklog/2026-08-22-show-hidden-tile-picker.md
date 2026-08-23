@@ -57,7 +57,7 @@ frontier 3: omega [done] (omega)
 
 ## What shipped
 
-- The shell menu now exposes `.` → Workspace → Show (`w`, then `s`). Show is
+- The shell menu now exposes top-level `.` → Show (`s`). Show is
   dimmed and non-dispatching unless an ordinary visible tile in the active
   workspace is focused.
 - Show opens a Cmd-P-style picker over only the active workspace's hidden
@@ -102,7 +102,7 @@ frontier 3: omega [done] (omega)
 
 ## Decisions
 
-- Show remains visible but dimmed when unavailable so the Workspace submenu is
+- Show remains visible but dimmed when unavailable so the shell menu is
   spatially stable and the context rule is discoverable.
 - Picker targets are captured as stable `WindowId`s and revalidated at commit
   time, preventing stale entries from unhiding the wrong tile.
