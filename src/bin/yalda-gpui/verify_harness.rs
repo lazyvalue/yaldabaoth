@@ -40,6 +40,102 @@ fn harness_boots(cx: &mut TestAppContext) {
     assert_eq!(value, 41, "TestAppContext entity round-trip");
 }
 
+/// Lifecycle terminal notifications must release the local "thinking" phase.
+/// A rejected optimistic prompt otherwise leaves the tile spinning forever even
+/// though the server has explicitly said that no turn is running.
+#[gpui::test]
+fn prompt_rejected_settles_agent_turn_idle(cx: &mut TestAppContext) {
+    use crate::TurnPhase;
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let (view, vcx, id, _session) = boot_with_transcript(cx);
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| {
+            c.turn_phase = TurnPhase::begin(std::time::Instant::now());
+        });
+        v.apply_server_batch(
+            vec![ServerNotification::PromptRejected {
+                session_id: "S1".into(),
+                reason: "agent disconnected".into(),
+                text: "please retry".into(),
+            }],
+            cx,
+        );
+    });
+
+    assert!(view.read_with(vcx, |v, cx| {
+        v.read_session(id, cx, |c| matches!(c.turn_phase, TurnPhase::Idle))
+            .unwrap_or(false)
+    }));
+}
+
+/// A detach is another terminal lifecycle event: the transport is gone, so a
+/// locally awaiting turn cannot remain live after the notification is folded.
+#[gpui::test]
+fn session_detached_settles_agent_turn_idle(cx: &mut TestAppContext) {
+    use crate::TurnPhase;
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let (view, vcx, id, _session) = boot_with_transcript(cx);
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| {
+            c.turn_phase = TurnPhase::begin(std::time::Instant::now());
+        });
+        v.apply_server_batch(
+            vec![ServerNotification::SessionDetached {
+                session_id: "S1".into(),
+                reason: "connection closed".into(),
+            }],
+            cx,
+        );
+    });
+
+    assert!(view.read_with(vcx, |v, cx| {
+        v.read_session(id, cx, |c| matches!(c.turn_phase, TurnPhase::Idle))
+            .unwrap_or(false)
+    }));
+}
+
+/// Archived transcripts are read-only. Submitting from a still-open archived
+/// tile must preserve both the draft and transcript and explain how to proceed.
+#[gpui::test]
+fn archived_session_submit_is_rejected_before_optimistic_commit(cx: &mut TestAppContext) {
+    use crate::agent::InputSurface;
+
+    let (view, vcx, id, _session) = boot_with_transcript(cx);
+    let before = view.update(vcx, |v, cx| {
+        v.jump_archived_sessions.insert("S1".into());
+        v.with_session(id, cx, |c| {
+            let mode = c.input_surface.mode;
+            c.input_surface = InputSurface::with_draft(mode, "do not send");
+        });
+        v.read_session(id, cx, |c| c.editor.document().full_text())
+            .unwrap()
+    });
+
+    view.update(vcx, |v, cx| v.submit_compose(cx));
+
+    view.read_with(vcx, |v, cx| {
+        let (draft, transcript, status, awaiting) = v
+            .read_session(id, cx, |c| {
+                (
+                    c.input_surface.compose().text(),
+                    c.editor.document().full_text(),
+                    c.status.as_ref().map(ToString::to_string),
+                    c.turn_phase.is_awaiting(),
+                )
+            })
+            .unwrap();
+        assert_eq!(draft, "do not send", "archived submit preserves the draft");
+        assert_eq!(transcript, before, "archived submit cannot add a user turn");
+        assert!(!awaiting, "archived submit cannot begin a turn");
+        assert!(
+            status.as_deref().is_some_and(|s| s.contains("archived")),
+            "status must explain that the session must be unarchived: {status:?}"
+        );
+    });
+}
+
 /// Stone 2: construct the REAL `YaldaGpuiView` in a headless test window and
 /// render a frame (`run_until_parked` drives layout/paint via the test
 /// platform). This is a *capability* proof — the production view is headlessly

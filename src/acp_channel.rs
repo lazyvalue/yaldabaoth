@@ -96,15 +96,7 @@ pub const DEFAULT_AGENT_COMMAND: &str = "claude-agent-acp";
 /// with the server session so a restart always resumes a thread with the same
 /// adapter that created it.
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    Default,
-    serde::Serialize,
-    serde::Deserialize,
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum AgentProvider {
@@ -230,8 +222,9 @@ pub struct UsageSnapshot {
 /// clipboard). Crosses the GUI↔session-server wire (`session_proto`) and is
 /// turned into an ACP `ContentBlock::Image` in the worker driver. `data` is
 /// standard base64 of the raw image bytes (NO `data:` URI prefix); `mime_type`
-/// is e.g. `"image/png"`. Ephemeral for now — not persisted in the WAL, so a
-/// resumed/replayed transcript shows the prompt text but not the image.
+/// is e.g. `"image/png"`. Unsettled prompt intents persist the attachment in
+/// the session WAL so a crash between admission and worker delivery can retry
+/// the complete payload.
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct ImageAttachment {
     pub data: String,
@@ -242,7 +235,7 @@ pub struct ImageAttachment {
 /// plus any image attachments. Bundled here (rather than the bare `String` the
 /// channel used to carry) so the driver can build a mixed
 /// `[Text, Image, …]` content-block vector for `session/prompt`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct PromptPayload {
     pub text: String,
     pub images: Vec<ImageAttachment>,
@@ -1257,10 +1250,7 @@ impl AcpChannelClient {
                 AgentProvider::Claude => DEFAULT_AGENT_FALLBACKS,
                 AgentProvider::Codex => DEFAULT_CODEX_AGENT_FALLBACKS,
             };
-            fallbacks
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect()
+            fallbacks.iter().map(|s| (*s).to_string()).collect()
         } else {
             vec![command_str.trim().to_string()]
         };
@@ -2311,7 +2301,8 @@ async fn worker_async(
 
     // 3) Bridge the std mpsc prompt channel into a tokio mpsc the async
     //    driver loop can await on. spawn_blocking holds the std recv() call.
-    let (async_prompt_tx, mut async_prompt_rx) = tokio::sync::mpsc::unbounded_channel::<PromptPayload>();
+    let (async_prompt_tx, mut async_prompt_rx) =
+        tokio::sync::mpsc::unbounded_channel::<PromptPayload>();
     let bridge_task = tokio::task::spawn_blocking(move || {
         while let Ok(prompt) = prompt_rx.recv() {
             if async_prompt_tx.send(prompt).is_err() {
@@ -2341,8 +2332,7 @@ async fn worker_async(
     // via `set_model` reaches the driver loop, which issues a
     // `session/set_config_option`. Kept on its own channel so it never queues
     // behind prompts (a switch applies immediately, mid-turn if needed).
-    let (async_set_model_tx, async_set_model_rx) =
-        tokio::sync::mpsc::unbounded_channel::<String>();
+    let (async_set_model_tx, async_set_model_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let set_model_bridge_task = tokio::task::spawn_blocking(move || {
         while let Ok(model_id) = set_model_rx.recv() {
             if async_set_model_tx.send(model_id).is_err() {
@@ -3318,7 +3308,10 @@ mod tests {
             McpServer::Stdio(s) => {
                 assert_eq!(s.name, "yalda", "server name must be yalda");
                 assert!(
-                    s.command.as_os_str().to_string_lossy().contains("yalda-mcp"),
+                    s.command
+                        .as_os_str()
+                        .to_string_lossy()
+                        .contains("yalda-mcp"),
                     "command should point at the yalda-mcp binary, got {:?}",
                     s.command
                 );
@@ -3452,9 +3445,18 @@ mod tests {
         assert_eq!(
             options,
             vec![
-                ModelOption { id: "default".into(), label: "Default (recommended)".into() },
-                ModelOption { id: "claude-fable-5[1m]".into(), label: "Fable".into() },
-                ModelOption { id: "sonnet".into(), label: "Sonnet".into() },
+                ModelOption {
+                    id: "default".into(),
+                    label: "Default (recommended)".into()
+                },
+                ModelOption {
+                    id: "claude-fable-5[1m]".into(),
+                    label: "Fable".into()
+                },
+                ModelOption {
+                    id: "sonnet".into(),
+                    label: "Sonnet".into()
+                },
             ]
         );
 
@@ -3489,7 +3491,10 @@ mod tests {
         // 4321 (agent-acp, ppid 1) and 5555 (code-acp, ppid 1) only.
         assert_eq!(pids, vec![4321, 5555]);
         // 7000 is an adapter but owned (ppid 2999) → never killed.
-        assert!(!pids.contains(&7000), "a live (owned) adapter must be spared");
+        assert!(
+            !pids.contains(&7000),
+            "a live (owned) adapter must be spared"
+        );
         // 6000 is orphaned but not an adapter → never killed.
         assert!(!pids.contains(&6000), "a non-adapter orphan must be spared");
     }
