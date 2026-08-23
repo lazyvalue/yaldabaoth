@@ -1703,6 +1703,7 @@ fn gpui_menu() -> Vec<MenuNode> {
             ],
         ),
         MenuNode::entry("j", "toggle jump panel", "toggle-jump-panel"),
+        MenuNode::entry("s", "show hidden tile", "show-hidden-tiles"),
         // Layout modes (UXI-Workspace-26) — the arrangement of the active
         // workspace's tiles. Plane is retired; the primary-area controls apply to
         // Tiling only.
@@ -1732,7 +1733,6 @@ fn gpui_menu() -> Vec<MenuNode> {
                 MenuNode::entry("x", "close workspace", "close-workspace"),
                 MenuNode::entry("p", "new project", "new-project"),
                 MenuNode::entry("b", "back and forth", "workspace-back-and-forth"),
-                MenuNode::entry("s", "show hidden tile", "show-hidden-tiles"),
             ],
         ),
         // System / dev — flattened up from the former `s` submenu to the root.

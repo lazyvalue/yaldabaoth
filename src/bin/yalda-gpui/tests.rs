@@ -3356,8 +3356,9 @@ fn gpui_menu_has_required_entries() {
     let mut leaf_actions: Vec<&str> = Vec::new();
     collect_leaves(&menu, &mut leaf_actions);
     // UXI-Menu-8 / UXI-Workspace-26: the shell root holds new-tile, theme,
-    // toggle-jump, the layout-modes submenu, workspace ops, and the flattened
-    // system/dev commands. Tile-scoped verbs moved to the `<space>` tile menu.
+    // toggle-jump, Show, the layout-modes submenu, workspace ops, and the
+    // flattened system/dev commands. Tile-scoped verbs moved to the `<space>`
+    // tile menu.
     let expected = [
         "new-agent-tile",
         "new-buffer-tile",
@@ -3367,6 +3368,7 @@ fn gpui_menu_has_required_entries() {
         "theme-nightfox",
         "theme-folio",
         "toggle-jump-panel",
+        "show-hidden-tiles",
         // layout modes submenu
         "layout-columns",
         "layout-tiling",
@@ -3381,7 +3383,6 @@ fn gpui_menu_has_required_entries() {
         "close-workspace",
         "new-project",
         "workspace-back-and-forth",
-        "show-hidden-tiles",
         // flattened system/dev
         "dev-restart-gui",
         "dev-restart-all",
@@ -3437,6 +3438,7 @@ fn shell_menu_root_is_the_approved_items() {
             ("n".into(), "new tile"),
             ("t".into(), "theme"),
             ("j".into(), "toggle jump panel"),
+            ("s".into(), "show hidden tile"),
             ("l".into(), "layout"),
             ("w".into(), "workspace"),
             ("r".into(), "rebuild and restart gui"),
@@ -3667,13 +3669,9 @@ fn shell_menu_close_tile_at_root_close_workspace_under_w() {
     let mut show = MenuState::new();
     show.open();
     assert_eq!(
-        show.process_key(KeyPress::new(Key::Char('w'), KMods::NONE), &menu),
-        None,
-    );
-    assert_eq!(
         show.process_key(KeyPress::new(Key::Char('s'), KMods::NONE), &menu),
         Some("show-hidden-tiles".to_string()),
-        "w s opens the active workspace hidden-tile picker"
+        "root s opens the active workspace hidden-tile picker"
     );
 }
 

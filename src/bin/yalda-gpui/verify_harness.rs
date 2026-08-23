@@ -9120,7 +9120,7 @@ fn hidden_tile_navigation_is_solo_until_explicit_unhide(cx: &mut TestAppContext)
     });
 }
 
-/// UXI-Workspace-27: `.` → Workspace → Show is a real active-workspace
+/// UXI-Workspace-27: `.` → Show is a real active-workspace
 /// operation. It opens even when empty, projects only that workspace's hidden
 /// stable ids, unhides/follows through both keyboard and click activation, and
 /// remains dimmed while focus is on a solo Detached tile.
@@ -9142,7 +9142,6 @@ fn workspace_show_picker_unhides_active_hidden_tile_and_disables_outside_workspa
         let menu = v.menu_ref().expect("shell menu opened");
         assert!(!menu.disabled.contains("show-hidden-tiles"));
     });
-    vcx.simulate_keystrokes("w");
     vcx.simulate_keystrokes("s");
     vcx.run_until_parked();
     view.read_with(vcx, |v, _| {
@@ -9197,7 +9196,6 @@ fn workspace_show_picker_unhides_active_hidden_tile_and_disables_outside_workspa
     });
 
     vcx.simulate_keystrokes(".");
-    vcx.simulate_keystrokes("w");
     vcx.simulate_keystrokes("s");
     vcx.run_until_parked();
     view.read_with(vcx, |v, _| {
@@ -9233,7 +9231,6 @@ fn workspace_show_picker_unhides_active_hidden_tile_and_disables_outside_workspa
     // target, proving mouse and keyboard dispatch converge.
     view.update(vcx, |v, _| v.workspace.hide_window(hidden_here).unwrap());
     vcx.simulate_keystrokes(".");
-    vcx.simulate_keystrokes("w");
     vcx.simulate_keystrokes("s");
     vcx.run_until_parked();
     crate::layout_probe_begin();
@@ -9264,7 +9261,6 @@ fn workspace_show_picker_unhides_active_hidden_tile_and_disables_outside_workspa
         v.workspace.detach_window(visible_here).unwrap();
     });
     vcx.simulate_keystrokes(".");
-    vcx.simulate_keystrokes("w");
     vcx.run_until_parked();
     view.read_with(vcx, |v, _| {
         assert!(v
