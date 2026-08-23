@@ -1339,3 +1339,42 @@ the `Plane` variant + `render_desktop` behind a UI cutoff (no menu / persisted
 arrangement is reversible without a migration. Hide/unhide of individual tiles is
 unchanged and orthogonal to Monocle (Monocle is a pure paint filter, not a
 membership change).
+
+### UXI-Workspace-27 — Show unhides a chosen tile in the active workspace
+
+**Statement.** The shell command panel's **`.` → Workspace → Show** command
+opens a compact picker over exactly the hidden tiles owned by the active
+workspace. The command is available only while an ordinary visible tile in that
+workspace is focused; a solo-presented hidden or Detached tile is not “focused
+on a workspace,” so Show remains present but dimmed and cannot dispatch.
+
+Opening Show is valid when the active workspace has no hidden tiles. The same
+picker card still opens with an explicit empty message; it never substitutes
+Detached tiles, hidden tiles from another workspace, or a newly-created tile.
+Rows use the tile's normal desktop title and stable `WindowId`, follow the
+Cmd-P palette's compact centered overlay language, and support `j`/`k`, arrow
+keys, Enter/`l`, Esc/`q`, hover selection, and click activation.
+
+Activating a row dismisses the picker and calls the existing typed Unhide
+transition for that exact stable tile. The tile becomes Attached + visible,
+the owning workspace becomes active, and the unchanged tile is focused. Its
+best-effort footprint restoration and persistence remain governed by
+`UXI-Workspace-24`; Show does not use the non-mutating solo-presentation path.
+
+**Applies to.** `main.rs`: the `show-hidden-tiles` shell-menu command,
+contextual disabled state, `HiddenTilePicker` overlay model/key handling/render,
+stable-id label projection, and unhide/follow dispatch; `yux/detail.rs`:
+`picker_option_row` presentation; `workspace.rs`: existing `unhide_window`.
+
+**Why.** Hidden tiles currently remain discoverable in the jump panel and
+Cmd-P, but restoring one requires first navigating to its solo presentation and
+then invoking Unhide. Show makes restoration a direct workspace operation while
+preserving the distinction between navigation and visibility.
+
+**Status.** `implemented (headless)`.
+
+**Enforcement.** A production-path GPUI guard opens the real `.` menu, descends
+through Workspace → Show, proves the empty state paints, then hides tiles in two
+workspaces and proves only the active workspace's stable tile is offered and
+unhidden/focused by the real picker key handler. The same guard presents a
+Detached tile and proves Show is dimmed and does not replace the menu overlay.

@@ -8893,6 +8893,176 @@ fn hidden_tile_navigation_is_solo_until_explicit_unhide(cx: &mut TestAppContext)
     });
 }
 
+/// UXI-Workspace-27: `.` → Workspace → Show is a real active-workspace
+/// operation. It opens even when empty, projects only that workspace's hidden
+/// stable ids, unhides/follows through both keyboard and click activation, and
+/// remains dimmed while focus is on a solo Detached tile.
+#[gpui::test]
+fn workspace_show_picker_unhides_active_hidden_tile_and_disables_outside_workspace(
+    cx: &mut TestAppContext,
+) {
+    use crate::workspace::{AttachedVisibility, SplitDir, TileMembership};
+    use crate::{App, LinearTile};
+
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_browser(cx);
+
+    // The command is available with ordinary workspace focus even when there
+    // are no hidden tiles; the resulting picker paints an explicit empty state.
+    vcx.simulate_keystrokes(".");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        let menu = v.menu_ref().expect("shell menu opened");
+        assert!(!menu.disabled.contains("show-hidden-tiles"));
+    });
+    vcx.simulate_keystrokes("w");
+    vcx.simulate_keystrokes("s");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        let picker = v
+            .hidden_tile_picker_ref()
+            .expect("Show opens the hidden-tile picker");
+        assert_eq!(picker.workspace_index, 0);
+        assert!(picker.targets.is_empty(), "empty means empty, not unavailable");
+    });
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    assert!(
+        crate::layout_probe_get("hidden-tile-picker-card").is_some(),
+        "the Cmd-P-like card paints"
+    );
+    assert!(
+        crate::layout_probe_get("hidden-tile-picker-empty").is_some(),
+        "an active workspace with no hidden tiles paints its empty message"
+    );
+    crate::layout_probe_end();
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+
+    // Hide one named tile in workspace 0 and one in workspace 1. The picker
+    // must capture only workspace 0's target even though both are live.
+    let (hidden_here, hidden_elsewhere, visible_here) = view.update(vcx, |v, _| {
+        let visible_here = v.workspace.focused_window_id().unwrap();
+        let mut local = LinearTile::new();
+        local.title = "Active hidden".into();
+        let hidden_here = v
+            .workspace
+            .split_focused(SplitDir::V, App::Linear(local))
+            .unwrap();
+        v.workspace.hide_window(hidden_here).unwrap();
+
+        let mut foreign_visible = LinearTile::new();
+        foreign_visible.title = "Other visible".into();
+        v.workspace
+            .push_workspace_inheriting(App::Linear(foreign_visible));
+        let mut foreign_hidden = LinearTile::new();
+        foreign_hidden.title = "Other hidden".into();
+        let hidden_elsewhere = v
+            .workspace
+            .split_focused(SplitDir::V, App::Linear(foreign_hidden))
+            .unwrap();
+        v.workspace.hide_window(hidden_elsewhere).unwrap();
+
+        v.workspace.set_active_workspace(0);
+        v.workspace.workspaces[0].focused = visible_here;
+        (hidden_here, hidden_elsewhere, visible_here)
+    });
+
+    vcx.simulate_keystrokes(".");
+    vcx.simulate_keystrokes("w");
+    vcx.simulate_keystrokes("s");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert_eq!(
+            v.hidden_tile_picker_ref().unwrap().targets,
+            vec![hidden_here],
+            "Show lists only hidden tiles owned by the active workspace"
+        );
+        assert!(matches!(
+            v.workspace.tile_membership(hidden_elsewhere),
+            Some(TileMembership::Attached {
+                workspace: 1,
+                visibility: AttachedVisibility::Hidden,
+            })
+        ));
+    });
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert!(!v.overlay_is_hidden_tile_picker());
+        assert_eq!(v.workspace.active_workspace, 0);
+        assert_eq!(v.workspace.focused_window_id(), Some(hidden_here));
+        assert_eq!(
+            v.workspace.tile_membership(hidden_here),
+            Some(TileMembership::Attached {
+                workspace: 0,
+                visibility: AttachedVisibility::Visible,
+            })
+        );
+    });
+
+    // Re-hide and activate the same stable row through its real painted click
+    // target, proving mouse and keyboard dispatch converge.
+    view.update(vcx, |v, _| v.workspace.hide_window(hidden_here).unwrap());
+    vcx.simulate_keystrokes(".");
+    vcx.simulate_keystrokes("w");
+    vcx.simulate_keystrokes("s");
+    vcx.run_until_parked();
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let row = crate::layout_probe_get("hidden-tile-picker-row-0")
+        .expect("hidden tile row paints a click target");
+    crate::layout_probe_end();
+    let at = point(px(row.0 + row.2 / 2.0), px(row.1 + row.3 / 2.0));
+    vcx.simulate_mouse_move(at, None, gpui::Modifiers::default());
+    vcx.simulate_click(at, gpui::Modifiers::default());
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert_eq!(v.workspace.focused_window_id(), Some(hidden_here));
+        assert!(matches!(
+            v.workspace.tile_membership(hidden_here),
+            Some(TileMembership::Attached {
+                visibility: AttachedVisibility::Visible,
+                ..
+            })
+        ));
+    });
+
+    // Solo Detached focus is explicitly outside a workspace. Show is still
+    // discoverable but dimmed, and pressing `s` cannot replace the menu.
+    view.update(vcx, |v, _| {
+        assert!(v.workspace.focus_tile(visible_here));
+        v.workspace.detach_window(visible_here).unwrap();
+    });
+    vcx.simulate_keystrokes(".");
+    vcx.simulate_keystrokes("w");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert!(v
+            .menu_ref()
+            .expect("shell menu over Detached tile")
+            .disabled
+            .contains("show-hidden-tiles"));
+    });
+    vcx.simulate_keystrokes("s");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert!(v.overlay_is_menu(), "disabled Show keeps the menu open");
+        assert!(!v.overlay_is_hidden_tile_picker());
+        assert_eq!(
+            v.workspace.focused_window_id(),
+            Some(visible_here),
+            "disabled Show cannot move focus away from the Detached tile"
+        );
+        assert_eq!(
+            v.workspace.tile_membership(visible_here),
+            Some(TileMembership::Detached)
+        );
+    });
+}
+
 /// UXI-Menu-9: Hide and Unhide are the shared suffix of the real tile menu,
 /// and applicability follows the focused tile's typed membership. A disabled
 /// key is inert: it neither invokes the command nor closes the menu.
