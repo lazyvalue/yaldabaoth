@@ -71,7 +71,9 @@ frontier 3: omega [done] (omega)
 ## Verification
 
 - `cargo check --bin yalda-gpui`: passed (existing warnings only).
-- `cargo test --bin yalda-gpui`: **686 passed, 0 failed, 2 ignored**.
+- `cargo test --bin yalda-gpui` on the feature branch: **686 passed, 0 failed,
+  2 ignored**. Repeated on the newer `main` after merge: **687 passed, 0 failed,
+  2 ignored**.
 - `workspace_show_picker_unhides_active_hidden_tile_and_disables_outside_workspace`:
   passed through real `.` → `w` → `s` keystrokes, painted empty and populated
   picker states, Enter and click activation, cross-workspace exclusion, and the
@@ -86,12 +88,15 @@ frontier 3: omega [done] (omega)
 - `git diff --check`: passed.
 - `scripts/check-cog-worklog.sh docs/worklog/2026-08-22-show-hidden-tile-picker.md`:
   passed.
+- `./dev-gui.sh`: release build passed; only the GUI was restarted, it
+  reconnected to the existing session server, and all 30 persisted agent
+  sessions were discovered for restoration.
 
 ## Open / caveats
 
-- Exact visual resemblance to Cmd-P remains `NEEDS-RUNTIME`: the harness proves
-  the card, empty state, rows, and hit targets paint, but pixel-level visual
-  judgment is the documented human-eye gap.
+- Exact visual resemblance to Cmd-P remains a human-eye check: the harness
+  proves the card, empty state, rows, and hit targets paint, and the rebuilt GUI
+  is running, but pixel-level visual judgment is not automatable here.
 - Repository-wide `cargo fmt --all -- --check` reports pre-existing formatting
   drift well outside this change; no bulk formatting rewrite was applied.
 
@@ -104,4 +109,4 @@ frontier 3: omega [done] (omega)
 
 ## Next
 
-- Human-eye check the picker against Cmd-P after restarting the rebuilt GUI.
+- Human-eye check the picker against Cmd-P in the freshly restarted GUI.
