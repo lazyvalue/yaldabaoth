@@ -144,7 +144,7 @@ pub(crate) struct CogTopicBinding {
 pub(crate) enum CogTopicKind {
     Graph,
     Bulletin,
-    MailingList,
+    Chat,
 }
 
 impl CogTopicKind {
@@ -152,7 +152,7 @@ impl CogTopicKind {
         match self {
             Self::Graph => "graph",
             Self::Bulletin => "note",
-            Self::MailingList => "list",
+            Self::Chat => "chat",
         }
     }
 }
@@ -377,7 +377,7 @@ pub(crate) struct CogMailFeedEntry {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
-pub(crate) struct CogMailingList {
+pub(crate) struct CogChat {
     pub(crate) id: String,
     #[serde(default)]
     pub(crate) name: String,
@@ -386,21 +386,21 @@ pub(crate) struct CogMailingList {
     #[serde(default)]
     pub(crate) created_at: i64,
     #[serde(default)]
-    pub(crate) topics: Vec<String>,
+    pub(crate) addresses: Vec<String>,
     #[serde(default)]
-    pub(crate) subscribers: Vec<String>,
+    pub(crate) members: Vec<String>,
     #[serde(default)]
-    pub(crate) entries: Vec<CogMailingListEntry>,
+    pub(crate) entries: Vec<CogChatEntry>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
-pub(crate) struct CogMailingListEntry {
+pub(crate) struct CogChatEntry {
     #[serde(default)]
     pub(crate) id: String,
     #[serde(default)]
     pub(crate) event_id: i64,
     #[serde(default)]
-    pub(crate) mailing_list: String,
+    pub(crate) chat: String,
     #[serde(default)]
     pub(crate) from: String,
     #[serde(default)]
@@ -416,7 +416,7 @@ pub(crate) struct CogMailingListEntry {
 pub(crate) enum CogTopicDetail {
     Graph(CogGraph),
     Note(CogMail),
-    MailingList(CogMailingList),
+    Chat(CogChat),
 }
 
 pub(crate) struct CogAgentDetail {
@@ -783,9 +783,7 @@ pub(crate) fn load_topic_detail(binding: &CogTopicBinding) -> Result<CogTopicDet
         CogTopicKind::Bulletin => {
             cog_json(&["mail", "get", &binding.object]).map(CogTopicDetail::Note)
         }
-        CogTopicKind::MailingList => {
-            cog_json(&["mailing-list", "get", &binding.object]).map(CogTopicDetail::MailingList)
-        }
+        CogTopicKind::Chat => cog_json(&["chat", "get", &binding.object]).map(CogTopicDetail::Chat),
     }
 }
 

@@ -779,7 +779,7 @@ impl CogView {
         match detail {
             CogTopicDetailState::Empty => div()
                 .child(section_heading("Topics", st))
-                .child(dim_line("Select a note, graph, or mailing list.", st)),
+                .child(dim_line("Select a note, graph, or chat.", st)),
             CogTopicDetailState::Loading(address) => div()
                 .child(section_heading("Loading", st))
                 .child(dim_line(address, st)),
@@ -793,9 +793,7 @@ impl CogView {
                     .child(topic_type_heading("GRAPH", address, st))
                     .child(graph_preview(graph, st)),
                 CogTopicDetail::Note(mail) => self.mail_detail_body("NOTE", address, mail, st, cx),
-                CogTopicDetail::MailingList(list) => {
-                    self.mailing_list_detail_body(address, list, st, cx)
-                }
+                CogTopicDetail::Chat(chat) => self.chat_detail_body(address, chat, st, cx),
             },
         }
     }
@@ -1007,10 +1005,10 @@ impl CogView {
         col
     }
 
-    fn mailing_list_detail_body(
+    fn chat_detail_body(
         &self,
         address: &str,
-        list: &CogMailingList,
+        chat: &CogChat,
         st: &DetailStyle,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
@@ -1019,35 +1017,48 @@ impl CogView {
             .flex_col()
             .w_full()
             .gap_2()
-            .child(topic_type_heading("MAILING LIST", address, st))
-            .child(title_line(&list.name, &list.id, st))
-            .child(kv_row("Creator", list.creator.clone(), st))
+            .child(topic_type_heading("CHAT", address, st))
+            .child(title_line(&chat.name, &chat.id, st))
+            .child(kv_row("Creator", chat.creator.clone(), st))
             .child(kv_row(
-                "Subscribers",
-                if list.subscribers.is_empty() {
+                "Addresses",
+                if chat.addresses.is_empty() {
                     "none".into()
                 } else {
-                    list.subscribers.join(", ")
+                    chat.addresses.join(", ")
+                },
+                st,
+            ))
+            .child(kv_row(
+                "Members",
+                if chat.members.is_empty() {
+                    "none".into()
+                } else {
+                    chat.members.join(", ")
                 },
                 st,
             ))
             .child(section_heading(
-                &format!("Archive ({})", list.entries.len()),
+                &format!("History ({})", chat.entries.len()),
                 st,
             ));
-        if list.entries.is_empty() {
-            return col.child(dim_line("No published entries.", st));
+        if chat.entries.is_empty() {
+            return col.child(dim_line("No messages yet.", st));
         }
-        for entry in &list.entries {
-            col = col.child(self.communication_card(
-                &format!("list:{}:{}", list.id, entry.event_id),
-                &entry.from,
-                entry.at,
-                entry.event_id,
-                &entry.content,
-                &entry.references,
-                st,
-                cx,
+        for entry in &chat.entries {
+            col = col.child(probe_bounds(
+                "cog-chat-entry",
+                self.communication_card(
+                    &format!("chat:{}:{}", chat.id, entry.event_id),
+                    &entry.from,
+                    entry.at,
+                    entry.event_id,
+                    &entry.content,
+                    &entry.references,
+                    st,
+                    cx,
+                )
+                .into_any_element(),
             ));
         }
         col
@@ -2014,7 +2025,7 @@ fn topic_row(row: &CogTopicRow, selected: bool, collapsed: bool, st: &DetailStyl
             match binding.kind {
                 CogTopicKind::Graph => "◇",
                 CogTopicKind::Bulletin => "✎",
-                CogTopicKind::MailingList => "✉",
+                CogTopicKind::Chat => "✉",
             },
             topic_leaf_label(binding),
             Some(binding.kind.label()),

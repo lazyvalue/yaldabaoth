@@ -25859,8 +25859,8 @@ fn cog_topic_browser_hierarchy_collapses_and_renders_typed_detail(cx: &mut TestA
                 ),
                 cog_test_topic(
                     "personal::team",
-                    crate::CogTopicKind::MailingList,
-                    "l1",
+                    crate::CogTopicKind::Chat,
+                    "c1",
                     "Friends",
                 ),
             ])))),
@@ -25903,17 +25903,17 @@ fn cog_topic_browser_hierarchy_collapses_and_renders_typed_detail(cx: &mut TestA
             detail_req,
             Ok(crate::CogFetch::TopicDetail {
                 address: "personal::team".into(),
-                result: Ok(crate::CogTopicDetail::MailingList(crate::CogMailingList {
-                    id: "l1".into(),
+                result: Ok(crate::CogTopicDetail::Chat(crate::CogChat {
+                    id: "c1".into(),
                     name: "Friends".into(),
                     creator: "a1".into(),
                     created_at: 1,
-                    topics: vec!["personal::team".into()],
-                    subscribers: vec!["a1".into()],
-                    entries: vec![crate::CogMailingListEntry {
+                    addresses: vec!["personal::team".into()],
+                    members: vec!["a1".into()],
+                    entries: vec![crate::CogChatEntry {
                         id: "le1".into(),
                         event_id: 9,
-                        mailing_list: "l1".into(),
+                        chat: "c1".into(),
                         from: "a1".into(),
                         at: 1_786_989_281_753_564_000,
                         actor: "agent".into(),
@@ -25931,9 +25931,11 @@ fn cog_topic_browser_hierarchy_collapses_and_renders_typed_detail(cx: &mut TestA
     view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
     let (_, _, _, height) =
-        crate::layout_probe_get("cog-topic-detail").expect("mailing-list detail did not paint");
+        crate::layout_probe_get("cog-topic-detail").expect("chat detail did not paint");
+    let chat_entry = crate::layout_probe_get("cog-chat-entry");
     crate::layout_probe_end();
-    assert!(height > 80.0, "typed list detail is non-trivial: {height}");
+    assert!(height > 80.0, "typed chat detail is non-trivial: {height}");
+    assert!(chat_entry.is_some(), "a readable Chat entry card paints");
 }
 
 /// UXI-Cog-15: the real Agents tab selects a registered address, folds delivery

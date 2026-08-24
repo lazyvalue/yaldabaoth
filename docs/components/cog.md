@@ -22,8 +22,8 @@ The tile has two panes and a small source tab bar:
   `Esc`/`h` returns one level, and `r` refreshes the active source.
 - **Right (detail, scrollable).** For a highlighted graph: its id, sealed/prototype,
   omega, description, Overview, nodes, and live graph state. For a bulletin/note:
-  its immutable mail entries and references. For a mailing list: metadata,
-  subscribers, and its replayable entry archive. For an agent: registration,
+  its immutable mail entries and references. For a Chat: addresses, current
+  members, and its replayable entry history. For an agent: registration,
   delivery state, and readable addressed mail. A selected graph node retains its
   content, output, transitions, and notes detail. The pane scrolls with `d`/`u`
   (half-page) and PageDown/PageUp.
@@ -57,7 +57,7 @@ cached two-pane body `CogView`).
 **Statement.** Opening or restoring a Cog tile lands on the **Topics** tab. The
 left pane behaves like a file explorer over all live bindings returned by
 `cog topic list ""`: slash-separated path components render once as expandable
-folders; the address key renders as a typed leaf labelled graph, note, or list.
+folders; the address key renders as a typed leaf labelled graph, note, or chat.
 Folders are initially expanded so the first draft exposes the whole hierarchy;
 clicking or pressing `Enter` toggles a folder, and the visible-row selection
 remains valid when a folder collapses. Empty data renders one non-selectable
@@ -93,8 +93,8 @@ without replacing the topic tree. A graph leaf shows a compact graph preview and
 offers activation into the existing full graph Overview/node view. A bulletin
 (the topic-addressable Cog note object) shows its name, participants/timestamps,
 immutable entries in event order, structured content through the existing
-foldable JSON tree, and typed object references. A mailing-list leaf shows its
-name/id, current subscribers, and complete replayable entry archive in event
+foldable JSON tree, and typed object references. A Chat leaf shows its name/id,
+Topic addresses, current members, and complete replayable entry history in event
 order, including content and references. Each renderer has an explicit empty
 state; a target-specific load error stays attached to the selected leaf and does
 not discard the tree. Changing selection resets only the right-pane scroll.
@@ -104,15 +104,17 @@ and `right_pane` renderer (`cog_view.rs`), and background fetch/reducer routing
 (`cog_ui.rs`).
 
 **Why.** The `/new-ux` requirement: "Right side can render either notes, graphs,
-or mailing lists." Cog calls topic-addressable zero-recipient notes Bulletins, so
-the UI labels that type **Note** while preserving its bulletin identity in detail.
+or mailing lists." Cog subsequently renamed Mailing Lists to **Chats** while
+preserving their shared, append-only communication role. Cog calls
+topic-addressable zero-recipient notes Bulletins, so the UI labels that type
+**Note** while preserving its bulletin identity in detail.
 
 **Status.** implemented
 
 **Enforcement.** `tests.rs::cog_new_cli_payloads_deserialize_without_optional_fields`
 covers the new typed CLI payloads. The production-path hierarchy guard above
-selects a Mailing List via the real row handler, folds it through
-`CogFetch::TopicDetail`, and probes a non-trivial archive; the graph and note arms
+selects a Chat via the real row handler, folds it through
+`CogFetch::TopicDetail`, and probes non-trivial history; the graph and note arms
 share the existing graph/mail renderers and compile under the full GUI suite.
 
 ### UXI-Cog-15 — The Agents tab lists registered agents and exposes readable mail
