@@ -5886,7 +5886,7 @@ fn cog_topic_tree_is_sorted_deduplicated_and_hierarchical() {
         created_at: 1,
     };
     let tree = CogTopicTree::from_bindings(vec![
-        binding("work/migrations::zeta", CogTopicKind::MailingList, "Zeta"),
+        binding("work/migrations::zeta", CogTopicKind::Chat, "Zeta"),
         binding("personal::journal", CogTopicKind::Bulletin, "Journal"),
         binding("work/migrations::alpha", CogTopicKind::Graph, "Alpha"),
         // Immutable addresses should already be unique, but a repeated server
@@ -5933,13 +5933,13 @@ fn cog_topic_tree_is_sorted_deduplicated_and_hierarchical() {
 fn cog_new_cli_payloads_deserialize_without_optional_fields() {
     let topic: crate::CogTopicBinding = serde_json::from_value(serde_json::json!({
         "address": "work::plan",
-        "kind": "graph",
-        "object": "g1",
-        "name": "Plan",
+        "kind": "chat",
+        "object": "c1",
+        "name": "Coordination",
         "created_at": 7
     }))
     .expect("topic summary payload");
-    assert_eq!(topic.kind, crate::CogTopicKind::Graph);
+    assert_eq!(topic.kind, crate::CogTopicKind::Chat);
 
     let address: crate::CogAgentAddress = serde_json::from_value(serde_json::json!({
         "id": "a1",
@@ -5971,17 +5971,17 @@ fn cog_new_cli_payloads_deserialize_without_optional_fields() {
     .expect("mail payload with resolved reference lacking object");
     assert_eq!(mail.entries[0].references[0].state, "live");
 
-    let list: crate::CogMailingList = serde_json::from_value(serde_json::json!({
-        "id": "l1",
-        "name": "migration team",
+    let chat: crate::CogChat = serde_json::from_value(serde_json::json!({
+        "id": "c1",
+        "name": "migration coordination",
         "creator": "a1",
         "created_at": 13,
-        "topics": ["work::team"],
-        "subscribers": ["a1", "a2"],
+        "addresses": ["work::team"],
+        "members": ["a1", "a2"],
         "entries": []
     }))
-    .expect("mailing list payload");
-    assert!(list.entries.is_empty());
+    .expect("chat payload");
+    assert!(chat.entries.is_empty());
 }
 
 #[test]
