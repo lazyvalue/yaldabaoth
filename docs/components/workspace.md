@@ -1378,3 +1378,45 @@ top-level Show, proves the empty state paints, then hides tiles in two
 workspaces and proves only the active workspace's stable tile is offered and
 unhidden/focused by the real picker key handler. The same guard presents a
 Detached tile and proves Show is dimmed and does not replace the menu overlay.
+
+### UXI-Workspace-28 — Boot restores durable tile membership before roster reconciliation
+
+**Statement.** On every ordinary launch, restart, and self-rebuild, Yalda must
+restore the persisted `Frame` ownership graph before the universal Agent roster
+may materialize roster-only sessions. A persisted tile keeps its exact stable
+`WindowId` and membership state—Attached + visible in its named workspace,
+Attached + hidden in that workspace, or Detached—across the process boundary.
+Roster reconciliation may synthesize a Detached tile only for a session absent
+from the fully restored ownership graph; it must never persist a pre-restore
+default frame over durable workspace membership.
+
+The restore prerequisite applies even though roster loading is asynchronous.
+Starting the request is observable work: a fast result can call
+`materialize_roster_detached_tiles` and `save_workspace_state`, so the request
+itself cannot be launched until restore has completed (or definitively found no
+snapshot). Session cwd identifies a Project, not one of its possibly many named
+workspaces, and therefore cannot reconstruct lost attachment after the fact.
+
+**Applies to.** `main.rs`: the production GUI initialization entry point and
+`restore_workspace_from_disk`; `agent_ui.rs`: `refresh_roster` and
+`materialize_roster_detached_tiles`; `persist.rs`: `workspace.json` snapshot and
+restore of visible, hidden-attached, and Detached tiles.
+
+**Why.** Named-workspace membership is user-authored durable state. The server
+roster is authoritative for which sessions exist, but it has no workspace
+identity and cannot safely run as an ownership migration before the saved frame
+is present. If it does, a reboot can intermittently empty a workspace and file
+its Agent tile under Detached.
+
+**Status.** `implemented (headless)` (bug-0059).
+
+**Enforcement.** The hermetic GPUI regression
+`boot_restores_attached_agent_before_fast_roster_save` drives the production boot
+initializer with a persisted named workspace containing one Agent tile and an
+immediately available matching roster entry. After initialization, the same
+stable tile must be Attached to that workspace, no Detached duplicate may
+exist, and the on-disk snapshot must retain the attached leaf. The negative
+control reverses the restore/roster order and reproduces the empty-workspace
+plus Detached result. The full `yalda-gpui` suite and changed-helper mutation
+gate also pass. Native process restart timing remains a runtime observation,
+not a correctness gap in the deterministically exercised ordering boundary.
