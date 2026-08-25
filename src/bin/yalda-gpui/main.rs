@@ -71,6 +71,8 @@ mod agent;
 mod agent_naming;
 mod agent_roster;
 mod agent_sessions;
+mod agent_stats_ui;
+mod agent_stats_view;
 mod agent_ui;
 mod browser_ui;
 mod chrome;
@@ -95,6 +97,7 @@ mod render_blocks;
 mod screens;
 mod session_tag_editor;
 mod system_console;
+mod telemetry;
 mod tool_body;
 mod transcript_view;
 #[cfg(test)]
@@ -106,6 +109,7 @@ pub(crate) use agent::*;
 pub(crate) use agent_naming::*;
 pub(crate) use agent_roster::*;
 pub(crate) use agent_sessions::*;
+pub(crate) use agent_stats_view::*;
 pub(crate) use cog::*;
 pub(crate) use cog_view::*;
 pub(crate) use diagram::*;
@@ -121,6 +125,7 @@ pub(crate) use project::*;
 pub(crate) use render_blocks::*;
 pub(crate) use session_tag_editor::*;
 pub(crate) use system_console::*;
+pub(crate) use telemetry::*;
 pub(crate) use tool_body::*;
 pub(crate) use transcript_view::*;
 pub(crate) use yux::*;
@@ -1413,6 +1418,8 @@ enum App {
     Cog(CogTile),
     /// The keybindings reference + rebind sheet (`keymap_tile.rs`).
     Keymap(KeymapTile),
+    /// Singleton live agent + repository telemetry surface.
+    AgentStats,
 }
 
 /// Exhaustive result of the one close-tile transition shared by every input
@@ -1443,6 +1450,7 @@ impl App {
             App::Linear(_) => None,
             App::Cog(_) => None,
             App::Keymap(_) => None,
+            App::AgentStats => None,
         }
     }
 }
@@ -1969,6 +1977,16 @@ struct YaldaGpuiView {
     /// Lazily-created cached body for the global system console. It survives
     /// overlay dismissal so build output keeps accumulating while hidden.
     system_console_view: Option<Entity<SystemConsoleView>>,
+    /// Lazily-created cached body for the singleton Agent Stats tile.
+    agent_stats_view: Option<Entity<AgentStatsView>>,
+    /// Drops stale repository scan completions after a newer project refresh.
+    agent_stats_scan_generation: u64,
+    /// Versioned, bounded telemetry restored from Yalda's durable home. All
+    /// mutation is in-memory; cloned snapshots are written off the UI thread.
+    telemetry_store: TelemetryStore,
+    telemetry_dirty_generation: u64,
+    telemetry_saved_generation: u64,
+    telemetry_save_in_flight: bool,
     /// One-shot footer message (e.g. "Only documents can be shown in multiple
     /// workspaces (yet)"). Rendered as a small toast in the bottom-right;
     /// cleared on the next overlay dismissal. Display-only. NOT part of
@@ -2182,6 +2200,12 @@ impl YaldaGpuiView {
             focus_handle,
             active_overlay: ActiveOverlay::None,
             system_console_view: None,
+            agent_stats_view: None,
+            agent_stats_scan_generation: 0,
+            telemetry_store: TelemetryStore::load(),
+            telemetry_dirty_generation: 0,
+            telemetry_saved_generation: 0,
+            telemetry_save_in_flight: false,
             transient_status: None,
             workspace: workspace::Frame::with_initial(initial, seed_project),
             projects,
@@ -2251,6 +2275,12 @@ impl YaldaGpuiView {
             focus_handle,
             active_overlay: ActiveOverlay::None,
             system_console_view: None,
+            agent_stats_view: None,
+            agent_stats_scan_generation: 0,
+            telemetry_store: TelemetryStore::load(),
+            telemetry_dirty_generation: 0,
+            telemetry_saved_generation: 0,
+            telemetry_save_in_flight: false,
             transient_status: None,
             workspace: workspace::Frame::with_initial(initial, seed_project),
             projects,
@@ -3383,8 +3413,8 @@ impl YaldaGpuiView {
         match focused {
             // Already picking — nothing to do.
             App::Buffer(BufferApp::Picking(_)) => return,
-            // Agent/Linear/Cog/Keymap tile: out of scope. No buffer here to pick into.
-            App::Agent(_) | App::Linear(_) | App::Cog(_) | App::Keymap(_) => {
+            // Non-buffer tile: out of scope. No buffer here to pick into.
+            App::Agent(_) | App::Linear(_) | App::Cog(_) | App::Keymap(_) | App::AgentStats => {
                 self.transient_status = Some("no buffer here".into());
                 cx.notify();
                 return;
@@ -3648,6 +3678,7 @@ impl YaldaGpuiView {
             self.notify_linear_views(MissReason::TextStyle, cx);
             self.notify_cog_views(MissReason::TextStyle, cx);
             self.notify_keymap_views(MissReason::TextStyle, cx);
+            self.notify_agent_stats_view(MissReason::TextStyle, cx);
             cx.notify();
         }
     }
@@ -3977,6 +4008,7 @@ impl YaldaGpuiView {
         self.notify_linear_views(MissReason::Refresh, cx);
         self.notify_cog_views(MissReason::Refresh, cx);
         self.notify_keymap_views(MissReason::Refresh, cx);
+        self.notify_agent_stats_view(MissReason::Refresh, cx);
         self.notify_system_console(MissReason::Refresh, cx);
         self.save_settings();
         cx.notify();
@@ -5641,6 +5673,7 @@ impl YaldaGpuiView {
             Some(App::Linear(_)) => (linear_local_menu(), "LINEAR"),
             Some(App::Cog(_)) => (cog_local_menu(), "COG"),
             Some(App::Keymap(_)) => (keymap_local_menu(), "KEYBINDINGS"),
+            Some(App::AgentStats) => (with_tile_commands(Vec::new()), "AGENT STATS"),
             None => return,
         };
         self.transient_status = None;
@@ -5735,6 +5768,7 @@ impl YaldaGpuiView {
             // The keymap tile captures text while filtering or rebinding — the
             // leaders must be suppressed then so keys reach the box.
             Some(App::Keymap(_)) => self.keymap_captures_text(cx),
+            Some(App::AgentStats) => false,
             Some(App::Buffer(BufferApp::Viewing(_))) | None => false,
         }
     }

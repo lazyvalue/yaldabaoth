@@ -1,6 +1,7 @@
 //! The **jump palette** (`UXI-JumpPanel-9`) — `Cmd-P`'s type-to-filter dialog
-//! over the jump panel's ordinary navigable set: durable workspaces and the
-//! stable tiles they own, followed by the **Detached** tile collection.
+//! over the jump panel's navigable set: permanent system destinations, durable
+//! workspaces and the stable tiles they own, followed by the **Detached** tile
+//! collection.
 //!
 //! The palette is a pure alternate *input* onto that list. It builds its
 //! candidates directly from the ownership model, independent of which filtered
@@ -16,6 +17,9 @@ use super::*;
 /// a tile id names the exact stateful shell object in either ownership domain.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PaletteTarget {
+    /// The global Agent Stats singleton. It is a permanent system command, not
+    /// an ordinary tile candidate, even after its backing tile is materialized.
+    AgentStats,
     /// GLOBAL index into `workspace.workspaces` (the same index
     /// `select_workspace` takes). Only non-ephemeral workspaces become items.
     Workspace(usize),
@@ -132,6 +136,12 @@ impl YaldaGpuiView {
         detail: String,
         cx: &gpui::App,
     ) -> Option<PaletteItem> {
+        // Agent Stats is represented by the permanent system command inserted
+        // by `jump_palette_items`; suppress its materialized singleton tile so
+        // Cmd-P never shows two entries for the same destination.
+        if matches!(&window.content, App::AgentStats) {
+            return None;
+        }
         let (label, is_agent, status, archived) = match &window.content {
             App::Agent(tile) => {
                 let local = tile.session();
@@ -191,7 +201,14 @@ impl YaldaGpuiView {
     /// folder followed by its visible and hidden tiles, then every Detached tile. A selected jump
     /// panel activity tab never changes `Cmd-P` candidates.
     pub(crate) fn jump_palette_items(&self, cx: &gpui::App) -> Vec<PaletteItem> {
-        let mut items = Vec::new();
+        let mut items = vec![PaletteItem {
+            target: PaletteTarget::AgentStats,
+            label: "Agent Stats".to_string(),
+            detail: "System".to_string(),
+            is_agent: false,
+            status: None,
+            active: false,
+        }];
         for (idx, wsp) in self.workspace.workspaces.iter().enumerate() {
             let project = self.projects.name_of(wsp.project()).to_string();
             let workspace_label = wsp.display_label().to_string();
@@ -378,6 +395,7 @@ impl YaldaGpuiView {
         let target = items[idx].target.clone();
         self.clear_overlay();
         match target {
+            PaletteTarget::AgentStats => self.open_agent_stats(cx),
             PaletteTarget::Workspace(i) => self.select_workspace(i, cx),
             PaletteTarget::Tile(id) => self.jump_to_tile(id, cx),
         }
@@ -459,6 +477,13 @@ impl YaldaGpuiView {
                     Some(AgentDotStatus::WaitingForYou) => ready,
                     _ => st.dim,
                 };
+                let glyph = if matches!(&it.target, PaletteTarget::AgentStats) {
+                    "◫"
+                } else if it.is_agent {
+                    "✦"
+                } else {
+                    "⊞"
+                };
                 let target = it.target.clone();
                 let mut row = div()
                     .id(SharedString::from(format!("jump-palette-row-{row_n}")))
@@ -470,9 +495,13 @@ impl YaldaGpuiView {
                     .px_4()
                     .py_1()
                     .hover(|s| s.bg(sel_bg))
-                    .child(div().w(px(16.0)).flex_none().text_color(badge_color).child(
-                        SharedString::new_static(if it.is_agent { "✦" } else { "⊞" }),
-                    ))
+                    .child(
+                        div()
+                            .w(px(16.0))
+                            .flex_none()
+                            .text_color(badge_color)
+                            .child(SharedString::new_static(glyph)),
+                    )
                     .child(
                         div()
                             .flex_1()
@@ -502,6 +531,7 @@ impl YaldaGpuiView {
                         move |this, _ev, _w, cx| {
                             this.clear_overlay();
                             match target.clone() {
+                                PaletteTarget::AgentStats => this.open_agent_stats(cx),
                                 PaletteTarget::Workspace(i) => this.select_workspace(i, cx),
                                 PaletteTarget::Tile(id) => this.jump_to_tile(id, cx),
                             }

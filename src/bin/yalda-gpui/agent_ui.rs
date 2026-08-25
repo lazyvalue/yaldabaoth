@@ -310,6 +310,10 @@ impl YaldaGpuiView {
                     let recovered_labels = this.recover_labels_from_roster(cx);
                     let recovered_providers = this.recover_providers_from_roster(cx);
                     let materialized = this.materialize_roster_detached_tiles();
+                    // The successful server roster is authoritative even when
+                    // Agent Stats has never been opened. Persist this lifecycle
+                    // boundary so a GUI restart does not erase fleet history.
+                    this.refresh_agent_stats_agents(cx);
                     if materialized {
                         this.save_workspace_state();
                     }
@@ -3340,6 +3344,7 @@ impl YaldaGpuiView {
         // (it has no `cx`); this is where the flag becomes a request.
         self.drain_autoname_requests(cx);
         if did_work {
+            self.refresh_agent_stats_agents(cx);
             cx.notify();
         }
         did_work
@@ -3520,6 +3525,7 @@ impl YaldaGpuiView {
         self.drain_autoname_requests(cx);
 
         if has_events {
+            self.refresh_agent_stats_agents(cx);
             cx.notify();
         }
         more_pending

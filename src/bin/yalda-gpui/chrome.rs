@@ -86,6 +86,7 @@ impl YaldaGpuiView {
             App::Linear(tile) => self.render_linear(leaf_root, tile, cx).into_any_element(),
             App::Cog(tile) => self.render_cog(leaf_root, tile, cx).into_any_element(),
             App::Keymap(tile) => self.render_keymap(leaf_root, tile, cx).into_any_element(),
+            App::AgentStats => self.render_agent_stats(leaf_root, cx).into_any_element(),
         };
         // Tag the LIVE content so the layout probe can assert it paints (the
         // semantic-zoom guard `plane_card_zoom_paints_placeholders_not_live_content`
@@ -181,10 +182,24 @@ impl YaldaGpuiView {
         let content = match self.workspace.workspaces[workspace_idx].view {
             // Columns: equal-width columns (no primary area). Tiling: dwm-style
             // primary/stack. Both share `render_columns`; `use_primary` selects.
-            workspace::WorkspaceView::Columns => self
-                .render_columns(root, layout, focused_id, attach_focus, rail_focusable, false, cx),
-            workspace::WorkspaceView::Tiling => self
-                .render_columns(root, layout, focused_id, attach_focus, rail_focusable, true, cx),
+            workspace::WorkspaceView::Columns => self.render_columns(
+                root,
+                layout,
+                focused_id,
+                attach_focus,
+                rail_focusable,
+                false,
+                cx,
+            ),
+            workspace::WorkspaceView::Tiling => self.render_columns(
+                root,
+                layout,
+                focused_id,
+                attach_focus,
+                rail_focusable,
+                true,
+                cx,
+            ),
             workspace::WorkspaceView::Monocle => {
                 self.render_monocle(root, layout, focused_id, attach_focus, rail_focusable, cx)
             }
@@ -1063,6 +1078,7 @@ impl YaldaGpuiView {
             App::Linear(tile) => tile.title(),
             App::Cog(tile) => tile.title(),
             App::Keymap(tile) => tile.title(),
+            App::AgentStats => "Agent Stats".to_string(),
         }
     }
 
@@ -1087,6 +1103,7 @@ impl YaldaGpuiView {
             App::Linear(_) => "◈",
             App::Cog(_) => "⚙",
             App::Keymap(_) => "⌘",
+            App::AgentStats => "◫",
         }
     }
 

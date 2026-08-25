@@ -18712,10 +18712,8 @@ fn topic_popup_message_box_navigates_and_accepts_without_submit(cx: &mut TestApp
         v.topic_completions = test_topic_bindings();
         v.with_session(id, cx, |c| {
             c.sent_history = vec!["old message".into()];
-            c.input_surface = InputSurface::with_draft(
-                crate::InputModeKind::Chatbox,
-                "ask %projects/cog",
-            );
+            c.input_surface =
+                InputSurface::with_draft(crate::InputModeKind::Chatbox, "ask %projects/cog");
             c.focus = AgentFocus::Compose;
             c.topic_query_refresh_active = true;
         });
@@ -18744,7 +18742,10 @@ fn topic_popup_message_box_navigates_and_accepts_without_submit(cx: &mut TestApp
     key(&view, vcx, "enter");
     view.read_with(vcx, |v, cx| {
         v.read_session(id, cx, |c| {
-            assert_eq!(c.input_surface.compose().text(), "ask projects/cog::roadmap");
+            assert_eq!(
+                c.input_surface.compose().text(),
+                "ask projects/cog::roadmap"
+            );
             assert!(
                 matches!(c.turn_phase, crate::TurnPhase::Idle),
                 "accepting a completion does not submit"
@@ -18757,10 +18758,8 @@ fn topic_popup_message_box_navigates_and_accepts_without_submit(cx: &mut TestApp
     // A fresh eligible query re-opens; Esc dismisses without editing/submitting.
     view.update(vcx, |v, cx| {
         v.with_session(id, cx, |c| {
-            c.input_surface = InputSurface::with_draft(
-                crate::InputModeKind::Chatbox,
-                "ask %projects/cog",
-            );
+            c.input_surface =
+                InputSurface::with_draft(crate::InputModeKind::Chatbox, "ask %projects/cog");
             c.topic_popup_dismissed = false;
         });
     });
@@ -18788,10 +18787,8 @@ fn topic_popup_worksheet_accepts_and_paints(cx: &mut TestAppContext) {
     view.update(vcx, |v, cx| {
         v.topic_completions = test_topic_bindings();
         v.with_session(id, cx, |c| {
-            c.input_surface = InputSurface::with_draft(
-                crate::InputModeKind::Worksheet,
-                "route %projects/cog/m",
-            );
+            c.input_surface =
+                InputSurface::with_draft(crate::InputModeKind::Worksheet, "route %projects/cog/m");
             c.focus = AgentFocus::Compose;
             c.you_block_open = true;
         });
@@ -20659,8 +20656,284 @@ fn keymap_body_is_cached_and_self_invalidates(cx: &mut TestAppContext) {
     );
 }
 
+/// UXI-AgentStats-3: the expensive telemetry body is a cached child. Shell-only
+/// repaint stays flat; changing the view-owned tab invalidates exactly that
+/// child through its mutation-site notify.
+#[gpui::test]
+fn agent_stats_cached_body_only_rerenders_for_owned_inputs(cx: &mut TestAppContext) {
+    crate::perf_reset("agent_stats");
+    let (view, vcx) = boot_browser(cx);
+    view.update(vcx, |v, cx| v.open_agent_stats(cx));
+    vcx.run_until_parked();
+
+    let base = crate::perf_render_count("agent_stats");
+    assert!(base >= 1, "Agent Stats must render after opening");
+    view.update(vcx, |_v, cx| cx.notify());
+    vcx.run_until_parked();
+    assert_eq!(
+        crate::perf_render_count("agent_stats"),
+        base,
+        "a root-only repaint must reuse the cached Agent Stats body"
+    );
+
+    let stats = view
+        .read_with(vcx, |v, _| v.agent_stats_view.clone())
+        .expect("Agent Stats cached body must exist");
+    stats.update(vcx, |stats, cx| {
+        stats.select_tab(crate::AgentStatsTab::Repository, cx)
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        crate::perf_render_count("agent_stats"),
+        base + 1,
+        "changing body-owned tab state must re-render the child once"
+    );
+}
+
+/// UXI-AgentStats-1/-4: every shell entry targets one materialized tile, that
+/// tile is suppressed from the ordinary Cmd-P list, and its persisted kind
+/// restores as Agent Stats rather than degrading into a Buffer.
+#[gpui::test]
+fn agent_stats_system_row_and_cmd_p_open_one_singleton(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_browser(cx);
+    view.update(vcx, |v, cx| {
+        v.open_jump_palette_impl(cx);
+        v.activate_jump_palette_selection(cx);
+    });
+    vcx.run_until_parked();
+
+    crate::layout_probe_begin();
+    view.update(vcx, |_v, cx| cx.notify());
+    vcx.run_until_parked();
+    let (x, y, w, h) =
+        crate::layout_probe_get("jump-agent-stats").expect("Agent Stats system row painted");
+    crate::layout_probe_end();
+    let at = point(px(x + w / 2.0), px(y + h / 2.0));
+    vcx.simulate_mouse_move(at, None, gpui::Modifiers::default());
+    vcx.simulate_click(at, gpui::Modifiers::default());
+    vcx.run_until_parked();
+
+    view.read_with(vcx, |v, cx| {
+        let stats_tiles = v
+            .workspace
+            .all_window_ids()
+            .into_iter()
+            .filter(|id| {
+                v.workspace
+                    .tile(*id)
+                    .is_some_and(|tile| matches!(&tile.content, crate::App::AgentStats))
+            })
+            .count();
+        assert_eq!(stats_tiles, 1, "opening twice must keep one stats tile");
+        let palette_targets = v
+            .jump_palette_items(cx)
+            .into_iter()
+            .filter(|item| matches!(&item.target, crate::PaletteTarget::AgentStats))
+            .count();
+        assert_eq!(
+            palette_targets, 1,
+            "Cmd-P must show one permanent system target and no ordinary duplicate"
+        );
+    });
+
+    view.update(vcx, |v, _cx| {
+        let persisted = crate::snapshot_content(&crate::App::AgentStats, &|_| None);
+        let json = serde_json::to_value(&persisted).expect("serialize Agent Stats kind");
+        assert_eq!(json["kind"], "agent_stats");
+        let theme = v.theme.clone();
+        let restored = crate::restore_content(&mut v.workspace, &theme, persisted);
+        assert!(matches!(restored, crate::App::AgentStats));
+    });
+}
+
 // ── Session recap (recap-panel, UXI-AgentTile-15) ──────────────────────────────────
 //
+/// UXI-AgentStats-5: collection is independent of tile materialization and the
+/// bounded telemetry document restores both pages into a reconstructed root.
+/// The source assertions happen synchronously in `open_agent_stats`, before its
+/// fresh repository scan can complete, which pins the reboot handoff rather
+/// than merely testing the store in isolation.
+#[gpui::test]
+fn agent_stats_restores_durable_observations_before_fresh_collection(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("temp telemetry dir");
+    let telemetry_path = temp.path().join("telemetry").join("v1.json");
+    let repository_root = std::env::current_dir().expect("test repository cwd");
+    let repository_scan = crate::scan_repository(&repository_root);
+    assert!(
+        matches!(repository_scan, crate::RepositoryScan::Ready(_)),
+        "the harness worktree must supply a real repository observation"
+    );
+
+    crate::with_telemetry_store_path(telemetry_path.clone(), || {
+        let (first_view, first_vcx) = boot_browser(cx);
+        add_free_session(&first_view, first_vcx, "durable-agent");
+        first_view.update(first_vcx, |view, cx| {
+            assert!(
+                view.agent_stats_view.is_none(),
+                "telemetry collection must not materialize the Agent Stats tile"
+            );
+            view.refresh_agent_stats_agents(cx);
+            assert!(
+                view.agent_stats_view.is_none(),
+                "closed-tile collection must remain independent of the UI"
+            );
+            let latest = view
+                .telemetry_store
+                .latest_agent()
+                .expect("closed-tile refresh records an agent observation");
+            assert_eq!(latest.snapshot.agents.len(), 1);
+            assert_eq!(latest.snapshot.agents[0].label, "durable-agent");
+            assert!(
+                view.telemetry_store
+                    .record_repository(crate::unix_millis_now(), &repository_scan),
+                "the real repository analysis must enter the durable store"
+            );
+            // The production GUI clones this same document to its background
+            // writer. Saving synchronously here keeps the test-only path
+            // override on this thread while still exercising production I/O.
+            view.telemetry_store
+                .save()
+                .expect("save production telemetry document");
+        });
+        assert!(
+            telemetry_path.is_file(),
+            "telemetry was written to temp only"
+        );
+
+        let loaded = crate::TelemetryStore::load();
+        assert_eq!(
+            loaded
+                .latest_agent()
+                .expect("saved agent observation")
+                .snapshot
+                .agents[0]
+                .label,
+            "durable-agent"
+        );
+        assert!(
+            loaded.latest_repository(&repository_root).is_some(),
+            "saved repository observation round-trips by normalized root"
+        );
+
+        crate::perf_reset("agent_stats");
+        let (restored_view, restored_vcx) = boot_browser(cx);
+        restored_view.update(restored_vcx, |view, cx| view.open_agent_stats(cx));
+
+        // Do not park the executor before these checks: opening schedules a
+        // fresh scan, but the first user-visible state must be the durable
+        // observation rather than a loading/empty flash.
+        restored_view.read_with(restored_vcx, |view, cx| {
+            let stats = view
+                .agent_stats_view
+                .as_ref()
+                .expect("production open path creates the cached stats body")
+                .read(cx);
+            assert_eq!(
+                stats.agent_observation_source(),
+                Some(crate::ObservationSource::Restored)
+            );
+            assert_eq!(
+                stats
+                    .agents()
+                    .expect("restored agent fleet")
+                    .agents
+                    .first()
+                    .map(|agent| agent.label.as_str()),
+                Some("durable-agent")
+            );
+            match stats.repository() {
+                crate::RepositoryStatsState::Observed {
+                    observation,
+                    source: crate::ObservationSource::Restored,
+                    refreshing: true,
+                    refresh_error: None,
+                } => assert_eq!(observation.snapshot.root, repository_root),
+                state => panic!("expected restored repository while refresh starts, got {state:?}"),
+            }
+        });
+
+        restored_vcx.run_until_parked();
+        assert!(
+            crate::perf_render_count("agent_stats") >= 1,
+            "the reconstructed Agent Stats body must paint"
+        );
+        restored_view.read_with(restored_vcx, |view, cx| {
+            let stats = view
+                .agent_stats_view
+                .as_ref()
+                .expect("restored stats body remains materialized")
+                .read(cx);
+            assert_eq!(
+                stats.agent_observation_source(),
+                Some(crate::ObservationSource::Restored),
+                "painting must not replace durable agent facts before a live collection"
+            );
+        });
+    });
+}
+
+/// UXI-AgentStats-2/-3: opening the production tile enters an explicit
+/// repository loading state, and only the newest asynchronous scan generation
+/// may replace it. Errors stay explicit instead of masquerading as empty data.
+#[gpui::test]
+fn agent_stats_repository_refresh_is_explicit_and_generation_gated(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_browser(cx);
+    view.update(vcx, |view, cx| view.open_agent_stats(cx));
+
+    let generation = view.read_with(vcx, |view, cx| {
+        let stats = view
+            .agent_stats_view
+            .as_ref()
+            .expect("open creates Agent Stats")
+            .read(cx);
+        assert!(
+            matches!(
+                stats.repository(),
+                crate::RepositoryStatsState::Loading { .. }
+            ),
+            "a repository scan must start in an explicit loading state"
+        );
+        view.agent_stats_scan_generation
+    });
+
+    let stale = crate::RepositoryScan::NotGit {
+        cwd: std::path::PathBuf::from("/stale-repository-result"),
+    };
+    assert!(!view.update(vcx, |view, cx| {
+        view.apply_agent_stats_repository(generation.wrapping_sub(1), stale, cx)
+    }));
+    view.read_with(vcx, |view, cx| {
+        let stats = view.agent_stats_view.as_ref().unwrap().read(cx);
+        assert!(
+            matches!(
+                stats.repository(),
+                crate::RepositoryStatsState::Loading { .. }
+            ),
+            "a stale completion must not replace the current loading state"
+        );
+    });
+
+    let error = crate::RepositoryCommandError {
+        operation: crate::RepositoryOperation::ReadHistory,
+        detail: "synthetic bounded failure".to_string(),
+    };
+    assert!(view.update(vcx, |view, cx| {
+        view.apply_agent_stats_repository(
+            generation,
+            crate::RepositoryScan::CommandError(error.clone()),
+            cx,
+        )
+    }));
+    view.read_with(vcx, |view, cx| {
+        let stats = view.agent_stats_view.as_ref().unwrap().read(cx);
+        assert!(matches!(
+            stats.repository(),
+            crate::RepositoryStatsState::Scan(crate::RepositoryScan::CommandError(actual))
+                if actual == &error
+        ));
+    });
+}
+
 // A recap is an LLM prose summary of ONE agent session, keyed by `SessionId`
 // (`self.recaps`) and rendered INSIDE that session's agent tile above the
 // subagents/tasks panels — re-runnable and dismissed. The live generation runs
@@ -25435,20 +25708,32 @@ fn jump_palette_arrows_select_and_enter_activates_the_selection(cx: &mut TestApp
     vcx.simulate_keystrokes("cmd-p");
     vcx.run_until_parked();
 
-    // Empty query ⇒ folder, child tile, then the next folder. Select beta's
-    // workspace row, not alpha's first child tile.
-    let (third_label, started_on) = view.update(vcx, |v, cx| {
+    // Empty query keeps panel order, including permanent System targets.
+    // Select beta's workspace row rather than depending on a fixed index.
+    let (target_rank, target_label, started_on) = view.update(vcx, |v, cx| {
         let (items, ranked) = v.jump_palette_ranked(cx);
         assert!(ranked.len() >= 3, "empty query lists everything");
-        (items[ranked[2]].label.clone(), v.workspace.active_workspace)
+        let target_rank = ranked
+            .iter()
+            .position(|index| matches!(items[*index].target, crate::PaletteTarget::Workspace(1)))
+            .expect("beta workspace is present in the palette");
+        assert!(target_rank > 0, "beta is not the initial highlighted row");
+        (
+            target_rank,
+            items[ranked[target_rank]].label.clone(),
+            v.workspace.active_workspace,
+        )
     });
 
-    vcx.simulate_keystrokes("down down");
+    let downs = std::iter::repeat_n("down", target_rank)
+        .collect::<Vec<_>>()
+        .join(" ");
+    vcx.simulate_keystrokes(&downs);
     vcx.run_until_parked();
     view.update(vcx, |v, _| {
         assert_eq!(
             v.jump_palette_ref().unwrap().selected,
-            2,
+            target_rank,
             "down moves the highlight"
         );
         assert_eq!(
@@ -25466,7 +25751,7 @@ fn jump_palette_arrows_select_and_enter_activates_the_selection(cx: &mut TestApp
             .to_string()
     });
     assert_eq!(
-        landed, third_label,
+        landed, target_label,
         "enter activates the HIGHLIGHTED row, not the top match"
     );
 }
@@ -26195,12 +26480,7 @@ fn cog_topic_browser_hierarchy_collapses_and_renders_typed_detail(cx: &mut TestA
                     "m1",
                     "Status note",
                 ),
-                cog_test_topic(
-                    "personal::team",
-                    crate::CogTopicKind::Chat,
-                    "c1",
-                    "Friends",
-                ),
+                cog_test_topic("personal::team", crate::CogTopicKind::Chat, "c1", "Friends"),
             ])))),
             cx,
         );
@@ -26372,7 +26652,10 @@ fn cog_agents_tab_reads_delivery_and_mail(cx: &mut TestAppContext) {
         crate::layout_probe_get("cog-agent-mail").expect("agent mail did not paint");
     let mail_entry = crate::layout_probe_get("cog-agent-mail-entry");
     crate::layout_probe_end();
-    assert!(detail_height > 180.0, "agent detail is non-trivial: {detail_height}");
+    assert!(
+        detail_height > 180.0,
+        "agent detail is non-trivial: {detail_height}"
+    );
     assert!(mail_height > 80.0, "mail cards are readable: {mail_height}");
     assert!(mail_entry.is_some(), "a readable mail-entry card paints");
 
@@ -26404,7 +26687,10 @@ fn cog_agents_tab_reads_delivery_and_mail(cx: &mut TestAppContext) {
         crate::layout_probe_get("cog-agent-mail").expect("empty-mail state did not paint");
     crate::layout_probe_end();
     assert!(empty_mail_height > 20.0, "friendly no-mail state paints");
-    assert!(empty_mail_height < mail_height, "empty mail is distinct from a thread");
+    assert!(
+        empty_mail_height < mail_height,
+        "empty mail is distinct from a thread"
+    );
 
     view.update(vcx, |v, cx| {
         v.cog_apply(
@@ -27144,9 +27430,7 @@ fn cog_tile_global_state(
     vcx: &mut gpui::VisualTestContext,
 ) -> (u64, Option<i64>, bool) {
     view.update(vcx, |v, _| match v.workspace.focused_content() {
-        Some(crate::App::Cog(tile)) => {
-            (tile.events_gen, tile.events_cursor, tile.events_connected)
-        }
+        Some(crate::App::Cog(tile)) => (tile.events_gen, tile.events_cursor, tile.events_connected),
         _ => panic!("expected a Cog tile"),
     })
 }
@@ -27391,7 +27675,10 @@ fn cog_global_events_resume_and_invalidate_current_projection(cx: &mut TestAppCo
         v.cog_push_global_event(wid, generation, event(42), cx);
     });
     let (_, refreshing, pending) = cog_tile_live_state(&view, vcx);
-    assert!(refreshing, "first event starts an immediate atomic Home read");
+    assert!(
+        refreshing,
+        "first event starts an immediate atomic Home read"
+    );
     assert!(pending, "second event coalesces into one trailing read");
     assert_eq!(cog_tile_global_state(&view, vcx).1, Some(42));
 
@@ -27415,7 +27702,11 @@ fn cog_global_events_resume_and_invalidate_current_projection(cx: &mut TestAppCo
     });
     let (_, cursor, connected) = cog_tile_global_state(&view, vcx);
     assert!(!connected, "disconnect enters bounded fallback mode");
-    assert_eq!(cursor, Some(42), "reconnect retains the last applied cursor");
+    assert_eq!(
+        cursor,
+        Some(42),
+        "reconnect retains the last applied cursor"
+    );
 }
 
 /// UXI-Cog-1 (regression): a Cog tile whose first render runs WITHOUT an explicit

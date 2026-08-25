@@ -13,6 +13,13 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Deeper agent and repository telemetry** — `DEFERRED` (roadmap graph `b68`;
+  v1 shipped in [the 2026-08-25 worklog](worklog/2026-08-25-agent-repository-telemetry-v1.md)).
+  Add exact lifecycle and tool durations, provider token classes, normalized task
+  outcomes, empirical repository navigation traces, and evidence-based failure or
+  frustration analysis after v1 establishes a durable baseline. Keep repository
+  analysis generic; Fulcrum remains the primary qualification corpus.
+
 - **Autocomplete Cog Topic paths in Agent Tile inputs** — `NEEDS-RUNTIME` (2026-08-24
   via `/new-ux`; `UXI-AgentTile-43`; Cog graph `o2q`). Captured verbatim: *"I
   want autocomplete for cog topic paths in agent tile inputs (chat and worksheet
