@@ -921,6 +921,10 @@ pub(crate) enum PersistedKind {
     /// so restore just opens a fresh one.
     #[serde(rename = "keymap")]
     Keymap {},
+    /// The global Agent Stats singleton. Its tab and snapshots are transient;
+    /// persistence restores one openable shell tile and refreshes live data.
+    #[serde(rename = "agent_stats")]
+    AgentStats {},
 }
 
 /// Persisted shadow of `BufferApp`'s mode (B1). `viewing`/`editing` carry the
@@ -1478,6 +1482,7 @@ pub(crate) fn snapshot_content(content: &App, resolve: SidResolver) -> Persisted
             state: tile.remembered(),
         },
         App::Keymap(_tile) => PersistedKind::Keymap {},
+        App::AgentStats => PersistedKind::AgentStats {},
     }
 }
 
@@ -1694,6 +1699,7 @@ pub(crate) fn restore_content(
         PersistedKind::Linear {} => App::Linear(LinearTile::new()),
         PersistedKind::Cog { state } => App::Cog(CogTile::restored(state)),
         PersistedKind::Keymap {} => App::Keymap(KeymapTile::new()),
+        PersistedKind::AgentStats {} => App::AgentStats,
     }
 }
 

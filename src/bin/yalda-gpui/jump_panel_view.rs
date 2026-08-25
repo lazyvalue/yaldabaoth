@@ -499,7 +499,9 @@ impl YaldaGpuiView {
                 roster_entered_at.or(local.and_then(|(_, started, _)| started))
             } else if local_awaiting {
                 // Local turn leads the SessionBusy broadcast.
-                local.and_then(|(_, started, _)| started).or(roster_entered_at)
+                local
+                    .and_then(|(_, started, _)| started)
+                    .or(roster_entered_at)
             } else {
                 // Idle: the roster's idle transition is identity-stable across a
                 // fresh attach; fall back to the local waiting_since.
@@ -841,20 +843,24 @@ impl YaldaGpuiView {
                 .map(|(index, wsp)| {
                     let mut tiles = Vec::new();
                     wsp.layout.for_each_leaf(&mut |window| {
-                        tiles.push(self.jump_tile_row(
-                            window,
-                            &tile_agent_rows,
-                            JumpTilePlacement::AttachedVisible,
-                            cx,
-                        ));
+                        if !matches!(&window.content, App::AgentStats) {
+                            tiles.push(self.jump_tile_row(
+                                window,
+                                &tile_agent_rows,
+                                JumpTilePlacement::AttachedVisible,
+                                cx,
+                            ));
+                        }
                     });
                     for hidden in &wsp.hidden_tiles {
-                        tiles.push(self.jump_tile_row(
-                            &hidden.window,
-                            &tile_agent_rows,
-                            JumpTilePlacement::AttachedHidden,
-                            cx,
-                        ));
+                        if !matches!(&hidden.window.content, App::AgentStats) {
+                            tiles.push(self.jump_tile_row(
+                                &hidden.window,
+                                &tile_agent_rows,
+                                JumpTilePlacement::AttachedHidden,
+                                cx,
+                            ));
+                        }
                     }
                     // Apply the user's drag order (UXI-JumpPanel-28): a STABLE sort
                     // by rank in `jump_tile_order`, so unlisted tiles keep their
@@ -908,7 +914,9 @@ impl YaldaGpuiView {
                 .workspace
                 .detached_tiles
                 .iter()
-                .filter(|tile| tile.project() == id)
+                .filter(|tile| {
+                    tile.project() == id && !matches!(&tile.window.content, App::AgentStats)
+                })
                 .map(|tile| {
                     self.jump_tile_row(
                         &tile.window,
@@ -1783,6 +1791,33 @@ impl YaldaGpuiView {
                 .child(SharedString::new_static("System console"))
                 .on_click(cx.listener(|this, _ev, _window, cx| {
                     this.open_system_console(cx);
+                }))
+                .into_any_element(),
+        ));
+        col = col.child(probe_bounds(
+            "jump-agent-stats",
+            div()
+                .id("jump-agent-stats")
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_1()
+                .cursor_pointer()
+                .hover(|s| s.bg(sel_bg))
+                .text_color(st.fg)
+                .font_family(st.mono.clone())
+                .text_size(px(st.pt))
+                .child(
+                    div()
+                        .text_color(st.err)
+                        .font_weight(FontWeight::BOLD)
+                        .child(SharedString::new_static("◫")),
+                )
+                .child(SharedString::new_static("Agent Stats"))
+                .on_click(cx.listener(|this, _ev, _window, cx| {
+                    this.open_agent_stats(cx);
                 }))
                 .into_any_element(),
         ));
