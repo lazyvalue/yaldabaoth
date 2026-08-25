@@ -2044,11 +2044,10 @@ struct YaldaGpuiView {
     /// per session suffices — multi-tile splits need no extra logic.
     transcript_views: HashMap<SessionId, Entity<TranscriptView>>,
     /// Installation-wide Cog Topic address catalog for Agent compose
-    /// autocomplete (UXI-AgentTile-43). Loaded lazily off the paint thread on
-    /// the first path-shaped compose token and shared by every Agent session.
+    /// autocomplete (UXI-AgentTile-43). Refreshed off the paint thread for every
+    /// newly opened percent query and shared by every Agent session.
     topic_completions: Vec<CogTopicBinding>,
-    topic_completions_loaded: bool,
-    topic_completions_loading: bool,
+    topic_completions_generation: u64,
     /// Scroll state for the root-level jump panel (jump-panel;
     /// spec-jump-panel.md). The panel itself is rendered inline (it's cheap —
     /// see `render_jump_panel`), so only its scroll position is retained here.
@@ -2198,8 +2197,7 @@ impl YaldaGpuiView {
             agent_roster: AgentRoster::default(),
             transcript_views: HashMap::new(),
             topic_completions: Vec::new(),
-            topic_completions_loaded: false,
-            topic_completions_loading: false,
+            topic_completions_generation: 0,
             jump_panel_scroll: ScrollHandle::new(),
             jump_panel_visible: true,
             jump_cwd_order: Vec::new(),
@@ -2268,8 +2266,7 @@ impl YaldaGpuiView {
             agent_roster: AgentRoster::default(),
             transcript_views: HashMap::new(),
             topic_completions: Vec::new(),
-            topic_completions_loaded: false,
-            topic_completions_loading: false,
+            topic_completions_generation: 0,
             jump_panel_scroll: ScrollHandle::new(),
             jump_panel_visible: true,
             jump_cwd_order: Vec::new(),

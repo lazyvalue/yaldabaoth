@@ -795,25 +795,28 @@ filter, dismissed / Normal-mode gates). NCs observed RED.
 **Message Box** and the inline **Worksheet** You-block — autocomplete raw Cog Topic
 addresses from the installation-wide Topic catalog:
 
-1. **Live source and loading.** The first eligible query asks the existing Cog
+1. **Live source and loading.** Every newly opened `%` query asks the existing Cog
    client for `cog topic list "" --limit 1000` on the background executor, never
-   the paint thread. The resulting address/kind/name catalog is shared across
-   Agent sessions for the rest of the app run, sorted and de-duplicated by exact
-   address. While loading or when Cog is unavailable, no empty/error popup steals
-   input; a failed load may retry on a later eligible edit. This uses the deployed
-   read contract and requires no Cog-side feature.
+   the paint thread. Its address/kind/name response atomically replaces the shared
+   catalog, sorted and de-duplicated by exact address. Edits to the suffix reuse
+   the refresh started for that query instead of spawning a subprocess per
+   keystroke; leaving and later starting another `%` query refreshes again. While
+   loading or when Cog is unavailable, no empty/error popup steals input; a failed
+   load may retry on a later newly opened query. This uses the deployed read
+   contract and requires no Cog-side feature.
 2. **Token-local query and filter.** The query is the whitespace-delimited token
-   containing the compose caret. It becomes eligible only after it contains `/`
-   or `::`, avoiding popups over ordinary prose. Rows are catalog entries whose
-   full address starts with that raw token (case-sensitive, matching Cog address
-   semantics), in deterministic address order. The bare leading `/token`
-   recognized by `UXI-AgentTile-42` remains slash-command completion and wins.
-   Empty matches mean no popup.
+   containing the compose caret, and it is eligible only when that token begins
+   with `%`. The suffix after `%` is the raw address prefix; bare `%` shows the
+   whole catalog. Rows are catalog entries whose full address starts with that
+   suffix (case-sensitive, matching Cog address semantics), in deterministic
+   address order. `/token` remains exclusively the slash-command completion from
+   `UXI-AgentTile-42`. Empty matches mean no popup.
 3. **Keys and replacement.** While Topic rows are visible, `Up`/`Down` move the
    clamped selection before history recall; `Tab` or `Enter` accepts the selected
-   row without submitting and replaces only the query token, preserving all text
-   around it and placing the caret immediately after the full address; a second
-   Enter submits normally. `Esc` dismisses the current query. Any compose edit
+   row without submitting and replaces the whole `%…` query token with the raw
+   Topic address, preserving all text around it and placing the caret immediately
+   after the full address; a second Enter submits normally. `Esc` dismisses the
+   current query. Any compose edit
    re-filters, resets selection, and clears dismissal.
 4. **Render.** The popup uses the same tail completion region above the input as
    slash commands in both placements. Each row shows the full address,
@@ -832,8 +835,9 @@ agent prompts. Typing them from memory is slow and typo-prone; using the same
 address catalog as the Cog browser makes every Agent input a reliable route picker
 without inventing a second addressing convention.
 
-**Status.** `implemented` (2026-08-24; Cog graph `o2q`). Headless probes cover
-both placements; exact runtime glyph/color appearance remains gap #1.
+**Status.** `implemented` (2026-08-24; initial Cog graph `o2q`, explicit-trigger
+and refresh follow-up `wiv`). Headless probes cover both placements; exact runtime
+glyph/color appearance remains gap #1.
 
 **Enforcement.** Headless guards in `verify_harness.rs` drive the real
 `handle_claude_key` path in Message Box and Worksheet, asserting popup navigation,

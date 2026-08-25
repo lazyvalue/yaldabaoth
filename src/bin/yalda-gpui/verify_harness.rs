@@ -18588,9 +18588,10 @@ fn topic_popup_message_box_navigates_and_accepts_without_submit(cx: &mut TestApp
             c.sent_history = vec!["old message".into()];
             c.input_surface = InputSurface::with_draft(
                 crate::InputModeKind::Chatbox,
-                "ask projects/cog",
+                "ask %projects/cog",
             );
             c.focus = AgentFocus::Compose;
+            c.topic_query_refresh_active = true;
         });
     });
     let key = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext, k: &str| {
@@ -18632,7 +18633,7 @@ fn topic_popup_message_box_navigates_and_accepts_without_submit(cx: &mut TestApp
         v.with_session(id, cx, |c| {
             c.input_surface = InputSurface::with_draft(
                 crate::InputModeKind::Chatbox,
-                "ask projects/cog",
+                "ask %projects/cog",
             );
             c.topic_popup_dismissed = false;
         });
@@ -18641,7 +18642,7 @@ fn topic_popup_message_box_navigates_and_accepts_without_submit(cx: &mut TestApp
     view.read_with(vcx, |v, cx| {
         let catalog = v.topic_completions.clone();
         v.read_session(id, cx, |c| {
-            assert_eq!(c.input_surface.compose().text(), "ask projects/cog");
+            assert_eq!(c.input_surface.compose().text(), "ask %projects/cog");
             assert!(c.topic_popup_rows(&catalog).is_empty());
             assert!(matches!(c.turn_phase, crate::TurnPhase::Idle));
         })
@@ -18663,7 +18664,7 @@ fn topic_popup_worksheet_accepts_and_paints(cx: &mut TestAppContext) {
         v.with_session(id, cx, |c| {
             c.input_surface = InputSurface::with_draft(
                 crate::InputModeKind::Worksheet,
-                "route projects/cog/m",
+                "route %projects/cog/m",
             );
             c.focus = AgentFocus::Compose;
             c.you_block_open = true;
@@ -18693,6 +18694,39 @@ fn topic_popup_worksheet_accepts_and_paints(cx: &mut TestAppContext) {
         })
         .unwrap();
     });
+}
+
+/// UXI-AgentTile-43 (REAL dispatch): opening a percent query invalidates stale
+/// cached rows before the fresh background response arrives, and leaving the
+/// query rearms the next percent trigger.
+#[gpui::test]
+fn topic_popup_percent_opening_refreshes_stale_catalog(cx: &mut TestAppContext) {
+    use crate::agent::{AgentFocus, InputSurface};
+    let (view, vcx, id, _s) = boot_with_transcript(cx);
+    view.update(vcx, |v, cx| {
+        v.topic_completions = test_topic_bindings();
+        v.with_session(id, cx, |c| {
+            c.input_surface = InputSurface::with_draft(crate::InputModeKind::Chatbox, "");
+            c.focus = AgentFocus::Compose;
+        });
+    });
+    let key = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext, k: &str| {
+        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(k), w, cx));
+    };
+
+    key(&view, vcx, "%");
+    assert!(
+        view.read_with(vcx, |v, _cx| v.topic_completions.is_empty()),
+        "a newly opened percent query discards stale catalog rows",
+    );
+
+    key(&view, vcx, "backspace");
+    view.update(vcx, |v, _cx| v.topic_completions = test_topic_bindings());
+    key(&view, vcx, "%");
+    assert!(
+        view.read_with(vcx, |v, _cx| v.topic_completions.is_empty()),
+        "leaving the query rearms a fresh request for the next percent trigger",
+    );
 }
 
 /// UXI-AgentTile-42 (n3a): the agent's advertised slash commands
