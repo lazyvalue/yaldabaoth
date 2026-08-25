@@ -35,10 +35,11 @@ has a distinct colour in both the left-list badge and the right-pane header.
 
 The body is a cached child entity (`CogView`, built on **yux**), so it re-renders
 only when its own payload / selection / scroll changes, not on unrelated typing.
-The cheap `CogTile` (title + monotonic `req` guard + the view handle) holds no
-payload; the loaded graph list / bundle lives in `CogView`. Fetches run on the
-background executor, never the paint thread; a monotonic `req` discards a stale
-response.
+The cheap `CogTile` holds no remote payload: it carries the title, monotonic
+request/liveness guards, subprocess handles, and a compact persistence shadow
+shared with `CogView`. Loaded Topic, Agent, Mail, Chat, and Graph data lives only
+in `CogView`. Fetches run on the background executor, never the paint thread; a
+monotonic `req` discards a stale response.
 
 Primary code home: `cog.rs` (subprocess client + data model + `CogTile`),
 `cog_ui.rs` (view-layer open/load/select/scroll/key methods), `cog_view.rs` (the
@@ -494,29 +495,38 @@ fold, visibility, and focus restoration by stable identity.
 
 ### UXI-Cog-17 — Every open Cog surface stays current
 
-**Statement.** A loaded graph remains event-driven through `cog graph watch`; each
-event coalesces a fresh bundle read. If that watcher cannot start or exits, bounded
-revalidation keeps the graph current. The current Cog contract has no global live
-stream for Topic hierarchy, Notes, Bulletins, Chats, registered Agents, delivery
-status, or Mail, so those visible browser surfaces revalidate as one atomic snapshot
-every 750 ms. Only one read plus one queued follow-up can exist per tile. Every
-result is guarded by both a unique tile token and the exact source/selection key,
-and an unchanged payload does not invalidate the cached body. Closing/replacing the
-tile cancels its task and graph child.
+**Statement.** Before the initial Home read, each tile captures
+`cog events --limit 0`, then follows `cog events --since <cursor> --follow` for
+installation-wide Topic, Graph/Note, Bulletin/Mail, Chat, and Agent mutations.
+Every new envelope advances the tile's global `event_id` cursor and immediately
+invalidates its current projection. Home reloads the hierarchy, directory, and
+selected detail as one atomic snapshot; Graph reloads its bundle in place. Only
+one read plus one queued follow-up can exist per tile, and Home results are guarded
+by both a unique tile token and the exact source/selection key.
 
-**Applies to.** `CogTile::{live_token, live_task, live_refreshing, live_pending}`;
-`CogLiveHome*`, `load_live_home`; `cog_start_live_revalidation`, `cog_live_tick`,
+The subscriber reconnects from its last applied cursor and is killed with the
+tile. While the command or daemon endpoint is unavailable, the current projection
+revalidates once per second; a connected feed gets a 30-second safety read. The
+graph-specific `cog graph watch` remains responsible for the visible event strip.
+An unchanged Home payload does not invalidate the cached body.
+
+**Applies to.** `CogTile::{live_token, live_task, live_refreshing, live_pending,
+events_watch, events_gen, events_connected, events_cursor}`; `CogLiveHome*`,
+`event_cursor`, `spawn_events`, `load_live_home`; `cog_start_live_revalidation`,
+`cog_start_events`, `cog_push_global_event`, `cog_invalidate_current`,
 `cog_apply_live_home`, `cog_watch_ended`; `CogView::{live_home_key,
 apply_live_home, update_bundle}` (`cog.rs`, `cog_ui.rs`, `cog_view.rs`).
 
-**Why.** The user requires Cog tiles to be always updated in real time. Graph SSE is
-used where Cog exposes it; bounded reconciliation is the compatibility bridge for
-the other upgraded Cog objects while a resumable global stream requested from the
-Cog builder is pending.
+**Why.** The user requires Cog tiles to be always updated in real time. The Cog
+builder supplied one resumable global feed after Yalda requested the missing
+contract; bounded reconciliation remains the compatibility bridge for a
+pre-feature daemon or disconnect.
 
 **Status.** implemented
 
-**Enforcement.** `cog_live_home_refresh_coalesces_and_rejects_stale_selection`
-drives the production tick/apply seams, proves burst coalescing, changes selection
-mid-read, and verifies the stale snapshot cannot alter the hierarchy before the
+**Enforcement.** `cog_global_events_resume_and_invalidate_current_projection`
+drives cursor capture, production invalidation, burst coalescing, disconnect, and
+rejection seams (negative control: remove event invalidation). The existing
+`cog_live_home_refresh_coalesces_and_rejects_stale_selection` changes selection
+mid-read and proves an old snapshot cannot alter the hierarchy before the
 current-key snapshot lands (negative control: remove the exact-key guard).

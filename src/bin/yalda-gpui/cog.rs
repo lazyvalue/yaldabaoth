@@ -650,6 +650,12 @@ impl EffStatus {
 pub(crate) enum CogFetch {
     /// Topic hierarchy + registered-address directory for the primary browser.
     Home(Box<CogHomeData>),
+    /// Production startup captures the installation cursor before Home so the
+    /// subsequent follow cannot miss a mutation racing the initial reads.
+    HomeAt {
+        home: Box<CogHomeData>,
+        cursor: Option<i64>,
+    },
     /// The graph explorer list (opening the tile / going back).
     Graphs(Vec<CogGraph>),
     /// A fully-loaded graph.
@@ -788,6 +794,18 @@ pub(crate) struct CogTile {
     pub(crate) live_pending: bool,
     /// Dropping the tile cancels its bounded non-graph revalidation loop.
     pub(crate) live_task: Option<Task<()>>,
+    /// Installation-wide `cog events --follow` child, kept for the tile's full
+    /// lifetime so Topic, Chat, Mail, Agent, and Graph mutations invalidate the
+    /// currently visible projection immediately.
+    pub(crate) events_watch: Option<std::process::Child>,
+    pub(crate) events_gen: u64,
+    pub(crate) events_connected: bool,
+    /// Startup cursor or last applied global event. Reused after disconnect so
+    /// the CLI resumes without a read/subscribe gap.
+    pub(crate) events_cursor: Option<i64>,
+    /// A global mutation arrived while the view was in a request-owned Loading
+    /// state. The completed request drains this into one trailing invalidation.
+    pub(crate) events_pending: bool,
 }
 
 impl CogTile {
@@ -816,6 +834,11 @@ impl CogTile {
             live_refreshing: false,
             live_pending: false,
             live_task: None,
+            events_watch: None,
+            events_gen: 0,
+            events_connected: false,
+            events_cursor: None,
+            events_pending: false,
         }
     }
 
@@ -833,6 +856,9 @@ impl Drop for CogTile {
         // A std `Child` does NOT kill on drop — do it explicitly so a closed /
         // replaced Cog tile never leaves an orphaned `cog graph watch` running.
         if let Some(mut child) = self.watch.take() {
+            let _ = child.kill();
+        }
+        if let Some(mut child) = self.events_watch.take() {
             let _ = child.kill();
         }
     }
@@ -919,6 +945,64 @@ pub(crate) fn load_home() -> Result<CogHomeData, String> {
         agents,
         agent_presence,
     })
+}
+
+#[derive(serde::Deserialize)]
+struct CogEventPage {
+    cursor: i64,
+}
+
+/// Capture the installation cursor without transferring history. Yalda does
+/// this before its first Home read and follows strictly after the cursor.
+pub(crate) fn event_cursor() -> Result<i64, String> {
+    cog_json::<CogEventPage>(&["events", "--limit", "0"]).map(|page| page.cursor)
+}
+
+/// Spawn the resumable installation-wide event feed. The CLI prints one JSON
+/// envelope per line and owns the HTTP/SSE protocol; Yalda owns process
+/// lifetime, generation guards, and reconnect from the last event id.
+pub(crate) fn spawn_events(
+    since: Option<i64>,
+) -> Result<
+    (
+        std::process::Child,
+        futures::channel::mpsc::UnboundedReceiver<String>,
+    ),
+    String,
+> {
+    let mut command = std::process::Command::new("cog");
+    command.arg("events");
+    let since_arg = since.map(|cursor| cursor.to_string());
+    if let Some(cursor) = &since_arg {
+        command.args(["--since", cursor]);
+    }
+    let mut child = command
+        .arg("--follow")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to start `cog events --follow`: {e}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "cog events --follow produced no stdout".to_string())?;
+    let (tx, rx) = futures::channel::mpsc::unbounded();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let reader = std::io::BufReader::new(stdout);
+        for line in reader.lines() {
+            match line {
+                Ok(line) if !line.trim().is_empty() => {
+                    if tx.unbounded_send(line).is_err() {
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    });
+    Ok((child, rx))
 }
 
 /// Revalidate the complete visible non-graph surface in one background pass.
