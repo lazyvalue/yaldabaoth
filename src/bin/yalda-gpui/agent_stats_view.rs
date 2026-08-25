@@ -7,6 +7,7 @@
 //! scan; neither concern belongs in this render component.
 
 use super::*;
+use std::path::Path;
 
 const MAX_AGENT_ROWS: usize = 200;
 const ROW_TEXT_PT: f32 = 11.0;
@@ -15,6 +16,7 @@ const ROW_TEXT_PT: f32 = 11.0;
 pub(crate) enum AgentStatsTab {
     #[default]
     Agents,
+    Inactive,
     Repository,
 }
 
@@ -29,6 +31,20 @@ struct AgentStatsAgentObservation {
     captured_at_unix_ms: u64,
     snapshot: FleetMetricSnapshot,
     source: ObservationSource,
+}
+
+/// One generic repository source offered by Agent Stats. `key` is the
+/// normalized scan-input path and remains stable across catalog rebuilds;
+/// successful scans may resolve that input to a parent Git root in the durable
+/// observation. Registered projects win the display label while retained-only
+/// analyses use an honest path-derived label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RepositoryChoice {
+    pub(crate) key: String,
+    pub(crate) label: String,
+    pub(crate) root: PathBuf,
+    pub(crate) registered: bool,
+    pub(crate) has_observation: bool,
 }
 
 /// Repository-page state. `Empty` is distinct from `Loading`: it means there
@@ -53,6 +69,11 @@ pub(crate) struct AgentStatsView {
     root: WeakEntity<YaldaGpuiView>,
     active_tab: AgentStatsTab,
     agents: Option<AgentStatsAgentObservation>,
+    repository_choices: Vec<RepositoryChoice>,
+    selected_repository_key: Option<String>,
+    repository_selection_explicit: bool,
+    repository_picker_open: bool,
+    repository_picker_index: usize,
     repository: RepositoryStatsState,
     scroll: ScrollHandle,
 }
@@ -78,6 +99,11 @@ impl AgentStatsView {
                 snapshot: observation.snapshot,
                 source,
             }),
+            repository_choices: Vec::new(),
+            selected_repository_key: None,
+            repository_selection_explicit: false,
+            repository_picker_open: false,
+            repository_picker_index: 0,
             repository: RepositoryStatsState::Empty,
             scroll: ScrollHandle::new(),
         }
@@ -101,11 +127,179 @@ impl AgentStatsView {
         &self.repository
     }
 
+    pub(crate) fn repository_choices(&self) -> &[RepositoryChoice] {
+        &self.repository_choices
+    }
+
+    pub(crate) fn selected_repository(&self) -> Option<&RepositoryChoice> {
+        let key = self.selected_repository_key.as_deref()?;
+        self.repository_choices
+            .iter()
+            .find(|choice| choice.key == key)
+    }
+
+    pub(crate) fn repository_picker_open(&self) -> bool {
+        self.repository_picker_open
+    }
+
+    pub(crate) fn toggle_repository_picker(&mut self, cx: &mut Context<Self>) {
+        if self.repository_choices.is_empty() {
+            return;
+        }
+        self.repository_picker_open = !self.repository_picker_open;
+        if self.repository_picker_open {
+            self.repository_picker_index = self
+                .selected_repository_key
+                .as_deref()
+                .and_then(|key| {
+                    self.repository_choices
+                        .iter()
+                        .position(|choice| choice.key == key)
+                })
+                .unwrap_or(0);
+        }
+        record_notify("agent_stats", MissReason::Refresh);
+        cx.notify();
+    }
+
+    pub(crate) fn close_repository_picker(&mut self, cx: &mut Context<Self>) {
+        if !self.repository_picker_open {
+            return;
+        }
+        self.repository_picker_open = false;
+        record_notify("agent_stats", MissReason::Refresh);
+        cx.notify();
+    }
+
+    pub(crate) fn move_repository_picker(&mut self, delta: i32, cx: &mut Context<Self>) {
+        if !self.repository_picker_open || self.repository_choices.is_empty() {
+            return;
+        }
+        let count = self.repository_choices.len() as i32;
+        self.repository_picker_index =
+            (self.repository_picker_index as i32 + delta).rem_euclid(count) as usize;
+        record_notify("agent_stats", MissReason::Refresh);
+        cx.notify();
+    }
+
+    /// Close the picker and return the stable key currently highlighted. The
+    /// root applies that key after this child update completes, avoiding a
+    /// re-entrant update of the cached view.
+    pub(crate) fn activate_repository_picker(&mut self, cx: &mut Context<Self>) -> Option<String> {
+        if !self.repository_picker_open {
+            self.toggle_repository_picker(cx);
+            return None;
+        }
+        let key = self
+            .repository_choices
+            .get(self.repository_picker_index)
+            .map(|choice| choice.key.clone());
+        self.repository_picker_open = false;
+        record_notify("agent_stats", MissReason::Refresh);
+        cx.notify();
+        key
+    }
+
+    /// Replace the available catalog. An explicit picker choice stays sticky;
+    /// otherwise `follow_preferred_root` makes an open/refocus follow the active
+    /// project. Explicit refresh passes false so `r` always refreshes the root
+    /// currently on screen.
+    pub(crate) fn set_repository_catalog(
+        &mut self,
+        choices: Vec<RepositoryChoice>,
+        preferred_root: Option<&Path>,
+        follow_preferred_root: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<PathBuf> {
+        let current_is_valid = self
+            .selected_repository_key
+            .as_deref()
+            .is_some_and(|key| choices.iter().any(|choice| choice.key == key));
+        if !current_is_valid {
+            self.repository_selection_explicit = false;
+        }
+        let retain_current = self.repository_selection_explicit || !follow_preferred_root;
+        let selected = repository_selection_key(
+            &choices,
+            self.selected_repository_key.as_deref(),
+            preferred_root,
+            retain_current,
+        );
+        let changed = self.repository_choices != choices
+            || self.selected_repository_key.as_ref() != selected.as_ref();
+        self.repository_choices = choices;
+        self.selected_repository_key = selected;
+        self.repository_picker_index = self
+            .selected_repository_key
+            .as_deref()
+            .and_then(|key| {
+                self.repository_choices
+                    .iter()
+                    .position(|choice| choice.key == key)
+            })
+            .unwrap_or(0);
+        if self.repository_choices.is_empty() {
+            self.repository_picker_open = false;
+        }
+        let root = self.selected_repository().map(|choice| choice.root.clone());
+        if changed {
+            record_notify("agent_stats", MissReason::Refresh);
+            cx.notify();
+        }
+        root
+    }
+
+    /// Select a current catalog entry by stable key. The caller owns starting
+    /// the off-thread scan for the returned root.
+    pub(crate) fn select_repository(
+        &mut self,
+        key: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<PathBuf> {
+        let root = self
+            .repository_choices
+            .iter()
+            .find(|choice| choice.key == key)
+            .map(|choice| choice.root.clone())?;
+        self.repository_selection_explicit = true;
+        if self.selected_repository_key.as_deref() != Some(key) {
+            self.selected_repository_key = Some(key.to_string());
+            self.repository_picker_index = self
+                .repository_choices
+                .iter()
+                .position(|choice| choice.key == key)
+                .unwrap_or(0);
+            self.scroll.set_offset(point(px(0.0), px(0.0)));
+            record_notify("agent_stats", MissReason::Refresh);
+            cx.notify();
+        }
+        Some(root)
+    }
+
+    pub(crate) fn mark_repository_analyzed(&mut self, key: &str, cx: &mut Context<Self>) {
+        let Some(choice) = self
+            .repository_choices
+            .iter_mut()
+            .find(|choice| choice.key == key)
+        else {
+            return;
+        };
+        if choice.has_observation {
+            return;
+        }
+        choice.has_observation = true;
+        record_notify("agent_stats", MissReason::Refresh);
+        cx.notify();
+    }
+
     pub(crate) fn select_tab(&mut self, tab: AgentStatsTab, cx: &mut Context<Self>) {
         if self.active_tab == tab {
             return;
         }
         self.active_tab = tab;
+        if tab != AgentStatsTab::Repository {
+            self.repository_picker_open = false;
+        }
         self.scroll.set_offset(point(px(0.0), px(0.0)));
         record_notify("agent_stats", MissReason::Refresh);
         cx.notify();
@@ -215,7 +409,12 @@ impl AgentStatsView {
             );
         };
         let snapshot = &observation.snapshot;
-        if snapshot.agents.is_empty() {
+        let active_agents = snapshot
+            .agents
+            .iter()
+            .filter(|agent| agent.state.is_active())
+            .collect::<Vec<_>>();
+        if active_agents.is_empty() {
             return div()
                 .flex()
                 .flex_col()
@@ -228,8 +427,8 @@ impl AgentStatsView {
                 ))
                 .child(empty_state(
                     "agent-stats-agents-empty",
-                    "No agent sessions",
-                    "Start or reconnect an agent to populate this page.",
+                    "No active agent sessions",
+                    "Ready and Working agents appear here. Archived and unavailable agents are under Inactive.",
                     st,
                 ))
                 .into_any_element();
@@ -252,7 +451,7 @@ impl AgentStatsView {
                     .flex()
                     .flex_row()
                     .gap_2()
-                    .child(metric_card("Agents", snapshot.agents.len().to_string(), st))
+                    .child(metric_card("Active", active_agents.len().to_string(), st))
                     .child(metric_card(
                         "Working",
                         snapshot.working.to_string(),
@@ -268,17 +467,9 @@ impl AgentStatsView {
                             accent: palette.ready,
                             ..clone_style(st)
                         },
-                    ))
-                    .child(metric_card(
-                        "Unavailable",
-                        snapshot.unavailable.to_string(),
-                        &DetailStyle {
-                            accent: st.dim,
-                            ..clone_style(st)
-                        },
                     )),
             )
-            .child(section_heading("Fleet averages", st))
+            .child(section_heading("Active averages", st))
             .child(
                 div()
                     .flex()
@@ -305,12 +496,15 @@ impl AgentStatsView {
                         st,
                     )),
             )
-            .child(section_heading("Agents", st))
+            .child(section_heading("Active agents", st))
             .child(agent_table_header(st));
 
-        let (shown, omitted) = bounded_agent_row_counts(snapshot.agents.len());
-        for (index, agent) in snapshot.agents.iter().take(shown).enumerate() {
-            body = body.child(agent_row(index, agent, st, palette));
+        let (shown, omitted) = bounded_agent_row_counts(active_agents.len());
+        for (index, agent) in active_agents.into_iter().take(shown).enumerate() {
+            body = body.child(probe_bounds_dyn(
+                format!("agent-stats-row-{}", agent.row_id),
+                agent_row(index, agent, st, palette),
+            ));
         }
         if omitted > 0 {
             body = body.child(omitted_row(omitted, "additional agents", st));
@@ -318,8 +512,98 @@ impl AgentStatsView {
         body.into_any_element()
     }
 
-    fn render_repository(&self, st: &DetailStyle, palette: StatsPalette) -> AnyElement {
-        match &self.repository {
+    fn render_inactive_agents(&self, st: &DetailStyle, palette: StatsPalette) -> AnyElement {
+        let Some(observation) = &self.agents else {
+            return empty_state(
+                "agent-stats-inactive-loading",
+                "Collecting inactive agents…",
+                "Archived and unavailable sessions will appear when the roster is loaded.",
+                st,
+            );
+        };
+        let snapshot = &observation.snapshot;
+        let inactive_agents = snapshot
+            .agents
+            .iter()
+            .filter(|agent| !agent.state.is_active())
+            .collect::<Vec<_>>();
+        if inactive_agents.is_empty() {
+            return div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(observation_row(
+                    observation.source,
+                    observation.captured_at_unix_ms,
+                    false,
+                    st,
+                ))
+                .child(empty_state(
+                    "agent-stats-inactive-empty",
+                    "No inactive agent sessions",
+                    "Archived and disconnected unarchived sessions are kept here when present.",
+                    st,
+                ))
+                .into_any_element();
+        }
+
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .gap_2()
+            .child(observation_row(
+                observation.source,
+                observation.captured_at_unix_ms,
+                false,
+                st,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .child(metric_card(
+                        "Inactive",
+                        inactive_agents.len().to_string(),
+                        st,
+                    ))
+                    .child(metric_card("Archived", snapshot.archived.to_string(), st))
+                    .child(metric_card(
+                        "Unavailable",
+                        snapshot.unavailable.to_string(),
+                        &DetailStyle {
+                            accent: st.dim,
+                            ..clone_style(st)
+                        },
+                    )),
+            )
+            .child(section_heading("Inactive agents", st))
+            .child(agent_table_header(st));
+
+        let (shown, omitted) = bounded_agent_row_counts(inactive_agents.len());
+        for (index, agent) in inactive_agents.into_iter().take(shown).enumerate() {
+            body = body.child(probe_bounds_dyn(
+                format!("agent-stats-row-{}", agent.row_id),
+                agent_row(index, agent, st, palette),
+            ));
+        }
+        if omitted > 0 {
+            body = body.child(omitted_row(omitted, "additional inactive agents", st));
+        }
+        body.into_any_element()
+    }
+
+    fn render_repository(
+        &self,
+        st: &DetailStyle,
+        palette: StatsPalette,
+        border: Hsla,
+        selected_bg: Hsla,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let selector = self.render_repository_selector(st, border, selected_bg, cx);
+        let content = match &self.repository {
             RepositoryStatsState::Empty => empty_state(
                 "agent-stats-repository-empty",
                 "No repository selected",
@@ -376,8 +660,187 @@ impl AgentStatsView {
                 }
                 body.into_any_element()
             }
-        }
+        };
+        div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .gap_3()
+            .child(selector)
+            .child(content)
+            .into_any_element()
     }
+
+    fn render_repository_selector(
+        &self,
+        st: &DetailStyle,
+        border: Hsla,
+        selected_bg: Hsla,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(selected) = self.selected_repository() else {
+            return empty_state(
+                "agent-stats-repository-selector-empty",
+                "No repositories available",
+                "Register a project or retain a repository analysis to add it here.",
+                st,
+            );
+        };
+        let selected_label = selected.label.clone();
+        let selected_root = selected.root.display().to_string();
+        let selected_key = selected.key.clone();
+        let mut selector = div()
+            .id("agent-stats-repository-selector")
+            .flex()
+            .flex_col()
+            .w_full()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(border)
+            .overflow_hidden()
+            .child(
+                div()
+                    .id("agent-stats-repository-selector-toggle")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(selected_bg))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .font_family(st.prose.clone())
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_size(st.base)
+                                    .child(SharedString::from(selected_label)),
+                            )
+                            .child(
+                                div()
+                                    .font_family(st.mono.clone())
+                                    .text_size(px(10.5))
+                                    .text_color(st.dim)
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(SharedString::from(selected_root)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_family(st.mono.clone())
+                            .text_size(px(11.0))
+                            .text_color(st.accent)
+                            .child(if self.repository_picker_open {
+                                "▴"
+                            } else {
+                                "▾"
+                            }),
+                    )
+                    .on_click(
+                        cx.listener(|this, _event, _window, cx| this.toggle_repository_picker(cx)),
+                    ),
+            );
+
+        if self.repository_picker_open {
+            let mut choices = div()
+                .id("agent-stats-repository-options")
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .p_2()
+                .max_h(px(294.0))
+                .overflow_y_scroll()
+                .border_t_1()
+                .border_color(border);
+            for (index, choice) in self.repository_choices.iter().enumerate() {
+                let label = format!("{} — {}", choice.label, choice.root.display());
+                let badge = if choice.key == selected_key {
+                    Some(("Selected", st.accent))
+                } else if !choice.registered {
+                    Some(("Stored", st.dim))
+                } else if choice.has_observation {
+                    Some(("Analyzed", st.dim))
+                } else {
+                    None
+                };
+                let row = picker_option_row(
+                    SharedString::from(format!("agent-stats-repository-option-{index}")),
+                    "⌂",
+                    &label,
+                    badge,
+                    index == self.repository_picker_index,
+                    st.accent,
+                    st.fg,
+                    selected_bg,
+                    &st.prose,
+                    &st.mono,
+                )
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    let Some(key) = this
+                        .repository_choices
+                        .get(index)
+                        .map(|choice| choice.key.clone())
+                    else {
+                        return;
+                    };
+                    this.repository_picker_open = false;
+                    record_notify("agent_stats", MissReason::Refresh);
+                    cx.notify();
+                    let root = this.root.clone();
+                    cx.spawn(async move |_this, cx| {
+                        if let Some(root) = root.upgrade() {
+                            let _ = root.update(cx, |root, cx| {
+                                root.select_agent_stats_repository(&key, cx)
+                            });
+                        }
+                    })
+                    .detach();
+                }));
+                choices = choices.child(probe_bounds_dyn(
+                    format!("agent-stats-repository-choice-{index}"),
+                    row.into_any_element(),
+                ));
+            }
+            selector = selector.child(choices);
+        }
+        selector.into_any_element()
+    }
+}
+
+fn repository_selection_key(
+    choices: &[RepositoryChoice],
+    current: Option<&str>,
+    preferred_root: Option<&Path>,
+    retain_current: bool,
+) -> Option<String> {
+    current
+        .filter(|_| retain_current)
+        .filter(|key| choices.iter().any(|choice| choice.key == *key))
+        .map(str::to_string)
+        .or_else(|| {
+            preferred_root.map(repository_root_key).and_then(|key| {
+                choices
+                    .iter()
+                    .any(|choice| choice.key == key)
+                    .then_some(key)
+            })
+        })
+        .or_else(|| {
+            current
+                .filter(|key| choices.iter().any(|choice| choice.key == *key))
+                .map(str::to_string)
+        })
+        .or_else(|| choices.first().map(|choice| choice.key.clone()))
 }
 
 impl Render for AgentStatsView {
@@ -410,12 +873,19 @@ impl Render for AgentStatsView {
             )
         };
 
-        let agent_count = self
+        let (active_count, inactive_count) = self
             .agents
             .as_ref()
-            .map(|observation| observation.snapshot.agents.len())
-            .unwrap_or(0);
+            .map(|observation| {
+                let snapshot = &observation.snapshot;
+                (
+                    snapshot.working + snapshot.ready,
+                    snapshot.archived + snapshot.unavailable,
+                )
+            })
+            .unwrap_or((0, 0));
         let agents_selected = self.active_tab == AgentStatsTab::Agents;
+        let inactive_selected = self.active_tab == AgentStatsTab::Inactive;
         let repository_selected = self.active_tab == AgentStatsTab::Repository;
         let tabs = div()
             .id("agent-stats-tabs")
@@ -433,7 +903,7 @@ impl Render for AgentStatsView {
                     Some(
                         compact_count_indicator(
                             "agent-stats-agent-count",
-                            agent_count,
+                            active_count,
                             st.accent,
                             &st,
                         )
@@ -445,6 +915,27 @@ impl Render for AgentStatsView {
                 )
                 .on_click(cx.listener(|this, _event, _window, cx| {
                     this.select_tab(AgentStatsTab::Agents, cx);
+                })),
+            )
+            .child(
+                compact_tab(
+                    "agent-stats-tab-inactive",
+                    "Inactive",
+                    Some(
+                        compact_count_indicator(
+                            "agent-stats-inactive-count",
+                            inactive_count,
+                            st.dim,
+                            &st,
+                        )
+                        .into_any_element(),
+                    ),
+                    inactive_selected,
+                    selected_bg,
+                    &st,
+                )
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.select_tab(AgentStatsTab::Inactive, cx);
                 })),
             )
             .child(
@@ -463,7 +954,10 @@ impl Render for AgentStatsView {
 
         let body = match self.active_tab {
             AgentStatsTab::Agents => self.render_agents(&st, palette),
-            AgentStatsTab::Repository => self.render_repository(&st, palette),
+            AgentStatsTab::Inactive => self.render_inactive_agents(&st, palette),
+            AgentStatsTab::Repository => {
+                self.render_repository(&st, palette, border, selected_bg, cx)
+            }
         };
 
         div()
@@ -641,6 +1135,7 @@ fn agent_row(
     let state_color = match agent.state {
         AgentMetricState::Working => palette.working,
         AgentMetricState::Ready => palette.ready,
+        AgentMetricState::Archived => st.dim,
         AgentMetricState::Unavailable => st.dim,
     };
     let provider = agent.provider.map(AgentProvider::label).unwrap_or("—");
@@ -995,6 +1490,16 @@ fn format_bytes(bytes: u64) -> String {
 mod tests {
     use super::*;
 
+    fn repository_choice(label: &str, root: PathBuf) -> RepositoryChoice {
+        RepositoryChoice {
+            key: repository_root_key(&root),
+            label: label.into(),
+            root,
+            registered: true,
+            has_observation: false,
+        }
+    }
+
     #[test]
     fn averages_expose_partial_coverage_and_unknown_values() {
         let known = MetricAverage {
@@ -1047,5 +1552,33 @@ mod tests {
         ] {
             assert!(!repository_operation_label(operation).is_empty());
         }
+    }
+
+    #[test]
+    fn repository_selection_defaults_to_active_then_retains_an_explicit_choice() {
+        let yalda = PathBuf::from("/test/yalda");
+        let fulcrum = PathBuf::from("/test/fulcrum");
+        let choices = vec![
+            repository_choice("Fulcrum", fulcrum.clone()),
+            repository_choice("Yalda", yalda.clone()),
+        ];
+        let yalda_key = repository_root_key(&yalda);
+        let fulcrum_key = repository_root_key(&fulcrum);
+
+        assert_eq!(
+            repository_selection_key(&choices, None, Some(&yalda), false),
+            Some(yalda_key.clone()),
+            "first open follows the active project"
+        );
+        assert_eq!(
+            repository_selection_key(&choices, Some(&fulcrum_key), Some(&yalda), true),
+            Some(fulcrum_key.clone()),
+            "an explicit selection remains sticky across refresh/open"
+        );
+        assert_eq!(
+            repository_selection_key(&choices, Some(&yalda_key), Some(&fulcrum), false),
+            Some(fulcrum_key),
+            "an implicit selection follows a newly active project on refocus"
+        );
     }
 }

@@ -19,6 +19,7 @@ use yalda::acp_channel::{AgentProvider, ToolCallStatus};
 pub(crate) enum AgentMetricState {
     Working,
     Ready,
+    Archived,
     Unavailable,
 }
 
@@ -27,8 +28,13 @@ impl AgentMetricState {
         match self {
             Self::Working => "Working",
             Self::Ready => "Ready",
+            Self::Archived => "Archived",
             Self::Unavailable => "Unavailable",
         }
+    }
+
+    pub(crate) fn is_active(self) -> bool {
+        matches!(self, Self::Working | Self::Ready)
     }
 }
 
@@ -46,8 +52,9 @@ impl ContextOccupancy {
 }
 
 /// One arithmetic mean with the population that actually supplied the fact.
-/// `population` is the fleet size; `denominator` is the number of known values.
-/// When the denominator is zero both `sum` and `mean` are unavailable.
+/// `population` is the size of the cohort being summarized; `denominator` is
+/// the number of known values. When the denominator is zero both `sum` and
+/// `mean` are unavailable.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct MetricAverage {
     pub(crate) sum: Option<f64>,
@@ -104,8 +111,10 @@ pub(crate) struct AgentMetricSnapshot {
     pub(crate) loaded: bool,
 }
 
-/// Fleet-wide means. Each metric has its own explicit denominator because the
-/// roster and loaded-session sources have different coverage.
+/// Active-fleet means. Archived and unavailable rows remain in the snapshot for
+/// inspection, but do not dilute the population describing agents that can do
+/// work now. Each metric has its own explicit denominator because the roster
+/// and loaded-session sources have different coverage.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct FleetMetricAverages {
     pub(crate) settled_turns: MetricAverage,
@@ -122,6 +131,10 @@ pub(crate) struct FleetMetricSnapshot {
     pub(crate) agents: Vec<AgentMetricSnapshot>,
     pub(crate) working: usize,
     pub(crate) ready: usize,
+    /// Additive within telemetry store v1 so documents written before archived
+    /// became a distinct state continue to deserialize.
+    #[serde(default)]
+    pub(crate) archived: usize,
     pub(crate) unavailable: usize,
     pub(crate) averages: FleetMetricAverages,
 }
@@ -154,7 +167,9 @@ impl From<&yalda::session_proto::SessionInfo> for RosterAgentMetricFacts {
 
 impl RosterAgentMetricFacts {
     fn state(&self) -> AgentMetricState {
-        if self.archived || !self.connected {
+        if self.archived {
+            AgentMetricState::Archived
+        } else if !self.connected {
             AgentMetricState::Unavailable
         } else if self.busy {
             AgentMetricState::Working
@@ -223,8 +238,9 @@ impl LoadedAgentMetricFacts {
     }
 }
 
-/// Merge the universal roster with locally loaded facts and calculate fleet
-/// totals and means. This function has no GPUI or clock dependency.
+/// Merge the universal roster with locally loaded facts, calculate state totals,
+/// and summarize the active cohort. This function has no GPUI or clock
+/// dependency.
 pub(crate) fn aggregate_agent_metrics(
     roster: impl IntoIterator<Item = RosterAgentMetricFacts>,
     loaded: impl IntoIterator<Item = LoadedAgentMetricFacts>,
@@ -277,39 +293,50 @@ pub(crate) fn aggregate_agent_metrics(
         .iter()
         .filter(|agent| agent.state == AgentMetricState::Ready)
         .count();
+    let archived = agents
+        .iter()
+        .filter(|agent| agent.state == AgentMetricState::Archived)
+        .count();
     let unavailable = agents
         .iter()
         .filter(|agent| agent.state == AgentMetricState::Unavailable)
         .count();
-    let population = agents.len();
+    let active_agents = agents
+        .iter()
+        .filter(|agent| agent.state.is_active())
+        .collect::<Vec<_>>();
+    let population = active_agents.len();
     let averages = FleetMetricAverages {
         settled_turns: MetricAverage::from_known(
-            agents
+            active_agents
                 .iter()
                 .map(|agent| agent.settled_turns.map(|value| value as f64)),
             population,
         ),
         tool_total: MetricAverage::from_known(
-            agents
+            active_agents
                 .iter()
                 .map(|agent| agent.tool_total.map(|value| value as f64)),
             population,
         ),
         tool_failures: MetricAverage::from_known(
-            agents
+            active_agents
                 .iter()
                 .map(|agent| agent.tool_failures.map(|value| value as f64)),
             population,
         ),
         context_percent: MetricAverage::from_known(
-            agents
+            active_agents
                 .iter()
                 .map(|agent| agent.context.and_then(ContextOccupancy::percent)),
             population,
         ),
-        cost_usd: MetricAverage::from_known(agents.iter().map(|agent| agent.cost_usd), population),
+        cost_usd: MetricAverage::from_known(
+            active_agents.iter().map(|agent| agent.cost_usd),
+            population,
+        ),
         current_turn_elapsed_secs: MetricAverage::from_known(
-            agents.iter().map(|agent| {
+            active_agents.iter().map(|agent| {
                 agent
                     .current_turn_elapsed
                     .map(|duration| duration.as_secs_f64())
@@ -322,6 +349,7 @@ pub(crate) fn aggregate_agent_metrics(
         agents,
         working,
         ready,
+        archived,
         unavailable,
         averages,
     }
@@ -450,14 +478,24 @@ mod tests {
                 roster("ready", "Ready", true, false, 3),
                 roster("working", "Working", true, true, 5),
                 roster("offline", "Offline", false, false, 8),
+                {
+                    let mut archived = roster("archived", "Archived", false, false, 13);
+                    archived.archived = true;
+                    archived
+                },
             ],
             [],
         );
 
-        assert_eq!(snapshot.agents.len(), 3);
+        assert_eq!(snapshot.agents.len(), 4);
         assert_eq!(
-            (snapshot.working, snapshot.ready, snapshot.unavailable),
-            (1, 1, 1)
+            (
+                snapshot.working,
+                snapshot.ready,
+                snapshot.archived,
+                snapshot.unavailable,
+            ),
+            (1, 1, 1, 1)
         );
         let ready = snapshot
             .agents
@@ -503,10 +541,12 @@ mod tests {
         assert_eq!(server.tool_total, Some(6));
         assert_eq!(server.tool_failures, Some(2));
         assert_eq!(server.current_turn_elapsed, Some(Duration::from_secs(12)));
-        assert!(snapshot
-            .agents
-            .iter()
-            .any(|agent| agent.row_id == "local:Local only"));
+        assert!(
+            snapshot
+                .agents
+                .iter()
+                .any(|agent| agent.row_id == "local:Local only")
+        );
     }
 
     #[test]
@@ -517,6 +557,12 @@ mod tests {
             [
                 roster("loaded", "Loaded", true, true, 4),
                 roster("roster-only", "Roster only", true, false, 2),
+                roster("offline", "Offline", false, false, 100),
+                {
+                    let mut archived = roster("archived", "Archived", false, false, 200);
+                    archived.archived = true;
+                    archived
+                },
             ],
             [partial],
         );
@@ -548,15 +594,41 @@ mod tests {
     }
 
     #[test]
-    fn disconnected_or_archived_roster_state_cannot_be_resurrected_locally() {
+    fn disconnected_and_archived_are_distinct_and_cannot_be_resurrected_locally() {
         let mut archived = roster("archived", "Archived", true, true, 1);
         archived.archived = true;
-        let mut local = loaded(Some("archived"), "Archived");
-        local.state = AgentMetricState::Working;
+        let disconnected = roster("disconnected", "Disconnected", false, true, 2);
+        let mut archived_local = loaded(Some("archived"), "Archived");
+        archived_local.state = AgentMetricState::Working;
+        let mut disconnected_local = loaded(Some("disconnected"), "Disconnected");
+        disconnected_local.state = AgentMetricState::Working;
 
-        let snapshot = aggregate_agent_metrics([archived], [local]);
-        assert_eq!(snapshot.agents[0].state, AgentMetricState::Unavailable);
+        let snapshot = aggregate_agent_metrics(
+            [archived, disconnected],
+            [archived_local, disconnected_local],
+        );
+        assert_eq!(
+            snapshot
+                .agents
+                .iter()
+                .find(|agent| agent.row_id == "archived")
+                .unwrap()
+                .state,
+            AgentMetricState::Archived
+        );
+        assert_eq!(
+            snapshot
+                .agents
+                .iter()
+                .find(|agent| agent.row_id == "disconnected")
+                .unwrap()
+                .state,
+            AgentMetricState::Unavailable
+        );
+        assert_eq!(snapshot.archived, 1);
         assert_eq!(snapshot.unavailable, 1);
         assert_eq!(snapshot.working, 0);
+        assert_eq!(snapshot.averages.settled_turns.population, 0);
+        assert_eq!(snapshot.averages.settled_turns.denominator, 0);
     }
 }

@@ -6,12 +6,14 @@
 ## Description
 
 Agent Stats is Yalda's singleton system tile for operational evidence about
-agents and source repositories. It has two read-only pages:
+agents and source repositories. It has three read-only pages:
 
-- **Agents** presents a live first-pass fleet snapshot and one row per known
-  root agent session.
-- **Repository** presents a bounded, read-only static scan of the current
-  project's repository.
+- **Agents** presents the live Working and Ready fleet without cold or
+  disconnected sessions crowding current work.
+- **Inactive** presents Archived and Unavailable sessions as distinct lifecycle
+  states.
+- **Repository** presents a bounded, read-only static scan selected from Yalda's
+  registered projects and previously analyzed repositories.
 
 The v1 source is deliberately honest. Agent facts come from the universal
 roster and from session state that this GUI has loaded. Repository facts come
@@ -34,6 +36,8 @@ Primary code homes are `telemetry/`, `agent_stats_view.rs`, and
 - Cog roadmap `b68` at `%projects/cog/telemetry::roadmap` — historical telemetry,
   deeper repository traces, optimization, and failure analysis.
 - Cog v1 graph `p62` at `%projects/cog/telemetry::v1` — implementation record.
+- Cog follow-up graph `9ku` — inactive-agent partition and multi-repository
+  selection.
 
 ## UX invariants
 
@@ -58,37 +62,55 @@ stateful monitor.
 
 **Enforcement.** `verify_harness.rs::agent_stats_system_row_and_cmd_p_open_one_singleton`.
 
-### UXI-AgentStats-2 — Agents and Repository are honest first-pass pages
+### UXI-AgentStats-2 — Active, inactive, and repository pages are honest
 
-**Statement.** The tile has exactly two top-level pages, **Agents** and
-**Repository**. Agents shows live fleet counts plus one row per known root
-session, with provider, model, availability, settled turns, current tool counts
-and failures, context occupancy, optional cumulative cost, and current-turn
-elapsed time when each source exists. Repository shows the project root, tracked
-file totals, bounded top-level and extension distributions, instruction and
-workspace-manifest counts, large source files, and recent Git churn. Loading,
-empty, non-Git, command-error, and unavailable-field states use explicit text.
-Context occupancy is never labeled as consumed tokens, and absent facts are
-never displayed as numeric zero.
+**Statement.** The tile has exactly three top-level pages, **Agents**,
+**Inactive**, and **Repository**. Agents contains only Working and Ready root
+sessions. Its totals and averages use that active population, with each metric's
+known-value denominator still explicit. Inactive contains every Archived and
+Unavailable root session and no active session. Archived is server-authoritative
+cold storage; Unavailable means an unarchived session whose live transport is
+not currently connected. Both states have distinct labels and counts.
 
-The Repository page scans the project that is current when Agent Stats opens or
-refreshes. The scan reads repository metadata and transiently counts bounded
-source-file lines. It never retains source content, runs builds or tests, or
-mutates the repository.
+Both agent pages show provider, model, availability, settled turns, current
+tool counts and failures, context occupancy, optional cumulative cost, and
+current-turn elapsed time when each source exists. Loading and empty states are
+explicit. Context occupancy is never labeled as consumed tokens, and absent
+facts are never displayed as numeric zero.
+
+Repository offers a bounded selector containing all registered project roots
+plus roots with retained analyses. Entries use project names when available and
+otherwise an honest path-derived label. Opening Agent Stats selects the project
+that was active at the entry point; choosing another entry keeps that selection
+while refreshing exactly that root. This path is generic: Yalda, Fulcrum, and
+every other repository use the same catalog, selection, scan, and persistence
+logic. Repository shows the selected root, tracked file totals, bounded
+top-level and extension distributions, instruction and workspace-manifest
+counts, large source files, and recent Git churn. Loading, non-Git, and
+command-error states use explicit text.
+
+The Repository page scans the selected catalog entry. A refresh retains that
+selection rather than silently switching back to the currently focused project.
+The scan reads repository metadata and transiently counts bounded source-file
+lines. It never retains source content, runs builds or tests, or mutates the
+repository.
 
 **Applies to.** `AgentMetricSnapshot`, `FleetMetricSnapshot`,
 `RepositorySnapshot`, `AgentStatsView`, and the Agent Stats refresh methods.
 
-**Why.** A compact first release is useful only if its labels do not imply
-historical or provider detail that Yalda cannot yet observe.
+**Why.** Current work must remain legible even when the durable roster contains
+many cold or disconnected sessions, and repository evidence must be comparable
+across the codebases Yalda's agents actually develop.
 
 **Status.** `implemented`
 
 **Enforcement.** `telemetry::agent::tests::roster_only_sessions_remain_visible_with_unloaded_facts_unknown`,
 `telemetry::agent::tests::every_average_exposes_its_actual_denominator`,
+`telemetry::agent::tests::disconnected_and_archived_are_distinct_and_cannot_be_resurrected_locally`,
 `telemetry::repository::tests::tracked_projection_is_deterministic_and_bounded`,
-`telemetry::repository::tests::scan_never_copies_file_content_into_snapshot`, and
-`verify_harness.rs::agent_stats_repository_refresh_is_explicit_and_generation_gated`.
+`telemetry::repository::tests::scan_never_copies_file_content_into_snapshot`,
+`verify_harness.rs::agent_stats_partitions_active_and_inactive_agents`, and
+`verify_harness.rs::agent_stats_selects_another_registered_repository`.
 
 ### UXI-AgentStats-3 — Collection and rendering never block the frame
 
