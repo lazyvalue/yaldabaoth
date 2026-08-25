@@ -2720,6 +2720,17 @@ pub(crate) struct HistoryNav {
     pub(crate) stash: String,
 }
 
+/// The whitespace-delimited, path-shaped compose token currently under the
+/// caret (UXI-AgentTile-43). `start`/`end` are absolute character offsets into
+/// the full compose draft, so accepting a row can replace exactly this token
+/// without disturbing surrounding prompt text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TopicQuery {
+    pub(crate) text: String,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+}
+
 /// The agent turn lifecycle as one explicit state (Finding 9). Replaces the
 /// loose `(awaiting_reply, turn_started, last_event_at, stop_requested_at)`
 /// quadruple whose valid combinations were unwritten convention — e.g.
@@ -3720,6 +3731,12 @@ pub(crate) struct AgentState {
     /// (UXI-AgentTile-42). Reset to `false` whenever the compose text (hence the
     /// query) changes, so editing the query re-opens the popup.
     pub(crate) slash_popup_dismissed: bool,
+    /// Cog Topic autocomplete popup selection (UXI-AgentTile-43), transient and
+    /// per session so switching Agent tiles preserves each draft's local UI.
+    pub(crate) topic_popup_sel: usize,
+    /// Esc dismissed the Topic popup for the current query. Any compose edit
+    /// clears this alongside resetting `topic_popup_sel`.
+    pub(crate) topic_popup_dismissed: bool,
     /// The session's permission mode, as session state sourced from the
     /// server. In session-server mode the agent/channel live in the server
     /// (not the GUI), so `channel` is `None` and the live `AcpChannelClient`
@@ -4151,6 +4168,94 @@ impl AgentState {
             .collect()
     }
 
+    /// Return the path-shaped, whitespace-delimited token containing the caret
+    /// (UXI-AgentTile-43). Ordinary words stay quiet until the token contains
+    /// `/` or `::`; a bare leading slash command belongs exclusively to
+    /// UXI-AgentTile-42.
+    pub(crate) fn topic_query(&self) -> Option<TopicQuery> {
+        if self.slash_query().is_some() {
+            return None;
+        }
+        let compose = self.input_surface.compose();
+        if compose.mode != EditMode::Insert {
+            return None;
+        }
+        let text = compose.text();
+        let chars: Vec<char> = text.chars().collect();
+        let cursor = compose.editor.cursor();
+        let line = cursor
+            .line
+            .min(compose.editor.document().line_count().saturating_sub(1));
+        let caret = compose.editor.document().rope().line_to_char(line)
+            + cursor
+                .col
+                .min(compose.editor.document().line_len_chars(line));
+        let mut start = caret.min(chars.len());
+        while start > 0 && !chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        let mut end = caret.min(chars.len());
+        while end < chars.len() && !chars[end].is_whitespace() {
+            end += 1;
+        }
+        if start == end {
+            return None;
+        }
+        let token: String = chars[start..end].iter().collect();
+        if !token.contains('/') && !token.contains("::") {
+            return None;
+        }
+        Some(TopicQuery {
+            text: token,
+            start,
+            end,
+        })
+    }
+
+    /// Filter the shared, installation-wide Cog Topic catalog by the raw token
+    /// under the caret. Exact case-sensitive prefix semantics match Cog Topic
+    /// addresses; catalog sorting/dedup happens once at load.
+    pub(crate) fn topic_popup_rows(
+        &self,
+        catalog: &[CogTopicBinding],
+    ) -> Vec<CogTopicBinding> {
+        if self.topic_popup_dismissed {
+            return Vec::new();
+        }
+        let Some(query) = self.topic_query() else {
+            return Vec::new();
+        };
+        catalog
+            .iter()
+            .filter(|binding| binding.address.starts_with(&query.text))
+            .cloned()
+            .collect()
+    }
+
+    /// Accept one Topic completion by replacing only the token under the caret,
+    /// preserving every surrounding character and placing the caret immediately
+    /// after the inserted raw address.
+    pub(crate) fn accept_topic_completion(&mut self, address: &str) {
+        let Some(query) = self.topic_query() else {
+            return;
+        };
+        let text = self.input_surface.compose().text();
+        let chars: Vec<char> = text.chars().collect();
+        let mut replaced = String::new();
+        replaced.extend(chars[..query.start].iter());
+        replaced.push_str(address);
+        replaced.extend(chars[query.end..].iter());
+        let caret = query.start + address.chars().count();
+        let compose = self.input_surface.compose_mut();
+        compose.set_recalled(&replaced);
+        let line = compose.editor.document().rope().char_to_line(caret);
+        let line_start = compose.editor.document().rope().line_to_char(line);
+        compose.editor.cursor_mut().line = line;
+        compose.editor.cursor_mut().col = caret - line_start;
+        self.topic_popup_dismissed = true;
+        self.history_reset();
+    }
+
     /// Re-seat panel focus after a panel open/close (UXI-AgentTile-3). If the active
     /// column is no longer focusable, hop to another open column; if none
     /// remain, leave panel focus (restoring the captured focus). No-op unless
@@ -4313,6 +4418,8 @@ impl AgentState {
             available_commands: Vec::new(),
             slash_popup_sel: 0,
             slash_popup_dismissed: false,
+            topic_popup_sel: 0,
+            topic_popup_dismissed: false,
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             usage: None,
             focused_subagent: None,
@@ -4404,6 +4511,8 @@ impl AgentState {
             available_commands: Vec::new(),
             slash_popup_sel: 0,
             slash_popup_dismissed: false,
+            topic_popup_sel: 0,
+            topic_popup_dismissed: false,
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             usage: None,
             focused_subagent: None,

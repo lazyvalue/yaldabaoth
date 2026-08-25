@@ -788,3 +788,58 @@ a sent-message ring is present — proving popup nav beats recall — `Enter` fi
 for a `/` draft, absent for plain text; NC-RED with the render gate disabled).
 Pure: `tests.rs::slash_query_and_popup_rows_filter` (query recognition, prefix
 filter, dismissed / Normal-mode gates). NCs observed RED.
+
+### UXI-AgentTile-43 — Cog Topic path autocomplete in both compose placements
+
+**Statement.** In Insert mode, both Agent Tile input placements — the pinned
+**Message Box** and the inline **Worksheet** You-block — autocomplete raw Cog Topic
+addresses from the installation-wide Topic catalog:
+
+1. **Live source and loading.** The first eligible query asks the existing Cog
+   client for `cog topic list "" --limit 1000` on the background executor, never
+   the paint thread. The resulting address/kind/name catalog is shared across
+   Agent sessions for the rest of the app run, sorted and de-duplicated by exact
+   address. While loading or when Cog is unavailable, no empty/error popup steals
+   input; a failed load may retry on a later eligible edit. This uses the deployed
+   read contract and requires no Cog-side feature.
+2. **Token-local query and filter.** The query is the whitespace-delimited token
+   containing the compose caret. It becomes eligible only after it contains `/`
+   or `::`, avoiding popups over ordinary prose. Rows are catalog entries whose
+   full address starts with that raw token (case-sensitive, matching Cog address
+   semantics), in deterministic address order. The bare leading `/token`
+   recognized by `UXI-AgentTile-42` remains slash-command completion and wins.
+   Empty matches mean no popup.
+3. **Keys and replacement.** While Topic rows are visible, `Up`/`Down` move the
+   clamped selection before history recall; `Tab` or `Enter` accepts the selected
+   row without submitting and replaces only the query token, preserving all text
+   around it and placing the caret immediately after the full address; a second
+   Enter submits normally. `Esc` dismisses the current query. Any compose edit
+   re-filters, resets selection, and clears dismissal.
+4. **Render.** The popup uses the same tail completion region above the input as
+   slash commands in both placements. Each row shows the full address,
+   Cog kind (`graph`, `note`, or `chat`), and optional human name; the selected row
+   is accent-washed. It is native-size chrome and is absent during read-only
+   transcript navigation.
+
+**Applies to.** `cog.rs`: live Topic binding list. `main.rs` / `agent_ui.rs`:
+background catalog ownership/loading and shared compose dispatch. `agent.rs`:
+per-session Topic popup selection/dismissal plus caret-token query/filter/replace.
+`screens.rs::render_agent`: the shared completion popup above Message Box and
+Worksheet compose placements.
+
+**Why.** Cog Topic addresses are hierarchical, exact, and frequently embedded in
+agent prompts. Typing them from memory is slow and typo-prone; using the same
+address catalog as the Cog browser makes every Agent input a reliable route picker
+without inventing a second addressing convention.
+
+**Status.** `implemented` (2026-08-24; Cog graph `o2q`). Headless probes cover
+both placements; exact runtime glyph/color appearance remains gap #1.
+
+**Enforcement.** Headless guards in `verify_harness.rs` drive the real
+`handle_claude_key` path in Message Box and Worksheet, asserting popup navigation,
+token-local acceptance, no accidental submit, and painted placement above the
+compose. A pure `tests.rs` guard pins query extraction, deterministic filtering,
+slash-command priority, and surrounding-text preservation. Each behavioral guard
+was observed RED: the tests first failed to compile against the missing Topic
+state/methods; disabling Topic key dispatch failed the Message Box selection
+assertion; disabling the Topic paint gate failed the Worksheet paint assertion.

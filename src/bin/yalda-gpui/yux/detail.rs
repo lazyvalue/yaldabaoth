@@ -425,6 +425,76 @@ pub(crate) fn picker_option_row(
     row
 }
 
+/// One semantic row in a compact keyboard completion popup. Domains provide a
+/// primary insertion label plus optional explanatory metadata; yux owns the
+/// shared popup geometry, selection wash, truncation, and typography used by
+/// slash-command and Cog Topic completion.
+#[derive(Clone)]
+pub(crate) struct CompletionPopupRow {
+    pub(crate) primary: String,
+    pub(crate) secondary: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn completion_popup(
+    id: impl Into<ElementId>,
+    rows: &[CompletionPopupRow],
+    selected: usize,
+    background: Hsla,
+    border: Hsla,
+    foreground: Hsla,
+    dim: Hsla,
+    accent: Hsla,
+    mono: &SharedString,
+) -> gpui::Stateful<gpui::Div> {
+    let mut selected_bg = accent;
+    selected_bg.a = 0.20;
+    let mut popup = div()
+        .id(id)
+        .flex()
+        .flex_col()
+        .flex_none()
+        .w_full()
+        .max_h(px(180.0))
+        .overflow_y_scroll()
+        .border_t_1()
+        .border_color(border)
+        .bg(background)
+        .text_size(px(12.0))
+        .font_family(mono.clone());
+    for (index, item) in rows.iter().enumerate() {
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .w_full()
+            .px_2()
+            .py(px(1.0));
+        if index == selected {
+            row = row.bg(selected_bg);
+        }
+        popup = popup.child(
+            row.child(
+                div()
+                    .flex_none()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(foreground)
+                    .child(SharedString::from(item.primary.clone())),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(dim)
+                    .child(SharedString::from(item.secondary.clone())),
+            ),
+        );
+    }
+    popup
+}
+
 /// An author · timestamp header over a multiline body (comments, updates).
 pub(crate) fn note_block(author: String, when: String, body: &str, st: &DetailStyle) -> gpui::Div {
     let hdr = if when.is_empty() {
