@@ -92,7 +92,6 @@ impl YaldaGpuiView {
                 vcx.notify();
             });
         }
-        self.cog_start_live_revalidation(target, cx);
         cx.notify();
 
         // Never spawn the live subprocess under test (hermetic — gap #2); the
@@ -103,7 +102,13 @@ impl YaldaGpuiView {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { cog::load_home().map(|home| CogFetch::Home(Box::new(home))) })
+                .spawn(async move {
+                    let cursor = cog::event_cursor().ok();
+                    cog::load_home().map(|home| CogFetch::HomeAt {
+                        home: Box::new(home),
+                        cursor,
+                    })
+                })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.cog_apply(target, req, result, cx);
@@ -445,6 +450,16 @@ impl YaldaGpuiView {
                 self.save_workspace_state();
                 cx.notify();
             }
+            Ok(CogFetch::HomeAt { home, cursor }) => {
+                if let Some(tile) = self.cog_tile_by_id_mut(target) {
+                    tile.events_cursor = match (tile.events_cursor, cursor) {
+                        (Some(old), Some(captured)) => Some(old.max(captured)),
+                        (old @ Some(_), None) => old,
+                        (None, captured) => captured,
+                    };
+                }
+                self.cog_apply(target, req, Ok(CogFetch::Home(home)), cx);
+            }
             Ok(CogFetch::Graphs(graphs)) => {
                 self.cog_stop_watch(target);
                 self.cog_set_view(
@@ -481,7 +496,14 @@ impl YaldaGpuiView {
             Err(e) => {
                 self.cog_stop_watch(target);
                 self.cog_set_view(target, CogViewState::Error(e), cx);
+                self.cog_start_live_revalidation(target, cx);
             }
+        }
+        let trailing = self
+            .cog_tile_by_id_mut(target)
+            .is_some_and(|tile| std::mem::take(&mut tile.events_pending));
+        if trailing {
+            self.cog_invalidate_current(target, cx);
         }
     }
 
@@ -562,11 +584,10 @@ impl YaldaGpuiView {
         }
     }
 
-    /// Start one lifecycle-bound freshness loop per Cog tile. Cog currently
-    /// offers graph SSE but no global Topic/Chat/Address/Mail stream, so those
-    /// surfaces use a coalesced sub-second reconciliation until the builder's
-    /// requested resumable stream is available. Dropping the tile drops this
-    /// task and generation tokens reject any already-completed old read.
+    /// Start one lifecycle-bound global subscriber and freshness supervisor per
+    /// Cog tile. The event stream gives immediate invalidation; a disconnected
+    /// installation revalidates once per second, and a connected stream gets a
+    /// 30-second safety read. Dropping the tile cancels the task and child.
     fn cog_start_live_revalidation(&mut self, target: workspace::WindowId, cx: &mut Context<Self>) {
         if cfg!(test) {
             return;
@@ -580,21 +601,32 @@ impl YaldaGpuiView {
             }
             tile.live_token
         };
+        self.cog_start_events(target, cx);
         let task = cx.spawn(async move |this, cx| {
+            let mut ticks = 0_u64;
             loop {
                 cx.background_executor()
-                    .timer(std::time::Duration::from_millis(750))
+                    .timer(std::time::Duration::from_secs(1))
                     .await;
+                ticks += 1;
                 let current = this
                     .update(cx, |view, cx| {
-                        let current = view
+                        let state = view
                             .cog_tile_by_id_mut(target)
-                            .map(|tile| tile.live_token == token)
-                            .unwrap_or(false);
-                        if current {
-                            view.cog_live_tick(target, cx);
+                            .map(|tile| (tile.live_token == token, tile.events_connected));
+                        let Some((current, connected)) = state else {
+                            return false;
+                        };
+                        if !current {
+                            return false;
                         }
-                        current
+                        if !connected {
+                            view.cog_start_events(target, cx);
+                            view.cog_invalidate_current(target, cx);
+                        } else if ticks % 30 == 0 {
+                            view.cog_invalidate_current(target, cx);
+                        }
+                        true
                     })
                     .unwrap_or(false);
                 if !current {
@@ -604,6 +636,134 @@ impl YaldaGpuiView {
         });
         if let Some(tile) = self.cog_tile_by_id_mut(target) {
             tile.live_task = Some(task);
+        }
+    }
+
+    /// Start/restart `cog events --follow` from the last applied global cursor.
+    /// Reader output is generation tagged so a killed prior process cannot
+    /// mutate a reused tile.
+    fn cog_start_events(&mut self, target: workspace::WindowId, cx: &mut Context<Self>) {
+        let (generation, cursor) = {
+            let Some(tile) = self.cog_tile_by_id_mut(target) else {
+                return;
+            };
+            if tile.events_watch.is_some() {
+                return;
+            }
+            tile.events_gen += 1;
+            (tile.events_gen, tile.events_cursor)
+        };
+        if cfg!(test) {
+            return;
+        }
+        match cog::spawn_events(cursor) {
+            Ok((child, mut rx)) => {
+                if let Some(tile) = self.cog_tile_by_id_mut(target) {
+                    tile.events_watch = Some(child);
+                    tile.events_connected = true;
+                }
+                cx.spawn(async move |this, cx| {
+                    use futures::StreamExt;
+                    while let Some(line) = rx.next().await {
+                        if this
+                            .update(cx, |view, cx| {
+                                view.cog_push_global_event(target, generation, line, cx)
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    let _ = this.update(cx, |view, _| {
+                        view.cog_event_stream_ended(target, generation)
+                    });
+                })
+                .detach();
+            }
+            Err(_) => self.cog_event_stream_ended(target, generation),
+        }
+    }
+
+    pub(crate) fn cog_push_global_event(
+        &mut self,
+        target: workspace::WindowId,
+        generation: u64,
+        line: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
+            return;
+        };
+        let Some(event_id) = event.get("event_id").and_then(serde_json::Value::as_i64) else {
+            return;
+        };
+        let fresh = {
+            let Some(tile) = self.cog_tile_by_id_mut(target) else {
+                return;
+            };
+            if tile.events_gen != generation
+                || tile.events_cursor.is_some_and(|cursor| event_id <= cursor)
+            {
+                false
+            } else {
+                tile.events_cursor = Some(event_id);
+                true
+            }
+        };
+        if fresh {
+            // Scope metadata is an optimization hint, never a correctness
+            // dependency: every new entity kind still refreshes this tile's
+            // current projection.
+            self.cog_invalidate_current(target, cx);
+        }
+    }
+
+    pub(crate) fn cog_event_stream_ended(
+        &mut self,
+        target: workspace::WindowId,
+        generation: u64,
+    ) {
+        let Some(tile) = self.cog_tile_by_id_mut(target) else {
+            return;
+        };
+        if tile.events_gen != generation {
+            return;
+        }
+        tile.events_connected = false;
+        if let Some(mut child) = tile.events_watch.take() {
+            let _ = child.kill();
+        }
+    }
+
+    /// Invalidate whatever the tile currently projects. Home uses the existing
+    /// exact-selection atomic snapshot; Graph uses its existing burst coalescer;
+    /// loading/error retries the cursor-before-read startup.
+    pub(crate) fn cog_invalidate_current(
+        &mut self,
+        target: workspace::WindowId,
+        cx: &mut Context<Self>,
+    ) {
+        let state = self
+            .cog_tile_by_id_mut(target)
+            .and_then(|tile| tile.view.clone())
+            .map(|view| {
+                let view = view.read(cx);
+                (
+                    view.current_graph_id().is_some(),
+                    view.live_home_key().is_some(),
+                    view.is_loading(),
+                )
+            });
+        match state {
+            Some((true, _, _)) => self.cog_refresh_bundle(target, cx),
+            Some((_, true, _)) => self.cog_live_tick(target, cx),
+            Some((_, _, true)) => {
+                if let Some(tile) = self.cog_tile_by_id_mut(target) {
+                    tile.events_pending = true;
+                }
+            }
+            Some(_) => self.cog_load_graphs_into(target, cx),
+            None => {}
         }
     }
 

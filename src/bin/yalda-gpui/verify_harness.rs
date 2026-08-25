@@ -27012,6 +27012,19 @@ fn cog_tile_live_state(
     })
 }
 
+#[cfg(test)]
+fn cog_tile_global_state(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+) -> (u64, Option<i64>, bool) {
+    view.update(vcx, |v, _| match v.workspace.focused_content() {
+        Some(crate::App::Cog(tile)) => {
+            (tile.events_gen, tile.events_cursor, tile.events_connected)
+        }
+        _ => panic!("expected a Cog tile"),
+    })
+}
+
 /// UXI-Cog-16: the additive Cog persistence payload accepts the historical
 /// empty shape and round-trips stable semantic state without remote data.
 ///
@@ -27202,6 +27215,81 @@ fn cog_live_home_refresh_coalesces_and_rejects_stale_selection(cx: &mut TestAppC
     vcx.run_until_parked();
     assert_eq!(cv.update(vcx, |c, _| c.topic_rows().len()), 4);
     assert!(!cog_tile_live_state(&view, vcx).1, "refresh cycle settled");
+}
+
+/// UXI-Cog-17: the global feed resumes after the cursor captured before Home,
+/// immediately invalidates the exact current projection, and coalesces a burst.
+/// Duplicate, stale-generation, and malformed envelopes cannot advance state.
+///
+/// Negative control: remove the global event's `cog_invalidate_current` call;
+/// the first event no longer starts the production Home refresh reducer.
+#[gpui::test]
+fn cog_global_events_resume_and_invalidate_current_projection(cx: &mut TestAppContext) {
+    let (view, vcx, cv, wid) = boot_with_cog(cx);
+    let req = cog_tile_req(&view, vcx);
+    view.update(vcx, |v, cx| {
+        v.cog_apply(
+            wid,
+            req,
+            Ok(crate::CogFetch::HomeAt {
+                home: Box::new(cog_test_home(vec![cog_test_topic(
+                    "work::chat",
+                    crate::CogTopicKind::Chat,
+                    "c1",
+                    "Work chat",
+                )])),
+                cursor: Some(40),
+            }),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    assert!(cv.update(vcx, |c, _| c.live_home_key().is_some()));
+    let (generation, cursor, connected) = cog_tile_global_state(&view, vcx);
+    assert_eq!(cursor, Some(40), "cursor is captured before initial Home");
+    assert!(!connected, "the hermetic test owns no subprocess");
+
+    let event = |id| {
+        serde_json::json!({
+            "event_id": id,
+            "kind": "chat_entry_sent",
+            "entity_kind": "chat",
+            "entity_id": "c1",
+            "topic_addresses": ["work::chat"],
+            "data": {}
+        })
+        .to_string()
+    };
+    view.update(vcx, |v, cx| {
+        v.cog_push_global_event(wid, generation, event(41), cx);
+        v.cog_push_global_event(wid, generation, event(42), cx);
+    });
+    let (_, refreshing, pending) = cog_tile_live_state(&view, vcx);
+    assert!(refreshing, "first event starts an immediate atomic Home read");
+    assert!(pending, "second event coalesces into one trailing read");
+    assert_eq!(cog_tile_global_state(&view, vcx).1, Some(42));
+
+    view.update(vcx, |v, cx| {
+        v.cog_push_global_event(wid, generation, event(42), cx);
+        v.cog_push_global_event(wid, generation.wrapping_add(1), event(99), cx);
+        v.cog_push_global_event(wid, generation, "not-json".into(), cx);
+        v.cog_push_global_event(wid, generation, "{\"kind\":\"missing-id\"}".into(), cx);
+    });
+    assert_eq!(
+        cog_tile_global_state(&view, vcx).1,
+        Some(42),
+        "duplicate, stale-generation, and malformed envelopes are rejected"
+    );
+
+    view.update(vcx, |v, _| {
+        if let Some(crate::App::Cog(tile)) = v.workspace.focused_content_mut() {
+            tile.events_connected = true;
+        }
+        v.cog_event_stream_ended(wid, generation);
+    });
+    let (_, cursor, connected) = cog_tile_global_state(&view, vcx);
+    assert!(!connected, "disconnect enters bounded fallback mode");
+    assert_eq!(cursor, Some(42), "reconnect retains the last applied cursor");
 }
 
 /// UXI-Cog-1 (regression): a Cog tile whose first render runs WITHOUT an explicit
