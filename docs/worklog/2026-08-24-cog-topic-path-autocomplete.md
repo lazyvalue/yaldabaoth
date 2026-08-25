@@ -1,7 +1,10 @@
 # Worklog: Cog Topic path autocomplete
 
 **Date:** 2026-08-24
-**Branches touched:** `codex/cog-topic-path-autocomplete` (pending integration commit) — Agent input autocomplete implementation and verification
+**Branches touched:**
+
+- `codex/cog-topic-path-autocomplete` (`6fe1abe`) — Agent input autocomplete implementation and verification
+- `main` (`ee531d2`) — feature integration and upgraded-dependency release verification
 
 ## Cog execution evidence
 
@@ -27,12 +30,13 @@ frontier 4: omega [open] (omega)
 - `e2is` `Add real-path RED guards`: claimed → closed; output: `{"summary":"Added pure query/filter/replacement coverage and two real key/render path guards","red_evidence":"tests first failed against the missing Topic model and app state"}`
 - `wx2o` `Load and model live Topic completions`: claimed → closed; output: `{"summary":"Added a lazy shared catalog, background-only Cog root load, address sort/dedup, caret-token filtering, per-session state, and token replacement","tests":"focused pure guard passed"}`
 - `naps` `Render and dispatch autocomplete`: claimed → closed; output: `{"summary":"Wired Topic completion through shared Message Box/Worksheet dispatch and yux popup chrome","tests":"both real-path popup guards passed"}`
-- `ftss` `Verify, reconcile, and integrate`: claimed → closed; output: pending final integration record.
-- `y4nw` `omega`: claimed → closed; output: pending final aggregate record.
+- `ftss` `Verify, reconcile, and integrate`: claimed → closed; output: `{"summary":"Reconciled UX/backlog, validated worklog, merged 6fe1abe to main as ee531d2, and rebuilt/tested against the upgraded Cargo state","compatibility":"live Cog root list, focused main tests, and main release build pass"}`
+- `y4nw` `omega`: claimed → closed; output: `{"summary":"Topic autocomplete is implemented in both placements with live data, real-path guards, reconciled docs, and a verified main build","remaining":"human native-pixel review only"}`
 
 ### Notes
 
 - Graph `o2q`, seq `15`, topic `deviation`: the graph was accidentally sealed before execution and rejected the first claim; it was unsealed before any tracked edit, its structure stayed unchanged, and final sealing was deferred until omega.
+- Node `ftss`, note `ffwmzz`, seq `3`, topic `deviation`: the aggregate process passed 705 and failed two existing steering harness cases; each case passes individually on both the feature branch and untouched baseline, so all 707 nonignored cases pass when those process-order-sensitive cases are isolated.
 
 ### Final status
 
@@ -73,6 +77,7 @@ frontier 4: omega [done] (omega)
 - Paint negative control: disabling the Topic render gate failed the Worksheet popup-paint assertion; restored GREEN.
 - Live compatibility: `cog topic list "" --limit 1000` succeeded and returned `projects/cog/mail::chat` as a `chat` binding.
 - `cargo build --release --bin yalda-gpui`: passed on the feature branch.
+- Main compatibility after merge: both Topic popup guards and `cargo build --release --bin yalda-gpui` pass against the user's upgraded, uncommitted `Cargo.toml`/`Cargo.lock` state.
 - `git diff --check`: passed.
 - `scripts/check-cog-worklog.sh docs/worklog/2026-08-24-cog-topic-path-autocomplete.md` passes.
 
