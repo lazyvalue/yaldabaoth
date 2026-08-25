@@ -1,7 +1,10 @@
 # Worklog: Percent-triggered fresh Topic autocomplete
 
 **Date:** 2026-08-24
-**Branches touched:** `codex/percent-topic-autocomplete-refresh` (pending integration commit) — explicit trigger and refresh lifecycle
+**Branches touched:**
+
+- `codex/percent-topic-autocomplete-refresh` (`6627930`) — explicit trigger and refresh lifecycle
+- `main` (`738d999`) — feature integration and upgraded-dependency verification
 
 ## Cog execution evidence
 
@@ -24,8 +27,8 @@ frontier 3: omega [open] (omega)
 - `oms4` `settle-percent-contract`: claimed → closed; output: `{"summary":"Made a leading percent token the exclusive Topic trigger, with raw suffix matching, full-token replacement, and one refresh per new query","compatibility":"existing Cog root-list API remains sufficient"}`
 - `epqe` `add-percent-red-guards`: claimed → closed; output: `{"summary":"Added percent query, unmarked-path rejection, once-per-opening refresh, stale invalidation, and both-placement guards","red_evidence":"five intended E0599 errors for the missing refresh-generation method"}`
 - `q6jl` `implement-fresh-percent-model`: claimed → closed; output: `{"summary":"Implemented percent-only queries plus per-session refresh state and app-wide generation-fenced background loads","tests":"Topic-focused set passed 9/9"}`
-- `421a` `reconcile-and-integrate`: claimed → closed; output: pending final integration record.
-- `klat` `omega`: claimed → closed; output: pending final aggregate record.
+- `421a` `reconcile-and-integrate`: claimed → closed; output: `{"summary":"Observed both negative controls, restored 9/9 Topic tests, validated the worklog, merged 6627930 to main as 738d999, and rebuilt against upgraded Cargo state","suite":"707 aggregate passes plus both sensitive steering cases pass individually"}`
+- `klat` `omega`: claimed → closed; output: `{"summary":"Percent-triggered completion refreshes live bindings in both placements with generation fencing and verified upgraded-main build","remaining":"human native-pixel review only"}`
 
 ### Notes
 
@@ -66,6 +69,7 @@ frontier 3: omega [done] (omega)
 - Trigger negative control: suppressing `%` recognition failed the percent-query eligibility assertion; restored GREEN.
 - Refresh negative control: suppressing refresh dispatch failed the stale-catalog invalidation assertion; restored GREEN.
 - `cargo build --release --bin yalda-gpui`: passed on the feature branch.
+- Main compatibility: the 9 Topic tests and release build pass against the user's upgraded, uncommitted `Cargo.toml`/`Cargo.lock` state.
 - `git diff --check`: passed.
 - `scripts/check-cog-worklog.sh docs/worklog/2026-08-24-percent-topic-autocomplete-refresh.md` passes.
 
