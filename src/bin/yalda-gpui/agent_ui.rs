@@ -2432,6 +2432,8 @@ impl YaldaGpuiView {
             available_commands: Vec::new(),
             slash_popup_sel: 0,
             slash_popup_dismissed: false,
+            topic_popup_sel: 0,
+            topic_popup_dismissed: false,
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             usage: None,
             focused_subagent: None,
@@ -6111,6 +6113,32 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
+    /// Lazily load the installation-wide Cog Topic catalog used by Agent compose
+    /// autocomplete (UXI-AgentTile-43). The subprocess is always on GPUI's
+    /// background executor; successful data is cached for the app run. A failed
+    /// load returns to idle so a later eligible edit can retry unobtrusively.
+    pub(crate) fn ensure_topic_completion_catalog(&mut self, cx: &mut Context<Self>) {
+        if self.topic_completions_loaded || self.topic_completions_loading || cfg!(test) {
+            return;
+        }
+        self.topic_completions_loading = true;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async { cog::list_topic_bindings() })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.topic_completions_loading = false;
+                if let Ok(bindings) = result {
+                    this.topic_completions = bindings;
+                    this.topic_completions_loaded = true;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     /// Key dispatch for the agent window. Recognises the agent-window-
     /// scoped shortcuts (`Ctrl-Enter` submit, `Ctrl-Alt-Enter` mode toggle)
     /// before routing remaining keys to either the chatbox (in Chatbox mode)
@@ -6508,6 +6536,7 @@ impl YaldaGpuiView {
         // in place. `compose_mut()` is total, so there is no per-placement branch.
         // (Compose has its own scroll/list_state, so no `pending_reveal_cursor`
         // transcript-reveal is needed for typing.)
+        let topic_catalog = self.topic_completions.clone();
         let Some(outcome) = self.with_session_silent(focused_id, cx, |claude| {
             claude.status = None;
 
@@ -6541,6 +6570,35 @@ impl YaldaGpuiView {
                     }
                     Key::Esc => {
                         claude.slash_popup_dismissed = true;
+                        return NormalOutcome::Handled;
+                    }
+                    _ => {}
+                }
+            }
+
+            // UXI-AgentTile-43: Topic completion shares the compose dispatch in
+            // both placements and owns its keys before history/editor motion.
+            // Slash completion stays first and `topic_query` excludes its draft.
+            let topic_rows = claude.topic_popup_rows(&topic_catalog);
+            if !topic_rows.is_empty() && press.modifiers.is_empty() {
+                match press.key {
+                    Key::Up => {
+                        claude.topic_popup_sel = claude.topic_popup_sel.saturating_sub(1);
+                        return NormalOutcome::Handled;
+                    }
+                    Key::Down => {
+                        claude.topic_popup_sel =
+                            (claude.topic_popup_sel + 1).min(topic_rows.len() - 1);
+                        return NormalOutcome::Handled;
+                    }
+                    Key::Tab | Key::Enter => {
+                        let sel = claude.topic_popup_sel.min(topic_rows.len() - 1);
+                        let address = topic_rows[sel].address.clone();
+                        claude.accept_topic_completion(&address);
+                        return NormalOutcome::Handled;
+                    }
+                    Key::Esc => {
+                        claude.topic_popup_dismissed = true;
                         return NormalOutcome::Handled;
                     }
                     _ => {}
@@ -6606,11 +6664,22 @@ impl YaldaGpuiView {
             if edited {
                 claude.slash_popup_sel = 0;
                 claude.slash_popup_dismissed = false;
+                claude.topic_popup_sel = 0;
+                claude.topic_popup_dismissed = false;
             }
             outcome
         }) else {
             return;
         };
+        // The key that introduced the first `/` may have created the eligible
+        // Topic token inside the closure above, so inspect after dispatch and
+        // start the lazy load here. The loader itself always runs off-thread.
+        if self
+            .agent_read(cx, |c| c.topic_query().is_some())
+            .unwrap_or(false)
+        {
+            self.ensure_topic_completion_catalog(cx);
+        }
         // UXI-AgentTile-11 bugfix (stale inline typing): when the compose is the INLINE
         // You-block it renders INSIDE the cached `TranscriptView`, whose
         // `cx.observe(&session)` fires only on a SESSION notify. `with_session_silent`

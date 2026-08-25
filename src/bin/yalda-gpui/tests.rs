@@ -6462,3 +6462,64 @@ fn slash_query_and_popup_rows_filter() {
         "no popup outside Insert mode"
     );
 }
+
+/// UXI-AgentTile-43 (pure): Topic completion is caret-token-local, requires a
+/// path-shaped token, filters exact raw address prefixes deterministically, and
+/// replaces only the token while preserving surrounding prompt text.
+#[test]
+fn topic_query_filters_and_replaces_caret_token() {
+    use crate::agent::AgentState;
+    use crate::{CogTopicBinding, CogTopicKind};
+
+    let binding = |address: &str, kind, name: &str| CogTopicBinding {
+        address: address.into(),
+        kind,
+        object: format!("object-{name}"),
+        name: name.into(),
+        created_at: 0,
+    };
+    let catalog = vec![
+        binding("projects/cog/mail::chat", CogTopicKind::Chat, "Cog mail"),
+        binding("projects/cog::roadmap", CogTopicKind::Bulletin, "Roadmap"),
+        binding("projects/cog::work", CogTopicKind::Graph, "Work"),
+    ];
+    let mut s = AgentState::new_for_test();
+
+    s.input_surface
+        .compose_mut()
+        .set_recalled("ask projects/co tomorrow");
+    // Put the caret immediately after the partial Topic token, not at draft end.
+    s.input_surface.compose_mut().editor.cursor_mut().col = 15;
+    let query = s.topic_query().expect("path-shaped caret token is eligible");
+    assert_eq!(query.text, "projects/co");
+    assert_eq!((query.start, query.end), (4, 15));
+    assert_eq!(
+        s.topic_popup_rows(&catalog)
+            .iter()
+            .map(|row| row.address.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "projects/cog/mail::chat",
+            "projects/cog::roadmap",
+            "projects/cog::work",
+        ],
+        "raw prefix filter is deterministic",
+    );
+
+    s.accept_topic_completion("projects/cog/mail::chat");
+    assert_eq!(
+        s.input_surface.compose().text(),
+        "ask projects/cog/mail::chat tomorrow",
+        "only the token under the caret is replaced",
+    );
+    let cursor = s.input_surface.compose().editor.cursor();
+    assert_eq!((cursor.line, cursor.col), (0, 27));
+
+    s.input_surface.compose_mut().set_recalled("ordinary prose");
+    assert!(s.topic_query().is_none(), "ordinary prose stays quiet");
+    s.input_surface.compose_mut().set_recalled("/co");
+    assert!(
+        s.topic_query().is_none(),
+        "a bare leading slash token belongs to slash-command completion",
+    );
+}

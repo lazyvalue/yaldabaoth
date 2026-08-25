@@ -18554,6 +18554,147 @@ fn slash_popup_paints_above_compose(cx: &mut TestAppContext) {
     );
 }
 
+fn test_topic_bindings() -> Vec<crate::CogTopicBinding> {
+    vec![
+        crate::CogTopicBinding {
+            address: "projects/cog/mail::chat".into(),
+            kind: crate::CogTopicKind::Chat,
+            object: "chat-1".into(),
+            name: "Cog mail".into(),
+            created_at: 0,
+        },
+        crate::CogTopicBinding {
+            address: "projects/cog::roadmap".into(),
+            kind: crate::CogTopicKind::Bulletin,
+            object: "note-1".into(),
+            name: "Roadmap".into(),
+            created_at: 0,
+        },
+    ]
+}
+
+/// UXI-AgentTile-43 (REAL dispatch): Topic completion owns arrows and Enter in
+/// the Message Box, replaces only the caret token, and does not submit.
+///
+/// Negative control: remove the Topic-popup interception in `handle_claude_key`;
+/// Down falls through and Enter submits, so the replacement/idle assertions fail.
+#[gpui::test]
+fn topic_popup_message_box_navigates_and_accepts_without_submit(cx: &mut TestAppContext) {
+    use crate::agent::{AgentFocus, InputSurface};
+    let (view, vcx, id, _s) = boot_with_transcript(cx);
+    view.update(vcx, |v, cx| {
+        v.topic_completions = test_topic_bindings();
+        v.with_session(id, cx, |c| {
+            c.sent_history = vec!["old message".into()];
+            c.input_surface = InputSurface::with_draft(
+                crate::InputModeKind::Chatbox,
+                "ask projects/cog",
+            );
+            c.focus = AgentFocus::Compose;
+        });
+    });
+    let key = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext, k: &str| {
+        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(k), w, cx));
+    };
+
+    key(&view, vcx, "down");
+    assert_eq!(
+        view.read_with(vcx, |v, cx| v
+            .read_session(id, cx, |c| c.topic_popup_sel)
+            .unwrap()),
+        1,
+        "Down selects the second Topic instead of recalling history",
+    );
+    key(&view, vcx, "up");
+    assert_eq!(
+        view.read_with(vcx, |v, cx| v
+            .read_session(id, cx, |c| c.topic_popup_sel)
+            .unwrap()),
+        0,
+        "Up returns to the first Topic",
+    );
+    key(&view, vcx, "down");
+    key(&view, vcx, "enter");
+    view.read_with(vcx, |v, cx| {
+        v.read_session(id, cx, |c| {
+            assert_eq!(c.input_surface.compose().text(), "ask projects/cog::roadmap");
+            assert!(
+                matches!(c.turn_phase, crate::TurnPhase::Idle),
+                "accepting a completion does not submit"
+            );
+            assert!(c.topic_popup_rows(&v.topic_completions).is_empty());
+        })
+        .unwrap();
+    });
+
+    // A fresh eligible query re-opens; Esc dismisses without editing/submitting.
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| {
+            c.input_surface = InputSurface::with_draft(
+                crate::InputModeKind::Chatbox,
+                "ask projects/cog",
+            );
+            c.topic_popup_dismissed = false;
+        });
+    });
+    key(&view, vcx, "escape");
+    view.read_with(vcx, |v, cx| {
+        let catalog = v.topic_completions.clone();
+        v.read_session(id, cx, |c| {
+            assert_eq!(c.input_surface.compose().text(), "ask projects/cog");
+            assert!(c.topic_popup_rows(&catalog).is_empty());
+            assert!(matches!(c.turn_phase, crate::TurnPhase::Idle));
+        })
+        .unwrap();
+    });
+}
+
+/// UXI-AgentTile-43 (REAL dispatch + PAINT): Worksheet uses the same Topic
+/// catalog, Tab acceptance, and popup render path as Message Box.
+///
+/// Negative control: disable the Topic render gate; the `topic-popup` probe is
+/// absent while the real Worksheet You-block remains painted.
+#[gpui::test]
+fn topic_popup_worksheet_accepts_and_paints(cx: &mut TestAppContext) {
+    use crate::agent::{AgentFocus, InputSurface};
+    let (view, vcx, id, _s) = boot_with_transcript(cx);
+    view.update(vcx, |v, cx| {
+        v.topic_completions = test_topic_bindings();
+        v.with_session(id, cx, |c| {
+            c.input_surface = InputSurface::with_draft(
+                crate::InputModeKind::Worksheet,
+                "route projects/cog/m",
+            );
+            c.focus = AgentFocus::Compose;
+            c.you_block_open = true;
+        });
+    });
+    // The You-block lives in the cached TranscriptView, so use the harness's
+    // cache-dirtying probe seam; the Topic popup is root-owned but the same seam
+    // also captures it on a fresh paint.
+    let you_block = probe_dirty(&view, vcx, "you-block");
+    let popup = probe_dirty(&view, vcx, "topic-popup");
+    assert!(popup.is_some(), "Topic popup paints for Worksheet input");
+    assert!(you_block.is_some(), "the inline Worksheet You-block paints");
+
+    view.update_in(vcx, |v, w, cx| {
+        v.handle_claude_key(&ws_bare_key("tab"), w, cx)
+    });
+    view.read_with(vcx, |v, cx| {
+        v.read_session(id, cx, |c| {
+            assert_eq!(
+                c.input_surface.compose().text(),
+                "route projects/cog/mail::chat"
+            );
+            assert!(
+                matches!(c.turn_phase, crate::TurnPhase::Idle),
+                "Tab completion does not submit"
+            );
+        })
+        .unwrap();
+    });
+}
+
 /// UXI-AgentTile-42 (n3a): the agent's advertised slash commands
 /// (`AvailableCommandsUpdate`, previously a parked no-op) reach the session model
 /// through the REAL reducer (`apply_server_batch` → `apply_reply_events`), and

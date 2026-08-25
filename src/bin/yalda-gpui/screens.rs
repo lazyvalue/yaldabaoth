@@ -1366,6 +1366,10 @@ impl YaldaGpuiView {
         let slash_sel = c.slash_popup_sel.min(slash_rows.len().saturating_sub(1));
         let show_slash_popup =
             !slash_rows.is_empty() && (c.focus == AgentFocus::Compose || show_compose);
+        let topic_rows = c.topic_popup_rows(&self.topic_completions);
+        let topic_sel = c.topic_popup_sel.min(topic_rows.len().saturating_sub(1));
+        let show_topic_popup =
+            !topic_rows.is_empty() && (c.focus == AgentFocus::Compose || show_compose);
         let compose_panel = if !show_compose {
             None
         } else {
@@ -2214,58 +2218,54 @@ impl YaldaGpuiView {
         if let Some(recap_el) = self.render_agent_recap(id, weak_self.clone()) {
             main_col = main_col.child(recap_el);
         }
-        // n3b (UXI-AgentTile-42): the slash-command autocomplete popup, pinned just
-        // ABOVE the compose in either placement. One row per filtered command
-        // (`/name` + description); the selected row is accent-washed.
+        // UXI-AgentTile-42/-43: shared yux completion chrome, pinned above the
+        // compose in either placement. Slash and Topic queries are mutually
+        // exclusive; each domain supplies only row labels and metadata.
         if show_slash_popup {
-            let mut hl = nc(at.warm_accent);
-            hl.a = 0.20;
-            let mut pop = div()
-                .id("slash-popup")
-                .flex()
-                .flex_col()
-                .flex_none()
-                .w_full()
-                .max_h(px(180.0))
-                .overflow_y_scroll()
-                .border_t_1()
-                .border_color(dim_fg)
-                .bg(compose_panel_bg)
-                .text_size(px(12.0))
-                .font_family(self.code_font.clone());
-            for (i, cmd) in slash_rows.iter().enumerate() {
-                let selected = i == slash_sel;
-                let name = format!("/{}", cmd.name);
-                let mut row = div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .w_full()
-                    .px_2()
-                    .py(px(1.0));
-                if selected {
-                    row = row.bg(hl);
-                }
-                pop = pop.child(
-                    row.child(
-                        div()
-                            .flex_none()
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(compose_fg)
-                            .child(SharedString::from(name)),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_color(dim_fg)
-                            .child(SharedString::from(cmd.description.clone())),
-                    ),
-                );
-            }
+            let rows: Vec<CompletionPopupRow> = slash_rows
+                .iter()
+                .map(|cmd| CompletionPopupRow {
+                    primary: format!("/{}", cmd.name),
+                    secondary: cmd.description.clone(),
+                })
+                .collect();
+            let pop = completion_popup(
+                "slash-popup",
+                &rows,
+                slash_sel,
+                compose_panel_bg,
+                dim_fg,
+                compose_fg,
+                dim_fg,
+                nc(at.warm_accent),
+                &self.code_font,
+            );
             main_col = main_col.child(probe_bounds("slash-popup", pop.into_any_element()));
+        }
+        if show_topic_popup {
+            let rows: Vec<CompletionPopupRow> = topic_rows
+                .iter()
+                .map(|topic| CompletionPopupRow {
+                    primary: topic.address.clone(),
+                    secondary: if topic.name.trim().is_empty() {
+                        topic.kind.label().to_string()
+                    } else {
+                        format!("{} · {}", topic.kind.label(), topic.name)
+                    },
+                })
+                .collect();
+            let pop = completion_popup(
+                "topic-popup",
+                &rows,
+                topic_sel,
+                compose_panel_bg,
+                dim_fg,
+                compose_fg,
+                dim_fg,
+                nc(at.warm_accent),
+                &self.code_font,
+            );
+            main_col = main_col.child(probe_bounds("topic-popup", pop.into_any_element()));
         }
         if let Some(panel) = compose_panel {
             main_col = main_col.child(panel);

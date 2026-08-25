@@ -30,8 +30,9 @@ strip**, the **transcript** (a cached child, `TranscriptView`), the **compose** 
   right sidepanel (Plan + Subagents), its keyboard focus model, and `Cmd-B` hide.
 - [transcript.md](transcript.md) — `UXI-AgentTile-4..8`, `-40`: the transcript reading
   surface (background, turn headers, subagent swap, render freshness, token splits).
-- [compose.md](compose.md) — `UXI-AgentTile-9..14`, `-21`: the compose input (word-wrap,
-  worksheet vs chatbox, paint-on-route, immediate submit, image paste, reply-with-quote).
+- [compose.md](compose.md) — `UXI-AgentTile-9..14`, `-21`, `-41..43`: the compose
+  input (word-wrap, worksheet vs Message Box, paint-on-route, immediate submit,
+  image paste, history recall, and command/Topic completion).
 - [naming.md](naming.md) — `UXI-AgentTile-27`: one-shot autonaming + summary of a
   session from its first exchange; an explicit rename latches and wins.
 - [recap.md](recap.md) — `UXI-AgentTile-15`: the pinned, isolated session recap.
@@ -82,3 +83,6 @@ strip**, the **transcript** (a cached child, `TranscriptView`), the **compose** 
 | UXI-AgentTile-33 | session-binding | Tagging a session opens a two-column add/remove dialog | implemented |
 | UXI-AgentTile-34 | session-binding | Session selection and workspace ownership are independent | implemented |
 | UXI-AgentTile-40 | transcript | `J`/`K` move directly between user turns | implemented |
+| UXI-AgentTile-41 | compose | Up/Down recall previously-sent compose messages | implemented |
+| UXI-AgentTile-42 | compose | Slash-command autocomplete popup in the compose | implemented |
+| UXI-AgentTile-43 | compose | Cog Topic path autocomplete in both compose placements | implemented |

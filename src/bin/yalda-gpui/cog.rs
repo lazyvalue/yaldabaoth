@@ -747,9 +747,16 @@ pub(crate) fn list_graphs() -> Result<Vec<CogGraph>, String> {
 /// List every live hierarchical Topic binding. The empty prefix is the public
 /// root-browser contract documented by Cog; `--limit 1000` matches the server's
 /// maximum page size for a dense first-draft explorer.
+pub(crate) fn list_topic_bindings() -> Result<Vec<CogTopicBinding>, String> {
+    let mut bindings: Vec<CogTopicBinding> =
+        cog_json(&["topic", "list", "", "--limit", "1000"])?;
+    bindings.sort_by(|a, b| a.address.cmp(&b.address));
+    bindings.dedup_by(|a, b| a.address == b.address);
+    Ok(bindings)
+}
+
 pub(crate) fn list_topics() -> Result<CogTopicTree, String> {
-    let bindings: Vec<CogTopicBinding> = cog_json(&["topic", "list", "", "--limit", "1000"])?;
-    Ok(CogTopicTree::from_bindings(bindings))
+    Ok(CogTopicTree::from_bindings(list_topic_bindings()?))
 }
 
 pub(crate) fn load_home() -> Result<CogHomeData, String> {
