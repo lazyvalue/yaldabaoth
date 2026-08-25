@@ -20,6 +20,7 @@ pub(crate) enum CogSourceTab {
     Agents,
 }
 
+#[derive(PartialEq)]
 pub(crate) enum CogTopicDetailState {
     Empty,
     Loading(String),
@@ -33,12 +34,14 @@ pub(crate) enum CogTopicDetailState {
     },
 }
 
+#[derive(PartialEq)]
 pub(crate) enum CogAgentDetailState {
     Empty,
     Loading(String),
     Loaded(Box<CogAgentDetail>),
 }
 
+#[derive(PartialEq)]
 pub(crate) struct CogHomeState {
     pub(crate) topics: CogTopicTree,
     pub(crate) agents: Vec<CogAgentAddress>,
@@ -131,6 +134,12 @@ pub(crate) enum CogViewState {
     },
 }
 
+pub(crate) enum CogResume {
+    Graph { id: String, label: Option<String> },
+    Topic(CogTopicBinding),
+    Agent(CogAgentAddress),
+}
+
 /// Which pane the keyboard drives. `Selector` selects rows; `Detail` and
 /// `Events` scroll their pane with the same j/k/arrow keys. `Events` is only
 /// reachable in the `Graph` state (the explorer has no live-events pane).
@@ -173,6 +182,10 @@ pub(crate) struct CogView {
     /// graph changes — a tile preference, not per-graph state (so `set_state`
     /// does not reset it). Default `false` (shown).
     events_hidden: bool,
+    /// Serializable semantic shadow shared with the cheap tile wrapper. Remote
+    /// payloads never enter it, so workspace saves remain small and restore is
+    /// forced through fresh Cog reads.
+    remembered: CogRememberedHandle,
     root: WeakEntity<YaldaGpuiView>,
     perf_label: &'static str,
 }
@@ -187,7 +200,8 @@ fn graph_matches(g: &CogGraph, filter: &str) -> bool {
 }
 
 impl CogView {
-    pub(crate) fn new(root: WeakEntity<YaldaGpuiView>) -> Self {
+    pub(crate) fn new(root: WeakEntity<YaldaGpuiView>, remembered: CogRememberedHandle) -> Self {
+        let restored = remembered.borrow().clone();
         CogView {
             state: CogViewState::Loading("loading topics…".into()),
             left_scroll: ScrollHandle::new(),
@@ -195,13 +209,18 @@ impl CogView {
             events: Vec::new(),
             events_scroll: ScrollHandle::new(),
             event_seq: 0,
-            focus: CogFocus::Selector,
             graph_filter: String::new(),
             filtering: false,
-            collapsed: std::collections::HashSet::new(),
-            topic_collapsed: std::collections::HashSet::new(),
+            collapsed: restored.json_collapsed.iter().cloned().collect(),
+            topic_collapsed: restored.topic_collapsed.iter().cloned().collect(),
             home_backstack: None,
-            events_hidden: false,
+            events_hidden: restored.events_hidden,
+            focus: match restored.focus {
+                CogRememberedFocus::Selector => CogFocus::Selector,
+                CogRememberedFocus::Detail => CogFocus::Detail,
+                CogRememberedFocus::Events => CogFocus::Events,
+            },
+            remembered,
             root,
             perf_label: "cog",
         }
@@ -209,6 +228,203 @@ impl CogView {
 
     pub(crate) fn perf_label(&self) -> &'static str {
         self.perf_label
+    }
+
+    fn remembered_source(tab: CogSourceTab) -> CogRememberedSource {
+        match tab {
+            CogSourceTab::Topics => CogRememberedSource::Topics,
+            CogSourceTab::Agents => CogRememberedSource::Agents,
+        }
+    }
+
+    fn source_tab(source: CogRememberedSource) -> CogSourceTab {
+        match source {
+            CogRememberedSource::Topics => CogSourceTab::Topics,
+            CogRememberedSource::Agents => CogSourceTab::Agents,
+        }
+    }
+
+    fn remembered_focus(focus: CogFocus) -> CogRememberedFocus {
+        match focus {
+            CogFocus::Selector => CogRememberedFocus::Selector,
+            CogFocus::Detail => CogRememberedFocus::Detail,
+            CogFocus::Events => CogRememberedFocus::Events,
+        }
+    }
+
+    fn topic_selection(&self) -> Option<CogRememberedTopic> {
+        let CogViewState::Home(home) = &self.state else {
+            return None;
+        };
+        match self.topic_rows().get(home.topic_selected)? {
+            CogTopicRow::Folder { path, .. } => Some(CogRememberedTopic::Folder(path.clone())),
+            CogTopicRow::Binding { binding, .. } => {
+                Some(CogRememberedTopic::Binding(binding.address.clone()))
+            }
+        }
+    }
+
+    /// Synchronize semantic UI state into the serialization shadow. Loading and
+    /// remote payloads are deliberately omitted. `clear_home_graph` is false
+    /// only while the freshly-loaded Home is staging a persisted graph restore.
+    fn sync_remembered(&self, clear_home_graph: bool) {
+        let mut remembered = self.remembered.borrow_mut();
+        remembered.topic_collapsed = self.topic_collapsed.iter().cloned().collect();
+        remembered.json_collapsed = self.collapsed.iter().cloned().collect();
+        remembered.events_hidden = self.events_hidden;
+        remembered.focus = Self::remembered_focus(self.focus);
+        match &self.state {
+            CogViewState::Home(home) => {
+                remembered.source = Self::remembered_source(home.tab);
+                remembered.topic = self.topic_selection();
+                remembered.agent = home.agents.get(home.agent_selected).map(|a| a.id.clone());
+                if clear_home_graph {
+                    remembered.graph = None;
+                    remembered.json_collapsed.clear();
+                }
+            }
+            CogViewState::Graph {
+                bundle,
+                selected,
+                overview,
+            } => {
+                remembered.graph = Some(CogRememberedGraph {
+                    id: bundle.graph.id.clone(),
+                    label: Some(bundle.graph.label()),
+                    overview: *overview,
+                    node: (!*overview)
+                        .then(|| bundle.nodes.get(*selected).map(|node| node.id.clone()))
+                        .flatten(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn persist_remembered(&self, cx: &mut Context<Self>) {
+        if let Some(root) = self.root.upgrade() {
+            root.update(cx, |root, _| root.save_workspace_state());
+        }
+    }
+
+    fn home_from_data(&self, data: CogHomeData) -> CogHomeState {
+        let remembered = self.remembered.borrow().clone();
+        let mut home = CogHomeState::new(data);
+        home.tab = Self::source_tab(remembered.source);
+
+        let mut topic_rows = Vec::new();
+        flatten_topic_nodes(
+            &home.topics.roots,
+            0,
+            &self.topic_collapsed,
+            &mut topic_rows,
+        );
+        if let Some(selection) = remembered.topic {
+            home.topic_selected = topic_rows
+                .iter()
+                .position(|row| match (row, &selection) {
+                    (CogTopicRow::Folder { path, .. }, CogRememberedTopic::Folder(saved)) => {
+                        path == saved
+                    }
+                    (CogTopicRow::Binding { binding, .. }, CogRememberedTopic::Binding(saved)) => {
+                        binding.address == *saved
+                    }
+                    _ => false,
+                })
+                .unwrap_or(0);
+        }
+        if let Some(id) = remembered.agent {
+            home.agent_selected = home
+                .agents
+                .iter()
+                .position(|address| address.id == id)
+                .unwrap_or(0);
+        }
+        home
+    }
+
+    /// Install a freshly-fetched browser payload while restoring stable
+    /// selector identities. A remembered graph remains staged until
+    /// [`resume`] is consumed by the root and its fresh bundle arrives.
+    pub(crate) fn install_home(&mut self, data: CogHomeData) {
+        let staged_graph = self.remembered.borrow().graph.clone();
+        let staged_json = self.remembered.borrow().json_collapsed.clone();
+        let staged_focus = self.remembered.borrow().focus;
+        let home = self.home_from_data(data);
+        self.set_state(CogViewState::Home(Box::new(home)));
+        self.collapsed = staged_json.iter().cloned().collect();
+        self.focus = match staged_focus {
+            CogRememberedFocus::Selector => CogFocus::Selector,
+            CogRememberedFocus::Detail | CogRememberedFocus::Events => CogFocus::Detail,
+        };
+        self.sync_remembered(staged_graph.is_none());
+        if let Some(graph) = staged_graph {
+            let mut remembered = self.remembered.borrow_mut();
+            remembered.graph = Some(graph);
+            remembered.json_collapsed = staged_json;
+        }
+    }
+
+    /// The immediate action needed after a fresh Home load, including reboot
+    /// restoration. Stable identifiers are resolved against the fresh payload.
+    pub(crate) fn resume(&self) -> Option<CogResume> {
+        if let Some(graph) = self.remembered.borrow().graph.clone() {
+            return Some(CogResume::Graph {
+                id: graph.id,
+                label: graph.label,
+            });
+        }
+        let CogViewState::Home(home) = &self.state else {
+            return None;
+        };
+        match home.tab {
+            CogSourceTab::Topics => self.selected_topic_binding().map(CogResume::Topic),
+            CogSourceTab::Agents => home
+                .agents
+                .get(home.agent_selected)
+                .cloned()
+                .map(CogResume::Agent),
+        }
+    }
+
+    pub(crate) fn live_home_key(&self) -> Option<CogLiveHomeKey> {
+        let CogViewState::Home(home) = &self.state else {
+            return None;
+        };
+        Some(CogLiveHomeKey {
+            source: Self::remembered_source(home.tab),
+            topic: self.selected_topic_binding().map(|binding| binding.address),
+            agent: self.selected_agent().map(|address| address.id),
+        })
+    }
+
+    /// Apply one whole non-graph revalidation atomically. A selection changed
+    /// while the subprocess reads were in flight makes the snapshot stale and
+    /// it is discarded in full; the next tick reads the new key.
+    pub(crate) fn apply_live_home(&mut self, key: &CogLiveHomeKey, live: CogLiveHome) -> bool {
+        if self.live_home_key().as_ref() != Some(key) {
+            return false;
+        }
+        let mut home = self.home_from_data(live.home);
+        if let Some((address, result)) = live.topic {
+            home.topic_detail = match result {
+                Ok(detail) => CogTopicDetailState::Loaded { address, detail },
+                Err(message) => CogTopicDetailState::Error { address, message },
+            };
+        }
+        if let Some((address, detail)) = live.agent {
+            if let Ok(delivery) = &detail.delivery {
+                home.agent_presence
+                    .insert(address, delivery.presence.clone());
+            }
+            home.agent_detail = CogAgentDetailState::Loaded(Box::new(detail));
+        }
+        let changed = !matches!(&self.state, CogViewState::Home(current) if **current == home);
+        if changed {
+            self.state = CogViewState::Home(Box::new(home));
+            self.sync_remembered(true);
+        }
+        changed
     }
 
     /// Replace the whole body state and reset both pane scrolls to the top.
@@ -224,6 +440,43 @@ impl CogView {
         self.collapsed.clear();
     }
 
+    /// Enter a loading state without throwing away the Home backstack. This is
+    /// shared by keyboard, mouse, and reboot restoration.
+    pub(crate) fn begin_graph_load(&mut self, id: String, label: Option<String>, status: String) {
+        if matches!(self.state, CogViewState::Home(_)) {
+            let previous =
+                std::mem::replace(&mut self.state, CogViewState::Loading(status.clone()));
+            if let CogViewState::Home(home) = previous {
+                self.home_backstack = Some(home);
+            }
+        }
+        self.set_state(CogViewState::Loading(status));
+        let mut remembered = self.remembered.borrow_mut();
+        let same_graph = remembered
+            .graph
+            .as_ref()
+            .is_some_and(|graph| graph.id == id);
+        if !same_graph {
+            remembered.json_collapsed.clear();
+        }
+        remembered.graph = Some(CogRememberedGraph {
+            id,
+            label,
+            overview: same_graph
+                .then(|| remembered.graph.as_ref().map(|graph| graph.overview))
+                .flatten()
+                .unwrap_or(true),
+            node: same_graph
+                .then(|| {
+                    remembered
+                        .graph
+                        .as_ref()
+                        .and_then(|graph| graph.node.clone())
+                })
+                .flatten(),
+        });
+    }
+
     pub(crate) fn enter_graph(&mut self, bundle: Box<CogBundle>) {
         if matches!(self.state, CogViewState::Home(_)) {
             let previous = std::mem::replace(
@@ -234,11 +487,41 @@ impl CogView {
                 self.home_backstack = Some(home);
             }
         }
+        let restored = self.remembered.borrow().graph.clone();
+        let same_graph = restored
+            .as_ref()
+            .is_some_and(|graph| graph.id == bundle.graph.id);
+        let selected = if same_graph {
+            restored
+                .as_ref()
+                .and_then(|graph| graph.node.as_deref())
+                .and_then(|node| bundle.nodes.iter().position(|item| item.id == node))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let overview = restored
+            .as_ref()
+            .filter(|_| same_graph)
+            .map(|graph| graph.overview)
+            .unwrap_or(true);
+        let restored_collapsed = same_graph
+            .then(|| self.remembered.borrow().json_collapsed.clone())
+            .unwrap_or_default();
+        let restored_focus = self.remembered.borrow().focus;
         self.set_state(CogViewState::Graph {
             bundle,
-            selected: 0,
-            overview: true,
+            selected,
+            overview,
         });
+        self.collapsed = restored_collapsed.iter().cloned().collect();
+        self.focus = match restored_focus {
+            CogRememberedFocus::Selector => CogFocus::Selector,
+            CogRememberedFocus::Detail => CogFocus::Detail,
+            CogRememberedFocus::Events if !self.events_hidden => CogFocus::Events,
+            CogRememberedFocus::Events => CogFocus::Detail,
+        };
+        self.sync_remembered(false);
     }
 
     pub(crate) fn return_home(&mut self) -> bool {
@@ -246,6 +529,7 @@ impl CogView {
             return false;
         };
         self.set_state(CogViewState::Home(home));
+        self.sync_remembered(true);
         true
     }
 
@@ -304,6 +588,7 @@ impl CogView {
         if let CogViewState::Home(home) = &mut self.state {
             home.topic_selected = home.topic_selected.min(len.saturating_sub(1));
         }
+        self.sync_remembered(true);
     }
 
     pub(crate) fn toggle_selected_topic_folder(&mut self) -> bool {
@@ -326,6 +611,8 @@ impl CogView {
         if !self.collapsed.remove(&path) {
             self.collapsed.insert(path);
         }
+        self.sync_remembered(false);
+        self.persist_remembered(cx);
         cx.notify();
     }
 
@@ -401,13 +688,16 @@ impl CogView {
     /// while watching), KEEPING the events feed, selection (clamped), scroll, and
     /// focus — unlike [`set_state`], which resets everything for a graph change.
     /// No-op if we've since left the graph.
-    pub(crate) fn update_bundle(&mut self, bundle: Box<CogBundle>) {
+    pub(crate) fn update_bundle(&mut self, bundle: Box<CogBundle>) -> bool {
         if let CogViewState::Graph {
             bundle: current,
             selected,
             ..
         } = &mut self.state
         {
+            if **current == *bundle {
+                return false;
+            }
             let n = bundle.nodes.len();
             *current = bundle;
             if n == 0 {
@@ -415,7 +705,10 @@ impl CogView {
             } else if *selected >= n {
                 *selected = n - 1;
             }
+            self.sync_remembered(false);
+            return true;
         }
+        false
     }
 
     // ── Live events ──────────────────────────────────────────────────────────
@@ -481,17 +774,20 @@ impl CogView {
         if self.events_hidden && self.focus == CogFocus::Events {
             self.focus = CogFocus::Detail;
         }
+        self.sync_remembered(false);
         cx.notify();
     }
 
     /// Move keyboard focus to the detail pane.
     pub(crate) fn focus_right(&mut self) {
         self.focus = CogFocus::Detail;
+        self.sync_remembered(false);
     }
 
     /// Move keyboard focus back to the selector.
     pub(crate) fn focus_left(&mut self) {
         self.focus = CogFocus::Selector;
+        self.sync_remembered(false);
     }
 
     /// Move keyboard focus to the live-events pane (no-op when the strip is not
@@ -499,6 +795,7 @@ impl CogView {
     pub(crate) fn focus_events(&mut self) {
         if self.events_pane_visible() {
             self.focus = CogFocus::Events;
+            self.sync_remembered(false);
         }
     }
 
@@ -511,6 +808,7 @@ impl CogView {
             CogFocus::Detail => CogFocus::Selector,
             CogFocus::Events => CogFocus::Selector,
         };
+        self.sync_remembered(false);
     }
 
     fn reset_scrolls(&mut self) {
@@ -547,6 +845,7 @@ impl CogView {
                 *selected = (*selected as i32 + delta).rem_euclid(n) as usize;
             }
             self.right_scroll.set_offset(gpui::point(px(0.0), px(0.0)));
+            self.sync_remembered(true);
             return;
         }
         // Explorer selection ranges over the FILTERED list.
@@ -558,6 +857,7 @@ impl CogView {
                 }
                 *selected = (*selected as i32 + delta).rem_euclid(n) as usize;
             }
+            self.sync_remembered(false);
             return;
         }
         match &mut self.state {
@@ -581,6 +881,7 @@ impl CogView {
             }
             _ => {}
         }
+        self.sync_remembered(false);
     }
 
     /// Are we in the graph explorer (vs a loaded graph)?
@@ -659,7 +960,7 @@ impl CogView {
         // Set our OWN loading state here (we hold `&mut self`); the root only
         // bumps the request id + spawns the fetch, so it never re-updates this
         // entity while it is mutably borrowed by the click handler.
-        self.set_state(CogViewState::Loading(format!("loading {id}…")));
+        self.begin_graph_load(id.clone(), label.clone(), format!("loading {id}…"));
         cx.notify();
         let view = cx.entity();
         if let Some(root) = self.root.upgrade() {
@@ -677,9 +978,12 @@ impl CogView {
         match row {
             CogTopicRow::Folder { path, .. } => {
                 self.toggle_topic_folder(&path);
+                self.persist_remembered(cx);
                 cx.notify();
             }
             CogTopicRow::Binding { binding, .. } => {
+                self.sync_remembered(true);
+                self.persist_remembered(cx);
                 self.set_topic_loading(binding.address.clone());
                 cx.notify();
                 let view = cx.entity();
@@ -708,6 +1012,8 @@ impl CogView {
         }
         self.focus = CogFocus::Selector;
         self.reset_scrolls();
+        self.sync_remembered(true);
+        self.persist_remembered(cx);
         cx.notify();
         if let Some(address) = agent {
             let view = cx.entity();
@@ -759,6 +1065,8 @@ impl CogView {
             _ => return,
         };
         self.right_scroll.set_offset(gpui::point(px(0.0), px(0.0)));
+        self.sync_remembered(true);
+        self.persist_remembered(cx);
         cx.notify();
         let view = cx.entity();
         if let Some(root) = self.root.upgrade() {
@@ -1122,6 +1430,8 @@ impl CogView {
         if changed {
             self.right_scroll.set_offset(gpui::point(px(0.0), px(0.0)));
             self.focus = CogFocus::Selector;
+            self.sync_remembered(false);
+            self.persist_remembered(cx);
             cx.notify();
         }
     }
@@ -1132,6 +1442,8 @@ impl CogView {
             *overview = true;
             self.right_scroll.set_offset(gpui::point(px(0.0), px(0.0)));
             self.focus = CogFocus::Selector;
+            self.sync_remembered(false);
+            self.persist_remembered(cx);
             cx.notify();
         }
     }
@@ -1139,12 +1451,14 @@ impl CogView {
     /// Click the right detail pane: move keyboard focus there (so j/k scroll it).
     pub(crate) fn click_focus_right(&mut self, cx: &mut Context<Self>) {
         self.focus_right();
+        self.persist_remembered(cx);
         cx.notify();
     }
 
     /// Click the live-events pane: move keyboard focus there.
     pub(crate) fn click_focus_events(&mut self, cx: &mut Context<Self>) {
         self.focus_events();
+        self.persist_remembered(cx);
         cx.notify();
     }
 

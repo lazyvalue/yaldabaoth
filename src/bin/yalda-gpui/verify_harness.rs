@@ -25961,6 +25961,43 @@ fn boot_with_cog<'a>(
 }
 
 #[cfg(test)]
+fn boot_with_restored_cog<'a>(
+    cx: &'a mut TestAppContext,
+    remembered: crate::CogRemembered,
+) -> (
+    gpui::Entity<YaldaGpuiView>,
+    &'a mut gpui::VisualTestContext,
+    gpui::Entity<crate::CogView>,
+    crate::workspace::WindowId,
+) {
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        )
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        v.splash_until = None;
+        v.set_screen(crate::App::Cog(crate::CogTile::restored(remembered)));
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    let (cv, wid) = view.update(vcx, |v, _| {
+        let wid = v.workspace.focused_window_id().expect("focused window");
+        let cv = match v.workspace.focused_content() {
+            Some(crate::App::Cog(tile)) => tile.view.clone().expect("restored CogView"),
+            _ => panic!("expected a restored Cog tile"),
+        };
+        (cv, wid)
+    });
+    (view, vcx, cv, wid)
+}
+
+#[cfg(test)]
 fn cog_tile_req(view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext) -> u64 {
     view.update(vcx, |v, _| match v.workspace.focused_content() {
         Some(crate::App::Cog(tile)) => tile.req,
@@ -26962,6 +26999,209 @@ fn cog_tile_needs_load(
         Some(crate::App::Cog(tile)) => tile.needs_load,
         _ => panic!("expected a Cog tile"),
     })
+}
+
+#[cfg(test)]
+fn cog_tile_live_state(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+) -> (u64, bool, bool) {
+    view.update(vcx, |v, _| match v.workspace.focused_content() {
+        Some(crate::App::Cog(tile)) => (tile.live_token, tile.live_refreshing, tile.live_pending),
+        _ => panic!("expected a Cog tile"),
+    })
+}
+
+/// UXI-Cog-16: the additive Cog persistence payload accepts the historical
+/// empty shape and round-trips stable semantic state without remote data.
+///
+/// Negative control: remove `#[serde(default)]` from `PersistedKind::Cog.state`;
+/// the legacy decode below fails.
+#[test]
+fn cog_persistence_is_backward_compatible_and_semantic() {
+    let legacy: crate::PersistedKind = serde_json::from_value(serde_json::json!({
+        "kind": "cog",
+        "data": {}
+    }))
+    .expect("historical empty Cog payload must remain readable");
+    assert!(matches!(legacy, crate::PersistedKind::Cog { state } if state.is_default()));
+
+    let remembered = crate::CogRemembered {
+        source: crate::CogRememberedSource::Agents,
+        topic: Some(crate::CogRememberedTopic::Binding(
+            "projects/cog::readme".into(),
+        )),
+        agent: Some("builder-1".into()),
+        graph: Some(crate::CogRememberedGraph {
+            id: "graph-1".into(),
+            label: Some("Live graph".into()),
+            overview: false,
+            node: Some("node-2".into()),
+        }),
+        topic_collapsed: ["projects/cog".into()].into(),
+        json_collapsed: ["n:node-2/content/detail".into()].into(),
+        events_hidden: true,
+        focus: crate::CogRememberedFocus::Detail,
+    };
+    let value = serde_json::to_value(crate::PersistedKind::Cog {
+        state: remembered.clone(),
+    })
+    .expect("serialize Cog state");
+    let decoded: crate::PersistedKind =
+        serde_json::from_value(value).expect("deserialize Cog state");
+    assert!(matches!(decoded, crate::PersistedKind::Cog { state } if state == remembered));
+}
+
+/// UXI-Cog-16: a restored graph resolves its node by stable id from a fresh
+/// bundle and restores JSON folds/display choices. The Home payload is fetched
+/// first, so Back still has a current browser rather than serialized content.
+#[gpui::test]
+fn cog_restores_graph_navigation_from_fresh_payload(cx: &mut TestAppContext) {
+    let remembered = crate::CogRemembered {
+        source: crate::CogRememberedSource::Topics,
+        topic: Some(crate::CogRememberedTopic::Binding("work::plan".into())),
+        graph: Some(crate::CogRememberedGraph {
+            id: "g1".into(),
+            label: Some("Graph One".into()),
+            overview: false,
+            node: Some("n2".into()),
+        }),
+        json_collapsed: ["n:n2/content/detail".into()].into(),
+        events_hidden: true,
+        focus: crate::CogRememberedFocus::Events,
+        ..Default::default()
+    };
+    let (view, vcx, cv, wid) = boot_with_restored_cog(cx, remembered);
+    let home_req = cog_tile_req(&view, vcx);
+    view.update(vcx, |v, cx| {
+        v.cog_apply(
+            wid,
+            home_req,
+            Ok(crate::CogFetch::Home(Box::new(cog_test_home(vec![
+                cog_test_topic("work::plan", crate::CogTopicKind::Graph, "g1", "Graph One"),
+            ])))),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    let graph_req = cog_tile_req(&view, vcx);
+    assert!(
+        graph_req > home_req,
+        "restore schedules the fresh graph read"
+    );
+    view.update(vcx, |v, cx| {
+        v.cog_apply(
+            wid,
+            graph_req,
+            Ok(crate::CogFetch::Graph(Box::new(cog_test_bundle(vec![
+                cog_test_node("n1", "first", "done", serde_json::json!({})),
+                cog_test_node(
+                    "n2",
+                    "second",
+                    "open",
+                    serde_json::json!({"detail": {"x": 1}}),
+                ),
+            ])))),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    assert_eq!(cv.update(vcx, |c, _| c.selected_index()), 1);
+    assert!(!cv.update(vcx, |c, _| c.showing_overview()));
+    assert!(cv.update(vcx, |c, _| c.json_folded("n:n2/content/detail")));
+    assert!(cv.update(vcx, |c, _| c.events_hidden()));
+    assert!(
+        cv.update(vcx, |c, _| c.focused_right()),
+        "hidden Events focus safely restores to Detail"
+    );
+}
+
+/// UXI-Cog-17: non-graph freshness reads are coalesced and selection-keyed.
+/// An old Topic snapshot cannot overwrite a newer selection; a following fresh
+/// snapshot atomically updates both the hierarchy and visible detail.
+///
+/// Negative control: remove the exact-key guard in `apply_live_home`; the stale
+/// snapshot changes the row count before the current-key apply.
+#[gpui::test]
+fn cog_live_home_refresh_coalesces_and_rejects_stale_selection(cx: &mut TestAppContext) {
+    let (view, vcx, cv, wid) = boot_with_cog(cx);
+    let a = cog_test_topic("work::a", crate::CogTopicKind::Graph, "ga", "A");
+    let b = cog_test_topic("work::b", crate::CogTopicKind::Graph, "gb", "B");
+    let c = cog_test_topic("work::c", crate::CogTopicKind::Graph, "gc", "C");
+    let req = cog_tile_req(&view, vcx);
+    view.update(vcx, |v, cx| {
+        v.cog_apply(
+            wid,
+            req,
+            Ok(crate::CogFetch::Home(Box::new(cog_test_home(vec![
+                a.clone(),
+                b.clone(),
+            ])))),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    cv.update(vcx, |c, cx| c.click_topic(1, cx));
+    let old_key = cv.update(vcx, |c, _| c.live_home_key().expect("home key"));
+    assert_eq!(old_key.topic.as_deref(), Some("work::a"));
+
+    view.update(vcx, |v, cx| v.cog_live_tick(wid, cx));
+    view.update(vcx, |v, cx| v.cog_live_tick(wid, cx));
+    let (token, refreshing, pending) = cog_tile_live_state(&view, vcx);
+    assert!(
+        refreshing && pending,
+        "one read in flight plus one coalesced follow-up"
+    );
+
+    cv.update(vcx, |c, cx| c.click_topic(2, cx));
+    let current_key = cv.update(vcx, |c, _| c.live_home_key().expect("new home key"));
+    assert_eq!(current_key.topic.as_deref(), Some("work::b"));
+    view.update(vcx, |v, cx| {
+        v.cog_apply_live_home(
+            wid,
+            token,
+            old_key,
+            Ok(crate::CogLiveHome {
+                home: cog_test_home(vec![a.clone(), b.clone(), c.clone()]),
+                topic: Some((
+                    "work::a".into(),
+                    Ok(crate::CogTopicDetail::Graph(cog_test_graph("ga", "A"))),
+                )),
+                agent: None,
+            }),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        cv.update(vcx, |c, _| c.topic_rows().len()),
+        3,
+        "stale snapshot was rejected in full"
+    );
+    assert!(
+        cog_tile_live_state(&view, vcx).1,
+        "queued current-key read started"
+    );
+
+    view.update(vcx, |v, cx| {
+        v.cog_apply_live_home(
+            wid,
+            token,
+            current_key,
+            Ok(crate::CogLiveHome {
+                home: cog_test_home(vec![a, b, c]),
+                topic: Some((
+                    "work::b".into(),
+                    Ok(crate::CogTopicDetail::Graph(cog_test_graph("gb", "B"))),
+                )),
+                agent: None,
+            }),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    assert_eq!(cv.update(vcx, |c, _| c.topic_rows().len()), 4);
+    assert!(!cog_tile_live_state(&view, vcx).1, "refresh cycle settled");
 }
 
 /// UXI-Cog-1 (regression): a Cog tile whose first render runs WITHOUT an explicit
