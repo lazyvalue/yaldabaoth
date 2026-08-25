@@ -5164,6 +5164,132 @@ fn workspace_cwd_persists_across_restart(cx: &mut TestAppContext) {
     );
 }
 
+/// bug-0059 / UXI-Workspace-28: GUI boot must restore the durable ownership
+/// graph before a fast universal-roster result may materialize roster-only
+/// sessions and save workspace.json. This drives the production
+/// `initialize_workspace_before_roster` entry point; its injected callback is
+/// the exact mutating tail of `refresh_roster` (materialize, then save when it
+/// changed something).
+///
+/// The setup snapshot models the reported state before corruption: stable tile
+/// 1175 is an Agent in the named Outlook workspace. The fresh view marks the
+/// session archived only to keep restore hermetic (a Dormant tile needs no live
+/// server); membership and roster reconciliation are identical for active and
+/// archived durable identities.
+///
+/// Negative control (required): move `start_roster(self, cx)` above the restore
+/// block in `initialize_workspace_before_roster`. The callback sees only the
+/// default frame, writes the session as Detached over the prepared snapshot,
+/// then restore reads that corruption; the `Outlook remains present` assertion
+/// fails RED.
+#[gpui::test]
+fn boot_restores_attached_agent_before_fast_roster_save(cx: &mut TestAppContext) {
+    use crate::persist::{
+        PersistedKind, PersistedLayout, load_persisted_workspace, with_workspace_path,
+    };
+    use crate::workspace::{AttachedVisibility, TileMembership};
+    use crate::{AgentTile, App, ServerSid};
+    use yalda::session_proto::SessionInfo;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("workspace.json");
+    let sid = "533c635d-3ce5-4391-afb5-7e8a40caf26e";
+    let stable_tile = 1175;
+
+    // Pre-reboot truth: outlook lead is Attached to the named Outlook workspace.
+    let (setup, setup_cx) = cx.add_window_view(hermetic_browser_view);
+    setup_cx.run_until_parked();
+    with_workspace_path(file.clone(), || {
+        setup.update(setup_cx, |v, _cx| {
+            let workspace = v.workspace.active_workspace_mut().expect("workspace");
+            workspace.display_name = Some("Outlook".into());
+            workspace.layout = crate::workspace::Layout::Leaf(crate::workspace::Window::new(
+                stable_tile,
+                workspace.project(),
+                App::Agent(AgentTile::dormant(ServerSid::new(sid))),
+            ));
+            workspace.focused = stable_tile;
+            v.workspace.next_window_id = stable_tile + 1;
+            v.save_workspace_state();
+        });
+    });
+
+    // Fresh process: run the same production initializer, with the roster
+    // callback made synchronous to model the fastest possible result.
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+    vcx.run_until_parked();
+    with_workspace_path(file.clone(), || {
+        view.update(vcx, |v, cx| {
+            v.jump_archived_sessions.insert(sid.into());
+            v.initialize_workspace_before_roster(true, cx, |v, _cx| {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                v.agent_roster.upsert(SessionInfo {
+                    session_id: sid.into(),
+                    acp_session_id: None,
+                    label: "outlook lead".into(),
+                    cwd,
+                    provider: yalda::acp_channel::AgentProvider::Codex,
+                    turns: 0,
+                    connected: true,
+                    permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+                    busy: false,
+                    archived: true,
+                });
+                if v.materialize_roster_detached_tiles() {
+                    v.save_workspace_state();
+                }
+            });
+        });
+    });
+
+    view.read_with(vcx, |v, _| {
+        let outlook = v
+            .workspace
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.display_name.as_deref() == Some("Outlook"))
+            .expect("Outlook remains present after boot");
+        assert_eq!(
+            v.workspace.tile_membership(stable_tile),
+            Some(TileMembership::Attached {
+                workspace: outlook,
+                visibility: AttachedVisibility::Visible,
+            }),
+            "the same stable tile remains Attached to Outlook"
+        );
+        assert!(
+            v.workspace.detached_tiles.iter().all(|tile| {
+                !matches!(&tile.window.content, App::Agent(agent)
+                    if agent.remembered_sid(|_| None).as_ref().is_some_and(|id| id.as_str() == sid))
+            }),
+            "the roster cannot create a Detached duplicate"
+        );
+    });
+
+    // The correctness boundary is the file the next reboot reads, not only the
+    // current frame: Outlook must still own the Agent leaf on disk.
+    let persisted = with_workspace_path(file, || {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        load_persisted_workspace(&cwd).expect("workspace snapshot")
+    });
+    let outlook = persisted
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.display_name.as_deref() == Some("Outlook"))
+        .expect("Outlook remains persisted");
+    assert!(matches!(
+        &outlook.layout,
+        PersistedLayout::Leaf(leaf)
+            if leaf.id == stable_tile
+                && matches!(&leaf.kind, PersistedKind::Agent { session_id }
+                    if session_id.as_ref().is_some_and(|id| id.as_str() == sid))
+    ));
+    assert!(persisted.detached_tiles.iter().all(|tile| {
+        !matches!(&tile.tile.kind, PersistedKind::Agent { session_id }
+            if session_id.as_ref().is_some_and(|id| id.as_str() == sid))
+    }));
+}
+
 /// A new agent inherits the workspace's LIVE cwd at create time — including a
 /// `Set CWD` done AFTER the selector was already open. Regression: the selector
 /// cached its cwd when it opened, so "open agent → Set CWD → Start a new

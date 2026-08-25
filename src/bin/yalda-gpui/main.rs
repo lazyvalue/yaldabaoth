@@ -2303,6 +2303,26 @@ impl YaldaGpuiView {
         }
     }
 
+    /// Establish durable tile ownership before any universal-roster result can
+    /// synthesize and persist Detached Agent tiles (UXI-Workspace-28).
+    ///
+    /// `start_roster` is injected so the production entry point and the
+    /// headless fast-result regression exercise this exact ordering seam.  The
+    /// callback may immediately call `materialize_roster_detached_tiles` and
+    /// `save_workspace_state`; by then restore has either completed or
+    /// definitively found no snapshot.
+    fn initialize_workspace_before_roster(
+        &mut self,
+        restore_saved_workspace: bool,
+        cx: &mut Context<Self>,
+        start_roster: impl FnOnce(&mut Self, &mut Context<Self>),
+    ) {
+        if restore_saved_workspace {
+            self.restore_workspace_from_disk(cx);
+        }
+        start_roster(self, cx);
+    }
+
     /// Persist the current workspace snapshot for the active cwd. Called
     /// after every structural mutation (workspace add/remove, split, close,
     /// focus change, etc.). Best-effort — failures are silent so a
@@ -10166,22 +10186,26 @@ fn main() {
                         if let Some(o) = prefs.jump_detached_tile_order {
                             view.jump_detached_tile_order = o;
                         }
-                        // Universal agent roster (universal-agent-list): start
-                        // the server pump + seed the roster at boot (not only
-                        // when an agent tile opens), so the jump panel shows
-                        // every active session from the first frame and stays
-                        // live via the Created/Closed/Renamed broadcasts.
-                        if view.session_server.is_some() {
-                            view.start_server_pump(cx);
-                            view.refresh_roster(cx);
-                        }
-                        // If we were launched with no explicit file arg, try to
-                        // restore the saved workspace for this cwd. With an
-                        // explicit arg the user wants that file, so the saved
-                        // snapshot stays on disk for the next no-arg launch.
-                        if initial_doc.is_none() {
-                            view.restore_workspace_from_disk(cx);
-                        }
+                        // UXI-Workspace-28: restore the durable ownership graph
+                        // before starting the universal roster. A fast roster
+                        // result materializes missing sessions as Detached and
+                        // saves workspace.json, so launching it first can
+                        // overwrite attached membership that is still on disk.
+                        view.initialize_workspace_before_roster(
+                            initial_doc.is_none(),
+                            cx,
+                            |view, cx| {
+                                // Universal agent roster (universal-agent-list):
+                                // start the server pump + seed the roster at boot
+                                // (not only when an agent tile opens), so the jump
+                                // panel shows every active session from the first
+                                // frame and stays live via Created/Closed/Renamed.
+                                if view.session_server.is_some() {
+                                    view.start_server_pump(cx);
+                                    view.refresh_roster(cx);
+                                }
+                            },
+                        );
                         // Reboot handoff: the previous yalda process set this
                         // env var via `reboot_into_claude` to mean "boot
                         // straight into the claude screen and resume every
