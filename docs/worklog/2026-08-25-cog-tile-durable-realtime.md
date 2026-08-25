@@ -5,7 +5,8 @@
 
 - `cog-durable-live` (`1928582`) — durable state and bounded exact-key refresh
 - `main` (`8725bd0`) — concurrent first integration
-- `feat/cog-tile-live-reconcile` — global-feed reconciliation, pending commit
+- `feat/cog-tile-live-reconcile` (`a8e1a70`) — global-feed reconciliation
+- `main` (`e8458b5`) — final integration and upgraded-state release verification
 
 ## Cog execution evidence
 
@@ -30,9 +31,9 @@ frontier 4: omega [open] (omega)
 - `0u5u` `persist`: claimed → closed; output: `{"summary":"Added backward-compatible, tile-local semantic state and fresh-data restoration","verification":["serialization compatibility guard","headless reboot restoration guard"]}`
 - `bl4v` `realtime`: claimed → closed; output: `{"summary":"Integrated cursor-before-read, resumable global events, reconnect, lifecycle guards, coalesced Home/Graph invalidation, and bounded fallback","compatibility":"pre-feature running cogd uses fallback until restart"}`
 - `xt0v` `integrate`: claimed → closed; output: `{"summary":"Added UXI-Cog-16/17 and persistence/live-update guards","tests":"Cog-focused suite passed; burst negative control observed RED"}`
-- `2h93` `reconcile-main`: claimed; final output pending.
-- `wkz0` `verify`: pending.
-- `g225` `omega`: pending.
+- `2h93` `reconcile-main`: claimed → closed; output: `{"summary":"Retained durable state and exact-selection refresh, then added the builder-delivered cursor/follow feed, duplicate rejection, Loading trailing invalidation, reconnect, and bounded fallback","tests":"29/29 Cog-focused tests passed; event negative control observed RED"}`
+- `wkz0` `verify`: claimed → closed; output: `{"summary":"Committed a8e1a70, merged as e8458b5 without disturbing upgraded Cargo state, and verified from primary main","tests":"713 passed, 0 failed, 2 ignored","release":"cargo build --release passed"}`
+- `g225` `omega`: claimed → closed; output: `{"summary":"Durable state and resumable live freshness are integrated on main","remaining":"restart operator-owned cogd to activate /v1/events; one-second fallback is active until then"}`
 
 ### Notes
 
@@ -42,16 +43,14 @@ frontier 4: omega [open] (omega)
 
 - Status: `complete`
 
-Final render will be recorded after omega closes:
-
 ```text
 graph cog-tile-durable-realtime (frontiers)
 frontier 0: contract [done]
 frontier 1: persist [done], realtime [done]
 frontier 2: integrate [done]
-frontier 3: reconcile-main [claimed]
-frontier 4: verify [open]
-frontier 5: omega [open] (omega)
+frontier 3: reconcile-main [done]
+frontier 4: verify [done]
+frontier 5: omega [done] (omega)
 ```
 
 ## Built (with status)
@@ -78,10 +77,13 @@ frontier 5: omega [open] (omega)
 - `cargo check --bin yalda-gpui`: passed on both implementations.
 - Reconciled `cargo test --bin yalda-gpui cog_ -- --nocapture`: **29 passed, 0 failed**.
 - Reconciled full `cargo test --bin yalda-gpui -- --nocapture`: **713 passed, 0 failed, 2 ignored**.
+- Primary-main `cargo test --bin yalda-gpui cog_ -- --nocapture`: **29 passed, 0 failed** against the user's upgraded Cargo state.
+- Primary-main full `cargo test --bin yalda-gpui -- --nocapture`: **713 passed, 0 failed, 2 ignored** against the upgraded Cargo state.
+- Primary-main `cargo build --release`: passed.
 - Global-feed negative control: suppressing event invalidation failed `cog_global_events_resume_and_invalidate_current_projection` at the immediate-refresh assertion; restored GREEN.
 - Original Home stale-key negative control was preserved from the concurrent implementation.
 - `git diff --check`: passed.
-- Reconcile commit, final main merge, main release build, and final graph evidence are pending the verification node.
+- Reconcile commit `a8e1a70` is merged to `main` as `e8458b5`; graph `bcp` is complete, island-free, and sealed.
 - `scripts/check-cog-worklog.sh docs/worklog/2026-08-25-cog-tile-durable-realtime.md` passes.
 
 ## Next
