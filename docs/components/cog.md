@@ -419,7 +419,8 @@ off/on. When hidden, the strip does not render — the top selector/detail row f
 the tile — and keyboard focus never rests on it (`Tab` skips Events; hiding while
 the strip has focus moves focus to the detail pane). The toggle is a per-tile
 preference: it is sticky across graph changes (not reset by `set_state`) and
-defaults to shown. It is in-memory only (not persisted across restart).
+defaults to shown. It is part of the tile's durable semantic state and therefore
+survives a Yalda restart.
 
 **Applies to.** `CogView::{events_hidden, events_pane_visible, toggle_events,
 focus_events, toggle_focus, focused_events}`, the render gate in `CogView::render`
@@ -463,3 +464,59 @@ tables with rows that can be folded closed."
 `toggle_json_fold`: folding a nested key marks it folded AND the Content section
 paints shorter — layout-probe, negative-control verified RED). Exact colours/glyphs
 are runtime gap #1.
+
+### UXI-Cog-16 — Cog tile navigation survives Yalda restarts
+
+**Statement.** Every Cog tile persists its semantic navigation and display state:
+Topics/Agents source, stable Topic or Agent selection, open graph and selected node
+(or Overview), collapsed Topic folders, collapsed graph JSON paths, live-events
+visibility, and pane focus. It never persists a loaded Topic, graph, address, mail,
+or chat payload. On restore the tile loads a fresh Home payload, resolves stable ids
+against it, then loads the selected detail/graph; removed objects fall back safely.
+The historical empty Cog persistence payload remains valid.
+
+**Applies to.** `CogRemembered*`, the shared `CogTile::remembered` serialization
+shadow, `CogView::{sync_remembered, install_home, resume, begin_graph_load,
+enter_graph}`, and `PersistedKind::Cog { state }` (`cog.rs`, `cog_view.rs`,
+`persist.rs`).
+
+**Why.** The user asked that Cog tiles remember their state between Yalda reboots.
+Persisting only identities/preferences both preserves context and prevents a reboot
+from painting obsolete server data.
+
+**Status.** implemented
+
+**Enforcement.** `cog_persistence_is_backward_compatible_and_semantic` decodes the
+legacy `{data:{}}` shape and round-trips all stable fields (negative control:
+remove the serde default). `cog_restores_graph_navigation_from_fresh_payload`
+drives the real Home→graph reducer with newly supplied payloads and verifies node,
+fold, visibility, and focus restoration by stable identity.
+
+### UXI-Cog-17 — Every open Cog surface stays current
+
+**Statement.** A loaded graph remains event-driven through `cog graph watch`; each
+event coalesces a fresh bundle read. If that watcher cannot start or exits, bounded
+revalidation keeps the graph current. The current Cog contract has no global live
+stream for Topic hierarchy, Notes, Bulletins, Chats, registered Agents, delivery
+status, or Mail, so those visible browser surfaces revalidate as one atomic snapshot
+every 750 ms. Only one read plus one queued follow-up can exist per tile. Every
+result is guarded by both a unique tile token and the exact source/selection key,
+and an unchanged payload does not invalidate the cached body. Closing/replacing the
+tile cancels its task and graph child.
+
+**Applies to.** `CogTile::{live_token, live_task, live_refreshing, live_pending}`;
+`CogLiveHome*`, `load_live_home`; `cog_start_live_revalidation`, `cog_live_tick`,
+`cog_apply_live_home`, `cog_watch_ended`; `CogView::{live_home_key,
+apply_live_home, update_bundle}` (`cog.rs`, `cog_ui.rs`, `cog_view.rs`).
+
+**Why.** The user requires Cog tiles to be always updated in real time. Graph SSE is
+used where Cog exposes it; bounded reconciliation is the compatibility bridge for
+the other upgraded Cog objects while a resumable global stream requested from the
+Cog builder is pending.
+
+**Status.** implemented
+
+**Enforcement.** `cog_live_home_refresh_coalesces_and_rejects_stale_selection`
+drives the production tick/apply seams, proves burst coalescing, changes selection
+mid-read, and verifies the stale snapshot cannot alter the hierarchy before the
+current-key snapshot lands (negative control: remove the exact-key guard).

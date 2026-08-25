@@ -2499,9 +2499,10 @@ impl YaldaGpuiView {
     ) -> gpui::Div {
         // The body is a cached child entity (yux), lazily created here.
         let weak = cx.entity().downgrade();
+        let remembered = tile.remembered.clone();
         let view = tile
             .view
-            .get_or_insert_with(|| cx.new(|_| CogView::new(weak)))
+            .get_or_insert_with(|| cx.new(|_| CogView::new(weak, remembered)))
             .clone();
 
         // A tile restored from disk never ran `open_cog_inner`; the graph-list

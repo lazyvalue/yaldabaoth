@@ -92,6 +92,7 @@ impl YaldaGpuiView {
                 vcx.notify();
             });
         }
+        self.cog_start_live_revalidation(target, cx);
         cx.notify();
 
         // Never spawn the live subprocess under test (hermetic — gap #2); the
@@ -139,9 +140,19 @@ impl YaldaGpuiView {
         label: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        // Keyboard path: set the loading view state here (we're not inside a
-        // CogView borrow), then bump req + spawn.
-        self.cog_set_view(target, CogViewState::Loading(format!("loading {id}…")), cx);
+        // Preserve the Home backstack while presenting loading. Stable graph
+        // identity is recorded before the fetch so a reboot during loading can
+        // resume the same graph.
+        if let Some(view) = self
+            .cog_tile_by_id_mut(target)
+            .and_then(|tile| tile.view.clone())
+        {
+            let status = format!("loading {id}…");
+            view.update(cx, |cv, vcx| {
+                cv.begin_graph_load(id.clone(), label.clone(), status);
+                vcx.notify();
+            });
+        }
         self.cog_fetch_graph(target, id, label, cx);
     }
 
@@ -166,6 +177,10 @@ impl YaldaGpuiView {
             }
             tile.req
         };
+        self.save_workspace_state();
+        if cfg!(test) {
+            return;
+        }
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -348,6 +363,8 @@ impl YaldaGpuiView {
             if let Some(tile) = self.cog_tile_by_id_mut(target) {
                 tile.title = "Cog".into();
             }
+            self.cog_live_tick(target, cx);
+            self.save_workspace_state();
             cx.notify();
         }
         returned
@@ -382,14 +399,51 @@ impl YaldaGpuiView {
                     });
                 }
                 self.cog_start_watch(target, id, cx);
+                self.cog_start_live_revalidation(target, cx);
+                self.save_workspace_state();
             }
             Ok(CogFetch::Home(home)) => {
                 self.cog_stop_watch(target);
-                self.cog_set_view(
-                    target,
-                    CogViewState::Home(Box::new(CogHomeState::new(*home))),
-                    cx,
-                );
+                let view = self
+                    .cog_tile_by_id_mut(target)
+                    .and_then(|tile| tile.view.clone());
+                let resume = view.as_ref().and_then(|view| {
+                    view.update(cx, |cv, vcx| {
+                        cv.install_home(*home);
+                        vcx.notify();
+                        cv.resume()
+                    })
+                });
+                if let Some(tile) = self.cog_tile_by_id_mut(target) {
+                    tile.title = "Cog".into();
+                }
+                self.cog_start_live_revalidation(target, cx);
+                match resume {
+                    Some(CogResume::Graph { id, label }) => {
+                        self.cog_open_graph(target, id, label, cx)
+                    }
+                    Some(CogResume::Topic(binding)) => {
+                        if let Some(view) = view {
+                            view.update(cx, |cv, vcx| {
+                                cv.set_topic_loading(binding.address.clone());
+                                vcx.notify();
+                            });
+                        }
+                        self.cog_fetch_topic(target, binding, cx);
+                    }
+                    Some(CogResume::Agent(address)) => {
+                        if let Some(view) = view {
+                            view.update(cx, |cv, vcx| {
+                                cv.set_agent_loading(address.id.clone());
+                                vcx.notify();
+                            });
+                        }
+                        self.cog_fetch_agent(target, address, cx);
+                    }
+                    None => {}
+                }
+                self.save_workspace_state();
+                cx.notify();
             }
             Ok(CogFetch::Graphs(graphs)) => {
                 self.cog_stop_watch(target);
@@ -467,6 +521,7 @@ impl YaldaGpuiView {
                             break;
                         }
                     }
+                    let _ = this.update(cx, |v, cx| v.cog_watch_ended(target, generation, cx));
                 })
                 .detach();
             }
@@ -482,6 +537,157 @@ impl YaldaGpuiView {
             if let Some(mut child) = tile.watch.take() {
                 let _ = child.kill();
             }
+        }
+    }
+
+    /// Mark a naturally-ended watcher absent. The bounded reconciliation loop
+    /// then becomes the graph fallback until the next graph open restarts SSE.
+    fn cog_watch_ended(
+        &mut self,
+        target: workspace::WindowId,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let ended = self
+            .cog_tile_by_id_mut(target)
+            .filter(|tile| tile.watch_gen == generation)
+            .map(|tile| {
+                if let Some(mut child) = tile.watch.take() {
+                    let _ = child.try_wait();
+                }
+            })
+            .is_some();
+        if ended {
+            self.cog_refresh_bundle(target, cx);
+        }
+    }
+
+    /// Start one lifecycle-bound freshness loop per Cog tile. Cog currently
+    /// offers graph SSE but no global Topic/Chat/Address/Mail stream, so those
+    /// surfaces use a coalesced sub-second reconciliation until the builder's
+    /// requested resumable stream is available. Dropping the tile drops this
+    /// task and generation tokens reject any already-completed old read.
+    fn cog_start_live_revalidation(&mut self, target: workspace::WindowId, cx: &mut Context<Self>) {
+        if cfg!(test) {
+            return;
+        }
+        let token = {
+            let Some(tile) = self.cog_tile_by_id_mut(target) else {
+                return;
+            };
+            if tile.live_task.is_some() {
+                return;
+            }
+            tile.live_token
+        };
+        let task = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(750))
+                    .await;
+                let current = this
+                    .update(cx, |view, cx| {
+                        let current = view
+                            .cog_tile_by_id_mut(target)
+                            .map(|tile| tile.live_token == token)
+                            .unwrap_or(false);
+                        if current {
+                            view.cog_live_tick(target, cx);
+                        }
+                        current
+                    })
+                    .unwrap_or(false);
+                if !current {
+                    break;
+                }
+            }
+        });
+        if let Some(tile) = self.cog_tile_by_id_mut(target) {
+            tile.live_task = Some(task);
+        }
+    }
+
+    /// Run one freshness cycle. Graphs keep their event-driven watcher and use
+    /// the cycle only as a fallback if that process is absent; browser surfaces
+    /// load their visible directory + detail as one atomic snapshot.
+    pub(crate) fn cog_live_tick(&mut self, target: workspace::WindowId, cx: &mut Context<Self>) {
+        let graph_fallback = self
+            .cog_tile_by_id_mut(target)
+            .and_then(|tile| tile.view.clone().map(|view| (tile.watch.is_none(), view)))
+            .is_some_and(|(no_watch, view)| no_watch && view.read(cx).current_graph_id().is_some());
+        if graph_fallback {
+            self.cog_refresh_bundle(target, cx);
+            return;
+        }
+
+        let Some(key) = self
+            .cog_tile_by_id_mut(target)
+            .and_then(|tile| tile.view.clone())
+            .and_then(|view| view.read(cx).live_home_key())
+        else {
+            return;
+        };
+        let token = {
+            let Some(tile) = self.cog_tile_by_id_mut(target) else {
+                return;
+            };
+            if tile.live_refreshing {
+                tile.live_pending = true;
+                return;
+            }
+            tile.live_refreshing = true;
+            tile.live_token
+        };
+        // Hermetic tests drive the real apply seam directly after asserting the
+        // in-flight/coalescing state.
+        if cfg!(test) {
+            return;
+        }
+        let request_key = key.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { cog::load_live_home(request_key) })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.cog_apply_live_home(target, token, key, result, cx)
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn cog_apply_live_home(
+        &mut self,
+        target: workspace::WindowId,
+        token: u64,
+        key: CogLiveHomeKey,
+        result: Result<CogLiveHome, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let pending = {
+            let Some(tile) = self
+                .cog_tile_by_id_mut(target)
+                .filter(|tile| tile.live_token == token)
+            else {
+                return;
+            };
+            tile.live_refreshing = false;
+            std::mem::take(&mut tile.live_pending)
+        };
+        if let Ok(live) = result {
+            let view = self
+                .cog_tile_by_id_mut(target)
+                .and_then(|tile| tile.view.clone());
+            if let Some(view) = view {
+                let changed = view.update(cx, |cv, _| cv.apply_live_home(&key, live));
+                if changed {
+                    view.update(cx, |_cv, vcx| vcx.notify());
+                    self.save_workspace_state();
+                }
+            }
+        }
+        if pending {
+            self.cog_live_tick(target, cx);
         }
     }
 
@@ -577,8 +783,9 @@ impl YaldaGpuiView {
             let view = self.cog_tile_by_id_mut(target).and_then(|t| t.view.clone());
             if let Some(v) = view {
                 v.update(cx, |cv, vcx| {
-                    cv.update_bundle(Box::new(bundle));
-                    vcx.notify();
+                    if cv.update_bundle(Box::new(bundle)) {
+                        vcx.notify();
+                    }
                 });
             }
         }
@@ -615,6 +822,7 @@ impl YaldaGpuiView {
                 cv.select_move(delta);
                 vcx.notify();
             });
+            self.save_workspace_state();
             let selected = v.read(cx).selected_topic_binding();
             if let Some(binding) = selected {
                 v.update(cx, |cv, vcx| {
@@ -670,6 +878,7 @@ impl YaldaGpuiView {
     pub(crate) fn cog_toggle_events(&mut self, cx: &mut Context<Self>) {
         if let Some(v) = self.cog_focused_tile_view() {
             v.update(cx, |cv, vcx| cv.toggle_events(vcx));
+            self.save_workspace_state();
         }
     }
 
@@ -725,8 +934,9 @@ impl YaldaGpuiView {
             }
             None => return None,
         }
+        let remembered = self.cog_tile_by_id_mut(target)?.remembered.clone();
         let weak = cx.entity().downgrade();
-        let view = cx.new(|_| CogView::new(weak));
+        let view = cx.new(|_| CogView::new(weak, remembered));
         let tile = self.cog_tile_by_id_mut(target)?;
         tile.view = Some(view.clone());
         Some(view)
@@ -751,6 +961,7 @@ impl YaldaGpuiView {
                 }
                 vcx.notify();
             });
+            self.save_workspace_state();
         }
     }
 
@@ -761,6 +972,7 @@ impl YaldaGpuiView {
                 cv.toggle_focus();
                 vcx.notify();
             });
+            self.save_workspace_state();
         }
     }
 

@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 // ── Data model (mirrors the `cog` CLI JSON shapes) ───────────────────────────
 
 /// One graph, as returned by `cog graph list` / `cog graph get`.
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, PartialEq, Eq)]
 pub(crate) struct CogGraph {
     pub(crate) id: String,
     #[serde(default)]
@@ -47,7 +47,7 @@ impl CogGraph {
 }
 
 /// A graph's derived state (`cog graph status`).
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize, PartialEq, Eq)]
 pub(crate) struct CogGraphStatus {
     #[serde(default)]
     pub(crate) status: String,
@@ -69,7 +69,7 @@ impl CogGraphStatus {
 }
 
 /// One node (`cog graph nodes`). `content` and `output` are free-form JSON.
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, PartialEq, Eq)]
 pub(crate) struct CogNode {
     pub(crate) id: String,
     #[serde(default)]
@@ -83,7 +83,7 @@ pub(crate) struct CogNode {
 }
 
 /// A dependency edge: `from` must be `done` before `to` becomes ready.
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, PartialEq, Eq)]
 pub(crate) struct CogEdge {
     pub(crate) from: String,
     pub(crate) to: String,
@@ -91,7 +91,7 @@ pub(crate) struct CogEdge {
 
 /// One entry in a node's log (`cog node log`). Status transitions carry
 /// `kind == "status_changed"` with `data.to`; notes carry `kind == "note"`.
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, PartialEq, Eq)]
 pub(crate) struct CogLogEntry {
     #[serde(default)]
     pub(crate) seq: i64,
@@ -106,7 +106,7 @@ pub(crate) struct CogLogEntry {
 }
 
 /// A node's notes, grouped by node (`cog graph read-node-notes`).
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, PartialEq, Eq)]
 pub(crate) struct CogNodeNotes {
     pub(crate) node: String,
     #[serde(default)]
@@ -114,7 +114,7 @@ pub(crate) struct CogNodeNotes {
 }
 
 /// One note on a node.
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, PartialEq, Eq)]
 pub(crate) struct CogNote {
     #[serde(default)]
     pub(crate) at: i64,
@@ -234,6 +234,29 @@ impl CogTopicTree {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.roots.is_empty()
+    }
+
+    /// Resolve one exact binding from the hierarchy. Live refreshes use the
+    /// stable Topic Address rather than an index, so inserts/re-sorts cannot
+    /// silently move the right pane onto another object.
+    pub(crate) fn binding(&self, address: &str) -> Option<CogTopicBinding> {
+        fn find(nodes: &[CogTopicNode], address: &str) -> Option<CogTopicBinding> {
+            for node in nodes {
+                match node {
+                    CogTopicNode::Folder { children, .. } => {
+                        if let Some(binding) = find(children, address) {
+                            return Some(binding);
+                        }
+                    }
+                    CogTopicNode::Binding(binding) if binding.address == address => {
+                        return Some(binding.clone());
+                    }
+                    CogTopicNode::Binding(_) => {}
+                }
+            }
+            None
+        }
+        find(&self.roots, address)
     }
 }
 
@@ -413,12 +436,14 @@ pub(crate) struct CogChatEntry {
     pub(crate) references: Vec<CogReference>,
 }
 
+#[derive(PartialEq)]
 pub(crate) enum CogTopicDetail {
     Graph(CogGraph),
     Note(CogMail),
     Chat(CogChat),
 }
 
+#[derive(PartialEq)]
 pub(crate) struct CogAgentDetail {
     pub(crate) address: CogAgentAddress,
     pub(crate) delivery: Result<CogDeliveryStatus, String>,
@@ -426,6 +451,7 @@ pub(crate) struct CogAgentDetail {
     pub(crate) threads: Result<Vec<CogMail>, String>,
 }
 
+#[derive(PartialEq, Eq)]
 pub(crate) struct CogHomeData {
     pub(crate) topics: CogTopicTree,
     pub(crate) agents: Vec<CogAgentAddress>,
@@ -443,6 +469,7 @@ impl CogNote {
 }
 
 /// Everything a loaded graph needs to render, fetched in one background pass.
+#[derive(PartialEq, Eq)]
 pub(crate) struct CogBundle {
     pub(crate) graph: CogGraph,
     pub(crate) status: CogGraphStatus,
@@ -639,6 +666,92 @@ pub(crate) enum CogFetch {
     },
 }
 
+// ── Durable semantic state + live revalidation ──────────────────────────────
+
+/// Stable selector identity persisted for the Topic tree. Indices are
+/// intentionally excluded because a newly-created sibling can reorder rows
+/// between Yalda launches.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub(crate) enum CogRememberedTopic {
+    Folder(String),
+    Binding(String),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CogRememberedSource {
+    #[default]
+    Topics,
+    Agents,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CogRememberedFocus {
+    #[default]
+    Selector,
+    Detail,
+    Events,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CogRememberedGraph {
+    pub(crate) id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) label: Option<String>,
+    #[serde(default)]
+    pub(crate) overview: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) node: Option<String>,
+}
+
+/// The durable shadow of a Cog tile. It stores navigation and display choices,
+/// never remote payloads; restore therefore always performs fresh Cog reads.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CogRemembered {
+    #[serde(default)]
+    pub(crate) source: CogRememberedSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) topic: Option<CogRememberedTopic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) graph: Option<CogRememberedGraph>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub(crate) topic_collapsed: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub(crate) json_collapsed: BTreeSet<String>,
+    #[serde(default)]
+    pub(crate) events_hidden: bool,
+    #[serde(default)]
+    pub(crate) focus: CogRememberedFocus,
+}
+
+impl CogRemembered {
+    pub(crate) fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+pub(crate) type CogRememberedHandle = std::rc::Rc<std::cell::RefCell<CogRemembered>>;
+
+/// Identity captured at the start of a non-graph refresh. Applying the result
+/// requires an exact key match, which prevents a slow old selection from
+/// replacing a newer right pane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CogLiveHomeKey {
+    pub(crate) source: CogRememberedSource,
+    pub(crate) topic: Option<String>,
+    pub(crate) agent: Option<String>,
+}
+
+pub(crate) struct CogLiveHome {
+    pub(crate) home: CogHomeData,
+    pub(crate) topic: Option<(String, Result<CogTopicDetail, String>)>,
+    pub(crate) agent: Option<(String, CogAgentDetail)>,
+}
+
 // ── The tile ─────────────────────────────────────────────────────────────────
 
 /// The `App::Cog` tile. Cheap, frequently-touched fields live here; the loaded
@@ -665,12 +778,32 @@ pub(crate) struct CogTile {
     /// runs `open_cog_inner`, so its first render kicks the load (else it sits
     /// frozen on "loading graphs…"). Cleared by `cog_load_graphs`.
     pub(crate) needs_load: bool,
+    /// Shared durable navigation shadow. The cached view owns its mutations;
+    /// the tile retains a handle solely so workspace snapshotting needs no GPUI
+    /// context and cannot serialize stale remote payloads.
+    pub(crate) remembered: CogRememberedHandle,
+    /// Per-instance identity for generation-guarding asynchronous live reads.
+    pub(crate) live_token: u64,
+    pub(crate) live_refreshing: bool,
+    pub(crate) live_pending: bool,
+    /// Dropping the tile cancels its bounded non-graph revalidation loop.
+    pub(crate) live_task: Option<Task<()>>,
 }
 
 impl CogTile {
     pub(crate) fn new() -> Self {
+        Self::restored(CogRemembered::default())
+    }
+
+    pub(crate) fn restored(remembered: CogRemembered) -> Self {
+        static NEXT_LIVE_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let title = remembered
+            .graph
+            .as_ref()
+            .and_then(|graph| graph.label.clone())
+            .unwrap_or_else(|| "Cog".into());
         CogTile {
-            title: "Cog".into(),
+            title,
             req: 0,
             view: None,
             watch: None,
@@ -678,11 +811,20 @@ impl CogTile {
             refreshing: false,
             refresh_pending: false,
             needs_load: true,
+            remembered: std::rc::Rc::new(std::cell::RefCell::new(remembered)),
+            live_token: NEXT_LIVE_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            live_refreshing: false,
+            live_pending: false,
+            live_task: None,
         }
     }
 
     pub(crate) fn title(&self) -> String {
         self.title.clone()
+    }
+
+    pub(crate) fn remembered(&self) -> CogRemembered {
+        self.remembered.borrow().clone()
     }
 }
 
@@ -748,8 +890,7 @@ pub(crate) fn list_graphs() -> Result<Vec<CogGraph>, String> {
 /// root-browser contract documented by Cog; `--limit 1000` matches the server's
 /// maximum page size for a dense first-draft explorer.
 pub(crate) fn list_topic_bindings() -> Result<Vec<CogTopicBinding>, String> {
-    let mut bindings: Vec<CogTopicBinding> =
-        cog_json(&["topic", "list", "", "--limit", "1000"])?;
+    let mut bindings: Vec<CogTopicBinding> = cog_json(&["topic", "list", "", "--limit", "1000"])?;
     bindings.sort_by(|a, b| a.address.cmp(&b.address));
     bindings.dedup_by(|a, b| a.address == b.address);
     Ok(bindings)
@@ -778,6 +919,39 @@ pub(crate) fn load_home() -> Result<CogHomeData, String> {
         agents,
         agent_presence,
     })
+}
+
+/// Revalidate the complete visible non-graph surface in one background pass.
+/// The directory is loaded first, then the active detail is resolved from that
+/// fresh directory so a rebinding can never fetch an obsolete object id.
+pub(crate) fn load_live_home(key: CogLiveHomeKey) -> Result<CogLiveHome, String> {
+    let home = load_home()?;
+    let topic = if key.source == CogRememberedSource::Topics {
+        key.topic.as_deref().and_then(|address| {
+            home.topics.binding(address).map(|binding| {
+                let address = binding.address.clone();
+                let detail = load_topic_detail(&binding);
+                (address, detail)
+            })
+        })
+    } else {
+        None
+    };
+    let agent = if key.source == CogRememberedSource::Agents {
+        key.agent.as_deref().and_then(|id| {
+            home.agents
+                .iter()
+                .find(|address| address.id == id)
+                .cloned()
+                .map(|address| {
+                    let id = address.id.clone();
+                    (id, load_agent_detail(address))
+                })
+        })
+    } else {
+        None
+    };
+    Ok(CogLiveHome { home, topic, agent })
 }
 
 /// Load the typed target behind one Topic leaf. Graph selection first paints a

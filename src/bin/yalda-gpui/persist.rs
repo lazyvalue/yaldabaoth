@@ -909,10 +909,14 @@ pub(crate) enum PersistedKind {
     /// remote and cheap to re-fetch).
     #[serde(rename = "linear")]
     Linear {},
-    /// A Cog explorer tile. The loaded graph isn't persisted — restore opens a
-    /// fresh explorer and the user re-picks the graph (cheap to re-fetch).
+    /// A Cog explorer tile. Only semantic navigation/display state is stored;
+    /// every remote payload is re-fetched on restore. `state` defaults so the
+    /// historical `{ "kind": "cog", "data": {} }` shape stays readable.
     #[serde(rename = "cog")]
-    Cog {},
+    Cog {
+        #[serde(default, skip_serializing_if = "CogRemembered::is_default")]
+        state: CogRemembered,
+    },
     /// The keybindings reference tile — stateless (it reads the live registry),
     /// so restore just opens a fresh one.
     #[serde(rename = "keymap")]
@@ -1470,7 +1474,9 @@ pub(crate) fn snapshot_content(content: &App, resolve: SidResolver) -> Persisted
             }
         }
         App::Linear(_tile) => PersistedKind::Linear {},
-        App::Cog(_tile) => PersistedKind::Cog {},
+        App::Cog(tile) => PersistedKind::Cog {
+            state: tile.remembered(),
+        },
         App::Keymap(_tile) => PersistedKind::Keymap {},
     }
 }
@@ -1686,7 +1692,7 @@ pub(crate) fn restore_content(
             )))
         }
         PersistedKind::Linear {} => App::Linear(LinearTile::new()),
-        PersistedKind::Cog {} => App::Cog(CogTile::new()),
+        PersistedKind::Cog { state } => App::Cog(CogTile::restored(state)),
         PersistedKind::Keymap {} => App::Keymap(KeymapTile::new()),
     }
 }
