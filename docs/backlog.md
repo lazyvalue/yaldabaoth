@@ -18,13 +18,16 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
   want autocomplete for cog topic paths in agent tile inputs (chat and worksheet
   mode). If you need features built, talk to the cog agent at
   projects/cog/mail::chat"* Existing Cog root Topic discovery is sufficient, so
-  no Cog-side feature request is needed. Settled behavior: in either Message Box
-  or Worksheet Insert mode, a whitespace-delimited token under the caret becomes
-  eligible once it contains `/` or `::`; a popup prefix-filters the live Topic
-  address catalog, arrows select, Tab/Enter replaces only that token with the full
-  raw address, and Esc dismisses the current query. Bare leading slash-command
-  completion retains priority. Headless interaction and render probes pass in
-  both placements; exact glyph/color appearance still needs a human runtime look.
+  no Cog-side feature request is needed. Follow-up adjustment (Cog graph `wiv`):
+  in either Message Box or Worksheet Insert mode, a whitespace-delimited token
+  beginning with `%` explicitly opens Topic completion; the suffix prefix-filters
+  a freshly fetched live Topic catalog, arrows select, Tab/Enter replaces the
+  whole `%…` token with the raw address, and Esc dismisses the current query. Each
+  new `%` query refreshes once in the background, while suffix keystrokes reuse
+  that query's result rather than spawning one process per character. Bare
+  leading slash-command completion remains independent. Headless interaction and
+  render probes pass in both placements; exact glyph/color appearance still needs
+  a human runtime look.
 
 - **Browse Cog by hierarchical topics and inspect agents' mail** — `NEEDS-RUNTIME`
   (2026-08-23 via `/new-ux`; `UXI-Cog-13..15`; Cog graphs `q3u`, compatibility

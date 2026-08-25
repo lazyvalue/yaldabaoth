@@ -2434,6 +2434,7 @@ impl YaldaGpuiView {
             slash_popup_dismissed: false,
             topic_popup_sel: 0,
             topic_popup_dismissed: false,
+            topic_query_refresh_active: false,
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             usage: None,
             focused_subagent: None,
@@ -6113,27 +6114,32 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
-    /// Lazily load the installation-wide Cog Topic catalog used by Agent compose
-    /// autocomplete (UXI-AgentTile-43). The subprocess is always on GPUI's
-    /// background executor; successful data is cached for the app run. A failed
-    /// load returns to idle so a later eligible edit can retry unobtrusively.
-    pub(crate) fn ensure_topic_completion_catalog(&mut self, cx: &mut Context<Self>) {
-        if self.topic_completions_loaded || self.topic_completions_loading || cfg!(test) {
+    /// Refresh the installation-wide Cog Topic catalog for a newly opened `%`
+    /// query (UXI-AgentTile-43). Stale rows disappear immediately. Every request
+    /// runs on GPUI's background executor and carries a generation fence so a
+    /// slower prior response can never overwrite a newer query's result.
+    pub(crate) fn refresh_topic_completion_catalog(&mut self, cx: &mut Context<Self>) {
+        self.topic_completions.clear();
+        self.topic_completions_generation = self.topic_completions_generation.wrapping_add(1);
+        let generation = self.topic_completions_generation;
+        if cfg!(test) {
+            cx.notify();
             return;
         }
-        self.topic_completions_loading = true;
+        cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async { cog::list_topic_bindings() })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                this.topic_completions_loading = false;
+                if this.topic_completions_generation != generation {
+                    return;
+                }
                 if let Ok(bindings) = result {
                     this.topic_completions = bindings;
-                    this.topic_completions_loaded = true;
-                    cx.notify();
                 }
+                cx.notify();
             });
         })
         .detach();
@@ -6671,14 +6677,14 @@ impl YaldaGpuiView {
         }) else {
             return;
         };
-        // The key that introduced the first `/` may have created the eligible
-        // Topic token inside the closure above, so inspect after dispatch and
-        // start the lazy load here. The loader itself always runs off-thread.
-        if self
-            .agent_read(cx, |c| c.topic_query().is_some())
-            .unwrap_or(false)
-        {
-            self.ensure_topic_completion_catalog(cx);
+        // The key that introduced `%` may have opened a new Topic query inside
+        // the closure above. Inspect after dispatch so the first generation
+        // refreshes once, while suffix edits reuse that request.
+        let refresh_topics = self
+            .with_session_silent(focused_id, cx, |c| c.begin_topic_query_refresh())
+            .unwrap_or(false);
+        if refresh_topics {
+            self.refresh_topic_completion_catalog(cx);
         }
         // UXI-AgentTile-11 bugfix (stale inline typing): when the compose is the INLINE
         // You-block it renders INSIDE the cached `TranscriptView`, whose

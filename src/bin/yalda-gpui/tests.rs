@@ -6463,9 +6463,9 @@ fn slash_query_and_popup_rows_filter() {
     );
 }
 
-/// UXI-AgentTile-43 (pure): Topic completion is caret-token-local, requires a
-/// path-shaped token, filters exact raw address prefixes deterministically, and
-/// replaces only the token while preserving surrounding prompt text.
+/// UXI-AgentTile-43 (pure): Topic completion is caret-token-local, requires an
+/// explicit percent trigger, filters raw address prefixes deterministically,
+/// and replaces the whole trigger token while preserving surrounding text.
 #[test]
 fn topic_query_filters_and_replaces_caret_token() {
     use crate::agent::AgentState;
@@ -6487,12 +6487,12 @@ fn topic_query_filters_and_replaces_caret_token() {
 
     s.input_surface
         .compose_mut()
-        .set_recalled("ask projects/co tomorrow");
+        .set_recalled("ask %projects/co tomorrow");
     // Put the caret immediately after the partial Topic token, not at draft end.
-    s.input_surface.compose_mut().editor.cursor_mut().col = 15;
-    let query = s.topic_query().expect("path-shaped caret token is eligible");
+    s.input_surface.compose_mut().editor.cursor_mut().col = 16;
+    let query = s.topic_query().expect("percent-prefixed caret token is eligible");
     assert_eq!(query.text, "projects/co");
-    assert_eq!((query.start, query.end), (4, 15));
+    assert_eq!((query.start, query.end), (4, 16));
     assert_eq!(
         s.topic_popup_rows(&catalog)
             .iter()
@@ -6517,9 +6517,48 @@ fn topic_query_filters_and_replaces_caret_token() {
 
     s.input_surface.compose_mut().set_recalled("ordinary prose");
     assert!(s.topic_query().is_none(), "ordinary prose stays quiet");
+    s.input_surface.compose_mut().set_recalled("projects/co");
+    assert!(
+        s.topic_query().is_none(),
+        "path-shaped prose without the explicit percent trigger stays quiet",
+    );
     s.input_surface.compose_mut().set_recalled("/co");
     assert!(
         s.topic_query().is_none(),
         "a bare leading slash token belongs to slash-command completion",
+    );
+
+    s.input_surface.compose_mut().set_recalled("%");
+    s.topic_popup_dismissed = false;
+    assert_eq!(
+        s.topic_popup_rows(&catalog).len(),
+        catalog.len(),
+        "a bare percent trigger offers the whole fresh catalog",
+    );
+}
+
+/// UXI-AgentTile-43 (pure): one refresh starts per open percent query. Suffix
+/// edits reuse it; leaving the query rearms the next percent trigger.
+#[test]
+fn topic_query_refreshes_once_per_opening() {
+    use crate::agent::AgentState;
+
+    let mut s = AgentState::new_for_test();
+    s.input_surface.compose_mut().set_recalled("%");
+    assert!(s.begin_topic_query_refresh());
+    assert!(!s.begin_topic_query_refresh());
+
+    s.input_surface.compose_mut().set_recalled("%projects/cog");
+    assert!(
+        !s.begin_topic_query_refresh(),
+        "suffix edits stay in the same query generation",
+    );
+
+    s.input_surface.compose_mut().set_recalled("ordinary prose");
+    assert!(!s.begin_topic_query_refresh());
+    s.input_surface.compose_mut().set_recalled("%projects/cog");
+    assert!(
+        s.begin_topic_query_refresh(),
+        "a later percent query starts a fresh catalog request",
     );
 }

@@ -3737,6 +3737,10 @@ pub(crate) struct AgentState {
     /// Esc dismissed the Topic popup for the current query. Any compose edit
     /// clears this alongside resetting `topic_popup_sel`.
     pub(crate) topic_popup_dismissed: bool,
+    /// This percent-query generation has already started its fresh root Topic
+    /// request. It stays set while the caret token remains eligible, preventing
+    /// a subprocess per suffix keystroke, and rearms after the query closes.
+    pub(crate) topic_query_refresh_active: bool,
     /// The session's permission mode, as session state sourced from the
     /// server. In session-server mode the agent/channel live in the server
     /// (not the GUI), so `channel` is `None` and the live `AcpChannelClient`
@@ -4168,10 +4172,10 @@ impl AgentState {
             .collect()
     }
 
-    /// Return the path-shaped, whitespace-delimited token containing the caret
-    /// (UXI-AgentTile-43). Ordinary words stay quiet until the token contains
-    /// `/` or `::`; a bare leading slash command belongs exclusively to
-    /// UXI-AgentTile-42.
+    /// Return the percent-triggered, whitespace-delimited token containing the
+    /// caret (UXI-AgentTile-43). `text` omits the leading `%` for raw address
+    /// prefix matching, while `start`/`end` retain the whole token so acceptance
+    /// removes the trigger. Slash commands remain exclusive to UXI-AgentTile-42.
     pub(crate) fn topic_query(&self) -> Option<TopicQuery> {
         if self.slash_query().is_some() {
             return None;
@@ -4202,19 +4206,31 @@ impl AgentState {
             return None;
         }
         let token: String = chars[start..end].iter().collect();
-        if !token.contains('/') && !token.contains("::") {
-            return None;
-        }
+        let prefix = token.strip_prefix('%')?;
         Some(TopicQuery {
-            text: token,
+            text: prefix.to_string(),
             start,
             end,
         })
     }
 
+    /// Return true exactly once when entering a percent Topic query. Edits to
+    /// that query reuse its request; leaving the query rearms the next opening.
+    pub(crate) fn begin_topic_query_refresh(&mut self) -> bool {
+        if self.topic_query().is_none() {
+            self.topic_query_refresh_active = false;
+            return false;
+        }
+        if self.topic_query_refresh_active {
+            return false;
+        }
+        self.topic_query_refresh_active = true;
+        true
+    }
+
     /// Filter the shared, installation-wide Cog Topic catalog by the raw token
     /// under the caret. Exact case-sensitive prefix semantics match Cog Topic
-    /// addresses; catalog sorting/dedup happens once at load.
+    /// addresses; catalog sorting/dedup happens on every fresh root load.
     pub(crate) fn topic_popup_rows(
         &self,
         catalog: &[CogTopicBinding],
@@ -4420,6 +4436,7 @@ impl AgentState {
             slash_popup_dismissed: false,
             topic_popup_sel: 0,
             topic_popup_dismissed: false,
+            topic_query_refresh_active: false,
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             usage: None,
             focused_subagent: None,
@@ -4513,6 +4530,7 @@ impl AgentState {
             slash_popup_dismissed: false,
             topic_popup_sel: 0,
             topic_popup_dismissed: false,
+            topic_query_refresh_active: false,
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             usage: None,
             focused_subagent: None,
