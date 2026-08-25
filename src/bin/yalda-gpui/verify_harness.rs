@@ -20680,7 +20680,7 @@ fn agent_stats_cached_body_only_rerenders_for_owned_inputs(cx: &mut TestAppConte
         .read_with(vcx, |v, _| v.agent_stats_view.clone())
         .expect("Agent Stats cached body must exist");
     stats.update(vcx, |stats, cx| {
-        stats.select_tab(crate::AgentStatsTab::Repository, cx)
+        stats.select_tab(crate::AgentStatsTab::Inactive, cx)
     });
     vcx.run_until_parked();
     assert_eq!(
@@ -20688,6 +20688,355 @@ fn agent_stats_cached_body_only_rerenders_for_owned_inputs(cx: &mut TestAppConte
         base + 1,
         "changing body-owned tab state must re-render the child once"
     );
+
+    stats.update(vcx, |stats, cx| {
+        stats.select_tab(crate::AgentStatsTab::Repository, cx)
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        crate::perf_render_count("agent_stats"),
+        base + 2,
+        "each three-page tab transition must invalidate only the cached child"
+    );
+}
+
+/// UXI-AgentStats-2: the live roster is projected into two non-overlapping
+/// pages. Working and Ready remain on Agents; authoritative Archived and
+/// disconnected-but-unarchived Unavailable rows move to Inactive. The probes
+/// assert the painted projection, while the state checks pin all three keyboard
+/// navigation families over the real cached view.
+///
+/// Negative control (observed RED): remove the `state.is_active()` filter in
+/// `AgentStatsView::render_agents` and the unavailable-row absence assertion
+/// fails because inactive history crowds the active page again.
+#[gpui::test]
+fn agent_stats_partitions_active_and_inactive_agents(cx: &mut TestAppContext) {
+    use yalda::session_proto::{Notification as ServerNotification, SessionInfo};
+
+    let (view, vcx) = boot_browser(cx);
+    let cwd = std::env::current_dir().expect("test cwd");
+    view.update(vcx, |view, cx| {
+        let row = |session_id: &str, label: &str, connected: bool, busy: bool, archived: bool| {
+            SessionInfo {
+                session_id: session_id.into(),
+                acp_session_id: None,
+                label: label.into(),
+                cwd: cwd.clone(),
+                provider: yalda::acp_channel::AgentProvider::Claude,
+                turns: 1,
+                connected,
+                permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+                busy,
+                archived,
+            }
+        };
+        view.open_agent_stats(cx);
+        view.apply_server_batch(
+            vec![
+                ServerNotification::SessionCreated {
+                    session: row("stats-working", "Working agent", true, true, false),
+                },
+                ServerNotification::SessionCreated {
+                    session: row("stats-ready", "Ready agent", true, false, false),
+                },
+                ServerNotification::SessionCreated {
+                    session: row(
+                        "stats-unavailable",
+                        "Unavailable agent",
+                        false,
+                        false,
+                        false,
+                    ),
+                },
+                ServerNotification::SessionCreated {
+                    session: row("stats-archived", "Archived agent", false, false, true),
+                },
+            ],
+            cx,
+        );
+    });
+
+    crate::layout_probe_begin();
+    vcx.run_until_parked();
+    assert!(crate::layout_probe_get("agent-stats-row-stats-working").is_some());
+    assert!(crate::layout_probe_get("agent-stats-row-stats-ready").is_some());
+    assert!(crate::layout_probe_get("agent-stats-row-stats-archived").is_none());
+    assert!(crate::layout_probe_get("agent-stats-row-stats-unavailable").is_none());
+    crate::layout_probe_end();
+
+    view.read_with(vcx, |view, cx| {
+        let stats = view
+            .agent_stats_view
+            .as_ref()
+            .expect("Agent Stats cached body")
+            .read(cx);
+        let snapshot = stats.agents().expect("live fleet snapshot");
+        assert_eq!((snapshot.working, snapshot.ready), (1, 1));
+        assert_eq!((snapshot.archived, snapshot.unavailable), (1, 1));
+        assert_eq!(snapshot.averages.settled_turns.population, 2);
+        assert_eq!(
+            snapshot
+                .agents
+                .iter()
+                .find(|agent| agent.row_id == "stats-archived")
+                .map(|agent| agent.state),
+            Some(crate::AgentMetricState::Archived)
+        );
+        assert_eq!(
+            snapshot
+                .agents
+                .iter()
+                .find(|agent| agent.row_id == "stats-unavailable")
+                .map(|agent| agent.state),
+            Some(crate::AgentMetricState::Unavailable)
+        );
+    });
+
+    crate::layout_probe_begin();
+    vcx.simulate_keystrokes("2");
+    vcx.run_until_parked();
+    assert!(crate::layout_probe_get("agent-stats-row-stats-working").is_none());
+    assert!(crate::layout_probe_get("agent-stats-row-stats-ready").is_none());
+    assert!(crate::layout_probe_get("agent-stats-row-stats-archived").is_some());
+    assert!(crate::layout_probe_get("agent-stats-row-stats-unavailable").is_some());
+    crate::layout_probe_end();
+
+    let active_tab = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.read_with(vcx, |view, cx| {
+            view.agent_stats_view
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .active_tab()
+        })
+    };
+    assert_eq!(active_tab(&view, vcx), crate::AgentStatsTab::Inactive);
+    vcx.simulate_keystrokes("tab");
+    assert_eq!(active_tab(&view, vcx), crate::AgentStatsTab::Repository);
+    vcx.simulate_keystrokes("left");
+    assert_eq!(active_tab(&view, vcx), crate::AgentStatsTab::Inactive);
+    vcx.simulate_keystrokes("right");
+    assert_eq!(active_tab(&view, vcx), crate::AgentStatsTab::Repository);
+    vcx.simulate_keystrokes("1");
+    assert_eq!(active_tab(&view, vcx), crate::AgentStatsTab::Agents);
+    vcx.simulate_keystrokes("3");
+    assert_eq!(active_tab(&view, vcx), crate::AgentStatsTab::Repository);
+}
+
+/// UXI-AgentStats-2/-5: registered repositories populate one generic picker,
+/// a persisted Fulcrum analysis restores before its fresh scan, and keyboard
+/// selection moves the singleton from Yalda to Fulcrum without a hard-coded
+/// path. Completion acceptance is gated by both generation and selected root.
+///
+/// Negative control (observed RED): remove the selected-root comparison in
+/// `apply_agent_stats_repository_for` and the stale-Yalda completion assertion
+/// accepts a result for the repository the user already left.
+#[gpui::test]
+fn agent_stats_selects_another_registered_repository(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().expect("repository fixtures");
+    let yalda = temp.path().join("yalda");
+    let fulcrum = temp.path().join("fulcrum");
+    for root in [&yalda, &fulcrum] {
+        std::fs::create_dir_all(root).expect("create repository fixture");
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["init", "--quiet"])
+            .status()
+            .expect("run git init");
+        assert!(status.success(), "initialize repository fixture");
+    }
+    let yalda_scan = crate::scan_repository(&yalda);
+    let fulcrum_scan = crate::scan_repository(&fulcrum);
+    assert!(matches!(yalda_scan, crate::RepositoryScan::Ready(_)));
+    assert!(matches!(fulcrum_scan, crate::RepositoryScan::Ready(_)));
+
+    let telemetry_path = temp.path().join("telemetry").join("v1.json");
+    crate::with_telemetry_store_path(telemetry_path, || {
+        let mut durable = crate::TelemetryStore::default();
+        assert!(durable.record_repository(1_000, &yalda_scan));
+        assert!(durable.record_repository(2_000, &fulcrum_scan));
+        durable.save().expect("persist both repository analyses");
+
+        let (view, vcx) = boot_browser(cx);
+        let (yalda_id, fulcrum_id) = view.update(vcx, |view, cx| {
+            let yalda_id = view
+                .projects
+                .create("Yalda".into(), yalda.clone())
+                .expect("register Yalda");
+            let fulcrum_id = view
+                .projects
+                .create("Fulcrum".into(), fulcrum.clone())
+                .expect("register Fulcrum");
+            view.workspace
+                .active_workspace_mut()
+                .expect("active workspace")
+                .set_project(yalda_id);
+            view.open_agent_stats(cx);
+            (yalda_id, fulcrum_id)
+        });
+
+        let (selected_index, fulcrum_index) = view.read_with(vcx, |view, cx| {
+            let stats = view.agent_stats_view.as_ref().unwrap().read(cx);
+            assert_eq!(
+                stats
+                    .selected_repository()
+                    .map(|choice| choice.label.as_str()),
+                Some("Yalda")
+            );
+            assert!(matches!(
+                stats.repository(),
+                crate::RepositoryStatsState::Observed {
+                    source: crate::ObservationSource::Restored,
+                    refreshing: true,
+                    ..
+                }
+            ));
+            let choices = stats.repository_choices();
+            let selected = choices
+                .iter()
+                .position(|choice| choice.label == "Yalda")
+                .expect("Yalda choice");
+            let fulcrum = choices
+                .iter()
+                .position(|choice| choice.label == "Fulcrum")
+                .expect("Fulcrum choice");
+            assert!(choices[fulcrum].has_observation);
+            (selected, fulcrum)
+        });
+
+        vcx.run_until_parked();
+        view.update(vcx, |view, cx| {
+            view.workspace.clear_solo_presentation();
+            view.workspace
+                .active_workspace_mut()
+                .expect("active workspace")
+                .set_project(fulcrum_id);
+            view.open_agent_stats(cx);
+        });
+        view.read_with(vcx, |view, cx| {
+            assert_eq!(
+                view.agent_stats_view
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .selected_repository()
+                    .map(|choice| choice.root.as_path()),
+                Some(fulcrum.as_path()),
+                "an implicit selection follows the project active at refocus"
+            );
+        });
+        view.update(vcx, |view, cx| {
+            view.workspace.clear_solo_presentation();
+            view.workspace
+                .active_workspace_mut()
+                .expect("active workspace")
+                .set_project(yalda_id);
+            view.open_agent_stats(cx);
+        });
+        view.read_with(vcx, |view, cx| {
+            assert_eq!(
+                view.agent_stats_view
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .selected_repository()
+                    .map(|choice| choice.root.as_path()),
+                Some(yalda.as_path()),
+                "implicit refocus remains project-relative until the user chooses"
+            );
+        });
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("3");
+        vcx.run_until_parked();
+        crate::layout_probe_begin();
+        vcx.simulate_keystrokes("enter");
+        vcx.run_until_parked();
+        assert!(
+            crate::layout_probe_get(&format!("agent-stats-repository-choice-{fulcrum_index}"))
+                .is_some(),
+            "the registered Fulcrum option must paint"
+        );
+        crate::layout_probe_end();
+
+        let choice_count = view.read_with(vcx, |view, cx| {
+            view.agent_stats_view
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .repository_choices()
+                .len()
+        });
+        let down_count = (fulcrum_index + choice_count - selected_index) % choice_count;
+        for _ in 0..down_count {
+            vcx.simulate_keystrokes("down");
+        }
+        vcx.simulate_keystrokes("enter");
+
+        let generation = view.read_with(vcx, |view, cx| {
+            let stats = view.agent_stats_view.as_ref().unwrap().read(cx);
+            assert_eq!(
+                stats
+                    .selected_repository()
+                    .map(|choice| choice.root.as_path()),
+                Some(fulcrum.as_path())
+            );
+            assert!(matches!(
+                stats.repository(),
+                crate::RepositoryStatsState::Observed { .. }
+            ));
+            view.agent_stats_scan_generation
+        });
+        let wrong_root = crate::RepositoryScan::NotGit { cwd: yalda.clone() };
+        assert!(!view.update(vcx, |view, cx| {
+            view.apply_agent_stats_repository_for(generation, &yalda, wrong_root, cx)
+        }));
+        assert!(!view.update(vcx, |view, cx| {
+            view.apply_agent_stats_repository_for(
+                generation.wrapping_sub(1),
+                &fulcrum,
+                crate::RepositoryScan::NotGit {
+                    cwd: fulcrum.clone(),
+                },
+                cx,
+            )
+        }));
+
+        vcx.run_until_parked();
+        view.update(vcx, |view, cx| {
+            view.workspace.clear_solo_presentation();
+            view.workspace
+                .active_workspace_mut()
+                .expect("active workspace")
+                .set_project(yalda_id);
+            view.open_agent_stats(cx);
+        });
+        assert_eq!(
+            view.read_with(vcx, |view, cx| {
+                view.agent_stats_view
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .selected_repository()
+                    .map(|choice| choice.root.clone())
+            }),
+            Some(fulcrum.clone()),
+            "an explicit picker choice stays sticky across project refocus"
+        );
+        vcx.simulate_keystrokes("r");
+        assert_eq!(
+            view.read_with(vcx, |view, cx| {
+                view.agent_stats_view
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .selected_repository()
+                    .map(|choice| choice.root.clone())
+            }),
+            Some(fulcrum.clone()),
+            "explicit refresh remains sticky to Fulcrum"
+        );
+    });
 }
 
 /// UXI-AgentStats-1/-4: every shell entry targets one materialized tile, that

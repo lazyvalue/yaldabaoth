@@ -302,9 +302,17 @@ pub(crate) fn repository_root_key(root: &Path) -> String {
 }
 
 fn agent_lifecycle_changed(before: &FleetMetricSnapshot, after: &FleetMetricSnapshot) -> bool {
-    if (before.working, before.ready, before.unavailable)
-        != (after.working, after.ready, after.unavailable)
-        || before.agents.len() != after.agents.len()
+    if (
+        before.working,
+        before.ready,
+        before.archived,
+        before.unavailable,
+    ) != (
+        after.working,
+        after.ready,
+        after.archived,
+        after.unavailable,
+    ) || before.agents.len() != after.agents.len()
     {
         return true;
     }
@@ -348,10 +356,11 @@ mod tests {
     }
 
     fn fleet(state: AgentMetricState, tools: usize) -> FleetMetricSnapshot {
-        let (working, ready, unavailable) = match state {
-            AgentMetricState::Working => (1, 0, 0),
-            AgentMetricState::Ready => (0, 1, 0),
-            AgentMetricState::Unavailable => (0, 0, 1),
+        let (working, ready, archived, unavailable) = match state {
+            AgentMetricState::Working => (1, 0, 0, 0),
+            AgentMetricState::Ready => (0, 1, 0, 0),
+            AgentMetricState::Archived => (0, 0, 1, 0),
+            AgentMetricState::Unavailable => (0, 0, 0, 1),
         };
         FleetMetricSnapshot {
             agents: vec![AgentMetricSnapshot {
@@ -374,6 +383,7 @@ mod tests {
             }],
             working,
             ready,
+            archived,
             unavailable,
             averages: FleetMetricAverages {
                 settled_turns: average(3.0),
@@ -476,9 +486,17 @@ mod tests {
             store.record_agent(3, fleet(AgentMetricState::Ready, 2)),
             "lifecycle transition bypasses throttle"
         );
+        assert!(
+            store.record_agent(4, fleet(AgentMetricState::Unavailable, 2)),
+            "becoming unavailable bypasses throttle"
+        );
+        assert!(
+            store.record_agent(5, fleet(AgentMetricState::Archived, 2)),
+            "unavailable-to-archived remains a durable lifecycle boundary"
+        );
 
         for index in 1..=(AGENT_HISTORY_LIMIT + 9) {
-            let timestamp = 3 + index as u64 * AGENT_SAMPLE_INTERVAL_MILLIS;
+            let timestamp = 5 + index as u64 * AGENT_SAMPLE_INTERVAL_MILLIS;
             assert!(store.record_agent(timestamp, fleet(AgentMetricState::Ready, index + 10)));
         }
         assert_eq!(store.agent_history().len(), AGENT_HISTORY_LIMIT);
@@ -541,6 +559,28 @@ mod tests {
             )
             .unwrap();
             assert_eq!(TelemetryStore::load(), TelemetryStore::default());
+        });
+    }
+
+    #[test]
+    fn v1_documents_without_archived_count_remain_readable() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("telemetry.json");
+        with_telemetry_store_path(path.clone(), || {
+            let mut store = TelemetryStore::default();
+            assert!(store.record_agent(1_000, fleet(AgentMetricState::Ready, 2)));
+            let mut document = serde_json::to_value(&store).unwrap();
+            document["agent_history"][0]["snapshot"]
+                .as_object_mut()
+                .unwrap()
+                .remove("archived");
+            fs::write(&path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+            let restored = TelemetryStore::load();
+            let snapshot = &restored.latest_agent().unwrap().snapshot;
+            assert_eq!(snapshot.ready, 1);
+            assert_eq!(snapshot.archived, 0);
+            assert_eq!(snapshot.agents[0].state, AgentMetricState::Ready);
         });
     }
 
