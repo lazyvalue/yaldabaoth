@@ -3,6 +3,7 @@ pub mod agent_event;
 pub mod agent_transcript;
 pub mod blocks;
 pub mod claude_channel;
+pub mod cog_runtime;
 pub mod command;
 pub mod config;
 pub mod cursor;
