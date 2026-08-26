@@ -778,19 +778,87 @@ fn codex_path_for_adapter(explicit: Option<OsString>) -> OsString {
         return path;
     }
 
-    find_executable_on_path("codex", std::env::var_os("PATH").as_deref())
+    let mut candidates = find_executables_on_path("codex", std::env::var_os("PATH").as_deref());
+    if let Some(login_path) = login_shell_path() {
+        for candidate in find_executables_on_path("codex", Some(&login_path)) {
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+    }
+
+    select_luna_capable_codex(candidates, codex_candidate_supports_luna)
         .map(PathBuf::into_os_string)
-        .or_else(|| resolve_via_login_shell("codex").map(OsString::from))
         // Preserve normal PATH lookup and fail clearly in codex-acp if Codex
         // is not installed, rather than silently selecting its stale bundle.
         .unwrap_or_else(|| OsString::from("codex"))
 }
 
-fn find_executable_on_path(name: &str, path: Option<&OsStr>) -> Option<PathBuf> {
-    let path = path?;
+fn find_executables_on_path(name: &str, path: Option<&OsStr>) -> Vec<PathBuf> {
+    let Some(path) = path else {
+        return Vec::new();
+    };
     std::env::split_paths(path)
         .map(|directory| directory.join(name))
-        .find(|candidate| candidate.is_file())
+        .filter(|candidate| candidate.is_file())
+        .collect()
+}
+
+fn login_shell_path() -> Option<OsString> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let output = std::process::Command::new(shell)
+        .arg("-lc")
+        .arg("printf '%s' \"$PATH\"")
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8(output.stdout).ok().map(OsString::from))
+        .flatten()
+}
+
+fn select_luna_capable_codex<F>(candidates: Vec<PathBuf>, mut supports_luna: F) -> Option<PathBuf>
+where
+    F: FnMut(&PathBuf) -> bool,
+{
+    candidates
+        .iter()
+        .find(|candidate| supports_luna(candidate))
+        .cloned()
+        .or_else(|| candidates.into_iter().next())
+}
+
+fn codex_candidate_supports_luna(path: &PathBuf) -> bool {
+    std::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .is_some_and(|output| {
+            let version = String::from_utf8_lossy(&output.stdout);
+            codex_version_supports_luna(&version)
+        })
+}
+
+fn codex_version_supports_luna(version_output: &str) -> bool {
+    let Some(version) = version_output
+        .split_whitespace()
+        .find(|token| token.chars().next().is_some_and(|c| c.is_ascii_digit()))
+    else {
+        return false;
+    };
+    if version.contains('-') {
+        return false;
+    }
+    let numbers: Vec<u64> = version
+        .split('.')
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()
+        .filter(|numbers: &Vec<u64>| numbers.len() == 3)
+        .unwrap_or_default();
+    numbers.as_slice() >= &[0, 147, 0]
 }
 
 /// Parse `ps -axo pid=,ppid=,command=` output and return the PIDs of ORPHANED
@@ -3972,7 +4040,7 @@ while True:
     }
 
     #[test]
-    fn codex_path_prefers_explicit_then_standalone_path() {
+    fn codex_path_prefers_explicit_then_luna_capable_standalone() {
         let explicit = OsString::from("/custom/codex");
         assert_eq!(
             codex_path_for_adapter(Some(explicit.clone())),
@@ -3985,10 +4053,28 @@ while True:
         std::fs::write(&codex, b"").expect("create fake standalone Codex");
         let path = std::env::join_paths([temp.path()]).expect("join test PATH");
         assert_eq!(
-            find_executable_on_path("codex", Some(&path)),
-            Some(codex),
+            find_executables_on_path("codex", Some(&path)),
+            vec![codex],
             "standalone Codex is resolved independently from codex-acp"
         );
+
+        let old = PathBuf::from("/old/codex");
+        let alpha = PathBuf::from("/alpha/codex");
+        let stable = PathBuf::from("/stable/codex");
+        assert_eq!(
+            select_luna_capable_codex(vec![old, alpha, stable.clone()], |candidate| {
+                candidate == &stable
+            }),
+            Some(stable),
+            "an older first PATH entry must not mask a Luna-capable CLI"
+        );
+
+        assert!(!codex_version_supports_luna("codex-cli 0.146.0"));
+        assert!(codex_version_supports_luna("codex-cli 0.147.0"));
+        assert!(codex_version_supports_luna("codex-cli 0.149.1"));
+        assert!(!codex_version_supports_luna(
+            "codex-cli 0.148.0-alpha.21"
+        ));
     }
 
     /// UXI-AgentTile-44 real launch-path guard. This crosses the production
