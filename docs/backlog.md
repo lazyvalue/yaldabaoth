@@ -13,6 +13,14 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Codex child resume reports the parent model** — `DEFERRED` (discovered
+  2026-08-26 while shipping `UXI-AgentTile-44`; Cog graph `w25`; see
+  [worklog](worklog/2026-08-26-codex-luna-subagents.md)). An authenticated child
+  spawned with no model override applies and runs `gpt-5.6-luna`, but codex-acp's
+  later child-thread resume response advertises the Sol parent model. This does
+  not block Luna execution. Revisit as a display-fidelity compatibility fix,
+  preferably after the adapter exposes the child's applied model consistently.
+
 - **Deeper agent and repository telemetry** — `DEFERRED` (roadmap graph `b68`;
   v1 shipped in [the 2026-08-25 worklog](worklog/2026-08-25-agent-repository-telemetry-v1.md)).
   Add exact lifecycle and tool durations, provider token classes, normalized task
