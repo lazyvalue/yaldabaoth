@@ -1,8 +1,8 @@
 # Default Codex subagents to Luna
 
 **Date:** 2026-08-26
-**Branches touched:** `codex/codex-luna-subagents` (`dc9c621`) →
-`main` (`df3ec37`)
+**Branches touched:** `codex/codex-luna-subagents` (`dc9c621`, `0c8e98b`,
+`7a86ce1`) → `main` (`df3ec37`, `00d5d4d`, `c0bb6e2`)
 
 ## Cog execution evidence
 
@@ -91,8 +91,9 @@ frontier 5: omega [done] (omega)
 - Added pure configuration/path guards, a real subprocess-environment guard,
   and an ignored authenticated live test that observes a spawned child's
   durable applied model.
-- Feature commit `dc9c621` merged to main as `df3ec37`; pre-existing user edits
-  to Cargo metadata and local lock/sidecar files were preserved.
+- Feature/runtime commits through `7a86ce1` merged to main through `c0bb6e2`;
+  pre-existing user edits to Cargo metadata and local lock/sidecar files were
+  preserved.
 
 ## Open / unresolved
 
