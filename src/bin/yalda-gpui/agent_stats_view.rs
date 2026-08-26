@@ -11,6 +11,7 @@ use std::path::Path;
 
 const MAX_AGENT_ROWS: usize = 200;
 const ROW_TEXT_PT: f32 = 11.0;
+pub(crate) const AGENT_STATS_CONTENT_MAX_PX: f32 = 1280.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum AgentStatsTab {
@@ -31,6 +32,95 @@ struct AgentStatsAgentObservation {
     captured_at_unix_ms: u64,
     snapshot: FleetMetricSnapshot,
     source: ObservationSource,
+}
+
+/// One selected agent's changes projected from the bounded fleet-observation
+/// history. These are observed samples, not exact lifecycle phase boundaries;
+/// ordinary metric churn may be coalesced for up to the store sample interval.
+#[derive(Debug, Clone, PartialEq)]
+struct AgentTimeline {
+    row_id: String,
+    label: String,
+    first_seen_unix_ms: u64,
+    last_seen_unix_ms: u64,
+    events: Vec<AgentTimelineEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct AgentTimelineEvent {
+    captured_at_unix_ms: u64,
+    agent: AgentMetricSnapshot,
+    delta: AgentTimelineDelta,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct AgentTimelineDelta {
+    settled_turns: Option<usize>,
+    tool_total: Option<usize>,
+    tool_failures: Option<usize>,
+    cost_usd: Option<f64>,
+}
+
+fn project_agent_timeline(
+    history: &[AgentFleetObservation],
+    latest: Option<&AgentStatsAgentObservation>,
+    row_id: &str,
+) -> Option<AgentTimeline> {
+    let mut observations = history
+        .iter()
+        .map(|observation| (observation.captured_at_unix_ms, &observation.snapshot))
+        .collect::<Vec<_>>();
+    if let Some(latest) = latest {
+        observations.push((latest.captured_at_unix_ms, &latest.snapshot));
+    }
+    observations.sort_by_key(|(captured_at_unix_ms, _)| *captured_at_unix_ms);
+
+    let mut timeline: Option<AgentTimeline> = None;
+    for (captured_at_unix_ms, snapshot) in observations {
+        let Some(agent) = snapshot.agents.iter().find(|agent| agent.row_id == row_id) else {
+            continue;
+        };
+        let timeline = timeline.get_or_insert_with(|| AgentTimeline {
+            row_id: row_id.to_string(),
+            label: agent.label.clone(),
+            first_seen_unix_ms: captured_at_unix_ms,
+            last_seen_unix_ms: captured_at_unix_ms,
+            events: Vec::new(),
+        });
+        timeline.last_seen_unix_ms = captured_at_unix_ms;
+        timeline.label = agent.label.clone();
+
+        let previous = timeline.events.last().map(|event| &event.agent);
+        if previous == Some(agent) {
+            continue;
+        }
+        let delta = previous
+            .map(|previous| AgentTimelineDelta {
+                settled_turns: known_counter_delta(previous.settled_turns, agent.settled_turns),
+                tool_total: known_counter_delta(previous.tool_total, agent.tool_total),
+                tool_failures: known_counter_delta(previous.tool_failures, agent.tool_failures),
+                cost_usd: known_float_delta(previous.cost_usd, agent.cost_usd),
+            })
+            .unwrap_or_default();
+        timeline.events.push(AgentTimelineEvent {
+            captured_at_unix_ms,
+            agent: agent.clone(),
+            delta,
+        });
+    }
+    timeline
+}
+
+fn known_counter_delta(previous: Option<usize>, current: Option<usize>) -> Option<usize> {
+    previous
+        .zip(current)
+        .and_then(|(previous, current)| current.checked_sub(previous))
+}
+
+fn known_float_delta(previous: Option<f64>, current: Option<f64>) -> Option<f64> {
+    previous
+        .zip(current)
+        .and_then(|(previous, current)| (current >= previous).then_some(current - previous))
 }
 
 /// One generic repository source offered by Agent Stats. `key` is the
@@ -69,6 +159,8 @@ pub(crate) struct AgentStatsView {
     root: WeakEntity<YaldaGpuiView>,
     active_tab: AgentStatsTab,
     agents: Option<AgentStatsAgentObservation>,
+    agent_history: Vec<AgentFleetObservation>,
+    selected_agent_row_id: Option<String>,
     repository_choices: Vec<RepositoryChoice>,
     selected_repository_key: Option<String>,
     repository_selection_explicit: bool,
@@ -91,6 +183,15 @@ impl AgentStatsView {
         observation: Option<AgentFleetObservation>,
         source: ObservationSource,
     ) -> Self {
+        Self::with_agent_history(root, observation, source, Vec::new())
+    }
+
+    pub(crate) fn with_agent_history(
+        root: WeakEntity<YaldaGpuiView>,
+        observation: Option<AgentFleetObservation>,
+        source: ObservationSource,
+        agent_history: Vec<AgentFleetObservation>,
+    ) -> Self {
         Self {
             root,
             active_tab: AgentStatsTab::Agents,
@@ -99,6 +200,8 @@ impl AgentStatsView {
                 snapshot: observation.snapshot,
                 source,
             }),
+            agent_history,
+            selected_agent_row_id: None,
             repository_choices: Vec::new(),
             selected_repository_key: None,
             repository_selection_explicit: false,
@@ -111,6 +214,14 @@ impl AgentStatsView {
 
     pub(crate) fn active_tab(&self) -> AgentStatsTab {
         self.active_tab
+    }
+
+    pub(crate) fn agent_timeline_open(&self) -> bool {
+        self.selected_agent_row_id.is_some()
+    }
+
+    pub(crate) fn selected_agent_row_id(&self) -> Option<&str> {
+        self.selected_agent_row_id.as_deref()
     }
 
     pub(crate) fn agents(&self) -> Option<&FleetMetricSnapshot> {
@@ -297,6 +408,7 @@ impl AgentStatsView {
             return;
         }
         self.active_tab = tab;
+        self.selected_agent_row_id = None;
         if tab != AgentStatsTab::Repository {
             self.repository_picker_open = false;
         }
@@ -305,10 +417,35 @@ impl AgentStatsView {
         cx.notify();
     }
 
-    pub(crate) fn set_agent_observation(
+    pub(crate) fn open_agent_timeline(&mut self, row_id: &str, cx: &mut Context<Self>) -> bool {
+        if project_agent_timeline(&self.agent_history, self.agents.as_ref(), row_id).is_none() {
+            return false;
+        }
+        if self.selected_agent_row_id.as_deref() == Some(row_id) {
+            return true;
+        }
+        self.selected_agent_row_id = Some(row_id.to_string());
+        self.scroll.set_offset(point(px(0.0), px(0.0)));
+        record_notify("agent_stats", MissReason::Refresh);
+        cx.notify();
+        true
+    }
+
+    pub(crate) fn close_agent_timeline(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.selected_agent_row_id.take().is_none() {
+            return false;
+        }
+        self.scroll.set_offset(point(px(0.0), px(0.0)));
+        record_notify("agent_stats", MissReason::Refresh);
+        cx.notify();
+        true
+    }
+
+    pub(crate) fn set_agent_telemetry(
         &mut self,
         observation: Option<AgentFleetObservation>,
         source: ObservationSource,
+        agent_history: Vec<AgentFleetObservation>,
         cx: &mut Context<Self>,
     ) {
         let next = observation.map(|observation| AgentStatsAgentObservation {
@@ -316,10 +453,11 @@ impl AgentStatsView {
             snapshot: observation.snapshot,
             source,
         });
-        if self.agents == next {
+        if self.agents == next && self.agent_history == agent_history {
             return;
         }
         self.agents = next;
+        self.agent_history = agent_history;
         record_notify("agent_stats", MissReason::Refresh);
         cx.notify();
     }
@@ -399,7 +537,13 @@ impl AgentStatsView {
         cx.notify();
     }
 
-    fn render_agents(&self, st: &DetailStyle, palette: StatsPalette) -> AnyElement {
+    fn render_agents(
+        &self,
+        st: &DetailStyle,
+        palette: StatsPalette,
+        selected_bg: Hsla,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Some(observation) = &self.agents else {
             return empty_state(
                 "agent-stats-agents-loading",
@@ -503,7 +647,7 @@ impl AgentStatsView {
         for (index, agent) in active_agents.into_iter().take(shown).enumerate() {
             body = body.child(probe_bounds_dyn(
                 format!("agent-stats-row-{}", agent.row_id),
-                agent_row(index, agent, st, palette),
+                self.interactive_agent_row(index, agent, st, palette, selected_bg, cx),
             ));
         }
         if omitted > 0 {
@@ -512,7 +656,13 @@ impl AgentStatsView {
         body.into_any_element()
     }
 
-    fn render_inactive_agents(&self, st: &DetailStyle, palette: StatsPalette) -> AnyElement {
+    fn render_inactive_agents(
+        &self,
+        st: &DetailStyle,
+        palette: StatsPalette,
+        selected_bg: Hsla,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Some(observation) = &self.agents else {
             return empty_state(
                 "agent-stats-inactive-loading",
@@ -585,13 +735,166 @@ impl AgentStatsView {
         for (index, agent) in inactive_agents.into_iter().take(shown).enumerate() {
             body = body.child(probe_bounds_dyn(
                 format!("agent-stats-row-{}", agent.row_id),
-                agent_row(index, agent, st, palette),
+                self.interactive_agent_row(index, agent, st, palette, selected_bg, cx),
             ));
         }
         if omitted > 0 {
             body = body.child(omitted_row(omitted, "additional inactive agents", st));
         }
         body.into_any_element()
+    }
+
+    fn interactive_agent_row(
+        &self,
+        index: usize,
+        agent: &AgentMetricSnapshot,
+        st: &DetailStyle,
+        palette: StatsPalette,
+        selected_bg: Hsla,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let row_id = agent.row_id.clone();
+        let mut hover_bg = selected_bg;
+        hover_bg.a *= 0.62;
+        agent_row(index, agent, st, palette)
+            .cursor_pointer()
+            .rounded_sm()
+            .hover(move |style| style.bg(hover_bg))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                this.open_agent_timeline(&row_id, cx);
+            }))
+            .into_any_element()
+    }
+
+    fn render_agent_timeline(
+        &self,
+        row_id: &str,
+        st: &DetailStyle,
+        palette: StatsPalette,
+        border: Hsla,
+        selected_bg: Hsla,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let back = probe_bounds(
+            "agent-stats-timeline-back",
+            context_menu_item(
+                "agent-stats-timeline-back-control",
+                "←",
+                st.accent,
+                "Back",
+                st.fg,
+                selected_bg,
+                &st.mono,
+            )
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.close_agent_timeline(cx);
+            }))
+            .into_any_element(),
+        );
+        let Some(timeline) =
+            project_agent_timeline(&self.agent_history, self.agents.as_ref(), row_id)
+        else {
+            return div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(back)
+                .child(empty_state(
+                    "agent-stats-timeline-empty",
+                    "No retained observations",
+                    "This agent no longer has a point inside the bounded telemetry history.",
+                    st,
+                ))
+                .into_any_element();
+        };
+
+        let state_changes = timeline
+            .events
+            .windows(2)
+            .filter(|events| events[0].agent.state != events[1].agent.state)
+            .count();
+        let observed_span = Duration::from_millis(
+            timeline
+                .last_seen_unix_ms
+                .saturating_sub(timeline.first_seen_unix_ms),
+        );
+        let turns_gained = timeline_counter_gain(&timeline.events, |delta| delta.settled_turns);
+        let tools_gained = timeline_counter_gain(&timeline.events, |delta| delta.tool_total);
+        let failures_gained = timeline_counter_gain(&timeline.events, |delta| delta.tool_failures);
+
+        let mut body = div()
+            .id("agent-stats-timeline")
+            .flex()
+            .flex_col()
+            .w_full()
+            .gap_2()
+            .child(back)
+            .child(
+                div()
+                    .font_family(st.prose.clone())
+                    .font_weight(FontWeight::BOLD)
+                    .text_size(px(st.pt * 1.35))
+                    .child(SharedString::from(timeline.label.clone())),
+            )
+            .child(kv_row("Telemetry identity", timeline.row_id.clone(), st))
+            .child(note_block(
+                "Observed timeline".to_string(),
+                "durable sampled telemetry".to_string(),
+                "Lifecycle boundaries are captured immediately. Ordinary metric changes are sampled at most every 30 seconds. Intervals are observed spans, not exact phase durations; context is occupancy, not historical token consumption.",
+                st,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(metric_card(
+                        "Observed span",
+                        format_duration_compact(observed_span),
+                        st,
+                    ))
+                    .child(metric_card(
+                        "State changes",
+                        state_changes.to_string(),
+                        st,
+                    ))
+                    .child(metric_card(
+                        "Turns gained",
+                        format_optional_gain(turns_gained),
+                        st,
+                    ))
+                    .child(metric_card(
+                        "Tools gained",
+                        format_optional_gain(tools_gained),
+                        st,
+                    ))
+                    .child(metric_card(
+                        "Failures gained",
+                        format_optional_gain(failures_gained),
+                        &DetailStyle {
+                            accent: if failures_gained.unwrap_or(0) > 0 {
+                                st.err
+                            } else {
+                                st.accent
+                            },
+                            ..clone_style(st)
+                        },
+                    )),
+            )
+            .child(section_heading("Observed timeline", st));
+
+        for (index, event) in timeline.events.iter().enumerate() {
+            let previous_state = index
+                .checked_sub(1)
+                .and_then(|previous| timeline.events.get(previous))
+                .map(|event| event.agent.state);
+            body = body.child(probe_bounds_dyn(
+                format!("agent-stats-timeline-event-{index}"),
+                timeline_event_card(index, event, previous_state, st, palette, border),
+            ));
+        }
+        probe_bounds("agent-stats-timeline", body.into_any_element())
     }
 
     fn render_repository(
@@ -952,10 +1255,16 @@ impl Render for AgentStatsView {
                 })),
             );
 
-        let body = match self.active_tab {
-            AgentStatsTab::Agents => self.render_agents(&st, palette),
-            AgentStatsTab::Inactive => self.render_inactive_agents(&st, palette),
-            AgentStatsTab::Repository => {
+        let selected_agent_row_id = self.selected_agent_row_id.clone();
+        let body = match (self.active_tab, selected_agent_row_id.as_deref()) {
+            (AgentStatsTab::Agents | AgentStatsTab::Inactive, Some(row_id)) => {
+                self.render_agent_timeline(row_id, &st, palette, border, selected_bg, cx)
+            }
+            (AgentStatsTab::Agents, None) => self.render_agents(&st, palette, selected_bg, cx),
+            (AgentStatsTab::Inactive, None) => {
+                self.render_inactive_agents(&st, palette, selected_bg, cx)
+            }
+            (AgentStatsTab::Repository, _) => {
                 self.render_repository(&st, palette, border, selected_bg, cx)
             }
         };
@@ -966,7 +1275,10 @@ impl Render for AgentStatsView {
             .flex_col()
             .bg(bg)
             .text_color(st.fg)
-            .child(tabs)
+            .child(probe_bounds(
+                "agent-stats-tabs-bounds",
+                tabs.into_any_element(),
+            ))
             .child(
                 div()
                     .id("agent-stats-scroll")
@@ -974,7 +1286,20 @@ impl Render for AgentStatsView {
                     .min_h_0()
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll)
-                    .child(div().flex().flex_col().w_full().p_3().pb_6().child(body)),
+                    .child(
+                        div().flex().w_full().justify_center().child(probe_bounds(
+                            "agent-stats-content",
+                            div()
+                                .flex()
+                                .flex_col()
+                                .w_full()
+                                .max_w(px(AGENT_STATS_CONTENT_MAX_PX))
+                                .p_3()
+                                .pb_6()
+                                .child(body)
+                                .into_any_element(),
+                        )),
+                    ),
             )
             .into_any_element()
     }
@@ -1131,13 +1456,8 @@ fn agent_row(
     agent: &AgentMetricSnapshot,
     st: &DetailStyle,
     palette: StatsPalette,
-) -> AnyElement {
-    let state_color = match agent.state {
-        AgentMetricState::Working => palette.working,
-        AgentMetricState::Ready => palette.ready,
-        AgentMetricState::Archived => st.dim,
-        AgentMetricState::Unavailable => st.dim,
-    };
+) -> gpui::Stateful<gpui::Div> {
+    let state_color = agent_state_color(agent.state, st, palette);
     let provider = agent.provider.map(AgentProvider::label).unwrap_or("—");
     let provider_model = match agent.model.as_deref() {
         Some(model) => format!("{provider} · {model}"),
@@ -1193,7 +1513,176 @@ fn agent_row(
     if !agent.loaded {
         row = row.text_color(st.dim);
     }
-    row.into_any_element()
+    row
+}
+
+fn agent_state_color(state: AgentMetricState, st: &DetailStyle, palette: StatsPalette) -> Hsla {
+    match state {
+        AgentMetricState::Working => palette.working,
+        AgentMetricState::Ready => palette.ready,
+        AgentMetricState::Archived | AgentMetricState::Unavailable => st.dim,
+    }
+}
+
+fn timeline_counter_gain(
+    events: &[AgentTimelineEvent],
+    select: impl Fn(AgentTimelineDelta) -> Option<usize>,
+) -> Option<usize> {
+    let mut known = false;
+    let total = events.iter().fold(0usize, |total, event| {
+        select(event.delta).map_or(total, |delta| {
+            known = true;
+            total.saturating_add(delta)
+        })
+    });
+    known.then_some(total)
+}
+
+fn format_optional_gain(value: Option<usize>) -> String {
+    value
+        .map(|value| format!("+{value}"))
+        .unwrap_or_else(|| "—".to_string())
+}
+
+fn format_duration_compact(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    let hours = seconds / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    let seconds = seconds % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn timeline_event_card(
+    index: usize,
+    event: &AgentTimelineEvent,
+    previous_state: Option<AgentMetricState>,
+    st: &DetailStyle,
+    palette: StatsPalette,
+    border: Hsla,
+) -> AnyElement {
+    let state_color = agent_state_color(event.agent.state, st, palette);
+    let at = fmt_epoch_ns(
+        event
+            .captured_at_unix_ms
+            .saturating_mul(1_000_000)
+            .min(i64::MAX as u64) as i64,
+    );
+    let mut changes = Vec::new();
+    if let Some(previous_state) = previous_state.filter(|state| *state != event.agent.state) {
+        changes.push(format!(
+            "{} → {}",
+            previous_state.label(),
+            event.agent.state.label()
+        ));
+    }
+    if let Some(delta) = event.delta.settled_turns.filter(|delta| *delta > 0) {
+        changes.push(format!("+{delta} turns"));
+    }
+    if let Some(delta) = event.delta.tool_total.filter(|delta| *delta > 0) {
+        changes.push(format!("+{delta} tools"));
+    }
+    if let Some(delta) = event.delta.tool_failures.filter(|delta| *delta > 0) {
+        changes.push(format!("+{delta} failed"));
+    }
+    if let Some(delta) = event.delta.cost_usd.filter(|delta| *delta > 0.0) {
+        changes.push(format!("+${delta:.2}"));
+    }
+    let change_summary = if index == 0 {
+        "First observed".to_string()
+    } else if changes.is_empty() {
+        "Snapshot changed".to_string()
+    } else {
+        changes.join(" · ")
+    };
+    let provider = event
+        .agent
+        .provider
+        .map(AgentProvider::label)
+        .unwrap_or("—");
+    let model = event.agent.model.as_deref().unwrap_or("—");
+    let turns = event
+        .agent
+        .settled_turns
+        .map(|turns| turns.to_string())
+        .unwrap_or_else(|| "—".to_string());
+    let tools = match (event.agent.tool_total, event.agent.tool_failures) {
+        (Some(total), Some(failures)) => format!("{total} · {failures} failed"),
+        (Some(total), None) => total.to_string(),
+        _ => "—".to_string(),
+    };
+    let context = event
+        .agent
+        .context
+        .and_then(ContextOccupancy::percent)
+        .map(|percent| format!("{percent:.1}% occupancy"))
+        .unwrap_or_else(|| "—".to_string());
+    let cost = event
+        .agent
+        .cost_usd
+        .map(|cost| format!("${cost:.2}"))
+        .unwrap_or_else(|| "—".to_string());
+    let header = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .px_2()
+        .py_1()
+        .child(
+            div()
+                .w(px(176.0))
+                .flex_none()
+                .font_family(st.mono.clone())
+                .text_size(px(ROW_TEXT_PT))
+                .text_color(st.dim)
+                .child(SharedString::from(format!("{at} UTC"))),
+        )
+        .child(compact_status_mark(
+            ("agent-stats-timeline-state", index),
+            event.agent.state.label(),
+            state_color,
+            st,
+        ))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .font_family(st.mono.clone())
+                .text_size(px(ROW_TEXT_PT))
+                .text_color(st.fg)
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .child(SharedString::from(change_summary)),
+        )
+        .into_any_element();
+    let body = div()
+        .flex()
+        .flex_col()
+        .child(kv_row(
+            "Provider · model",
+            format!("{provider} · {model}"),
+            st,
+        ))
+        .child(kv_row("Settled turns", turns, st))
+        .child(kv_row("Tools", tools, st))
+        .child(kv_row("Context", context, st))
+        .child(kv_row("Cost", cost, st))
+        .into_any_element();
+    compact_bounded_group(
+        ("agent-stats-timeline-card", index),
+        header,
+        Some(body),
+        border,
+        border,
+    )
+    .into_any_element()
 }
 
 fn dense_row(
@@ -1490,6 +1979,74 @@ fn format_bytes(bytes: u64) -> String {
 mod tests {
     use super::*;
 
+    fn no_average(population: usize) -> MetricAverage {
+        MetricAverage {
+            sum: None,
+            mean: None,
+            denominator: 0,
+            population,
+        }
+    }
+
+    fn fleet(agents: Vec<AgentMetricSnapshot>) -> FleetMetricSnapshot {
+        let working = agents
+            .iter()
+            .filter(|agent| agent.state == AgentMetricState::Working)
+            .count();
+        let ready = agents
+            .iter()
+            .filter(|agent| agent.state == AgentMetricState::Ready)
+            .count();
+        let archived = agents
+            .iter()
+            .filter(|agent| agent.state == AgentMetricState::Archived)
+            .count();
+        let unavailable = agents
+            .iter()
+            .filter(|agent| agent.state == AgentMetricState::Unavailable)
+            .count();
+        let population = working + ready;
+        FleetMetricSnapshot {
+            agents,
+            working,
+            ready,
+            archived,
+            unavailable,
+            averages: FleetMetricAverages {
+                settled_turns: no_average(population),
+                tool_total: no_average(population),
+                tool_failures: no_average(population),
+                context_percent: no_average(population),
+                cost_usd: no_average(population),
+                current_turn_elapsed_secs: no_average(population),
+            },
+        }
+    }
+
+    fn timeline_agent(
+        row_id: &str,
+        state: AgentMetricState,
+        turns: usize,
+        tools: usize,
+        failures: usize,
+    ) -> AgentMetricSnapshot {
+        AgentMetricSnapshot {
+            row_id: row_id.into(),
+            session_id: Some(row_id.into()),
+            label: format!("Agent {row_id}"),
+            provider: None,
+            model: None,
+            state,
+            settled_turns: Some(turns),
+            tool_total: Some(tools),
+            tool_failures: Some(failures),
+            context: None,
+            cost_usd: Some(tools as f64 / 10.0),
+            current_turn_elapsed: None,
+            loaded: true,
+        }
+    }
+
     fn repository_choice(label: &str, root: PathBuf) -> RepositoryChoice {
         RepositoryChoice {
             key: repository_root_key(&root),
@@ -1579,6 +2136,49 @@ mod tests {
             repository_selection_key(&choices, Some(&yalda_key), Some(&fulcrum), false),
             Some(fulcrum_key),
             "an implicit selection follows a newly active project on refocus"
+        );
+    }
+
+    #[test]
+    fn agent_timeline_collapses_unrelated_fleet_churn_and_reports_known_deltas() {
+        let ready = timeline_agent("selected", AgentMetricState::Ready, 1, 2, 0);
+        let working = timeline_agent("selected", AgentMetricState::Working, 3, 7, 1);
+        let unrelated = timeline_agent("other", AgentMetricState::Unavailable, 0, 0, 0);
+        let history = vec![
+            AgentFleetObservation {
+                captured_at_unix_ms: 1_000,
+                snapshot: fleet(vec![ready.clone()]),
+            },
+            AgentFleetObservation {
+                captured_at_unix_ms: 2_000,
+                snapshot: fleet(vec![ready, unrelated]),
+            },
+            AgentFleetObservation {
+                captured_at_unix_ms: 3_000,
+                snapshot: fleet(vec![working.clone()]),
+            },
+        ];
+        let latest = AgentStatsAgentObservation {
+            captured_at_unix_ms: 4_000,
+            snapshot: fleet(vec![working]),
+            source: ObservationSource::Live,
+        };
+
+        let timeline = project_agent_timeline(&history, Some(&latest), "selected")
+            .expect("selected agent timeline");
+        assert_eq!(timeline.first_seen_unix_ms, 1_000);
+        assert_eq!(timeline.last_seen_unix_ms, 4_000);
+        assert_eq!(timeline.events.len(), 2, "unrelated fleet churn collapses");
+        assert_eq!(timeline.events[0].agent.state, AgentMetricState::Ready);
+        assert_eq!(timeline.events[1].agent.state, AgentMetricState::Working);
+        assert_eq!(timeline.events[1].delta.settled_turns, Some(2));
+        assert_eq!(timeline.events[1].delta.tool_total, Some(5));
+        assert_eq!(timeline.events[1].delta.tool_failures, Some(1));
+        assert!(
+            timeline.events[1]
+                .delta
+                .cost_usd
+                .is_some_and(|delta| (delta - 0.5).abs() < f64::EPSILON * 4.0)
         );
     }
 }

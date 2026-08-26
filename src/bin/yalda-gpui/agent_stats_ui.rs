@@ -92,7 +92,9 @@ impl YaldaGpuiView {
                 ObservationSource::Live,
             ),
         };
-        let view = cx.new(|_| AgentStatsView::with_agent_observation(weak, observation, source));
+        let history = self.telemetry_store.agent_history().to_vec();
+        let view =
+            cx.new(|_| AgentStatsView::with_agent_history(weak, observation, source, history));
         self.agent_stats_view = Some(view.clone());
         view
     }
@@ -149,13 +151,15 @@ impl YaldaGpuiView {
             self.mark_telemetry_dirty(cx);
         }
         if let Some(view) = self.agent_stats_view.clone() {
+            let history = self.telemetry_store.agent_history().to_vec();
             view.update(cx, |view, cx| {
-                view.set_agent_observation(
+                view.set_agent_telemetry(
                     Some(AgentFleetObservation {
                         captured_at_unix_ms,
                         snapshot,
                     }),
                     ObservationSource::Live,
+                    history,
                     cx,
                 )
             });
@@ -343,6 +347,12 @@ impl YaldaGpuiView {
         let Some(view) = self.agent_stats_view.clone() else {
             return;
         };
+        if view.read(cx).agent_timeline_open() && press.key == Key::Esc {
+            view.update(cx, |view, cx| {
+                view.close_agent_timeline(cx);
+            });
+            return;
+        }
         let repository_picker = view.read(cx).active_tab() == AgentStatsTab::Repository
             && view.read(cx).repository_picker_open();
         if repository_picker {

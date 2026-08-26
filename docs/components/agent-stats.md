@@ -38,6 +38,8 @@ Primary code homes are `telemetry/`, `agent_stats_view.rs`, and
 - Cog v1 graph `p62` at `%projects/cog/telemetry::v1` — implementation record.
 - Cog follow-up graph `9ku` — inactive-agent partition and multi-repository
   selection.
+- Cog follow-up graph `k2k` — readable-width tables and per-agent observed
+  timelines.
 
 ## UX invariants
 
@@ -174,3 +176,60 @@ does not erase it.
 `telemetry::store::tests::repository_entries_are_latest_by_normalized_root_and_bounded`,
 `telemetry::store::tests::missing_corrupt_and_unknown_versions_fail_safe`, and
 `verify_harness.rs::agent_stats_restores_durable_observations_before_fresh_collection`.
+
+### UXI-AgentStats-6 — Dense evidence keeps a readable measure
+
+**Statement.** The tabs remain tile-width, while the scroll body's metric cards,
+tables, repository projections, and detail content share a centered readable
+measure capped at 1,280 logical pixels. Below that cap the body remains fluid and
+uses the available width. Flexible agent labels and repository count labels grow
+only inside that measure; they never push their trailing values to opposite edges
+of an ultrawide tile.
+
+**Applies to.** `AgentStatsView::render`, active/inactive agent tables,
+`repository_ready`, and per-agent timeline detail.
+
+**Why.** Operational tables are read by scanning across rows. Letting a flexible
+cell absorb an ultrawide monitor makes related values visually unrelated and
+forces excessive eye travel.
+
+**Status.** `implemented`
+
+**Enforcement.**
+`verify_harness.rs::agent_stats_content_keeps_a_readable_measure_on_wide_tiles`.
+
+### UXI-AgentStats-7 — Agent rows open an honest durable timeline
+
+**Statement.** Clicking any row on Agents or Inactive opens an in-place detail
+view for that row's stable telemetry identity. The detail header names the agent
+and exposes a visible **Back** control; Back or Escape returns to the originating
+list without changing the top-level tab. Switching top-level tabs closes the
+detail.
+
+The detail derives a bounded chronological timeline from the same retained fleet
+observations used by Agent Stats. It shows first/last observation, state changes,
+and known deltas for settled turns, tools, tool failures, context occupancy, and
+cost. Consecutive fleet samples that do not change the selected agent are
+collapsed. The current live observation may appear as an unsaved trailing point.
+The view calls this an **observed timeline** and states that lifecycle boundaries
+are captured immediately while ordinary metric churn is sampled at most every 30
+seconds; it never claims exact phase durations or historical token consumption.
+
+Restored history opens before fresh collection after a Yalda reboot. If retention
+contains no point for the selected identity, the detail shows an explicit empty
+state. Timeline persistence remains telemetry-store v1 and retains only the
+existing privacy-safe snapshots: never transcripts, prompts, source content, or
+tool inputs/outputs.
+
+**Applies to.** `AgentStatsView`, `TelemetryStore::agent_history`, agent-row click
+handlers, Agent Stats key handling, and the cached render body.
+
+**Why.** Fleet aggregates reveal which agents are expensive or stalled; the
+timeline is the first drill-down needed to see when their lifecycle and activity
+changed without overstating the precision of v1 telemetry.
+
+**Status.** `implemented`
+
+**Enforcement.**
+`agent_stats_view::tests::agent_timeline_collapses_unrelated_fleet_churn_and_reports_known_deltas`
+and `verify_harness.rs::agent_stats_row_click_opens_durable_observed_timeline`.
