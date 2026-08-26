@@ -10585,6 +10585,7 @@ fn tag_editor_mouse_click_toggles(cx: &mut TestAppContext) {
             crate::layout_probe_get(probe).unwrap_or_else(|| panic!("{probe} paints"));
         crate::layout_probe_end();
         let at = point(px(x + w / 2.0), px(y + h / 2.0));
+        crate::layout_probe_begin();
         vcx.simulate_mouse_move(at, None, gpui::Modifiers::default());
         vcx.simulate_click(at, gpui::Modifiers::default());
         vcx.run_until_parked();
@@ -20698,6 +20699,226 @@ fn agent_stats_cached_body_only_rerenders_for_owned_inputs(cx: &mut TestAppConte
         base + 2,
         "each three-page tab transition must invalidate only the cached child"
     );
+}
+
+/// UXI-AgentStats-6: the tab chrome may fill an ultrawide tile, but the evidence
+/// body and its dense rows stay within the shared readable measure. This drives
+/// the real resize and paint path rather than checking a style constant.
+///
+/// Negative control: removing `max_w(AGENT_STATS_CONTENT_MAX_PX)` from the
+/// production scroll-body wrapper makes the content-vs-tabs gap assertion fail.
+#[gpui::test]
+fn agent_stats_content_keeps_a_readable_measure_on_wide_tiles(cx: &mut TestAppContext) {
+    use yalda::session_proto::{Notification as ServerNotification, SessionInfo};
+
+    let (view, vcx) = boot_browser(cx);
+    let cwd = std::env::current_dir().expect("test cwd");
+    view.update(vcx, |view, cx| {
+        view.open_agent_stats(cx);
+        view.apply_server_batch(
+            vec![ServerNotification::SessionCreated {
+                session: SessionInfo {
+                    session_id: "wide-agent".into(),
+                    acp_session_id: None,
+                    label: "Wide-screen agent".into(),
+                    cwd,
+                    provider: yalda::acp_channel::AgentProvider::Codex,
+                    turns: 4,
+                    connected: true,
+                    permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+                    busy: false,
+                    archived: false,
+                },
+            }],
+            cx,
+        );
+    });
+    crate::layout_probe_begin();
+    vcx.simulate_resize(gpui::size(px(2200.0), px(900.0)));
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let (tabs_x, _, tabs_w, _) = crate::layout_probe_get("agent-stats-tabs-bounds")
+        .expect("tile-wide Agent Stats tabs must paint");
+    let (content_x, _, content_w, _) = crate::layout_probe_get("agent-stats-content")
+        .expect("bounded Agent Stats content must paint");
+    let (row_x, _, row_w, _) =
+        crate::layout_probe_get("agent-stats-row-wide-agent").expect("active agent row must paint");
+    crate::layout_probe_end();
+
+    assert!(
+        content_w <= crate::AGENT_STATS_CONTENT_MAX_PX + 0.5,
+        "content widened past the readable measure: {content_w}"
+    );
+    assert!(
+        tabs_w - content_w > 400.0,
+        "the guard needs a genuinely ultrawide tile; tabs {tabs_w}, content {content_w}"
+    );
+    assert!(
+        content_x > tabs_x && row_x >= content_x && row_x + row_w <= content_x + content_w + 0.5,
+        "the row must stay inside the centered content measure"
+    );
+    crate::layout_probe_begin();
+    vcx.simulate_keystrokes("3");
+    vcx.run_until_parked();
+    let (_, _, repository_w, _) = crate::layout_probe_get("agent-stats-content")
+        .expect("repository content uses the same measure");
+    crate::layout_probe_end();
+    assert!(repository_w <= crate::AGENT_STATS_CONTENT_MAX_PX + 0.5);
+}
+
+/// UXI-AgentStats-7: a real painted row click opens the timeline projected from
+/// multiple fleet observations restored from disk. Escape and the painted Back
+/// control both return to the originating Agents list.
+///
+/// Negative control: removing the production row's `on_click` handler leaves
+/// `agent-stats-timeline` unpainted after `simulate_click` and fails RED.
+#[gpui::test]
+fn agent_stats_row_click_opens_durable_observed_timeline(cx: &mut TestAppContext) {
+    use yalda::session_proto::{Notification as ServerNotification, SessionInfo};
+
+    let temp = tempfile::tempdir().expect("timeline telemetry fixture");
+    let telemetry_path = temp.path().join("telemetry").join("v1.json");
+    let cwd = std::env::current_dir().expect("test cwd");
+    let session = |busy: bool, turns: usize| SessionInfo {
+        session_id: "timeline-agent".into(),
+        acp_session_id: None,
+        label: "Timeline agent".into(),
+        cwd: cwd.clone(),
+        provider: yalda::acp_channel::AgentProvider::Codex,
+        turns,
+        connected: true,
+        permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+        busy,
+        archived: false,
+    };
+
+    crate::with_telemetry_store_path(telemetry_path, || {
+        let (collector, collector_vcx) = boot_browser(cx);
+        collector.update(collector_vcx, |view, cx| {
+            view.apply_server_batch(
+                vec![ServerNotification::SessionCreated {
+                    session: session(false, 1),
+                }],
+                cx,
+            );
+            view.refresh_agent_stats_agents(cx);
+            view.apply_server_batch(
+                vec![ServerNotification::SessionCreated {
+                    session: session(true, 3),
+                }],
+                cx,
+            );
+            view.refresh_agent_stats_agents(cx);
+            assert!(
+                view.telemetry_store.agent_history().len() >= 2,
+                "the fixture must persist at least one lifecycle transition"
+            );
+            view.telemetry_store
+                .save()
+                .expect("save timeline observations");
+        });
+
+        crate::perf_reset("agent_stats");
+        let (view, vcx) = boot_browser(cx);
+        view.update(vcx, |view, cx| view.open_agent_stats(cx));
+        crate::layout_probe_begin();
+        vcx.run_until_parked();
+        let (x, y, w, h) = crate::layout_probe_get("agent-stats-row-timeline-agent")
+            .expect("restored active row must paint before fresh collection");
+        crate::layout_probe_end();
+        let list_render_count = crate::perf_render_count("agent_stats");
+        let at = point(px(x + w / 2.0), px(y + h / 2.0));
+        crate::layout_probe_begin();
+        vcx.simulate_mouse_move(at, None, gpui::Modifiers::default());
+        vcx.simulate_click(at, gpui::Modifiers::default());
+        view.read_with(vcx, |view, cx| {
+            assert_eq!(
+                view.agent_stats_view
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .selected_agent_row_id(),
+                Some("timeline-agent"),
+                "the production row click must select its stable telemetry identity"
+            );
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, cx| {
+            assert_eq!(
+                view.agent_stats_view
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .selected_agent_row_id(),
+                Some("timeline-agent"),
+                "timeline selection must survive the frame that paints detail"
+            );
+        });
+        assert!(
+            crate::perf_render_count("agent_stats") > list_render_count,
+            "row selection must invalidate the cached Agent Stats body"
+        );
+        assert!(crate::layout_probe_get("agent-stats-timeline").is_some());
+        assert!(crate::layout_probe_get("agent-stats-timeline-event-0").is_some());
+        assert!(crate::layout_probe_get("agent-stats-timeline-event-1").is_some());
+        assert!(
+            crate::layout_probe_get("agent-stats-timeline-back").is_some(),
+            "visible Back control must paint"
+        );
+        crate::layout_probe_end();
+        view.read_with(vcx, |view, cx| {
+            assert_eq!(
+                view.agent_stats_view
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .selected_agent_row_id(),
+                Some("timeline-agent")
+            );
+        });
+        crate::layout_probe_begin();
+        vcx.simulate_keystrokes("escape");
+        vcx.run_until_parked();
+        let row = crate::layout_probe_get("agent-stats-row-timeline-agent")
+            .expect("Escape restores the originating list");
+        crate::layout_probe_end();
+        view.read_with(vcx, |view, cx| {
+            assert!(
+                !view
+                    .agent_stats_view
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .agent_timeline_open()
+            );
+        });
+
+        let row_at = point(px(row.0 + row.2 / 2.0), px(row.1 + row.3 / 2.0));
+        crate::layout_probe_begin();
+        vcx.simulate_mouse_move(row_at, None, gpui::Modifiers::default());
+        vcx.simulate_click(row_at, gpui::Modifiers::default());
+        vcx.run_until_parked();
+        let back = crate::layout_probe_get("agent-stats-timeline-back")
+            .expect("Back repaints after the second row click");
+        crate::layout_probe_end();
+        let back_at = point(px(back.0 + back.2 / 2.0), px(back.1 + back.3 / 2.0));
+        crate::layout_probe_begin();
+        vcx.simulate_mouse_move(back_at, None, gpui::Modifiers::default());
+        vcx.simulate_click(back_at, gpui::Modifiers::default());
+        vcx.run_until_parked();
+        assert!(crate::layout_probe_get("agent-stats-row-timeline-agent").is_some());
+        crate::layout_probe_end();
+        view.read_with(vcx, |view, cx| {
+            assert!(
+                !view
+                    .agent_stats_view
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .agent_timeline_open()
+            );
+        });
+    });
 }
 
 /// UXI-AgentStats-2: the live roster is projected into two non-overlapping
