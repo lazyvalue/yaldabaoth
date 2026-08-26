@@ -40,8 +40,9 @@ strip**, the **transcript** (a cached child, `TranscriptView`), the **compose** 
 - [session-binding.md](session-binding.md) — `UXI-AgentTile-18..19`, `-22..23`, `-34`: durable
   tile↔session identity + auto-resume on restart (the unresumable-session notice,
   and the typed-`yes` close confirmation + its auto-insert).
-- [providers.md](providers.md) — `UXI-AgentTile-30`: explicit Claude/Codex choice
-  with durable provider ownership and subscription-safe Codex authentication.
+- [providers.md](providers.md) — `UXI-AgentTile-30`, `-44`: explicit
+  Claude/Codex choice with durable provider ownership, subscription-safe Codex
+  authentication, and Luna-default Codex subagents.
 - [picker.md](picker.md) — `UXI-AgentTile-32`: existing archived sessions are
   absent from both selectable and in-use picker rows.
 
@@ -86,3 +87,4 @@ strip**, the **transcript** (a cached child, `TranscriptView`), the **compose** 
 | UXI-AgentTile-41 | compose | Up/Down recall previously-sent compose messages | implemented |
 | UXI-AgentTile-42 | compose | Slash-command autocomplete popup in the compose | implemented |
 | UXI-AgentTile-43 | compose | Cog Topic path autocomplete in both compose placements | implemented |
+| UXI-AgentTile-44 | providers | Codex subagents default to Luna without changing the parent model | implemented |

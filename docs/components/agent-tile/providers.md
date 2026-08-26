@@ -1,6 +1,7 @@
 # Agent Tile — Providers
 
-Facet of the [Agent Tile](README.md) component. Owns `UXI-AgentTile-30`.
+Facet of the [Agent Tile](README.md) component. Owns `UXI-AgentTile-30`,
+`UXI-AgentTile-44`.
 
 ## UXI-AgentTile-30 — Claude and Codex sessions coexist with durable provider identity
 
@@ -37,3 +38,46 @@ private Codex login.
 
 **Status.** `implemented` (compile + headless tests; live Codex ACP handshake
 requires the local adapter installation).
+
+## UXI-AgentTile-44 — Codex subagents default to Luna without changing the parent model
+
+**Statement.** Every Codex adapter process that Yalda starts receives
+`agents.default_subagent_model = "gpt-5.6-luna"` through the adapter's
+`CODEX_CONFIG` session overlay. A Codex `spawn_agent` call that omits an explicit
+model therefore uses Luna even when the parent session uses Sol or Terra. The
+overlay changes only the subagent default: it does not set the parent `model`,
+change the parent model picker (`UXI-AgentTile-16`), or add values to Codex's
+own explicit `spawn_agent(model=...)` schema.
+
+Yalda merges the setting into an inherited `CODEX_CONFIG` JSON object. It
+preserves all unrelated root keys and all other `agents` keys. Yalda replaces
+an inherited `agents.default_subagent_model` value with Luna because this is the
+Yalda-host contract; a caller can still select any explicit model that Codex's
+spawn tool offers. Claude adapter processes inherit `CODEX_CONFIG` unchanged.
+Malformed or non-object `CODEX_CONFIG` is an adapter-launch error instead of a
+silent configuration reset.
+
+Yalda also sets `CODEX_PATH` for Codex adapters. An explicit host value remains
+authoritative; otherwise Yalda resolves the standalone `codex` CLI from its
+process PATH or the user's login shell. This deliberately bypasses
+`codex-acp`'s bundled runtime, because adapter 1.1.7 bundles Codex 0.145.0,
+which rejects Luna subagents. Luna requires a stable standalone Codex CLI
+0.147.0 or newer; update it with `codex update` when necessary.
+
+**Applies to.** `acp_channel.rs` — the provider-scoped subprocess environment
+assembled by `worker_async`, including the `CODEX_CONFIG` merge helper.
+
+**Enforcement.** `acp_channel::tests::codex_config_sets_luna_and_preserves_other_settings`
+pins the structural merge. The subprocess-boundary test
+`codex_spawn_injects_luna_subagent_default_without_touching_claude` starts fake
+Codex and Claude ACP peers and records their real child environments. The Codex
+child must receive Luna plus the inherited configuration; the Claude child must
+receive the inherited environment unchanged. The ignored live guard
+`tests/codex_luna_subagent_live.rs` asks an authenticated Codex parent to spawn
+a default-model child and requires the child's durable
+`thread_settings_applied` event to record `gpt-5.6-luna`. The durable event is
+used because codex-acp currently reports the parent model when reopening a
+spawned child even though the child rollout ran with Luna.
+
+**Status.** `implemented` (pure structural merge, headless real-subprocess
+environment check, and an explicit authenticated live guard).
