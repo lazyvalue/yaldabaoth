@@ -290,6 +290,44 @@ Yalda reads `~/.config/yalda/config.kdl` (if present) for theme, max line
 width, custom keybindings, and a custom menu tree. See `src/config.rs` for the
 schema.
 
+### Cog runtime delivery
+
+`yalda-session-server` can optionally act as Cog's external runtime for selected
+Mail and Chat addresses. It reuses the sessions the server already owns; it
+does not start a second provider process. Create `~/.yalda/cog-runtime.json`
+(or set `YALDA_COG_RUNTIME_CONFIG` to another path) before starting the server:
+
+```json
+{
+  "schema_version": "1",
+  "cog_url": "http://127.0.0.1:7666",
+  "host_id": "yalda-session-server",
+  "allow_takeover": false,
+  "addresses": [
+    {
+      "address_id": "opaque-cog-address",
+      "yalda_session_id": "stable-server-session-id",
+      "provider": "codex"
+    }
+  ]
+}
+```
+
+The file is strict and takes effect on the next server restart. Each selected
+session must already exist, be unarchived, and match provider `codex` or
+`claude`. Unknown fields, duplicate mappings, non-loopback Cog URLs, missing
+sessions, and provider mismatches fail closed before any Cog mutation.
+
+Activation is capability-gated. If Cog returns 404 or an incompatible contract
+from `/v1/runtime-delivery/capabilities`, the adapter remains inert and retries
+the read-only probe every five minutes. When active it combines resumable SSE
+wakes with an authoritative five-second claim tick, journals every dispatch and
+terminal transition with `fsync`, and advances no Cog cursor before provider
+success. External ownership is durable and never falls back to Cog's embedded
+runtime while Yalda is offline. Recovery state is stored beside the config as
+`cog-runtime-journal.ndjson` and `cog-runtime-wake.cursor` (under `~/.yalda/` for
+the default config).
+
 ## Testing
 
 ```sh
