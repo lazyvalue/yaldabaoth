@@ -58,8 +58,9 @@ Malformed or non-object `CODEX_CONFIG` is an adapter-launch error instead of a
 silent configuration reset.
 
 Yalda also sets `CODEX_PATH` for Codex adapters. An explicit host value remains
-authoritative; otherwise Yalda resolves the standalone `codex` CLI from its
-process PATH or the user's login shell. This deliberately bypasses
+authoritative; otherwise Yalda enumerates standalone `codex` candidates from
+its process PATH and the user's login-shell PATH, preferring a stable 0.147.0+
+candidate even when an older binary appears first. This deliberately bypasses
 `codex-acp`'s bundled runtime, because adapter 1.1.7 bundles Codex 0.145.0,
 which rejects Luna subagents. Luna requires a stable standalone Codex CLI
 0.147.0 or newer; update it with `codex update` when necessary.

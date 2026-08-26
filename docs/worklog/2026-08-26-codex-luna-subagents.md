@@ -33,7 +33,13 @@ frontier 3: omega [open] (omega)
   tests, live verification, release builds, diff hygiene, feature commit, and
   main integration.
 - `a6tg` `omega`: claimed → closed; output confirmed the requested capability,
-  evidence, documentation, and integration are complete.
+  evidence, documentation, and integration were complete; later reopened when
+  integrated-main PATH inspection exposed an older first candidate.
+- `xp8h` `select-luna-capable-codex`: added after the first omega closure;
+  claimed → closed; output recorded all-candidate version selection and an
+  authenticated Luna spawn with the real old-0.146-first PATH.
+- `a6tg` `omega`: reclaimed → closed after the runtime-candidate hardening and
+  final integrated-main verification.
 
 ### Notes
 
@@ -49,6 +55,12 @@ frontier 3: omega [open] (omega)
 - Node `xfm9`, seq `6`, topic `deviation`: the worklog was drafted before graph
   closure, then validated after omega because the validator requires a complete
   graph.
+- Graph seq `24`, topic `deviation`: integrated-main PATH inspection found
+  Codex 0.146.0 before 0.149.1, so omega reopened and gained the
+  `select-luna-capable-codex` node.
+- Node `xp8h`, seq `1`, topic `decision`: automatic resolution considers every
+  process/login-shell candidate and prefers stable 0.147.0+ while an explicit
+  `CODEX_PATH` remains authoritative.
 - Repository-wide `cargo fmt --all -- --check` exposes pre-existing formatting
   drift. No bulk formatting was retained; scoped changes pass
   `git diff --check`.
@@ -63,7 +75,8 @@ frontier 0: spec-luna-default [done]
 frontier 1: implement-luna-default [done]
 frontier 2: enable-luna-runtime [done]
 frontier 3: verify-and-record [done]
-frontier 4: omega [done] (omega)
+frontier 4: select-luna-capable-codex [done]
+frontier 5: omega [done] (omega)
 ```
 
 ## Built (with status)
@@ -73,7 +86,8 @@ frontier 4: omega [done] (omega)
   pinning the parent model or changing Claude.
 - Yalda supplies `CODEX_PATH` so codex-acp uses the independently updated
   standalone Codex CLI rather than its incompatible bundled 0.145.0 runtime.
-  Explicit host overrides remain authoritative.
+  Explicit host overrides remain authoritative; automatic resolution examines
+  every process/login-shell candidate and prefers stable Codex 0.147.0+.
 - Added pure configuration/path guards, a real subprocess-environment guard,
   and an ignored authenticated live test that observes a spawned child's
   durable applied model.
@@ -101,6 +115,8 @@ frontier 4: omega [done] (omega)
   externally supplied `CODEX_PATH`.
 - Live child rollout recorded `thread_settings_applied.model = gpt-5.6-luna` and
   ran the child turn with Luna.
+- The authenticated live guard also passed with the machine's real old-first
+  PATH (`0.146.0` before `0.149.1`), proving version-aware selection.
 - Focused Luna/path tests: 3 passed.
 - ACP channel suite: 27 passed, 1 intentionally ignored.
 - Full library suite: 213 passed, 2 intentionally ignored.
