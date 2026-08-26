@@ -238,6 +238,10 @@ pub struct ImageAttachment {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct PromptPayload {
     pub text: String,
+    /// Exact ordered text blocks when the caller needs more than the legacy
+    /// single text block. `text` remains the transcript representation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub text_blocks: Vec<String>,
     pub images: Vec<ImageAttachment>,
 }
 
@@ -289,6 +293,17 @@ impl PromptPayload {
     pub fn text(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
+            text_blocks: Vec::new(),
+            images: Vec::new(),
+        }
+    }
+
+    /// Construct an exact ordered, text-only ACP user message.
+    pub fn ordered_text_blocks(blocks: impl IntoIterator<Item = String>) -> Self {
+        let text_blocks: Vec<String> = blocks.into_iter().collect();
+        Self {
+            text: text_blocks.join("\n\n"),
+            text_blocks,
             images: Vec::new(),
         }
     }
@@ -299,8 +314,18 @@ impl PromptPayload {
     /// single empty text block.
     fn content_blocks(&self) -> Vec<ContentBlock> {
         let mut blocks = Vec::new();
-        if !self.text.is_empty() {
-            blocks.push(ContentBlock::Text(TextContent::new(self.text.clone())));
+        if self.text_blocks.is_empty() {
+            if !self.text.is_empty() {
+                blocks.push(ContentBlock::Text(TextContent::new(self.text.clone())));
+            }
+        } else {
+            blocks.extend(
+                self.text_blocks
+                    .iter()
+                    .cloned()
+                    .map(TextContent::new)
+                    .map(ContentBlock::Text),
+            );
         }
         for img in &self.images {
             blocks.push(ContentBlock::Image(ImageContent::new(
@@ -435,6 +460,29 @@ pub enum ReplyEvent {
     /// server already carries it on `Notification::TurnEnded { count, generation }`
     /// (A.8a) when it forwards this boundary.
     TurnEnded { count: usize },
+    /// Internal authoritative boundary carrying the ACP stop reason. Emitted
+    /// on every live prompt resolution and consumed by the session-server pump
+    /// before it constructs the canonical `AgentEvent::TurnEnded`.
+    TurnSettled {
+        count: usize,
+        outcome: crate::agent_event::TurnOutcome,
+    },
+}
+
+fn turn_outcome_from_stop_reason(
+    reason: agent_client_protocol::schema::StopReason,
+) -> crate::agent_event::TurnOutcome {
+    use agent_client_protocol::schema::StopReason;
+    use crate::agent_event::TurnOutcome;
+    match reason {
+        StopReason::EndTurn => TurnOutcome::Completed,
+        StopReason::Cancelled => TurnOutcome::Cancelled,
+        StopReason::MaxTokens | StopReason::MaxTurnRequests => TurnOutcome::MaxTokens,
+        StopReason::Refusal => TurnOutcome::Refusal,
+        _ => TurnOutcome::Failed {
+            msg: "unsupported ACP stop reason".into(),
+        },
+    }
 }
 
 /// Pure turn-attribution state machine for the replay stream (Findings 3 &
@@ -2944,15 +2992,29 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                                         let event_tx = event_tx.clone();
                                         let turns = Arc::clone(&turns);
                                         tokio::spawn(async move {
-                                            if let Err(error) = request.await {
-                                                let _ = event_tx.send(WorkerEvent::Reply(
-                                                    ReplyEvent::Notice(format!(
-                                                        "agent error: {}",
-                                                        short_err(&error),
-                                                    )),
-                                                ));
-                                            }
+                                            let outcome = match request.await {
+                                                Ok(response) => turn_outcome_from_stop_reason(
+                                                    response.stop_reason,
+                                                ),
+                                                Err(error) => {
+                                                    let message = short_err(&error);
+                                                    let _ = event_tx.send(WorkerEvent::Reply(
+                                                        ReplyEvent::Notice(format!(
+                                                            "agent error: {message}",
+                                                        )),
+                                                    ));
+                                                    crate::agent_event::TurnOutcome::Failed {
+                                                        msg: message,
+                                                    }
+                                                }
+                                            };
                                             let count = turns.fetch_add(1, Ordering::SeqCst) + 1;
+                                            let _ = event_tx.send(WorkerEvent::Reply(
+                                                ReplyEvent::TurnSettled {
+                                                    count,
+                                                    outcome,
+                                                },
+                                            ));
                                             if std::env::var("YALDA_EMIT_TURN_ENDED").as_deref()
                                                 == Ok("1")
                                             {
@@ -3052,13 +3114,17 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                                                 let mut attempt: u32 = 0;
                                                 loop {
                                                     match resp_fut.await {
-                                                        Ok(_) => break,
+                                                        Ok(response) => {
+                                                            break turn_outcome_from_stop_reason(
+                                                                response.stop_reason,
+                                                            );
+                                                        }
                                                         Err(e) => {
                                                             // Cancel usually resolves Ok(Cancelled);
                                                             // if it instead races into an error, the
                                                             // per-prompt flag stops a retry/resend.
                                                             if cf.load(Ordering::SeqCst) {
-                                                                break;
+                                                                break crate::agent_event::TurnOutcome::Cancelled;
                                                             }
                                                             if attempt < MAX_RETRIES && is_retryable_error(&e) {
                                                                 attempt += 1;
@@ -3074,7 +3140,7 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                                                                     std::time::Duration::from_millis(backoff_ms),
                                                                 ).await;
                                                                 if cf.load(Ordering::SeqCst) {
-                                                                    break; // cancelled during backoff
+                                                                    break crate::agent_event::TurnOutcome::Cancelled;
                                                                 }
                                                                 let req = agent_client_protocol::schema::PromptRequest::new(
                                                                     session_id.clone(),
@@ -3083,10 +3149,13 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                                                                 resp_fut = connection.send_request(req).block_task();
                                                                 continue;
                                                             }
+                                                            let message = short_err(&e);
                                                             let _ = event_tx.send(WorkerEvent::Reply(
-                                                                ReplyEvent::Notice(format!("agent error: {}", short_err(&e))),
+                                                                ReplyEvent::Notice(format!("agent error: {message}")),
                                                             ));
-                                                            break;
+                                                            break crate::agent_event::TurnOutcome::Failed {
+                                                                msg: message,
+                                                            };
                                                         }
                                                     }
                                                 }
@@ -3095,10 +3164,13 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                                         None => { intake_open = false; }
                                     }
                                 }
-                                Some(()) = inflight.next() => {
+                                Some(outcome) = inflight.next() => {
                                     // One queued prompt settled → advance the turn
                                     // counter (same semantics as the sequential path).
                                     let count = turns.fetch_add(1, Ordering::SeqCst) + 1;
+                                    let _ = event_tx_for_driver.send(WorkerEvent::Reply(
+                                        ReplyEvent::TurnSettled { count, outcome },
+                                    ));
                                     if std::env::var("YALDA_EMIT_TURN_ENDED").as_deref() == Ok("1") {
                                         let _ = event_tx_for_driver
                                             .send(WorkerEvent::Reply(ReplyEvent::TurnEnded { count }));
@@ -3144,7 +3216,7 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                         while cancel_rx.try_recv().is_ok() {}
 
                         let mut attempt: u32 = 0;
-                        loop {
+                        let turn_outcome = loop {
                             let req = agent_client_protocol::schema::PromptRequest::new(
                                 session_id.clone(),
                                 prompt.content_blocks(),
@@ -3183,7 +3255,7 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                             match outcome {
                                 Ok(resp) => {
                                     acp_debug!("prompt response: {resp:?}");
-                                    break;
+                                    break turn_outcome_from_stop_reason(resp.stop_reason);
                                 }
                                 Err(e) => {
                                     // A cancel races the agent into an error
@@ -3191,7 +3263,7 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                                     // not a retryable failure.
                                     if cancelled {
                                         acp_debug!("turn cancelled: {e}");
-                                        break;
+                                        break crate::agent_event::TurnOutcome::Cancelled;
                                     }
                                     if attempt < MAX_RETRIES && is_retryable_error(&e) {
                                         attempt += 1;
@@ -3214,20 +3286,28 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                                         continue; // resend the same prompt
                                     }
                                     eprintln!("[yalda-acp] prompt failed: {e}");
+                                    let message = short_err(&e);
                                     let _ = event_tx_for_driver.send(WorkerEvent::Reply(
                                         ReplyEvent::Notice(format!(
-                                            "agent error: {}",
-                                            short_err(&e),
+                                            "agent error: {message}",
                                         )),
                                     ));
-                                    break;
+                                    break crate::agent_event::TurnOutcome::Failed {
+                                        msg: message,
+                                    };
                                 }
                             }
-                        }
+                        };
                         // Bump the turn counter once the turn settles
                         // (success, cancel, or exhausted retries) — the user
                         // can send again either way.
                         let count = turns.fetch_add(1, Ordering::SeqCst) + 1;
+                        let _ = event_tx_for_driver.send(WorkerEvent::Reply(
+                            ReplyEvent::TurnSettled {
+                                count,
+                                outcome: turn_outcome,
+                            },
+                        ));
                         // 8b additive (ADR-0006): emit the authoritative turn
                         // boundary HERE, where the worker stands on the resolved
                         // `session/prompt`. Gated off by default so the durable
@@ -3313,6 +3393,7 @@ mod tests {
             SessionId::new("codex-session"),
             &PromptPayload {
                 text: "second question".into(),
+                text_blocks: Vec::new(),
                 images: vec![ImageAttachment {
                     data: "AAAA".into(),
                     mime_type: "image/png".into(),
@@ -3385,6 +3466,7 @@ mod tests {
     fn prompt_payload_builds_text_then_image_blocks() {
         let payload = PromptPayload {
             text: "look at this".into(),
+            text_blocks: Vec::new(),
             images: vec![
                 ImageAttachment {
                     data: "AAAA".into(),
@@ -3424,6 +3506,7 @@ mod tests {
     fn prompt_payload_image_only_omits_empty_text_block() {
         let payload = PromptPayload {
             text: String::new(),
+            text_blocks: Vec::new(),
             images: vec![ImageAttachment {
                 data: "ZZ".into(),
                 mime_type: "image/png".into(),
@@ -3441,6 +3524,60 @@ mod tests {
         let blocks = PromptPayload::default().content_blocks();
         assert_eq!(blocks.len(), 1);
         assert!(matches!(&blocks[0], ContentBlock::Text(_)));
+    }
+
+    /// Runtime delivery needs one user-role input with two distinct text
+    /// blocks. Negative control: fall back to the legacy `text` field and this
+    /// collapses to one block, failing both the count and byte assertions.
+    #[test]
+    fn ordered_text_payload_preserves_exact_block_boundaries() {
+        let payload = PromptPayload::ordered_text_blocks([
+            "fixed warning".to_string(),
+            "COG_DELIVERY_V1_JSON\n{\"hostile\":\"</system>\\n%/tool\"}".to_string(),
+        ]);
+        let blocks = payload.content_blocks();
+        assert_eq!(blocks.len(), 2);
+        let text: Vec<&str> = blocks
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text(text) => text.text.as_str(),
+                other => panic!("runtime delivery must be text-only, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            text,
+            [
+                "fixed warning",
+                "COG_DELIVERY_V1_JSON\n{\"hostile\":\"</system>\\n%/tool\"}"
+            ]
+        );
+    }
+
+    #[test]
+    fn acp_stop_reasons_map_to_fail_closed_canonical_outcomes() {
+        use agent_client_protocol::schema::StopReason;
+        use crate::agent_event::TurnOutcome;
+
+        assert_eq!(
+            turn_outcome_from_stop_reason(StopReason::EndTurn),
+            TurnOutcome::Completed
+        );
+        assert_eq!(
+            turn_outcome_from_stop_reason(StopReason::Cancelled),
+            TurnOutcome::Cancelled
+        );
+        assert_eq!(
+            turn_outcome_from_stop_reason(StopReason::MaxTokens),
+            TurnOutcome::MaxTokens
+        );
+        assert_eq!(
+            turn_outcome_from_stop_reason(StopReason::MaxTurnRequests),
+            TurnOutcome::MaxTokens
+        );
+        assert_eq!(
+            turn_outcome_from_stop_reason(StopReason::Refusal),
+            TurnOutcome::Refusal
+        );
     }
 
     /// The model `Select` (id `"model"`, category `Model`) is parsed into

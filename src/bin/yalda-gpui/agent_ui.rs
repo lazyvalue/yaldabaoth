@@ -3745,6 +3745,7 @@ impl YaldaGpuiView {
                         count == claude.replay_turns.last_seen,
                     );
                 }
+                ReplyEvent::TurnSettled { .. } => {}
             }
         }
         replay_complete
@@ -5328,6 +5329,7 @@ impl YaldaGpuiView {
         } else {
             let payload = yalda::acp_channel::PromptPayload {
                 text: combined.clone(),
+                text_blocks: Vec::new(),
                 images: images.clone(),
             };
             self.with_session_silent(id, cx, |c| {
@@ -5405,6 +5407,7 @@ impl YaldaGpuiView {
         } else {
             let payload = yalda::acp_channel::PromptPayload {
                 text: prompt_body.clone(),
+                text_blocks: Vec::new(),
                 images: images.to_vec(),
             };
             self.with_session_silent(id, cx, |claude| {

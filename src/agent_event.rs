@@ -575,7 +575,7 @@ pub fn agent_kind_from_reply(reply: &ReplyEvent) -> Option<AgentEventKind> {
         ReplyEvent::UserMessage(text) => AgentEventKind::UserMessage { text: text.clone() },
         // Envelope-authoritative: caller supplies the outcome + turn.
         ReplyEvent::ReplayComplete => return None,
-        ReplyEvent::TurnEnded { .. } => return None,
+        ReplyEvent::TurnEnded { .. } | ReplyEvent::TurnSettled { .. } => return None,
     })
 }
 

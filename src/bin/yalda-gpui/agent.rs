@@ -2349,7 +2349,8 @@ impl SubAgentTranscript {
                 | ReplyEvent::UsageUpdated(_)
                 | ReplyEvent::Notice(_)
                 | ReplyEvent::ReplayComplete
-                | ReplyEvent::TurnEnded { .. } => {}
+                | ReplyEvent::TurnEnded { .. }
+                | ReplyEvent::TurnSettled { .. } => {}
             }
         }
         transcript
