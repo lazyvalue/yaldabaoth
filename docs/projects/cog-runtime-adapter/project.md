@@ -1,7 +1,7 @@
 # Project: Cog runtime-delivery adapter
 
-**Status:** in progress — canonical protocol v9 accepted; live activation gated
-by the currently-404 capability endpoint.
+**Status:** implemented and integrated — canonical protocol v9 accepted; live
+activation remains gated by the currently-404 capability endpoint.
 **Cog graph:** `vkf`
 **Spec:** `docs/specs/spec-cog-runtime-adapter.md`
 **Decision:** ADR-0036
@@ -56,5 +56,4 @@ Codex / Claude provider session
 
 | Ticket | Status |
 |---|---|
-| `001-ticket-runtime-adapter-v1.md` | in progress |
-
+| `001-ticket-runtime-adapter-v1.md` | complete |

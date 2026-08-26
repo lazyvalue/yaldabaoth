@@ -16,7 +16,7 @@ live activation disabled until Cog advertises the complete capability set.
 - [x] Implement durable journal and coordinator recovery/claim lifecycle.
 - [x] Wire optional config, supervision, and capability-gated activation.
 - [x] Negative-control focused guards and pass full verification.
-- [ ] Document, worklog, merge to main, rebuild, and runtime-check activation.
+- [x] Document, worklog, merge to main, rebuild, and runtime-check activation.
 
 ## Verification
 
