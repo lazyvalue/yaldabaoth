@@ -60,6 +60,7 @@ struct AgentTimelineDelta {
     tool_total: Option<usize>,
     tool_failures: Option<usize>,
     tool_usage: Option<Vec<ToolMetricDelta>>,
+    tool_failure_reasons: Option<Vec<ToolFailureMetricDelta>>,
     cost_usd: Option<f64>,
 }
 
@@ -68,6 +69,20 @@ struct ToolMetricDelta {
     name: String,
     calls: usize,
     failures: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToolFailureMetricDelta {
+    tool: String,
+    reason: String,
+    count: usize,
+}
+
+#[derive(Debug)]
+struct AgentProjectGroup<'a> {
+    key: String,
+    label: String,
+    agents: Vec<&'a AgentMetricSnapshot>,
 }
 
 fn project_agent_timeline(
@@ -109,6 +124,7 @@ fn project_agent_timeline(
                 tool_total: known_counter_delta(previous.tool_total, agent.tool_total),
                 tool_failures: known_counter_delta(previous.tool_failures, agent.tool_failures),
                 tool_usage: known_tool_deltas(previous, agent),
+                tool_failure_reasons: known_tool_failure_deltas(previous, agent),
                 cost_usd: known_float_delta(previous.cost_usd, agent.cost_usd),
             })
             .unwrap_or_default();
@@ -170,6 +186,51 @@ fn known_tool_deltas(
         }
     }
     deltas.sort_by(|left, right| left.name.cmp(&right.name));
+    Some(deltas)
+}
+
+fn known_tool_failure_deltas(
+    previous: &AgentMetricSnapshot,
+    current: &AgentMetricSnapshot,
+) -> Option<Vec<ToolFailureMetricDelta>> {
+    let previous = previous.tool_failure_reasons.as_ref()?;
+    let current = current.tool_failure_reasons.as_ref()?;
+    let previous = previous
+        .iter()
+        .map(|failure| {
+            (
+                (failure.tool.as_str(), failure.reason.as_str()),
+                failure.count,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let current_keys = current
+        .iter()
+        .map(|failure| (failure.tool.as_str(), failure.reason.as_str()))
+        .collect::<std::collections::BTreeSet<_>>();
+    if previous.keys().any(|key| !current_keys.contains(key)) {
+        return None;
+    }
+    let mut deltas = Vec::new();
+    for failure in current {
+        let prior = previous
+            .get(&(failure.tool.as_str(), failure.reason.as_str()))
+            .copied()
+            .unwrap_or(0);
+        let count = failure.count.checked_sub(prior)?;
+        if count > 0 {
+            deltas.push(ToolFailureMetricDelta {
+                tool: failure.tool.clone(),
+                reason: failure.reason.clone(),
+                count,
+            });
+        }
+    }
+    deltas.sort_by(|left, right| {
+        left.tool
+            .cmp(&right.tool)
+            .then_with(|| left.reason.cmp(&right.reason))
+    });
     Some(deltas)
 }
 
@@ -242,6 +303,16 @@ impl AgentStatsView {
         source: ObservationSource,
         agent_history: Vec<AgentFleetObservation>,
     ) -> Self {
+        Self::with_agent_history_and_catalog(root, observation, source, agent_history, Vec::new())
+    }
+
+    pub(crate) fn with_agent_history_and_catalog(
+        root: WeakEntity<YaldaGpuiView>,
+        observation: Option<AgentFleetObservation>,
+        source: ObservationSource,
+        agent_history: Vec<AgentFleetObservation>,
+        repository_choices: Vec<RepositoryChoice>,
+    ) -> Self {
         Self {
             root,
             active_tab: AgentStatsTab::Agents,
@@ -252,7 +323,7 @@ impl AgentStatsView {
             }),
             agent_history,
             selected_agent_row_id: None,
-            repository_choices: Vec::new(),
+            repository_choices,
             selected_repository_key: None,
             repository_selection_explicit: false,
             repository_picker_open: false,
@@ -694,11 +765,35 @@ impl AgentStatsView {
             .child(agent_table_header(st));
 
         let (shown, omitted) = bounded_agent_row_counts(active_agents.len());
-        for (index, agent) in active_agents.into_iter().take(shown).enumerate() {
+        let mut remaining = shown;
+        let mut row_index = 0usize;
+        for (group_index, group) in group_agents_by_project(active_agents, &self.repository_choices)
+            .into_iter()
+            .enumerate()
+        {
+            if remaining == 0 {
+                break;
+            }
             body = body.child(probe_bounds_dyn(
-                format!("agent-stats-row-{}", agent.row_id),
-                self.interactive_agent_row(index, agent, st, palette, selected_bg, cx),
+                format!("agent-stats-project-group-{}", group.key),
+                compact_list_group_heading(
+                    ("agent-stats-active-project-heading", group_index),
+                    "◇",
+                    &group.label,
+                    group.agents.len(),
+                    st.accent,
+                    st,
+                )
+                .into_any_element(),
             ));
+            for agent in group.agents.into_iter().take(remaining) {
+                body = body.child(probe_bounds_dyn(
+                    format!("agent-stats-row-{}", agent.row_id),
+                    self.interactive_agent_row(row_index, agent, st, palette, selected_bg, cx),
+                ));
+                row_index += 1;
+                remaining -= 1;
+            }
         }
         if omitted > 0 {
             body = body.child(omitted_row(omitted, "additional agents", st));
@@ -782,11 +877,36 @@ impl AgentStatsView {
             .child(agent_table_header(st));
 
         let (shown, omitted) = bounded_agent_row_counts(inactive_agents.len());
-        for (index, agent) in inactive_agents.into_iter().take(shown).enumerate() {
+        let mut remaining = shown;
+        let mut row_index = 0usize;
+        for (group_index, group) in
+            group_agents_by_project(inactive_agents, &self.repository_choices)
+                .into_iter()
+                .enumerate()
+        {
+            if remaining == 0 {
+                break;
+            }
             body = body.child(probe_bounds_dyn(
-                format!("agent-stats-row-{}", agent.row_id),
-                self.interactive_agent_row(index, agent, st, palette, selected_bg, cx),
+                format!("agent-stats-inactive-project-group-{}", group.key),
+                compact_list_group_heading(
+                    ("agent-stats-inactive-project-heading", group_index),
+                    "◇",
+                    &group.label,
+                    group.agents.len(),
+                    st.accent,
+                    st,
+                )
+                .into_any_element(),
             ));
+            for agent in group.agents.into_iter().take(remaining) {
+                body = body.child(probe_bounds_dyn(
+                    format!("agent-stats-row-{}", agent.row_id),
+                    self.interactive_agent_row(row_index, agent, st, palette, selected_bg, cx),
+                ));
+                row_index += 1;
+                remaining -= 1;
+            }
         }
         if omitted > 0 {
             body = body.child(omitted_row(omitted, "additional inactive agents", st));
@@ -872,6 +992,18 @@ impl AgentStatsView {
         let tools_gained = timeline_counter_gain(&timeline.events, |delta| delta.tool_total);
         let failures_gained = timeline_counter_gain(&timeline.events, |delta| delta.tool_failures);
         let tool_usage = latest_known_tool_usage(&timeline.events);
+        let failure_reasons = latest_known_failure_reasons(&timeline.events);
+        let identity = timeline.events.last().map(|event| {
+            let provider = event
+                .agent
+                .provider
+                .map(AgentProvider::label)
+                .unwrap_or("—");
+            match event.agent.model.as_deref() {
+                Some(model) => format!("{provider} · {model}"),
+                None => provider.to_string(),
+            }
+        });
 
         let mut body = div()
             .id("agent-stats-timeline")
@@ -888,10 +1020,19 @@ impl AgentStatsView {
                     .child(SharedString::from(timeline.label.clone())),
             )
             .child(kv_row("Telemetry identity", timeline.row_id.clone(), st))
+            .child(probe_bounds(
+                "agent-stats-timeline-provider",
+                kv_row(
+                    "Provider · model",
+                    identity.unwrap_or_else(|| "—".to_string()),
+                    st,
+                )
+                .into_any_element(),
+            ))
             .child(note_block(
                 "Observed timeline".to_string(),
                 "durable sampled telemetry".to_string(),
-                "Lifecycle boundaries are captured immediately. Ordinary metric changes are sampled at most every 30 seconds. Intervals are observed spans, not exact phase durations; named tool changes belong to their observation sample, not an exact call timestamp. Context is occupancy, not historical token consumption.",
+                "Lifecycle boundaries are captured immediately. Ordinary metric changes are sampled at most every 30 seconds. Tools in a card were observed since the prior sample, not at an exact call timestamp. Context is occupancy, not historical token consumption.",
                 st,
             ))
             .child(
@@ -935,16 +1076,23 @@ impl AgentStatsView {
             )
             .child(section_heading("Tool usage · latest known", st))
             .child(tool_usage_breakdown(tool_usage.as_deref(), st))
+            .child(section_heading("Failure reasons · latest known", st))
+            .child(failure_reason_breakdown(failure_reasons.as_deref(), st))
             .child(section_heading("Observed timeline", st));
 
         for (index, event) in timeline.events.iter().enumerate() {
-            let previous_state = index
+            let previous = index
                 .checked_sub(1)
-                .and_then(|previous| timeline.events.get(previous))
-                .map(|event| event.agent.state);
+                .and_then(|previous| timeline.events.get(previous));
+            if event.delta.settled_turns.is_some_and(|settled| settled > 0) {
+                body = body.child(probe_bounds_dyn(
+                    format!("agent-stats-timeline-turn-divider-{index}"),
+                    timeline_turn_divider(event, st),
+                ));
+            }
             body = body.child(probe_bounds_dyn(
                 format!("agent-stats-timeline-event-{index}"),
-                timeline_event_card(index, event, previous_state, st, palette, border),
+                timeline_event_card(index, event, previous, st, palette, border),
             ));
         }
         probe_bounds("agent-stats-timeline", body.into_any_element())
@@ -1504,6 +1652,41 @@ fn agent_table_header(st: &DetailStyle) -> AnyElement {
         .into_any_element()
 }
 
+fn group_agents_by_project<'a>(
+    agents: Vec<&'a AgentMetricSnapshot>,
+    choices: &[RepositoryChoice],
+) -> Vec<AgentProjectGroup<'a>> {
+    let mut groups: BTreeMap<(bool, String, String), (String, Vec<&AgentMetricSnapshot>)> =
+        BTreeMap::new();
+    for agent in agents {
+        let project = agent.cwd.as_deref().and_then(|cwd| {
+            choices
+                .iter()
+                .filter(|choice| choice.registered && cwd.starts_with(&choice.root))
+                .max_by(|left, right| {
+                    left.root
+                        .components()
+                        .count()
+                        .cmp(&right.root.components().count())
+                        .then_with(|| right.key.cmp(&left.key))
+                })
+        });
+        let (unassigned, key, label) = match project {
+            Some(project) => (false, project.key.clone(), project.label.clone()),
+            None => (true, "unassigned".to_string(), "Unassigned".to_string()),
+        };
+        groups
+            .entry((unassigned, label.to_lowercase(), key.clone()))
+            .or_insert_with(|| (label, Vec::new()))
+            .1
+            .push(agent);
+    }
+    groups
+        .into_iter()
+        .map(|((_, _, key), (label, agents))| AgentProjectGroup { key, label, agents })
+        .collect()
+}
+
 fn agent_row(
     index: usize,
     agent: &AgentMetricSnapshot,
@@ -1606,6 +1789,23 @@ fn latest_known_tool_usage(events: &[AgentTimelineEvent]) -> Option<Vec<ToolMetr
     Some(tools)
 }
 
+fn latest_known_failure_reasons(
+    events: &[AgentTimelineEvent],
+) -> Option<Vec<ToolFailureMetricSnapshot>> {
+    let mut failures = events
+        .iter()
+        .rev()
+        .find_map(|event| event.agent.tool_failure_reasons.clone())?;
+    failures.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.tool.cmp(&right.tool))
+            .then_with(|| left.reason.cmp(&right.reason))
+    });
+    Some(failures)
+}
+
 fn tool_usage_breakdown(tools: Option<&[ToolMetricSnapshot]>, st: &DetailStyle) -> AnyElement {
     let Some(tools) = tools else {
         return note_block(
@@ -1656,65 +1856,173 @@ fn tool_usage_breakdown(tools: Option<&[ToolMetricSnapshot]>, st: &DetailStyle) 
     body.into_any_element()
 }
 
-fn format_tool_snapshot(tools: Option<&[ToolMetricSnapshot]>) -> String {
+fn failure_reason_breakdown(
+    failures: Option<&[ToolFailureMetricSnapshot]>,
+    st: &DetailStyle,
+) -> AnyElement {
+    let Some(failures) = failures else {
+        return note_block(
+            "Failure reasons unavailable".to_string(),
+            "unknown coverage".to_string(),
+            "Retained observations predate bounded failed-tool diagnostics or the session was not loaded.",
+            st,
+        )
+        .into_any_element();
+    };
+    if failures.is_empty() {
+        return note_block(
+            "No failed tool calls".to_string(),
+            "latest known coverage".to_string(),
+            "No failed tools appear in the latest retained diagnostic coverage.",
+            st,
+        )
+        .into_any_element();
+    }
+
+    let mut body = div().flex().flex_col().w_full().child(
+        dense_row("agent-stats-timeline-failures-header", st.dim, &st.mono)
+            .font_weight(FontWeight::BOLD)
+            .border_b_1()
+            .border_color(st.dim)
+            .child(fixed_cell("Tool", 160.0))
+            .child(fixed_cell("Count", 70.0))
+            .child(flex_cell("Reason")),
+    );
+    for (index, failure) in failures.iter().enumerate() {
+        body = body.child(probe_bounds_dyn(
+            format!("agent-stats-timeline-failure-reason-{index}"),
+            dense_row(
+                ("agent-stats-timeline-failure-row", index),
+                st.err,
+                &st.mono,
+            )
+            .child(fixed_cell(&failure.tool, 160.0))
+            .child(fixed_cell(&failure.count.to_string(), 70.0))
+            .child(flex_cell(&failure.reason))
+            .into_any_element(),
+        ));
+    }
+    body.into_any_element()
+}
+
+fn format_tool_snapshot(tools: Option<&[ToolMetricSnapshot]>) -> (&'static str, String) {
     let Some(tools) = tools else {
-        return "—".to_string();
+        return (
+            "Tools known at first sample",
+            "Tool names unavailable at first sample".to_string(),
+        );
     };
     if tools.is_empty() {
-        return "None".to_string();
+        return (
+            "Tools known at first sample",
+            "No tools were known at the first retained sample".to_string(),
+        );
     }
     let shown = tools
         .iter()
-        .take(8)
+        .take(12)
         .map(|tool| {
             if tool.failures > 0 {
-                format!(
-                    "{} {} calls / {} failed",
-                    tool.name, tool.calls, tool.failures
-                )
+                format!("{} ×{} · {} failed", tool.name, tool.calls, tool.failures)
             } else {
-                format!("{} {} calls", tool.name, tool.calls)
+                format!("{} ×{}", tool.name, tool.calls)
             }
         })
         .collect::<Vec<_>>();
-    if tools.len() > shown.len() {
+    let detail = if tools.len() > shown.len() {
         format!(
-            "{} · … {} more",
-            shown.join(" · "),
+            "{}\n… {} more tools",
+            shown.join("\n"),
             tools.len() - shown.len()
         )
     } else {
-        shown.join(" · ")
-    }
+        shown.join("\n")
+    };
+    ("Tools known at first sample", detail)
 }
 
-fn format_tool_deltas(deltas: Option<&[ToolMetricDelta]>) -> String {
+fn format_tool_deltas(deltas: Option<&[ToolMetricDelta]>) -> (&'static str, String) {
     let Some(deltas) = deltas else {
-        return "—".to_string();
+        return (
+            "Tools in this sample",
+            "Tool names unavailable for this sample".to_string(),
+        );
     };
     if deltas.is_empty() {
-        return "No named tool change".to_string();
+        return (
+            "Tools in this sample",
+            "No tool activity observed in this sample".to_string(),
+        );
     }
     let shown = deltas
         .iter()
-        .take(8)
+        .take(12)
         .map(|tool| {
             if tool.failures > 0 {
-                format!("{} +{} / +{} failed", tool.name, tool.calls, tool.failures)
+                format!("{} ×{} · {} failed", tool.name, tool.calls, tool.failures)
             } else {
-                format!("{} +{}", tool.name, tool.calls)
+                format!("{} ×{}", tool.name, tool.calls)
             }
         })
         .collect::<Vec<_>>();
-    if deltas.len() > shown.len() {
+    let detail = if deltas.len() > shown.len() {
         format!(
-            "{} · … {} more",
-            shown.join(" · "),
+            "{}\n… {} more tools",
+            shown.join("\n"),
             deltas.len() - shown.len()
         )
     } else {
-        shown.join(" · ")
+        shown.join("\n")
+    };
+    ("Tools in this sample", detail)
+}
+
+fn format_failure_snapshot(failures: Option<&[ToolFailureMetricSnapshot]>) -> Option<String> {
+    let failures = failures?;
+    if failures.is_empty() {
+        return None;
     }
+    Some(
+        failures
+            .iter()
+            .take(12)
+            .map(|failure| {
+                let count = (failure.count > 1).then(|| format!(" ×{}", failure.count));
+                format!(
+                    "{}{} — {}",
+                    failure.tool,
+                    count.unwrap_or_default(),
+                    failure.reason
+                )
+            })
+            .chain((failures.len() > 12).then(|| format!("… {} more reasons", failures.len() - 12)))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+fn format_failure_deltas(deltas: Option<&[ToolFailureMetricDelta]>) -> Option<String> {
+    let deltas = deltas?;
+    if deltas.is_empty() {
+        return None;
+    }
+    Some(
+        deltas
+            .iter()
+            .take(12)
+            .map(|failure| {
+                let count = (failure.count > 1).then(|| format!(" ×{}", failure.count));
+                format!(
+                    "{}{} — {}",
+                    failure.tool,
+                    count.unwrap_or_default(),
+                    failure.reason
+                )
+            })
+            .chain((deltas.len() > 12).then(|| format!("… {} more reasons", deltas.len() - 12)))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
 }
 
 fn format_optional_gain(value: Option<usize>) -> String {
@@ -1737,10 +2045,22 @@ fn format_duration_compact(duration: Duration) -> String {
     }
 }
 
+fn timeline_turn_divider(event: &AgentTimelineEvent, st: &DetailStyle) -> AnyElement {
+    let settled = event.delta.settled_turns.unwrap_or(0);
+    let current = event.agent.settled_turns.unwrap_or(settled);
+    let label = if settled == 1 {
+        format!("Turn {current} settled")
+    } else {
+        let first = current.saturating_sub(settled).saturating_add(1);
+        format!("Turns {first}–{current} settled")
+    };
+    section_heading(&label, st).into_any_element()
+}
+
 fn timeline_event_card(
     index: usize,
     event: &AgentTimelineEvent,
-    previous_state: Option<AgentMetricState>,
+    previous: Option<&AgentTimelineEvent>,
     st: &DetailStyle,
     palette: StatsPalette,
     border: Hsla,
@@ -1752,69 +2072,58 @@ fn timeline_event_card(
             .saturating_mul(1_000_000)
             .min(i64::MAX as u64) as i64,
     );
-    let mut changes = Vec::new();
-    if let Some(previous_state) = previous_state.filter(|state| *state != event.agent.state) {
-        changes.push(format!(
-            "{} → {}",
-            previous_state.label(),
-            event.agent.state.label()
-        ));
-    }
-    if let Some(delta) = event.delta.settled_turns.filter(|delta| *delta > 0) {
-        changes.push(format!("+{delta} turns"));
-    }
-    if let Some(delta) = event.delta.tool_total.filter(|delta| *delta > 0) {
-        changes.push(format!("+{delta} tools"));
-    }
-    if let Some(delta) = event.delta.tool_failures.filter(|delta| *delta > 0) {
-        changes.push(format!("+{delta} failed"));
-    }
-    if let Some(delta) = event.delta.cost_usd.filter(|delta| *delta > 0.0) {
-        changes.push(format!("+${delta:.2}"));
-    }
+    let state_change = previous
+        .map(|previous| previous.agent.state)
+        .filter(|previous_state| *previous_state != event.agent.state)
+        .map(|previous_state| {
+            format!("{} → {}", previous_state.label(), event.agent.state.label())
+        });
     let change_summary = if index == 0 {
-        "First observed".to_string()
-    } else if changes.is_empty() {
-        "Snapshot changed".to_string()
+        "First retained sample".to_string()
+    } else if let Some(state_change) = state_change {
+        state_change
+    } else if event
+        .delta
+        .tool_usage
+        .as_ref()
+        .is_some_and(|tools| !tools.is_empty())
+    {
+        "Tool activity".to_string()
+    } else if event
+        .delta
+        .tool_failure_reasons
+        .as_ref()
+        .is_some_and(|failures| !failures.is_empty())
+    {
+        "Failure detail updated".to_string()
     } else {
-        changes.join(" · ")
+        "Observation changed".to_string()
     };
-    let provider = event
-        .agent
-        .provider
-        .map(AgentProvider::label)
-        .unwrap_or("—");
-    let model = event.agent.model.as_deref().unwrap_or("—");
-    let turns = event
-        .agent
-        .settled_turns
-        .map(|turns| turns.to_string())
-        .unwrap_or_else(|| "—".to_string());
-    let tools = match (event.agent.tool_total, event.agent.tool_failures) {
-        (Some(total), Some(failures)) => format!("{total} · {failures} failed"),
-        (Some(total), None) => total.to_string(),
-        _ => "—".to_string(),
-    };
-    let context = event
-        .agent
-        .context
-        .and_then(ContextOccupancy::percent)
-        .map(|percent| format!("{percent:.1}% occupancy"))
-        .unwrap_or_else(|| "—".to_string());
-    let cost = event
-        .agent
-        .cost_usd
-        .map(|cost| format!("${cost:.2}"))
-        .unwrap_or_else(|| "—".to_string());
-    let tool_detail = if index == 0 {
+    let (tool_detail_label, tool_detail) = if index == 0 {
         format_tool_snapshot(event.agent.tool_usage.as_deref())
     } else {
         format_tool_deltas(event.delta.tool_usage.as_deref())
     };
-    let tool_detail_label = if index == 0 {
-        "Tools observed"
+    let failure_detail = if index == 0 {
+        match format_failure_snapshot(event.agent.tool_failure_reasons.as_deref()) {
+            Some(detail) => Some(detail),
+            None if event.agent.tool_failure_reasons.is_none()
+                && event.agent.tool_failures.unwrap_or(0) > 0 =>
+            {
+                Some("Failure reasons unavailable at first sample".to_string())
+            }
+            None => None,
+        }
     } else {
-        "Named tool changes"
+        match format_failure_deltas(event.delta.tool_failure_reasons.as_deref()) {
+            Some(detail) => Some(detail),
+            None if event.delta.tool_failure_reasons.is_none()
+                && event.delta.tool_failures.unwrap_or(0) > 0 =>
+            {
+                Some("Failure reasons unavailable for this sample".to_string())
+            }
+            None => None,
+        }
     };
     let header = div()
         .flex()
@@ -1851,27 +2160,51 @@ fn timeline_event_card(
                 .child(SharedString::from(change_summary)),
         )
         .into_any_element();
-    let body = div()
-        .flex()
-        .flex_col()
-        .child(kv_row(
-            "Provider · model",
-            format!("{provider} · {model}"),
-            st,
-        ))
-        .child(kv_row("Settled turns", turns, st))
-        .child(kv_row("Tools", tools, st))
-        .child(probe_bounds_dyn(
-            format!("agent-stats-timeline-event-tools-{index}"),
-            kv_row(tool_detail_label, tool_detail, st).into_any_element(),
-        ))
-        .child(kv_row("Context", context, st))
-        .child(kv_row("Cost", cost, st))
-        .into_any_element();
+    let mut body = div().flex().flex_col().gap_2().child(probe_bounds_dyn(
+        format!("agent-stats-timeline-event-tools-{index}"),
+        detail_list_block(tool_detail_label, &tool_detail, st.fg, st).into_any_element(),
+    ));
+    if let Some(failure_detail) = failure_detail {
+        let label = if index == 0 {
+            "Failures known at first sample"
+        } else {
+            "Failures in this sample"
+        };
+        body = body.child(probe_bounds_dyn(
+            format!("agent-stats-timeline-event-failures-{index}"),
+            detail_list_block(label, &failure_detail, st.err, st).into_any_element(),
+        ));
+    }
+    let context = event.agent.context.and_then(ContextOccupancy::percent);
+    let previous_context =
+        previous.and_then(|previous| previous.agent.context.and_then(ContextOccupancy::percent));
+    if context.is_some() && (index == 0 || context != previous_context) {
+        body = body.child(probe_bounds_dyn(
+            format!("agent-stats-timeline-context-{index}"),
+            kv_row(
+                "Context",
+                format!("{:.1}% occupancy", context.unwrap_or_default()),
+                st,
+            )
+            .into_any_element(),
+        ));
+    }
+    let cost = if index == 0 {
+        event.agent.cost_usd.map(|cost| format!("${cost:.2}"))
+    } else {
+        event
+            .delta
+            .cost_usd
+            .filter(|cost| *cost > 0.0)
+            .map(|cost| format!("+${cost:.2}"))
+    };
+    if let Some(cost) = cost {
+        body = body.child(kv_row("Cost", cost, st));
+    }
     compact_bounded_group(
         ("agent-stats-timeline-card", index),
         header,
-        Some(body),
+        Some(body.into_any_element()),
         border,
         border,
     )
@@ -2227,6 +2560,7 @@ mod tests {
             row_id: row_id.into(),
             session_id: Some(row_id.into()),
             label: format!("Agent {row_id}"),
+            cwd: None,
             provider: None,
             model: None,
             state,
@@ -2234,6 +2568,7 @@ mod tests {
             tool_total: Some(tools),
             tool_failures: Some(failures),
             tool_usage: None,
+            tool_failure_reasons: None,
             context: None,
             cost_usd: Some(tools as f64 / 10.0),
             current_turn_elapsed: None,
@@ -2267,6 +2602,42 @@ mod tests {
         };
         assert_eq!(format_average(known, 1, "s"), "6.0s  ·  2/5 known");
         assert_eq!(format_average(unknown, 1, "s"), "—  ·  0/5 known");
+    }
+
+    #[test]
+    fn agent_project_groups_use_longest_registered_root_and_keep_unknown_unassigned() {
+        let mut root = timeline_agent("root", AgentMetricState::Ready, 1, 0, 0);
+        root.cwd = Some(PathBuf::from("/work/other"));
+        let mut nested = timeline_agent("nested", AgentMetricState::Working, 1, 0, 0);
+        nested.cwd = Some(PathBuf::from("/work/fulcrum/services/api"));
+        let mut retained_only = timeline_agent("retained", AgentMetricState::Ready, 1, 0, 0);
+        retained_only.cwd = Some(PathBuf::from("/retained/repo"));
+        let unknown = timeline_agent("unknown", AgentMetricState::Ready, 1, 0, 0);
+        let mut retained = repository_choice("Retained", PathBuf::from("/retained"));
+        retained.registered = false;
+        let choices = vec![
+            repository_choice("Workspace", PathBuf::from("/work")),
+            repository_choice("Fulcrum", PathBuf::from("/work/fulcrum")),
+            retained,
+        ];
+
+        let groups =
+            group_agents_by_project(vec![&root, &nested, &retained_only, &unknown], &choices);
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| (group.label.as_str(), group.agents.len()))
+                .collect::<Vec<_>>(),
+            vec![("Fulcrum", 1), ("Workspace", 1), ("Unassigned", 2)]
+        );
+        assert_eq!(groups[0].agents[0].row_id, "nested");
+        assert!(
+            groups[2]
+                .agents
+                .iter()
+                .any(|agent| agent.row_id == "retained"),
+            "retained repositories are not registered project ownership"
+        );
     }
 
     #[test]
@@ -2391,6 +2762,7 @@ mod tests {
                 failures: 0,
             },
         ]);
+        first.tool_failure_reasons = Some(Vec::new());
         let mut second = timeline_agent("selected", AgentMetricState::Ready, 2, 5, 1);
         second.tool_usage = Some(vec![
             ToolMetricSnapshot {
@@ -2404,6 +2776,11 @@ mod tests {
                 failures: 0,
             },
         ]);
+        second.tool_failure_reasons = Some(vec![ToolFailureMetricSnapshot {
+            tool: "bash".into(),
+            reason: "Permission denied by policy".into(),
+            count: 1,
+        }]);
         assert_eq!(
             known_tool_deltas(&first, &first),
             Some(Vec::new()),
@@ -2438,6 +2815,34 @@ mod tests {
             }]),
             "a status update can add a failure without adding a call"
         );
+        assert_eq!(
+            known_tool_failure_deltas(&first, &second),
+            Some(vec![ToolFailureMetricDelta {
+                tool: "bash".into(),
+                reason: "Permission denied by policy".into(),
+                count: 1,
+            }])
+        );
+        let mut reason_rolled_back = second.clone();
+        reason_rolled_back.tool_failure_reasons.as_mut().unwrap()[0].count = 0;
+        let mut prior_reason = first.clone();
+        prior_reason.tool_failure_reasons = Some(vec![ToolFailureMetricSnapshot {
+            tool: "bash".into(),
+            reason: "Permission denied by policy".into(),
+            count: 1,
+        }]);
+        assert_eq!(
+            known_tool_failure_deltas(&prior_reason, &reason_rolled_back),
+            None,
+            "failure-reason counter rollback is unknown rather than negative"
+        );
+        let mut vanished_reason = second.clone();
+        vanished_reason.tool_failure_reasons = Some(Vec::new());
+        assert_eq!(
+            known_tool_failure_deltas(&prior_reason, &vanished_reason),
+            None,
+            "a vanished cumulative failure reason invalidates the delta"
+        );
         let history = vec![
             AgentFleetObservation {
                 captured_at_unix_ms: 1_000,
@@ -2469,5 +2874,32 @@ mod tests {
         assert_eq!(aggregate[0].name, "read", "most-used tool ranks first");
         assert_eq!(aggregate[1].name, "bash");
         assert_eq!(aggregate[1].failures, 1);
+        assert_eq!(
+            timeline.events[1].delta.tool_failure_reasons,
+            Some(vec![ToolFailureMetricDelta {
+                tool: "bash".into(),
+                reason: "Permission denied by policy".into(),
+                count: 1,
+            }])
+        );
+        assert_eq!(
+            format_tool_deltas(timeline.events[1].delta.tool_usage.as_deref()),
+            (
+                "Tools in this sample",
+                "bash ×1 · 1 failed\nread ×2".to_string()
+            )
+        );
+        assert_eq!(
+            format_failure_deltas(timeline.events[1].delta.tool_failure_reasons.as_deref()),
+            Some("bash — Permission denied by policy".to_string())
+        );
+        assert_eq!(
+            format_tool_deltas(None),
+            (
+                "Tools in this sample",
+                "Tool names unavailable for this sample".to_string()
+            ),
+            "legacy samples remain explicitly unknown"
+        );
     }
 }

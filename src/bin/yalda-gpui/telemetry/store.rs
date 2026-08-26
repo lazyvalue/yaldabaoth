@@ -367,6 +367,7 @@ mod tests {
                 row_id: "agent-1".into(),
                 session_id: Some("session-1".into()),
                 label: "Agent one".into(),
+                cwd: Some(PathBuf::from("/projects/one")),
                 provider: None,
                 model: Some("test-model".into()),
                 state,
@@ -377,6 +378,11 @@ mod tests {
                     name: "read".into(),
                     calls: tools,
                     failures: 1,
+                }]),
+                tool_failure_reasons: Some(vec![crate::ToolFailureMetricSnapshot {
+                    tool: "read".into(),
+                    reason: "Permission denied".into(),
+                    count: 1,
                 }]),
                 context: Some(ContextOccupancy {
                     used: 25,
@@ -460,6 +466,12 @@ mod tests {
                     .unwrap()[0]
                     .name,
                 "read"
+            );
+            let agent = &restored.latest_agent().unwrap().snapshot.agents[0];
+            assert_eq!(agent.cwd.as_deref(), Some(Path::new("/projects/one")));
+            assert_eq!(
+                agent.tool_failure_reasons.as_ref().unwrap()[0].reason,
+                "Permission denied"
             );
             let restored_repository = restored.latest_repository(&repository_root).unwrap();
             assert_eq!(restored_repository.captured_at_unix_ms, 2_000);
@@ -598,17 +610,19 @@ mod tests {
     }
 
     #[test]
-    fn older_v1_documents_load_with_unknown_tool_coverage() {
+    fn older_v1_documents_load_with_unknown_project_and_tool_diagnostic_coverage() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("telemetry.json");
         with_telemetry_store_path(path.clone(), || {
             let mut store = TelemetryStore::default();
             assert!(store.record_agent(1_000, fleet(AgentMetricState::Ready, 2)));
             let mut document = serde_json::to_value(&store).unwrap();
-            document["agent_history"][0]["snapshot"]["agents"][0]
+            let agent = document["agent_history"][0]["snapshot"]["agents"][0]
                 .as_object_mut()
-                .unwrap()
-                .remove("tool_usage");
+                .unwrap();
+            agent.remove("cwd");
+            agent.remove("tool_usage");
+            agent.remove("tool_failure_reasons");
             fs::write(&path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
 
             let restored = TelemetryStore::load();
@@ -616,6 +630,11 @@ mod tests {
             assert_eq!(agent.tool_total, Some(2));
             assert_eq!(agent.tool_failures, Some(1));
             assert_eq!(agent.tool_usage, None, "missing additive field is unknown");
+            assert_eq!(agent.cwd, None, "missing project coverage stays unknown");
+            assert_eq!(
+                agent.tool_failure_reasons, None,
+                "missing diagnostic coverage stays unknown"
+            );
         });
     }
 

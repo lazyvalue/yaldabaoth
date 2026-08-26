@@ -268,6 +268,64 @@ evidence without retaining operational payloads.
 
 **Enforcement.**
 `telemetry::agent::tests::loaded_agent_tool_usage_is_normalized_bounded_and_grouped`,
-`telemetry::store::tests::older_v1_documents_load_with_unknown_tool_coverage`,
+`telemetry::store::tests::older_v1_documents_load_with_unknown_project_and_tool_diagnostic_coverage`,
 `agent_stats_view::tests::agent_timeline_projects_named_tool_deltas`, and
-`verify_harness.rs::agent_stats_timeline_restores_named_tool_breakdowns`.
+`verify_harness.rs::agent_stats_timeline_restores_concrete_tools_failure_reasons_and_compact_cards`.
+
+### UXI-AgentStats-9 — Agents are project-grouped and timeline samples are concise
+
+**Statement.** The Agents and Inactive pages group root-session rows by their
+registered Yalda project. Project ownership is derived from the session working
+directory using the longest matching registered project root, so a nested
+project wins over its parent. Sessions without known working-directory coverage
+or a registered matching root appear under an explicit **Unassigned** group;
+the UI never guesses from an agent label. Group headings include row counts and
+remain inside the existing global row bound.
+
+Agent Stats describes Yalda/ACP root sessions. Provider-internal subagents are
+not independent fleet rows because the universal roster does not assign them a
+stable session identity; their activity remains attributable to the parent
+session's tools until such an identity exists.
+
+The per-agent detail presents provider and model once in its identity header,
+not in every observation. A settled-turn counter change is a divider between
+observation cards rather than a repeated key/value row. Cards omit cumulative
+turn and tool totals. Instead, the first retained card labels its cumulative
+tool coverage as **Tools known at first sample**, and later cards show **Tools
+in this sample**: the named, counted tool deltas observed since the prior
+retained sample. Unknown legacy coverage and known empty activity have distinct
+copy. These deltas belong to the sample interval and do not claim exact
+tool-call timestamps.
+
+Each sampled failed-tool delta includes the bounded provider-reported reason
+when one is available. Collection never reads tool input and never retains a
+successful tool's output. For a failed call it extracts at most one
+single-line, 240-character diagnostic from explicit error/message/stderr output
+or ACP text content, groups identical `(tool, reason)` observations, and uses an
+explicit **No reason reported** fallback. At most 64 distinct failure-reason
+rows are retained per agent. These local diagnostics can contain provider- or
+tool-authored paths and values; the UI and schema describe them as bounded
+diagnostics, not as secret-redacted data. Tool-call ids and complete payloads
+remain excluded.
+
+Timeline card labels have a fixed non-wrapping column wide enough for the
+longest label. Tool and failure details use multiline rows rather than one long
+wrapped key/value value.
+
+**Applies to.** `AgentMetricSnapshot`, `ToolMetricSnapshot`,
+`collect_agent_metrics`, project grouping, timeline projection,
+`AgentStatsView`, and `TelemetryStore` v1 compatibility.
+
+**Why.** Fleet work is primarily understood by codebase, while a useful agent
+timeline should expose the activity that changed without repeating stable
+identity and cumulative counters. Failure counts identify concentration;
+bounded reasons make that concentration actionable.
+
+**Status.** `implemented`
+
+**Enforcement.** `telemetry::agent::tests::failed_tool_diagnostics_are_bounded_grouped_and_ignore_inputs_and_successes`,
+`telemetry::store::tests::older_v1_documents_load_with_unknown_project_and_tool_diagnostic_coverage`,
+`agent_stats_view::tests::agent_project_groups_use_longest_registered_root_and_keep_unknown_unassigned`,
+`agent_stats_view::tests::agent_timeline_projects_named_tool_deltas`,
+`verify_harness.rs::agent_stats_groups_active_and_inactive_sessions_by_project`,
+and `verify_harness.rs::agent_stats_timeline_restores_concrete_tools_failure_reasons_and_compact_cards`.

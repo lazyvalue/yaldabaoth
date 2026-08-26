@@ -93,8 +93,16 @@ impl YaldaGpuiView {
             ),
         };
         let history = self.telemetry_store.agent_history().to_vec();
-        let view =
-            cx.new(|_| AgentStatsView::with_agent_history(weak, observation, source, history));
+        let catalog = agent_stats_repository_catalog(&self.projects, &self.telemetry_store);
+        let view = cx.new(|_| {
+            AgentStatsView::with_agent_history_and_catalog(
+                weak,
+                observation,
+                source,
+                history,
+                catalog,
+            )
+        });
         self.agent_stats_view = Some(view.clone());
         view
     }

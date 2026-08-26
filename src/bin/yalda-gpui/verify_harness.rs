@@ -20923,14 +20923,18 @@ fn agent_stats_row_click_opens_durable_observed_timeline(cx: &mut TestAppContext
     });
 }
 
-/// UXI-AgentStats-8: production collection groups sanitized tool names and
-/// failures, the v1 telemetry document restores them, and a real painted row
-/// click exposes both the per-agent aggregate and sampled event detail.
+/// UXI-AgentStats-8/-9: production collection groups sanitized tool names and
+/// bounded failure reasons, the v1 telemetry document restores them, and a
+/// real painted row click exposes the per-agent aggregate, sampled event
+/// detail, turn divider, and a single compact provider row.
 ///
-/// Negative control: replacing production `summarize_tool_usage` with an empty
-/// vector leaves both named aggregate probes absent and fails RED.
+/// Negative controls: replacing production failure-reason collection with an
+/// empty vector leaves both diagnostic probes absent; restoring the old 96px
+/// wrapping key label makes the provider row exceed the one-line height guard.
 #[gpui::test]
-fn agent_stats_timeline_restores_named_tool_breakdowns(cx: &mut TestAppContext) {
+fn agent_stats_timeline_restores_concrete_tools_failure_reasons_and_compact_cards(
+    cx: &mut TestAppContext,
+) {
     use yalda::acp_channel::{AgentProvider, ToolCall, ToolCallStatus, ToolKind};
     use yalda::session_proto::{Notification as ServerNotification, SessionInfo};
 
@@ -20976,6 +20980,8 @@ fn agent_stats_timeline_restores_named_tool_breakdowns(cx: &mut TestAppContext) 
                 let mut agent = view.agent_mut(cx).expect("loaded agent");
                 let mut failed_read = ToolCall::new("tool-read-2", "Read");
                 failed_read.status = ToolCallStatus::Failed;
+                failed_read.raw_output =
+                    Some(serde_json::json!({"error": {"message": "permission denied by policy"}}));
                 let key = crate::ToolCallKey::from_id(&failed_read.tool_call_id);
                 let anchor = agent.editor.anchor_for_line(0);
                 agent.tools.register(key, failed_read, anchor);
@@ -20984,6 +20990,8 @@ fn agent_stats_timeline_restores_named_tool_breakdowns(cx: &mut TestAppContext) 
                 failed_bash.kind = ToolKind::Execute;
                 failed_bash.status = ToolCallStatus::Failed;
                 failed_bash.raw_input = Some(serde_json::json!({"command": "private-command"}));
+                failed_bash.raw_output =
+                    Some(serde_json::json!({"stderr": "command exited with status 17"}));
                 let key = crate::ToolCallKey::from_id(&failed_bash.tool_call_id);
                 let anchor = agent.editor.anchor_for_line(0);
                 agent.tools.register(key, failed_bash, anchor);
@@ -20996,8 +21004,31 @@ fn agent_stats_timeline_restores_named_tool_breakdowns(cx: &mut TestAppContext) 
             );
             view.refresh_agent_stats_agents(cx);
 
+            {
+                let mut agent = view.agent_mut(cx).expect("loaded agent");
+                let mut search = ToolCall::new("tool-search-1", "Search");
+                search.meta = serde_json::json!({"claudeCode": {"toolName": "Grep"}})
+                    .as_object()
+                    .cloned();
+                search.status = ToolCallStatus::Completed;
+                let key = crate::ToolCallKey::from_id(&search.tool_call_id);
+                let anchor = agent.editor.anchor_for_line(0);
+                agent.tools.register(key, search, anchor);
+            }
+            view.apply_server_batch(
+                vec![ServerNotification::SessionBusy {
+                    session_id: "S1".into(),
+                    busy: false,
+                }],
+                cx,
+            );
+            view.refresh_agent_stats_agents(cx);
+
             let history = view.telemetry_store.agent_history();
-            assert!(history.len() >= 2, "state transition retains both samples");
+            assert!(
+                history.len() >= 3,
+                "state transition and same-turn tool activity retain three samples"
+            );
             let tools = history
                 .last()
                 .unwrap()
@@ -21007,8 +21038,29 @@ fn agent_stats_timeline_restores_named_tool_breakdowns(cx: &mut TestAppContext) 
                 .find(|agent| agent.row_id == "S1")
                 .and_then(|agent| agent.tool_usage.as_ref())
                 .expect("production collector supplies named tool coverage");
-            assert_eq!(tools.iter().map(|tool| tool.calls).sum::<usize>(), 3);
+            assert_eq!(tools.iter().map(|tool| tool.calls).sum::<usize>(), 4);
             assert_eq!(tools.iter().map(|tool| tool.failures).sum::<usize>(), 2);
+            let reasons = history
+                .last()
+                .unwrap()
+                .snapshot
+                .agents
+                .iter()
+                .find(|agent| agent.row_id == "S1")
+                .and_then(|agent| agent.tool_failure_reasons.as_ref())
+                .expect("production collector supplies failure-reason coverage");
+            assert!(reasons.iter().any(|failure| {
+                failure.tool == "read" && failure.reason == "permission denied by policy"
+            }));
+            assert!(reasons.iter().any(|failure| {
+                failure.tool == "bash" && failure.reason == "command exited with status 17"
+            }));
+            assert!(
+                reasons
+                    .iter()
+                    .all(|failure| !failure.reason.contains("private-command")),
+                "tool inputs are not retained as failure diagnostics"
+            );
             view.telemetry_store.save().expect("save named tool facts");
         });
 
@@ -21027,10 +21079,111 @@ fn agent_stats_timeline_restores_named_tool_breakdowns(cx: &mut TestAppContext) 
         vcx.run_until_parked();
         assert!(crate::layout_probe_get("agent-stats-timeline-tool-read").is_some());
         assert!(crate::layout_probe_get("agent-stats-timeline-tool-bash").is_some());
+        assert!(crate::layout_probe_get("agent-stats-timeline-tool-grep").is_some());
         assert!(crate::layout_probe_get("agent-stats-timeline-event-tools-0").is_some());
         assert!(crate::layout_probe_get("agent-stats-timeline-event-tools-1").is_some());
+        assert!(crate::layout_probe_get("agent-stats-timeline-event-tools-2").is_some());
+        assert!(crate::layout_probe_get("agent-stats-timeline-failure-reason-0").is_some());
+        assert!(crate::layout_probe_get("agent-stats-timeline-failure-reason-1").is_some());
+        assert!(crate::layout_probe_get("agent-stats-timeline-event-failures-1").is_some());
+        assert!(
+            crate::layout_probe_get("agent-stats-timeline-turn-divider-0").is_none(),
+            "the first retained sample must not be preceded by a settled-turn divider"
+        );
+        assert!(crate::layout_probe_get("agent-stats-timeline-turn-divider-1").is_some());
+        assert!(
+            crate::layout_probe_get("agent-stats-timeline-turn-divider-2").is_none(),
+            "same-turn tool activity must not receive a settled-turn divider"
+        );
+        let (_, _, _, provider_height) = crate::layout_probe_get("agent-stats-timeline-provider")
+            .expect("provider/model identity paints once above the cards");
+        assert!(
+            provider_height < 28.0,
+            "provider/model label wrapped despite the compact non-wrapping row: {provider_height}"
+        );
         crate::layout_probe_end();
     });
+}
+
+/// UXI-AgentStats-9: both roster pages are grouped by the longest matching
+/// registered project root, with unmatched sessions explicitly separated.
+///
+/// Negative control: disabling the registered-root match removes the Yalda
+/// and Fulcrum headings and fails RED.
+#[gpui::test]
+fn agent_stats_groups_active_and_inactive_sessions_by_project(cx: &mut TestAppContext) {
+    use yalda::session_proto::{Notification as ServerNotification, SessionInfo};
+
+    let temp = tempfile::tempdir().expect("project group fixtures");
+    let workspace = temp.path().join("workspace");
+    let yalda = workspace.join("yalda");
+    let fulcrum = workspace.join("fulcrum");
+    let unassigned = temp.path().join("elsewhere");
+    for root in [&yalda, &fulcrum, &unassigned] {
+        std::fs::create_dir_all(root).expect("create project group fixture");
+    }
+    let yalda_key = crate::repository_root_key(&yalda);
+    let fulcrum_key = crate::repository_root_key(&fulcrum);
+
+    let (view, vcx) = boot_browser(cx);
+    view.update(vcx, |view, cx| {
+        view.projects
+            .create("Yalda".into(), yalda.clone())
+            .expect("register Yalda");
+        view.projects
+            .create("Fulcrum".into(), fulcrum.clone())
+            .expect("register Fulcrum");
+        let row = |session_id: &str, cwd: PathBuf, connected: bool, archived: bool| SessionInfo {
+            session_id: session_id.into(),
+            acp_session_id: None,
+            label: session_id.into(),
+            cwd,
+            provider: yalda::acp_channel::AgentProvider::Codex,
+            turns: 1,
+            connected,
+            permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+            busy: false,
+            archived,
+        };
+        view.open_agent_stats(cx);
+        view.apply_server_batch(
+            vec![
+                ServerNotification::SessionCreated {
+                    session: row("yalda-active", yalda.join("src"), true, false),
+                },
+                ServerNotification::SessionCreated {
+                    session: row("fulcrum-active", fulcrum.join("services"), true, false),
+                },
+                ServerNotification::SessionCreated {
+                    session: row("unknown-active", unassigned.clone(), true, false),
+                },
+                ServerNotification::SessionCreated {
+                    session: row("fulcrum-archived", fulcrum.join("docs"), false, true),
+                },
+            ],
+            cx,
+        );
+    });
+
+    crate::layout_probe_begin();
+    vcx.run_until_parked();
+    assert!(crate::layout_probe_get(&format!("agent-stats-project-group-{yalda_key}")).is_some());
+    assert!(crate::layout_probe_get(&format!("agent-stats-project-group-{fulcrum_key}")).is_some());
+    assert!(crate::layout_probe_get("agent-stats-project-group-unassigned").is_some());
+    assert!(crate::layout_probe_get("agent-stats-row-yalda-active").is_some());
+    assert!(crate::layout_probe_get("agent-stats-row-fulcrum-active").is_some());
+    assert!(crate::layout_probe_get("agent-stats-row-unknown-active").is_some());
+    crate::layout_probe_end();
+
+    crate::layout_probe_begin();
+    vcx.simulate_keystrokes("2");
+    vcx.run_until_parked();
+    assert!(
+        crate::layout_probe_get(&format!("agent-stats-inactive-project-group-{fulcrum_key}"))
+            .is_some()
+    );
+    assert!(crate::layout_probe_get("agent-stats-row-fulcrum-archived").is_some());
+    crate::layout_probe_end();
 }
 
 /// UXI-AgentStats-2: the live roster is projected into two non-overlapping
