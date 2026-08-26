@@ -233,3 +233,41 @@ changed without overstating the precision of v1 telemetry.
 **Enforcement.**
 `agent_stats_view::tests::agent_timeline_collapses_unrelated_fleet_churn_and_reports_known_deltas`
 and `verify_harness.rs::agent_stats_row_click_opens_durable_observed_timeline`.
+
+### UXI-AgentStats-8 — Tool usage is attributable without retaining payloads
+
+**Statement.** An agent timeline shows which tools changed at each retained
+observation and includes one deterministic aggregate table for that agent. Each
+aggregate row names the tool and reports observed calls, failures, and failure
+rate. Failures are grouped by tool rather than shown only as one session total.
+Timeline entries describe per-tool changes as observed deltas at the sample time;
+they do not claim an exact call start, completion, or failure timestamp.
+
+Tool coverage is optional. A locally loaded session supplies a bounded set of
+normalized tool names with cumulative call and failed-call counts. An unloaded
+session is **unknown**, not zero; retained history may still supply its latest
+known breakdown. Names prefer a provider-reported tool identifier, then a safe
+single-token title, and finally the coarse ACP kind. Normalization is
+case-insensitive, length-bounded, and accepts only identifier punctuation.
+
+The additive telemetry-store v1 field retains only tool name and integer counts.
+It never persists tool-call ids, arguments, outputs, content, file locations,
+source text, prompts, or error messages. Old v1 documents without the field load
+with unknown tool coverage. Cardinality is bounded per agent and deterministic
+when providers report more distinct names than the limit.
+
+**Applies to.** `AgentMetricSnapshot`, `collect_agent_metrics`,
+`TelemetryStore`, `project_agent_timeline`, and `AgentStatsView` timeline detail.
+
+**Why.** A total failure count identifies a struggling agent but cannot reveal
+whether the problem is concentrated in shell execution, file editing, search,
+or another tool. Names and grouped outcomes provide actionable optimization
+evidence without retaining operational payloads.
+
+**Status.** `implemented`
+
+**Enforcement.**
+`telemetry::agent::tests::loaded_agent_tool_usage_is_normalized_bounded_and_grouped`,
+`telemetry::store::tests::older_v1_documents_load_with_unknown_tool_coverage`,
+`agent_stats_view::tests::agent_timeline_projects_named_tool_deltas`, and
+`verify_harness.rs::agent_stats_timeline_restores_named_tool_breakdowns`.

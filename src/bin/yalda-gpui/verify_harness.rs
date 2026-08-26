@@ -20921,6 +20921,116 @@ fn agent_stats_row_click_opens_durable_observed_timeline(cx: &mut TestAppContext
     });
 }
 
+/// UXI-AgentStats-8: production collection groups sanitized tool names and
+/// failures, the v1 telemetry document restores them, and a real painted row
+/// click exposes both the per-agent aggregate and sampled event detail.
+///
+/// Negative control: replacing production `summarize_tool_usage` with an empty
+/// vector leaves both named aggregate probes absent and fails RED.
+#[gpui::test]
+fn agent_stats_timeline_restores_named_tool_breakdowns(cx: &mut TestAppContext) {
+    use yalda::acp_channel::{AgentProvider, ToolCall, ToolCallStatus, ToolKind};
+    use yalda::session_proto::{Notification as ServerNotification, SessionInfo};
+
+    let temp = tempfile::tempdir().expect("named tool telemetry fixture");
+    let telemetry_path = temp.path().join("telemetry").join("v1.json");
+    let cwd = std::env::current_dir().expect("test cwd");
+    let roster = |busy: bool, turns: usize| SessionInfo {
+        session_id: "S1".into(),
+        acp_session_id: None,
+        label: "Tool breakdown agent".into(),
+        cwd: cwd.clone(),
+        provider: AgentProvider::Codex,
+        turns,
+        connected: true,
+        permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+        busy,
+        archived: false,
+    };
+
+    crate::with_telemetry_store_path(telemetry_path, || {
+        let (collector, collector_vcx, _id, _session) = boot_with_transcript(cx);
+        collector.update(collector_vcx, |view, cx| {
+            {
+                let mut agent = view.agent_mut(cx).expect("loaded agent");
+                let mut read = ToolCall::new("tool-read-1", "Find a file");
+                read.meta = serde_json::json!({"claudeCode": {"toolName": "Read"}})
+                    .as_object()
+                    .cloned();
+                read.status = ToolCallStatus::Completed;
+                let key = crate::ToolCallKey::from_id(&read.tool_call_id);
+                let anchor = agent.editor.anchor_for_line(0);
+                agent.tools.register(key, read, anchor);
+            }
+            view.apply_server_batch(
+                vec![ServerNotification::SessionCreated {
+                    session: roster(false, 1),
+                }],
+                cx,
+            );
+            view.refresh_agent_stats_agents(cx);
+
+            {
+                let mut agent = view.agent_mut(cx).expect("loaded agent");
+                let mut failed_read = ToolCall::new("tool-read-2", "Read");
+                failed_read.status = ToolCallStatus::Failed;
+                let key = crate::ToolCallKey::from_id(&failed_read.tool_call_id);
+                let anchor = agent.editor.anchor_for_line(0);
+                agent.tools.register(key, failed_read, anchor);
+
+                let mut failed_bash = ToolCall::new("tool-bash-1", "Bash");
+                failed_bash.kind = ToolKind::Execute;
+                failed_bash.status = ToolCallStatus::Failed;
+                failed_bash.raw_input = Some(serde_json::json!({"command": "private-command"}));
+                let key = crate::ToolCallKey::from_id(&failed_bash.tool_call_id);
+                let anchor = agent.editor.anchor_for_line(0);
+                agent.tools.register(key, failed_bash, anchor);
+            }
+            view.apply_server_batch(
+                vec![ServerNotification::SessionCreated {
+                    session: roster(true, 2),
+                }],
+                cx,
+            );
+            view.refresh_agent_stats_agents(cx);
+
+            let history = view.telemetry_store.agent_history();
+            assert!(history.len() >= 2, "state transition retains both samples");
+            let tools = history
+                .last()
+                .unwrap()
+                .snapshot
+                .agents
+                .iter()
+                .find(|agent| agent.row_id == "S1")
+                .and_then(|agent| agent.tool_usage.as_ref())
+                .expect("production collector supplies named tool coverage");
+            assert_eq!(tools.iter().map(|tool| tool.calls).sum::<usize>(), 3);
+            assert_eq!(tools.iter().map(|tool| tool.failures).sum::<usize>(), 2);
+            view.telemetry_store.save().expect("save named tool facts");
+        });
+
+        let (view, vcx) = boot_browser(cx);
+        view.update(vcx, |view, cx| view.open_agent_stats(cx));
+        crate::layout_probe_begin();
+        vcx.run_until_parked();
+        let (x, y, width, height) =
+            crate::layout_probe_get("agent-stats-row-S1").expect("restored tool agent row paints");
+        crate::layout_probe_end();
+
+        crate::layout_probe_begin();
+        let at = point(px(x + width / 2.0), px(y + height / 2.0));
+        vcx.simulate_mouse_move(at, None, gpui::Modifiers::default());
+        vcx.simulate_click(at, gpui::Modifiers::default());
+        vcx.run_until_parked();
+        assert!(crate::layout_probe_get("agent-stats-timeline-tool-read").is_some());
+        assert!(crate::layout_probe_get("agent-stats-timeline-tool-bash").is_some());
+        assert!(crate::layout_probe_get("agent-stats-timeline-event-tools-0").is_some());
+        assert!(crate::layout_probe_get("agent-stats-timeline-event-tools-1").is_some());
+        crate::layout_probe_end();
+    });
+}
+
 /// UXI-AgentStats-2: the live roster is projected into two non-overlapping
 /// pages. Working and Ready remain on Agents; authoritative Archived and
 /// disconnected-but-unarchived Unavailable rows move to Inactive. The probes
