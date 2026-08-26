@@ -380,18 +380,18 @@ to `Idle`) while it is **not** the focused tile's session, it is marked
 **unread**. The mark clears when the session becomes focused/viewed. A turn that
 finishes while you ARE focused never marks unread (you're reading it live).
 
-**Unread persists across restart, and REPLAY never raises it.** The mark is
-saved per session (`acp_sessions.json`, `SessionSnapshot.unread`) and restored on
-launch (`state.unread = slot.unread`), so what was unread before a restart stays
-unread and what was read stays read. Reloading a transcript on restart/reconnect
-(`session/load` → `ReplayComplete` / `ReplayEnd`) finalizes the same
-`(generation, turn)` but is **not** new output, so it must NOT raise unread —
-otherwise every restored non-focused session comes back red. `finalize_agent_
+**Unread is session-lifetime, NOT persisted, and REPLAY never raises it.** A
+restored session starts **read**. Turns only finalize while the app runs, so
+nothing is legitimately "unread across a restart"; and reloading a transcript on
+restart/reconnect (`session/load` → `ReplayComplete` / `ReplayEnd`) finalizes the
+same `(generation, turn)` but is **not** new output, so it must NOT raise unread
+— otherwise every restored non-focused session comes back red. `finalize_agent_
 turn_idem` takes a `raise_unread` flag: the live turn-end sites pass `true`; the
 replay-completion sites pass `false` (the pump passes `turn_ended`, which is
 `false` on a replay-only completion). The modern agent-stream replay end
 (`AgentEventEffect::ReplayEnded` → `finalize_replay_prefix`) already never
-touched unread.
+touched unread. (An earlier attempt persisted `unread` to `acp_sessions.json`;
+that just froze the replay-inflated red on disk, so it was dropped.)
 
 Unread does not change jump-panel styling. Both read and unread idle sessions are
 Waiting and wear the same green ready-for-input wash without a repeated status
@@ -426,8 +426,6 @@ proves Waiting rows carry no redundant status hint.
 `replay_on_background_session_does_not_mark_unread` drives the REAL
 `ReplayComplete` path on a backgrounded session and asserts it stays read (NC:
 pass `raise_unread = true` at the replay-completion finalize → RED).
-`session_unread_state_round_trips_through_save_load` pins the persistence half
-(unread survives save→load; read stays read).
 
 _Note (UXI-JumpPanel-7): the status glyph is a **`✦`** whose color carries the
 state (orange working / green ready / dim unavailable), not a separate ●/○ dot._

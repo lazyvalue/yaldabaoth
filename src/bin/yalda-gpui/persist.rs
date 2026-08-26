@@ -1907,11 +1907,6 @@ pub(crate) struct PersistedSlot {
     /// italic summary line survives a restart — the naming call is one-shot per
     /// session and is never re-run to rebuild it.
     pub(crate) summary: Option<String>,
-    /// Whether the session finished a turn the user hasn't looked at yet
-    /// (`AgentState::unread`). Persisted so the jump panel's unread dot survives
-    /// a restart — otherwise every restored session comes back read. Absent (old
-    /// file, or a read session) => `false`, same downgrade contract as above.
-    pub(crate) unread: bool,
 }
 
 /// Load the persisted slot list for `cwd`. Returns an empty vec if no
@@ -1953,7 +1948,6 @@ pub(crate) fn load_persisted_acp_sessions(cwd: &std::path::Path) -> Vec<Persiste
             cwd: None,
             compose_draft: None,
             summary: None,
-            unread: false,
         }];
     }
     let Some(arr) = entry.as_array() else {
@@ -2016,8 +2010,6 @@ pub(crate) fn load_persisted_acp_sessions(cwd: &std::path::Path) -> Vec<Persiste
                 .get("summary")
                 .and_then(|c| c.as_str())
                 .map(|s| s.to_string());
-            // Jump-panel unread dot. Absent (old file, or a read session) => false.
-            let unread = obj.get("unread").and_then(|b| b.as_bool()).unwrap_or(false);
             Some(PersistedSlot {
                 id,
                 label,
@@ -2030,7 +2022,6 @@ pub(crate) fn load_persisted_acp_sessions(cwd: &std::path::Path) -> Vec<Persiste
                 cwd,
                 compose_draft,
                 summary,
-                unread,
             })
         })
         .collect();
@@ -2175,9 +2166,6 @@ pub(crate) struct SessionSnapshot {
     pub(crate) compose_draft: Option<String>,
     /// The autonamer's summary (`UXI-AgentTile-27`); `None`/empty is not written.
     pub(crate) summary: Option<String>,
-    /// Jump-panel unread state (`AgentState::unread`). Only written when true,
-    /// same downgrade contract as `sidepanel_hidden`.
-    pub(crate) unread: bool,
 }
 
 pub(crate) fn save_persisted_acp_sessions(cwd: &std::path::Path, snaps: &[SessionSnapshot]) {
@@ -2251,11 +2239,6 @@ pub(crate) fn save_persisted_acp_sessions(cwd: &std::path::Path, snaps: &[Sessio
             // fields above — only written when present.
             if let Some(summary) = snap.summary.as_ref().filter(|s| !s.is_empty()) {
                 obj.insert("summary".into(), serde_json::Value::String(summary.clone()));
-            }
-            // Jump-panel unread dot: only write when unread, so an old binary
-            // reading a read session sees the absent-key default (false).
-            if snap.unread {
-                obj.insert("unread".into(), serde_json::Value::Bool(true));
             }
             serde_json::Value::Object(obj)
         })

@@ -207,10 +207,10 @@ impl YaldaGpuiView {
                 state.tasklist_open = slot.tasklist_open;
                 state.subagents_open = slot.subagents_open;
                 state.sidepanel_hidden = slot.sidepanel_hidden;
-                // Restore the jump-panel unread dot (otherwise every restored
-                // session comes back read). The focused/active session clears
-                // itself via mark_session_read once it's viewed.
-                state.unread = slot.unread;
+                // Unread is session-lifetime, NOT persisted: a restored session
+                // starts read. Turns only finalize while the app runs, so nothing
+                // is legitimately "unread across a restart"; and replay must not
+                // redden the row (UXI-JumpPanel-6). `state.unread` stays false here.
                 self.show_local_session(
                     AgentSession {
                         state,
@@ -2341,7 +2341,6 @@ impl YaldaGpuiView {
                         cwd: session.cwd.clone(),
                         compose_draft: (!draft.trim().is_empty()).then_some(draft),
                         summary: session.state.summary.clone(),
-                        unread: session.state.unread,
                     });
                 }
             }

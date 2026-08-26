@@ -2745,7 +2745,6 @@ impl YaldaGpuiView {
                                 cwd: None,
                                 compose_draft: None,
                                 summary: None,
-                                unread: false,
                             }
                         })),
                         _ if any_identity => None,
