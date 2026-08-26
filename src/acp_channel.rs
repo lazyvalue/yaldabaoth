@@ -51,6 +51,7 @@
 //!   to render tool calls inline would mean picking a richer reply format and
 //!   teaching `append_to_claude_buffer` to handle it.
 
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -709,6 +710,9 @@ fn allow_tool_kind(mode: PermissionMode, kind: ToolKind) -> bool {
 /// rather than silently launch a worse agent.
 pub const DEFAULT_AGENT_FALLBACKS: &[&str] = &["claude-agent-acp"];
 pub const DEFAULT_CODEX_AGENT_FALLBACKS: &[&str] = &["codex-acp"];
+const CODEX_CONFIG_ENV: &str = "CODEX_CONFIG";
+const CODEX_PATH_ENV: &str = "CODEX_PATH";
+const DEFAULT_CODEX_SUBAGENT_MODEL: &str = "gpt-5.6-luna";
 
 /// Command-name needles identifying an ACP adapter subprocess, for the
 /// orphan reaper. Covers the current binary + the legacy one.
@@ -727,6 +731,134 @@ pub fn agent_auth_env_vars_to_remove(
         vars.extend(["OPENAI_API_KEY", "CODEX_API_KEY", "DEFAULT_AUTH_REQUEST"]);
     }
     vars
+}
+
+/// Build the Codex adapter's session overlay without discarding any settings
+/// already supplied by its host. Malformed overlays fail before an adapter
+/// starts with surprising partial configuration.
+fn codex_config_with_luna_subagent_default(existing: Option<&str>) -> io::Result<String> {
+    let mut config: serde_json::Value = match existing {
+        Some(raw) => serde_json::from_str(raw).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid {CODEX_CONFIG_ENV} JSON: {error}"),
+            )
+        })?,
+        None => serde_json::json!({}),
+    };
+    let root = config.as_object_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{CODEX_CONFIG_ENV} must be a JSON object"),
+        )
+    })?;
+    let agents = root
+        .entry("agents")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{CODEX_CONFIG_ENV}.agents must be a JSON object"),
+            )
+        })?;
+    agents.insert(
+        "default_subagent_model".into(),
+        serde_json::Value::String(DEFAULT_CODEX_SUBAGENT_MODEL.into()),
+    );
+    serde_json::to_string(&config).map_err(io::Error::other)
+}
+
+/// Resolve the standalone Codex CLI that `codex-acp` should host. Without an
+/// explicit `CODEX_PATH`, codex-acp falls back to its bundled CLI; currently
+/// shipped adapter versions bundle a pre-Luna multi-agent runtime. Always set
+/// the variable so the adapter uses the user's independently updated CLI.
+fn codex_path_for_adapter(explicit: Option<OsString>) -> OsString {
+    if let Some(path) = explicit.filter(|path| !path.is_empty()) {
+        return path;
+    }
+
+    let mut candidates = find_executables_on_path("codex", std::env::var_os("PATH").as_deref());
+    if let Some(login_path) = login_shell_path() {
+        for candidate in find_executables_on_path("codex", Some(&login_path)) {
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+    }
+
+    select_luna_capable_codex(candidates, codex_candidate_supports_luna)
+        .map(PathBuf::into_os_string)
+        // Preserve normal PATH lookup and fail clearly in codex-acp if Codex
+        // is not installed, rather than silently selecting its stale bundle.
+        .unwrap_or_else(|| OsString::from("codex"))
+}
+
+fn find_executables_on_path(name: &str, path: Option<&OsStr>) -> Vec<PathBuf> {
+    let Some(path) = path else {
+        return Vec::new();
+    };
+    std::env::split_paths(path)
+        .map(|directory| directory.join(name))
+        .filter(|candidate| candidate.is_file())
+        .collect()
+}
+
+fn login_shell_path() -> Option<OsString> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let output = std::process::Command::new(shell)
+        .arg("-lc")
+        .arg("printf '%s' \"$PATH\"")
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8(output.stdout).ok().map(OsString::from))
+        .flatten()
+}
+
+fn select_luna_capable_codex<F>(candidates: Vec<PathBuf>, mut supports_luna: F) -> Option<PathBuf>
+where
+    F: FnMut(&PathBuf) -> bool,
+{
+    candidates
+        .iter()
+        .find(|candidate| supports_luna(candidate))
+        .cloned()
+        .or_else(|| candidates.into_iter().next())
+}
+
+fn codex_candidate_supports_luna(path: &PathBuf) -> bool {
+    std::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .is_some_and(|output| {
+            let version = String::from_utf8_lossy(&output.stdout);
+            codex_version_supports_luna(&version)
+        })
+}
+
+fn codex_version_supports_luna(version_output: &str) -> bool {
+    let Some(version) = version_output
+        .split_whitespace()
+        .find(|token| token.chars().next().is_some_and(|c| c.is_ascii_digit()))
+    else {
+        return false;
+    };
+    if version.contains('-') {
+        return false;
+    }
+    let numbers: Vec<u64> = version
+        .split('.')
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()
+        .filter(|numbers: &Vec<u64>| numbers.len() == 3)
+        .unwrap_or_default();
+    numbers.as_slice() >= &[0, 147, 0]
 }
 
 /// Parse `ps -axo pid=,ppid=,command=` output and return the PIDs of ORPHANED
@@ -2283,6 +2415,23 @@ async fn worker_async(
     for key in agent_auth_env_vars_to_remove(provider, allow_codex_api_key) {
         cmd.env_remove(key);
     }
+    if provider == AgentProvider::Codex {
+        match codex_config_with_luna_subagent_default(
+            std::env::var(CODEX_CONFIG_ENV).ok().as_deref(),
+        ) {
+            Ok(config) => {
+                cmd.env(CODEX_CONFIG_ENV, config);
+            }
+            Err(error) => {
+                let _ = ready_tx.send(Err(error));
+                return Ok(());
+            }
+        }
+        cmd.env(
+            CODEX_PATH_ENV,
+            codex_path_for_adapter(std::env::var_os(CODEX_PATH_ENV)),
+        );
+    }
     // Reasoning depth is intentionally NOT configured here. The adapter/SDK
     // already default to adaptive thinking at effort "high", so a raw
     // `MAX_THINKING_TOKENS` budget would only fight the adaptive system. Do
@@ -3814,6 +3963,201 @@ while True:
             std::fs::set_permissions(&path, perms).unwrap();
         }
         path
+    }
+
+    /// A minimal ACP peer that records the exact `CODEX_CONFIG` value its
+    /// subprocess inherited before it answers the normal startup handshake.
+    fn write_environment_agent_script(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("fake_environment_agent.py");
+        let script = r#"#!/usr/bin/env python3
+import json, os, sys
+
+with open(sys.argv[1], "w", encoding="utf-8") as log:
+    json.dump({"present": "CODEX_CONFIG" in os.environ,
+               "value": os.environ.get("CODEX_CONFIG"),
+               "codex_path_present": "CODEX_PATH" in os.environ,
+               "codex_path": os.environ.get("CODEX_PATH")}, log)
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    try:
+        msg = json.loads(line)
+    except Exception:
+        continue
+    method = msg.get("method", "")
+    msg_id = msg.get("id")
+    if method == "initialize":
+        emit({"jsonrpc": "2.0", "id": msg_id,
+              "result": {"protocolVersion": 1, "agentCapabilities": {}}})
+    elif method == "session/new":
+        emit({"jsonrpc": "2.0", "id": msg_id,
+              "result": {"sessionId": "environment-session"}})
+"#;
+        let mut file = std::fs::File::create(&path).expect("create environment script");
+        file.write_all(script.as_bytes())
+            .expect("write environment script");
+        drop(file);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&path, permissions).unwrap();
+        }
+        path
+    }
+
+    /// UXI-AgentTile-44 structural guard. Negative control: leave the parsed
+    /// config unchanged and the Luna assertion fails while the preservation
+    /// assertions still prove the fixture is meaningful.
+    #[test]
+    fn codex_config_sets_luna_and_preserves_other_settings() {
+        let merged = codex_config_with_luna_subagent_default(Some(
+            r#"{"service_tier":"fast","agents":{"max_concurrent_threads_per_session":3,"default_subagent_model":"gpt-5.6-terra"}}"#,
+        ))
+        .expect("merge valid Codex config");
+        let value: serde_json::Value = serde_json::from_str(&merged).expect("parse merged config");
+
+        assert_eq!(value["service_tier"], "fast");
+        assert_eq!(value["agents"]["max_concurrent_threads_per_session"], 3);
+        assert_eq!(
+            value["agents"]["default_subagent_model"],
+            DEFAULT_CODEX_SUBAGENT_MODEL
+        );
+        assert!(
+            value.get("model").is_none(),
+            "the subagent default must not pin the parent model"
+        );
+        assert!(codex_config_with_luna_subagent_default(Some("[]")).is_err());
+        assert!(codex_config_with_luna_subagent_default(Some("not-json")).is_err());
+        assert!(codex_config_with_luna_subagent_default(Some(r#"{"agents":true}"#)).is_err());
+    }
+
+    #[test]
+    fn codex_path_prefers_explicit_then_luna_capable_standalone() {
+        let explicit = OsString::from("/custom/codex");
+        assert_eq!(
+            codex_path_for_adapter(Some(explicit.clone())),
+            explicit,
+            "an explicit CODEX_PATH remains authoritative"
+        );
+
+        let temp = tempfile::tempdir().expect("tmpdir");
+        let codex = temp.path().join("codex");
+        std::fs::write(&codex, b"").expect("create fake standalone Codex");
+        let path = std::env::join_paths([temp.path()]).expect("join test PATH");
+        assert_eq!(
+            find_executables_on_path("codex", Some(&path)),
+            vec![codex],
+            "standalone Codex is resolved independently from codex-acp"
+        );
+
+        let old = PathBuf::from("/old/codex");
+        let alpha = PathBuf::from("/alpha/codex");
+        let stable = PathBuf::from("/stable/codex");
+        assert_eq!(
+            select_luna_capable_codex(vec![old, alpha, stable.clone()], |candidate| {
+                candidate == &stable
+            }),
+            Some(stable),
+            "an older first PATH entry must not mask a Luna-capable CLI"
+        );
+
+        assert!(!codex_version_supports_luna("codex-cli 0.146.0"));
+        assert!(codex_version_supports_luna("codex-cli 0.147.0"));
+        assert!(codex_version_supports_luna("codex-cli 0.149.1"));
+        assert!(!codex_version_supports_luna(
+            "codex-cli 0.148.0-alpha.21"
+        ));
+    }
+
+    /// UXI-AgentTile-44 real launch-path guard. This crosses the production
+    /// `tokio::process::Command` boundary: Codex must receive the Luna overlay,
+    /// while Claude must see exactly the host environment Yalda inherited.
+    #[test]
+    fn codex_spawn_injects_luna_subagent_default_without_touching_claude() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| !status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("python3 not available — skipping ACP environment test");
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("tmpdir");
+        let script = write_environment_agent_script(temp.path());
+        let inherited = std::env::var(CODEX_CONFIG_ENV).ok();
+
+        let codex_log = temp.path().join("codex-environment.json");
+        let codex_command = format!("{} {}", script.display(), codex_log.display());
+        let codex = AcpChannelClient::spawn_with_resume_in_for(
+            AgentProvider::Codex,
+            &codex_command,
+            Some(temp.path().to_path_buf()),
+            None,
+            YaldaFrontend::Gpui,
+        )
+        .expect("spawn fake Codex adapter");
+        let codex_environment: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&codex_log).expect("read Codex environment"),
+        )
+        .expect("parse Codex environment");
+        let codex_config: serde_json::Value = serde_json::from_str(
+            codex_environment["value"]
+                .as_str()
+                .expect("Codex child receives CODEX_CONFIG"),
+        )
+        .expect("parse child CODEX_CONFIG");
+        assert_eq!(
+            codex_config["agents"]["default_subagent_model"],
+            DEFAULT_CODEX_SUBAGENT_MODEL
+        );
+        assert_eq!(codex_environment["codex_path_present"], true);
+        assert_eq!(
+            codex_environment["codex_path"].as_str().map(OsString::from),
+            Some(codex_path_for_adapter(
+                std::env::var_os(CODEX_PATH_ENV)
+            )),
+            "Codex adapters use the standalone CLI instead of their bundled runtime"
+        );
+        drop(codex);
+
+        let claude_log = temp.path().join("claude-environment.json");
+        let claude_command = format!("{} {}", script.display(), claude_log.display());
+        let claude = AcpChannelClient::spawn_with_resume_in_for(
+            AgentProvider::Claude,
+            &claude_command,
+            Some(temp.path().to_path_buf()),
+            None,
+            YaldaFrontend::Gpui,
+        )
+        .expect("spawn fake Claude adapter");
+        let claude_environment: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&claude_log).expect("read Claude environment"),
+        )
+        .expect("parse Claude environment");
+        assert_eq!(claude_environment["present"].as_bool(), Some(inherited.is_some()));
+        assert_eq!(
+            claude_environment["value"].as_str(),
+            inherited.as_deref(),
+            "Claude must inherit CODEX_CONFIG unchanged"
+        );
+        assert_eq!(
+            claude_environment["codex_path"].as_str().map(OsString::from),
+            std::env::var_os(CODEX_PATH_ENV),
+            "Claude must inherit CODEX_PATH unchanged"
+        );
+        drop(claude);
     }
 
     /// A steering-capable ACP peer that keeps the initial prompt open, records
