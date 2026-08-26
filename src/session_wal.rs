@@ -93,6 +93,8 @@ enum WalRecord {
     PromptIntent {
         id: u64,
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        text_blocks: Vec<String>,
         images: Vec<ImageAttachment>,
     },
     PromptTerminal {
@@ -242,6 +244,7 @@ impl SessionWal {
         self.write_record(&WalRecord::PromptIntent {
             id,
             text: payload.text.clone(),
+            text_blocks: payload.text_blocks.clone(),
             images: payload.images.clone(),
         })?;
         self.file.sync_data()
@@ -420,11 +423,20 @@ pub fn recover_one(path: &Path) -> std::io::Result<Option<RecoveredSession>> {
             WalRecord::Archive { archived: value } => archived = value,
             WalRecord::Permission { mode } => permission_override = Some(mode),
             WalRecord::Model { model_id: value } => model_id = Some(value),
-            WalRecord::PromptIntent { id, text, images } => {
+            WalRecord::PromptIntent {
+                id,
+                text,
+                text_blocks,
+                images,
+            } => {
                 max_prompt_id = Some(max_prompt_id.map_or(id, |seen| seen.max(id)));
                 prompt_intents.push(RecoveredPrompt {
                     id,
-                    payload: PromptPayload { text, images },
+                    payload: PromptPayload {
+                        text,
+                        text_blocks,
+                        images,
+                    },
                 });
             }
             WalRecord::PromptTerminal { id, .. } => {
@@ -900,6 +912,7 @@ mod tests {
                 7,
                 &PromptPayload {
                     text: "retry after crash".into(),
+                    text_blocks: vec!["one".into(), "two".into()],
                     images: vec![ImageAttachment {
                         data: "aW1hZ2U=".into(),
                         mime_type: "image/png".into(),
@@ -922,6 +935,10 @@ mod tests {
         assert_eq!(
             recovered.pending_prompts[0].payload.text,
             "retry after crash"
+        );
+        assert_eq!(
+            recovered.pending_prompts[0].payload.text_blocks,
+            ["one", "two"]
         );
         assert_eq!(recovered.pending_prompts[0].payload.images.len(), 1);
         assert_eq!(recovered.next_prompt_id, 9);

@@ -10,7 +10,7 @@
 //!
 //! The GUI auto-launches this binary if not already running.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -24,6 +24,10 @@ use tokio::sync::{broadcast, mpsc, watch};
 use yalda::acp_channel::{
     AgentProvider, AgentSpawner, AgentTransport, ImageAttachment, PermissionMode, PromptPayload,
     RealAgentSpawner, TransportHandle, YaldaFrontend, configured_agent_command,
+};
+use yalda::cog_runtime::{
+    FailureClass, OpaqueId, ProviderDeliveryFailure, ProviderDeliveryRequest,
+    ProviderDeliveryResult, ProviderKind, ProviderReceipt,
 };
 use yalda::session_proto::*;
 
@@ -200,6 +204,12 @@ enum Command {
         text: String,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+    /// Private in-process Cog adapter path. The reply remains open until the
+    /// correlated provider turn reaches a canonical terminal outcome.
+    CogDelivery {
+        request: ProviderDeliveryRequest,
+        reply: tokio::sync::oneshot::Sender<ProviderDeliveryResult>,
+    },
     Cancel {
         sid: ServerSessionId,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
@@ -285,6 +295,7 @@ enum Command {
         sid: ServerSessionId,
         generation: u64,
         turns: usize,
+        outcome: yalda::agent_event::TurnOutcome,
     },
     /// The pump observed the worker's end-of-replay marker on a resumed
     /// channel and dropped its fence; clear the actor's copy so a later
@@ -354,6 +365,21 @@ struct PendingPrompt {
     payload: PromptPayload,
 }
 
+struct PendingProviderDelivery {
+    request: ProviderDeliveryRequest,
+    payload: PromptPayload,
+    reply: tokio::sync::oneshot::Sender<ProviderDeliveryResult>,
+}
+
+struct ActiveProviderDelivery {
+    attempt_id: OpaqueId,
+    provider: ProviderKind,
+    provider_session_id: OpaqueId,
+    generation: u64,
+    target_turn_count: usize,
+    reply: tokio::sync::oneshot::Sender<ProviderDeliveryResult>,
+}
+
 struct ManagedSession {
     id: ServerSessionId,
     label: String,
@@ -408,6 +434,10 @@ struct ManagedSession {
     /// Prompts that arrived before the ACP subprocess finished spawning.
     /// Drained in submission order once `channel` becomes `Some`.
     pending_prompts: Vec<PendingPrompt>,
+    /// Cog deliveries waiting for exclusive use of this provider session.
+    pending_provider_deliveries: VecDeque<PendingProviderDelivery>,
+    /// At most one delivery is correlated with a live provider turn.
+    active_provider_delivery: Option<ActiveProviderDelivery>,
     /// Monotonic identity for prompt intent/terminal WAL records.
     next_prompt_id: u64,
     /// Every notification ever broadcast for this session, so a
@@ -541,6 +571,19 @@ impl ManagedSession {
     /// without waking subscribers, or one broadcast without being logged).
     fn record(&mut self, note: Notification) {
         self.push_event(note);
+    }
+
+    fn fail_provider_deliveries(&mut self, failure: ProviderDeliveryFailure) {
+        if let Some(active) = self.active_provider_delivery.take() {
+            let _ = active
+                .reply
+                .send(ProviderDeliveryResult::Failed(failure.clone()));
+        }
+        for pending in self.pending_provider_deliveries.drain(..) {
+            let _ = pending
+                .reply
+                .send(ProviderDeliveryResult::Failed(failure.clone()));
+        }
     }
 
     /// The single in-memory + WAL push, with Stage B ringbuffer trim (spec §6).
@@ -954,6 +997,8 @@ fn new_managed_session(
         log_tx,
         forwarder: None,
         pending_prompts: Vec::new(),
+        pending_provider_deliveries: VecDeque::new(),
+        active_provider_delivery: None,
         next_prompt_id: 1,
         event_log,
         replay_fence: 0,
@@ -1159,6 +1204,31 @@ impl SessionManager {
         rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
     }
 
+    async fn send_cog_delivery(
+        &self,
+        request: ProviderDeliveryRequest,
+    ) -> ProviderDeliveryResult {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        if self
+            .cmd_tx
+            .send(Command::CogDelivery { request, reply })
+            .is_err()
+        {
+            return ProviderDeliveryResult::Failed(ProviderDeliveryFailure::new(
+                FailureClass::ProviderUnavailable,
+                true,
+                "session manager is unavailable",
+            ));
+        }
+        rx.await.unwrap_or_else(|_| {
+            ProviderDeliveryResult::Failed(ProviderDeliveryFailure::new(
+                FailureClass::ProviderUnavailable,
+                true,
+                "session manager stopped before provider terminal result",
+            ))
+        })
+    }
+
     async fn send_cancel(&self, sid: &str) -> Result<(), String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         let _ = self.cmd_tx.send(Command::Cancel {
@@ -1332,6 +1402,10 @@ fn restore_seed_from_disk(
                     payload: pending.payload.clone(),
                 })
                 .collect(),
+            // The adapter's own fsync journal recovers runtime deliveries;
+            // process-local reply channels cannot survive session recovery.
+            pending_provider_deliveries: VecDeque::new(),
+            active_provider_delivery: None,
             next_prompt_id: rs.next_prompt_id,
             event_log,
             replay_fence: rs.turns,
@@ -1514,6 +1588,9 @@ impl Manager {
                 // Ungated: enqueue directly, no owner check (ADR-0015).
                 let _ = reply.send(self.enqueue_prompt(&session_id, &text, Vec::new()));
             }
+            Command::CogDelivery { request, reply } => {
+                self.do_cog_delivery(request, reply);
+            }
             Command::Cancel { sid, reply } => {
                 let _ = reply.send(self.do_cancel(&sid));
             }
@@ -1648,6 +1725,7 @@ impl Manager {
                 sid,
                 generation,
                 turns,
+                outcome,
             } => {
                 let Some(s) = self.sessions.get_mut(&sid) else {
                     return;
@@ -1680,9 +1758,7 @@ impl Manager {
                         channel_generation,
                         completed_turn,
                         agent_seq,
-                        yalda::agent_event::turn_ended_kind(
-                            yalda::agent_event::TurnOutcome::Completed,
-                        ),
+                        yalda::agent_event::turn_ended_kind(outcome.clone()),
                     ),
                 });
                 s.record(Notification::TurnEnded {
@@ -1690,10 +1766,79 @@ impl Manager {
                     turn_count: turns,
                     generation: channel_generation,
                 });
+                // A runtime delivery succeeds only at this canonical, live,
+                // durably-recorded boundary. ReplayDone never enters this arm.
+                let provider_terminal = s
+                    .active_provider_delivery
+                    .as_ref()
+                    .is_some_and(|delivery| {
+                        delivery.generation == generation
+                            && turns >= delivery.target_turn_count
+                    })
+                    .then(|| {
+                        (
+                            s.active_provider_delivery
+                                .take()
+                                .expect("matched active provider delivery"),
+                            outcome,
+                        )
+                    });
                 // bug-0022: the turn is settled — the session is idle again.
                 // Broadcast so every GUI's status mark drops out of "working",
                 // including the ones not attached to this session.
                 self.set_busy(&sid, false);
+                if let Some((delivery, outcome)) = provider_terminal {
+                    if outcome == yalda::agent_event::TurnOutcome::Completed {
+                        tracing::info!(
+                            attempt_id = %delivery.attempt_id,
+                            session_id = %sid,
+                            turn = completed_turn,
+                            "Cog provider delivery reached durable terminal success"
+                        );
+                        let _ = delivery.reply.send(ProviderDeliveryResult::Succeeded(
+                            ProviderReceipt {
+                                kind: delivery.provider,
+                                session_id: delivery.provider_session_id,
+                                turn_id: Some(
+                                    OpaqueId::new(completed_turn.to_string())
+                                        .expect("decimal turn id is non-empty"),
+                                ),
+                                metadata: None,
+                            },
+                        ));
+                    } else {
+                        let (class, retryable, message) = match outcome {
+                            yalda::agent_event::TurnOutcome::Cancelled => (
+                                FailureClass::Cancelled,
+                                false,
+                                "provider turn was cancelled".to_string(),
+                            ),
+                            yalda::agent_event::TurnOutcome::MaxTokens => (
+                                FailureClass::ProviderRejected,
+                                false,
+                                "provider turn reached its processing limit".to_string(),
+                            ),
+                            yalda::agent_event::TurnOutcome::Refusal => (
+                                FailureClass::ProviderRejected,
+                                false,
+                                "provider refused the delivery".to_string(),
+                            ),
+                            yalda::agent_event::TurnOutcome::Failed { msg } => {
+                                (FailureClass::ProviderRejected, false, msg)
+                            }
+                            yalda::agent_event::TurnOutcome::ReplayEnd => (
+                                FailureClass::Internal,
+                                false,
+                                "replay boundary cannot settle provider delivery".to_string(),
+                            ),
+                            yalda::agent_event::TurnOutcome::Completed => unreachable!(),
+                        };
+                        let _ = delivery.reply.send(ProviderDeliveryResult::Failed(
+                            ProviderDeliveryFailure::new(class, retryable, message),
+                        ));
+                    }
+                }
+                self.start_next_provider_delivery(&sid);
             }
             Command::ReplayDone { sid, generation } => {
                 let Some(s) = self.sessions.get_mut(&sid) else {
@@ -1728,6 +1873,11 @@ impl Manager {
             session.channel = None;
             session.busy = false;
             session.replay_fence = 0;
+            session.fail_provider_deliveries(ProviderDeliveryFailure::new(
+                FailureClass::ProviderUnavailable,
+                true,
+                reason.clone(),
+            ));
             for pending in std::mem::take(&mut session.pending_prompts) {
                 session
                     .finish_prompt_intent(pending.id, yalda::session_wal::PromptOutcome::Rejected);
@@ -1860,7 +2010,12 @@ impl Manager {
 
         // Only after durable deletion succeeds may the actor drop the live
         // transport and announce closure.
-        let session = self.sessions.remove(session_id).expect("checked above");
+        let mut session = self.sessions.remove(session_id).expect("checked above");
+        session.fail_provider_deliveries(ProviderDeliveryFailure::new(
+            FailureClass::Cancelled,
+            false,
+            "provider session was closed",
+        ));
         let _ = session
             .gen_watch
             .send_replace(session.channel_generation.wrapping_add(1));
@@ -1946,6 +2101,212 @@ impl Manager {
         self.enqueue_prompt(session_id, text, images)
     }
 
+    fn do_cog_delivery(
+        &mut self,
+        request: ProviderDeliveryRequest,
+        reply: tokio::sync::oneshot::Sender<ProviderDeliveryResult>,
+    ) {
+        let payload = match request.envelope.provider_blocks() {
+            Ok(blocks) => PromptPayload::ordered_text_blocks(blocks),
+            Err(error) => {
+                let _ = reply.send(ProviderDeliveryResult::Failed(
+                    ProviderDeliveryFailure::new(
+                        FailureClass::UnsupportedContractValue,
+                        false,
+                        format!("could not serialize Cog delivery envelope: {error}"),
+                    ),
+                ));
+                return;
+            }
+        };
+        let session_id = request.server_session_id.clone();
+        let pending = PendingProviderDelivery {
+            request,
+            payload,
+            reply,
+        };
+
+        let steer_now = {
+            let Some(session) = self.sessions.get_mut(&session_id) else {
+                let _ = pending.reply.send(ProviderDeliveryResult::Failed(
+                    ProviderDeliveryFailure::new(
+                        FailureClass::ProviderUnavailable,
+                        true,
+                        format!("no such provider session: {session_id}"),
+                    ),
+                ));
+                return;
+            };
+            let provider_matches = matches!(
+                (session.provider, pending.request.provider),
+                (AgentProvider::Codex, ProviderKind::Codex)
+                    | (AgentProvider::Claude, ProviderKind::Claude)
+            );
+            if !provider_matches {
+                let _ = pending.reply.send(ProviderDeliveryResult::Failed(
+                    ProviderDeliveryFailure::new(
+                        FailureClass::UnsupportedContractValue,
+                        false,
+                        "configured Cog provider does not match the Yalda session provider",
+                    ),
+                ));
+                return;
+            }
+            if session.archived || session.lifecycle != SessionLifecycle::Live {
+                let _ = pending.reply.send(ProviderDeliveryResult::Failed(
+                    ProviderDeliveryFailure::new(
+                        FailureClass::ProviderUnavailable,
+                        true,
+                        "provider session is not live",
+                    ),
+                ));
+                return;
+            }
+            let steer_now = session.busy
+                && pending.request.provider == ProviderKind::Codex
+                && session
+                    .channel
+                    .as_ref()
+                    .is_some_and(TransportHandle::supports_steering);
+            if session.active_provider_delivery.is_some() || (session.busy && !steer_now) {
+                session.pending_provider_deliveries.push_back(pending);
+                return;
+            }
+            steer_now
+        };
+        self.start_provider_delivery(&session_id, pending, steer_now);
+    }
+
+    /// Start one provider turn or native Codex steer. Returns true only after
+    /// the exact two-block payload was accepted by the sole live transport.
+    fn start_provider_delivery(
+        &mut self,
+        session_id: &str,
+        pending: PendingProviderDelivery,
+        steer: bool,
+    ) -> bool {
+        let mut pending = Some(pending);
+        let mut became_busy = false;
+        let failure = {
+            let Some(session) = self.sessions.get_mut(session_id) else {
+                return self.fail_pending_provider_delivery(
+                    pending.take().expect("pending delivery"),
+                    ProviderDeliveryFailure::new(
+                        FailureClass::ProviderUnavailable,
+                        true,
+                        "provider session disappeared before dispatch",
+                    ),
+                );
+            };
+            let Some(channel) = session.channel.as_ref() else {
+                return self.fail_pending_provider_delivery(
+                    pending.take().expect("pending delivery"),
+                    ProviderDeliveryFailure::new(
+                        FailureClass::ProviderUnavailable,
+                        true,
+                        "provider session has no live transport",
+                    ),
+                );
+            };
+            let raw_session_id = channel
+                .session_id()
+                .or_else(|| session.acp_session_id.clone());
+            let Some(raw_session_id) = raw_session_id else {
+                return self.fail_pending_provider_delivery(
+                    pending.take().expect("pending delivery"),
+                    ProviderDeliveryFailure::new(
+                        FailureClass::ProviderUnavailable,
+                        true,
+                        "provider did not expose a session id",
+                    ),
+                );
+            };
+            let provider_session_id = match OpaqueId::new(raw_session_id) {
+                Ok(value) => value,
+                Err(error) => {
+                    return self.fail_pending_provider_delivery(
+                        pending.take().expect("pending delivery"),
+                        ProviderDeliveryFailure::new(
+                            FailureClass::UnsupportedContractValue,
+                            false,
+                            format!("invalid provider session id: {error}"),
+                        ),
+                    );
+                }
+            };
+            let pending_ref = pending.as_ref().expect("pending delivery");
+            let sent = if steer {
+                channel.steer_payload(pending_ref.payload.clone())
+            } else {
+                channel.send_payload(pending_ref.payload.clone())
+            };
+            match sent {
+                Ok(()) => {
+                    let pending = pending.take().expect("pending delivery");
+                    became_busy = !session.busy;
+                    session.busy = true;
+                    session.active_provider_delivery = Some(ActiveProviderDelivery {
+                        attempt_id: pending.request.envelope.attempt_id,
+                        provider: pending.request.provider,
+                        provider_session_id,
+                        generation: session.channel_generation,
+                        target_turn_count: session.turns.saturating_add(1),
+                        reply: pending.reply,
+                    });
+                    None
+                }
+                Err(error) => Some(ProviderDeliveryFailure::new(
+                    FailureClass::ProviderUnavailable,
+                    true,
+                    format!("provider input was rejected before dispatch: {error}"),
+                )),
+            }
+        };
+
+        if let Some(failure) = failure {
+            return self.fail_pending_provider_delivery(
+                pending.take().expect("pending delivery remains on failure"),
+                failure,
+            );
+        }
+        if became_busy {
+            self.broadcast_busy(session_id, true);
+        }
+        true
+    }
+
+    fn fail_pending_provider_delivery(
+        &self,
+        pending: PendingProviderDelivery,
+        failure: ProviderDeliveryFailure,
+    ) -> bool {
+        let _ = pending
+            .reply
+            .send(ProviderDeliveryResult::Failed(failure));
+        false
+    }
+
+    fn start_next_provider_delivery(&mut self, session_id: &str) {
+        loop {
+            let pending = self
+                .sessions
+                .get_mut(session_id)
+                .and_then(|session| {
+                    if session.active_provider_delivery.is_none() && !session.busy {
+                        session.pending_provider_deliveries.pop_front()
+                    } else {
+                        None
+                    }
+                });
+            let Some(pending) = pending else {
+                return;
+            };
+            if self.start_provider_delivery(session_id, pending, false) {
+                return;
+            }
+        }
+    }
+
     fn do_steer(
         &mut self,
         session_id: &str,
@@ -1969,6 +2330,7 @@ impl Manager {
 
         let pending = session.begin_prompt_intent(PromptPayload {
             text: text.to_string(),
+            text_blocks: Vec::new(),
             images,
         })?;
         let prompt_id = pending.id;
@@ -2055,6 +2417,7 @@ impl Manager {
         }
         let pending = session.begin_prompt_intent(PromptPayload {
             text: text.to_string(),
+            text_blocks: Vec::new(),
             images,
         })?;
         let prompt_id = pending.id;
@@ -2159,6 +2522,15 @@ impl Manager {
                 .sessions
                 .get_mut(session_id)
                 .ok_or_else(|| format!("no such session: {session_id}"))?;
+            if let Some(active) = session.active_provider_delivery.take() {
+                let _ = active.reply.send(ProviderDeliveryResult::Failed(
+                    ProviderDeliveryFailure::new(
+                        FailureClass::Cancelled,
+                        false,
+                        "provider turn was cancelled",
+                    ),
+                ));
+            }
             if let Some(channel) = session.channel.as_ref() {
                 channel.cancel();
             }
@@ -2212,6 +2584,11 @@ impl Manager {
                 .and_then(|c| c.session_id())
                 .or_else(|| session.acp_session_id.clone());
             let was_busy = session.busy;
+            session.fail_provider_deliveries(ProviderDeliveryFailure::new(
+                FailureClass::ProviderUnavailable,
+                true,
+                "provider session is restarting",
+            ));
             // Fence and drop the old transport BEFORE the blocking replacement
             // handshake begins. Keeping it live until PublishChannel allowed a
             // prompt to race onto the doomed generation during restart.
@@ -2352,6 +2729,11 @@ impl Manager {
                     if let Some(channel) = session.channel.as_ref() {
                         channel.cancel();
                     }
+                    session.fail_provider_deliveries(ProviderDeliveryFailure::new(
+                        FailureClass::Cancelled,
+                        false,
+                        "provider session was archived",
+                    ));
                     session.archived = true;
                     session.lifecycle = SessionLifecycle::Archived;
                     session.busy = false;
@@ -2623,6 +3005,26 @@ fn publish_channel(
 /// SOLE owner of the client: it drops it (running the blocking `Drop`) on its
 /// OWN thread when it observes a generation bump (restart) or a closed inlet
 /// (close) — never on the actor (Blocker A).
+fn take_settled_outcome(
+    outcomes: &mut BTreeMap<usize, yalda::agent_event::TurnOutcome>,
+    previous_turns: usize,
+    current_turns: usize,
+) -> yalda::agent_event::TurnOutcome {
+    let outcome = if current_turns == previous_turns.saturating_add(1) {
+        outcomes.remove(&current_turns).unwrap_or_else(|| {
+            yalda::agent_event::TurnOutcome::Failed {
+                msg: "provider turn boundary had no ACP stop reason".into(),
+            }
+        })
+    } else {
+        yalda::agent_event::TurnOutcome::Failed {
+            msg: "provider turn counter skipped a correlatable boundary".into(),
+        }
+    };
+    outcomes.retain(|count, _| *count > current_turns);
+    outcome
+}
+
 fn spawn_pump_thread(
     cmd_tx: mpsc::UnboundedSender<Command>,
     session_id: ServerSessionId,
@@ -2640,6 +3042,8 @@ fn spawn_pump_thread(
             let gen_rx = gen_rx;
 
             let mut last_turns: usize = 0;
+            let mut settled_outcomes: BTreeMap<usize, yalda::agent_event::TurnOutcome> =
+                BTreeMap::new();
             // Marker-based replay fence (see `yalda::replay_fence`). The
             // suppression decision stays pump-side (cycle granularity); the
             // actor only sees Records that should be logged, plus one
@@ -2695,6 +3099,27 @@ fn spawn_pump_thread(
                 } else {
                     Vec::new()
                 };
+
+                // `TurnSettled` is an internal worker→pump fence carrying the
+                // real ACP stop reason. Consume it here so it never enters the
+                // GUI/WAL reply stream, but retain it until the matching turn
+                // counter becomes visible.
+                events.retain(|event| {
+                    if let yalda::acp_channel::ReplyEvent::TurnSettled { count, outcome } = event {
+                        settled_outcomes.insert(*count, outcome.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+                tail_events.retain(|event| {
+                    if let yalda::acp_channel::ReplyEvent::TurnSettled { count, outcome } = event {
+                        settled_outcomes.insert(*count, outcome.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
 
                 // ── Replay fence: suppress the resume's duplicate history ──
                 // A restored/resumed session replays prior turns that are
@@ -2786,6 +3211,8 @@ fn spawn_pump_thread(
                             event: ev,
                         });
                     }
+                    let outcome =
+                        take_settled_outcome(&mut settled_outcomes, last_turns, current_turns);
                     last_turns = current_turns;
                     // Report session-absolute turns: the channel's counter
                     // restarts at 0 on every spawn, so a resumed session's
@@ -2797,6 +3224,7 @@ fn spawn_pump_thread(
                         sid: session_id.clone(),
                         generation: my_generation,
                         turns: turn_base + current_turns,
+                        outcome,
                     });
                 }
 
@@ -3638,6 +4066,31 @@ async fn main() -> io::Result<()> {
 mod lifecycle_tests {
     use super::*;
 
+    #[test]
+    fn provider_turn_outcome_requires_one_exact_correlated_boundary() {
+        use yalda::agent_event::TurnOutcome;
+
+        let mut outcomes = BTreeMap::from([(1, TurnOutcome::Refusal)]);
+        assert_eq!(take_settled_outcome(&mut outcomes, 0, 1), TurnOutcome::Refusal);
+        assert!(outcomes.is_empty());
+
+        let mut missing = BTreeMap::new();
+        assert!(matches!(
+            take_settled_outcome(&mut missing, 1, 2),
+            TurnOutcome::Failed { .. }
+        ));
+
+        let mut skipped = BTreeMap::from([
+            (3, TurnOutcome::Completed),
+            (4, TurnOutcome::Completed),
+        ]);
+        assert!(matches!(
+            take_settled_outcome(&mut skipped, 2, 4),
+            TurnOutcome::Failed { .. }
+        ));
+        assert!(skipped.is_empty(), "ambiguous skipped outcomes are discarded");
+    }
+
     /// Regression (bug-0053): a server restart is a new channel generation.
     /// The durable WAL may already contain generation 1 from an earlier hard
     /// session restart; restarting the whole server must therefore seed the
@@ -4069,6 +4522,286 @@ mod lifecycle_tests {
             spawner: Arc::new(RealAgentSpawner),
             bridge_tx: None,
         }
+    }
+
+    #[cfg(feature = "test-support")]
+    fn cog_provider_request(
+        server_session_id: &str,
+        provider: ProviderKind,
+    ) -> ProviderDeliveryRequest {
+        use yalda::cog_runtime::{
+            DeliveryEnvelope, DeliveryRecipient, DeliveryReply, DeliverySchema, DeliveryTrust,
+            DeliveryAuthority, ReplyMechanism, SenderAuthentication, Sha256Digest,
+        };
+
+        ProviderDeliveryRequest {
+            server_session_id: server_session_id.to_string(),
+            provider,
+            envelope: DeliveryEnvelope {
+                schema: DeliverySchema::V1,
+                attempt_id: OpaqueId::new("attempt-1").unwrap(),
+                delivery_key: OpaqueId::new("delivery-1").unwrap(),
+                payload_digest: Sha256Digest::new("0".repeat(64)).unwrap(),
+                recipient: DeliveryRecipient {
+                    address_id: OpaqueId::new("address-1").unwrap(),
+                },
+                trust: DeliveryTrust {
+                    authority: DeliveryAuthority::UntrustedPeerMessage,
+                    sender_authentication: SenderAuthentication::ClaimedAddressPlusAuditActor,
+                    may_expand_agent_authority: false,
+                },
+                reply: DeliveryReply {
+                    mechanism: ReplyMechanism::Cog,
+                    mail_or_chat_ids: vec![OpaqueId::new("mail-1").unwrap()],
+                },
+                entries: Vec::new(),
+            },
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    fn live_cog_provider_session(
+        sid: &str,
+        provider: AgentProvider,
+        steering: bool,
+        busy: bool,
+    ) -> (Manager, yalda::acp_channel::FakeAgentControls) {
+        let (transport, controls) =
+            yalda::acp_channel::FakeTransport::with_session_id_and_steering(
+                &format!("acp-{sid}"),
+                steering,
+            );
+        let mut session = new_managed_session(
+            sid.into(),
+            "Cog provider".into(),
+            PathBuf::from("/tmp/project"),
+            provider,
+            PermissionMode::ReadOnly,
+            None,
+            None,
+        );
+        session.channel = Some(transport.handle());
+        session.lifecycle = SessionLifecycle::Live;
+        session.busy = busy;
+        (manager_with_session(session), controls)
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn cog_provider_idle_delivery_is_exact_and_completes_only_at_live_turn_end() {
+        use yalda::cog_runtime::{
+            DELIVERY_JSON_PREFIX, ProviderDeliveryResult, UNTRUSTED_DELIVERY_WARNING,
+        };
+
+        let (mut manager, mut controls) =
+            live_cog_provider_session("runtime-idle", AgentProvider::Codex, true, false);
+        let (reply, mut result) = tokio::sync::oneshot::channel();
+        manager.do_cog_delivery(
+            cog_provider_request("runtime-idle", ProviderKind::Codex),
+            reply,
+        );
+
+        let payload = controls
+            .try_recv_native_prompt()
+            .expect("idle prompt submitted");
+        assert_eq!(payload.text_blocks.len(), 2);
+        assert_eq!(payload.text_blocks[0], UNTRUSTED_DELIVERY_WARNING);
+        assert!(payload.text_blocks[1].starts_with(DELIVERY_JSON_PREFIX));
+        assert!(
+            matches!(
+                result.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "transport acceptance is not terminal success"
+        );
+
+        manager.apply(Command::ReplayDone {
+            sid: "runtime-idle".into(),
+            generation: 0,
+        });
+        assert!(matches!(
+            result.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        manager.apply(Command::TurnCount {
+            sid: "runtime-idle".into(),
+            generation: 0,
+            turns: 1,
+            outcome: yalda::agent_event::TurnOutcome::Completed,
+        });
+        match result.try_recv().expect("durable terminal result") {
+            ProviderDeliveryResult::Succeeded(receipt) => {
+                assert_eq!(receipt.kind, ProviderKind::Codex);
+                assert_eq!(receipt.session_id.as_str(), "acp-runtime-idle");
+                assert_eq!(receipt.turn_id.unwrap().as_str(), "0");
+            }
+            other => panic!("expected provider success, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn cog_provider_busy_codex_uses_native_steering_without_replacement() {
+        let (mut manager, mut controls) =
+            live_cog_provider_session("runtime-steer", AgentProvider::Codex, true, true);
+        let (reply, mut result) = tokio::sync::oneshot::channel();
+        manager.do_cog_delivery(
+            cog_provider_request("runtime-steer", ProviderKind::Codex),
+            reply,
+        );
+
+        let payload = controls
+            .try_recv_native_steer()
+            .expect("busy capable Codex is steered");
+        assert_eq!(payload.text_blocks.len(), 2);
+        assert!(controls.prompt_rx.try_recv().is_err());
+        assert!(controls.cancel_rx.try_recv().is_err());
+        assert!(matches!(
+            result.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        manager.apply(Command::TurnCount {
+            sid: "runtime-steer".into(),
+            generation: 0,
+            turns: 1,
+            outcome: yalda::agent_event::TurnOutcome::Completed,
+        });
+        assert!(matches!(
+            result.try_recv(),
+            Ok(ProviderDeliveryResult::Succeeded(_))
+        ));
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn cog_provider_busy_claude_serializes_until_existing_turn_settles() {
+        let (mut manager, controls) =
+            live_cog_provider_session("runtime-claude", AgentProvider::Claude, false, true);
+        let (reply, mut result) = tokio::sync::oneshot::channel();
+        manager.do_cog_delivery(
+            cog_provider_request("runtime-claude", ProviderKind::Claude),
+            reply,
+        );
+        assert!(controls.prompt_rx.try_recv().is_err());
+
+        manager.apply(Command::TurnCount {
+            sid: "runtime-claude".into(),
+            generation: 0,
+            turns: 1,
+            outcome: yalda::agent_event::TurnOutcome::Completed,
+        });
+        let payload = controls
+            .prompt_rx
+            .try_recv()
+            .expect("Claude delivery starts only after prior turn");
+        assert_eq!(payload.text_blocks.len(), 2);
+        assert!(matches!(
+            result.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        manager.apply(Command::TurnCount {
+            sid: "runtime-claude".into(),
+            generation: 0,
+            turns: 2,
+            outcome: yalda::agent_event::TurnOutcome::Completed,
+        });
+        match result.try_recv().expect("Claude terminal result") {
+            ProviderDeliveryResult::Succeeded(receipt) => {
+                assert_eq!(receipt.kind, ProviderKind::Claude);
+                assert_eq!(receipt.turn_id.unwrap().as_str(), "1");
+            }
+            other => panic!("expected Claude success, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn cog_provider_cancel_and_disconnect_are_terminal_failures() {
+        let (mut cancelled_manager, _controls) =
+            live_cog_provider_session("runtime-cancel", AgentProvider::Codex, false, false);
+        let (cancel_reply, mut cancel_result) = tokio::sync::oneshot::channel();
+        cancelled_manager.do_cog_delivery(
+            cog_provider_request("runtime-cancel", ProviderKind::Codex),
+            cancel_reply,
+        );
+        cancelled_manager.do_cancel("runtime-cancel").unwrap();
+        assert!(matches!(
+            cancel_result.try_recv(),
+            Ok(ProviderDeliveryResult::Failed(ProviderDeliveryFailure {
+                class: FailureClass::Cancelled,
+                ..
+            }))
+        ));
+
+        let (mut disconnected_manager, _controls) =
+            live_cog_provider_session("runtime-disconnect", AgentProvider::Codex, false, false);
+        let (disconnect_reply, mut disconnect_result) = tokio::sync::oneshot::channel();
+        disconnected_manager.do_cog_delivery(
+            cog_provider_request("runtime-disconnect", ProviderKind::Codex),
+            disconnect_reply,
+        );
+        disconnected_manager.apply(Command::AgentDisconnected {
+            sid: "runtime-disconnect".into(),
+            generation: 0,
+        });
+        assert!(matches!(
+            disconnect_result.try_recv(),
+            Ok(ProviderDeliveryResult::Failed(ProviderDeliveryFailure {
+                class: FailureClass::ProviderUnavailable,
+                retryable: true,
+                ..
+            }))
+        ));
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn cog_provider_rejects_mismatched_provider_before_any_input() {
+        let (mut manager, mut controls) =
+            live_cog_provider_session("runtime-reject", AgentProvider::Codex, true, false);
+        let (reply, mut result) = tokio::sync::oneshot::channel();
+        manager.do_cog_delivery(
+            cog_provider_request("runtime-reject", ProviderKind::Claude),
+            reply,
+        );
+        assert!(matches!(
+            result.try_recv(),
+            Ok(ProviderDeliveryResult::Failed(ProviderDeliveryFailure {
+                class: FailureClass::UnsupportedContractValue,
+                retryable: false,
+                ..
+            }))
+        ));
+        assert!(controls.prompt_rx.try_recv().is_err());
+        assert!(controls.try_recv_native_prompt().is_none());
+        assert!(controls.try_recv_native_steer().is_none());
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn cog_provider_refusal_is_durable_failure_not_success() {
+        let (mut manager, _controls) =
+            live_cog_provider_session("runtime-refusal", AgentProvider::Claude, false, false);
+        let (reply, mut result) = tokio::sync::oneshot::channel();
+        manager.do_cog_delivery(
+            cog_provider_request("runtime-refusal", ProviderKind::Claude),
+            reply,
+        );
+        manager.apply(Command::TurnCount {
+            sid: "runtime-refusal".into(),
+            generation: 0,
+            turns: 1,
+            outcome: yalda::agent_event::TurnOutcome::Refusal,
+        });
+        assert!(matches!(
+            result.try_recv(),
+            Ok(ProviderDeliveryResult::Failed(ProviderDeliveryFailure {
+                class: FailureClass::ProviderRejected,
+                retryable: false,
+                ..
+            }))
+        ));
     }
 
     #[test]

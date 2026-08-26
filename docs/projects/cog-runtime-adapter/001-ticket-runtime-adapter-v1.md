@@ -12,7 +12,7 @@ live activation disabled until Cog advertises the complete capability set.
 - [x] Specify placement, activation, ownership, claims, recovery, provider
       correlation, journal, retirement, shutdown, and verification.
 - [ ] Implement exact wire types, codecs, errors, HTTP operations, and wake SSE.
-- [ ] Implement the exact two-block session-manager provider bridge.
+- [x] Implement the exact two-block session-manager provider bridge.
 - [ ] Implement durable journal and coordinator recovery/claim lifecycle.
 - [ ] Wire optional config, supervision, and capability-gated activation.
 - [ ] Negative-control focused guards and pass full verification.
