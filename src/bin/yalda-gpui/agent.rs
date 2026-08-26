@@ -4859,7 +4859,17 @@ impl AgentState {
     /// `turn_phase = Idle` decision (it is a pump-side concern, spec §7): this
     /// keeps finalize a pure ledger op and lets the caller flip the phase only
     /// when a finalize genuinely happened.
-    pub(crate) fn finalize_agent_turn_idem(&mut self, generation: u64, turn: usize) -> bool {
+    /// `raise_unread` distinguishes a genuinely-new live turn-end (raise the
+    /// jump-panel unread mark) from a REPLAY completion (do NOT — reloading old
+    /// history on restart/reconnect is not new output the user hasn't seen).
+    /// Both regimes still finalize the transcript, arm autoname, and settle the
+    /// caret here; only the attention mark is gated (UXI-JumpPanel-6).
+    pub(crate) fn finalize_agent_turn_idem(
+        &mut self,
+        generation: u64,
+        turn: usize,
+        raise_unread: bool,
+    ) -> bool {
         if !self.finalized.insert((generation, turn)) {
             return false; // already finalized this (generation, turn)
         }
@@ -4892,15 +4902,23 @@ impl AgentState {
                 self.focus = AgentFocus::Compose;
             }
         }
-        // A turn just finalized → its output is unread by default. The entry
-        // points (pump_session / apply_server_batch) clear
-        // this again for the session the user is currently focused on, so a turn
-        // that ends while you're watching it stays read. Central here because
-        // this idempotent ledger is the one place every turn-end path converges.
-        // Even if an older result was still unread, the row was Working during
-        // this turn and is entering Waiting anew now.
+        // A LIVE turn just finalized → its output is unread by default. The entry
+        // points (pump_session / apply_server_batch) clear this again for the
+        // session the user is currently focused on, so a turn that ends while
+        // you're watching it stays read. Central here because this idempotent
+        // ledger is the one place every turn-end path converges. Even if an older
+        // result was still unread, the row was Working during this turn and is
+        // entering Waiting anew now.
+        //
+        // REPLAY (`raise_unread == false`) is exempt: reloading a transcript on
+        // restart/reconnect finalizes the same (generation, turn) but produces no
+        // new output, so it must not reddens every restored session's jump dot.
+        // The restored/persisted `unread` (set on restore from disk) is left
+        // untouched (UXI-JumpPanel-6).
         self.waiting_since = Some(std::time::Instant::now());
-        self.unread = true;
+        if raise_unread {
+            self.unread = true;
+        }
         true
     }
 

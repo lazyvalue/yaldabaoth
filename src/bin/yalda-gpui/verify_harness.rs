@@ -2071,6 +2071,88 @@ fn jump_dot_unread_on_background_turn_end_read_on_focused(cx: &mut TestAppContex
     });
 }
 
+/// UXI-JumpPanel-6 (restart boundary): REPLAY reloading a session's history is
+/// NOT new output, so it must NOT mark a backgrounded session unread. Replay is
+/// exactly what a restart does — the pump reconnects each session and `session/
+/// load`s its transcript, ending in `ReplayComplete`. Before the fix that
+/// completion routed through `finalize_agent_turn_idem`, which unconditionally
+/// set `unread = true`, so every restored non-focused session came back red
+/// (and, once persisted, stayed red forever).
+///
+/// Drives the REAL replay path (`apply_server_batch` → `apply_reply_events` →
+/// `ReplayComplete` → `finalize_agent_turn_idem`) on a BACKGROUNDED session,
+/// then asserts it is NOT unread through the real row projection.
+///
+/// Negative control (observed RED): pass `true` for `raise_unread` at the
+/// replay-completion finalize site → S1 comes back unread and this fails.
+#[gpui::test]
+fn replay_on_background_session_does_not_mark_unread(cx: &mut TestAppContext) {
+    use crate::{AgentSession, AgentState, AgentTile, App};
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let (view, vcx) = boot_browser(cx);
+
+    // Two bound server-managed sessions. S2 is installed second, so it is the
+    // focused tile's session; S1 is backgrounded but still in the store.
+    let (s1, _s2) = view.update(vcx, |v, cx| {
+        let mk = |sid: &str| AgentSession {
+            state: AgentState::new_server_managed(None),
+            label: format!("sess-{sid}"),
+            cwd: PathBuf::from("."),
+            resume_id: None,
+        };
+        v.set_screen(App::Agent(AgentTile::new()));
+        let s1 = v.show_local_session(mk("S1"), cx);
+        v.sessions
+            .bind_sid(s1, ServerSid::new("S1"))
+            .expect("S1 binds");
+        v.set_screen(App::Agent(AgentTile::new()));
+        let s2 = v.show_local_session(mk("S2"), cx);
+        v.sessions
+            .bind_sid(s2, ServerSid::new("S2"))
+            .expect("S2 binds");
+        (s1, s2)
+    });
+    vcx.run_until_parked();
+
+    // Sanity: S1 is backgrounded.
+    view.update(vcx, |v, _cx| {
+        assert_ne!(v.jump_active_session().0, Some(s1), "S1 is backgrounded");
+    });
+
+    // Replay S1's history through the REAL server path, ending in ReplayComplete
+    // — exactly what a restart does when it reconnects and re-loads the session.
+    view.update(vcx, |v, cx| {
+        let ev = |e: ReplyEvent| ServerNotification::ReplyEvent {
+            session_id: "S1".into(),
+            event: e,
+        };
+        v.apply_server_batch(
+            vec![
+                ev(ReplyEvent::Chunk("old agent reply from before restart\n".into())),
+                ev(ReplyEvent::ReplayComplete),
+            ],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    view.update(vcx, |v, cx| {
+        let rows = v.jump_panel_agent_rows(cx);
+        let s1_unread = rows
+            .iter()
+            .find(|r| r.order_sid.as_deref() == Some("S1"))
+            .unwrap_or_else(|| panic!("row for S1"))
+            .unread;
+        assert!(
+            !s1_unread,
+            "replaying old history must NOT mark a backgrounded session unread — \
+             restart is not new output the user hasn't seen"
+        );
+    });
+}
+
 /// UXI-AgentTile-23 (ADR-0027): the transcript row-background selector gives a
 /// USER turn the theme's faint `user_turn_bg` tint and leaves agent / tool /
 /// system / untagged lines transparent (UXI-AgentTile-4). The painted hue is
@@ -18446,7 +18528,7 @@ fn worksheet_turn_end_carries_over_draft_or_rests_in_nav(cx: &mut TestAppContext
         let n = cb.editor.document().rope().len_chars();
         cb.editor.programmatic_insert(n, "carry");
         let g = c.generation;
-        c.finalize_agent_turn_idem(g, 1);
+        c.finalize_agent_turn_idem(g, 1, true);
     });
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
@@ -18459,7 +18541,7 @@ fn worksheet_turn_end_carries_over_draft_or_rests_in_nav(cx: &mut TestAppContext
     view2.update(vcx2, |v, cx| {
         let mut c = v.agent_mut(cx).expect("agent");
         let g = c.generation;
-        c.finalize_agent_turn_idem(g, 1);
+        c.finalize_agent_turn_idem(g, 1, true);
         assert!(!c.you_block_open, "empty draft → no block");
         assert_eq!(
             c.focus,

@@ -1768,7 +1768,7 @@ fn worksheet_turn_end_moves_caret_to_tail() {
     st.editor.cursor_mut().line = 0;
     st.editor.cursor_mut().col = 0;
     st.pending_reveal_cursor = false;
-    assert!(st.finalize_agent_turn_idem(0, 1), "first finalize runs");
+    assert!(st.finalize_agent_turn_idem(0, 1, true), "first finalize runs");
     let last = st.editor.document().line_count() - 1;
     assert_eq!(
         st.editor.cursor().line,
@@ -1790,7 +1790,7 @@ fn chatbox_turn_end_leaves_caret_put() {
         .append_llm_chunk(TurnId::Llm(1), "a long\nmulti-line\nreply");
     st.editor.cursor_mut().line = 0;
     st.editor.cursor_mut().col = 0;
-    assert!(st.finalize_agent_turn_idem(0, 1), "first finalize runs");
+    assert!(st.finalize_agent_turn_idem(0, 1, true), "first finalize runs");
     assert_eq!(
         st.editor.cursor().line,
         0,

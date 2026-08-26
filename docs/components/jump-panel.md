@@ -375,10 +375,23 @@ pixels are harness gap #1 (human eye).
 
 ### UXI-JumpPanel-6 — Unread is internal attention state, not a third visual state
 
-**Statement.** When an agent session finishes a turn (its phase returns to
-`Idle`) while it is **not** the focused tile's session, it is marked **unread**.
-The mark clears when the session becomes focused/viewed. A turn that finishes
-while you ARE focused never marks unread (you're reading it live).
+**Statement.** When an agent session finishes a **live** turn (its phase returns
+to `Idle`) while it is **not** the focused tile's session, it is marked
+**unread**. The mark clears when the session becomes focused/viewed. A turn that
+finishes while you ARE focused never marks unread (you're reading it live).
+
+**Unread persists across restart, and REPLAY never raises it.** The mark is
+saved per session (`acp_sessions.json`, `SessionSnapshot.unread`) and restored on
+launch (`state.unread = slot.unread`), so what was unread before a restart stays
+unread and what was read stays read. Reloading a transcript on restart/reconnect
+(`session/load` → `ReplayComplete` / `ReplayEnd`) finalizes the same
+`(generation, turn)` but is **not** new output, so it must NOT raise unread —
+otherwise every restored non-focused session comes back red. `finalize_agent_
+turn_idem` takes a `raise_unread` flag: the live turn-end sites pass `true`; the
+replay-completion sites pass `false` (the pump passes `turn_ended`, which is
+`false` on a replay-only completion). The modern agent-stream replay end
+(`AgentEventEffect::ReplayEnded` → `finalize_replay_prefix`) already never
+touched unread.
 
 Unread does not change jump-panel styling. Both read and unread idle sessions are
 Waiting and wear the same green ready-for-input wash without a repeated status
@@ -410,6 +423,11 @@ separate visual treatment contradicted the Waiting tab and made the list noisy.
 focused session; asserts their distinct unread booleans while both project to
 `WaitingForYou`. `jump_session_rows_do_not_paint_redundant_status_words`
 proves Waiting rows carry no redundant status hint.
+`replay_on_background_session_does_not_mark_unread` drives the REAL
+`ReplayComplete` path on a backgrounded session and asserts it stays read (NC:
+pass `raise_unread = true` at the replay-completion finalize → RED).
+`session_unread_state_round_trips_through_save_load` pins the persistence half
+(unread survives save→load; read stays read).
 
 _Note (UXI-JumpPanel-7): the status glyph is a **`✦`** whose color carries the
 state (orange working / green ready / dim unavailable), not a separate ●/○ dot._

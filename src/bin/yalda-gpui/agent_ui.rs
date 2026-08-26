@@ -3052,7 +3052,9 @@ impl YaldaGpuiView {
                             // finalize the transcript exactly once.
                             let gen_ = claude.generation;
                             let turn = claude.replay_turns.last_seen;
-                            if claude.finalize_agent_turn_idem(gen_, turn) {
+                            // Replay completion (ReplayComplete marker) is not new
+                            // output — must NOT raise unread (UXI-JumpPanel-6).
+                            if claude.finalize_agent_turn_idem(gen_, turn, false) {
                                 claude.turn_phase = TurnPhase::Idle;
                             }
                         }
@@ -3169,7 +3171,8 @@ impl YaldaGpuiView {
                         // legacy boundary (key `turns`) are DISTINCT and BOTH
                         // finalize, defeating the §7/§9 exactly-once backstop.
                         let completed_turn = turn_count.saturating_sub(1);
-                        if claude.finalize_agent_turn_idem(gen_, completed_turn) {
+                        // Live `ServerNotification::TurnEnded` — new output → unread.
+                        if claude.finalize_agent_turn_idem(gen_, completed_turn, true) {
                             claude.turn_phase = TurnPhase::Idle;
                         }
                     });
@@ -3485,7 +3488,10 @@ impl YaldaGpuiView {
                     // generation, so the slot's current generation keys it.
                     let gen_ = claude.generation;
                     let turn = claude.replay_turns.last_seen;
-                    if claude.finalize_agent_turn_idem(gen_, turn) {
+                    // `turn_ended` is a live turn-counter bump (new output → unread);
+                    // a replay-only completion has `turn_ended == false` and must
+                    // NOT raise unread (UXI-JumpPanel-6, restart boundary).
+                    if claude.finalize_agent_turn_idem(gen_, turn, turn_ended) {
                         claude.turn_phase = TurnPhase::Idle;
                     }
                 }
@@ -4052,7 +4058,9 @@ impl YaldaGpuiView {
         match effect {
             AgentEventEffect::None => {}
             AgentEventEffect::TurnEnded { generation, turn } => {
-                if claude.finalize_agent_turn_idem(generation, turn) {
+                // Forwarded live turn-end (new output → unread). Replay end arrives
+                // as the separate `ReplayEnded` effect below, which never raises.
+                if claude.finalize_agent_turn_idem(generation, turn, true) {
                     claude.turn_phase = TurnPhase::Idle;
                 }
             }
