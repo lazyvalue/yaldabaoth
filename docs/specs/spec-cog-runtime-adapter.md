@@ -59,6 +59,17 @@ Configuration is optional and explicit at `~/.yalda/cog-runtime.json`, with the
 }
 ```
 
+The file is read once per server start, rejects unknown fields, and must contain
+at least one route. `yalda_session_id` is the durable session-server id (not the
+provider's ACP id). Each Cog address and Yalda session may occur once. The
+selected session must exist, be unarchived, and use the configured provider
+before the adapter makes its first Cog mutation. Configuration changes take
+effect on the next session-server restart.
+
+V1 uses negotiated-safe fixed bounds: 60-second host and attempt leases, four
+concurrent attempts, 100 entries, and 1,000,000 content bytes per claim. A Cog
+capability range that cannot support those values fails activation closed.
+
 An address entry is the operator's explicit selection for external ownership.
 Duplicate address or Yalda-session mappings, empty ids, unknown providers,
 non-loopback Cog URLs, archived/missing sessions, or provider mismatches fail
@@ -70,6 +81,12 @@ transfer, claim, wake connection, or provider input—unless the response is
 HTTP 200, protocol `1`, both source kinds, all configured provider kinds, and
 every required v9 feature. HTTP 404 is the expected compatibility state during
 Cog rollout. Unknown required values or limits also fail closed.
+
+While inactive on 404 the supervisor probes again every five minutes. While
+active it revalidates the capability contract every five minutes and pauses new
+claims immediately on withdrawal, mismatch, or transport uncertainty. Existing
+provider work remains fenced and renewed until its terminal result is durable;
+then the adapter releases its host and returns to inactive negotiation.
 
 `allow_takeover=false` never replaces a different live host instance.
 `allow_takeover=true` is explicit local-supervisor authorization for the one
@@ -131,7 +148,11 @@ closed and never dispatches.
 
 One resumable SSE connection covers the host. Claim immediately after connect
 and after each `delivery-ready` frame; wakes are only hints. Resume with the last
-persisted `WakeId`, while every claim is authoritative.
+persisted `WakeId`, while every claim is authoritative. The cursor is atomically
+fsynced at `~/.yalda/cog-runtime-wake.cursor` (or beside an override config)
+before its wake schedules a claim. Independently, a five-second authoritative
+claim tick bounds recovery when a wake is delayed or the SSE connection is
+reconnecting.
 
 Claims use configured, successfully reconciled addresses and negotiated limits.
 One address has at most one active attempt. Retired/unowned/unavailable ids are
@@ -183,7 +204,7 @@ transaction moves source cursors.
 
 ## 6. Durable journal
 
-`~/.yalda/cog-runtime-journal.ndjson` (or the test/config-adjacent override) is an
+`~/.yalda/cog-runtime-journal.ndjson` (or the config-adjacent override) is an
 append-only, fsync-on-transition journal. Each record contains schema version,
 monotonic local sequence, attempt/address/key/digest, all current fences,
 dispatch state, idempotency key, provider session/turn ids when known, terminal
@@ -214,7 +235,9 @@ dispatch, retry, skip, transfer owner, or revive from journal recovery.
 The adapter task has its own cancellation token and bounded reconnect backoff.
 On graceful server shutdown it stops new claims, records any observed provider
 terminal result, releases still-claimed attempts without cursor movement, then
-releases the exact host lease. A crash relies on lease expiry and journal replay.
+releases the exact host lease. The server allows up to 30 seconds for this
+bounded cleanup before aborting the supervisor and exiting. A crash relies on
+lease expiry and journal replay.
 
 Adapter failure does not stop the session server. The supervisor logs a stable
 inactive/error status and retries capability/transport failures with a cap.

@@ -14,7 +14,7 @@ live activation disabled until Cog advertises the complete capability set.
 - [x] Implement exact wire types, codecs, errors, HTTP operations, and wake SSE.
 - [x] Implement the exact two-block session-manager provider bridge.
 - [x] Implement durable journal and coordinator recovery/claim lifecycle.
-- [ ] Wire optional config, supervision, and capability-gated activation.
+- [x] Wire optional config, supervision, and capability-gated activation.
 - [ ] Negative-control focused guards and pass full verification.
 - [ ] Document, worklog, merge to main, rebuild, and runtime-check activation.
 

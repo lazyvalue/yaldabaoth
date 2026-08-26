@@ -13,5 +13,7 @@ pub mod wire;
 pub use coordinator::*;
 pub use journal::*;
 pub use provider::*;
-pub use transport::{CapabilityProbe, ClientError, CogClient, CogRuntimeTransport};
+pub use transport::{
+    CapabilityProbe, ClientError, CogClient, CogRuntimeTransport, UreqTransport, WakeStream,
+};
 pub use wire::*;

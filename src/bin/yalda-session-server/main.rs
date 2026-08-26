@@ -32,6 +32,7 @@ use yalda::cog_runtime::{
 use yalda::session_proto::*;
 
 mod bridge;
+mod cog_runtime;
 mod launchd;
 
 // ── Forwarder progress + published log snapshot (Bug 1) ─────────────
@@ -4001,6 +4002,11 @@ async fn main() -> io::Result<()> {
     // unconfigured (the common case); spec-external-chat-bridge.md.
     bridge::maybe_spawn_bridge(Arc::clone(&manager), bridge_evt_rx);
 
+    // Optional Cog runtime delivery is a supervised child of this process and
+    // reuses the manager-owned provider sessions. An absent/invalid/incompatible
+    // configuration is inert and never prevents the session server starting.
+    let cog_runtime = cog_runtime::spawn_if_configured(Arc::clone(&manager));
+
     // Handle graceful shutdown — persist sessions before exiting.
     // Listen for both SIGINT (Ctrl-C) and SIGTERM (kill / process manager).
     let mgr_shutdown = Arc::clone(&manager);
@@ -4021,6 +4027,9 @@ async fn main() -> io::Result<()> {
         #[cfg(not(unix))]
         {
             ctrl_c.await.ok();
+        }
+        if let Some(runtime) = cog_runtime {
+            runtime.shutdown().await;
         }
         // No explicit persist needed: each session's durable WAL is written
         // continuously (ADR-0009), so sessions already survive this shutdown

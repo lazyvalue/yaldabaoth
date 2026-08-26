@@ -43,6 +43,12 @@ pub enum ActivationStatus {
     InertCapabilitiesUnavailable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityStatus {
+    Compatible,
+    Unavailable,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DispatchAction {
     pub attempt_id: OpaqueId,
@@ -146,19 +152,12 @@ impl<T: CogRuntimeTransport> DeliveryCoordinator<T> {
     }
 
     pub fn activate(&mut self) -> Result<ActivationStatus, CoordinatorError> {
-        let capabilities = match self.client.probe_capabilities()? {
-            CapabilityProbe::Unavailable => {
+        match self.revalidate_capabilities()? {
+            CapabilityStatus::Unavailable => {
                 return Ok(ActivationStatus::InertCapabilitiesUnavailable);
             }
-            CapabilityProbe::Available(capabilities) => capabilities,
-        };
-        let providers = self.configured_providers();
-        if let Some(error) = capabilities.compatibility_error(&providers) {
-            return Err(CoordinatorError::Contract(format!(
-                "Cog runtime capabilities are incompatible: {error}"
-            )));
+            CapabilityStatus::Compatible => {}
         }
-        self.validate_limits(&capabilities)?;
 
         let current = match self.client.get_host_lease(&self.config.host_id) {
             Ok(response) => Some(response),
@@ -189,7 +188,7 @@ impl<T: CogRuntimeTransport> DeliveryCoordinator<T> {
                 instance_id: self.config.instance_id,
                 protocol_version: ProtocolOne::V1,
                 source_kinds: vec![SourceKind::Mail, SourceKind::Chat],
-                provider_kinds: providers,
+                provider_kinds: self.configured_providers(),
                 lease_seconds: self.config.host_lease_seconds,
                 takeover,
                 expected_host_fence,
@@ -203,6 +202,25 @@ impl<T: CogRuntimeTransport> DeliveryCoordinator<T> {
             host_fence: lease.lease.host_fence,
             eligible_addresses: self.eligible.keys().cloned().collect(),
         })
+    }
+
+    /// Re-negotiate the live contract without making a host, owner, attempt, or
+    /// journal mutation. Supervisors use this periodically so a withdrawn or
+    /// incompatible capability stops new delivery instead of relying on a
+    /// process restart.
+    pub fn revalidate_capabilities(&self) -> Result<CapabilityStatus, CoordinatorError> {
+        let capabilities = match self.client.probe_capabilities()? {
+            CapabilityProbe::Unavailable => return Ok(CapabilityStatus::Unavailable),
+            CapabilityProbe::Available(capabilities) => capabilities,
+        };
+        let providers = self.configured_providers();
+        if let Some(error) = capabilities.compatibility_error(&providers) {
+            return Err(CoordinatorError::Contract(format!(
+                "Cog runtime capabilities are incompatible: {error}"
+            )));
+        }
+        self.validate_limits(&capabilities)?;
+        Ok(CapabilityStatus::Compatible)
     }
 
     pub fn renew_host(&mut self) -> Result<(), CoordinatorError> {
@@ -993,15 +1011,17 @@ mod tests {
     fn capability_404_is_inert_before_any_mutation() {
         let dir = tempfile::tempdir().unwrap();
         let transport = Arc::new(ScriptedTransport::default());
-        transport
-            .responses
-            .lock()
-            .unwrap()
-            .push_back(Ok(HttpResponse {
-                status: 404,
-                headers: BTreeMap::new(),
-                body: Vec::new(),
-            }));
+        for _ in 0..2 {
+            transport
+                .responses
+                .lock()
+                .unwrap()
+                .push_back(Ok(HttpResponse {
+                    status: 404,
+                    headers: BTreeMap::new(),
+                    body: Vec::new(),
+                }));
+        }
         let journal = DeliveryJournal::open(dir.path().join("journal")).unwrap();
         let mut coordinator = DeliveryCoordinator::new(
             CogClient::from_shared(Arc::clone(&transport)),
@@ -1009,17 +1029,21 @@ mod tests {
             journal,
         );
         assert_eq!(
+            coordinator.revalidate_capabilities().unwrap(),
+            CapabilityStatus::Unavailable
+        );
+        assert_eq!(
             coordinator.activate().unwrap(),
             ActivationStatus::InertCapabilitiesUnavailable
         );
         let requests = transport.requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
+        assert_eq!(requests.len(), 2);
         assert_eq!(
-            requests[0].method,
+            requests[1].method,
             crate::cog_runtime::transport::HttpMethod::Get
         );
         assert_eq!(
-            requests[0].path_and_query,
+            requests[1].path_and_query,
             "/v1/runtime-delivery/capabilities"
         );
         assert_eq!(coordinator.journal.snapshot().next_seq, 1);
