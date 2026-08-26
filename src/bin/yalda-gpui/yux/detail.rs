@@ -62,8 +62,10 @@ pub(crate) fn kv_row(label: &str, value: String, st: &DetailStyle) -> gpui::Div 
         .font_family(st.mono.clone())
         .child(
             div()
-                .w(px(96.0))
+                .w(px(160.0))
                 .flex_none()
+                .whitespace_nowrap()
+                .overflow_hidden()
                 .text_color(st.dim)
                 .child(SharedString::from(label.to_string())),
         )
@@ -74,6 +76,33 @@ pub(crate) fn kv_row(label: &str, value: String, st: &DetailStyle) -> gpui::Div 
                 .text_color(st.fg)
                 .child(SharedString::from(value)),
         )
+}
+
+/// A compact labelled block whose detail is intentionally multiline. This is
+/// preferable to forcing activity lists or diagnostics into one wrapping
+/// key/value cell.
+pub(crate) fn detail_list_block(
+    label: &str,
+    detail: &str,
+    color: Hsla,
+    st: &DetailStyle,
+) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .gap(px(2.0))
+        .child(
+            div()
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .font_family(st.mono.clone())
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_size(px(st.pt * 0.82))
+                .text_color(st.dim)
+                .child(SharedString::from(label.to_string())),
+        )
+        .child(multiline_text(detail, color, &st.mono, st.base))
 }
 
 /// An underlined section heading.
@@ -285,12 +314,7 @@ pub(crate) fn compact_list_group_heading(
                 .child(SharedString::from(glyph.to_string())),
         )
         .child(SharedString::from(label.to_uppercase()))
-        .child(
-            div()
-                .flex_1()
-                .h(px(1.0))
-                .bg(hairline),
-        )
+        .child(div().flex_1().h(px(1.0)).bg(hairline))
         .child(
             div()
                 .text_color(quiet_tint)

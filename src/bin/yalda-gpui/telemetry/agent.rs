@@ -8,14 +8,19 @@
 //! presented as having zero tools, zero context occupancy, or zero cost.
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use super::super::*;
 use yalda::acp_channel::{AgentProvider, ToolCall, ToolCallStatus, ToolKind};
 
 pub(crate) const MAX_DISTINCT_TOOLS_PER_AGENT: usize = 64;
+pub(crate) const MAX_FAILURE_REASONS_PER_AGENT: usize = 64;
 const MAX_TOOL_NAME_CHARS: usize = 64;
+const MAX_FAILURE_REASON_CHARS: usize = 240;
 const OTHER_TOOLS_NAME: &str = "other-tools";
+const OTHER_FAILURE_REASONS: &str = "Other failure reasons";
+const NO_FAILURE_REASON: &str = "No reason reported";
 
 /// Coarse live state available for every roster row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -56,6 +61,16 @@ pub(crate) struct ToolMetricSnapshot {
     pub(crate) name: String,
     pub(crate) calls: usize,
     pub(crate) failures: usize,
+}
+
+/// One bounded diagnostic shared by identical failed calls. This intentionally
+/// omits call ids and inputs; `reason` is a short provider/tool-authored error
+/// excerpt and is not claimed to be secret-redacted.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ToolFailureMetricSnapshot {
+    pub(crate) tool: String,
+    pub(crate) reason: String,
+    pub(crate) count: usize,
 }
 
 impl ContextOccupancy {
@@ -110,6 +125,10 @@ pub(crate) struct AgentMetricSnapshot {
     pub(crate) row_id: String,
     pub(crate) session_id: Option<String>,
     pub(crate) label: String,
+    /// Session working directory used only for deterministic project grouping.
+    /// Older telemetry documents omit it and therefore render as Unassigned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cwd: Option<PathBuf>,
     pub(crate) provider: Option<AgentProvider>,
     pub(crate) model: Option<String>,
     pub(crate) state: AgentMetricState,
@@ -120,6 +139,10 @@ pub(crate) struct AgentMetricSnapshot {
     /// empty vector is a known loaded session with no observed tool calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) tool_usage: Option<Vec<ToolMetricSnapshot>>,
+    /// `None` is unknown legacy/unloaded coverage; `Some([])` is a loaded
+    /// session with no failed calls carrying diagnostic coverage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tool_failure_reasons: Option<Vec<ToolFailureMetricSnapshot>>,
     pub(crate) context: Option<ContextOccupancy>,
     /// Cumulative provider-reported cost when available.
     pub(crate) cost_usd: Option<f64>,
@@ -161,6 +184,7 @@ pub(crate) struct FleetMetricSnapshot {
 pub(crate) struct RosterAgentMetricFacts {
     pub(crate) session_id: String,
     pub(crate) label: String,
+    pub(crate) cwd: PathBuf,
     pub(crate) provider: Option<AgentProvider>,
     pub(crate) connected: bool,
     pub(crate) busy: bool,
@@ -173,6 +197,7 @@ impl From<&yalda::session_proto::SessionInfo> for RosterAgentMetricFacts {
         Self {
             session_id: info.session_id.clone(),
             label: info.label.clone(),
+            cwd: info.cwd.clone(),
             provider: Some(info.provider),
             connected: info.connected,
             busy: info.busy,
@@ -201,6 +226,7 @@ impl RosterAgentMetricFacts {
             row_id: self.session_id.clone(),
             session_id: Some(self.session_id),
             label: self.label,
+            cwd: Some(self.cwd),
             provider: self.provider,
             model: None,
             state,
@@ -208,6 +234,7 @@ impl RosterAgentMetricFacts {
             tool_total: None,
             tool_failures: None,
             tool_usage: None,
+            tool_failure_reasons: None,
             context: None,
             cost_usd: None,
             current_turn_elapsed: None,
@@ -222,6 +249,7 @@ pub(crate) struct LoadedAgentMetricFacts {
     pub(crate) local_id: String,
     pub(crate) session_id: Option<String>,
     pub(crate) label: String,
+    pub(crate) cwd: PathBuf,
     pub(crate) provider: Option<AgentProvider>,
     pub(crate) model: Option<String>,
     pub(crate) state: AgentMetricState,
@@ -229,6 +257,7 @@ pub(crate) struct LoadedAgentMetricFacts {
     pub(crate) tool_total: usize,
     pub(crate) tool_failures: usize,
     pub(crate) tool_usage: Vec<ToolMetricSnapshot>,
+    pub(crate) tool_failure_reasons: Vec<ToolFailureMetricSnapshot>,
     pub(crate) context: Option<ContextOccupancy>,
     pub(crate) cost_usd: Option<f64>,
     pub(crate) current_turn_elapsed: Option<Duration>,
@@ -243,6 +272,7 @@ impl LoadedAgentMetricFacts {
                 .unwrap_or_else(|| self.local_id.clone()),
             session_id: self.session_id,
             label: self.label,
+            cwd: Some(self.cwd),
             provider: self.provider,
             model: self.model,
             state: self.state,
@@ -250,6 +280,7 @@ impl LoadedAgentMetricFacts {
             tool_total: Some(self.tool_total),
             tool_failures: Some(self.tool_failures),
             tool_usage: Some(self.tool_usage),
+            tool_failure_reasons: Some(self.tool_failure_reasons),
             context: self.context,
             cost_usd: self.cost_usd,
             current_turn_elapsed: self.current_turn_elapsed,
@@ -282,10 +313,12 @@ pub(crate) fn aggregate_agent_metrics(
         if let Some(sid) = matched_sid {
             let row = rows.get_mut(&sid).expect("matched roster row exists");
             row.loaded = true;
+            row.cwd = Some(facts.cwd);
             row.model = facts.model;
             row.tool_total = Some(facts.tool_total);
             row.tool_failures = Some(facts.tool_failures);
             row.tool_usage = Some(facts.tool_usage);
+            row.tool_failure_reasons = Some(facts.tool_failure_reasons);
             row.context = facts.context;
             row.cost_usd = facts.cost_usd;
             row.current_turn_elapsed = facts.current_turn_elapsed;
@@ -419,6 +452,7 @@ pub(crate) fn collect_agent_metrics(
             };
             let turn_started = session.turn_phase.turn_started();
             let tool_usage = summarize_tool_usage(session.tools.calls.values());
+            let tool_failure_reasons = summarize_tool_failure_reasons(session.tools.calls.values());
             let tool_total = tool_usage.iter().map(|tool| tool.calls).sum();
             let tool_failures = tool_usage.iter().map(|tool| tool.failures).sum();
             let context = session.usage.as_ref().map(|usage| ContextOccupancy {
@@ -430,6 +464,7 @@ pub(crate) fn collect_agent_metrics(
                 local_id: format!("local:{}", id.0),
                 session_id: sid,
                 label: session.label.clone(),
+                cwd: session.cwd.clone(),
                 provider: Some(session.provider),
                 model: session.agent_model.clone(),
                 state: local_state,
@@ -437,6 +472,7 @@ pub(crate) fn collect_agent_metrics(
                 tool_total,
                 tool_failures,
                 tool_usage,
+                tool_failure_reasons,
                 context,
                 cost_usd: session.usage.as_ref().and_then(|usage| usage.cost_usd),
                 current_turn_elapsed: turn_started
@@ -541,6 +577,112 @@ fn summarize_tool_usage<'a>(
     kept
 }
 
+fn summarize_tool_failure_reasons<'a>(
+    calls: impl IntoIterator<Item = &'a ToolCall>,
+) -> Vec<ToolFailureMetricSnapshot> {
+    let mut grouped: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for call in calls {
+        if call.status != ToolCallStatus::Failed {
+            continue;
+        }
+        let key = (telemetry_tool_name(call), tool_failure_reason(call));
+        let count = grouped.entry(key).or_default();
+        *count = count.saturating_add(1);
+    }
+
+    if grouped.len() <= MAX_FAILURE_REASONS_PER_AGENT {
+        return grouped
+            .into_iter()
+            .map(|((tool, reason), count)| ToolFailureMetricSnapshot {
+                tool,
+                reason,
+                count,
+            })
+            .collect();
+    }
+
+    let overflow_key = (
+        OTHER_TOOLS_NAME.to_string(),
+        OTHER_FAILURE_REASONS.to_string(),
+    );
+    let mut overflow = grouped.remove(&overflow_key).unwrap_or(0);
+    let mut kept = Vec::with_capacity(MAX_FAILURE_REASONS_PER_AGENT);
+    for ((tool, reason), count) in grouped {
+        if kept.len() < MAX_FAILURE_REASONS_PER_AGENT - 1 {
+            kept.push(ToolFailureMetricSnapshot {
+                tool,
+                reason,
+                count,
+            });
+        } else {
+            overflow = overflow.saturating_add(count);
+        }
+    }
+    kept.push(ToolFailureMetricSnapshot {
+        tool: OTHER_TOOLS_NAME.to_string(),
+        reason: OTHER_FAILURE_REASONS.to_string(),
+        count: overflow,
+    });
+    kept
+}
+
+fn tool_failure_reason(call: &ToolCall) -> String {
+    failure_reason_from_json(call.raw_output.as_ref())
+        .or_else(|| {
+            call.content.iter().find_map(|content| {
+                let yalda::acp_channel::ToolCallContent::Content(content) = content else {
+                    return None;
+                };
+                let agent_client_protocol::schema::ContentBlock::Text(text) = &content.content
+                else {
+                    return None;
+                };
+                normalize_failure_reason(&text.text)
+            })
+        })
+        .unwrap_or_else(|| NO_FAILURE_REASON.to_string())
+}
+
+fn failure_reason_from_json(value: Option<&serde_json::Value>) -> Option<String> {
+    let value = value?;
+    match value {
+        serde_json::Value::String(value) => normalize_failure_reason(value),
+        serde_json::Value::Object(map) => {
+            for key in ["error", "message", "stderr"] {
+                let Some(value) = map.get(key) else {
+                    continue;
+                };
+                if let Some(reason) = failure_reason_from_json(Some(value)) {
+                    return Some(reason);
+                }
+            }
+            for key in ["exit_code", "exitCode"] {
+                if let Some(code) = map.get(key).and_then(serde_json::Value::as_i64) {
+                    return Some(format!("Exit code {code}"));
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn normalize_failure_reason(value: &str) -> Option<String> {
+    let collapsed = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    if collapsed.chars().count() <= MAX_FAILURE_REASON_CHARS {
+        return Some(collapsed);
+    }
+    let mut bounded = collapsed
+        .chars()
+        .take(MAX_FAILURE_REASON_CHARS.saturating_sub(1))
+        .collect::<String>();
+    bounded.push('…');
+    Some(bounded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -555,6 +697,7 @@ mod tests {
         RosterAgentMetricFacts {
             session_id: sid.into(),
             label: label.into(),
+            cwd: PathBuf::from(format!("/projects/{label}")),
             provider: Some(AgentProvider::Claude),
             connected,
             busy,
@@ -568,6 +711,7 @@ mod tests {
             local_id: format!("local:{label}"),
             session_id: sid.map(str::to_string),
             label: label.into(),
+            cwd: PathBuf::from(format!("/projects/{label}")),
             provider: Some(AgentProvider::Codex),
             model: Some("gpt-test".into()),
             state: AgentMetricState::Ready,
@@ -586,6 +730,11 @@ mod tests {
                     failures: 2,
                 },
             ],
+            tool_failure_reasons: vec![ToolFailureMetricSnapshot {
+                tool: "bash".into(),
+                reason: "Exit code 1".into(),
+                count: 2,
+            }],
             context: Some(ContextOccupancy {
                 used: 25,
                 capacity: 100,
@@ -631,6 +780,7 @@ mod tests {
         assert_eq!(ready.tool_total, None, "unloaded tools are unavailable");
         assert_eq!(ready.tool_failures, None);
         assert_eq!(ready.tool_usage, None);
+        assert_eq!(ready.tool_failure_reasons, None);
         assert_eq!(ready.context, None);
         assert_eq!(ready.cost_usd, None);
         assert_eq!(ready.model, None);
@@ -668,6 +818,10 @@ mod tests {
         assert_eq!(server.tool_usage.as_ref().unwrap().len(), 2);
         assert_eq!(server.tool_usage.as_ref().unwrap()[1].name, "bash");
         assert_eq!(server.tool_usage.as_ref().unwrap()[1].failures, 2);
+        assert_eq!(
+            server.tool_failure_reasons.as_ref().unwrap()[0].reason,
+            "Exit code 1"
+        );
         assert_eq!(server.current_turn_elapsed, Some(Duration::from_secs(12)));
         assert!(
             snapshot
@@ -787,6 +941,82 @@ mod tests {
         assert_eq!(bounded.len(), MAX_DISTINCT_TOOLS_PER_AGENT);
         assert_eq!(bounded.last().unwrap().name, OTHER_TOOLS_NAME);
         assert_eq!(bounded.last().unwrap().calls, 7);
+    }
+
+    #[test]
+    fn failed_tool_diagnostics_are_bounded_grouped_and_ignore_inputs_and_successes() {
+        let mut failed = ToolCall::new("failed-1", "Bash");
+        failed.kind = ToolKind::Execute;
+        failed.status = ToolCallStatus::Failed;
+        failed.raw_input = Some(serde_json::json!({"command": "private-input"}));
+        failed.raw_output = Some(serde_json::json!({
+            "stderr": "  Permission denied\nwhile opening /tmp/example  "
+        }));
+        let mut duplicate = failed.clone();
+        duplicate.tool_call_id = "failed-2".into();
+
+        let mut nested = ToolCall::new("failed-3", "Read");
+        nested.status = ToolCallStatus::Failed;
+        nested.raw_output = Some(serde_json::json!({
+            "error": {"message": "missing file"}
+        }));
+
+        let mut without_reason = ToolCall::new("failed-4", "Search");
+        without_reason.status = ToolCallStatus::Failed;
+
+        let mut success = ToolCall::new("success-1", "Bash");
+        success.status = ToolCallStatus::Completed;
+        success.raw_output = Some(serde_json::json!({"stderr": "private-success-output"}));
+
+        let diagnostics = summarize_tool_failure_reasons([
+            &failed,
+            &duplicate,
+            &nested,
+            &without_reason,
+            &success,
+        ]);
+        assert_eq!(
+            diagnostics,
+            vec![
+                ToolFailureMetricSnapshot {
+                    tool: "bash".into(),
+                    reason: "Permission denied while opening /tmp/example".into(),
+                    count: 2,
+                },
+                ToolFailureMetricSnapshot {
+                    tool: "read".into(),
+                    reason: "missing file".into(),
+                    count: 1,
+                },
+                ToolFailureMetricSnapshot {
+                    tool: "search".into(),
+                    reason: NO_FAILURE_REASON.into(),
+                    count: 1,
+                },
+            ]
+        );
+        let encoded = serde_json::to_string(&diagnostics).unwrap();
+        assert!(!encoded.contains("private-input"));
+        assert!(!encoded.contains("private-success-output"));
+
+        let bounded = normalize_failure_reason(&"x".repeat(MAX_FAILURE_REASON_CHARS + 10)).unwrap();
+        assert_eq!(bounded.chars().count(), MAX_FAILURE_REASON_CHARS);
+        assert!(bounded.ends_with('…'));
+
+        let many = (0..(MAX_FAILURE_REASONS_PER_AGENT + 5))
+            .map(|index| {
+                let mut call = ToolCall::new(format!("failed-{index}"), "Bash");
+                call.status = ToolCallStatus::Failed;
+                call.raw_output =
+                    Some(serde_json::json!({"message": format!("failure-{index:03}")}));
+                call
+            })
+            .collect::<Vec<_>>();
+        let bounded = summarize_tool_failure_reasons(many.iter());
+        assert_eq!(bounded.len(), MAX_FAILURE_REASONS_PER_AGENT);
+        assert_eq!(bounded.last().unwrap().tool, OTHER_TOOLS_NAME);
+        assert_eq!(bounded.last().unwrap().reason, OTHER_FAILURE_REASONS);
+        assert_eq!(bounded.last().unwrap().count, 6);
     }
 
     #[test]
