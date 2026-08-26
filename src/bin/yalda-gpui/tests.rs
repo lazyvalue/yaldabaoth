@@ -4390,6 +4390,7 @@ fn compose_draft_persist_roundtrip() {
                 cwd: cwd.to_path_buf(),
                 compose_draft: Some("persisted draft".into()),
                 summary: None,
+                unread: false,
             },
             persist::SessionSnapshot {
                 id: "S-empty".into(),
@@ -4403,6 +4404,7 @@ fn compose_draft_persist_roundtrip() {
                 cwd: cwd.to_path_buf(),
                 compose_draft: None,
                 summary: None,
+                unread: false,
             },
         ];
         persist::save_persisted_acp_sessions(cwd, &snaps);

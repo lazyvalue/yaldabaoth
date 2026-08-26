@@ -6161,6 +6161,7 @@ fn multi_session_persistence_round_trips_distinct_sids() {
             cwd: cwd.clone(),
             compose_draft: None,
             summary: None,
+            unread: false,
         },
         SessionSnapshot {
             id: "SID-B".into(),
@@ -6175,6 +6176,7 @@ fn multi_session_persistence_round_trips_distinct_sids() {
             cwd: cwd.clone(),
             compose_draft: None,
             summary: None,
+            unread: false,
         },
     ];
 
@@ -23858,6 +23860,7 @@ fn renamed_session_label_round_trips_unchanged() {
             cwd: cwd.clone(),
             compose_draft: None,
             summary: None,
+            unread: false,
         },
         SessionSnapshot {
             id: "sid-beta".into(),
@@ -23871,6 +23874,7 @@ fn renamed_session_label_round_trips_unchanged() {
             cwd: cwd.clone(),
             compose_draft: None,
             summary: None,
+            unread: false,
         },
     ];
     let loaded = with_acp_persist_path(file.clone(), || {
@@ -23882,6 +23886,58 @@ fn renamed_session_label_round_trips_unchanged() {
         labels,
         vec!["my important agent".to_string(), "reviewer".to_string()],
         "custom labels must survive save→load verbatim, never revert to claude-N"
+    );
+}
+
+/// The jump-panel unread dot survives a restart: an UNREAD session round-trips
+/// through the REAL save + load path as unread, and a READ session stays read.
+/// Before the fix `unread` was in-memory only and every restored session came
+/// back read. Negative control: drop the `if snap.unread { … }` writer in
+/// `save_persisted_acp_sessions` (or the reader in `load_persisted_acp_sessions`)
+/// and `unread_alpha` loads as `false` — this assertion fires.
+#[test]
+fn session_unread_state_round_trips_through_save_load() {
+    use crate::InputModeKind;
+    use crate::persist::{
+        SessionSnapshot, load_persisted_acp_sessions, save_persisted_acp_sessions,
+        with_acp_persist_path,
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("acp_sessions.json");
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mk = |id: &str, unread: bool| SessionSnapshot {
+        id: id.into(),
+        label: id.into(),
+        provider: yalda::acp_channel::AgentProvider::Claude,
+        active: false,
+        mode: InputModeKind::Worksheet,
+        tasklist_open: false,
+        subagents_open: false,
+        sidepanel_hidden: false,
+        cwd: cwd.clone(),
+        compose_draft: None,
+        summary: None,
+        unread,
+    };
+    let snaps = vec![mk("unread_alpha", true), mk("read_beta", false)];
+    let loaded = with_acp_persist_path(file.clone(), || {
+        save_persisted_acp_sessions(&cwd, &snaps);
+        load_persisted_acp_sessions(&cwd)
+    });
+    let unread_of = |id: &str| {
+        loaded
+            .iter()
+            .find(|s| s.id.to_string() == id)
+            .unwrap_or_else(|| panic!("slot {id} missing after load"))
+            .unread
+    };
+    assert!(
+        unread_of("unread_alpha"),
+        "an unread session must restore as unread (the jump-panel dot survives restart)"
+    );
+    assert!(
+        !unread_of("read_beta"),
+        "a read session must restore as read"
     );
 }
 
