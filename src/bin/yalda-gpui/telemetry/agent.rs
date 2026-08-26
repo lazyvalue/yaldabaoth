@@ -11,7 +11,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
 use super::super::*;
-use yalda::acp_channel::{AgentProvider, ToolCallStatus};
+use yalda::acp_channel::{AgentProvider, ToolCall, ToolCallStatus, ToolKind};
+
+pub(crate) const MAX_DISTINCT_TOOLS_PER_AGENT: usize = 64;
+const MAX_TOOL_NAME_CHARS: usize = 64;
+const OTHER_TOOLS_NAME: &str = "other-tools";
 
 /// Coarse live state available for every roster row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -43,6 +47,15 @@ impl AgentMetricState {
 pub(crate) struct ContextOccupancy {
     pub(crate) used: u64,
     pub(crate) capacity: u64,
+}
+
+/// Privacy-safe cumulative counts for one normalized tool name. No call id,
+/// input, output, content, location, prompt, or error text crosses this boundary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ToolMetricSnapshot {
+    pub(crate) name: String,
+    pub(crate) calls: usize,
+    pub(crate) failures: usize,
 }
 
 impl ContextOccupancy {
@@ -103,6 +116,10 @@ pub(crate) struct AgentMetricSnapshot {
     pub(crate) settled_turns: Option<usize>,
     pub(crate) tool_total: Option<usize>,
     pub(crate) tool_failures: Option<usize>,
+    /// `None` means this session was not loaded and coverage is unknown. An
+    /// empty vector is a known loaded session with no observed tool calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tool_usage: Option<Vec<ToolMetricSnapshot>>,
     pub(crate) context: Option<ContextOccupancy>,
     /// Cumulative provider-reported cost when available.
     pub(crate) cost_usd: Option<f64>,
@@ -190,6 +207,7 @@ impl RosterAgentMetricFacts {
             settled_turns: self.settled_turns,
             tool_total: None,
             tool_failures: None,
+            tool_usage: None,
             context: None,
             cost_usd: None,
             current_turn_elapsed: None,
@@ -210,6 +228,7 @@ pub(crate) struct LoadedAgentMetricFacts {
     pub(crate) settled_turns: Option<usize>,
     pub(crate) tool_total: usize,
     pub(crate) tool_failures: usize,
+    pub(crate) tool_usage: Vec<ToolMetricSnapshot>,
     pub(crate) context: Option<ContextOccupancy>,
     pub(crate) cost_usd: Option<f64>,
     pub(crate) current_turn_elapsed: Option<Duration>,
@@ -230,6 +249,7 @@ impl LoadedAgentMetricFacts {
             settled_turns: self.settled_turns,
             tool_total: Some(self.tool_total),
             tool_failures: Some(self.tool_failures),
+            tool_usage: Some(self.tool_usage),
             context: self.context,
             cost_usd: self.cost_usd,
             current_turn_elapsed: self.current_turn_elapsed,
@@ -265,6 +285,7 @@ pub(crate) fn aggregate_agent_metrics(
             row.model = facts.model;
             row.tool_total = Some(facts.tool_total);
             row.tool_failures = Some(facts.tool_failures);
+            row.tool_usage = Some(facts.tool_usage);
             row.context = facts.context;
             row.cost_usd = facts.cost_usd;
             row.current_turn_elapsed = facts.current_turn_elapsed;
@@ -397,12 +418,9 @@ pub(crate) fn collect_agent_metrics(
                 AgentMetricState::Unavailable
             };
             let turn_started = session.turn_phase.turn_started();
-            let tool_failures = session
-                .tools
-                .calls
-                .values()
-                .filter(|call| call.status == ToolCallStatus::Failed)
-                .count();
+            let tool_usage = summarize_tool_usage(session.tools.calls.values());
+            let tool_total = tool_usage.iter().map(|tool| tool.calls).sum();
+            let tool_failures = tool_usage.iter().map(|tool| tool.failures).sum();
             let context = session.usage.as_ref().map(|usage| ContextOccupancy {
                 used: usage.tokens_used,
                 capacity: usage.tokens_total,
@@ -416,8 +434,9 @@ pub(crate) fn collect_agent_metrics(
                 model: session.agent_model.clone(),
                 state: local_state,
                 settled_turns: Some(session.replay_turns.last_seen),
-                tool_total: session.tools.calls.len(),
+                tool_total,
                 tool_failures,
+                tool_usage,
                 context,
                 cost_usd: session.usage.as_ref().and_then(|usage| usage.cost_usd),
                 current_turn_elapsed: turn_started
@@ -427,6 +446,99 @@ pub(crate) fn collect_agent_metrics(
         .collect::<Vec<_>>();
 
     aggregate_agent_metrics(roster_facts, loaded_facts)
+}
+
+/// Prefer provider-reported identifiers, then a safe title token, then the
+/// coarse ACP kind. The accepted alphabet prevents a descriptive title or
+/// payload fragment from becoming durable telemetry by accident.
+pub(crate) fn telemetry_tool_name(call: &ToolCall) -> String {
+    let metadata_name = call.meta.as_ref().and_then(|meta| {
+        ["claudeCode", "codex"]
+            .into_iter()
+            .find_map(|namespace| {
+                meta.get(namespace)
+                    .and_then(|value| value.as_object())
+                    .and_then(|value| value.get("toolName"))
+                    .and_then(|value| value.as_str())
+            })
+            .or_else(|| meta.get("toolName").and_then(|value| value.as_str()))
+    });
+    metadata_name
+        .and_then(normalize_tool_name)
+        .or_else(|| normalize_tool_name(call.title.trim()))
+        .unwrap_or_else(|| coarse_tool_name(&call.kind).to_string())
+}
+
+fn normalize_tool_name(candidate: &str) -> Option<String> {
+    let candidate = candidate.trim_matches(|character: char| {
+        !character.is_ascii_alphanumeric() && !matches!(character, '_' | '-' | '.' | ':')
+    });
+    if candidate.is_empty()
+        || candidate.chars().count() > MAX_TOOL_NAME_CHARS
+        || !candidate.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':')
+        })
+    {
+        return None;
+    }
+    Some(candidate.to_ascii_lowercase())
+}
+
+fn coarse_tool_name(kind: &ToolKind) -> &'static str {
+    match kind {
+        ToolKind::Read => "read",
+        ToolKind::Edit => "edit",
+        ToolKind::Search => "search",
+        ToolKind::Execute => "run",
+        ToolKind::Move => "move",
+        ToolKind::Delete => "delete",
+        ToolKind::Fetch => "fetch",
+        ToolKind::Think => "think",
+        ToolKind::SwitchMode => "mode",
+        ToolKind::Other => "tool",
+        _ => "tool",
+    }
+}
+
+fn summarize_tool_usage<'a>(
+    calls: impl IntoIterator<Item = &'a ToolCall>,
+) -> Vec<ToolMetricSnapshot> {
+    let mut by_name: BTreeMap<String, ToolMetricSnapshot> = BTreeMap::new();
+    for call in calls {
+        let name = telemetry_tool_name(call);
+        let entry = by_name.entry(name.clone()).or_insert(ToolMetricSnapshot {
+            name,
+            calls: 0,
+            failures: 0,
+        });
+        entry.calls = entry.calls.saturating_add(1);
+        if call.status == ToolCallStatus::Failed {
+            entry.failures = entry.failures.saturating_add(1);
+        }
+    }
+
+    if by_name.len() <= MAX_DISTINCT_TOOLS_PER_AGENT {
+        return by_name.into_values().collect();
+    }
+
+    let mut overflow = by_name
+        .remove(OTHER_TOOLS_NAME)
+        .unwrap_or(ToolMetricSnapshot {
+            name: OTHER_TOOLS_NAME.to_string(),
+            calls: 0,
+            failures: 0,
+        });
+    let mut kept = Vec::with_capacity(MAX_DISTINCT_TOOLS_PER_AGENT);
+    for (_, tool) in by_name {
+        if kept.len() < MAX_DISTINCT_TOOLS_PER_AGENT - 1 {
+            kept.push(tool);
+        } else {
+            overflow.calls = overflow.calls.saturating_add(tool.calls);
+            overflow.failures = overflow.failures.saturating_add(tool.failures);
+        }
+    }
+    kept.push(overflow);
+    kept
 }
 
 #[cfg(test)]
@@ -462,6 +574,18 @@ mod tests {
             settled_turns: Some(4),
             tool_total: 6,
             tool_failures: 2,
+            tool_usage: vec![
+                ToolMetricSnapshot {
+                    name: "read".into(),
+                    calls: 4,
+                    failures: 0,
+                },
+                ToolMetricSnapshot {
+                    name: "bash".into(),
+                    calls: 2,
+                    failures: 2,
+                },
+            ],
             context: Some(ContextOccupancy {
                 used: 25,
                 capacity: 100,
@@ -506,6 +630,7 @@ mod tests {
         assert_eq!(ready.settled_turns, Some(3), "roster turns are known");
         assert_eq!(ready.tool_total, None, "unloaded tools are unavailable");
         assert_eq!(ready.tool_failures, None);
+        assert_eq!(ready.tool_usage, None);
         assert_eq!(ready.context, None);
         assert_eq!(ready.cost_usd, None);
         assert_eq!(ready.model, None);
@@ -540,6 +665,9 @@ mod tests {
         );
         assert_eq!(server.tool_total, Some(6));
         assert_eq!(server.tool_failures, Some(2));
+        assert_eq!(server.tool_usage.as_ref().unwrap().len(), 2);
+        assert_eq!(server.tool_usage.as_ref().unwrap()[1].name, "bash");
+        assert_eq!(server.tool_usage.as_ref().unwrap()[1].failures, 2);
         assert_eq!(server.current_turn_elapsed, Some(Duration::from_secs(12)));
         assert!(
             snapshot
@@ -591,6 +719,74 @@ mod tests {
         assert_eq!(snapshot.averages.context_percent.mean, None);
         assert_eq!(snapshot.averages.cost_usd.mean, None);
         assert_eq!(snapshot.averages.current_turn_elapsed_secs.mean, None);
+    }
+
+    #[test]
+    fn loaded_agent_tool_usage_is_normalized_bounded_and_grouped() {
+        assert_eq!(normalize_tool_name(""), None);
+        assert_eq!(normalize_tool_name("!!Read!!").as_deref(), Some("read"));
+        assert_eq!(
+            normalize_tool_name("mcp__read").as_deref(),
+            Some("mcp__read")
+        );
+        assert!(normalize_tool_name(&"a".repeat(MAX_TOOL_NAME_CHARS)).is_some());
+        assert_eq!(
+            normalize_tool_name(&"a".repeat(MAX_TOOL_NAME_CHARS + 1)),
+            None
+        );
+        assert_eq!(
+            normalize_tool_name(&"a".repeat(MAX_TOOL_NAME_CHARS + 2)),
+            None
+        );
+
+        let mut multiword = ToolCall::new("multiword", "Read private/file.rs");
+        multiword.kind = ToolKind::Read;
+        assert_eq!(telemetry_tool_name(&multiword), "read");
+
+        let mut namespaced = ToolCall::new("namespaced", "Fallback");
+        namespaced.meta = serde_json::json!({"codex": {"toolName": "MCP__Repo__Search"}})
+            .as_object()
+            .cloned();
+        assert_eq!(telemetry_tool_name(&namespaced), "mcp__repo__search");
+
+        let mut read = ToolCall::new("read-1", "Find a file");
+        read.meta = serde_json::json!({"claudeCode": {"toolName": "Read"}})
+            .as_object()
+            .cloned();
+        let mut failed_read = read.clone();
+        failed_read.tool_call_id = "read-2".into();
+        failed_read.status = ToolCallStatus::Failed;
+        let mut shell = ToolCall::new("shell-1", "Bash");
+        shell.status = ToolCallStatus::Completed;
+        shell.raw_input = Some(serde_json::json!({"command": "private-command"}));
+
+        let usage = summarize_tool_usage([&read, &failed_read, &shell]);
+        assert_eq!(
+            usage,
+            vec![
+                ToolMetricSnapshot {
+                    name: "bash".into(),
+                    calls: 1,
+                    failures: 0,
+                },
+                ToolMetricSnapshot {
+                    name: "read".into(),
+                    calls: 2,
+                    failures: 1,
+                },
+            ]
+        );
+        let encoded = serde_json::to_string(&usage).unwrap();
+        assert!(!encoded.contains("private-command"));
+        assert!(!encoded.contains("shell-1"));
+
+        let calls = (0..(MAX_DISTINCT_TOOLS_PER_AGENT + 6))
+            .map(|index| ToolCall::new(format!("id-{index}"), format!("tool-{index:03}")))
+            .collect::<Vec<_>>();
+        let bounded = summarize_tool_usage(calls.iter());
+        assert_eq!(bounded.len(), MAX_DISTINCT_TOOLS_PER_AGENT);
+        assert_eq!(bounded.last().unwrap().name, OTHER_TOOLS_NAME);
+        assert_eq!(bounded.last().unwrap().calls, 7);
     }
 
     #[test]

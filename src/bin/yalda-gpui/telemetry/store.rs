@@ -373,6 +373,11 @@ mod tests {
                 settled_turns: Some(3),
                 tool_total: Some(tools),
                 tool_failures: Some(1),
+                tool_usage: Some(vec![crate::ToolMetricSnapshot {
+                    name: "read".into(),
+                    calls: tools,
+                    failures: 1,
+                }]),
                 context: Some(ContextOccupancy {
                     used: 25,
                     capacity: 100,
@@ -448,6 +453,14 @@ mod tests {
             let restored = TelemetryStore::load();
             assert_eq!(restored, store);
             assert_eq!(restored.latest_agent().unwrap().captured_at_unix_ms, 1_000);
+            assert_eq!(
+                restored.latest_agent().unwrap().snapshot.agents[0]
+                    .tool_usage
+                    .as_ref()
+                    .unwrap()[0]
+                    .name,
+                "read"
+            );
             let restored_repository = restored.latest_repository(&repository_root).unwrap();
             assert_eq!(restored_repository.captured_at_unix_ms, 2_000);
             assert_eq!(restored_repository.snapshot.tracked_files, 7);
@@ -581,6 +594,28 @@ mod tests {
             assert_eq!(snapshot.ready, 1);
             assert_eq!(snapshot.archived, 0);
             assert_eq!(snapshot.agents[0].state, AgentMetricState::Ready);
+        });
+    }
+
+    #[test]
+    fn older_v1_documents_load_with_unknown_tool_coverage() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("telemetry.json");
+        with_telemetry_store_path(path.clone(), || {
+            let mut store = TelemetryStore::default();
+            assert!(store.record_agent(1_000, fleet(AgentMetricState::Ready, 2)));
+            let mut document = serde_json::to_value(&store).unwrap();
+            document["agent_history"][0]["snapshot"]["agents"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("tool_usage");
+            fs::write(&path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+            let restored = TelemetryStore::load();
+            let agent = &restored.latest_agent().unwrap().snapshot.agents[0];
+            assert_eq!(agent.tool_total, Some(2));
+            assert_eq!(agent.tool_failures, Some(1));
+            assert_eq!(agent.tool_usage, None, "missing additive field is unknown");
         });
     }
 
