@@ -954,6 +954,23 @@ mod tests {
         }
     }
 
+    fn delivery_entry(source_kind: SourceKind, source_id: &str, event_id: u64) -> DeliveryEntry {
+        DeliveryEntry {
+            event_id: DecimalU64(event_id),
+            source_kind,
+            source_id: OpaqueId::new(source_id).unwrap(),
+            source_name: source_id.into(),
+            topic_addresses: vec!["projects/cog/mail".into()],
+            entry_id: OpaqueId::new(format!("entry-{event_id}")).unwrap(),
+            from: OpaqueId::new("peer").unwrap(),
+            audit_actor: "peer-actor".into(),
+            at: timestamp(),
+            content: serde_json::json!({"message":format!("entry {event_id}")}),
+            content_size_bytes: DecimalU64(8),
+            references: Vec::new(),
+        }
+    }
+
     fn capabilities_json() -> serde_json::Value {
         serde_json::json!({
             "schema_version":"1",
@@ -1104,6 +1121,117 @@ mod tests {
     }
 
     #[test]
+    fn activation_renews_the_same_live_instance_without_takeover() {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = Arc::new(ScriptedTransport::default());
+        transport.push_json(200, capabilities_json());
+        transport.push_json(
+            200,
+            lease_json(ProtocolUuid::from_uuid(uuid::Uuid::nil()), 7, true),
+        );
+        transport.push_json(
+            200,
+            lease_json(ProtocolUuid::from_uuid(uuid::Uuid::nil()), 8, true),
+        );
+        transport.push_json(
+            200,
+            serde_json::json!({
+                "schema_version":"1", "address_id":"address",
+                "owner":{"mode":"external","host_id":"yalda-host","owner_generation":"3"},
+                "server_time":timestamp().as_str()
+            }),
+        );
+        transport.push_json(
+            200,
+            serde_json::json!({
+                "schema_version":"1", "attempts":[], "server_time":timestamp().as_str()
+            }),
+        );
+        let journal = DeliveryJournal::open(dir.path().join("journal")).unwrap();
+        let mut coordinator = DeliveryCoordinator::new(
+            CogClient::from_shared(Arc::clone(&transport)),
+            config(vec![route("address", "session")]),
+            journal,
+        );
+
+        assert_eq!(
+            coordinator.activate().unwrap(),
+            ActivationStatus::Active {
+                host_fence: DecimalU64(8),
+                eligible_addresses: vec![OpaqueId::new("address").unwrap()]
+            }
+        );
+        let requests = transport.requests.lock().unwrap();
+        let lease_body: serde_json::Value = serde_json::from_slice(&requests[2].body).unwrap();
+        assert_eq!(lease_body["takeover"], false);
+        assert_eq!(lease_body["expected_host_fence"], "7");
+    }
+
+    #[test]
+    fn explicit_route_selection_cas_transfers_owner_to_the_runtime_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = Arc::new(ScriptedTransport::default());
+        transport.push_json(200, capabilities_json());
+        transport.push_json(
+            404,
+            serde_json::json!({"error":{
+                "code":"host_not_found", "message":"missing", "retryable":false,
+                "details":{}
+            }}),
+        );
+        transport.push_json(
+            200,
+            lease_json(ProtocolUuid::from_uuid(uuid::Uuid::nil()), 1, true),
+        );
+        transport.push_json(
+            200,
+            serde_json::json!({
+                "schema_version":"1", "address_id":"address",
+                "owner":{"mode":"cogd","owner_generation":"2"},
+                "server_time":timestamp().as_str()
+            }),
+        );
+        transport.push_json(
+            200,
+            serde_json::json!({
+                "schema_version":"1", "address_id":"address",
+                "owner":{"mode":"external","host_id":"yalda-host","owner_generation":"3"},
+                "server_time":timestamp().as_str()
+            }),
+        );
+        transport.push_json(
+            200,
+            serde_json::json!({
+                "schema_version":"1", "attempts":[], "server_time":timestamp().as_str()
+            }),
+        );
+        let mut runtime_config = config(vec![route("address", "session")]);
+        runtime_config.reconcile_ownership = true;
+        let journal = DeliveryJournal::open(dir.path().join("journal")).unwrap();
+        let mut coordinator = DeliveryCoordinator::new(
+            CogClient::from_shared(Arc::clone(&transport)),
+            runtime_config,
+            journal,
+        );
+        assert!(matches!(
+            coordinator.activate().unwrap(),
+            ActivationStatus::Active { .. }
+        ));
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 6);
+        assert_eq!(
+            requests[4].method,
+            crate::cog_runtime::transport::HttpMethod::Put
+        );
+        let body: serde_json::Value = serde_json::from_slice(&requests[4].body).unwrap();
+        assert_eq!(body["expected_owner_generation"], "2");
+        assert_eq!(
+            body["owner"],
+            serde_json::json!({"mode":"external","host_id":"yalda-host"})
+        );
+    }
+
+    #[test]
     fn live_other_instance_requires_explicit_takeover_before_mutation() {
         let dir = tempfile::tempdir().unwrap();
         let transport = Arc::new(ScriptedTransport::default());
@@ -1201,6 +1329,128 @@ mod tests {
         let requests = transport.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].body, requests[1].body, "idempotent retry body");
+    }
+
+    #[test]
+    fn mixed_mail_chat_batch_preserves_order_and_never_submits_a_cursor_advance() {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = Arc::new(ScriptedTransport::default());
+        let journal = DeliveryJournal::open(dir.path().join("journal")).unwrap();
+        let mut coordinator = coordinator(
+            Arc::clone(&transport),
+            journal,
+            vec![route("address", "session")],
+        );
+        let mut attempt = claimed_attempt("address", 1);
+        let chat_id = OpaqueId::new("chat-1").unwrap();
+        attempt.common.oversize = true;
+        attempt.common.cursor_before.points = vec![
+            CursorPoint {
+                owner: CursorOwner::Mail,
+                position: DecimalU64(10),
+            },
+            CursorPoint {
+                owner: CursorOwner::Chat {
+                    chat_id: chat_id.clone(),
+                },
+                position: DecimalU64(20),
+            },
+        ];
+        attempt.common.cursor_through.points = vec![
+            CursorPoint {
+                owner: CursorOwner::Mail,
+                position: DecimalU64(11),
+            },
+            CursorPoint {
+                owner: CursorOwner::Chat {
+                    chat_id: chat_id.clone(),
+                },
+                position: DecimalU64(21),
+            },
+        ];
+        attempt.common.advances = vec![
+            CursorAdvance {
+                owner: CursorOwner::Mail,
+                before: DecimalU64(10),
+                through: DecimalU64(11),
+            },
+            CursorAdvance {
+                owner: CursorOwner::Chat { chat_id },
+                before: DecimalU64(20),
+                through: DecimalU64(21),
+            },
+        ];
+        attempt.common.entries = vec![
+            delivery_entry(SourceKind::Mail, "mail-1", 11),
+            delivery_entry(SourceKind::Chat, "chat-1", 21),
+        ];
+        let attempt_id = attempt.common.attempt_id.clone();
+        let cursor_before = attempt.common.cursor_before.clone();
+        let cursor_after = attempt.common.cursor_through.clone();
+        let completed_common = attempt.common.clone();
+        let action = coordinator
+            .admit_claimed_attempt(attempt)
+            .unwrap()
+            .expect("one coalesced provider dispatch");
+        assert_eq!(action.request.envelope.entries.len(), 2);
+        assert_eq!(
+            action.request.envelope.entries[0].source_kind,
+            SourceKind::Mail
+        );
+        assert_eq!(
+            action.request.envelope.entries[1].source_kind,
+            SourceKind::Chat
+        );
+        assert!(
+            transport.requests.lock().unwrap().is_empty(),
+            "provider dispatch alone must not acknowledge Cog or move a cursor"
+        );
+
+        let provider = ProviderReceipt {
+            kind: ProviderKind::Codex,
+            session_id: OpaqueId::new("provider-session").unwrap(),
+            turn_id: Some(OpaqueId::new("turn-1").unwrap()),
+            metadata: None,
+        };
+        transport.push_json(
+            200,
+            serde_json::to_value(AttemptMutationResponse {
+                schema_version: ProtocolOne::V1,
+                attempt: AttemptView {
+                    common: completed_common,
+                    status: AttemptStatus::Completed {
+                        completion: CompletionReceipt {
+                            receipt_id: OpaqueId::new("receipt-1").unwrap(),
+                            attempt_id: attempt_id.clone(),
+                            idempotency_key: ProtocolUuid::from_uuid(uuid::Uuid::nil()),
+                            request_digest: Sha256Digest::new("b".repeat(64)).unwrap(),
+                            address_id: OpaqueId::new("address").unwrap(),
+                            cursor_before,
+                            cursor_after,
+                            provider: provider.clone(),
+                            completed_at: timestamp(),
+                            audit_event_id: DecimalU64(99),
+                        },
+                    },
+                },
+                idempotent_replay: false,
+                server_time: timestamp(),
+            })
+            .unwrap(),
+        );
+        coordinator
+            .record_provider_result(&attempt_id, ProviderDeliveryResult::Succeeded(provider))
+            .unwrap();
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(body.get("cursor_before").is_none());
+        assert!(body.get("cursor_after").is_none());
+        assert!(body.get("advances").is_none());
+        assert!(matches!(
+            coordinator.journal.latest(&attempt_id).unwrap().state,
+            JournalState::CogCompleted
+        ));
     }
 
     #[test]
