@@ -65,6 +65,12 @@ dropped. **The second test is load-bearing:** the first passed while the app was
 still broken because it set `resume_sid` by hand and never exercised the save path
 that resolves a created session's id (bug-0001). Live re-attach: human runtime check.
 
+The server-side half is guarded by
+`yalda-session-server::durable_recovery_never_replaces_a_failed_resume_with_a_fresh_identity`:
+WAL recovery passes the remembered provider id through the resume-only ACP path,
+so load failure cannot fall through to `session/new` and merge a second provider
+conversation into the durable Yalda session (bug-0069).
+
 ### UXI-AgentTile-19 — An unresumable session shows an inline "start fresh" notice, never a picker
 
 **Statement.** If a tile's remembered session cannot be resumed on restart (the

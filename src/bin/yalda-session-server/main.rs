@@ -1476,6 +1476,7 @@ fn spawn_resume_worker(
                 Some(cwd),
                 acp_session_id.clone(),
                 YaldaFrontend::Gpui,
+                acp_session_id.is_some(),
             ) {
                 Ok(client) => {
                     // Resume/fresh recovery → is_respawn=false. Recovery already
@@ -1950,6 +1951,7 @@ impl Manager {
                     Some(cwd),
                     resume_session_id,
                     YaldaFrontend::Gpui,
+                    false,
                 ) {
                     Ok(client) => {
                         // Fresh spawn → is_respawn = false, generation stays 0.
@@ -2627,7 +2629,15 @@ impl Manager {
                 }
                 let cmd = configured_agent_command(provider);
                 let resumed = resume_id.is_some();
-                match spawner.spawn(provider, &cmd, Some(cwd), resume_id, YaldaFrontend::Gpui) {
+                let resume_only = resume_id.is_some();
+                match spawner.spawn(
+                    provider,
+                    &cmd,
+                    Some(cwd),
+                    resume_id,
+                    YaldaFrontend::Gpui,
+                    resume_only,
+                ) {
                     Ok(client) => {
                         // The generation was bumped synchronously before this
                         // worker began, so publish it without a second bump.
@@ -2830,7 +2840,15 @@ impl Manager {
                 }
                 let cmd = configured_agent_command(provider);
                 let resumed = resume_id.is_some();
-                match spawner.spawn(provider, &cmd, Some(cwd), resume_id, YaldaFrontend::Gpui) {
+                let resume_only = resume_id.is_some();
+                match spawner.spawn(
+                    provider,
+                    &cmd,
+                    Some(cwd),
+                    resume_id,
+                    YaldaFrontend::Gpui,
+                    resume_only,
+                ) {
                     Ok(client) => {
                         publish_channel(
                             &cmd_tx,
@@ -4919,7 +4937,7 @@ mod lifecycle_tests {
     }
 
     struct CaptureFailSpawner {
-        resume_tx: std::sync::mpsc::Sender<Option<String>>,
+        resume_tx: std::sync::mpsc::Sender<(Option<String>, bool)>,
     }
 
     impl AgentSpawner for CaptureFailSpawner {
@@ -4930,10 +4948,37 @@ mod lifecycle_tests {
             _cwd: Option<PathBuf>,
             resume: Option<String>,
             _frontend: YaldaFrontend,
+            resume_only: bool,
         ) -> io::Result<Box<dyn AgentTransport>> {
-            let _ = self.resume_tx.send(resume);
+            let _ = self.resume_tx.send((resume, resume_only));
             Err(io::Error::other("injected handshake failure"))
         }
+    }
+
+    #[test]
+    fn durable_recovery_never_replaces_a_failed_resume_with_a_fresh_identity() {
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        spawn_resume_worker(
+            cmd_tx,
+            ResumeJob {
+                session_id: "recover-identity".into(),
+                cwd: PathBuf::from("/tmp/project"),
+                provider: AgentProvider::Claude,
+                acp_session_id: Some("durable-provider-id".into()),
+                expected_generation: 3,
+            },
+            Arc::new(CaptureFailSpawner { resume_tx }),
+        );
+
+        assert_eq!(
+            resume_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("recovery worker called spawner"),
+            (Some("durable-provider-id".into()), true),
+            "WAL recovery must fail closed when session/load fails; allowing the ACP layer to \
+             fall back to session/new merges two provider conversations under one Yalda id"
+        );
     }
 
     #[test]
@@ -4975,8 +5020,8 @@ mod lifecycle_tests {
             resume_rx
                 .recv_timeout(std::time::Duration::from_secs(1))
                 .expect("restart worker called spawner"),
-            Some("durable-acp-id".into()),
-            "restart must fall back to the saved ACP id after a dead channel"
+            (Some("durable-acp-id".into()), true),
+            "restart must use the saved ACP id without creating a replacement identity"
         );
     }
 
@@ -5021,7 +5066,7 @@ mod lifecycle_tests {
             resume_rx
                 .recv_timeout(std::time::Duration::from_secs(1))
                 .expect("retry called spawner"),
-            Some("retry-acp-id".into())
+            (Some("retry-acp-id".into()), true)
         );
     }
 

@@ -172,6 +172,7 @@ fn real_spawner_forwards_to_subprocess_path() {
         None,
         None,
         YaldaFrontend::Gpui,
+        false,
     );
     // No such binary on PATH → NotFound, surfaced through the trait unchanged.
     // (Map the Ok arm away first — `Box<dyn AgentTransport>` isn't `Debug`, so
@@ -209,6 +210,7 @@ fn fake_spawner_yields_in_process_transport() {
             None,
             None,
             YaldaFrontend::Gpui,
+            false,
         )
         .expect("fake spawn succeeds");
     assert!(transport.is_connected());
@@ -263,6 +265,7 @@ fn fake_spawner_can_fail_on_demand() {
             None,
             None,
             YaldaFrontend::Gpui,
+            false,
         )
         .map(|_| ())
         .expect_err("fake spawner returns the injected error");

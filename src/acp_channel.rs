@@ -949,6 +949,8 @@ pub trait AgentSpawner: Send + Sync {
     /// Spawn (or resume) an agent and complete its blocking handshake, returning
     /// the owning transport. Mirrors [`AcpChannelClient::spawn_with_resume_in`]:
     /// `command` empty ⇒ default fallback chain; `resume` `Some` ⇒ `session/load`.
+    /// When `resume_only` is true, a failed/missing load capability is returned
+    /// as an error instead of silently falling through to `session/new`.
     /// Runs on a dedicated OS spawn thread (the handshake blocks), never the actor.
     fn spawn(
         &self,
@@ -957,6 +959,7 @@ pub trait AgentSpawner: Send + Sync {
         cwd: Option<PathBuf>,
         resume: Option<String>,
         frontend: YaldaFrontend,
+        resume_only: bool,
     ) -> io::Result<Box<dyn AgentTransport>>;
 }
 
@@ -973,9 +976,22 @@ impl AgentSpawner for RealAgentSpawner {
         cwd: Option<PathBuf>,
         resume: Option<String>,
         frontend: YaldaFrontend,
+        resume_only: bool,
     ) -> io::Result<Box<dyn AgentTransport>> {
-        AcpChannelClient::spawn_with_resume_in_for(provider, command, cwd, resume, frontend)
-            .map(|c| Box::new(c) as Box<dyn AgentTransport>)
+        let client = if resume_only {
+            let resume = resume.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "resume-only spawn requires a provider session id",
+                )
+            })?;
+            AcpChannelClient::spawn_resume_only_in_for(
+                provider, command, cwd, resume, frontend,
+            )
+        } else {
+            AcpChannelClient::spawn_with_resume_in_for(provider, command, cwd, resume, frontend)
+        }?;
+        Ok(Box::new(client) as Box<dyn AgentTransport>)
     }
 }
 
@@ -1263,6 +1279,7 @@ mod fake {
             cwd: Option<PathBuf>,
             resume: Option<String>,
             _frontend: YaldaFrontend,
+            _resume_only: bool,
         ) -> io::Result<Box<dyn AgentTransport>> {
             let mut f = self
                 .factory
