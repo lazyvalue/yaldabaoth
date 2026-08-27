@@ -1,0 +1,51 @@
+# yalda-session-server — systemd USER service (Linux).
+#
+# Runs the durable session server as a supervised, login-persistent daemon so it
+# survives GUI restarts AND logout, and starts at boot. This is the Linux
+# counterpart to the macOS LaunchAgent (src/bin/yalda-session-server/launchd.rs).
+#
+# Install once with ./install-service.sh (copies this to
+# ~/.config/systemd/user/, enables linger, starts it). Ship a new build with
+# ./deploy-server.sh (rebuild → copy binary to ~/.local/bin → restart). The WAL
+# (~/.yalda/wal, ADR-0009/-0018) makes every restart lossless: agents, mid-turn
+# context and transcripts replay on startup and the GUI reconnects.
+#
+# ExecStart points at a STABLE installed path (~/.local/bin), not the cargo
+# target dir, so a `cargo build` can never clobber the binary the live service
+# is executing, and the unit isn't tied to a checkout location.
+
+[Unit]
+Description=Yalda session server (durable ACP agent daemon)
+Documentation=file:%h/ws/yaldabaoth/docs/decisions
+# No socket-activation dependency: the server owns its own AF_UNIX socket at
+# /tmp/yalda-session-$USER.sock and single-instance-guards on it.
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/yalda-session-server
+
+# Restart on a CRASH (non-zero exit / killed by signal) but NOT on a clean
+# exit(0). The single-instance guard exits 0 when another server already owns
+# the socket; Restart=on-failure keeps systemd from respawning that clean exit
+# in a tight loop. Mirrors the LaunchAgent's KeepAlive.SuccessfulExit=false.
+Restart=on-failure
+RestartSec=1
+
+# Graceful teardown: default KillSignal is SIGTERM, which the server handles
+# losslessly (flushes/holds its WALs). Give it room before SIGKILL.
+TimeoutStopSec=10
+
+# The server resolves the `claude` / `codex` provider binaries via PATH
+# (acp_channel.rs). A systemd user service starts with a minimal environment, so
+# set a PATH that covers the usual install locations. There is also a
+# login_shell_path() fallback in the code, but setting it here is deterministic.
+# Specifiers (%h) are expanded by systemd.
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:%h/.npm-global/bin:%h/.claude/local:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+
+# Keep the existing log destination so `tail -f ~/.yalda/session-server.log`
+# still works, matching the GUI-auto-launched path (session_client.rs).
+StandardOutput=append:%h/.yalda/session-server.log
+StandardError=append:%h/.yalda/session-server.log
+
+[Install]
+WantedBy=default.target
