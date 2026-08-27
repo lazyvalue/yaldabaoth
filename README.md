@@ -58,7 +58,7 @@ GPU driver — e.g. `mesa-vulkan-drivers` — is needed to run):
 ```sh
 sudo apt install \
   libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev \
-  libwayland-dev libxkbcommon-x11-0 mesa-vulkan-drivers
+  libwayland-dev mesa-vulkan-drivers
 ```
 
 No root? `scripts/linux-linklibs.sh` recreates just the required link-time
