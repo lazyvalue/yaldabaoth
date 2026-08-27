@@ -374,13 +374,14 @@ impl YaldaGpuiView {
         }
     }
 
-    /// Open the loaded issue/project in the system browser (macOS `open`).
+    /// Open the loaded issue/project in the system browser (macOS `open`,
+    /// Linux `xdg-open`).
     pub(crate) fn linear_open_url(&mut self, cx: &mut Context<Self>) {
         let url = self
             .linear_focused_tile_view()
             .and_then(|v| v.read(cx).current_url());
         if let Some(url) = url {
-            let _ = std::process::Command::new("open").arg(url).spawn();
+            let _ = open_in_default_handler(&url);
         }
     }
 

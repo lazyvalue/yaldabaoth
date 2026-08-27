@@ -44,6 +44,32 @@ Provider command overrides:
 
 ## Build
 
+Yalda builds on macOS and Linux (x86-64). The GPUI desktop app
+(`yalda-gpui`) is the only target with platform system dependencies; the
+supporting binaries (`yalda-channel`, `yalda-mcp`, `yalda-session-server`)
+need only the Rust toolchain.
+
+### Linux prerequisites
+
+GPUI links the system X11 / xkb C libraries. On Debian/Ubuntu install the
+`-dev` packages (they provide the link-time `.so` symlinks; a Vulkan-capable
+GPU driver — e.g. `mesa-vulkan-drivers` — is needed to run):
+
+```sh
+sudo apt install \
+  libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev \
+  libwayland-dev libxkbcommon-x11-0 mesa-vulkan-drivers
+```
+
+No root? `scripts/linux-linklibs.sh` recreates just the required link-time
+symlinks in a user-owned directory and prints the `-L` path to add to
+`RUSTFLAGS` (or `~/.cargo/config.toml`). See the script header for details.
+
+### macOS prerequisites
+
+The Xcode command-line tools (`xcode-select --install`) supply the linker and
+SDK; no other system packages are required.
+
 ```sh
 cargo build --release
 ```

@@ -56,6 +56,30 @@ pub(crate) fn install_yaldabaoth_app_icon() {
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn install_yaldabaoth_app_icon() {}
 
+/// Open a URL (or path) in the OS default handler, cross-platform: macOS
+/// `open`, Linux/BSD `xdg-open`, Windows `start`. Best-effort — the caller
+/// logs a spawn failure. The launch is a live-subprocess side effect (verify-
+/// harness gap #2), verified by a human, not headlessly. Callers pass only
+/// links `classify_link` deemed External (http/https/mailto), so this never
+/// launches an arbitrary local handler.
+pub(crate) fn open_in_default_handler(url: &str) -> std::io::Result<()> {
+    use std::process::Command;
+    #[cfg(target_os = "macos")]
+    let mut cmd = Command::new("open");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = Command::new("xdg-open");
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        // `start` is a cmd.exe builtin; the empty "" is its title argument so a
+        // quoted URL isn't mistaken for the window title.
+        let mut c = Command::new("cmd");
+        c.args(["/C", "start", ""]);
+        c
+    };
+    cmd.arg(url);
+    cmd.spawn().map(|_child| ())
+}
+
 /// Pick the PNG bytes to stage for a pasted image, preferring a real PNG rep
 /// over a TIFF that had to be transcoded, and rejecting empty payloads. Pure so
 /// the preference/empty logic is headlessly testable — the mac-only FFI that

@@ -13,6 +13,17 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Linux port follow-ups** — `READY` (from
+  [worklog](worklog/2026-08-26-linux-port.md)). The app now builds, links, runs,
+  and tests on Linux (x86-64). Remaining hardening: (1) make the two
+  transcript-steering tests hermetic via the `test-support` FakeTransport so the
+  full suite is green on a serverless box; (2) harden the `yalda-acp-stub`
+  handshake/pump against CPU-load timeouts (or bound subprocess-test parallelism)
+  so the full parallel gate is reliable on Linux — then the `linux-build` CI job
+  can run tests, not just build; (3) newer toolchain (1.98) surfaces new clippy
+  lints (e.g. `tests.rs` `0x40_67_64` "mistyped literal suffix") that the
+  `-D warnings` quality gate will need swept, independent of Linux.
+
 - **Codex child resume reports the parent model** — `DEFERRED` (discovered
   2026-08-26 while shipping `UXI-AgentTile-44`; Cog graph `w25`; see
   [worklog](worklog/2026-08-26-codex-luna-subagents.md)). An authenticated child

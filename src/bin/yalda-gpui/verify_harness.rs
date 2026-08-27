@@ -23646,10 +23646,12 @@ fn cmd_shift_drag_pans_the_plane(cx: &mut TestAppContext) {
         (d.slot_of(win_a), d.slot_of(win_b))
     });
 
+    // `secondary_key()` is the platform's pan modifier (Cmd on macOS, Ctrl on
+    // Linux/Windows) — the same key `desktop_pan_grab`'s `secondary()` guard
+    // reads. Hardcoding `platform` here would never pan on Linux.
     let cmd_shift = Modifiers {
-        platform: true,
         shift: true,
-        ..Default::default()
+        ..Modifiers::secondary_key()
     };
     // Derive endpoints from the REAL painted geometry (pitch varies with the
     // painted canvas). Mouse-DOWN in the empty bottom-right corner so the
@@ -23690,10 +23692,7 @@ fn cmd_only_drag_does_not_pan_the_plane(cx: &mut TestAppContext) {
 
     // Cmd held, Shift NOT held — over the same empty canvas the Cmd+Shift test
     // uses (so the gesture reaches the canvas-root handler).
-    let cmd_only = Modifiers {
-        platform: true,
-        ..Default::default()
-    };
+    let cmd_only = Modifiers::secondary_key();
     vcx.simulate_mouse_down(point(px(600.0), px(400.0)), MouseButton::Left, cmd_only);
     vcx.simulate_mouse_move(
         point(px(450.0), px(320.0)),
@@ -23731,9 +23730,8 @@ fn cmd_shift_pan_rests_view_cell_aligned(cx: &mut TestAppContext) {
     });
 
     let cmd_shift = Modifiers {
-        platform: true,
         shift: true,
-        ..Default::default()
+        ..Modifiers::secondary_key()
     };
     // Down (empty corner) + move ~1.4 pitch: leaves a FRACTIONAL pan mid-gesture
     // that snaps to a positive whole slot on release. Endpoints derived from the

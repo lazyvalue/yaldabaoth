@@ -9226,28 +9226,66 @@ impl YaldaGpuiView {
         div().absolute().inset_0().child(backdrop).child(popup)
     }
 
-    /// Best-effort copy via macOS `pbcopy`. Failures are silent — yank is
-    /// a convenience, and we don't want to surface system errors per keystroke.
-    /// (TUI uses the same approach.)
+    /// Best-effort clipboard copy through the OS CLI tool. Failures are silent
+    /// — yank is a convenience, and we don't want to surface system errors per
+    /// keystroke. (TUI uses the same approach.) macOS uses `pbcopy`; Linux tries
+    /// `wl-copy` (Wayland), then `xclip`, then `xsel` — whichever is installed.
     fn yank_to_clipboard(text: &str) {
         use std::io::Write;
         use std::process::{Command, Stdio};
-        if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn()
-            && let Some(mut stdin) = child.stdin.take()
-        {
-            let _ = stdin.write_all(text.as_bytes());
+        // (program, args) candidates in preference order for this platform.
+        #[cfg(target_os = "macos")]
+        let candidates: &[(&str, &[&str])] = &[("pbcopy", &[])];
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let candidates: &[(&str, &[&str])] = &[
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard"]),
+            ("xsel", &["--clipboard", "--input"]),
+        ];
+        #[cfg(not(unix))]
+        let candidates: &[(&str, &[&str])] = &[];
+        for (prog, args) in candidates {
+            let Ok(mut child) = Command::new(prog)
+                .args(*args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            else {
+                continue; // tool not installed — try the next candidate
+            };
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = child.wait();
+            return;
         }
     }
 
-    /// Best-effort read via macOS `pbpaste`. Returns `None` on failure.
+    /// Best-effort clipboard read through the OS CLI tool. Returns `None` on
+    /// failure. macOS uses `pbpaste`; Linux tries `wl-paste`, then `xclip`,
+    /// then `xsel` — whichever is installed.
     fn read_from_clipboard() -> Option<String> {
         use std::process::Command;
-        let output = Command::new("pbpaste").output().ok()?;
-        if output.status.success() {
-            String::from_utf8(output.stdout).ok()
-        } else {
-            None
+        #[cfg(target_os = "macos")]
+        let candidates: &[(&str, &[&str])] = &[("pbpaste", &[])];
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let candidates: &[(&str, &[&str])] = &[
+            ("wl-paste", &["--no-newline"]),
+            ("xclip", &["-selection", "clipboard", "-out"]),
+            ("xsel", &["--clipboard", "--output"]),
+        ];
+        #[cfg(not(unix))]
+        let candidates: &[(&str, &[&str])] = &[];
+        for (prog, args) in candidates {
+            let Ok(output) = Command::new(prog).args(*args).output() else {
+                continue; // tool not installed — try the next candidate
+            };
+            if output.status.success() {
+                return String::from_utf8(output.stdout).ok();
+            }
         }
+        None
     }
 
     // ---- Claude (ACP) screen ----------------------------------------------

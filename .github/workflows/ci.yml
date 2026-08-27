@@ -25,6 +25,29 @@ jobs:
       - name: CI gate (build + test)
         run: bash scripts/ci.sh # same gate as the local .githooks/pre-push hook
 
+  # ── Linux compile target: the app builds on Linux too (GPUI links the system
+  # X11/xkb libraries). This job guards that the Linux target keeps COMPILING —
+  # all targets, tests included — so a macOS-only change can't silently break the
+  # Linux build. It does not RUN the suite here: the subprocess-spawning
+  # integration tests are load-sensitive and the transcript-steering tests expect
+  # a running session server, both of which are environment concerns orthogonal
+  # to "does it compile on Linux". Run the full suite locally per README (Linux
+  # prerequisites). ──────────────────────────────────────────────────────────
+  linux-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install GPUI system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev mesa-vulkan-drivers
+      - name: Build all targets (Linux)
+        run: cargo build --all-targets --features test-support
+
   # ── Quality gate: tree is clippy-clean and fmt-clean as of 2026-06-08, so this
   # stays green. clippy runs with --features test-support because the in-process
   # FakeTransport test targets are gated behind that feature. ──────────────────
