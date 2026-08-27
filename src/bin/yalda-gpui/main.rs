@@ -10200,7 +10200,63 @@ fn run_hash_diff_subcommand(args: &[String]) -> i32 {
     0
 }
 
+/// On Linux, GPUI picks its windowing backend purely from `WAYLAND_DISPLAY`
+/// (`gpui::guess_compositor`): set ⇒ Wayland, else X11. Yalda draws no
+/// **client-side decorations** — it was built against macOS's native titlebar
+/// and has no titlebar/resize-border of its own. On Wayland, a compositor that
+/// refuses server-side decorations (GNOME/Mutter is the notable one) then leaves
+/// the window with NOTHING to grab: it can't be moved or resized. Under X11
+/// (native or XWayland) the window manager always provides server-side
+/// decorations, so move/resize just work.
+///
+/// So until Yalda grows its own CSD, prefer X11 whenever an X server is
+/// reachable: unset `WAYLAND_DISPLAY` before GPUI reads it so `guess_compositor`
+/// falls to X11. Escape hatch: set `YALDA_WAYLAND=1` to keep native Wayland
+/// (correct on SSD-capable compositors — KDE, COSMIC, wlroots — or once CSD
+/// lands). No-op when already on X11, headless, or when there's no `DISPLAY`
+/// (a pure-Wayland session with no XWayland — nothing to fall back to).
+/// Pure decision for [`prefer_x11_for_window_decorations`]: given the relevant
+/// environment (is a Wayland display set, is an X server reachable, did the user
+/// force Wayland, is GPUI headless), should we drop `WAYLAND_DISPLAY` to route
+/// GPUI onto X11? Only when on Wayland with an X fallback available and no
+/// override — never when the user forced Wayland, when headless, or when there's
+/// no X server to fall back to.
+#[cfg(target_os = "linux")]
+fn should_prefer_x11(
+    on_wayland: bool,
+    x11_available: bool,
+    force_wayland: bool,
+    headless: bool,
+) -> bool {
+    !force_wayland && !headless && on_wayland && x11_available
+}
+
+#[cfg(target_os = "linux")]
+fn prefer_x11_for_window_decorations() {
+    let prefer = should_prefer_x11(
+        std::env::var_os("WAYLAND_DISPLAY").is_some_and(|d| !d.is_empty()),
+        std::env::var_os("DISPLAY").is_some_and(|d| !d.is_empty()),
+        std::env::var_os("YALDA_WAYLAND").is_some(),
+        std::env::var_os("ZED_HEADLESS").is_some(),
+    );
+    if prefer {
+        // SAFETY: single-threaded — this runs at the very top of `main`, before
+        // any GPUI/thread spawn reads the environment.
+        unsafe { std::env::remove_var("WAYLAND_DISPLAY") };
+        eprintln!(
+            "[yalda-gpui] using the X11 backend for working window move/resize \
+             (GNOME/Wayland forces client-side decorations Yalda doesn't draw yet); \
+             set YALDA_WAYLAND=1 to force native Wayland"
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn prefer_x11_for_window_decorations() {}
+
 fn main() {
+    // MUST run before any GPUI init reads the environment (see the fn docs).
+    prefer_x11_for_window_decorations();
     let args: Vec<String> = std::env::args().collect();
     // Cog node `merge-gate` (v5tg): intercept the hidden `--hash-diff`
     // subcommand BEFORE any GUI/window setup (before the orphan reaper, the

@@ -3,6 +3,25 @@
 use super::*;
 use crate::chrome::{DESKTOP_CELL_H, DESKTOP_CELL_W, DESKTOP_GUTTER};
 
+/// Linux windowing backend choice (fix: GNOME/Wayland forces client-side
+/// decorations Yalda doesn't draw, so the window can't be moved/resized). We
+/// route onto X11 (working server-side decorations) ONLY when on Wayland with an
+/// X fallback and no override.
+#[cfg(target_os = "linux")]
+#[test]
+fn prefer_x11_only_on_wayland_with_x_fallback_and_no_override() {
+    // The fix case: Wayland session with XWayland available, no override.
+    assert!(should_prefer_x11(true, true, false, false));
+    // User forced native Wayland — leave it alone (SSD compositors, or once CSD lands).
+    assert!(!should_prefer_x11(true, true, true, false));
+    // Headless — never touch the backend.
+    assert!(!should_prefer_x11(true, true, false, true));
+    // Already on X11 (no Wayland display) — nothing to switch.
+    assert!(!should_prefer_x11(false, true, false, false));
+    // Pure Wayland with no X server to fall back to — can't help, don't strand it.
+    assert!(!should_prefer_x11(true, false, false, false));
+}
+
 #[test]
 fn bare_ctrl_w_is_exclusively_reserved_as_the_shell_prefix() {
     assert!(is_ctrl_w_shell_prefix(&KeyPress::new(

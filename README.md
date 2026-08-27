@@ -65,6 +65,13 @@ No root? `scripts/linux-linklibs.sh` recreates just the required link-time
 symlinks in a user-owned directory and prints the `-L` path to add to
 `RUSTFLAGS` (or `~/.cargo/config.toml`). See the script header for details.
 
+**Windowing backend.** Yalda has no client-side window decorations of its own,
+so on GNOME/Wayland (which forces CSD) the window can't be moved or resized. On
+Linux it therefore defaults to the **X11 backend** (XWayland when in a Wayland
+session), where the window manager draws a normal titlebar and move/resize work.
+Set `YALDA_WAYLAND=1` to force the native Wayland backend instead — correct on
+SSD-capable compositors (KDE, COSMIC, wlroots).
+
 ### macOS prerequisites
 
 The Xcode command-line tools (`xcode-select --install`) supply the linker and
