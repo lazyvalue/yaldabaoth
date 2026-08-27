@@ -6310,6 +6310,22 @@ impl YaldaGpuiView {
                 }
             }
             "new-cog-tile" => {
+                // A solo-presented tile lives outside the visible workspace
+                // layout, so there is nothing for `split_focused` to split.
+                // Create another detached tile and present it, preserving the
+                // tile the user was viewing (the same ownership transition as
+                // `new-agent-tile` above).
+                if self.workspace.presented_tile().is_some() {
+                    let project = self.workspace.inherited_project();
+                    let id = self
+                        .workspace
+                        .push_detached(App::Cog(CogTile::new()), project);
+                    self.workspace.present_solo(id);
+                    self.cog_load_graphs_into(id, cx);
+                    self.save_workspace_state();
+                    cx.notify();
+                    return;
+                }
                 // Split a new tile (focus lands on it), then swap it for a
                 // Cog explorer via `open_cog_inner` — mirrors new-linear-tile.
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));

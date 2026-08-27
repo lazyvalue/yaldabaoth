@@ -27778,6 +27778,76 @@ fn cog_test_bundle(nodes: Vec<crate::CogNode>) -> crate::CogBundle {
     }
 }
 
+/// UXI-Cog-13 / UXI-Workspace-24: shell New -> Cog adds a split Cog tile in a
+/// workspace, or creates a new detached Cog tile when the current tile is
+/// solo-presented, preserving the tile the user was viewing. This drives the
+/// exact command emitted by `.` -> new -> cog in both focus domains.
+///
+/// NEGATIVE CONTROL (observed RED): the pre-fix dispatcher only calls
+/// `split_focused`, which returns `None` while a detached tile is presented;
+/// `presented_tile` remains the original Linear tile and this test fails.
+#[gpui::test]
+fn new_cog_tile_from_solo_presentation_creates_and_focuses_detached_cog(cx: &mut TestAppContext) {
+    use crate::workspace::TileMembership;
+    use crate::{App, LinearTile};
+
+    let (view, vcx) = boot_browser(cx);
+    let before = active_tile_count(&view, vcx);
+    view.update(vcx, |v, cx| v.dispatch_menu_command("new-cog-tile", cx));
+    vcx.run_until_parked();
+    assert_eq!(
+        active_tile_count(&view, vcx),
+        before + 1,
+        "New -> Cog adds a tile inside a workspace"
+    );
+    view.read_with(vcx, |v, _| {
+        assert!(
+            matches!(v.workspace.focused_content(), Some(App::Cog(_))),
+            "the attached tile is a Cog explorer"
+        );
+    });
+
+    let original = view.update(vcx, |v, _| {
+        let project = v.workspace.inherited_project();
+        let original = v
+            .workspace
+            .push_detached(App::Linear(LinearTile::new()), project);
+        assert!(v.workspace.present_solo(original));
+        original
+    });
+
+    view.update(vcx, |v, cx| v.dispatch_menu_command("new-cog-tile", cx));
+    vcx.run_until_parked();
+
+    view.read_with(vcx, |v, _| {
+        let created = v
+            .workspace
+            .presented_tile()
+            .expect("New -> Cog presents the created tile")
+            .window_id();
+        assert_ne!(created, original, "New -> Cog must create a distinct tile");
+        assert!(
+            matches!(
+                v.workspace.tile(created).map(|tile| &tile.content),
+                Some(App::Cog(_))
+            ),
+            "the newly presented tile is a Cog explorer"
+        );
+        assert_eq!(
+            v.workspace.tile_membership(created),
+            Some(TileMembership::Detached),
+            "a tile created outside the workspace remains detached"
+        );
+        assert!(
+            matches!(
+                v.workspace.tile(original).map(|tile| &tile.content),
+                Some(App::Linear(_))
+            ),
+            "the previously presented tile and its content survive"
+        );
+    });
+}
+
 /// UXI-Cog-1: a Cog tile's real reducer, fed a graph list, lands on the graph
 /// explorer state with the graphs present.
 #[gpui::test]

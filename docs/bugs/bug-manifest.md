@@ -83,6 +83,7 @@ and a **timestamped log** of every actual attempt.
 | bug-0059 | reboot-detaches-agent-tile | FIXED | 2026-08-25 | 1 | GUI boot now restores `workspace.json` before starting universal roster reconciliation, preventing a fast roster result from persisting the pre-restore frame over named-workspace Agent membership; exact production-initializer guard, RED ordering control, full suite, and mutation gate passed |
 | bug-0060 | empty-workspace-command-menus-dead | FIXED | 2026-08-29 | 1 | the empty-layout surface now owns shell focus, raw leader dispatch, and global action listeners; `.` opens the shell menu and `space` falls back to that menu when no App is focused; real close-and-keystroke guard, full suites, builds, and changed-line mutation gate pass under Cog graph `vfl` |
 | bug-0069 | recovery-merges-provider-sessions | FIXED | 2026-08-27 | 1 | durable server recovery/restart/unarchive now fail closed on `session/load` failure instead of silently creating a fresh provider identity and appending its conversation to the existing Yalda WAL |
+| bug-0061 | new-cog-solo-noop | FIXED | 2026-08-27 | 1 | New → Cog only tried to split an attached workspace leaf, so it silently no-op'd from a solo-presented tile; it now creates and presents a detached Cog tile while preserving the original |
 <!-- Example row once populated:
 | bug-0001 | chatbox-caret-offscreen | RECURRED | 2026-05-02 | 16 | caret + text scroll out of the visible chatbox; no single owner of caret-in-viewport |
 -->

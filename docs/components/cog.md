@@ -86,6 +86,11 @@ asserts deterministic hierarchy construction. The headless production-path guard
 applies Home through the real reducer, asserts the default visible hierarchy,
 drives real collapse/expand and leaf-click handlers, and probes both panes. It was
 observed RED with descendant flattening disabled (2 rows painted instead of 6).
+`new_cog_tile_from_solo_presentation_creates_and_focuses_detached_cog` drives the
+real shell-menu dispatcher in both attachment domains: a workspace adds a split
+Cog tile, while a solo-presented tile creates and presents a distinct Detached
+Cog tile without replacing the original. Its pre-fix control observed the solo
+command leave the original tile id unchanged.
 
 ### UXI-Cog-14 — Topic leaves select a typed right-pane renderer
 
