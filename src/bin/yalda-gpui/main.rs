@@ -1485,8 +1485,9 @@ struct MenuOverlay {
     /// the space leader.
     leader: char,
     /// Leaf focused when the menu was opened — if focus moves while the menu
-    /// is open the overlay dismisses (Behavior 9: no stale dispatch).
-    opened_from: workspace::WindowId,
+    /// is open the overlay dismisses (Behavior 9: no stale dispatch). `None`
+    /// is the legitimate origin for the focused empty-workspace shell surface.
+    opened_from: Option<workspace::WindowId>,
     /// Command names disabled in the current context (Behavior 10). Rendered
     /// dimmed; key presses on them are ignored (menu stays open).
     disabled: HashSet<String>,
@@ -5522,14 +5523,12 @@ impl YaldaGpuiView {
         self.active_overlay = ActiveOverlay::None;
     }
 
-    fn open_menu_inner(&mut self, cx: &mut Context<Self>) {
+    fn open_menu_inner_with_leader(&mut self, leader: char, cx: &mut Context<Self>) {
         // No-op if already open (defensive — the action shouldn't fire then).
         if self.overlay_is_menu() {
             return;
         }
-        let Some(opened_from) = self.workspace.focused_window_id() else {
-            return;
-        };
+        let opened_from = self.workspace.focused_window_id();
         // Opening the menu dismisses any lingering toast.
         self.transient_status = None;
         let mut state = MenuState::new();
@@ -5538,11 +5537,15 @@ impl YaldaGpuiView {
             state,
             menu: gpui_menu(),
             header: "MENU",
-            leader: '.',
+            leader,
             opened_from,
             disabled: self.global_menu_disabled(),
         }));
         cx.notify();
+    }
+
+    fn open_menu_inner(&mut self, cx: &mut Context<Self>) {
+        self.open_menu_inner_with_leader('.', cx);
     }
 
     /// Behavior 10: global-menu entries inapplicable to the focused content
@@ -5661,6 +5664,13 @@ impl YaldaGpuiView {
         if self.overlay_is_menu() {
             return;
         }
+        // With no focused App there is no honest tile-local vocabulary. The
+        // visible object is the workspace shell itself, so keep Space live by
+        // falling back to the shell menu while retaining Space in the trail.
+        if self.workspace.focused_window_id().is_none() {
+            self.open_menu_inner_with_leader(' ', cx);
+            return;
+        }
         let Some(opened_from) = self.workspace.focused_window_id() else {
             return;
         };
@@ -5684,7 +5694,7 @@ impl YaldaGpuiView {
             menu,
             header,
             leader: ' ',
-            opened_from,
+            opened_from: Some(opened_from),
             disabled,
         }));
         cx.notify();
@@ -5793,6 +5803,19 @@ impl YaldaGpuiView {
             _ => return false,
         }
         true
+    }
+
+    /// Raw-key owner for the valid no-tile workspace state. Ordinary App roots
+    /// call `leader_intercept` from their own handlers; without a leaf, this
+    /// focused shell surface must do that job itself.
+    fn handle_empty_workspace_key(
+        &mut self,
+        ev: &KeyDownEvent,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let press = keystroke_to_keypress(&ev.keystroke);
+        self.leader_intercept(&press, cx);
     }
 
     /// Menu's key handler. Esc pops a level (or closes from root). Any
@@ -9275,7 +9298,7 @@ impl Render for YaldaGpuiView {
         // while a menu was open, dismiss it — stale entries must not
         // dispatch against the wrong content.
         if let ActiveOverlay::Menu(m) = &self.active_overlay
-            && self.workspace.focused_window_id() != Some(m.opened_from)
+            && self.workspace.focused_window_id() != m.opened_from
         {
             self.clear_overlay();
         }

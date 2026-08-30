@@ -9798,6 +9798,62 @@ fn close_sole_bound_agent_leaves_empty_workspace(cx: &mut TestAppContext) {
     });
 }
 
+/// bug-0060 / UXI-Workspace-1 / UXI-Menu-6: closing the sole tile leaves a
+/// valid empty workspace, and that painted empty-state surface must still own
+/// command input. With no focused App, both `space` and `.` open the shell menu.
+///
+/// This drives the reported REAL path: production close command → render the
+/// `Layout::Empty` branch → window keystroke dispatch. Calling
+/// `leader_intercept` directly would bypass the missing focus/listener defect.
+///
+/// Negative control (observed RED before the fix): the unmodified empty branch
+/// has no `track_focus`/`on_key_down`, so the first `space` assertion sees no
+/// overlay at all.
+#[gpui::test]
+fn empty_workspace_keeps_both_command_leaders_live(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_browser(cx);
+
+    view.update(vcx, |v, cx| v.dispatch_menu_command("close-window", cx));
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert!(matches!(
+            v.workspace.active_workspace().map(|w| &w.layout),
+            Some(crate::workspace::Layout::Empty)
+        ));
+        assert_eq!(v.workspace.focused_window_id(), None);
+    });
+    let root_focused = vcx.update(|window, cx| view.read(cx).focus_handle.is_focused(window));
+    assert!(root_focused, "the empty-state shell retains root focus");
+
+    vcx.simulate_keystrokes("space");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        let menu = v
+            .menu_ref()
+            .expect("space opens the shell menu on an empty workspace");
+        assert_eq!(menu.header, "MENU");
+        assert_eq!(menu.leader, ' ');
+        assert_eq!(menu.opened_from, None);
+    });
+
+    view.update(vcx, |v, cx| {
+        v.clear_overlay();
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes(".");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        let menu = v
+            .menu_ref()
+            .expect("period opens the shell menu on an empty workspace");
+        assert_eq!(menu.header, "MENU");
+        assert_eq!(menu.leader, '.');
+        assert_eq!(menu.opened_from, None);
+    });
+}
+
 /// bug-0047: the server can publish a newly-created session to the roster
 /// before the create reply binds that server sid to its provisional local
 /// session. Roster materialization must not leave a second stable Agent tile

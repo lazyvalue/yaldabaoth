@@ -204,6 +204,11 @@ object class (ADR-0032):
   workspaces, appearance, and system. It is the same tree regardless of focused
   tile. It contains everything the retired `?` global menu held.
 
+An empty workspace has no focused App to supply a tile menu, but it remains a
+focused shell surface: both `space` and `.` open the shell menu there. This keeps
+the command surface reachable after closing the sole tile without inventing a
+fake tile object or a third menu scope.
+
 `?` **does not open a menu.** A bare `?` in a navigation state is inert (or a
 literal character where text is captured). Actions that must work *while typing*
 (workspace jump, jump-panel toggle) are direct chords, never leader-menu items.
@@ -228,8 +233,10 @@ Object is the distinction the operator feels, and it maps to exactly two menus.
 **Enforcement.** `verify_harness.rs` — a `?` press in a navigation state opens no
 menu overlay; former `?` command names (`new-workspace`, `rename-workspace`,
 `new-project`, `open-system-console`, `toggle-jump-panel`) dispatch and are
-reachable under `.`. Negative control: restore the `?` route ⇒ the "no overlay"
-assert goes RED.
+reachable under `.`. `empty_workspace_keeps_both_command_leaders_live` drives
+the real empty-state key-dispatch path for `space` and `.`. Negative control:
+restore the `?` route ⇒ the "no overlay" assert goes RED; remove the empty-state
+focus/key listener ⇒ the empty-workspace guard goes RED.
 
 ### UXI-Menu-7 — no duplicate key at any one menu level
 
