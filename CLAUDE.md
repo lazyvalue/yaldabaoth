@@ -153,6 +153,33 @@ only when asked" guidance. The quality gate still holds: never commit an
 unverified guess (guard RED, or you couldn't localize on the real path — report
 instead). **Push** to a remote is the one step that still needs an explicit ask.
 
+### NEVER restart Yalda or its session server without explicit permission
+
+**Agents MUST NOT restart, quit, kill, relaunch, or replace either the running
+`yalda-gpui` process or `yalda-session-server` unless Scott explicitly approves
+that specific restart in the current conversation.** This includes direct shell
+commands (`dev-gui.sh`, `dev-server.sh`, `pkill`, `kill`, `systemctl restart`),
+the in-app Restart / Rebuild & Restart actions, and any indirect operation whose
+activation stops or replaces a running process. A request to fix, build, test,
+commit, merge, or "ship" a change is **not** permission to restart anything.
+
+Before asking for restart permission, perform a read-only live-session check and
+state exactly what will be restarted, how many sessions are attached or running,
+that every attached session will disconnect, and that in-flight work may be lost.
+Approval is one-shot and applies only to the named process(es). If live-session
+state cannot be determined, treat sessions as live and do not restart.
+
+The default activation boundary is **build only**. Build the required release
+binary, report that the running process has not been touched, and leave activation
+to Scott. Never treat WAL replay, provider `session/load`, supervision, or prior
+successful recovery as a safety guarantee: persisted transcript recovery is not
+the same as preserving a live process or its in-flight work, and recovery can be
+partial. **No agent may restart the session server merely to pick up a change or
+restart the GUI merely to demonstrate a fix.** This prohibition overrides any
+instruction elsewhere in this repository that says to restart as part of the
+definition of done; mark activation `NEEDS-RUNTIME` and hand the exact command to
+Scott instead.
+
 ## The GUI
 
 `yalda-gpui` is the user-facing surface; all new UX work targets it. The
