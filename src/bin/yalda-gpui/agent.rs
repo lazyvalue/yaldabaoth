@@ -465,6 +465,33 @@ pub(crate) fn tool_inline_detail(tc: &yalda::acp_channel::ToolCall) -> Option<St
     None
 }
 
+/// Cog node `refresh-triggers` (7ods), spec B3(b): whether a tool call just
+/// reported a completed file mutation — the signal that should debounce-
+/// trigger a Diff tile re-derive. Two independent signals, either sufficient:
+/// a mutating ACP `kind` (Edit/Move/Delete) carrying a `file_path` input (the
+/// same extraction `tool_inline_detail` uses for its inline label), OR any
+/// completed call that reports `locations` (the ACP-native "files affected by
+/// this call" field) — this covers an agent that classifies a write under a
+/// different `kind`. `Read`/`Search`/`Execute` report no locations and carry
+/// no mutating kind, so they never trigger.
+pub(crate) fn tool_call_reports_file_change(tc: &yalda::acp_channel::ToolCall) -> bool {
+    use yalda::acp_channel::{ToolCallStatus, ToolKind};
+    if tc.status != ToolCallStatus::Completed {
+        return false;
+    }
+    if !tc.locations.is_empty() {
+        return true;
+    }
+    let mutating_kind = matches!(tc.kind, ToolKind::Edit | ToolKind::Move | ToolKind::Delete);
+    mutating_kind
+        && tc
+            .raw_input
+            .as_ref()
+            .and_then(|v| v.get("file_path"))
+            .and_then(|v| v.as_str())
+            .is_some()
+}
+
 /// Clamp inline tool details by Unicode scalar values, never by UTF-8 bytes.
 /// ACP inputs are arbitrary user/tool text, so a display limit can land inside
 /// a multi-byte character even when the string itself is valid UTF-8.
@@ -3889,6 +3916,27 @@ pub(crate) struct AgentState {
     /// the layer that can actually spawn the HTTP call. This flag exists because
     /// the turn-finalize chokepoint is on `AgentState` (no `cx`, no view).
     pub(crate) autoname_due: bool,
+    /// Cog node `refresh-triggers` (7ods), spec B3(a): set by
+    /// `finalize_agent_turn_idem` when a LIVE (non-replay) turn finalizes;
+    /// drained by `drain_diff_refresh_requests` on the view, which re-derives
+    /// any `App::Diff` tile whose `DiffSource::Session` points at this
+    /// session. Mirrors `autoname_due` — the finalize chokepoint has no `cx`.
+    pub(crate) diff_turn_completed_due: bool,
+    /// Cog node `refresh-triggers` (7ods), spec B3(b): bumped by the
+    /// `ToolCallStarted`/`ToolCallUpdated` reducer arms whenever a completed
+    /// tool call reports a file change (`tool_call_reports_file_change`).
+    /// The view-layer drain compares this against `diff_file_change_seen_gen`
+    /// to detect new activity and schedules a DEBOUNCED refresh — coalescing
+    /// a burst of file-touching tool calls (e.g. a multi-file edit turn) into
+    /// one re-derive instead of one per tool call.
+    pub(crate) diff_file_change_gen: u64,
+    /// Watermark: the `diff_file_change_gen` value already handed to a
+    /// scheduled debounce task. Advanced eagerly at schedule time (not at
+    /// fire time) so a burst within the debounce window schedules at most
+    /// one NEW timer per additional generation, while the fire-time
+    /// generation check (`schedule_debounced_diff_refresh`) still collapses
+    /// a whole burst down to the single trailing refresh.
+    pub(crate) diff_file_change_seen_gen: u64,
     /// Background polling task that drains the ACP channel into the editor
     /// every ~50ms. Held only so that dropping `AgentState` (e.g. on
     /// `back_to_doc`) cancels the task. The leading `_` mutes unused-field
@@ -4472,6 +4520,9 @@ impl AgentState {
             // session that already carries a real name.
             autoname: AutonameState::Done,
             autoname_due: false,
+            diff_turn_completed_due: false,
+            diff_file_change_gen: 0,
+            diff_file_change_seen_gen: 0,
             _pump: None,
         }
     }
@@ -4566,6 +4617,9 @@ impl AgentState {
             // session that already carries a real name.
             autoname: AutonameState::Done,
             autoname_due: false,
+            diff_turn_completed_due: false,
+            diff_file_change_gen: 0,
+            diff_file_change_seen_gen: 0,
             _pump: None,
         };
         // The follow-output scroll handler is wired by the owning
@@ -4918,6 +4972,12 @@ impl AgentState {
         self.waiting_since = Some(std::time::Instant::now());
         if raise_unread {
             self.unread = true;
+            // Cog node `refresh-triggers` (7ods), spec B3(a): a genuinely-new
+            // live turn completion re-derives any Diff tile bound to this
+            // session. A REPLAY completion (`raise_unread == false`) is exempt
+            // for the same reason it doesn't raise unread — reloading old
+            // history on restart/reconnect changed nothing on disk just now.
+            self.diff_turn_completed_due = true;
         }
         true
     }

@@ -2473,6 +2473,9 @@ impl YaldaGpuiView {
             // session that already carries a real name.
             autoname: AutonameState::Done,
             autoname_due: false,
+            diff_turn_completed_due: false,
+            diff_file_change_gen: 0,
+            diff_file_change_seen_gen: 0,
             _pump: None,
         };
         // The follow-output scroll handler is wired by the owning
@@ -3350,6 +3353,12 @@ impl YaldaGpuiView {
         // session for autonaming. `finalize_agent_turn_idem` only raises a flag
         // (it has no `cx`); this is where the flag becomes a request.
         self.drain_autoname_requests(cx);
+        // Cog node `refresh-triggers` (7ods), spec B3(a)/(b): same shape as the
+        // autoname drain above — re-derive any Diff tile bound to a session
+        // whose turn just finalized, and schedule a debounced re-derive for
+        // any session that just reported a completed file-mutating tool call.
+        self.drain_diff_refresh_requests(cx);
+        self.drain_diff_file_change_requests(cx);
         if did_work {
             self.refresh_agent_stats_agents(cx);
             cx.notify();
@@ -3533,6 +3542,10 @@ impl YaldaGpuiView {
         // UXI-AgentTile-27: same drain as the server path — a direct-spawn
         // session's first turn finalizes here, not in `apply_server_batch`.
         self.drain_autoname_requests(cx);
+        // Cog node `refresh-triggers` (7ods), spec B3(a)/(b): same drain as
+        // the server path, for the direct-channel pump.
+        self.drain_diff_refresh_requests(cx);
+        self.drain_diff_file_change_requests(cx);
 
         if has_events {
             self.refresh_agent_stats_agents(cx);
@@ -3629,6 +3642,12 @@ impl YaldaGpuiView {
                 }
                 ReplyEvent::ToolCallStarted(mut tc) => {
                     cap_tool_call_payloads(&mut tc);
+                    // Spec B3(b): a tool call can in principle arrive already
+                    // `Completed` (near-instant execution) — check before it
+                    // moves into `register` below.
+                    if tool_call_reports_file_change(&tc) {
+                        claude.diff_file_change_gen = claude.diff_file_change_gen.wrapping_add(1);
+                    }
                     let floor = agent_tail_floor_char(&claude.editor);
                     let anchor = anchor_for_new_tool_call(&mut claude.editor, floor);
                     // Parse the protocol id into the domain key ONCE here, at
@@ -3651,6 +3670,14 @@ impl YaldaGpuiView {
                     if let Some(existing) = claude.tools.call_mut(&id) {
                         existing.update(upd.fields);
                         cap_tool_call_payloads(existing);
+                        // Spec B3(b): the merged tool call now reflects the
+                        // update — check it (not the raw `upd`) so a status
+                        // flip to `Completed` carried by a PRIOR field set is
+                        // still caught.
+                        if tool_call_reports_file_change(existing) {
+                            claude.diff_file_change_gen =
+                                claude.diff_file_change_gen.wrapping_add(1);
+                        }
                         // No sub-agent mirror to update: `subagents()`
                         // derives label + status live from the tool call we
                         // just mutated (ADR-0006 quick win #1).
@@ -3665,6 +3692,10 @@ impl YaldaGpuiView {
                         );
                         tc.update(upd.fields);
                         cap_tool_call_payloads(&mut tc);
+                        if tool_call_reports_file_change(&tc) {
+                            claude.diff_file_change_gen =
+                                claude.diff_file_change_gen.wrapping_add(1);
+                        }
                         let floor = agent_tail_floor_char(&claude.editor);
                         let anchor = anchor_for_new_tool_call(&mut claude.editor, floor);
                         claude
@@ -3870,6 +3901,11 @@ impl YaldaGpuiView {
             AgentEventKind::ToolCallStarted(tc) => {
                 let mut tc = tc.clone();
                 cap_tool_call_payloads(&mut tc);
+                // Spec B3(b): see the mirrored check in `apply_reply_events` —
+                // a tool call can in principle arrive already `Completed`.
+                if tool_call_reports_file_change(&tc) {
+                    claude.diff_file_change_gen = claude.diff_file_change_gen.wrapping_add(1);
+                }
                 let floor = agent_tail_floor_char(&claude.editor);
                 let anchor = anchor_for_new_tool_call(&mut claude.editor, floor);
                 let id = ToolCallKey::from_id(&tc.tool_call_id);
@@ -3885,11 +3921,19 @@ impl YaldaGpuiView {
                 if let Some(existing) = claude.tools.call_mut(&id) {
                     existing.update(upd.fields.clone());
                     cap_tool_call_payloads(existing);
+                    // Spec B3(b): check the merged call, mirroring the legacy
+                    // `apply_reply_events` arm.
+                    if tool_call_reports_file_change(existing) {
+                        claude.diff_file_change_gen = claude.diff_file_change_gen.wrapping_add(1);
+                    }
                 } else {
                     let mut tc =
                         yalda::acp_channel::ToolCall::new(upd.tool_call_id.clone(), String::new());
                     tc.update(upd.fields.clone());
                     cap_tool_call_payloads(&mut tc);
+                    if tool_call_reports_file_change(&tc) {
+                        claude.diff_file_change_gen = claude.diff_file_change_gen.wrapping_add(1);
+                    }
                     let floor = agent_tail_floor_char(&claude.editor);
                     let anchor = anchor_for_new_tool_call(&mut claude.editor, floor);
                     claude

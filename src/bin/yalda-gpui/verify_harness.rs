@@ -29286,3 +29286,310 @@ fn diff_view_unrelated_root_notify_is_render_flat(cx: &mut TestAppContext) {
          (before {after}, after {after_refresh})"
     );
 }
+
+// ── Cog node `refresh-triggers` (7ods): spec B3(a)/(b) automatic re-derive ──
+
+/// Boot a real session-bound Agent tile (`boot_with_transcript`, sid `S1`),
+/// point its `cwd` at `worktree`, then open a SEPARATE Diff tile
+/// `Session`-bound to the same session id alongside it (`split_focused`, not
+/// `set_screen` — this must NOT disturb the Agent tile, mirroring a real
+/// workspace where an agent session and its Diff review sit in two tiles at
+/// once). Returns once the Diff tile's first on-paint derive has settled.
+fn boot_diff_bound_to_session<'a>(
+    cx: &'a mut TestAppContext,
+    worktree: PathBuf,
+) -> (
+    gpui::Entity<YaldaGpuiView>,
+    &'a mut gpui::VisualTestContext,
+    crate::SessionId,
+    crate::workspace::WindowId,
+) {
+    let (view, vcx, id, session) = boot_with_transcript(cx);
+    session.update(vcx, |s, _cx| s.cwd = worktree);
+    let diff_id = view.update(vcx, |v, cx| {
+        let wid = v
+            .workspace
+            .split_focused(
+                crate::workspace::SplitDir::V,
+                crate::App::Diff(crate::DiffTile::bound_to_session(id)),
+            )
+            .expect("split for a second (Diff) tile");
+        cx.notify();
+        wid
+    });
+    vcx.run_until_parked();
+    (view, vcx, id, diff_id)
+}
+
+/// Cog node `refresh-triggers` (7ods), spec B3(a): "when a bound session's
+/// turn completes" re-derives any Diff tile sourced from it — through the
+/// REAL entry point (`apply_server_batch` folding a `TurnEnded` notification
+/// exactly as the live server pump would), not a hand-called `refresh_diff`.
+///
+/// Negative control (observed RED — see report): commenting out the
+/// `self.drain_diff_refresh_requests(cx);` call in `apply_server_batch`
+/// leaves `model_gen` unchanged after the `TurnEnded` batch.
+#[gpui::test]
+fn diff_tile_rederives_on_bound_session_turn_completion(cx: &mut TestAppContext) {
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let temp = diff_fixture_repo();
+    let worktree = temp.path().to_path_buf();
+    let (view, vcx, _id, diff_id) = boot_diff_bound_to_session(cx, worktree.clone());
+
+    let gen0 = view.read_with(vcx, |v, _| {
+        let tile = v.diff_tile_ref(diff_id).expect("Diff tile");
+        assert!(tile.model.is_some(), "first on-paint derive must have landed");
+        tile.model_gen
+    });
+
+    // Change the worktree so a genuine second derive would see something new
+    // (not asserted on directly — `model_gen` moving is the re-derive proof).
+    std::fs::write(worktree.join("a.txt"), "line1\nchanged a\nturn-triggered\n").unwrap();
+
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![ServerNotification::TurnEnded {
+                session_id: "S1".into(),
+                turn_count: 1,
+                generation: 0,
+            }],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    let gen1 = view.read_with(vcx, |v, _| v.diff_tile_ref(diff_id).unwrap().model_gen);
+    assert!(
+        gen1 > gen0,
+        "a bound session's TurnEnded must re-derive its Diff tile (gen0={gen0}, gen1={gen1})"
+    );
+}
+
+/// Cog node `refresh-triggers` (7ods), spec B3(b): "debounced after any
+/// tool-call completion... that reports file changes". Two file-editing tool
+/// calls complete back-to-back (well inside the debounce window) — this must
+/// coalesce to exactly ONE re-derive, not two, and NONE before the window
+/// elapses. Drives the real `apply_server_batch` → reducer → drain → spawned
+/// debounce task path; the test controls time via the deterministic test
+/// executor (`advance_clock`), never a wall-clock sleep.
+///
+/// Negative control (observed RED — see report): commenting out the
+/// `self.drain_diff_file_change_requests(cx);` call leaves `model_gen`
+/// unchanged even after the debounce window elapses.
+#[gpui::test]
+fn diff_tile_rederives_debounced_after_file_changing_tool_call(cx: &mut TestAppContext) {
+    use yalda::acp_channel::{ReplyEvent, ToolCall, ToolCallStatus, ToolKind};
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let temp = diff_fixture_repo();
+    let worktree = temp.path().to_path_buf();
+    let (view, vcx, _id, diff_id) = boot_diff_bound_to_session(cx, worktree.clone());
+    let gen0 = view.read_with(vcx, |v, _| v.diff_tile_ref(diff_id).unwrap().model_gen);
+
+    let ev = |e: ReplyEvent| ServerNotification::ReplyEvent {
+        session_id: "S1".into(),
+        event: e,
+    };
+    let edit_call = |tool_id: &str, path: &std::path::Path| {
+        let mut tc = ToolCall::new(tool_id.to_string(), format!("Edit {}", path.display()));
+        tc.kind = ToolKind::Edit;
+        tc.status = ToolCallStatus::Completed;
+        tc.raw_input = Some(serde_json::json!({ "file_path": path.to_string_lossy() }));
+        tc
+    };
+
+    // First completed file edit.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![ev(ReplyEvent::ToolCallStarted(edit_call(
+                "tool-edit-1",
+                &worktree.join("a.txt"),
+            )))],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    // A second completed file edit arrives immediately (same tick), well
+    // inside the debounce window — must coalesce with the first.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![ev(ReplyEvent::ToolCallStarted(edit_call(
+                "tool-edit-2",
+                &worktree.join("b.txt"),
+            )))],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    let gen_before_window = view.read_with(vcx, |v, _| v.diff_tile_ref(diff_id).unwrap().model_gen);
+    assert_eq!(
+        gen_before_window, gen0,
+        "must NOT re-derive before the debounce window elapses"
+    );
+
+    vcx.executor()
+        .advance_clock(crate::YaldaGpuiView::DIFF_FILE_CHANGE_DEBOUNCE);
+    vcx.run_until_parked();
+
+    let gen_after = view.read_with(vcx, |v, _| v.diff_tile_ref(diff_id).unwrap().model_gen);
+    assert_eq!(
+        gen_after,
+        gen0 + 1,
+        "two completions inside one debounce window must coalesce to exactly \
+         ONE re-derive (gen0={gen0}, got {gen_after})"
+    );
+}
+
+/// spec B3 "Hunk focus survives refresh when the focused hunk's hash still
+/// exists": a triggered (not manual) re-derive that changes a DIFFERENT
+/// file's hunk must leave the focused hunk's identity untouched.
+///
+/// Negative control (observed RED — see report): commenting out the trigger
+/// wiring leaves this test vacuously passing for the wrong reason (no
+/// re-derive at all) — paired with the "must re-derive" assert on `model_gen`
+/// above, which fails RED in that state, so the pairing is meaningful.
+#[gpui::test]
+fn diff_tile_triggered_refresh_preserves_focus_when_hunk_unchanged(cx: &mut TestAppContext) {
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let temp = diff_fixture_repo();
+    let worktree = temp.path().to_path_buf();
+    let (view, vcx, _id, diff_id) = boot_diff_bound_to_session(cx, worktree.clone());
+
+    let (gen0, file0_name, prev_hash) = view.read_with(vcx, |v, _| {
+        let tile = v.diff_tile_ref(diff_id).expect("Diff tile");
+        let model = tile.model.as_ref().expect("first derive settled");
+        assert_eq!(model.files.len(), 2, "fixture touches two files");
+        // Default focus is (file 0, hunk 0).
+        (
+            tile.model_gen,
+            model.files[0].path.clone(),
+            tile.focused_hunk_hash().expect("a hunk is focused"),
+        )
+    });
+    assert!(
+        file0_name.ends_with("a.txt"),
+        "fixture's file 0 must be a.txt (stable git diff ordering), got {file0_name:?}"
+    );
+
+    // Change b.txt only — a.txt (the focused file) is untouched, so its hunk
+    // hash must be identical after the re-derive.
+    std::fs::write(worktree.join("b.txt"), "line1\nchanged b\nmore\n").unwrap();
+
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![ServerNotification::TurnEnded {
+                session_id: "S1".into(),
+                turn_count: 1,
+                generation: 0,
+            }],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    view.read_with(vcx, |v, _| {
+        let tile = v.diff_tile_ref(diff_id).expect("Diff tile");
+        assert!(
+            tile.model_gen > gen0,
+            "a real re-derive must have happened (gen0={gen0}, got {})",
+            tile.model_gen
+        );
+        assert_eq!(
+            tile.focus,
+            crate::DiffFocus { file: 0, hunk: 0 },
+            "focus must stay on a.txt's hunk (file 0 unchanged in the new model)"
+        );
+        assert_eq!(
+            tile.focused_hunk_hash(),
+            Some(prev_hash),
+            "an unchanged hunk's hash (and thus focus identity) must survive a \
+             triggered refresh"
+        );
+    });
+}
+
+/// spec B3 "otherwise focus moves to the nearest hunk": a triggered re-derive
+/// that removes the CURRENTLY FOCUSED hunk (its content changed back to
+/// match the merge-base, so the hunk disappears from the model entirely)
+/// must move focus to the nearest surviving hunk — not panic, not point at a
+/// stale/out-of-range index. Drives spec B3(b) (the debounced tool-call
+/// trigger) for this assertion, so both triggers get focus-survival coverage
+/// across the two tests.
+#[gpui::test]
+fn diff_tile_triggered_refresh_moves_focus_to_nearest_when_hunk_hash_gone(cx: &mut TestAppContext) {
+    use yalda::acp_channel::{ReplyEvent, ToolCall, ToolCallStatus, ToolKind};
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let temp = diff_fixture_repo();
+    let worktree = temp.path().to_path_buf();
+    let (view, vcx, _id, diff_id) = boot_diff_bound_to_session(cx, worktree.clone());
+
+    // Focus b.txt's hunk (file index 1) — the one about to disappear.
+    let (gen0, prev_hash) = view.update(vcx, |v, cx| {
+        let window = v.workspace.tile_mut(diff_id).expect("Diff tile window");
+        let crate::App::Diff(tile) = &mut window.content else {
+            panic!("tile at diff_id is not a Diff tile");
+        };
+        let model = tile.model.as_ref().expect("first derive settled");
+        assert_eq!(model.files.len(), 2, "fixture touches two files");
+        assert!(
+            model.files[1].path.ends_with("b.txt"),
+            "fixture's file 1 must be b.txt, got {:?}",
+            model.files[1].path
+        );
+        tile.focus = crate::DiffFocus { file: 1, hunk: 0 };
+        let hash = tile.focused_hunk_hash().expect("b.txt hunk focused");
+        cx.notify();
+        (tile.model_gen, hash)
+    });
+
+    // Revert b.txt to the merge-base content — its hunk vanishes from the
+    // next derive entirely (not just changes hash: the file itself drops out
+    // of the diff, since it now matches merge-base exactly).
+    std::fs::write(worktree.join("b.txt"), "line1\n").unwrap();
+
+    let ev = ServerNotification::ReplyEvent {
+        session_id: "S1".into(),
+        event: {
+            let mut tc = ToolCall::new("tool-edit-revert-b", "Edit b.txt");
+            tc.kind = ToolKind::Edit;
+            tc.status = ToolCallStatus::Completed;
+            tc.raw_input =
+                Some(serde_json::json!({ "file_path": worktree.join("b.txt").to_string_lossy() }));
+            ReplyEvent::ToolCallStarted(tc)
+        },
+    };
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(vec![ev], cx);
+    });
+    vcx.run_until_parked();
+    vcx.executor()
+        .advance_clock(crate::YaldaGpuiView::DIFF_FILE_CHANGE_DEBOUNCE);
+    vcx.run_until_parked();
+
+    view.read_with(vcx, |v, _| {
+        let tile = v.diff_tile_ref(diff_id).expect("Diff tile");
+        assert!(
+            tile.model_gen > gen0,
+            "the debounced tool-call trigger must have re-derived (gen0={gen0}, got {})",
+            tile.model_gen
+        );
+        let model = tile.model.as_ref().expect("re-derive settled");
+        assert_eq!(model.files.len(), 1, "b.txt's hunk must have vanished entirely");
+        assert_eq!(
+            tile.focus,
+            crate::DiffFocus { file: 0, hunk: 0 },
+            "focus must fall back to the nearest surviving hunk (a.txt), not panic \
+             or stay pointed at the now-gone file index 1"
+        );
+        assert_ne!(
+            tile.focused_hunk_hash(),
+            Some(prev_hash),
+            "the old (now-gone) hunk hash must not still read as focused"
+        );
+    });
+}

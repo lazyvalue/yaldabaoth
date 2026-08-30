@@ -190,6 +190,126 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
+    /// Every window id holding a Diff tile whose `DiffSource` is
+    /// `Session(id)` — spec B3 triggers (a)/(b) fan out a re-derive to
+    /// however many tiles (across however many workspaces) are watching one
+    /// session's worktree. Mirrors the `for_each_attached_window` walk
+    /// `reconcile_session_closed` uses to find a session's `App::Agent` tile,
+    /// generalized to `App::Diff` and to "however many", not "at most one" —
+    /// unlike an agent tile's 1:1 binding, several Diff tiles may legitimately
+    /// watch the same session's worktree at once.
+    fn diff_windows_bound_to_session(&self, id: SessionId) -> Vec<workspace::WindowId> {
+        let mut out = Vec::new();
+        for wsp in self.workspace.workspaces.iter() {
+            wsp.for_each_attached_window(&mut |window| {
+                if let App::Diff(tile) = &window.content
+                    && tile.source == Some(DiffSource::Session(id))
+                {
+                    out.push(window.id());
+                }
+            });
+        }
+        out
+    }
+
+    /// Re-derive every Diff tile bound to session `id` (spec B3 triggers
+    /// (a)/(b)). A no-op when nothing is watching this session — the common
+    /// case, since most sessions never have a Diff tile open on them.
+    pub(crate) fn refresh_diff_tiles_for_session(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        for wid in self.diff_windows_bound_to_session(id) {
+            self.refresh_diff(wid, cx);
+        }
+    }
+
+    /// Cog node `refresh-triggers` (7ods), spec B3(a): "when a bound session's
+    /// turn completes". `finalize_agent_turn_idem` is the one chokepoint every
+    /// turn-completion path (forwarded `AgentEvent`, legacy inference, the
+    /// direct-channel path) funnels through, so arming `diff_turn_completed_due`
+    /// there and draining it HERE — exactly where `drain_autoname_requests`
+    /// already runs, for the same "no `cx` at the finalize site" reason —
+    /// covers every completion path by construction. Not debounced: a turn
+    /// completion is a single, infrequent event (unlike a burst of tool
+    /// calls), so an immediate re-derive is correct as-is.
+    pub(crate) fn drain_diff_refresh_requests(&mut self, cx: &mut Context<Self>) {
+        let due: Vec<SessionId> = self
+            .sessions
+            .iter()
+            .filter(|(_, ent)| ent.read(cx).state.diff_turn_completed_due)
+            .map(|(id, _)| id)
+            .collect();
+        for id in due {
+            if let Some(ent) = self.sessions.get(id) {
+                ent.update(cx, |s, _| s.state.diff_turn_completed_due = false);
+            }
+            self.refresh_diff_tiles_for_session(id, cx);
+        }
+    }
+
+    /// Debounce window for spec B3(b) — long enough to coalesce a multi-file
+    /// edit turn's tool-call completions (which land back-to-back) into one
+    /// re-derive, short enough that the diff still feels live.
+    pub(crate) const DIFF_FILE_CHANGE_DEBOUNCE: std::time::Duration =
+        std::time::Duration::from_millis(600);
+
+    /// Cog node `refresh-triggers` (7ods), spec B3(b): "debounced after any
+    /// tool-call completion... that reports file changes". The reducer arms
+    /// (`apply_reply_events` / `apply_agent_event`) bump
+    /// `diff_file_change_gen` on every completed file-mutating tool call —
+    /// cheap, `cx`-free bookkeeping at the point of detection. This drain
+    /// (called from the same two pump chokepoints as
+    /// `drain_diff_refresh_requests`) notices a session whose generation has
+    /// moved since the last schedule, marks it seen, and schedules ONE
+    /// debounce task carrying that generation.
+    pub(crate) fn drain_diff_file_change_requests(&mut self, cx: &mut Context<Self>) {
+        let due: Vec<(SessionId, u64)> = self
+            .sessions
+            .iter()
+            .filter_map(|(id, ent)| {
+                let s = ent.read(cx);
+                let gen_ = s.state.diff_file_change_gen;
+                if gen_ != s.state.diff_file_change_seen_gen {
+                    Some((id, gen_))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for (id, gen_) in due {
+            if let Some(ent) = self.sessions.get(id) {
+                ent.update(cx, |s, _| s.state.diff_file_change_seen_gen = gen_);
+            }
+            self.schedule_debounced_diff_refresh(id, gen_, cx);
+        }
+    }
+
+    /// Wait out the debounce window, then re-derive ONLY if `gen_` is still
+    /// the LATEST generation for this session — a later bump during the
+    /// window means a newer scheduled task (carrying that later `gen_`) owns
+    /// the eventual refresh instead, so this stale one no-ops. This trailing-
+    /// edge pattern collapses a whole burst of file-touching tool calls to
+    /// exactly one re-derive: the caller marks each generation "seen" at
+    /// SCHEDULE time (`drain_diff_file_change_requests`), so a burst inside
+    /// one window spawns several of these tasks, but every task except the
+    /// one whose `gen_` survives untouched through its own wait exits without
+    /// deriving.
+    fn schedule_debounced_diff_refresh(&mut self, id: SessionId, gen_: u64, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Self::DIFF_FILE_CHANGE_DEBOUNCE)
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let current = this
+                    .sessions
+                    .get(id)
+                    .map(|ent| ent.read(cx).state.diff_file_change_gen);
+                if current == Some(gen_) {
+                    this.refresh_diff_tiles_for_session(id, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
     /// `r` / the tile-menu "refresh" verb (spec B3 manual refresh) for the
     /// FOCUSED Diff tile.
     pub(crate) fn diff_refresh_focused(&mut self, cx: &mut Context<Self>) {
