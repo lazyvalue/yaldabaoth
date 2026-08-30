@@ -285,6 +285,69 @@ impl DiffTile {
     }
 }
 
+// ── Cog node `merge-gate` (v5tg): spec B7 pure predicate ────────────────────
+
+/// Why `merge_gate_decision` refused a merge (spec B7). Exhaustive — these
+/// are the ONLY three things B7 names as merge-blocking, so a caller can
+/// match on this without a catch-all arm ever needing to fire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MergeRefusal {
+    /// `usize` is the count of hunks in the current `DiffModel` that are not
+    /// yet reviewed (spec: "refuses with the unreviewed count").
+    UnreviewedHunks(usize),
+    /// The worktree the Diff tile is bound to has uncommitted changes
+    /// (tracked or untracked) — checked fresh via `git status --porcelain`
+    /// at merge time, NEVER via `DiffModel::dirty` (which means "differs
+    /// from merge-base", not "has uncommitted changes" — see `diff_model.rs`
+    /// module docs on `parse_diff`).
+    FeatureWorktreeDirty,
+    /// The primary checkout (spec: "the merge executes in the primary
+    /// checkout... it refuses if the primary checkout is dirty") has
+    /// uncommitted changes.
+    PrimaryCheckoutDirty,
+}
+
+impl std::fmt::Display for MergeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MergeRefusal::UnreviewedHunks(n) => {
+                write!(f, "{n} unreviewed hunk{}", if *n == 1 { "" } else { "s" })
+            }
+            MergeRefusal::FeatureWorktreeDirty => write!(f, "feature worktree dirty"),
+            MergeRefusal::PrimaryCheckoutDirty => write!(f, "primary checkout dirty"),
+        }
+    }
+}
+
+/// THE pure merge-gate predicate (spec B7): "merges the branch into base
+/// ONLY when every hunk in the current `DiffModel` is reviewed and the
+/// feature worktree is clean"; independently, "it refuses if the primary
+/// checkout is dirty". Pure — no I/O, no subprocess — so it's exhaustively
+/// unit-testable without a real git fixture; the ONLY production caller is
+/// `diff_ui.rs::run_merge_gate`, which resolves `feature_clean` /
+/// `primary_clean` via real `git status --porcelain` checks
+/// (`diff_git.rs::worktree_is_clean`) run off the paint path (spec C2)
+/// before calling in. Checked in the order the spec lists them, though
+/// callers should treat the specific `Err` variant, not the check order, as
+/// the contract.
+pub(crate) fn merge_gate_decision(
+    model: &DiffModel,
+    feature_clean: bool,
+    primary_clean: bool,
+) -> Result<(), MergeRefusal> {
+    let unreviewed = model.unreviewed_hunk_count();
+    if unreviewed > 0 {
+        return Err(MergeRefusal::UnreviewedHunks(unreviewed));
+    }
+    if !feature_clean {
+        return Err(MergeRefusal::FeatureWorktreeDirty);
+    }
+    if !primary_clean {
+        return Err(MergeRefusal::PrimaryCheckoutDirty);
+    }
+    Ok(())
+}
+
 /// Build the `<abs-path>:<line>` argument `zed` takes on its command line
 /// (spec B8 "Open in Zed"): the worktree root joined with the focused file's
 /// repo-relative path, suffixed with the hunk's first new-file line. Pure —
@@ -374,5 +437,116 @@ mod zed_open_tests {
         let rel = std::path::Path::new("src/bin/app/main.rs");
         let arg = zed_open_arg(worktree, rel, 1);
         assert_eq!(arg, "/Users/scott/ws/proj/src/bin/app/main.rs:1");
+    }
+}
+
+// ── Cog node `merge-gate` (v5tg): spec B7 pure predicate ────────────────────
+
+#[cfg(test)]
+mod merge_gate_decision_tests {
+    use super::*;
+
+    /// Build a `DiffModel` with `n_unreviewed` unreviewed hunks and
+    /// `n_reviewed` reviewed hunks (all in one fake file) — `merge_gate_decision`
+    /// only ever reads `unreviewed_hunk_count()`, so no real diff text is
+    /// needed.
+    fn model_with(n_unreviewed: usize, n_reviewed: usize) -> DiffModel {
+        let mut hunks = Vec::new();
+        for i in 0..n_unreviewed {
+            hunks.push(Hunk {
+                header: "@@ -1,1 +1,1 @@".into(),
+                lines: vec![],
+                hunk_hash: i as u64,
+                reviewed: false,
+            });
+        }
+        for i in 0..n_reviewed {
+            hunks.push(Hunk {
+                header: "@@ -1,1 +1,1 @@".into(),
+                lines: vec![],
+                hunk_hash: 1000 + i as u64,
+                reviewed: true,
+            });
+        }
+        DiffModel {
+            worktree: PathBuf::from("/tmp/fake"),
+            branch: "feature".into(),
+            base: "main".into(),
+            merge_base: "deadbeef".into(),
+            dirty: n_unreviewed + n_reviewed > 0,
+            files: vec![FileDiff {
+                path: PathBuf::from("src/lib.rs"),
+                status: FileStatus::Modified,
+                hunks,
+                added: 0,
+                removed: 0,
+            }],
+        }
+    }
+
+    /// The all-clear case: every hunk reviewed, both worktrees clean — the
+    /// gate ALLOWS (`Ok(())`).
+    #[test]
+    fn allows_when_all_reviewed_and_both_worktrees_clean() {
+        let model = model_with(0, 3);
+        assert_eq!(merge_gate_decision(&model, true, true), Ok(()));
+    }
+
+    /// Spec B7 reason #1: any unreviewed hunk refuses, carrying the count —
+    /// this is the check the NEGATIVE CONTROL below disables to prove the
+    /// guard is load-bearing.
+    #[test]
+    fn refuses_with_unreviewed_count_when_hunks_unreviewed() {
+        let model = model_with(2, 1);
+        assert_eq!(
+            merge_gate_decision(&model, true, true),
+            Err(MergeRefusal::UnreviewedHunks(2))
+        );
+    }
+
+    /// Spec B7 reason #2: a dirty feature worktree refuses even when every
+    /// hunk is reviewed.
+    #[test]
+    fn refuses_when_feature_worktree_dirty() {
+        let model = model_with(0, 1);
+        assert_eq!(
+            merge_gate_decision(&model, false, true),
+            Err(MergeRefusal::FeatureWorktreeDirty)
+        );
+    }
+
+    /// Spec B7 reason #3: a dirty primary checkout refuses even when
+    /// everything about the feature side is clean/reviewed.
+    #[test]
+    fn refuses_when_primary_checkout_dirty() {
+        let model = model_with(0, 1);
+        assert_eq!(
+            merge_gate_decision(&model, true, false),
+            Err(MergeRefusal::PrimaryCheckoutDirty)
+        );
+    }
+
+    /// Unreviewed hunks take priority over a dirty primary checkout when
+    /// BOTH are true — the returned reason is deterministic, not whichever
+    /// happened to be checked last.
+    #[test]
+    fn unreviewed_hunks_take_priority_over_dirty_checkouts() {
+        let model = model_with(1, 0);
+        assert_eq!(
+            merge_gate_decision(&model, false, false),
+            Err(MergeRefusal::UnreviewedHunks(1))
+        );
+    }
+
+    /// `MergeRefusal::Display` renders the human-readable reason strings the
+    /// spec names verbatim (`transient_status` text — spec B7: "refuses with
+    /// the unreviewed count" / "feature worktree dirty" / "primary checkout
+    /// dirty").
+    #[test]
+    fn merge_refusal_display_matches_spec_wording() {
+        assert_eq!(MergeRefusal::UnreviewedHunks(1).to_string(), "1 unreviewed hunk");
+        assert_eq!(MergeRefusal::UnreviewedHunks(3).to_string(), "3 unreviewed hunks");
+        assert_eq!(MergeRefusal::FeatureWorktreeDirty.to_string(), "feature worktree dirty");
+        assert_eq!(MergeRefusal::PrimaryCheckoutDirty.to_string(), "primary checkout dirty");
     }
 }

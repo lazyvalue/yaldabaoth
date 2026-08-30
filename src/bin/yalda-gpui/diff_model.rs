@@ -64,6 +64,20 @@ impl DiffModel {
             .filter(|h| !h.reviewed)
             .count()
     }
+
+    /// Every `hunk_hash` in this model, in file/occurrence order — the ONE
+    /// place both `diff_ui.rs`'s tile-side gate (via `DiffModel` directly)
+    /// and the hidden `yalda-gpui --hash-diff` subcommand (`main.rs`) read
+    /// hashes from, so the two can never compute them differently (spec C6).
+    /// `main()`'s `run_hash_diff_subcommand` prints exactly these, one per
+    /// line, in this order.
+    pub fn hunk_hashes(&self) -> Vec<u64> {
+        self.files
+            .iter()
+            .flat_map(|f| f.hunks.iter())
+            .map(|h| h.hunk_hash)
+            .collect()
+    }
 }
 
 /// What happened to a file between `merge_base` and the working tree.
@@ -617,6 +631,42 @@ index 1111111..2222222 100644
 ";
         let m = model(raw);
         assert!(!m.files[0].hunks[0].reviewed);
+    }
+
+    /// Cog node `merge-gate` (v5tg): `hunk_hashes()` returns exactly the
+    /// per-hunk `hunk_hash` values in file/occurrence order — the ordering
+    /// `run_hash_diff_subcommand` (`main.rs`) relies on to print one hash per
+    /// line "in file/occurrence order" per its documented contract.
+    #[test]
+    fn hunk_hashes_returns_hashes_in_file_occurrence_order() {
+        let raw = "\
+diff --git a/src/foo.rs b/src/foo.rs
+index 1111111..2222222 100644
+--- a/src/foo.rs
++++ b/src/foo.rs
+@@ -1,3 +1,3 @@
+ fn foo() {
+-    old_line();
++    new_line();
+ }
+diff --git a/src/bar.rs b/src/bar.rs
+index 3333333..4444444 100644
+--- a/src/bar.rs
++++ b/src/bar.rs
+@@ -10,2 +10,3 @@ fn bar() {
+     let x = 1;
++    let y = 2;
+     let z = 3;
+";
+        let m = model(raw);
+        let expected: Vec<u64> = m
+            .files
+            .iter()
+            .flat_map(|f| f.hunks.iter())
+            .map(|h| h.hunk_hash)
+            .collect();
+        assert_eq!(m.hunk_hashes(), expected);
+        assert_eq!(m.hunk_hashes().len(), 2);
     }
 
     /// An empty diff (nothing changed) parses to zero files and `dirty ==

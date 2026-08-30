@@ -355,18 +355,85 @@ impl YaldaGpuiView {
         self.diff_unbind(id, cx);
     }
 
-    /// Tile-menu "merge" verb (spec B7) — the merge gate itself is a later
-    /// cog node's job; this is the present, wired STUB the spec's B9 menu
-    /// requires.
+    /// Tile-menu "merge" verb (spec B7) — Cog node `merge-gate` (v5tg): the
+    /// tile-side half of the two-layer merge gate. Reads the FOCUSED tile's
+    /// current `DiffModel` + bound worktree, then hands off to
+    /// `run_merge_gate` on the background executor (spec C2 — even the
+    /// clean-checks and, when allowed, the merge itself all shell out to
+    /// git, so none of it belongs on the paint path). Refusal and success
+    /// are both reported via `transient_status`; a refusal touches git not
+    /// at all beyond the two `status --porcelain` checks `run_merge_gate`
+    /// needs to evaluate the gate.
     pub(crate) fn diff_merge_focused(&mut self, cx: &mut Context<Self>) {
-        self.transient_status = Some("merge gate not implemented yet".into());
-        cx.notify();
+        let Some(id) = self.workspace.focused_window_id() else {
+            return;
+        };
+        if !matches!(self.workspace.focused_content(), Some(App::Diff(_))) {
+            return;
+        }
+        let Some(tile) = self.diff_tile_ref(id) else {
+            return;
+        };
+        let Some(model) = tile.model.clone() else {
+            self.transient_status = Some("no diff to merge — bind + refresh first".into());
+            cx.notify();
+            return;
+        };
+        let Some(feature_worktree) = tile.worktree() else {
+            self.transient_status = Some("no worktree bound".into());
+            cx.notify();
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let message = cx
+                .background_executor()
+                .spawn(async move { run_merge_gate(&model, &feature_worktree) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.transient_status = Some(message.into());
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
-    /// Tile-menu "install hook" verb (spec B7) — the hook installer is a
-    /// later cog node's job; present, wired STUB per spec B9.
+    /// Tile-menu "install hook" verb (spec B7) — Cog node `merge-gate`
+    /// (v5tg): installs the second (git-hook) layer into the FOCUSED tile's
+    /// bound worktree's git common dir (`diff_git.rs::install_merge_gate_hook`).
+    /// Run synchronously in the handler (never from `render` — spec C2 is
+    /// about the paint path specifically): this is a rare, explicit,
+    /// one-shot action, same precedent as `open_hunk_in_zed`'s direct
+    /// `Command::spawn` below, not a hot path that needs a background-
+    /// executor detour. Spec B7: "Never install automatically — only this
+    /// explicit command."
     pub(crate) fn diff_install_hook_focused(&mut self, cx: &mut Context<Self>) {
-        self.transient_status = Some("merge-gate hook installer not implemented yet".into());
+        let Some(id) = self.workspace.focused_window_id() else {
+            return;
+        };
+        if !matches!(self.workspace.focused_content(), Some(App::Diff(_))) {
+            return;
+        }
+        let Some(worktree) = self.diff_tile_ref(id).and_then(|t| t.worktree()) else {
+            self.transient_status = Some("no worktree bound".into());
+            cx.notify();
+            return;
+        };
+        let bin = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                self.transient_status =
+                    Some(format!("couldn't resolve yalda-gpui's own binary path: {e}").into());
+                cx.notify();
+                return;
+            }
+        };
+        self.transient_status = Some(
+            match install_merge_gate_hook(&worktree, &bin) {
+                Ok(msg) => msg,
+                Err(msg) => format!("hook install failed: {msg}"),
+            }
+            .into(),
+        );
         cx.notify();
     }
 
@@ -715,6 +782,51 @@ impl YaldaGpuiView {
             self.transient_status = Some(format!("couldn't open zed: {e}").into());
             cx.notify();
         }
+    }
+}
+
+// ── Cog node `merge-gate` (v5tg): spec B7 ───────────────────────────────────
+
+/// Off-paint-path merge attempt body for `diff_merge_focused` (spec B7 /
+/// C2). Re-checks BOTH worktrees' clean state FRESH via
+/// `diff_git.rs::worktree_is_clean` — never `DiffModel::dirty`, which means
+/// "differs from merge-base" (`diff_model.rs`'s `parse_diff` docs), not "has
+/// uncommitted changes" — resolves the primary checkout via the shared
+/// `yalda::worktree::list_worktrees` helper (the SAME parser the file
+/// browser's worktree switcher already trusts, per spec: "Resolve the
+/// primary checkout from `git worktree list`... via the diff_git helpers" —
+/// no second `git worktree list` parser gets written for this), defers the
+/// actual go/no-go to the pure `merge_gate_decision` (`diff.rs`), and only
+/// on success calls `execute_merge_no_ff`. Returns the `transient_status`
+/// text either way; never panics, and never leaves a live checkout
+/// conflicted (`execute_merge_no_ff` already aborted internally on failure
+/// by the time it returns).
+fn run_merge_gate(model: &DiffModel, feature_worktree: &std::path::Path) -> String {
+    let feature_clean = match worktree_is_clean(feature_worktree) {
+        Ok(c) => c,
+        Err(e) => return format!("merge refused: couldn't check feature worktree: {e}"),
+    };
+    let worktrees = worktree::list_worktrees(feature_worktree);
+    let Some(primary) = worktrees.into_iter().next().map(|w| w.path) else {
+        return "merge refused: couldn't resolve the primary checkout (not a git repo?)".to_string();
+    };
+    let primary_clean = if primary == feature_worktree {
+        feature_clean
+    } else {
+        match worktree_is_clean(&primary) {
+            Ok(c) => c,
+            Err(e) => return format!("merge refused: couldn't check primary checkout: {e}"),
+        }
+    };
+    if let Err(refusal) = merge_gate_decision(model, feature_clean, primary_clean) {
+        return format!("merge refused: {refusal}");
+    }
+    match execute_merge_no_ff(&primary, &model.branch) {
+        Ok(()) => format!("merged {} into {} (--no-ff)", model.branch, primary.display()),
+        Err(conflict) => format!(
+            "merge conflict in {} — aborted, no changes left ({conflict})",
+            primary.display()
+        ),
     }
 }
 

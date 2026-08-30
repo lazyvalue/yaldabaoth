@@ -1,0 +1,147 @@
+#!/bin/sh
+# yalda-pre-merge-hook — Cog node `merge-gate` (v5tg), docs/specs/spec-diff-review.md B7.
+#
+# The SECOND layer of the two-layer merge gate. The FIRST layer is the Diff
+# tile's own `merge` command (`diff_ui.rs::diff_merge_focused`, gated by the
+# pure `merge_gate_decision` in `diff.rs`); this script is independent of
+# that path and exists to catch a merge done by an agent or at the raw CLI
+# that bypasses the tile entirely. It recomputes the SAME predicate the tile
+# evaluates, reading the SAME `ReviewState` file, and hashing the SAME way —
+# via the hidden `yalda-gpui --hash-diff` subcommand below, which is a thin
+# shell around `diff_model.rs`'s `parse_diff` + `hunk_hash`. This script
+# NEVER reimplements hunk hashing itself (spec C6: one normalization, shared
+# by hook and tile; a drift between them is a bug, not a fallback).
+#
+# Installed by `diff_install_hook_focused` (`diff_ui.rs`) into the git common
+# dir's `hooks/pre-merge-commit` (with `@@YALDA_GPUI_BIN@@` below replaced by
+# the resolved absolute path of the installing `yalda-gpui` binary), and
+# reused (unmodified — this script only cares whether `MERGE_HEAD` exists,
+# not which hook name invoked it) from the installed `hooks/pre-commit`
+# fragment to cover a conflicted merge finished by hand via `git commit`
+# (`pre-merge-commit` never fires for that path). The installer also sets
+# `merge.ff false`, since `pre-merge-commit` never fires for a fast-forward
+# merge either.
+#
+# Exit non-zero refuses the merge/commit. Exit 0 allows it.
+#
+# KNOWN, DOCUMENTED HOLE (not defended — spec B7): `git merge --no-verify` /
+# `git commit --no-verify` bypasses this hook entirely. The gate is
+# defense-in-depth against accidental unreviewed merges, not access control.
+# A repo that never installs this hook simply lacks the second layer.
+set -eu
+
+# The `yalda-gpui` binary path. `YALDA_GPUI_BIN` (env) wins when set non-empty
+# — this is what lets this exact checked-in file (with the placeholder below
+# left un-substituted) be exercised directly by tests, and what lets a human
+# override it ad hoc. The installer bakes the resolved absolute path into the
+# placeholder for the copy it actually installs. If neither resolves to an
+# executable file we FAIL CLOSED (spec: "If the yalda-gpui binary is missing
+# at merge time, FAIL CLOSED") — there is no other way to recompute hunk
+# hashes, so silently allowing the merge would defeat the whole gate.
+YALDA_GPUI_BIN="${YALDA_GPUI_BIN:-@@YALDA_GPUI_BIN@@}"
+
+fail() {
+    echo "yalda-pre-merge-hook: $1" >&2
+    exit 1
+}
+
+# Only meaningful during an actual merge. `pre-commit` invokes this
+# unconditionally on EVERY commit (via the installed fragment), so a normal
+# (non-merge) commit must be a silent allow regardless of whether the binary
+# below is even present — checked BEFORE the binary check for exactly that
+# reason.
+merge_head_sha=$(git rev-parse -q --verify MERGE_HEAD 2>/dev/null) || exit 0
+
+[ -x "$YALDA_GPUI_BIN" ] || fail "yalda-gpui binary not found/executable at '$YALDA_GPUI_BIN' — failing closed (cannot verify review state)"
+
+# Identify the branch being merged: the local branch (if any) whose tip is
+# exactly MERGE_HEAD. If more than one local branch shares that tip, the
+# first one `for-each-ref` reports is used — a documented limitation, not a
+# silent one.
+branch=$(git for-each-ref --points-at="$merge_head_sha" --format='%(refname:short)' refs/heads/ | head -n1)
+[ -n "$branch" ] || fail "cannot determine the branch being merged (MERGE_HEAD $merge_head_sha matches no local branch tip) — failing closed"
+
+# Resolve the git common dir as an absolute path (ReviewState lives there,
+# shared by every worktree of this repo — spec § Data Model).
+common_dir=$(git rev-parse --git-common-dir)
+case "$common_dir" in
+    /*) : ;;
+    *) common_dir="$(pwd)/$common_dir" ;;
+esac
+common_dir=$(cd "$common_dir" && pwd)
+
+# Resolve the branch's worktree via `git worktree list --porcelain` (blocks
+# separated by a blank line; parsed by hand here since this is a standalone
+# POSIX sh script with no JSON/porcelain parser available — this parsing is
+# NOT the C6-covered normalization, only hunk hashing is).
+worktree_path=""
+current_path=""
+current_branch=""
+worktree_list_out=$(git worktree list --porcelain)
+while IFS= read -r line; do
+    case "$line" in
+        "worktree "*)
+            current_path=${line#worktree }
+            current_branch=""
+            ;;
+        "branch refs/heads/"*)
+            current_branch=${line#branch refs/heads/}
+            ;;
+        "")
+            if [ "$current_branch" = "$branch" ] && [ -z "$worktree_path" ]; then
+                worktree_path="$current_path"
+            fi
+            ;;
+        *) ;;
+    esac
+done <<WORKTREES
+$worktree_list_out
+
+WORKTREES
+
+[ -n "$worktree_path" ] || fail "cannot resolve a worktree checked out on branch '$branch' — failing closed"
+[ -d "$worktree_path" ] || fail "resolved worktree '$worktree_path' for branch '$branch' does not exist — failing closed"
+
+# Feature worktree must be clean (spec B7 — same clean-check the tile's
+# `merge` command re-derives fresh, never a stale flag).
+if [ -n "$(git -C "$worktree_path" status --porcelain)" ]; then
+    fail "feature worktree ($worktree_path) is dirty — commit or stash before merging"
+fi
+
+# Load the branch's reviewed hashes (spec § Data Model:
+# `<git-common-dir>/yalda-review/<branch>.json`, `/` in the branch name
+# sanitized to `--` exactly like `review_state.rs::sanitize_branch`). A
+# missing file means an empty reviewed set, not an error — matching
+# `load_review_state`'s "missing file => empty state" contract — which then
+# naturally refuses the merge below since nothing is reviewed.
+sanitized_branch=$(printf '%s' "$branch" | sed 's#/#--#g')
+review_file="$common_dir/yalda-review/$sanitized_branch.json"
+if [ -f "$review_file" ]; then
+    reviewed_hashes=$(grep -Eo '[0-9]+' "$review_file" || true)
+else
+    reviewed_hashes=""
+fi
+
+# Recompute the CURRENT hunk hashes the ONE shared way (spec C6) — never
+# reimplemented here.
+current_hashes=$("$YALDA_GPUI_BIN" --hash-diff "$worktree_path") || fail "yalda-gpui --hash-diff failed for $worktree_path — failing closed"
+
+unreviewed=0
+for h in $current_hashes; do
+    found=0
+    for r in $reviewed_hashes; do
+        if [ "$h" = "$r" ]; then
+            found=1
+            break
+        fi
+    done
+    if [ "$found" -eq 0 ]; then
+        unreviewed=$((unreviewed + 1))
+    fi
+done
+
+if [ "$unreviewed" -gt 0 ]; then
+    fail "$unreviewed unreviewed hunk(s) on branch '$branch' — review them in the Diff tile before merging"
+fi
+
+exit 0
