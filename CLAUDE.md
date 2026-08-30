@@ -196,6 +196,18 @@ so items stay crate-visible regardless of file):
 - `linear.rs` / `linear_ui.rs` / `linear_view.rs` — `App::Linear`: the Linear
   GraphQL client + data model, the view-layer methods, and the cached body
   component (built on **yux**).
+- `diff.rs` / `diff_ui.rs` / `diff_view.rs` + `diff_model.rs` / `diff_git.rs` /
+  `review_state.rs` — `App::Diff`: the read-only diff-review tile
+  (`docs/specs/spec-diff-review.md`, `docs/components/diff.md`). `diff.rs` = tile
+  data model + pure helpers (`merge_gate_decision`, `zed_open_arg`,
+  `build_hunk_comment_prompt`, `DiffProjections`); `diff_ui.rs` = view methods
+  (bind/refresh/apply derive pipeline, review marks, comment→steering, merge
+  gate, open); `diff_view.rs` = the yux cached body (`DiffView`, root-observed).
+  `diff_model.rs` = the pure unified-diff parser + `hunk_hash` (the shared
+  normalization; also drives the hidden `--hash-diff` subcommand, C6);
+  `diff_git.rs` = the async `git` subprocess boundary; `review_state.rs` =
+  per-branch reviewed-hash persistence in the git common dir. Merge hook:
+  `scripts/yalda-pre-merge-hook`.
 - `yux/` — the reusable UX component layer (cached-view infra + view
   primitives). See **"yux" below** and `yux/CLAUDE.md`.
 - `persist.rs` — paths, preferences, workspace + ACP-session persistence,

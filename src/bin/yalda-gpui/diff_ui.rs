@@ -6,6 +6,22 @@
 use super::*;
 
 impl YaldaGpuiView {
+    /// Open a Diff tile (Cmd-D / Ctrl-Shift-D — spec-diff-review.md B1).
+    /// Mirrors `open_linear` exactly: replaces the focused tile's content
+    /// with a fresh, UNBOUND `App::Diff` (which renders the selector). No-op
+    /// if already on a Diff tile.
+    pub(crate) fn open_diff(&mut self, _: &OpenDiff, _w: &mut Window, cx: &mut Context<Self>) {
+        self.open_diff_inner(cx);
+    }
+
+    pub(crate) fn open_diff_inner(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.workspace.focused_content(), Some(App::Diff(_))) {
+            return;
+        }
+        self.set_screen(App::Diff(DiffTile::new()));
+        cx.notify();
+    }
+
     pub(crate) fn diff_tile_ref(&self, id: workspace::WindowId) -> Option<&DiffTile> {
         match &self.workspace.tile(id)?.content {
             App::Diff(tile) => Some(tile),

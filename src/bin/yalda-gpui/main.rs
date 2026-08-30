@@ -229,6 +229,7 @@ actions!(
         OpenAgent,
         OpenLinear,
         OpenCog,
+        OpenDiff,
         OpenKeymap,
         OpenMenu,
         OpenLocalMenu,
@@ -1714,6 +1715,7 @@ fn gpui_menu() -> Vec<MenuNode> {
                 MenuNode::entry("b", "buffer", "new-buffer-tile"),
                 MenuNode::entry("l", "linear", "new-linear-tile"),
                 MenuNode::entry("c", "cog", "new-cog-tile"),
+                MenuNode::entry("d", "diff", "new-diff-tile"),
                 MenuNode::entry("k", "keybindings", "new-keymap-tile"),
             ],
         ),
@@ -6289,6 +6291,24 @@ impl YaldaGpuiView {
                     cx.notify();
                 }
             }
+            "new-diff-tile" => {
+                // Split a new tile (focus lands on it), then swap it for a
+                // Diff viewport via `open_diff_inner` — mirrors new-linear-tile.
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                if self
+                    .workspace
+                    .split_focused(
+                        workspace::SplitDir::V,
+                        App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd))),
+                    )
+                    .is_some()
+                {
+                    self.workspace.retile_active();
+                    self.open_diff_inner(cx);
+                    self.save_workspace_state();
+                    cx.notify();
+                }
+            }
             "new-cog-tile" => {
                 // Split a new tile (focus lands on it), then swap it for a
                 // Cog explorer via `open_cog_inner` — mirrors new-linear-tile.
@@ -10430,6 +10450,7 @@ fn main() {
                     MenuItem::action("Open Claude Session", OpenAgent),
                     MenuItem::action("Open Linear", OpenLinear),
                     MenuItem::action("Open Cog Explorer", OpenCog),
+                    MenuItem::action("Open Diff", OpenDiff),
                     MenuItem::action("Keyboard Shortcuts", OpenKeymap),
                 ],
             },

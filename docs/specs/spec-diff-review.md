@@ -1,6 +1,7 @@
 # Diff Review Tile (`App::Diff`)
 
-**Status:** DRAFT
+**Status:** ACTIVE (implemented — see `docs/components/diff.md` for the shipped
+`UXI-Diff-N` invariants)
 **Last updated:** 2026-08-29
 
 ## Builds On
@@ -263,3 +264,25 @@ Hunk review lifecycle (per hunk identity):
   `hunk_hash` salted with occurrence index; `git add -N` dropped for a
   non-mutating untracked listing; hook binary path baked at install, fail
   closed.
+- 2026-08-29 — Implemented via Cog graph `ec3` (13 nodes). Status DRAFT→ACTIVE.
+  Behaviors B1–B9 + Data Model + C1–C6 shipped on `main` and reconciled to
+  `docs/components/diff.md` (`UXI-Diff-1..9`). Deviations from the draft:
+  - **`DiffView` observes the root entity**, not a separate model entity —
+    `DiffTile` owns `model`/`focus`/`collapsed` inline (unlike Linear/Cog), so
+    the cached body reads the tile back through the root and self-notifies on a
+    `DiffSeqs` change; text-zoom rides the same fingerprint (no separate notify
+    walk).
+  - **Persist arm** stores `tile.worktree()` (cx-free) rather than resolving a
+    live session `cwd` at snapshot time; a `Session`-bound tile's derived
+    worktree *is* that session's cwd at derive time.
+  - **Comment compose renders at the screen level** (uncached, like the agent
+    compose), so typing never touches the cached `DiffView` — no new `DiffSeqs`
+    input was needed.
+  - **Jump panel has no per-row unread glyph today** (`docs/components/jump-panel.md`
+    — unread only tints the workspace-folder aggregate), so B6 "alongside the
+    unread badge" is realized as the unreviewed chip painting while the row's
+    `unread` flag is independently true.
+  - **Open gesture added** (`OpenDiff`, global `cmd-*` + menu) so an unbound
+    tile (the selector) is reachable from the GUI — the draft named no open key.
+  - **`--no-verify`** documented in-code as the residual gate hole (defense in
+    depth, not access control).

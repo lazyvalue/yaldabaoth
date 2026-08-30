@@ -448,6 +448,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::open_browser))
             .on_action(cx.listener(Self::open_agent))
             .on_action(cx.listener(Self::open_linear))
+            .on_action(cx.listener(Self::open_diff))
             .on_action(cx.listener(Self::open_cog))
             .on_action(cx.listener(Self::open_keymap))
             .on_action(cx.listener(Self::zoom_in))

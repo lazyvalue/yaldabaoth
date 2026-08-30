@@ -8322,6 +8322,36 @@ fn focused_in_insert_mode_tracks_compose_not_transcript(cx: &mut TestAppContext)
     );
 }
 
+/// `OpenDiff` (Cmd-D / Ctrl-Shift-D, mirroring `OpenLinear` exactly —
+/// spec-diff-review.md B1) opens a fresh, UNBOUND `App::Diff` tile, which
+/// renders the selector. Drives the REAL entry point `open_diff_inner` — the
+/// same method the `OpenDiff` action / menu item calls — not a hand-built
+/// `App::Diff(DiffTile::bound_to_path(...))` the way `boot_with_diff`
+/// constructs its OWN fixture further down in this file.
+#[gpui::test]
+fn open_diff_inner_opens_unbound_diff_tile(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_browser(cx);
+    view.update(vcx, |v, cx| {
+        v.open_diff_inner(cx);
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |v, _cx| match v.workspace.focused_content() {
+        Some(crate::App::Diff(tile)) => {
+            assert!(
+                tile.source.is_none(),
+                "a freshly opened Diff tile must be UNBOUND so it renders the \
+                 selector (spec B1), got source = {:?}",
+                tile.source.is_some()
+            );
+        }
+        other => panic!(
+            "expected open_diff_inner to focus an App::Diff tile, got a \
+             different tile (is_some={:?})",
+            other.is_some()
+        ),
+    });
+}
+
 /// ADR-0032 (UXI-Menu-6): the numbered workspace list is NO LONGER a menu entry
 /// — it must work while typing, so it lives on the `ctrl-1..0` direct chords, not
 /// a leader menu. The `.` shell menu keeps workspace New/Rename as direct root
