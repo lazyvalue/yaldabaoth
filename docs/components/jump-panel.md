@@ -1490,7 +1490,11 @@ the same typed source:
 2. Hidden rows are visibly distinguishable from visible rows but retain the
    ordinary fixed chrome typography and tile metadata.
 3. **Detached** contains exactly Detached tiles. Detached tiles retain the tag
-   folder organization formerly used by Unbound.
+   folder organization formerly used by Unbound. The universal-roster
+   reconciliation enforces one stable tile per durable Agent session before
+   projection: an Attached tile wins over any stale Detached copy; otherwise
+   one Detached tile wins, with duplicate tile tags merged into it. The panel
+   never masks conflicting owners with renderer-only row deduplication.
 4. Activating an attached visible tile selects its workspace and focuses it.
 5. Activating an attached hidden tile presents it alone without unhiding it.
 6. Activating a Detached tile presents it alone without attaching it.
@@ -1519,6 +1523,11 @@ asserts workspace-follow plus visible focus. Existing
 `jump_panel_workspace_folders_and_unbound_rows_are_tile_native` and
 `jump_palette_opens_detached_tile_then_attaches_same_identity` cover visible and
 Detached activation, stable identity, tag grouping, and attachment.
+`roster_reconciliation_retires_duplicate_detached_session_tiles` constructs both
+an Attached+Detached and a Detached+Detached identity collision, drives the real
+roster materialization choke, and proves each durable session has one resulting
+jump-panel destination. Its negative control fails before projection because the
+old materializer treated the first owner as sufficient and left every duplicate.
 
 ### UXI-JumpPanel-26 — Navigation identity stays legible, compact, and explicit
 

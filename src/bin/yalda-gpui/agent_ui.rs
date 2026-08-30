@@ -1071,17 +1071,11 @@ impl YaldaGpuiView {
         ids
     }
 
-    /// Enforce one stable tile for a newly bound durable session. The tile
-    /// that owns the live local session is canonical; roster-created dormant
-    /// Detached duplicates are retired and their tags are merged into it.
-    fn reconcile_bound_agent_identity(
+    fn retire_detached_agent_identity_duplicates(
         &mut self,
-        owner: SessionId,
+        canonical: workspace::WindowId,
         sid: &str,
-    ) -> AgentIdentityRepair {
-        let Some(canonical) = self.agent_tile_id_for_session(owner) else {
-            return AgentIdentityRepair::Unique;
-        };
+    ) -> usize {
         let duplicates: Vec<_> = self
             .agent_tile_ids_for_server_sid(sid)
             .into_iter()
@@ -1101,11 +1095,39 @@ impl YaldaGpuiView {
             }
             self.workspace.remove_detached_window(*duplicate);
         }
-        if duplicates.is_empty() {
+        duplicates.len()
+    }
+
+    /// Heal stale roster ownership before it reaches the jump-panel projection.
+    /// Attached owners are visited first and therefore win over Detached copies;
+    /// when every owner is Detached, the oldest stable tile wins. We only retire
+    /// Detached duplicates because deleting a second Attached tile would also
+    /// mutate a workspace layout and needs the restore-time ownership repair's
+    /// stronger placement policy.
+    fn reconcile_roster_agent_identity(&mut self, sid: &str) -> usize {
+        let Some(canonical) = self.agent_tile_ids_for_server_sid(sid).first().copied() else {
+            return 0;
+        };
+        self.retire_detached_agent_identity_duplicates(canonical, sid)
+    }
+
+    /// Enforce one stable tile for a newly bound durable session. The tile
+    /// that owns the live local session is canonical; roster-created dormant
+    /// Detached duplicates are retired and their tags are merged into it.
+    fn reconcile_bound_agent_identity(
+        &mut self,
+        owner: SessionId,
+        sid: &str,
+    ) -> AgentIdentityRepair {
+        let Some(canonical) = self.agent_tile_id_for_session(owner) else {
+            return AgentIdentityRepair::Unique;
+        };
+        let retired = self.retire_detached_agent_identity_duplicates(canonical, sid);
+        if retired == 0 {
             AgentIdentityRepair::Unique
         } else {
             self.save_workspace_state();
-            AgentIdentityRepair::RetiredDetachedDuplicates(duplicates.len())
+            AgentIdentityRepair::RetiredDetachedDuplicates(retired)
         }
     }
 
@@ -1120,6 +1142,9 @@ impl YaldaGpuiView {
             .collect();
         let mut changed = false;
         for info in entries {
+            if self.reconcile_roster_agent_identity(&info.session_id) > 0 {
+                changed = true;
+            }
             if self
                 .agent_tile_id_for_server_sid(&info.session_id)
                 .is_some()

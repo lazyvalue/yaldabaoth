@@ -9711,6 +9711,123 @@ fn hidden_agent_prevents_cross_project_roster_duplicate(cx: &mut TestAppContext)
     });
 }
 
+/// bug-0062: stale live ownership can contain two stable Agent tiles remembering
+/// the same server session. The universal-roster reconciliation must heal that
+/// state before the jump panel projects it: an Attached owner wins over a
+/// Detached duplicate, and duplicate Detached owners collapse to one.
+#[gpui::test]
+fn roster_reconciliation_retires_duplicate_detached_session_tiles(cx: &mut TestAppContext) {
+    use crate::{AgentTile, App, ServerSid};
+    use yalda::session_proto::SessionInfo;
+
+    let (view, vcx) = boot_browser(cx);
+    view.update(vcx, |v, cx| {
+        let project = v.workspace.inherited_project();
+        let cwd = v.projects.cwd_of(project).expect("project cwd").to_path_buf();
+        let attached_sid = "DUPLICATE-ATTACHED";
+        let attached = v
+            .workspace
+            .split_focused(
+                crate::workspace::SplitDir::V,
+                App::Agent(AgentTile::dormant(ServerSid::new(attached_sid))),
+            )
+            .expect("attached Agent tile");
+        let stale_detached = v.workspace.push_detached(
+            App::Agent(AgentTile::dormant(ServerSid::new(attached_sid))),
+            project,
+        );
+        v.workspace
+            .tile_mut(stale_detached)
+            .unwrap()
+            .tags
+            .insert("from-stale-attached-copy".into());
+
+        let detached_sid = "DUPLICATE-DETACHED";
+        let retained_detached = v.workspace.push_detached(
+            App::Agent(AgentTile::dormant(ServerSid::new(detached_sid))),
+            project,
+        );
+        let stale_second_detached = v.workspace.push_detached(
+            App::Agent(AgentTile::dormant(ServerSid::new(detached_sid))),
+            project,
+        );
+        v.workspace
+            .tile_mut(stale_second_detached)
+            .unwrap()
+            .tags
+            .insert("from-stale-detached-copy".into());
+
+        for (sid, label) in [
+            (attached_sid, "attached duplicate"),
+            (detached_sid, "detached duplicate"),
+        ] {
+            v.agent_roster.upsert(SessionInfo {
+                session_id: sid.into(),
+                acp_session_id: None,
+                label: label.into(),
+                cwd: cwd.clone(),
+                provider: yalda::acp_channel::AgentProvider::Codex,
+                turns: 0,
+                connected: true,
+                permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+                busy: false,
+                archived: false,
+            });
+        }
+
+        assert!(
+            v.materialize_roster_detached_tiles(),
+            "healing duplicate ownership is a material roster change"
+        );
+        assert_eq!(v.agent_tile_id_for_server_sid(attached_sid), Some(attached));
+        assert!(v.workspace.tile(stale_detached).is_none());
+        assert!(
+            v.workspace
+                .tile(attached)
+                .unwrap()
+                .tags
+                .contains("from-stale-attached-copy")
+        );
+        assert_eq!(
+            v.agent_tile_id_for_server_sid(detached_sid),
+            Some(retained_detached)
+        );
+        assert!(v.workspace.tile(stale_second_detached).is_none());
+        assert!(
+            v.workspace
+                .tile(retained_detached)
+                .unwrap()
+                .tags
+                .contains("from-stale-detached-copy")
+        );
+        assert!(v.validate_agent_tile_identities().is_ok());
+
+        let sections = v.jump_panel_sections(cx).0;
+        let destinations = sections
+            .iter()
+            .flat_map(|section| {
+                section
+                    .workspace_folders
+                    .iter()
+                    .flat_map(|folder| folder.tiles.iter())
+                    .chain(section.detached.iter())
+            })
+            .filter_map(|tile| tile.agent.as_ref())
+            .filter_map(|row| row.order_sid.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            destinations.iter().filter(|sid| **sid == attached_sid).count(),
+            1,
+            "the Attached session has one jump-panel destination"
+        );
+        assert_eq!(
+            destinations.iter().filter(|sid| **sid == detached_sid).count(),
+            1,
+            "the Detached session has one jump-panel destination"
+        );
+    });
+}
+
 /// UXI-Workspace-21: Close Tile acts on the directly focused stable tile even
 /// when it lives in Unbound. Exercise the exact two picker states from the bug
 /// report through the real system-menu command dispatcher.
