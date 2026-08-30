@@ -87,6 +87,7 @@ impl YaldaGpuiView {
             App::Cog(tile) => self.render_cog(leaf_root, tile, cx).into_any_element(),
             App::Keymap(tile) => self.render_keymap(leaf_root, tile, cx).into_any_element(),
             App::AgentStats => self.render_agent_stats(leaf_root, cx).into_any_element(),
+            App::Diff(tile) => self.render_diff(leaf_root, id, tile, cx).into_any_element(),
         };
         // Tag the LIVE content so the layout probe can assert it paints (the
         // semantic-zoom guard `plane_card_zoom_paints_placeholders_not_live_content`
@@ -1112,6 +1113,7 @@ impl YaldaGpuiView {
             App::Cog(tile) => tile.title(),
             App::Keymap(tile) => tile.title(),
             App::AgentStats => "Agent Stats".to_string(),
+            App::Diff(tile) => tile.title(),
         }
     }
 
@@ -1137,6 +1139,7 @@ impl YaldaGpuiView {
             App::Cog(_) => "⚙",
             App::Keymap(_) => "⌘",
             App::AgentStats => "◫",
+            App::Diff(_) => "±",
         }
     }
 

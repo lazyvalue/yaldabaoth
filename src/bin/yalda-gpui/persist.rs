@@ -925,6 +925,13 @@ pub(crate) enum PersistedKind {
     /// persistence restores one openable shell tile and refreshes live data.
     #[serde(rename = "agent_stats")]
     AgentStats {},
+    /// A Diff Review tile (spec-diff-review.md § Persistence). `SessionId` is
+    /// runtime-local and meaningless across restarts, so only the worktree
+    /// path is persisted — a session-bound tile restores `Path`-bound to the
+    /// same worktree (re-binding to a session is a manual act); `None`
+    /// restores an unbound tile (the selector).
+    #[serde(rename = "diff")]
+    Diff { worktree: Option<PathBuf> },
 }
 
 /// Persisted shadow of `BufferApp`'s mode (B1). `viewing`/`editing` carry the
@@ -1483,6 +1490,18 @@ pub(crate) fn snapshot_content(content: &App, resolve: SidResolver) -> Persisted
         },
         App::Keymap(_tile) => PersistedKind::Keymap {},
         App::AgentStats => PersistedKind::AgentStats {},
+        // Deviation from the literal spec wording (which resolves a
+        // session-bound tile's worktree via the live session's `cwd`):
+        // `DiffTile::worktree()` already prefers the last-DERIVED model's
+        // worktree (which for a `Session`-bound tile IS that session's cwd,
+        // captured at derive time) over the raw `source`, and is `cx`-free —
+        // `snapshot_content` has no session-store access to resolve a live
+        // `cwd` itself. A tile that was bound but never finished a first
+        // derive (no model yet) falls back to `None` (restores as the
+        // selector), same as "no prior binding" elsewhere in this node.
+        App::Diff(tile) => PersistedKind::Diff {
+            worktree: tile.worktree(),
+        },
     }
 }
 
@@ -1700,6 +1719,10 @@ pub(crate) fn restore_content(
         PersistedKind::Cog { state } => App::Cog(CogTile::restored(state)),
         PersistedKind::Keymap {} => App::Keymap(KeymapTile::new()),
         PersistedKind::AgentStats {} => App::AgentStats,
+        PersistedKind::Diff { worktree } => App::Diff(match worktree {
+            Some(w) => DiffTile::bound_to_path(w),
+            None => DiffTile::new(),
+        }),
     }
 }
 

@@ -29080,3 +29080,209 @@ fn cog_graph_picker_search_filters(cx: &mut TestAppContext) {
         "clearing the filter restores the full list"
     );
 }
+
+// ── Diff Review tile (`App::Diff`, cog node app-diff-tile / nd0e) ──────────
+
+/// Fixture: an init'd git repo with `main` + a `feature` branch one commit
+/// ahead touching TWO files (so the parsed model has ≥2 hunks to move focus
+/// across). Mirrors `diff_git.rs`'s own fixture builder but lives here since
+/// that module's copy is private to its own test module. Entirely inside a
+/// tempdir — never touches a real repo (spec C5).
+fn diff_fixture_repo() -> tempfile::TempDir {
+    fn git_ok(dir: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .unwrap_or_else(|e| panic!("failed to run git {args:?}: {e}"));
+        assert!(status.success(), "git {args:?} failed in {}", dir.display());
+    }
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let dir = temp.path();
+
+    git_ok(dir, &["init", "--quiet"]);
+    git_ok(dir, &["config", "user.email", "test@example.com"]);
+    git_ok(dir, &["config", "user.name", "Test"]);
+    git_ok(dir, &["config", "commit.gpgsign", "false"]);
+
+    std::fs::write(dir.join("a.txt"), "line1\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "line1\n").unwrap();
+    git_ok(dir, &["add", "a.txt", "b.txt"]);
+    git_ok(dir, &["commit", "--quiet", "-m", "initial"]);
+    git_ok(dir, &["branch", "-M", "main"]);
+
+    git_ok(dir, &["checkout", "--quiet", "-b", "feature"]);
+    std::fs::write(dir.join("a.txt"), "line1\nchanged a\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "line1\nchanged b\n").unwrap();
+    git_ok(dir, &["add", "a.txt", "b.txt"]);
+    git_ok(dir, &["commit", "--quiet", "-m", "two file change"]);
+
+    temp
+}
+
+/// Boot a hermetic browser view, replace the focused tile with a `Diff` tile
+/// `Path`-bound to `worktree`, and kick its first derive via the REAL
+/// first-render path (`render_diff`'s `needs_load` check) by forcing a
+/// paint. Returns once the derive has settled.
+fn boot_with_diff<'a>(
+    cx: &'a mut TestAppContext,
+    worktree: PathBuf,
+) -> (
+    gpui::Entity<YaldaGpuiView>,
+    &'a mut gpui::VisualTestContext,
+    crate::workspace::WindowId,
+) {
+    let (view, vcx) = boot_browser(cx);
+    let id = view.update(vcx, |v, cx| {
+        v.set_screen(crate::App::Diff(crate::DiffTile::bound_to_path(worktree)));
+        let id = v.workspace.focused_window_id().expect("focused Diff tile");
+        cx.notify();
+        id
+    });
+    vcx.run_until_parked();
+    (view, vcx, id)
+}
+
+/// DONE_WHEN #1 (app-diff-tile, nd0e): a Diff tile bound to a tempdir git
+/// fixture derives a real diff (real `collect_raw_diff` subprocess + real
+/// `parse_diff`, off the paint path), PAINTS its file list + hunk blocks
+/// (layout probe — non-vacuous: painted bounds must be non-empty, per the
+/// anti-circling "assert PAINT, not state" rule), and `j`/`k` move the
+/// focused hunk through the REAL key-dispatch path (`register_keymap` +
+/// `simulate_keystrokes` → the real `on_key_down` → `handle_diff_key`), not a
+/// hand-called `move_hunk_focus`.
+#[gpui::test]
+fn diff_tile_paints_files_and_hunks_and_jk_moves_focus(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let worktree = temp.path().to_path_buf();
+    let (view, vcx, id) = boot_with_diff(cx, worktree);
+    vcx.run_until_parked();
+
+    let (files, hunk_count) = view.read_with(vcx, |v, _| {
+        let tile = v.diff_tile_ref(id).expect("Diff tile");
+        let model = tile.model.as_ref().expect("derive must have completed");
+        (
+            model.files.len(),
+            model.files.iter().map(|f| f.hunks.len()).sum::<usize>(),
+        )
+    });
+    assert_eq!(files, 2, "fixture touches two files");
+    assert!(
+        hunk_count >= 2,
+        "fixture must produce at least 2 hunks to move focus across, got {hunk_count}"
+    );
+
+    // PAINT assertion: the file list + hunk block must actually be painted,
+    // with non-empty bounds. The derive already settled (and self-notified
+    // the cached `DiffView` once) inside `boot_with_diff`/the extra settle
+    // above, both BEFORE the probe map existed — so a bare root `cx.notify()`
+    // here would be a no-op cache hit (the fingerprint hasn't moved) and the
+    // probe would miss even though the content is correctly painted.
+    // Force the cached body's OWN entity to redraw (a legitimate, explicit
+    // "please repaint" — not a state mutation) so this frame is the one
+    // that's actually probed.
+    let dv = view.read_with(vcx, |v, _| v.diff_tile_ref(id).and_then(|t| t.view.clone()));
+    crate::layout_probe_begin();
+    match dv {
+        Some(dv) => dv.update(vcx, |_, cx| cx.notify()),
+        None => view.update(vcx, |_, cx| cx.notify()),
+    }
+    vcx.run_until_parked();
+    let file0 = crate::layout_probe_get("diff-file-0");
+    let file1 = crate::layout_probe_get("diff-file-1");
+    let hunk00 = crate::layout_probe_get("diff-hunk-0-0");
+    crate::layout_probe_end();
+
+    let (_, _, fw0, fh0) = file0.expect("file row 0 did not paint");
+    let (_, _, fw1, fh1) = file1.expect("file row 1 did not paint");
+    let (_, _, hw, hh) = hunk00.expect("hunk block 0-0 did not paint");
+    assert!(fw0 > 4.0 && fh0 > 4.0, "file row 0 has no painted area");
+    assert!(fw1 > 4.0 && fh1 > 4.0, "file row 1 has no painted area");
+    assert!(hw > 4.0 && hh > 4.0, "hunk block 0-0 has no painted area");
+
+    // Real keystroke dispatch: j moves focus, k moves it back.
+    let before = view.read_with(vcx, |v, _| v.diff_tile_ref(id).unwrap().focus);
+    vcx.simulate_keystrokes("j");
+    vcx.run_until_parked();
+    let after_j = view.read_with(vcx, |v, _| v.diff_tile_ref(id).unwrap().focus);
+    assert_ne!(before, after_j, "j must move the focused hunk");
+
+    vcx.simulate_keystrokes("k");
+    vcx.run_until_parked();
+    let after_k = view.read_with(vcx, |v, _| v.diff_tile_ref(id).unwrap().focus);
+    assert_eq!(after_k, before, "k must move focus back to the start");
+}
+
+/// spec B1: a deleted/invalid worktree derives to an inline error, never a
+/// panic — the real `refresh_diff` → `diff_apply` path, not a hand-built
+/// error state.
+#[gpui::test]
+fn diff_tile_invalid_worktree_is_inline_error_not_panic(cx: &mut TestAppContext) {
+    let bogus = PathBuf::from("/nonexistent/definitely-not-a-repo-path-98765");
+    let (view, vcx, id) = boot_with_diff(cx, bogus);
+    vcx.run_until_parked();
+
+    view.read_with(vcx, |v, _| {
+        let tile = v.diff_tile_ref(id).expect("Diff tile");
+        assert!(tile.model.is_none(), "an invalid worktree must not produce a model");
+        assert!(
+            tile.error.is_some(),
+            "an invalid worktree must surface an inline error"
+        );
+    });
+}
+
+/// DONE_WHEN #2 (yux mandatory render-count guard, mirrors
+/// `transcript_021_chatbox_keystroke_is_render_flat` /
+/// `linear_input_keystroke_is_render_flat`): an UNRELATED root notify leaves
+/// the cached `DiffView`'s `record_render` count FLAT — proof the
+/// root-observe fingerprint (`DiffSeqs`) actually filters rather than firing
+/// on every root notify. Paired with a positive control: a real derive
+/// completion (which DOES move `DiffSeqs::model_gen`) must re-render.
+#[gpui::test]
+fn diff_view_unrelated_root_notify_is_render_flat(cx: &mut TestAppContext) {
+    crate::perf_reset("diff");
+    let temp = diff_fixture_repo();
+    let worktree = temp.path().to_path_buf();
+    let (view, vcx, id) = boot_with_diff(cx, worktree);
+    vcx.run_until_parked();
+    // Settle the first real render before baselining (mirrors the
+    // linear/transcript render-count tests' settle step).
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let base = crate::perf_render_count("diff");
+    assert!(base >= 1, "diff body must render at least once on first frame");
+
+    for _ in 0..5 {
+        // An unrelated root mutation + notify (a transient status message,
+        // exactly the shape of typing in an unrelated agent tile). This
+        // notifies ROOT (which DiffView observes) but touches none of
+        // DiffSeqs's fields.
+        view.update(vcx, |v, cx| {
+            v.transient_status = Some("unrelated".into());
+            cx.notify();
+        });
+        vcx.run_until_parked();
+    }
+    let after = crate::perf_render_count("diff");
+    assert_eq!(
+        after, base,
+        "an unrelated root notify must NOT re-render the cached Diff body; \
+         count must stay flat ({base}), got {after}"
+    );
+
+    // Negative-control companion: a REAL state-changing root notify (a
+    // second derive bumping `model_gen`) must still bust the cache — proves
+    // the filter isn't just permanently stuck.
+    view.update(vcx, |v, cx| v.refresh_diff(id, cx));
+    vcx.run_until_parked();
+    let after_refresh = crate::perf_render_count("diff");
+    assert!(
+        after_refresh > after,
+        "a real derive completion (model_gen bump) must re-render the cached body \
+         (before {after}, after {after_refresh})"
+    );
+}

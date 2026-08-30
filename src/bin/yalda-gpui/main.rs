@@ -80,8 +80,11 @@ mod cog;
 mod cog_ui;
 mod cog_view;
 mod diagram;
+mod diff;
 mod diff_git;
 mod diff_model;
+mod diff_ui;
+mod diff_view;
 mod edit_ui;
 mod highlight_cache;
 mod jump_palette;
@@ -116,8 +119,10 @@ pub(crate) use agent_stats_view::*;
 pub(crate) use cog::*;
 pub(crate) use cog_view::*;
 pub(crate) use diagram::*;
+pub(crate) use diff::*;
 pub(crate) use diff_git::*;
 pub(crate) use diff_model::*;
+pub(crate) use diff_view::*;
 pub(crate) use jump_palette::*;
 pub(crate) use jump_panel_view::*;
 pub(crate) use keymap_registry::*;
@@ -1426,6 +1431,8 @@ enum App {
     Keymap(KeymapTile),
     /// Singleton live agent + repository telemetry surface.
     AgentStats,
+    /// The Diff Review tile (`diff.rs` / `diff_view.rs`, spec-diff-review.md).
+    Diff(DiffTile),
 }
 
 /// Exhaustive result of the one close-tile transition shared by every input
@@ -1457,6 +1464,7 @@ impl App {
             App::Cog(_) => None,
             App::Keymap(_) => None,
             App::AgentStats => None,
+            App::Diff(_) => None,
         }
     }
 }
@@ -1897,6 +1905,18 @@ fn cog_local_menu() -> Vec<MenuNode> {
         MenuNode::entry("g", "back to graph list", "cog-graphs"),
         MenuNode::entry("r", "refresh", "cog-refresh"),
         MenuNode::entry("e", "hide/show live events", "cog-toggle-events"),
+    ])
+}
+
+/// Diff tile verbs (spec B9): refresh, bind (choose a different
+/// session/path), merge + install-hook are wired STUBS — the merge gate
+/// (B7) is a later cog node's job; this node ships the menu surface per B9.
+fn diff_local_menu() -> Vec<MenuNode> {
+    with_tile_commands(vec![
+        MenuNode::entry("r", "refresh", "diff-refresh"),
+        MenuNode::entry("b", "bind (choose session/path)", "diff-bind"),
+        MenuNode::entry("m", "merge (reviewed only)", "diff-merge"),
+        MenuNode::entry("i", "install merge-gate hook", "diff-install-hook"),
     ])
 }
 
@@ -3421,7 +3441,12 @@ impl YaldaGpuiView {
             // Already picking — nothing to do.
             App::Buffer(BufferApp::Picking(_)) => return,
             // Non-buffer tile: out of scope. No buffer here to pick into.
-            App::Agent(_) | App::Linear(_) | App::Cog(_) | App::Keymap(_) | App::AgentStats => {
+            App::Agent(_)
+            | App::Linear(_)
+            | App::Cog(_)
+            | App::Keymap(_)
+            | App::AgentStats
+            | App::Diff(_) => {
                 self.transient_status = Some("no buffer here".into());
                 cx.notify();
                 return;
@@ -5690,6 +5715,7 @@ impl YaldaGpuiView {
             Some(App::Cog(_)) => (cog_local_menu(), "COG"),
             Some(App::Keymap(_)) => (keymap_local_menu(), "KEYBINDINGS"),
             Some(App::AgentStats) => (with_tile_commands(Vec::new()), "AGENT STATS"),
+            Some(App::Diff(_)) => (diff_local_menu(), "DIFF"),
             None => return,
         };
         self.transient_status = None;
@@ -5785,6 +5811,10 @@ impl YaldaGpuiView {
             // leaders must be suppressed then so keys reach the box.
             Some(App::Keymap(_)) => self.keymap_captures_text(cx),
             Some(App::AgentStats) => false,
+            // The hunk-comment compose (spec B4) is the tile's only insert
+            // surface; this node always leaves it `None`, so a Diff tile is
+            // navigation-only for now.
+            Some(App::Diff(tile)) => tile.compose.is_some(),
             Some(App::Buffer(BufferApp::Viewing(_))) | None => false,
         }
     }
@@ -5953,6 +5983,10 @@ impl YaldaGpuiView {
             "cog-graphs" => self.cog_load_graphs(cx),
             "cog-refresh" => self.cog_refresh_focused(cx),
             "cog-toggle-events" => self.cog_toggle_events(cx),
+            "diff-refresh" => self.diff_refresh_focused(cx),
+            "diff-bind" => self.diff_bind_focused(cx),
+            "diff-merge" => self.diff_merge_focused(cx),
+            "diff-install-hook" => self.diff_install_hook_focused(cx),
             "keymap-filter" => self.keymap_menu_filter(cx),
             "keymap-rebind" => self.keymap_menu_rebind(cx),
             "keymap-reset" => self.keymap_menu_reset(cx),

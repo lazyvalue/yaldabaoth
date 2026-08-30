@@ -2488,6 +2488,105 @@ impl YaldaGpuiView {
             .child(body_area)
     }
 
+    /// Render a Diff tile (`App::Diff`): a slim header bar (title + key hints)
+    /// over the cached scrollable body (`DiffView`). Navigation-only (spec
+    /// B9) — all keys route through `handle_diff_key`. `id` is the tile's
+    /// stable `WindowId`, needed so the lazily-created `DiffView` can find its
+    /// own `DiffTile` back through the root (see `diff_view.rs` module docs).
+    pub(crate) fn render_diff(
+        &mut self,
+        root: gpui::Div,
+        id: workspace::WindowId,
+        tile: &mut DiffTile,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        // Restored/freshly-bound tiles kick their first derive here (mirrors
+        // `CogTile::needs_load` — `restore_content` has no `cx`).
+        if tile.needs_load && tile.source.is_some() {
+            self.refresh_diff(id, cx);
+        }
+
+        let view = self.diff_view_for(id, cx);
+
+        let scale = self.text_scale;
+        let base = px(14.0 * scale);
+        let dim = nc(self.theme.agent.dim);
+        let accent = nc(self.theme.agent.warm_accent);
+        let fg = self.editor_fg();
+        let bg = self.editor_bg();
+
+        let hint = if self.diff_tile_ref(id).is_some_and(|t| t.source.is_none()) {
+            "1-9 diff a session · p diff this workspace dir"
+        } else {
+            "j/k hunk · [ / ] file · z fold · r refresh · space tile menu"
+        };
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .w_full()
+            .px_4()
+            .py_2()
+            .bg(bg_or(self.theme.top_bar, STATUS_BG))
+            .border_b_1()
+            .border_color(dim)
+            .font_family(self.code_font.clone())
+            .text_size(base)
+            .child(
+                div()
+                    .flex_none()
+                    .pr_1()
+                    .text_color(accent)
+                    .font_weight(FontWeight::BOLD)
+                    .child(SharedString::from("diff › ")),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_color(fg)
+                    .child(SharedString::from(tile.title())),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(dim)
+                    .child(SharedString::from(hint)),
+            );
+
+        let body_area = div().flex_1().min_h_0().w_full().child(cached_child(view));
+
+        root.key_context("DiffView")
+            .on_key_down(cx.listener(Self::handle_diff_key))
+            .on_action(cx.listener(Self::quit))
+            .on_action(cx.listener(Self::restart))
+            .on_action(cx.listener(Self::open_browser))
+            .on_action(cx.listener(Self::open_agent))
+            .on_action(cx.listener(Self::open_linear))
+            .on_action(cx.listener(Self::open_cog))
+            .on_action(cx.listener(Self::open_keymap))
+            .on_action(cx.listener(Self::zoom_in))
+            .on_action(cx.listener(Self::zoom_out))
+            .on_action(cx.listener(Self::zoom_reset))
+            .on_action(cx.listener(Self::toggle_theme))
+            .on_action(cx.listener(Self::copy_selection))
+            .on_action(cx.listener(Self::paste_from_clipboard))
+            .on_action(cx.listener(Self::rename_workspace))
+            .on_action(cx.listener(Self::also_show_tile))
+            .on_action(cx.listener(Self::toggle_file_browser_rail))
+            .on_action(cx.listener(Self::toggle_jump_panel))
+            .on_action(cx.listener(Self::open_jump_palette))
+            .workspace_nav(cx)
+            .on_action(cx.listener(Self::toggle_outline_rail))
+            .on_action(cx.listener(Self::flip_rail_side))
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(bg)
+            .child(header)
+            .child(body_area)
+    }
+
     /// Render a Cog explorer tile (`App::Cog`): a slim header bar plus the
     /// cached two-pane body (`CogView`). Navigation-only — no text input — so the
     /// header just advertises the keys; all keys route through `handle_cog_key`.
