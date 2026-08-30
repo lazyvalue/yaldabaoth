@@ -96,6 +96,13 @@ pub(crate) struct AgentRow {
     /// `AgentState.unread`. Retained for attention/accounting; it no longer
     /// changes the row's visible operational state.
     pub(crate) unread: bool,
+    /// Cog node `badge-projection` (1cxd), spec B6: the unreviewed-hunk count
+    /// projected from `DiffProjections` for this session's `cwd` (the same
+    /// worktree key a `Session`-bound Diff tile resolves to in `refresh_diff`).
+    /// `0` means either the worktree has no unreviewed hunks or it has never
+    /// had a Diff tile derive against it — both render no badge. Rendered
+    /// ALONGSIDE (not replacing) `unread` in `jump_session_row_el`.
+    pub(crate) unreviewed_hunks: usize,
     /// The autonamer's compact topic summary of the session (`UXI-AgentTile-27`),
     /// Rendered as a small italic second line under the label. Live local state
     /// is authoritative; roster-only sessions fall back to the durable
@@ -258,6 +265,18 @@ pub(crate) fn agent_provider_mark(provider: AgentProvider) -> &'static str {
         AgentProvider::Claude => "✳",
         AgentProvider::Codex => "⌬",
     }
+}
+
+/// Cog node `badge-projection` (1cxd), spec B6: the unreviewed-hunk-count
+/// badge text for a jump-panel session row, or `None` when there is nothing
+/// to show — `0` means either the worktree has no unreviewed hunks or it was
+/// never opened in a Diff tile at all (spec B6: "a worktree never opened in a
+/// Diff tile shows no count"), and both render no badge. Rendered ALONGSIDE
+/// (not replacing) the row's `unread` accounting — the two are independent
+/// axes (turn-attention vs. review-attention) and can both be true for one
+/// row. Pure so the display text is headlessly testable independent of paint.
+pub(crate) fn unreviewed_badge_label(count: usize) -> Option<String> {
+    (count > 0).then(|| format!("{count}±"))
 }
 
 /// The operational status palette is deliberately small and literal.
@@ -538,6 +557,7 @@ impl YaldaGpuiView {
                 connected: info.connected,
                 awaiting,
                 unread,
+                unreviewed_hunks: self.unreviewed_hunks_for(&info.cwd),
                 order_sid: Some(info.session_id.clone()),
                 state_entered_at,
                 tags: self
@@ -595,6 +615,7 @@ impl YaldaGpuiView {
                 connected: true,
                 awaiting: Some(ent.read(cx).state.turn_phase.is_awaiting()),
                 unread: ent.read(cx).state.unread,
+                unreviewed_hunks: self.unreviewed_hunks_for(&ent.read(cx).cwd),
                 // Its own sid when it has one (bound but the roster hasn't listed
                 // it yet), else — for a `/clear` placeholder — the killed
                 // session's sid, whose order slot it inherits.
@@ -2755,6 +2776,27 @@ fn jump_session_row_el(
         active.then_some(selection_mark),
         hidden_indicator,
     );
+    // Cog node `badge-projection` (1cxd), spec B6: the unreviewed-hunk-count
+    // badge, appended as its own trailing chip so it renders ALONGSIDE (never
+    // replacing) the status/provider marks above — independent of `unread`,
+    // both can be visible on one row at once. Absent entirely (not an empty
+    // chip) when there is nothing to show (spec: no count ⇒ no badge).
+    if let Some(label) = unreviewed_badge_label(row.unreviewed_hunks) {
+        let mut chip_bg = st.accent;
+        chip_bg.a = 0.16;
+        let badge_el = div()
+            .flex_none()
+            .px_1()
+            .rounded_sm()
+            .bg(chip_bg)
+            .text_color(st.accent)
+            .text_size(px(st.pt * 0.78))
+            .child(SharedString::from(label));
+        r = r.child(probe_bounds_dyn(
+            format!("jump-session-unreviewed-{i}{id_suffix}"),
+            badge_el.into_any_element(),
+        ));
+    }
     if let Some(hue) = match status {
         AgentDotStatus::Working => Some(working_orange),
         AgentDotStatus::WaitingForYou => Some(ready),

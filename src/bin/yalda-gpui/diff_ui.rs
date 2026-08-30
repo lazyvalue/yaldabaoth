@@ -20,6 +20,16 @@ impl YaldaGpuiView {
         }
     }
 
+    /// Cog node `badge-projection` (1cxd), spec B6: the current unreviewed-
+    /// hunk count for `worktree`, or `0` when this worktree has never had a
+    /// `DiffModel` derive land in `self.diff_projections` (spec: "a worktree
+    /// never opened in a Diff tile shows no count"). Read by the jump panel
+    /// (`jump_panel_view.rs`) keyed on a session's `cwd` — the same worktree
+    /// key `refresh_diff` resolves a `Session`-sourced tile to.
+    pub(crate) fn unreviewed_hunks_for(&self, worktree: &std::path::Path) -> usize {
+        self.diff_projections.get(worktree).copied().unwrap_or(0)
+    }
+
     /// The live render-input fingerprint for the Diff tile at `id` (used by
     /// `DiffView`'s root-observe filter — see `diff_view.rs` module docs).
     /// `DiffSeqs::default()` for a tile that's gone / not a Diff tile — a
@@ -175,9 +185,17 @@ impl YaldaGpuiView {
             return;
         }
         tile.refreshing = false;
+        // Cog node `badge-projection` (1cxd), spec B6: captured alongside the
+        // successful derive (never on error — a failed refresh leaves the
+        // previous projection stale-frozen, same as it leaves `tile.model`
+        // untouched-by-clearing) and written to `self.diff_projections`
+        // AFTER `tile`'s borrow ends below, since the projection lives on
+        // root, not the tile.
+        let mut projection: Option<(PathBuf, usize)> = None;
         match result {
             Ok(model) => {
                 let prev_hash = tile.focused_hunk_hash();
+                projection = Some((model.worktree.clone(), model.unreviewed_hunk_count()));
                 tile.model = Some(model);
                 tile.error = None;
                 tile.model_gen = tile.model_gen.wrapping_add(1);
@@ -186,6 +204,9 @@ impl YaldaGpuiView {
             Err(e) => {
                 tile.error = Some(e.to_string());
             }
+        }
+        if let Some((worktree, count)) = projection {
+            self.diff_projections.insert(worktree, count);
         }
         cx.notify();
     }

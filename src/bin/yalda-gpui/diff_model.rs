@@ -51,6 +51,21 @@ pub struct DiffModel {
     pub files: Vec<FileDiff>,
 }
 
+impl DiffModel {
+    /// Count of hunks across every file where `!reviewed` (spec B6: the
+    /// `DiffProjections` value written on every derive — `diff_apply`,
+    /// `diff_ui.rs`). Recomputed fresh from the just-joined `reviewed` flags,
+    /// so it always reflects the ReviewState join at THIS derive, not a
+    /// stale accounting.
+    pub fn unreviewed_hunk_count(&self) -> usize {
+        self.files
+            .iter()
+            .flat_map(|f| f.hunks.iter())
+            .filter(|h| !h.reviewed)
+            .count()
+    }
+}
+
 /// What happened to a file between `merge_base` and the working tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileStatus {

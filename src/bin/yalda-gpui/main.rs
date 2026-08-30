@@ -2159,6 +2159,15 @@ struct YaldaGpuiView {
     /// sid is unranked and drops to the bottom of its cwd group — bug-0007's
     /// recurrence. Entries are consumed at bind and dropped on close.
     jump_order_succession: HashMap<SessionId, String>,
+    /// Cog node `badge-projection` (1cxd), spec B6 / § Data Model: root-owned
+    /// worktree → unreviewed-hunk-count projection, updated ONLY at
+    /// `DiffModel` derive time (`diff_apply`, `diff_ui.rs`). Read by the jump
+    /// panel (`AgentRow::unreviewed_hunks`, `jump_panel_view.rs`) to render
+    /// the unreviewed badge alongside the unread mark. Survives Diff tile
+    /// close (it's on root, not the tile); shared across every tile watching
+    /// one worktree (last derive wins); NOT persisted — a worktree never
+    /// opened in a Diff tile this session has no entry.
+    diff_projections: DiffProjections,
     /// Pinned session recaps (recap-panel), keyed by the session they summarize —
     /// one per session, so a recap is SPECIFIC to its agent tile (UXI-AgentTile-15). An
     /// entry appears when summoned (`recap-session`), is re-runnable and dismissed
@@ -2263,6 +2272,7 @@ impl YaldaGpuiView {
             jump_tile_order: Vec::new(),
             jump_detached_tile_order: Vec::new(),
             jump_order_succession: HashMap::new(),
+            diff_projections: HashMap::new(),
             recaps: HashMap::new(),
             roster_unread: HashMap::new(),
             // bug-0020: id-keyed autoname summaries, durable across restarts.
@@ -2338,6 +2348,7 @@ impl YaldaGpuiView {
             jump_tile_order: Vec::new(),
             jump_detached_tile_order: Vec::new(),
             jump_order_succession: HashMap::new(),
+            diff_projections: HashMap::new(),
             recaps: HashMap::new(),
             roster_unread: HashMap::new(),
             // bug-0020: id-keyed autoname summaries, durable across restarts.

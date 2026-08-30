@@ -17,6 +17,16 @@
 
 use super::*;
 
+/// Cog node `badge-projection` (1cxd), spec B6 / § Data Model: a root-owned,
+/// worktree-keyed projection of the unreviewed-hunk count, updated ONLY at
+/// `DiffModel` derive time (`diff_apply`, `diff_ui.rs`) — never by a
+/// background scan. Lives on `YaldaGpuiView` (not on any `DiffTile`), so it
+/// survives a tile close and is shared by every tile watching one worktree
+/// (last derive wins). Not persisted: a worktree never opened in a Diff tile
+/// this session has no entry, and a count goes stale-frozen once nothing
+/// refreshes that worktree — both per spec B6.
+pub(crate) type DiffProjections = HashMap<PathBuf, usize>;
+
 /// What a Diff tile shows the cumulative diff for (spec § Data Model).
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) enum DiffSource {

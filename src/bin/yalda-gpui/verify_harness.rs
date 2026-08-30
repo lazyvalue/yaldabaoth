@@ -1940,6 +1940,7 @@ fn agent_dot_status_mapping() {
         connected,
         awaiting,
         unread,
+        unreviewed_hunks: 0,
         tags: Vec::new(),
     };
     // Reply in flight → working (unread irrelevant while working).
@@ -10344,6 +10345,7 @@ fn session_tags_partition_folders_and_untagged() {
         connected: true,
         awaiting: Some(false),
         unread: false,
+        unreviewed_hunks: 0,
         order_sid: Some(label.into()),
         state_entered_at: None,
         tags: tags.iter().map(|s| s.to_string()).collect(),
@@ -11555,6 +11557,7 @@ fn jump_reorder_ordering_applies_and_defaults_to_alpha() {
         connected: true,
         awaiting: None,
         unread: false,
+        unreviewed_hunks: 0,
         order_sid: Some(sid.into()),
         state_entered_at: None,
         tags: Vec::new(),
@@ -11628,6 +11631,7 @@ fn jump_agent_state_tabs_filter_and_sort_without_moving_all() {
             connected: true,
             awaiting,
             unread,
+            unreviewed_hunks: 0,
             order_sid: Some(sid.into()),
             state_entered_at: Some(base - std::time::Duration::from_secs(age_secs)),
             tags: Vec::new(),
@@ -13618,6 +13622,7 @@ fn jump_panel_groups_agent_rows_by_cwd() {
         connected: true,
         awaiting: None,
         unread: false,
+        unreviewed_hunks: 0,
         tags: Vec::new(),
     };
     // Two projects, one with two sessions; input order is by-label (a,b,c).
@@ -30311,5 +30316,165 @@ fn diff_tile_o_key_with_no_model_is_noop_no_panic(cx: &mut TestAppContext) {
     assert!(
         status.is_none(),
         "o with no model must be a silent no-op, got {status:?}"
+    );
+}
+
+// ── Cog node `badge-projection` (1cxd): spec B6 unreviewed-hunk badge ──────
+
+/// Cog node `badge-projection` (1cxd), spec B6: deriving a Diff tile
+/// (`boot_diff_bound_to_session`'s real first-paint derive → `diff_apply`)
+/// writes the unreviewed-hunk count into the root-owned `DiffProjections`,
+/// keyed by worktree; the jump panel's REAL row-build path
+/// (`jump_panel_agent_rows`) carries it as `AgentRow::unreviewed_hunks` for
+/// the session sharing that worktree as its `cwd`, and the REAL paint
+/// (`render_jump_panel` → `jump_session_row_el`'s unreviewed-badge chip)
+/// shows it — not a hand-built row or a bare state assert.
+///
+/// Negative control (observed RED — see report): commenting out the
+/// `self.diff_projections.insert(worktree, count);` line in `diff_apply`
+/// (`diff_ui.rs`) leaves `diff_projections` empty and the badge probe misses.
+#[gpui::test]
+fn jump_panel_paints_unreviewed_badge_after_diff_derive(cx: &mut TestAppContext) {
+    let temp = diff_fixture_repo();
+    let worktree = temp.path().to_path_buf();
+    let (view, vcx, _sid, diff_id) = boot_diff_bound_to_session(cx, worktree.clone());
+
+    let expected = view.read_with(vcx, |v, _| {
+        let tile = v.diff_tile_ref(diff_id).expect("Diff tile");
+        let model = tile.model.as_ref().expect("first on-paint derive must have landed");
+        model.unreviewed_hunk_count()
+    });
+    assert!(
+        expected > 0,
+        "fixture must produce at least one unreviewed hunk to show a badge"
+    );
+
+    let projected = view.read_with(vcx, |v, _| v.diff_projections.get(&worktree).copied());
+    assert_eq!(
+        projected,
+        Some(expected),
+        "the derive must write the unreviewed count into DiffProjections keyed by worktree"
+    );
+
+    let row_count = view.read_with(vcx, |v, cx| {
+        v.jump_panel_agent_rows(cx)
+            .into_iter()
+            .find(|r| r.cwd == worktree)
+            .map(|r| r.unreviewed_hunks)
+    });
+    assert_eq!(
+        row_count,
+        Some(expected),
+        "the jump-panel row's view-model field must carry the projected count"
+    );
+
+    // PAINT: force a fresh frame and probe the badge chip on the session's
+    // row (flat index 0 — the only session in this fixture).
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let badge = crate::layout_probe_get("jump-session-unreviewed-0");
+    crate::layout_probe_end();
+    let (_, _, w, h) = badge.expect("unreviewed badge did not paint");
+    assert!(w > 0.0 && h > 0.0, "unreviewed badge has no painted area");
+}
+
+/// Cog node `badge-projection` (1cxd), spec B6: "rendered alongside (not
+/// replacing) the unread badge when both are present". A session that is
+/// BOTH unread (the real `AgentState.unread`, set via `with_session` — the
+/// same field the jump-panel unread accounting reads) AND has unreviewed
+/// hunks keeps both facts live on the same row: `unread` stays `true` and
+/// the unreviewed badge still paints. Neither write clobbers the other.
+#[gpui::test]
+fn jump_panel_unread_and_unreviewed_badge_coexist(cx: &mut TestAppContext) {
+    let temp = diff_fixture_repo();
+    let worktree = temp.path().to_path_buf();
+    let (view, vcx, sid, diff_id) = boot_diff_bound_to_session(cx, worktree.clone());
+
+    let expected = view.read_with(vcx, |v, _| {
+        v.diff_tile_ref(diff_id)
+            .unwrap()
+            .model
+            .as_ref()
+            .unwrap()
+            .unreviewed_hunk_count()
+    });
+    assert!(expected > 0, "fixture must produce unreviewed hunks");
+
+    view.update(vcx, |v, cx| v.with_session(sid, cx, |c| c.unread = true));
+    vcx.run_until_parked();
+
+    let row = view.read_with(vcx, |v, cx| {
+        v.jump_panel_agent_rows(cx)
+            .into_iter()
+            .find(|r| r.cwd == worktree)
+            .expect("session row present")
+    });
+    assert!(
+        row.unread,
+        "unread must stay true alongside a nonzero unreviewed count"
+    );
+    assert_eq!(
+        row.unreviewed_hunks, expected,
+        "the unreviewed count must be unaffected by unread"
+    );
+
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let badge = crate::layout_probe_get("jump-session-unreviewed-0");
+    crate::layout_probe_end();
+    assert!(
+        badge.is_some(),
+        "the unreviewed badge must still paint on a row that is also unread"
+    );
+}
+
+/// Cog node `badge-projection` (1cxd), spec B6: "survives tile close" — the
+/// projection is root-owned, not tile-owned. Close the Diff tile through the
+/// REAL close path (`cmd-w` → the real `CloseWindow` binding →
+/// `close_window` → `close_focused_tile` → `workspace.close_focused()`, the
+/// sole semantic close-tile boundary), not a hand-called teardown, then
+/// assert the projection — and the jump-panel badge it drives — are still
+/// present via the session's Agent tile (which remains open).
+#[gpui::test]
+fn diff_projection_survives_diff_tile_close(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let worktree = temp.path().to_path_buf();
+    let (view, vcx, _sid, diff_id) = boot_diff_bound_to_session(cx, worktree.clone());
+
+    let expected = view.read_with(vcx, |v, _| v.diff_projections.get(&worktree).copied());
+    assert!(matches!(expected, Some(n) if n > 0), "fixture must derive unreviewed hunks");
+
+    // The Diff tile is focused (split_focused focuses the new leaf) — cmd-w
+    // closes exactly it via the real binding, not `diff_unbind`/a hand teardown.
+    assert_eq!(
+        view.read_with(vcx, |v, _| v.workspace.focused_window_id()),
+        Some(diff_id),
+        "the split Diff tile must be the focused window before closing it"
+    );
+    vcx.simulate_keystrokes("cmd-w");
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(vcx, |v, _| v.diff_tile_ref(diff_id).is_none()),
+        "the Diff tile must actually be gone after the real close path"
+    );
+
+    let after = view.read_with(vcx, |v, _| v.diff_projections.get(&worktree).copied());
+    assert_eq!(
+        after, expected,
+        "DiffProjections is root-owned and must survive the Diff tile's close"
+    );
+
+    let row_count = view.read_with(vcx, |v, cx| {
+        v.jump_panel_agent_rows(cx)
+            .into_iter()
+            .find(|r| r.cwd == worktree)
+            .map(|r| r.unreviewed_hunks)
+    });
+    assert_eq!(
+        row_count, expected,
+        "the jump-panel badge must still show via the session's remaining Agent tile"
     );
 }
