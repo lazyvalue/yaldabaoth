@@ -542,6 +542,7 @@ impl YaldaGpuiView {
             Key::Char('v') => self.toggle_hunk_reviewed(id, cx),
             Key::Char('V') => self.mark_file_reviewed(id, cx),
             Key::Char('c') => self.open_hunk_comment(id, cx),
+            Key::Char('o') => self.open_hunk_in_zed(id, cx),
             _ => {}
         }
     }
@@ -660,5 +661,54 @@ impl YaldaGpuiView {
             Self::dispatch_insert_core(&mut compose.editor, &mut compose.mode, press);
         }
         cx.notify();
+    }
+
+    // ── Cog node `open-in-zed` (oc72): spec B8 ──────────────────────────────
+
+    /// `o` on a focused hunk (spec B8 "Open in Zed"): spawn
+    /// `zed <abs-path>:<first-new-line>`, fire-and-forget — the child is
+    /// spawned and immediately detached (no wait, no captured output), so a
+    /// slow or hung `zed` can never block the UI thread. `abs-path` is the
+    /// bound worktree joined with the focused file's repo-relative path;
+    /// `first-new-line` is the hunk's first added/new line
+    /// (`Hunk::new_line_range().0`) — the pure composition of the two lives
+    /// in `zed_open_arg` (`diff.rs`) so it's unit-tested without spawning. A
+    /// missing/failing `zed` binary surfaces a `transient_status` hint
+    /// instead of panicking (spec B8, DONE_WHEN #2); the binary name is read
+    /// through `zed_bin()` below so a test always exercises that branch
+    /// rather than depending on whether the real editor happens to be
+    /// installed on the machine running the test.
+    pub(crate) fn open_hunk_in_zed(&mut self, id: workspace::WindowId, cx: &mut Context<Self>) {
+        let target = self.diff_tile_ref(id).and_then(|t| {
+            let worktree = t.worktree()?;
+            let model = t.model.as_ref()?;
+            let file = model.files.get(t.focus.file)?;
+            let hunk = file.hunks.get(t.focus.hunk)?;
+            Some((worktree, file.path.clone(), hunk.new_line_range().0))
+        });
+        let Some((worktree, rel_path, first_new_line)) = target else {
+            return;
+        };
+        let arg = zed_open_arg(&worktree, &rel_path, first_new_line);
+        if let Err(e) = std::process::Command::new(zed_bin()).arg(&arg).spawn() {
+            self.transient_status = Some(format!("couldn't open zed: {e}").into());
+            cx.notify();
+        }
+    }
+}
+
+/// The `zed` binary name (spec B8). Test-only seam: under `cfg(test)` this is
+/// always a deliberately-bogus name so no test can ever launch the real
+/// editor (even one installed on the machine running the test) — every test
+/// of `open_hunk_in_zed` therefore exercises the missing-binary/error branch
+/// by construction, no environment-dependent skip needed.
+fn zed_bin() -> &'static str {
+    #[cfg(test)]
+    {
+        "yalda-test-nonexistent-zed-binary"
+    }
+    #[cfg(not(test))]
+    {
+        "zed"
     }
 }

@@ -30111,3 +30111,77 @@ fn diff_hunk_comment_open_type_submit_delivers_prefixed_prompt(cx: &mut TestAppC
         assert!(tile.comment_target.is_none());
     });
 }
+
+// ── Cog node `open-in-zed` (oc72): spec B8 "Open in Zed" ────────────────────
+
+/// spec B8 DONE_WHEN #2: `o` on the focused hunk (the REAL key-dispatch path
+/// — `register_keymap` + `simulate_keystrokes`, not a hand-called
+/// `open_hunk_in_zed`) spawns `zed_bin()`, which under `cfg(test)` is always
+/// a deliberately-bogus binary name (`diff_ui.rs::zed_bin`) — so this test
+/// exercises the missing-binary/spawn-error branch by construction, with no
+/// dependency on whether the real `zed` editor happens to be installed on
+/// the machine running the test, and never actually launches an editor.
+/// Asserts the failure surfaces as a `transient_status` hint and the app
+/// does not panic (spec B8: "a missing `zed` binary surfaces a status
+/// hint").
+///
+/// Negative control (observed RED — see report): commenting out the
+/// `self.transient_status = Some(...)` assignment in `open_hunk_in_zed`
+/// (`diff_ui.rs`) leaves `transient_status` `None` after the same keystroke.
+#[gpui::test]
+fn diff_tile_o_key_missing_zed_binary_sets_status_hint_no_panic(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let worktree = temp.path().to_path_buf();
+    let (view, vcx, id) = boot_with_diff(cx, worktree);
+
+    view.read_with(vcx, |v, _| {
+        let tile = v.diff_tile_ref(id).expect("Diff tile");
+        let model = tile.model.as_ref().expect("derive must have completed");
+        assert!(
+            !model.files.is_empty() && !model.files[0].hunks.is_empty(),
+            "fixture must produce a focusable hunk"
+        );
+    });
+
+    view.update(vcx, |v, cx| {
+        v.transient_status = None;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("o");
+    vcx.run_until_parked();
+
+    let status = view.read_with(vcx, |v, _| v.transient_status.clone());
+    assert!(
+        status.is_some(),
+        "a missing zed binary must surface a transient_status hint, got None"
+    );
+}
+
+/// spec B8: `o` on a Diff tile with no derived model yet (or no hunks) is a
+/// silent no-op — no panic, no spawn attempt, no spurious status hint. Guards
+/// the `and_then` chain in `open_hunk_in_zed` against an empty/absent model.
+#[gpui::test]
+fn diff_tile_o_key_with_no_model_is_noop_no_panic(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let bogus = PathBuf::from("/nonexistent/definitely-not-a-repo-path-oc72");
+    let (view, vcx, _id) = boot_with_diff(cx, bogus);
+    vcx.run_until_parked();
+
+    view.update(vcx, |v, cx| {
+        v.transient_status = None;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("o");
+    vcx.run_until_parked();
+
+    let status = view.read_with(vcx, |v, _| v.transient_status.clone());
+    assert!(
+        status.is_none(),
+        "o with no model must be a silent no-op, got {status:?}"
+    );
+}

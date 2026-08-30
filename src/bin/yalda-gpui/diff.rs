@@ -275,6 +275,15 @@ impl DiffTile {
     }
 }
 
+/// Build the `<abs-path>:<line>` argument `zed` takes on its command line
+/// (spec B8 "Open in Zed"): the worktree root joined with the focused file's
+/// repo-relative path, suffixed with the hunk's first new-file line. Pure —
+/// no filesystem access, no spawn — so it's unit-tested independent of the
+/// actual `zed` launch (`diff_ui.rs::open_hunk_in_zed` is the only caller).
+pub(crate) fn zed_open_arg(worktree: &std::path::Path, rel_path: &std::path::Path, first_new_line: usize) -> String {
+    format!("{}:{}", worktree.join(rel_path).display(), first_new_line)
+}
+
 #[cfg(test)]
 mod comment_prompt_tests {
     use super::*;
@@ -329,5 +338,31 @@ mod comment_prompt_tests {
         let prompt =
             build_hunk_comment_prompt(std::path::Path::new("a.rs"), (1, 1), "@@ -1 +1 @@\n", "  hi  \n");
         assert!(prompt.trim_end().ends_with("hi"), "got {prompt:?}");
+    }
+}
+
+// ── Cog node `open-in-zed` (oc72): spec B8 ──────────────────────────────────
+
+#[cfg(test)]
+mod zed_open_tests {
+    use super::*;
+
+    /// Spec B8 DONE_WHEN #1: the pure `<abs-path>:<line>` composition —
+    /// worktree joined with the repo-relative path, colon-suffixed with the
+    /// hunk's first new-file line. No spawn, no filesystem access.
+    #[test]
+    fn zed_open_arg_joins_worktree_rel_path_and_line() {
+        let worktree = std::path::Path::new("/repo/worktree");
+        let rel = std::path::Path::new("src/foo.rs");
+        let arg = zed_open_arg(worktree, rel, 42);
+        assert_eq!(arg, "/repo/worktree/src/foo.rs:42");
+    }
+
+    #[test]
+    fn zed_open_arg_handles_nested_rel_path_and_line_one() {
+        let worktree = std::path::Path::new("/Users/scott/ws/proj");
+        let rel = std::path::Path::new("src/bin/app/main.rs");
+        let arg = zed_open_arg(worktree, rel, 1);
+        assert_eq!(arg, "/Users/scott/ws/proj/src/bin/app/main.rs:1");
     }
 }
