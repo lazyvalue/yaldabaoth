@@ -29765,6 +29765,134 @@ fn diff_tile_shift_v_marks_whole_file_reviewed(cx: &mut TestAppContext) {
     });
 }
 
+// ── Cog node `diff-persistence` (w5a4): spec § Persistence ──────────────────
+
+/// spec-diff-review.md § Persistence: a Diff tile bound to a SESSION persists
+/// as `Path`-bound to that session's DERIVED worktree — `SessionId` is
+/// runtime-local and must not survive a restart (a session-bound tile always
+/// restores `Path`-bound, per the doc comment on `PersistedKind::Diff`) — and
+/// restores holding the SAME worktree path, `DiffSource::Path`-bound, never
+/// re-attached to a session id.
+///
+/// Drives the REAL entry points: `boot_diff_bound_to_session` binds a Diff
+/// tile to a real session (sid "S1") whose `cwd` is a tempdir git fixture and
+/// runs the real on-paint derive (`render_diff`'s `needs_load` kick), so
+/// `tile.worktree()` resolves through the derived model exactly as it would
+/// live — NOT a hand-built `DiffTile` with `model` poked in directly. Then
+/// `crate::snapshot_content` / `crate::restore_content` (the same functions
+/// `save_workspace_state` / restore call) do the round trip.
+///
+/// Negative control (observed RED — see report): reverting
+/// `PersistedKind::Diff { worktree: tile.worktree() }` to `worktree: None`
+/// makes the restored tile unbound (`source: None`) instead of `Path`-bound —
+/// the second assertion block fails for the right reason.
+#[gpui::test]
+fn diff_tile_session_bound_persists_and_restores_as_path_bound(cx: &mut TestAppContext) {
+    let temp = diff_fixture_repo();
+    let worktree = temp.path().to_path_buf();
+    let (view, vcx, _sid, diff_id) = boot_diff_bound_to_session(cx, worktree.clone());
+
+    // Precondition: the first on-paint derive landed, so `tile.worktree()`
+    // resolves via the derived model's worktree (spec deviation noted on
+    // `snapshot_content`'s `App::Diff` arm) rather than falling back to
+    // `None` the way an un-derived session-bound tile would.
+    view.read_with(vcx, |v, _| {
+        let tile = v.diff_tile_ref(diff_id).expect("Diff tile");
+        assert!(
+            matches!(tile.source, Some(crate::DiffSource::Session(_))),
+            "fixture must still be session-bound before the snapshot"
+        );
+        assert!(tile.model.is_some(), "first on-paint derive must have landed");
+    });
+
+    let persisted = view.read_with(vcx, |v, _| {
+        let content = &v
+            .workspace
+            .tile(diff_id)
+            .expect("Diff tile window")
+            .content;
+        crate::snapshot_content(content, &|_| None)
+    });
+
+    match &persisted {
+        crate::PersistedKind::Diff { worktree: w } => {
+            assert_eq!(
+                w.as_deref(),
+                Some(worktree.as_path()),
+                "must persist the session's DERIVED worktree, not None"
+            );
+        }
+        other => panic!("expected PersistedKind::Diff, got {other:?}"),
+    }
+
+    let restored = view.update(vcx, |v, _cx| {
+        let theme = v.theme.clone();
+        crate::restore_content(&mut v.workspace, &theme, persisted)
+    });
+
+    match restored {
+        crate::App::Diff(tile) => match &tile.source {
+            Some(crate::DiffSource::Path(p)) => {
+                assert_eq!(
+                    p, &worktree,
+                    "restored tile must be Path-bound to the SAME worktree"
+                );
+            }
+            Some(crate::DiffSource::Session(_)) => panic!(
+                "restored tile must NOT still be Session-bound — SessionId is \
+                 runtime-local and must not survive a restart (spec Persistence)"
+            ),
+            None => panic!(
+                "restored session-bound tile must restore Path-bound per spec, \
+                 got unbound instead"
+            ),
+        },
+        _ => panic!("expected the restored content to be App::Diff"),
+    }
+}
+
+/// spec § Persistence, unbound case: a Diff tile with no binding at all
+/// persists `worktree: None` and restores as an unbound tile (the selector) —
+/// not a Path-bound tile to some stale default.
+#[gpui::test]
+fn diff_tile_unbound_persists_and_restores_unbound(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_browser(cx);
+    let diff_id = view.update(vcx, |v, cx| {
+        v.set_screen(crate::App::Diff(crate::DiffTile::new()));
+        let id = v.workspace.focused_window_id().expect("focused Diff tile");
+        cx.notify();
+        id
+    });
+    vcx.run_until_parked();
+
+    let persisted = view.read_with(vcx, |v, _| {
+        let content = &v
+            .workspace
+            .tile(diff_id)
+            .expect("Diff tile window")
+            .content;
+        crate::snapshot_content(content, &|_| None)
+    });
+    match &persisted {
+        crate::PersistedKind::Diff { worktree: None } => {}
+        other => panic!("an unbound Diff tile must persist worktree: None, got {other:?}"),
+    }
+
+    let restored = view.update(vcx, |v, _cx| {
+        let theme = v.theme.clone();
+        crate::restore_content(&mut v.workspace, &theme, persisted)
+    });
+    match restored {
+        crate::App::Diff(tile) => {
+            assert!(
+                tile.source.is_none(),
+                "restoring worktree: None must yield an unbound (selector) Diff tile"
+            );
+        }
+        _ => panic!("expected the restored content to be App::Diff"),
+    }
+}
+
 // ── Cog node `comment-steering` (hk81): spec B4 comment → steering ──────────
 
 /// `c` on a focused hunk of a `Path`-bound Diff tile (no session — spec C4)
