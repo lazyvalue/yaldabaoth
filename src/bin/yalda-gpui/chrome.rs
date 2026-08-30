@@ -153,10 +153,43 @@ impl YaldaGpuiView {
                         .text_size(px(12.0))
                         .child("Choose a hidden tile in the jump panel or Cmd-P to view it"),
                 );
+            // A valid empty workspace has no App leaf to carry the shared focus
+            // handle or screen-level action listeners. Make the visible empty
+            // state that shell input root so leaders and global workspace keys
+            // remain live after closing the sole tile (bug-0060).
+            let empty_root = div()
+                .size_full()
+                .key_context("EmptyWorkspaceView")
+                .on_key_down(cx.listener(Self::handle_empty_workspace_key))
+                .on_action(cx.listener(Self::open_menu))
+                .on_action(cx.listener(Self::open_local_menu))
+                .on_action(cx.listener(Self::quit))
+                .on_action(cx.listener(Self::restart))
+                .on_action(cx.listener(Self::open_browser))
+                .on_action(cx.listener(Self::open_agent))
+                .on_action(cx.listener(Self::open_linear))
+                .on_action(cx.listener(Self::open_cog))
+                .on_action(cx.listener(Self::open_keymap))
+                .on_action(cx.listener(Self::new_workspace))
+                .on_action(cx.listener(Self::close_workspace))
+                .on_action(cx.listener(Self::zoom_in))
+                .on_action(cx.listener(Self::zoom_out))
+                .on_action(cx.listener(Self::zoom_reset))
+                .on_action(cx.listener(Self::toggle_theme))
+                .on_action(cx.listener(Self::rename_workspace))
+                .on_action(cx.listener(Self::toggle_jump_panel))
+                .on_action(cx.listener(Self::open_jump_palette))
+                .workspace_nav(cx)
+                .child(content);
+            let empty_root = if attach_focus {
+                empty_root.track_focus(&self.focus_handle)
+            } else {
+                empty_root
+            };
             return div()
                 .size_full()
                 .ctrl_w_shell_actions(cx)
-                .child(content)
+                .child(empty_root)
                 .into_any_element();
         }
         let workspace_idx = self.workspace.active_workspace;

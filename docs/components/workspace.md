@@ -77,10 +77,11 @@ bindings (app-global, `None` context), `goto_workspace_number`, and the
 needs a handler in the focused element's ancestry — same discipline as
 `toggle_jump_panel`). `jump_panel_view.rs`: the workspace-row number badge.
 
-**Edge.** An **empty-layout** workspace renders a bare div with no action
-handlers (chrome.rs), so global keys (incl. `ctrl-<n>`, `ctrl-tab`, `cmd-t`)
-don't dispatch while sitting on one — a pre-existing, transient edge state, not
-specific to this binding.
+**Edge.** An **empty-layout** workspace is still a focused shell surface. Its
+empty-state root owns the shared focus handle and shell key listeners, so direct
+workspace actions and both command leaders remain available even though there is
+no tile leaf to own input. In this state `.` opens the shell menu normally and
+`space` falls back to that same shell menu because there is no focused App object.
 
 **Why.** Direct numeric workspace switching, matching the visible numbering.
 
@@ -89,7 +90,9 @@ specific to this binding.
 **Enforcement.** `verify_harness.rs`: `ctrl_digit_switches_workspace` (full
 keymap→action→handler dispatch: `ctrl-3` then `ctrl-1`, plus past-the-end no-op)
 and `workspace_number_ignores_direct_unbound_focus` (direct focus does not
-enter workspace numbering).
+enter workspace numbering); `empty_workspace_keeps_both_command_leaders_live`
+closes the sole tile through the production command path, then drives real
+`space` and `.` keystrokes against the painted empty-state surface.
 
 ---
 
