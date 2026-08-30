@@ -349,6 +349,106 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
+    /// Toggle the focused hunk's reviewed state (spec B5 `v`). Flips the
+    /// in-memory `DiffModel`'s hunk immediately (so the cached `DiffView`
+    /// re-renders off the `model_gen` bump — no new `DiffSeqs` field needed,
+    /// since a mark IS a model mutation, same bump path a refresh uses) and
+    /// persists the flip to `ReviewState` on the background executor (spec
+    /// C2 — `ReviewState` I/O never runs on the render path; this is an event
+    /// handler, not render, but the actual git/file I/O still moves off the
+    /// foreground thread to match `refresh_diff`'s discipline).
+    pub(crate) fn toggle_hunk_reviewed(&mut self, id: workspace::WindowId, cx: &mut Context<Self>) {
+        let Some(hash) = self.diff_tile_ref(id).and_then(|t| t.focused_hunk_hash()) else {
+            return;
+        };
+        let target = self
+            .diff_tile_ref(id)
+            .and_then(|t| t.model.as_ref())
+            .and_then(|m| {
+                m.files
+                    .iter()
+                    .flat_map(|f| f.hunks.iter())
+                    .find(|h| h.hunk_hash == hash)
+            })
+            .map(|h| !h.reviewed);
+        let Some(mark) = target else { return };
+        self.set_hunks_reviewed(id, &[hash], mark, cx);
+    }
+
+    /// File-level "mark all" (spec B5, bound to `V`/shift-v): marks every
+    /// hunk in the focused file reviewed. Unlike the single-hunk `v` toggle,
+    /// this always marks true — a blunt "I've reviewed this whole file" act,
+    /// not a per-hunk flip (a mixed file would otherwise have no well-defined
+    /// toggle direction).
+    pub(crate) fn mark_file_reviewed(&mut self, id: workspace::WindowId, cx: &mut Context<Self>) {
+        let Some(hashes) = self.diff_tile_ref(id).and_then(|t| {
+            let model = t.model.as_ref()?;
+            let file = model.files.get(t.focus.file)?;
+            Some(file.hunks.iter().map(|h| h.hunk_hash).collect::<Vec<_>>())
+        }) else {
+            return;
+        };
+        self.set_hunks_reviewed(id, &hashes, true, cx);
+    }
+
+    /// Shared core for `toggle_hunk_reviewed` / `mark_file_reviewed`: sets
+    /// every hash in `hashes` to reviewed = `mark` in BOTH the in-memory
+    /// `DiffModel` (so the view reflects it this frame, via a `model_gen`
+    /// bump) and the persisted `ReviewState` (spec B5: "Marks persist in
+    /// `ReviewState` across restarts"). The persistence half runs on the
+    /// background executor — `resolve_git_common_dir` shells out to git, and
+    /// `save_review_state` does file I/O, both of which must stay off the
+    /// paint path (spec C2) even though this is only called from a key
+    /// handler.
+    fn set_hunks_reviewed(
+        &mut self,
+        id: workspace::WindowId,
+        hashes: &[u64],
+        mark: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if hashes.is_empty() {
+            return;
+        }
+        let Some(tile) = self.diff_tile_mut(id) else {
+            return;
+        };
+        let Some(model) = &mut tile.model else {
+            return;
+        };
+        let hash_set: HashSet<u64> = hashes.iter().copied().collect();
+        for file in &mut model.files {
+            for hunk in &mut file.hunks {
+                if hash_set.contains(&hunk.hunk_hash) {
+                    hunk.reviewed = mark;
+                }
+            }
+        }
+        tile.model_gen = tile.model_gen.wrapping_add(1);
+        let worktree = model.worktree.clone();
+        let branch = model.branch.clone();
+        let model_snapshot = model.clone();
+        let hashes = hashes.to_vec();
+        cx.notify();
+
+        cx.background_executor()
+            .spawn(async move {
+                let Some(common) = resolve_git_common_dir(&worktree) else {
+                    return;
+                };
+                let mut state = load_review_state(&common, &branch);
+                for h in &hashes {
+                    if mark {
+                        state.mark_reviewed(*h);
+                    } else {
+                        state.mark_unreviewed(*h);
+                    }
+                }
+                save_review_state(&common, &branch, &mut state, &model_snapshot);
+            })
+            .detach();
+    }
+
     /// Key handler for a focused Diff tile (spec B9: navigation-only — the
     /// hunk-comment compose is the tile's only insert-mode surface, and it's
     /// `None` out of this node).
@@ -429,6 +529,8 @@ impl YaldaGpuiView {
                 cx.notify();
             }
             Key::Char('r') => self.refresh_diff(id, cx),
+            Key::Char('v') => self.toggle_hunk_reviewed(id, cx),
+            Key::Char('V') => self.mark_file_reviewed(id, cx),
             _ => {}
         }
     }

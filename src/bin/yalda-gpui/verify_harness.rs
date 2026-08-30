@@ -29593,3 +29593,174 @@ fn diff_tile_triggered_refresh_moves_focus_to_nearest_when_hunk_hash_gone(cx: &m
         );
     });
 }
+
+// ── Cog node `review-marks-ui` (fb5x): spec B5 review marks ─────────────────
+
+/// `v` on the focused Diff tile toggles that hunk's reviewed state, through
+/// the REAL keystroke path (`register_keymap` + `simulate_keystrokes` →
+/// `on_key_down` → `handle_diff_key` → `toggle_hunk_reviewed`) — not a
+/// hand-called mutation. Verifies BOTH halves of spec B5: the in-memory
+/// `DiffModel` flips (so the view reflects it this frame) AND the mark
+/// actually reaches `ReviewState` on disk in the fixture repo's OWN git
+/// common dir (the fixture is already a tempdir, so this never touches a real
+/// repo — spec C5). Toggling again removes it from disk.
+///
+/// Negative control (observed RED — see report): commenting out the
+/// `Key::Char('v') => self.toggle_hunk_reviewed(id, cx),` arm in
+/// `handle_diff_key` leaves the hunk's `reviewed` flag `false` after the
+/// keystroke — the first assertion fails for the right reason.
+#[gpui::test]
+fn diff_tile_v_toggles_hunk_reviewed_and_persists(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let worktree = temp.path().to_path_buf();
+    let (view, vcx, id) = boot_with_diff(cx, worktree.clone());
+
+    let (hash, branch) = view.read_with(vcx, |v, _| {
+        let tile = v.diff_tile_ref(id).expect("Diff tile");
+        let model = tile.model.as_ref().expect("derive settled");
+        assert!(
+            !model.files[0].hunks[0].reviewed,
+            "fixture hunk must start unreviewed"
+        );
+        (tile.focused_hunk_hash().expect("a hunk is focused"), model.branch.clone())
+    });
+
+    let common = crate::resolve_git_common_dir(&worktree).expect("fixture is a real git repo");
+
+    vcx.simulate_keystrokes("v");
+    vcx.run_until_parked();
+
+    view.read_with(vcx, |v, _| {
+        let tile = v.diff_tile_ref(id).expect("Diff tile");
+        let model = tile.model.as_ref().expect("model still present");
+        assert!(
+            model.files[0].hunks[0].reviewed,
+            "toggling `v` must flip the focused hunk's in-memory reviewed flag"
+        );
+    });
+    let state = crate::load_review_state(&common, &branch);
+    assert!(
+        state.is_reviewed(hash),
+        "the mark must reach ReviewState on disk in the fixture's own git common dir"
+    );
+
+    // Toggle again — must remove the mark, both in memory and on disk.
+    vcx.simulate_keystrokes("v");
+    vcx.run_until_parked();
+
+    view.read_with(vcx, |v, _| {
+        let tile = v.diff_tile_ref(id).expect("Diff tile");
+        let model = tile.model.as_ref().expect("model still present");
+        assert!(
+            !model.files[0].hunks[0].reviewed,
+            "toggling `v` a second time must flip the hunk back to unreviewed"
+        );
+    });
+    let state = crate::load_review_state(&common, &branch);
+    assert!(
+        !state.is_reviewed(hash),
+        "the second toggle must remove the mark from disk"
+    );
+}
+
+/// spec B5 staleness: "Any edit that changes a hunk's content changes its
+/// hash, so it reverts to unreviewed automatically." Marks a hunk reviewed,
+/// edits the underlying file so that hunk's content (and thus `hunk_hash`)
+/// changes, re-derives through the real `refresh_diff` path, and asserts the
+/// NEW hash reads unreviewed — no timestamp/SHA-comparison logic involved, it
+/// falls out of the join-by-hash at derive time (already exercised by
+/// `join_reviewed_flags`/`review_state.rs`'s own unit tests; this is the
+/// end-to-end path through a live `DiffTile`).
+#[gpui::test]
+fn diff_tile_content_edit_reverts_hunk_to_unreviewed(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let worktree = temp.path().to_path_buf();
+    let (view, vcx, id) = boot_with_diff(cx, worktree.clone());
+
+    // Mark a.txt's (file 0) sole hunk reviewed via the real keystroke path.
+    view.update(vcx, |v, cx| {
+        if let Some(tile) = v.workspace.tile_mut(id) {
+            let crate::App::Diff(t) = &mut tile.content else {
+                panic!("not a Diff tile");
+            };
+            t.focus = crate::DiffFocus { file: 0, hunk: 0 };
+        }
+        cx.notify();
+    });
+    vcx.simulate_keystrokes("v");
+    vcx.run_until_parked();
+
+    let old_hash = view.read_with(vcx, |v, _| {
+        let tile = v.diff_tile_ref(id).expect("Diff tile");
+        assert!(
+            tile.model.as_ref().unwrap().files[0].hunks[0].reviewed,
+            "setup: hunk must be reviewed before the edit"
+        );
+        tile.model.as_ref().unwrap().files[0].hunks[0].hunk_hash
+    });
+
+    // Change a.txt's content — its hunk's hash must change.
+    std::fs::write(worktree.join("a.txt"), "line1\nchanged a differently\nextra\n").unwrap();
+
+    view.update(vcx, |v, cx| v.refresh_diff(id, cx));
+    vcx.run_until_parked();
+
+    view.read_with(vcx, |v, _| {
+        let tile = v.diff_tile_ref(id).expect("Diff tile");
+        let model = tile.model.as_ref().expect("re-derive settled");
+        let hunk = &model.files[0].hunks[0];
+        assert_ne!(
+            hunk.hunk_hash, old_hash,
+            "editing the hunk's content must change its hash"
+        );
+        assert!(
+            !hunk.reviewed,
+            "a hunk whose content changed (new hash) must read unreviewed, \
+             even though the OLD hash was marked reviewed"
+        );
+    });
+}
+
+/// spec B5 "File-level 'mark all' exists": `shift-v` on a focused Diff tile
+/// marks EVERY hunk in the focused file reviewed, not just the focused one —
+/// through the real keystroke path (`handle_diff_key` → `mark_file_reviewed`).
+/// The fixture's two files each carry exactly one hunk, so this also proves
+/// mark-all does NOT spill into the other (unfocused) file.
+///
+/// Negative control (observed RED — see report): commenting out the
+/// `Key::Char('V') => self.mark_file_reviewed(id, cx),` arm leaves file 0's
+/// hunk unreviewed after the keystroke.
+#[gpui::test]
+fn diff_tile_shift_v_marks_whole_file_reviewed(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let worktree = temp.path().to_path_buf();
+    let (view, vcx, id) = boot_with_diff(cx, worktree.clone());
+
+    view.read_with(vcx, |v, _| {
+        let tile = v.diff_tile_ref(id).expect("Diff tile");
+        let model = tile.model.as_ref().expect("derive settled");
+        assert_eq!(model.files.len(), 2, "fixture touches two files");
+        assert_eq!(tile.focus, crate::DiffFocus { file: 0, hunk: 0 }, "starts focused on file 0");
+        assert!(!model.files[0].hunks[0].reviewed);
+        assert!(!model.files[1].hunks[0].reviewed);
+    });
+
+    vcx.simulate_keystrokes("shift-v");
+    vcx.run_until_parked();
+
+    view.read_with(vcx, |v, _| {
+        let tile = v.diff_tile_ref(id).expect("Diff tile");
+        let model = tile.model.as_ref().expect("model still present");
+        assert!(
+            model.files[0].hunks[0].reviewed,
+            "mark-all must mark the focused file's hunk reviewed"
+        );
+        assert!(
+            !model.files[1].hunks[0].reviewed,
+            "mark-all must NOT mark the OTHER file's hunk reviewed"
+        );
+    });
+}
