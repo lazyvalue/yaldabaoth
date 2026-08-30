@@ -200,6 +200,8 @@ object class (ADR-0032):
   `App::{Buffer(Viewing/Editing/Picking), Agent, Linear, Cog, Keymap}`). The
   mechanism is uniform; the primary vocabulary is per-App, followed by the
   shared tile-visibility verbs Hide (`h`) and Unhide (`H`).
+  In an empty workspace there is no focused App scope, so `space` falls back to
+  the shell menu instead of becoming inert.
 - **`.`** opens the single **shell** menu (`gpui_menu`) — verbs on tiles,
   workspaces, appearance, and system. It is the same tree regardless of focused
   tile. It contains everything the retired `?` global menu held.
@@ -233,10 +235,11 @@ Object is the distinction the operator feels, and it maps to exactly two menus.
 **Enforcement.** `verify_harness.rs` — a `?` press in a navigation state opens no
 menu overlay; former `?` command names (`new-workspace`, `rename-workspace`,
 `new-project`, `open-system-console`, `toggle-jump-panel`) dispatch and are
-reachable under `.`. `empty_workspace_keeps_both_command_leaders_live` drives
-the real empty-state key-dispatch path for `space` and `.`. Negative control:
-restore the `?` route ⇒ the "no overlay" assert goes RED; remove the empty-state
-focus/key listener ⇒ the empty-workspace guard goes RED.
+reachable under `.`. `empty_workspace_keeps_both_command_leaders_live` and
+`empty_workspace_dot_and_space_open_the_shell_menu` drive the real empty-state
+key-dispatch path for `space` and `.` (the latter paints the production empty
+root). Negative control: restore the `?` route ⇒ the "no overlay" assert goes
+RED; remove the empty-state focus/key listener ⇒ the empty-workspace guards go RED.
 
 ### UXI-Menu-7 — no duplicate key at any one menu level
 

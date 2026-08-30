@@ -85,6 +85,7 @@ and a **timestamped log** of every actual attempt.
 | bug-0069 | recovery-merges-provider-sessions | FIXED | 2026-08-27 | 1 | durable server recovery/restart/unarchive now fail closed on `session/load` failure instead of silently creating a fresh provider identity and appending its conversation to the existing Yalda WAL |
 | bug-0061 | new-cog-solo-noop | FIXED | 2026-08-27 | 1 | New → Cog only tried to split an attached workspace leaf, so it silently no-op'd from a solo-presented tile; it now creates and presents a detached Cog tile while preserving the original |
 | bug-0062 | jump-panel-duplicate-agent-sessions | FIXED | 2026-08-30 | 1 | roster materialization treated the first tile remembering a session sid as sufficient, leaving stale Attached+Detached or Detached+Detached owners to paint duplicate jump entries; roster reconciliation now retains the Attached/oldest owner, merges tags, and retires redundant Detached tiles |
+| bug-0063 | empty-workspace-menu-leaders-inert | FIXED | 2026-08-30 | 1 | the empty-layout render branch omitted the shell input/action surface and menu overlays required a focused tile; the empty root now owns global routing, shell menus support a no-tile origin, and Space falls back to shell scope |
 <!-- Example row once populated:
 | bug-0001 | chatbox-caret-offscreen | RECURRED | 2026-05-02 | 16 | caret + text scroll out of the visible chatbox; no single owner of caret-in-viewport |
 -->

@@ -1844,6 +1844,55 @@ fn workspace_cycle_works_from_the_agent_screen(cx: &mut TestAppContext) {
     });
 }
 
+/// bug-0063: an empty workspace still owns the shell focus surface. Its real
+/// painted root must route both menu leaders; with no focused App, Space falls
+/// back to the shell menu rather than attempting a nonexistent local menu.
+#[gpui::test]
+fn empty_workspace_dot_and_space_open_the_shell_menu(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_browser(cx);
+    view.update(vcx, |v, _| {
+        let project = v.workspace.inherited_project();
+        v.push_empty_workspace(project);
+        v.workspace.set_active_workspace(1);
+        assert!(matches!(
+            v.workspace.active_workspace().unwrap().layout,
+            crate::workspace::Layout::Empty
+        ));
+    });
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes(".");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        let menu = v
+            .menu_ref()
+            .expect("dot opens a menu from the empty workspace");
+        assert_eq!(menu.header, "MENU");
+        assert_eq!(menu.leader, '.');
+    });
+
+    // Use a fresh painted shell surface for the second leader. This keeps the
+    // assertion about empty-workspace routing independent of overlay focus
+    // restoration, which is covered by the menu lifecycle tests.
+    let (space_view, space_vcx) = boot_browser(cx);
+    space_view.update(space_vcx, |v, _| {
+        let project = v.workspace.inherited_project();
+        v.push_empty_workspace(project);
+        v.workspace.set_active_workspace(1);
+    });
+    space_vcx.run_until_parked();
+    space_vcx.simulate_keystrokes("space");
+    space_vcx.run_until_parked();
+    space_view.read_with(space_vcx, |v, _| {
+        let menu = v
+            .menu_ref()
+            .expect("Space opens a useful menu from the empty workspace");
+        assert_eq!(menu.header, "MENU");
+        assert_eq!(menu.leader, '.');
+    });
+}
+
 /// Direct unbound focus does not enter workspace numbering; `ctrl-<n>` still
 /// addresses the durable workspace folders shown by the jump panel.
 #[gpui::test]

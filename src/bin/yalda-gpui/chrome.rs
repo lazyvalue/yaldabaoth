@@ -123,7 +123,13 @@ impl YaldaGpuiView {
                 cx,
             );
             return div()
+                .id("empty-workspace-root")
+                .key_context("EmptyWorkspaceView")
                 .size_full()
+                .on_key_down(cx.listener(Self::handle_empty_workspace_key))
+                .on_action(cx.listener(Self::open_menu))
+                .on_action(cx.listener(Self::open_local_menu))
+                .workspace_nav(cx)
                 .ctrl_w_shell_actions(cx)
                 .child(content)
                 .into_any_element();

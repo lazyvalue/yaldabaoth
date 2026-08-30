@@ -5716,6 +5716,10 @@ impl YaldaGpuiView {
             return;
         }
         let Some(opened_from) = self.workspace.focused_window_id() else {
+            // There is no App-local command scope in an empty workspace. Keep
+            // the universal Space leader useful by falling back to the shell
+            // menu, whose commands remain meaningful without a focused tile.
+            self.open_menu_inner(cx);
             return;
         };
         let disabled = self.tile_menu_disabled();
