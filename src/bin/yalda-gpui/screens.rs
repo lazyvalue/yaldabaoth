@@ -2515,10 +2515,17 @@ impl YaldaGpuiView {
         let fg = self.editor_fg();
         let bg = self.editor_bg();
 
-        let hint = if self.diff_tile_ref(id).is_some_and(|t| t.source.is_none()) {
-            "1-9 diff a session · p diff this workspace dir"
+        let commentable = matches!(tile.source, Some(DiffSource::Session(_)));
+        let hint = if tile.source.is_none() {
+            "1-9 diff a session · p diff this workspace dir".to_string()
+        } else if tile.compose.is_some() {
+            "esc cancel · ctrl-enter send comment".to_string()
+        } else if commentable {
+            // spec B4/C4: the comment affordance is absent (not merely inert)
+            // on a `Path`-bound tile — no session to steer the comment into.
+            "j/k hunk · [ / ] file · z fold · r refresh · c comment · space tile menu".to_string()
         } else {
-            "j/k hunk · [ / ] file · z fold · r refresh · space tile menu"
+            "j/k hunk · [ / ] file · z fold · r refresh · space tile menu".to_string()
         };
         let header = div()
             .flex()
@@ -2556,7 +2563,20 @@ impl YaldaGpuiView {
 
         let body_area = div().flex_1().min_h_0().w_full().child(cached_child(view));
 
-        root.key_context("DiffView")
+        // spec B4: the hunk-comment compose, pinned in the tile — rendered at
+        // the SCREEN level (like the agent tile's compose sits outside its
+        // cached transcript), NOT inside the cached `DiffView`, so typing here
+        // never re-renders the expensive diff body and needs no `DiffSeqs`
+        // entry. `None` renders nothing (the common case).
+        let comment_panel = match (&tile.comment_target, &tile.compose) {
+            (Some(target), Some(compose)) => Some(self.render_diff_comment_compose(
+                target, compose, scale, dim, accent, fg, bg,
+            )),
+            _ => None,
+        };
+
+        let mut root = root
+            .key_context("DiffView")
             .on_key_down(cx.listener(Self::handle_diff_key))
             .on_action(cx.listener(Self::quit))
             .on_action(cx.listener(Self::restart))
@@ -2584,7 +2604,107 @@ impl YaldaGpuiView {
             .size_full()
             .bg(bg)
             .child(header)
-            .child(body_area)
+            .child(body_area);
+        if let Some(panel) = comment_panel {
+            root = root.child(panel);
+        }
+        root
+    }
+
+    /// The pinned hunk-comment compose body (spec B4). Renders EVERY line of
+    /// the draft unclipped and unscrolled (no fixed height, no
+    /// `overflow_hidden`) — for a short review comment this trivially upholds
+    /// INV-UX-1 (the caret can't be stranded off-screen: there is no scrolled
+    /// region to strand it in) without needing the full wrapped/virtualized
+    /// machinery the agent compose (INV-UX-1/2) carries for its much larger
+    /// worksheet/chatbox surfaces. Each line renders in its own `w_full()`
+    /// block, which wraps long text the same way `yux::multiline_text` does
+    /// (gpui's default block-text flow) — the INV-UX-2 word-wrap property,
+    /// without a bespoke wrap pass. `target` is the snapshot captured at open
+    /// time (`open_hunk_comment`), not live model state.
+    #[allow(clippy::too_many_arguments)]
+    fn render_diff_comment_compose(
+        &self,
+        target: &CommentTarget,
+        compose: &Compose,
+        scale: f32,
+        dim: Hsla,
+        accent: Hsla,
+        fg: Hsla,
+        bg: Hsla,
+    ) -> AnyElement {
+        let base = px(14.0 * scale);
+        let small = px(12.0 * scale);
+        let text = compose.text();
+        let cursor = compose.editor.cursor();
+        let doc_lines: Vec<&str> = if text.is_empty() {
+            vec![""]
+        } else {
+            text.split('\n').collect()
+        };
+
+        let mut lines_col = div().flex().flex_col().w_full().gap_0();
+        for (i, line) in doc_lines.iter().enumerate() {
+            let rendered = if i == cursor.line {
+                let mut chars: Vec<char> = line.chars().collect();
+                let col = cursor.col.min(chars.len());
+                chars.insert(col, '\u{2758}'); // caret marker (thin vertical bar)
+                chars.into_iter().collect::<String>()
+            } else {
+                (*line).to_string()
+            };
+            lines_col = lines_col.child(
+                div()
+                    .w_full()
+                    .font_family(self.code_font.clone())
+                    .text_size(base)
+                    .text_color(fg)
+                    .child(SharedString::from(rendered)),
+            );
+        }
+
+        let panel = div()
+            .id("diff-comment-compose")
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w_full()
+            .gap_1()
+            .px_4()
+            .py_2()
+            .border_t_1()
+            .border_color(accent)
+            .bg(bg_or(self.theme.top_bar, STATUS_BG))
+            .child(
+                div()
+                    .text_color(accent)
+                    .font_family(self.code_font.clone())
+                    .text_size(small)
+                    .child(SharedString::from(format!(
+                        "commenting on {} lines {}-{}",
+                        target.path.display(),
+                        target.line_range.0,
+                        target.line_range.1
+                    ))),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .min_h(px(24.0 * scale))
+                    .p_1()
+                    .bg(bg)
+                    .border_1()
+                    .border_color(dim)
+                    .child(lines_col),
+            )
+            .child(
+                div()
+                    .text_color(dim)
+                    .font_family(self.code_font.clone())
+                    .text_size(small)
+                    .child(SharedString::from("esc cancel · ctrl-enter send")),
+            );
+        probe_bounds("diff-comment-compose", panel.into_any_element())
     }
 
     /// Render a Cog explorer tile (`App::Cog`): a slim header bar plus the

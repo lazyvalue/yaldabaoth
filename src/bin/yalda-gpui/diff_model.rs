@@ -88,6 +88,64 @@ pub struct Hunk {
     pub reviewed: bool,
 }
 
+impl Hunk {
+    /// The inclusive new-file line range this hunk covers (spec B4: "the new
+    /// line range"), parsed from the `+c,d` operand of the `@@ -a,b +c,d @@`
+    /// header. `header` is display-only everywhere else in this module (never
+    /// fed to `hunk_hash`), but it is the ONLY place the new-file line numbers
+    /// survive parsing — `DiffLine` content carries no position — so this is
+    /// the one legitimate reader of it. Returns `(0, 0)` for a header that
+    /// fails to parse (defensive; every hunk this parser emits has a
+    /// well-formed header).
+    pub fn new_line_range(&self) -> (usize, usize) {
+        parse_new_line_range(&self.header).unwrap_or((0, 0))
+    }
+
+    /// Reconstruct the hunk's patch text verbatim: the header line, then each
+    /// content line with its `+`/`-`/` ` prefix restored (spec B4: "the hunk
+    /// patch text (header + lines)"). The inverse of `parse_hunks`' line
+    /// splitting, minus any `\ No newline at end of file` markers (dropped at
+    /// parse time — spec doesn't need them echoed back to the agent).
+    pub fn patch_text(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&self.header);
+        out.push('\n');
+        for line in &self.lines {
+            let (prefix, text) = match line {
+                DiffLine::Added(t) => ("+", t.as_str()),
+                DiffLine::Removed(t) => ("-", t.as_str()),
+                DiffLine::Context(t) => (" ", t.as_str()),
+            };
+            out.push_str(prefix);
+            out.push_str(text);
+            out.push('\n');
+        }
+        out
+    }
+}
+
+/// Parse the `+c,d` (new-file start,count) operand out of a `@@ -a,b +c,d @@`
+/// hunk header into the inclusive `(first, last)` new-file line range. `d`
+/// defaults to 1 when omitted (unified-diff convention for a single-line
+/// hunk); a `d == 0` hunk (a pure deletion — no new lines survive at all)
+/// reports `(c, c)` as a single-line anchor rather than an empty/inverted
+/// range.
+fn parse_new_line_range(header: &str) -> Option<(usize, usize)> {
+    let after_plus = header.split(" +").nth(1)?;
+    let operand = after_plus.split(' ').next()?;
+    let mut parts = operand.splitn(2, ',');
+    let start: usize = parts.next()?.parse().ok()?;
+    let count: usize = match parts.next() {
+        Some(c) => c.parse().ok()?,
+        None => 1,
+    };
+    if count == 0 {
+        Some((start, start))
+    } else {
+        Some((start, start + count - 1))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DiffLine {
     Context(String),
@@ -553,5 +611,78 @@ index 1111111..2222222 100644
         let m = model("");
         assert!(m.files.is_empty());
         assert!(!m.dirty);
+    }
+
+    // ── Cog node `comment-steering` (hk81): `Hunk::new_line_range` /
+    // `Hunk::patch_text`, spec B4 ────────────────────────────────────────────
+
+    #[test]
+    fn new_line_range_reads_the_plus_operand() {
+        let raw = "\
+diff --git a/src/bar.rs b/src/bar.rs
+index 3333333..4444444 100644
+--- a/src/bar.rs
++++ b/src/bar.rs
+@@ -10,2 +10,3 @@ fn bar() {
+     let x = 1;
++    let y = 2;
+     let z = 3;
+";
+        let m = model(raw);
+        assert_eq!(m.files[0].hunks[0].new_line_range(), (10, 12));
+    }
+
+    /// A single-line hunk omits the count (`+c` not `+c,1`) per unified-diff
+    /// convention — the count must default to 1.
+    #[test]
+    fn new_line_range_defaults_omitted_count_to_one() {
+        let raw = "\
+diff --git a/src/foo.rs b/src/foo.rs
+index 1111111..2222222 100644
+--- a/src/foo.rs
++++ b/src/foo.rs
+@@ -1 +1 @@
+-old
++new
+";
+        let m = model(raw);
+        assert_eq!(m.files[0].hunks[0].new_line_range(), (1, 1));
+    }
+
+    /// A pure deletion (`+c,0` — no new lines survive at all) reports a
+    /// single-line anchor rather than an empty/inverted range.
+    #[test]
+    fn new_line_range_zero_count_anchors_to_start() {
+        let raw = "\
+diff --git a/src/foo.rs b/src/foo.rs
+index 1111111..2222222 100644
+--- a/src/foo.rs
++++ b/src/foo.rs
+@@ -1,2 +0,0 @@
+-old1
+-old2
+";
+        let m = model(raw);
+        assert_eq!(m.files[0].hunks[0].new_line_range(), (0, 0));
+    }
+
+    #[test]
+    fn patch_text_round_trips_header_and_prefixed_lines() {
+        let raw = "\
+diff --git a/src/foo.rs b/src/foo.rs
+index 1111111..2222222 100644
+--- a/src/foo.rs
++++ b/src/foo.rs
+@@ -1,3 +1,3 @@
+ fn foo() {
+-    old_line();
++    new_line();
+ }
+";
+        let m = model(raw);
+        assert_eq!(
+            m.files[0].hunks[0].patch_text(),
+            "@@ -1,3 +1,3 @@\n fn foo() {\n-    old_line();\n+    new_line();\n }\n"
+        );
     }
 }

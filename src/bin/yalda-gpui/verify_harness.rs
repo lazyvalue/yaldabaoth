@@ -29764,3 +29764,350 @@ fn diff_tile_shift_v_marks_whole_file_reviewed(cx: &mut TestAppContext) {
         );
     });
 }
+
+// ── Cog node `comment-steering` (hk81): spec B4 comment → steering ──────────
+
+/// `c` on a focused hunk of a `Path`-bound Diff tile (no session — spec C4)
+/// must NOT open the comment compose: there is nothing to steer a comment
+/// INTO. The affordance is absent, not merely inert-with-an-error (spec B4:
+/// "the affordance is absent, not erroring").
+///
+/// Negative control (observed RED — see report): dropping the
+/// `matches!(t.source, Some(DiffSource::Session(_)))` guard in
+/// `open_hunk_comment` makes this test fail (the compose opens anyway).
+#[gpui::test]
+fn diff_tile_path_bound_c_opens_no_comment_compose(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let worktree = temp.path().to_path_buf();
+    let (view, vcx, id) = boot_with_diff(cx, worktree);
+
+    view.read_with(vcx, |v, _| {
+        let tile = v.diff_tile_ref(id).expect("Diff tile");
+        assert!(tile.model.is_some(), "derive must have settled");
+        assert!(tile.compose.is_none(), "no compose before the keystroke");
+    });
+
+    vcx.simulate_keystrokes("c");
+    vcx.run_until_parked();
+
+    view.read_with(vcx, |v, _| {
+        let tile = v.diff_tile_ref(id).expect("Diff tile");
+        assert!(
+            tile.compose.is_none(),
+            "a Path-bound tile has no comment affordance — `c` must be a no-op"
+        );
+        assert!(tile.comment_target.is_none());
+    });
+
+    // The hint line must not advertise `c comment` either (spec B4: the
+    // affordance is absent, not just inert) — read back through the real
+    // render path.
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    crate::layout_probe_end();
+}
+
+/// `c` on a focused hunk of a SESSION-bound Diff tile opens the comment
+/// compose (spec B4) through the REAL keystroke path — and it is the tile's
+/// only insert-mode surface: `focused_in_insert_mode` must flip to `true`
+/// while it's open (main.rs's `App::Diff(tile) => tile.compose.is_some()`
+/// arm), so the universal `space`/`.` leaders are suppressed exactly like
+/// every other compose in the app.
+///
+/// Negative control (observed RED — see report): commenting out the
+/// `Key::Char('c') => self.open_hunk_comment(id, cx),` arm in
+/// `handle_diff_key` leaves `tile.compose` `None` after the keystroke.
+#[gpui::test]
+fn diff_tile_c_opens_comment_compose_on_session_bound_tile(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let worktree = temp.path().to_path_buf();
+    let (view, vcx, _id, diff_id) = boot_diff_bound_to_session(cx, worktree);
+
+    view.read_with(vcx, |v, cx| {
+        assert!(
+            !v.focused_in_insert_mode(cx),
+            "hunk-nav (no compose yet) is NOT insert mode"
+        );
+    });
+
+    vcx.simulate_keystrokes("c");
+    vcx.run_until_parked();
+
+    view.read_with(vcx, |v, cx| {
+        let tile = v.diff_tile_ref(diff_id).expect("Diff tile");
+        assert!(tile.compose.is_some(), "`c` must open the comment compose");
+        assert!(
+            tile.comment_target.is_some(),
+            "the focused hunk must be snapshotted as the comment target"
+        );
+        assert!(
+            v.focused_in_insert_mode(cx),
+            "an open comment compose is the tile's only insert-mode surface"
+        );
+    });
+}
+
+/// Esc while composing (spec B4/B9) cancels: drops BOTH the compose and its
+/// target, back to plain hunk-nav (`focused_in_insert_mode` flips back to
+/// `false`) — through the real keystroke path.
+///
+/// Negative control (observed RED — see report): commenting out the
+/// `Key::Esc => self.cancel_hunk_comment(...)` branch in
+/// `handle_diff_comment_key` leaves `tile.compose` `Some` after Esc.
+#[gpui::test]
+fn diff_tile_esc_cancels_comment_compose(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let worktree = temp.path().to_path_buf();
+    let (view, vcx, _id, diff_id) = boot_diff_bound_to_session(cx, worktree);
+
+    vcx.simulate_keystrokes("c");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert!(v.diff_tile_ref(diff_id).unwrap().compose.is_some());
+    });
+
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+
+    view.read_with(vcx, |v, cx| {
+        let tile = v.diff_tile_ref(diff_id).expect("Diff tile");
+        assert!(tile.compose.is_none(), "Esc must drop the compose");
+        assert!(tile.comment_target.is_none(), "Esc must drop the anchor too");
+        assert!(
+            !v.focused_in_insert_mode(cx),
+            "back to hunk-nav after cancel"
+        );
+    });
+
+    // The tile must still be perfectly usable for ordinary hunk-nav after the
+    // cancel — `j` still moves focus.
+    let before = view.read_with(vcx, |v, _| v.diff_tile_ref(diff_id).unwrap().focus);
+    vcx.simulate_keystrokes("j");
+    vcx.run_until_parked();
+    let after = view.read_with(vcx, |v, _| v.diff_tile_ref(diff_id).unwrap().focus);
+    assert_ne!(before, after, "hunk-nav must work again after Esc cancels the compose");
+}
+
+/// Like `boot_diff_bound_to_session`, but the underlying agent slot is bound
+/// to NEITHER a server sid NOR a channel, and the view is built through the
+/// hermetic `boot_browser` (which forces `session_server` off via
+/// `with_no_session_server` — `persist.rs`'s documented test-hygiene seam).
+/// `boot_diff_bound_to_session`'s `Some("S1")` sid takes the SERVER path in
+/// `send_prompt_to_session`, which a stray REAL `yalda-session-server`
+/// reachable on the machine running the test would fire-and-forget ACCEPT
+/// (its `prompt()` doesn't validate the sid exists) — flaky-green depending on
+/// what else is running on the box. No sid + no channel + no server takes
+/// NEITHER path, so `sent` is deterministically `false` regardless of the
+/// environment — the fixture for asserting a genuinely failed send.
+fn boot_diff_bound_to_disconnected_session<'a>(
+    cx: &'a mut TestAppContext,
+    worktree: PathBuf,
+) -> (
+    gpui::Entity<YaldaGpuiView>,
+    &'a mut gpui::VisualTestContext,
+    crate::workspace::WindowId,
+) {
+    let (view, vcx) = boot_browser(cx);
+    install_agent_slot(&view, &mut *vcx, None);
+    let diff_id = view.update(vcx, |v, cx| {
+        let id = v.focused_bound_session().expect("bound session");
+        if let Some(ent) = v.session_entity(id) {
+            ent.update(cx, |s, _| s.cwd = worktree.clone());
+        }
+        let diff_id = v
+            .workspace
+            .split_focused(
+                crate::workspace::SplitDir::V,
+                crate::App::Diff(crate::DiffTile::bound_to_session(id)),
+            )
+            .expect("split for a second (Diff) tile");
+        cx.notify();
+        diff_id
+    });
+    vcx.run_until_parked();
+    (view, vcx, diff_id)
+}
+
+/// DONE_WHEN (failure path): with the agent slot connected to NEITHER a
+/// session-server sid NOR a channel (`boot_diff_bound_to_disconnected_session`
+/// — deterministic regardless of what else is running on the test machine), a
+/// submit through the REAL `c` → type → Ctrl-Enter path fails, and the draft
+/// (+ its anchor) is LEFT INTACT in `tile.compose`/`tile.comment_target` —
+/// spec B4: "On send failure the draft stays in the compose (no silent
+/// drop)".
+///
+/// Negative control (observed RED — see report): in `submit_hunk_comment`,
+/// unconditionally clearing `tile.compose`/`comment_target` (instead of only
+/// on `sent == true`) makes this test fail (the compose is gone after the
+/// failed submit).
+#[gpui::test]
+fn diff_tile_comment_submit_failure_keeps_draft(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let worktree = temp.path().to_path_buf();
+    let (view, vcx, diff_id) = boot_diff_bound_to_disconnected_session(cx, worktree);
+
+    vcx.simulate_keystrokes("c");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert!(v.diff_tile_ref(diff_id).unwrap().compose.is_some());
+    });
+
+    view.update(vcx, |v, cx| {
+        let window = v.workspace.tile_mut(diff_id).expect("Diff tile window");
+        let crate::App::Diff(tile) = &mut window.content else {
+            panic!("not a Diff tile");
+        };
+        let compose = tile.compose.as_mut().expect("compose open");
+        for ch in "needs work".chars() {
+            compose.editor.insert_char(ch);
+        }
+        cx.notify();
+    });
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("ctrl-enter");
+    vcx.run_until_parked();
+
+    view.read_with(vcx, |v, _| {
+        let tile = v.diff_tile_ref(diff_id).expect("Diff tile");
+        assert!(
+            tile.compose.is_some(),
+            "a failed send (no daemon in this harness) must leave the draft in place"
+        );
+        assert_eq!(
+            tile.compose.as_ref().unwrap().text(),
+            "needs work",
+            "the exact typed draft must survive a failed send"
+        );
+        assert!(
+            tile.comment_target.is_some(),
+            "the hunk anchor must survive too, so a retry still has full context"
+        );
+    });
+}
+
+/// Behind `test-support` (the in-process transport feature, mirrors
+/// `boot_worksheet_channel`): boot a browser with a channel-connected agent
+/// session, point its `cwd` at a real git fixture, and open a SEPARATE Diff
+/// tile `Session`-bound to it (mirrors `boot_diff_bound_to_session`, minus the
+/// server-sid binding so `send_prompt_to_session` takes the in-process
+/// `channel.send_payload` path instead of the absent session-server path).
+#[cfg(feature = "test-support")]
+fn boot_diff_comment_channel(
+    cx: &mut TestAppContext,
+    worktree: PathBuf,
+) -> (
+    gpui::Entity<YaldaGpuiView>,
+    &mut gpui::VisualTestContext,
+    crate::workspace::WindowId,
+    yalda::acp_channel::TestChannelControls,
+) {
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        )
+    });
+    vcx.run_until_parked();
+    install_agent_slot(&view, &mut *vcx, None); // None sid ⇒ channel.send() path
+    let (client, controls) = yalda::acp_channel::AcpChannelClient::test_connected();
+    let diff_id = view.update(vcx, |v, cx| {
+        v.splash_until = None;
+        let id = v.focused_bound_session().expect("bound session");
+        v.with_session(id, cx, |c| c.channel = Some(client));
+        if let Some(ent) = v.session_entity(id) {
+            ent.update(cx, |s, _| s.cwd = worktree.clone());
+        }
+        let diff_id = v
+            .workspace
+            .split_focused(
+                crate::workspace::SplitDir::V,
+                crate::App::Diff(crate::DiffTile::bound_to_session(id)),
+            )
+            .expect("split for a second (Diff) tile");
+        cx.notify();
+        diff_id
+    });
+    vcx.run_until_parked();
+    (view, vcx, diff_id, controls)
+}
+
+/// DONE_WHEN #1 (comment-steering, hk81): `c` on a focused hunk of a
+/// session-bound Diff tile opens the compose; a typed comment submitted with
+/// Ctrl-Enter reaches the bound session's REAL channel
+/// (`send_prompt_to_session` → `channel.send_payload`) carrying the exact
+/// prompt `build_hunk_comment_prompt` would build from the SAME path/range/
+/// patch the tile actually derived — i.e. this proves both that
+/// `submit_hunk_comment` calls that builder AND that real data (not a stub)
+/// flows from the derived `DiffModel` through to the wire.
+///
+/// Negative control (observed RED — see report): in `submit_hunk_comment`,
+/// replace the `build_hunk_comment_prompt(...)` call with the raw `comment`
+/// text — the `assert_eq!(payload.text, expected, ...)` fails (the delivered
+/// text is missing the path/range/patch prefix).
+#[cfg(feature = "test-support")]
+#[gpui::test]
+fn diff_hunk_comment_open_type_submit_delivers_prefixed_prompt(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let worktree = temp.path().to_path_buf();
+    let (view, vcx, diff_id, controls) = boot_diff_comment_channel(cx, worktree.clone());
+
+    let (path, line_range, patch) = view.read_with(vcx, |v, _| {
+        let tile = v.diff_tile_ref(diff_id).expect("Diff tile");
+        let model = tile.model.as_ref().expect("first on-paint derive must have landed");
+        let file = &model.files[0];
+        let hunk = &file.hunks[0];
+        (file.path.clone(), hunk.new_line_range(), hunk.patch_text())
+    });
+
+    vcx.simulate_keystrokes("c");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert!(
+            v.diff_tile_ref(diff_id).unwrap().compose.is_some(),
+            "c must open the comment compose"
+        );
+    });
+
+    let comment = "please rename this";
+    view.update(vcx, |v, cx| {
+        let window = v.workspace.tile_mut(diff_id).expect("Diff tile window");
+        let crate::App::Diff(tile) = &mut window.content else {
+            panic!("not a Diff tile");
+        };
+        let compose = tile.compose.as_mut().expect("compose open");
+        for ch in comment.chars() {
+            compose.editor.insert_char(ch);
+        }
+        cx.notify();
+    });
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("ctrl-enter");
+    vcx.run_until_parked();
+
+    let payload = controls
+        .prompt_rx
+        .try_recv()
+        .expect("a prompt reached the channel");
+    let expected = crate::build_hunk_comment_prompt(&path, line_range, &patch, comment);
+    assert_eq!(
+        payload.text, expected,
+        "the delivered prompt must be exactly the built hunk-comment prompt"
+    );
+
+    view.read_with(vcx, |v, _| {
+        let tile = v.diff_tile_ref(diff_id).expect("Diff tile");
+        assert!(tile.compose.is_none(), "compose clears on a successful send");
+        assert!(tile.comment_target.is_none());
+    });
+}

@@ -35,9 +35,49 @@ pub(crate) struct DiffFocus {
     pub(crate) hunk: usize,
 }
 
-/// A Diff tile's payload (spec § Data Model). `compose` is reserved for the
-/// hunk-comment surface (spec B4, "comment → steering") — a LATER cog node
-/// wires it; this node always leaves it `None`.
+/// Snapshot of the hunk a comment compose is anchored to (spec B4), captured
+/// at OPEN time (`open_hunk_comment`, `diff_ui.rs`) rather than read live off
+/// `DiffTile.model` at submit time — a background refresh (spec B3) can land
+/// mid-compose and the tile's `focus`/`model` can move on, but the comment
+/// compose is a short-lived side conversation about the hunk as it looked
+/// when `c` was pressed, not a live view that would need to track a refresh.
+#[derive(Clone)]
+pub(crate) struct CommentTarget {
+    /// Repo-relative path of the file the commented hunk belongs to.
+    pub(crate) path: PathBuf,
+    /// Inclusive new-file line range (`Hunk::new_line_range`).
+    pub(crate) line_range: (usize, usize),
+    /// Verbatim hunk patch text (`Hunk::patch_text`) — header + prefixed lines.
+    pub(crate) patch: String,
+}
+
+/// Build the outgoing prompt for a hunk comment (spec B4): a machine-readable
+/// prefix — repo-relative path, new-line range, and the hunk's verbatim patch
+/// text, fenced so the agent can cleanly separate it from the human comment
+/// that follows — then the user's typed comment. Pure and unit-tested
+/// independent of the send path; `submit_hunk_comment` (`diff_ui.rs`) is the
+/// only caller.
+pub(crate) fn build_hunk_comment_prompt(
+    path: &std::path::Path,
+    line_range: (usize, usize),
+    patch: &str,
+    comment: &str,
+) -> String {
+    format!(
+        "Review comment on a diff hunk:\n```\npath: {}\nlines {}-{}\n{}\n```\n{}",
+        path.display(),
+        line_range.0,
+        line_range.1,
+        patch.trim_end_matches('\n'),
+        comment.trim()
+    )
+}
+
+/// A Diff tile's payload (spec § Data Model). `compose` is the hunk-comment
+/// surface (spec B4, "comment → steering") — opened by `open_hunk_comment`,
+/// paired with `comment_target` (the hunk it's anchored to); `None` when no
+/// comment is being composed (the tile's default, and its only insert-mode
+/// surface — spec B9).
 pub(crate) struct DiffTile {
     pub(crate) source: Option<DiffSource>,
     /// Last successfully derived diff (kept during a refresh — spec B3:
@@ -45,8 +85,15 @@ pub(crate) struct DiffTile {
     pub(crate) model: Option<DiffModel>,
     pub(crate) focus: DiffFocus,
     pub(crate) collapsed: HashSet<PathBuf>,
-    /// Reserved for spec B4 — always `None` out of this node.
+    /// The open hunk-comment compose (spec B4) — the tile's only insert-mode
+    /// surface (`focused_in_insert_mode`, `main.rs`, keys off `.is_some()`).
+    /// Opened by `open_hunk_comment`, cleared by `cancel_hunk_comment` (Esc)
+    /// or on a successful `submit_hunk_comment` (left intact on send failure
+    /// so the draft is never dropped).
     pub(crate) compose: Option<Compose>,
+    /// The hunk `compose` is anchored to, snapshotted at open time (see
+    /// [`CommentTarget`]). Always `Some` exactly when `compose` is.
+    pub(crate) comment_target: Option<CommentTarget>,
     pub(crate) refreshing: bool,
     /// Monotonic guard so a stale in-flight refresh can't clobber a newer
     /// one (mirrors `LinearTile::req` / `CogTile::req`).
@@ -81,6 +128,7 @@ impl DiffTile {
             focus: DiffFocus::default(),
             collapsed: HashSet::new(),
             compose: None,
+            comment_target: None,
             refreshing: false,
             req: 0,
             model_gen: 0,
@@ -224,5 +272,62 @@ impl DiffTile {
             self.collapsed.insert(path.to_path_buf());
         }
         self.collapsed_gen = self.collapsed_gen.wrapping_add(1);
+    }
+}
+
+#[cfg(test)]
+mod comment_prompt_tests {
+    use super::*;
+
+    /// Cog node `comment-steering` (hk81), spec B4: the built prompt must
+    /// carry the repo-relative path, the new-line range, the verbatim patch
+    /// text, and the user's comment — in that order, fenced so the agent can
+    /// tell the machine-readable context apart from the human text. This is
+    /// the pure-fn half of DONE_WHEN #1 (see `diff_ui.rs::submit_hunk_comment`
+    /// for the send-path half).
+    #[test]
+    fn build_hunk_comment_prompt_includes_path_range_patch_and_comment() {
+        let patch = "@@ -1,3 +1,3 @@\n fn foo() {\n-    old_line();\n+    new_line();\n }\n";
+        let prompt = build_hunk_comment_prompt(
+            std::path::Path::new("src/foo.rs"),
+            (10, 12),
+            patch,
+            "please rename this",
+        );
+        assert!(
+            prompt.contains("src/foo.rs"),
+            "prompt must carry the repo-relative path: {prompt:?}"
+        );
+        assert!(
+            prompt.contains("10-12") || prompt.contains("10") && prompt.contains("12"),
+            "prompt must carry the new-line range: {prompt:?}"
+        );
+        assert!(
+            prompt.contains("@@ -1,3 +1,3 @@"),
+            "prompt must carry the hunk header: {prompt:?}"
+        );
+        assert!(
+            prompt.contains("-    old_line();") && prompt.contains("+    new_line();"),
+            "prompt must carry the verbatim patch lines: {prompt:?}"
+        );
+        assert!(
+            prompt.contains("please rename this"),
+            "prompt must carry the user's comment: {prompt:?}"
+        );
+        // Order: path/range/patch (the machine-readable prefix) before the
+        // human comment, per spec B4 ("prefixed by machine-readable context").
+        let patch_pos = prompt.find("@@ -1,3").unwrap();
+        let comment_pos = prompt.find("please rename this").unwrap();
+        assert!(
+            patch_pos < comment_pos,
+            "the patch context must precede the comment text"
+        );
+    }
+
+    #[test]
+    fn build_hunk_comment_prompt_trims_comment_whitespace() {
+        let prompt =
+            build_hunk_comment_prompt(std::path::Path::new("a.rs"), (1, 1), "@@ -1 +1 @@\n", "  hi  \n");
+        assert!(prompt.trim_end().ends_with("hi"), "got {prompt:?}");
     }
 }

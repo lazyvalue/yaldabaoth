@@ -449,25 +449,35 @@ impl YaldaGpuiView {
             .detach();
     }
 
-    /// Key handler for a focused Diff tile (spec B9: navigation-only — the
-    /// hunk-comment compose is the tile's only insert-mode surface, and it's
-    /// `None` out of this node).
+    /// Key handler for a focused Diff tile (spec B9): navigation by default —
+    /// the hunk-comment compose (spec B4) is the tile's only insert-mode
+    /// surface, checked FIRST (before the platform/control bail and
+    /// `leader_intercept`) so Ctrl-Enter can reach `submit_hunk_comment` while
+    /// composing. `focused_in_insert_mode` (`main.rs`) already keys off
+    /// `tile.compose.is_some()`, so leaders are suppressed correctly while
+    /// composing regardless — this early branch is what makes the compose's
+    /// OWN keys (Esc/Ctrl-Enter/typing) actually reach it.
     pub(crate) fn handle_diff_key(
         &mut self,
         ev: &KeyDownEvent,
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if ev.keystroke.modifiers.platform || ev.keystroke.modifiers.control {
-            return;
-        }
         let press = keystroke_to_keypress(&ev.keystroke);
-        if self.leader_intercept(&press, cx) {
-            return;
-        }
         let Some(id) = self.workspace.focused_window_id() else {
             return;
         };
+        if self.diff_tile_ref(id).is_some_and(|t| t.compose.is_some()) {
+            self.handle_diff_comment_key(id, press, cx);
+            return;
+        }
+
+        if ev.keystroke.modifiers.platform || ev.keystroke.modifiers.control {
+            return;
+        }
+        if self.leader_intercept(&press, cx) {
+            return;
+        }
         let unbound = matches!(self.diff_tile_ref(id), Some(t) if t.source.is_none());
         if unbound {
             match press.key {
@@ -531,7 +541,124 @@ impl YaldaGpuiView {
             Key::Char('r') => self.refresh_diff(id, cx),
             Key::Char('v') => self.toggle_hunk_reviewed(id, cx),
             Key::Char('V') => self.mark_file_reviewed(id, cx),
+            Key::Char('c') => self.open_hunk_comment(id, cx),
             _ => {}
         }
+    }
+
+    // ── Cog node `comment-steering` (hk81): spec B4 comment → steering ──────
+
+    /// `c` on a focused hunk (spec B4): open the hunk-comment compose,
+    /// snapshotting the focused hunk's path/line-range/patch into
+    /// `comment_target` so a later background refresh (spec B3) can't move
+    /// the ground the comment was written against out from under it. A
+    /// `Path`-bound tile has NO comment affordance (spec B4/C4: comment→
+    /// steering needs a session to steer) — `c` is a silent no-op there, and
+    /// likewise a no-op with no model/no hunks to anchor to.
+    pub(crate) fn open_hunk_comment(&mut self, id: workspace::WindowId, cx: &mut Context<Self>) {
+        let target = self.diff_tile_ref(id).and_then(|t| {
+            if !matches!(t.source, Some(DiffSource::Session(_))) {
+                return None;
+            }
+            let model = t.model.as_ref()?;
+            let file = model.files.get(t.focus.file)?;
+            let hunk = file.hunks.get(t.focus.hunk)?;
+            Some(CommentTarget {
+                path: file.path.clone(),
+                line_range: hunk.new_line_range(),
+                patch: hunk.patch_text(),
+            })
+        });
+        let Some(target) = target else {
+            return;
+        };
+        if let Some(tile) = self.diff_tile_mut(id) {
+            tile.comment_target = Some(target);
+            tile.compose = Some(Compose::new());
+        }
+        cx.notify();
+    }
+
+    /// Esc while composing (spec B4/B9): cancel — drop the compose AND its
+    /// target, back to hunk-nav. Unlike the worksheet's layered Esc
+    /// (Insert→Normal, then leave), this compose has exactly one level: it is
+    /// a short-lived, single-purpose surface, not an editable transcript
+    /// block.
+    pub(crate) fn cancel_hunk_comment(&mut self, id: workspace::WindowId, cx: &mut Context<Self>) {
+        if let Some(tile) = self.diff_tile_mut(id) {
+            tile.compose = None;
+            tile.comment_target = None;
+        }
+        cx.notify();
+    }
+
+    /// Ctrl-Enter while composing (spec B4): build the prefixed prompt
+    /// (`build_hunk_comment_prompt`, `diff.rs`) and send it to the bound
+    /// session via the SAME `send_prompt_to_session` core the agent compose
+    /// uses (`agent_ui.rs`) — mid-turn it steers, idle it prompts, no new
+    /// transport. `steer_codex` is computed exactly like `submit_compose`'s:
+    /// Claude keeps its unconditional promptQueueing path; only a
+    /// cleanly-awaiting Codex session asks the transport to steer. On success
+    /// the compose clears; on FAILURE it is left intact (spec B4: "the draft
+    /// stays in the compose") with a status hint so the user can retry.
+    pub(crate) fn submit_hunk_comment(&mut self, id: workspace::WindowId, cx: &mut Context<Self>) {
+        let target_and_session = self.diff_tile_ref(id).and_then(|t| {
+            let Some(DiffSource::Session(sid)) = t.source else {
+                return None;
+            };
+            let target = t.comment_target.clone()?;
+            let comment = t.compose.as_ref()?.text();
+            Some((sid, target, comment))
+        });
+        let Some((sid, target, comment)) = target_and_session else {
+            return;
+        };
+        let prompt =
+            build_hunk_comment_prompt(&target.path, target.line_range, &target.patch, &comment);
+        let steer_codex = self
+            .read_session(sid, cx, |c| {
+                c.provider == AgentProvider::Codex && matches!(c.turn_phase, TurnPhase::Awaiting { .. })
+            })
+            .unwrap_or(false);
+        let sent = self.send_prompt_to_session(sid, &prompt, &[], None, steer_codex, cx);
+        if sent {
+            if let Some(tile) = self.diff_tile_mut(id) {
+                tile.compose = None;
+                tile.comment_target = None;
+            }
+            self.transient_status = Some("comment sent".into());
+        } else {
+            // Spec B4: on send FAILURE the draft stays in `tile.compose` — no
+            // silent drop. Nothing else to undo: we never touched it.
+            self.transient_status =
+                Some("send failed — reconnecting; press ctrl-enter to retry".into());
+        }
+        cx.notify();
+    }
+
+    /// Key dispatch while the hunk-comment compose is open (spec B4/B9). Esc
+    /// cancels; Ctrl-Enter submits (mirrors the agent compose's Ctrl-Enter
+    /// submit key — `handle_claude_key`, `agent_ui.rs` — so the same chord
+    /// submits every compose in the app); everything else is ordinary typing,
+    /// dispatched through the SAME insert-mode core the agent compose and the
+    /// Edit view share (`dispatch_insert_core`). The compose never leaves
+    /// Insert mode on its own — `dispatch_insert_core`'s internal Esc arm
+    /// (which would drop to Normal) never fires because Esc is handled here
+    /// first, so there is no Normal-mode dispatch to wire.
+    fn handle_diff_comment_key(&mut self, id: workspace::WindowId, press: KeyPress, cx: &mut Context<Self>) {
+        if press.key == Key::Esc && press.modifiers.is_empty() {
+            self.cancel_hunk_comment(id, cx);
+            return;
+        }
+        if press.key == Key::Enter && press.modifiers.contains(KMods::CONTROL) {
+            self.submit_hunk_comment(id, cx);
+            return;
+        }
+        if let Some(tile) = self.diff_tile_mut(id)
+            && let Some(compose) = tile.compose.as_mut()
+        {
+            Self::dispatch_insert_core(&mut compose.editor, &mut compose.mode, press);
+        }
+        cx.notify();
     }
 }
