@@ -1,7 +1,10 @@
 # Worklog: lossless restart WAL and split-brain prevention
 
 **Date:** 2026-08-30
-**Branches touched:** `fix/lossless-restart-wal`
+**Branches touched:**
+
+- `fix/lossless-restart-wal` (`8eef3b1`)
+- `main` (`077b5e1` merge)
 
 ## Cog execution evidence
 
@@ -45,9 +48,13 @@ frontier 7: omega [open] (omega)
 - `vdr` `prevent-split-brain`: added after emergency process evidence, claimed
   → closed; OS lifetime server lease and exclusive per-WAL writer locks passed
   real multi-process and byte-preservation guards.
-- `f5u` `integrate-document`: claimed; integration is recorded in this commit.
-- `3nk` `final-worklog`: pending until the implementation is merged to `main`.
-- `ccd` `omega`: pending final merged verification.
+- `f5u` `integrate-document`: claimed → closed; verified commit `8eef3b1`
+  merged to local `main` as `077b5e1`, then the competing-server and WAL
+  matrices passed again from merged main.
+- `3nk` `final-worklog`: claimed → closed; complete graph and merged-main
+  evidence captured in this artifact.
+- `ccd` `omega`: claimed → closed; output: all durability, exclusivity,
+  documentation, integration, and no-activation requirements were confirmed.
 
 ### Notes
 
@@ -61,10 +68,26 @@ frontier 7: omega [open] (omega)
   were observed RED and restored before the green gate.
 - No fixed binary was activated and no surviving live Yalda process was
   restarted.
+- Finalization-order deviation: the validator requires a complete graph while
+  final-worklog/omega require the final artifact. Cog note `finalization-order`
+  records that both nodes were closed from established merged-main evidence,
+  followed immediately by this truthful snapshot and validation.
 
 ### Final status
 
-- Status: `integration pending`
+- Status: `complete`
+
+```text
+graph make-restarts-session-wal-lossless (frontiers)
+frontier 0: audit-restart-loss [done], prevent-split-brain [done]
+frontier 1: audit-backup-replay [done], spec-lossless-invariant [done]
+frontier 2: guard-old-wal [done], harden-restart-entrypoints [done]
+frontier 3: implement-wal-migration [done]
+frontier 4: verify-lossless-restarts [done]
+frontier 5: integrate-document [done]
+frontier 6: final-worklog [done]
+frontier 7: omega [done] (omega)
+```
 
 ## Built (with status)
 
@@ -103,10 +126,14 @@ frontier 7: omega [open] (omega)
 - WAL matrix: **18 passed, 0 failed**.
 - Competing real server: loser stopped at lifetime lease; owner socket inode and
   service remained intact.
+- Merged-main critical rerun: competing-server guard and all **18** WAL tests
+  passed.
 - Release build: `yalda-session-server` and `yalda-gpui` passed.
 - `git diff --check`: passed.
+- `scripts/check-cog-worklog.sh
+  docs/worklog/2026-08-30-lossless-restart-wal.md`: passed.
 
 ## Next
 
-- Merge to `main`, rerun the critical guards, finalize this worklog and graph,
-  and leave activation pending explicit user-controlled restart permission.
+- Activation remains pending explicit user-controlled restart permission. Do not
+  restart the live GUI or server automatically.
