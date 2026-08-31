@@ -1384,6 +1384,7 @@ impl CogView {
         st: &DetailStyle,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
+        let author = self.communication_author_label(from);
         let mut body = card(st)
             .child(
                 div()
@@ -1394,7 +1395,10 @@ impl CogView {
                     .text_color(st.dim)
                     .font_family(st.mono.clone())
                     .text_size(px(st.pt * 0.82))
-                    .child(SharedString::from(from.to_string()))
+                    .child(probe_bounds(
+                        "cog-communication-author",
+                        div().child(SharedString::from(author)).into_any_element(),
+                    ))
                     .child(SharedString::from(format!(
                         "#{} · {}",
                         event_id,
@@ -1410,6 +1414,35 @@ impl CogView {
             body = body.child(refs);
         }
         body
+    }
+
+    /// Human-facing label for a communication sender. Cog's short address is a
+    /// routing identity, so keep it for precision but lead with the registered
+    /// name already present in the loaded Home directory.
+    pub(crate) fn communication_author_label(&self, from: &str) -> String {
+        if from.trim().is_empty() {
+            return "—".into();
+        }
+        let agents = match &self.state {
+            CogViewState::Home(home) => Some(home.agents.as_slice()),
+            _ => self
+                .home_backstack
+                .as_deref()
+                .map(|home| home.agents.as_slice()),
+        };
+        let Some(address) = agents
+            .unwrap_or_default()
+            .iter()
+            .find(|address| address.id == from)
+        else {
+            return from.into();
+        };
+        let name = address.name.trim();
+        if name.is_empty() || name == address.id {
+            address.id.clone()
+        } else {
+            format!("{name} · {}", address.id)
+        }
     }
 
     /// Click a node row: select it (its detail fills the right pane) and put

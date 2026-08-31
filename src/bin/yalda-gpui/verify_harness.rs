@@ -27653,6 +27653,96 @@ fn cog_topic_browser_hierarchy_collapses_and_renders_typed_detail(cx: &mut TestA
     assert!(chat_entry.is_some(), "a readable Chat entry card paints");
 }
 
+/// UXI-Cog-19: the real Home + typed-detail reducers carry the loaded address
+/// directory into Chat rendering, where a terse sender id becomes a useful
+/// name-first label while retaining the exact address.
+///
+/// NEGATIVE CONTROL: removing the address-directory lookup from
+/// `communication_author_label` makes the label assertion return bare `ncz`.
+#[gpui::test]
+fn cog_communication_author_uses_registered_agent_name(cx: &mut TestAppContext) {
+    let (view, vcx, cv, wid) = boot_with_cog(cx);
+    let mut home = cog_test_home(vec![cog_test_topic(
+        "projects/schema::coordination",
+        crate::CogTopicKind::Chat,
+        "chat-1",
+        "Schema coordination",
+    )]);
+    home.agents.push(crate::CogAgentAddress {
+        id: "ncz".into(),
+        name: "l11-schema-cleanup-worker".into(),
+        provider: "claude".into(),
+        session: "session-ncz".into(),
+        cwd: "/work".into(),
+        created_at: 1,
+        retired_at: None,
+        retired_reason: None,
+    });
+    let req = cog_tile_req(&view, vcx);
+    view.update(vcx, |v, cx| {
+        v.cog_apply(wid, req, Ok(crate::CogFetch::Home(Box::new(home))), cx);
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        cv.update(vcx, |c, _| c.communication_author_label("ncz")),
+        "l11-schema-cleanup-worker · ncz",
+        "registered name is primary and stable address remains secondary"
+    );
+    assert_eq!(
+        cv.update(vcx, |c, _| c.communication_author_label("external-actor")),
+        "external-actor",
+        "unknown actors remain readable"
+    );
+    assert_eq!(
+        cv.update(vcx, |c, _| c.communication_author_label("")),
+        "—",
+        "empty authors have an explicit fallback"
+    );
+
+    // Root folder + nested folder + Chat leaf. Drive the real click/fetch reducer.
+    cv.update(vcx, |c, cx| c.click_topic(2, cx));
+    let detail_req = cog_tile_req(&view, vcx);
+    view.update(vcx, |v, cx| {
+        v.cog_apply(
+            wid,
+            detail_req,
+            Ok(crate::CogFetch::TopicDetail {
+                address: "projects/schema::coordination".into(),
+                result: Ok(crate::CogTopicDetail::Chat(crate::CogChat {
+                    id: "chat-1".into(),
+                    name: "Schema coordination".into(),
+                    creator: "ncz".into(),
+                    created_at: 1,
+                    addresses: vec!["projects/schema::coordination".into()],
+                    members: vec!["ncz".into()],
+                    entries: vec![crate::CogChatEntry {
+                        id: "entry-1".into(),
+                        event_id: 7,
+                        chat: "chat-1".into(),
+                        from: "ncz".into(),
+                        at: 1_786_989_281_753_564_000,
+                        actor: "claude".into(),
+                        content: serde_json::json!({"message":"schema cleanup ready"}),
+                        references: vec![],
+                    }],
+                })),
+            }),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    crate::layout_probe_begin();
+    cv.update(vcx, |_, cx| cx.notify());
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let author = crate::layout_probe_get("cog-communication-author");
+    let entry = crate::layout_probe_get("cog-chat-entry");
+    crate::layout_probe_end();
+    let (_, _, width, height) = author.expect("resolved communication author paints");
+    assert!(width > 20.0 && height > 5.0, "author label has real painted size");
+    assert!(entry.is_some(), "the containing communication card paints");
+}
+
 /// UXI-Cog-15: the real Agents tab selects a registered address, folds delivery
 /// state and ordered direct-mail threads through the production reducer, and
 /// paints readable cards in the cached right pane.

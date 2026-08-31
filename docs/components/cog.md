@@ -574,3 +574,40 @@ the card click handler and failed with Overview still selected.
 `cog_native_graph_layout_keeps_islands_missing_edges_and_cycles` guards stable
 fallback layering without dropping nodes. Exact pixels and colours remain
 runtime gap #1.
+
+### UXI-Cog-19 — Agent communication authors are human-readable
+
+**Statement.** Mail and Chat entry headers resolve an author that matches a
+registered Cog agent address through the address directory already loaded with
+the Topics/Agents home snapshot. The registered agent name is the primary label
+and the stable short address remains secondary—for example,
+`l11-schema-cleanup-worker · ncz`—so communication is immediately attributable
+without losing exact identity. If the registered name is empty or identical to
+the id, the id renders once. Unknown non-empty actors remain unchanged; an empty
+author renders `—`.
+
+Resolution applies equally while browsing a Topic communication target and an
+agent's readable mail. Entering a full graph retains the parked home directory,
+so the same label rule is available to graph-owned communication surfaces. A
+live Home refresh updates the directory and author labels atomically through the
+existing cached `CogView` invalidation; rendering performs no fetch or notify.
+
+**Applies to.** `CogView` address lookup / author formatting and
+`communication_card` callers for Note, Chat, inbox, and agent thread entries
+(`cog_view.rs`); the `CogHomeData.agents` directory loaded by `load_home`
+(`cog.rs`).
+
+**Why.** Cog address ids are deliberately short stable routing identifiers, not
+human-facing names. A header such as `ncz` gives the operator no useful context
+even though the same loaded address record already names it
+`l11-schema-cleanup-worker`.
+
+**Status.** `implemented` (2026-08-30; Cog graph `k4v`).
+
+**Enforcement.** `cog_communication_author_uses_registered_agent_name` loads an
+address named `l11-schema-cleanup-worker` through the real Home reducer, opens a
+typed Chat detail through the real click/fetch reducer, probes the painted author
+and card, and proves the name-first label retains `ncz`. It also guards unknown
+and empty-author fallbacks. Its negative control removed directory resolution
+and failed because the result regressed to bare `ncz`. Exact pixels and colours
+remain runtime gap #1.
