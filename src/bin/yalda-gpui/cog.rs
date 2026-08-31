@@ -479,7 +479,8 @@ pub(crate) struct CogBundle {
     pub(crate) logs: BTreeMap<String, Vec<CogLogEntry>>,
     /// node id → its notes.
     pub(crate) notes: BTreeMap<String, Vec<CogNote>>,
-    /// The ASCII DAG render (`cog graph render`), shown in the Overview.
+    /// Legacy CLI render payload, retained for wire compatibility but no longer
+    /// painted by the native Overview diagram.
     pub(crate) render: String,
 }
 
@@ -1118,7 +1119,8 @@ pub(crate) fn load_graph(id: &str) -> Result<CogBundle, String> {
     let edges: Vec<CogEdge> = cog_json(&["graph", "edges", id]).unwrap_or_default();
     let node_notes: Vec<CogNodeNotes> =
         cog_json(&["graph", "read-node-notes", id]).unwrap_or_default();
-    // The ASCII DAG render for the Overview (raw text, not JSON).
+    // Retain the legacy CLI render payload for wire compatibility. The Overview
+    // derives its native diagram from nodes + edges instead.
     let render = run_cog(&["graph", "render", id]).unwrap_or_default();
 
     let mut notes: BTreeMap<String, Vec<CogNote>> = BTreeMap::new();

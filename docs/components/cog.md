@@ -313,18 +313,19 @@ verified RED by clearing events in `update_bundle`). The live `cog graph watch`
 subprocess ↔ strip loop is runtime gap #2 (`cfg(test)` skips the spawn); confirm
 against `cogd` at runtime.
 
-### UXI-Cog-8 — The left panel has an Overview tab (graph render + stats)
+### UXI-Cog-8 — The left panel has an Overview tab (graph + stats)
 
 **Statement.** In a loaded graph the left panel lists `[Overview, nodes…]` — an
 **Overview** row at the top. Selecting it (click, or `k`/↑ up from the first node)
-shows, in the detail pane, the graph's rendered structure (`cog graph render`) plus
-aggregate **stats**: node count, counts by status, and claimed→done completion
-times (count, quickest, longest, average).
+shows, in the detail pane, the graph's structure plus aggregate **stats**: node
+count, counts by status, and claimed→done completion times (count, quickest,
+longest, average). UXI-Cog-18 supersedes the original textual `cog graph render`
+presentation with the native interactive GPUI diagram.
 
 **Applies to.** `CogViewState::Graph { overview }`, `overview_row` / `overview_body`
 / `click_overview` / `showing_overview`, `select_move` (Overview at linear index 0)
-(`cog_view.rs`); `CogBundle::stats` / `completion_ns` / `fmt_duration_ns`,
-`CogBundle.render` (`cog.rs`).
+(`cog_view.rs`); `CogBundle::stats` / `completion_ns` / `fmt_duration_ns`
+(`cog.rs`).
 
 **Why.** The `/new-ux` request: "on the left panel, create an Overview listing (tab)
 at the top … render the graph and give stats: number nodes, quickest / longest /
@@ -335,8 +336,8 @@ average completion time."
 **Enforcement.** `verify_harness.rs::cog_stats_completion_times` (real
 `bundle.stats()` math: counts + quickest/longest/avg from node logs) and
 `cog_overview_reachable_and_toc_jumps` (real `cog_select`: `k` up from node 0 reaches
-the Overview and its body paints — layout-probe). Exact graph-render glyphs are
-runtime gap #1.
+the Overview and its body paints — layout-probe). Native graph behavior is
+enforced by UXI-Cog-18.
 
 ### UXI-Cog-9 — Node detail has a Table of Contents, State transitions first
 
@@ -535,3 +536,41 @@ rejection seams (negative control: remove event invalidation). The existing
 `cog_live_home_refresh_coalesces_and_rejects_stale_selection` changes selection
 mid-read and proves an old snapshot cannot alter the hierarchy before the
 current-key snapshot lands (negative control: remove the exact-key guard).
+
+### UXI-Cog-18 — Graph Overview is an interactive native diagram
+
+**Statement.** A loaded graph's Overview renders its nodes and dependency edges
+as native GPUI elements, not the textual `cog graph render` ASCII output. Nodes
+are arranged in dependency layers from roots toward omega; peers share a layer,
+and cycles, islands, or missing edge endpoints degrade to stable additional
+layers instead of hiding nodes or preventing paint. Each node card shows its
+human label and effective status with the same status semantics and colours as
+the selector. Edges visibly connect predecessor and successor cards, including
+fan-in and fan-out, while remaining legible in a constrained, scrollable detail
+pane.
+
+Every node card is clickable. Activating one selects that exact node, leaves
+Overview, resets the right-pane scroll, and presents the standard node detail
+from UXI-Cog-2/4/9 (status transitions, content, output, and notes). The existing
+left selector and keyboard navigation remain available and synchronized with
+the diagram selection. Stats remain above the diagram; live events and cached
+view ownership are unchanged.
+
+**Applies to.** Native graph layout and diagram elements plus their click wiring
+in `CogView::right_pane` / `overview_body` (`cog_view.rs`), derived solely from
+`CogBundle::{nodes,edges}` and `effective_status` (`cog.rs`).
+
+**Why.** The graph Overview is a spatial dependency model. ASCII makes node and
+edge relationships difficult to scan and cannot provide a direct path from a
+visual node to the detail already available elsewhere in the tile.
+
+**Status.** `implemented` (2026-08-30; Cog graph `i1z`).
+
+**Enforcement.** `cog_overview_native_graph_click_opens_node_detail` applies a
+fan-in DAG through the real Cog reducer, probes native node and edge paint,
+clicks the painted card through GPUI's mouse dispatcher, and asserts that the
+existing detail surface opens for that exact node. Its negative control removed
+the card click handler and failed with Overview still selected.
+`cog_native_graph_layout_keeps_islands_missing_edges_and_cycles` guards stable
+fallback layering without dropping nodes. Exact pixels and colours remain
+runtime gap #1.

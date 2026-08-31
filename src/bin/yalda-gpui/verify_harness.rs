@@ -28000,6 +28000,111 @@ fn cog_node_selection_resets_right_scroll(cx: &mut TestAppContext) {
     assert_eq!(after, 0.0, "changing node resets the right pane to the top");
 }
 
+/// UXI-Cog-18: Overview paints a native GPUI dependency diagram and clicking a
+/// diagram node opens that exact node's standard detail surface. The test uses
+/// painted bounds and the real mouse dispatcher, not a direct state mutation.
+///
+/// NEGATIVE CONTROL (observed RED): remove the diagram card's `probe_bounds_dyn`
+/// wrapper and this fails because `cog-graph-node-probe-2` never paints. Remove
+/// its `on_click` and the selected index remains 0 / Overview remains visible.
+#[gpui::test]
+fn cog_overview_native_graph_click_opens_node_detail(cx: &mut TestAppContext) {
+    let (view, vcx, cv, wid) = boot_with_cog(cx);
+    let req = cog_tile_req(&view, vcx);
+    let mut bundle = cog_test_bundle(vec![
+        cog_test_node("a", "Discover", "done", serde_json::json!({"step": "a"})),
+        cog_test_node("b", "Design", "done", serde_json::json!({"step": "b"})),
+        cog_test_node("c", "Build", "open", serde_json::json!({"step": "c"})),
+    ]);
+    bundle.edges = vec![
+        crate::CogEdge {
+            from: "a".into(),
+            to: "c".into(),
+        },
+        crate::CogEdge {
+            from: "b".into(),
+            to: "c".into(),
+        },
+    ];
+    bundle.render = "ASCII SENTINEL MUST NOT BE THE OVERVIEW".into();
+    assert_eq!(
+        crate::graph_diagram_layers(&bundle),
+        vec![vec![0, 1], vec![2]],
+        "two roots share a layer and their successor follows"
+    );
+    view.update(vcx, |v, cx| {
+        v.cog_apply(wid, req, Ok(crate::CogFetch::Graph(Box::new(bundle))), cx);
+    });
+    vcx.run_until_parked();
+
+    crate::layout_probe_begin();
+    cv.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let node = crate::layout_probe_get("cog-graph-node-probe-2")
+        .expect("native Build node card paints in Overview");
+    let edge0 = crate::layout_probe_get("cog-graph-edge-probe-0-0")
+        .expect("first native dependency connector paints");
+    let edge1 = crate::layout_probe_get("cog-graph-edge-probe-0-1")
+        .expect("fan-in's second dependency connector paints");
+    crate::layout_probe_end();
+    assert!(node.2 > 100.0 && node.3 > 20.0, "node card has real size");
+    assert!(edge0.2 > 40.0 && edge1.2 > 40.0, "edge lanes have real size");
+
+    let at = gpui::point(gpui::px(node.0 + node.2 / 2.0), gpui::px(node.1 + node.3 / 2.0));
+    vcx.simulate_mouse_move(at, None, gpui::Modifiers::default());
+    vcx.simulate_click(at, gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert_eq!(
+        cv.update(vcx, |c, _| (c.showing_overview(), c.selected_index())),
+        (false, 2),
+        "clicking Build leaves Overview and selects that exact node"
+    );
+
+    crate::layout_probe_begin();
+    cv.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    assert!(
+        crate::layout_probe_get("cog-sec-0").is_some(),
+        "the standard node detail sections paint after diagram selection"
+    );
+    assert!(
+        crate::layout_probe_get("cog-graph-node-probe-2").is_none(),
+        "the diagram is replaced by node detail"
+    );
+    crate::layout_probe_end();
+}
+
+/// UXI-Cog-18: malformed input cannot make nodes disappear. Missing endpoints
+/// are ignored for layering, and cyclic nodes occupy a stable fallback layer.
+#[gpui::test]
+fn cog_native_graph_layout_keeps_islands_missing_edges_and_cycles(_cx: &mut TestAppContext) {
+    let mut bundle = cog_test_bundle(vec![
+        cog_test_node("root", "Root", "done", serde_json::Value::Null),
+        cog_test_node("island", "Island", "open", serde_json::Value::Null),
+        cog_test_node("x", "Cycle X", "open", serde_json::Value::Null),
+        cog_test_node("y", "Cycle Y", "open", serde_json::Value::Null),
+    ]);
+    bundle.edges = vec![
+        crate::CogEdge {
+            from: "missing".into(),
+            to: "root".into(),
+        },
+        crate::CogEdge {
+            from: "x".into(),
+            to: "y".into(),
+        },
+        crate::CogEdge {
+            from: "y".into(),
+            to: "x".into(),
+        },
+    ];
+    assert_eq!(
+        crate::graph_diagram_layers(&bundle),
+        vec![vec![0, 1], vec![2, 3]],
+        "roots/islands paint first and the cyclic remainder paints stably"
+    );
+}
+
 /// UXI-Cog-3: the right pane scrolls on `d`/`u` and clamps at the top.
 #[gpui::test]
 fn cog_right_pane_scrolls_and_clamps(cx: &mut TestAppContext) {

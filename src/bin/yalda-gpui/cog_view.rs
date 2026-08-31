@@ -125,7 +125,7 @@ pub(crate) enum CogViewState {
         selected: usize,
     },
     /// A loaded graph — left is `[Overview, nodes…]`, right is the Overview
-    /// (graph render + stats) or the selected node's detail. `selected` indexes
+    /// (native graph diagram + stats) or the selected node's detail. `selected` indexes
     /// into `bundle.nodes`; `overview` (top row) overrides it when set.
     Graph {
         bundle: Box<CogBundle>,
@@ -1436,7 +1436,7 @@ impl CogView {
         }
     }
 
-    /// Click the Overview row: show the graph render + stats in the detail pane.
+    /// Click the Overview row: show the native graph diagram + stats in detail.
     pub(crate) fn click_overview(&mut self, cx: &mut Context<Self>) {
         if let CogViewState::Graph { overview, .. } = &mut self.state {
             *overview = true;
@@ -1887,11 +1887,11 @@ impl CogView {
                     scroll = scroll.child(single_inner("Select a node on the left.", st.dim, st));
                 }
             },
-            // The Overview: graph render + stats.
+            // The Overview: native graph diagram + stats.
             CogViewState::Graph { bundle, .. } => {
                 scroll = scroll.child(probe_bounds(
                     "cog-right-content",
-                    overview_body(bundle, st).into_any_element(),
+                    self.overview_body(bundle, st, cx).into_any_element(),
                 ));
             }
             CogViewState::Graphs { graphs, selected } => {
@@ -2576,66 +2576,260 @@ fn overview_row(is_sel: bool, st: &DetailStyle) -> gpui::Div {
         )
 }
 
-/// The Overview detail: the graph's ASCII DAG render plus aggregate stats
-/// (node counts by status + claimed→done completion min/max/avg).
-fn overview_body(bundle: &CogBundle, st: &DetailStyle) -> gpui::Div {
-    let s = bundle.stats();
-    let mut col = div().flex().flex_col().w_full().gap_2();
+/// Stable dependency layers for the native graph diagram. Known predecessors
+/// participate in Kahn's algorithm; missing endpoints do not hide otherwise
+/// valid nodes, and a final layer contains any cyclic remainder.
+pub(crate) fn graph_diagram_layers(bundle: &CogBundle) -> Vec<Vec<usize>> {
+    let by_id: std::collections::HashMap<&str, usize> = bundle
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(i, node)| (node.id.as_str(), i))
+        .collect();
+    let mut indegree = vec![0usize; bundle.nodes.len()];
+    let mut outgoing = vec![Vec::new(); bundle.nodes.len()];
+    for edge in &bundle.edges {
+        if let (Some(&from), Some(&to)) =
+            (by_id.get(edge.from.as_str()), by_id.get(edge.to.as_str()))
+        {
+            indegree[to] += 1;
+            outgoing[from].push(to);
+        }
+    }
 
-    col = col.child(
-        div()
+    let mut remaining = bundle.nodes.len();
+    let mut emitted = vec![false; bundle.nodes.len()];
+    let mut layers = Vec::new();
+    while remaining > 0 {
+        let layer: Vec<usize> = indegree
+            .iter()
+            .enumerate()
+            .filter_map(|(i, degree)| (!emitted[i] && *degree == 0).then_some(i))
+            .collect();
+        if layer.is_empty() {
+            layers.push(
+                emitted
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, seen)| (!*seen).then_some(i))
+                    .collect(),
+            );
+            break;
+        }
+        for &i in &layer {
+            emitted[i] = true;
+            remaining -= 1;
+            for &to in &outgoing[i] {
+                indegree[to] = indegree[to].saturating_sub(1);
+            }
+        }
+        layers.push(layer);
+    }
+    layers
+}
+
+impl CogView {
+    /// The Overview detail: aggregate stats plus a native, clickable GPUI DAG.
+    fn overview_body(
+        &self,
+        bundle: &CogBundle,
+        st: &DetailStyle,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let s = bundle.stats();
+        let mut col = div().flex().flex_col().w_full().gap_2();
+
+        col = col.child(
+            div()
+                .w_full()
+                .text_color(st.fg)
+                .font_family(st.prose.clone())
+                .font_weight(FontWeight::BOLD)
+                .text_size(px(st.pt * 1.45))
+                .child(SharedString::from(bundle.graph.label())),
+        );
+
+        // Stats.
+        col = col.child(section_heading("Stats", st));
+        let mut meta = div().flex().flex_col().gap_1().w_full();
+        meta = meta.child(kv_row("Nodes", s.total.to_string(), st));
+        meta = meta.child(kv_row(
+            "By status",
+            format!(
+                "{} done · {} claimed · {} open · {} failed",
+                s.done, s.claimed, s.open, s.failed
+            ),
+            st,
+        ));
+        let dur = |v: Option<i64>| v.map(fmt_duration_ns).unwrap_or_else(|| "—".into());
+        meta = meta.child(kv_row(
+            "Completion",
+            format!(
+                "{} completed · quickest {} · longest {} · avg {}",
+                s.completed,
+                dur(s.quickest_ns),
+                dur(s.longest_ns),
+                dur(s.average_ns)
+            ),
+            st,
+        ));
+        col = col.child(meta);
+
+        col = col.child(section_heading("Graph", st));
+        let layers = graph_diagram_layers(bundle);
+        if layers.is_empty() {
+            return col.child(dim_line("No nodes.", st));
+        }
+
+        let by_id: std::collections::HashMap<&str, usize> = bundle
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, node)| (node.id.as_str(), i))
+            .collect();
+        let node_layer: std::collections::HashMap<usize, usize> = layers
+            .iter()
+            .enumerate()
+            .flat_map(|(layer, nodes)| nodes.iter().map(move |index| (*index, layer)))
+            .collect();
+
+        let mut diagram = div()
+            .id("cog-graph-diagram")
+            .flex()
+            .flex_col()
             .w_full()
-            .text_color(st.fg)
-            .font_family(st.prose.clone())
-            .font_weight(FontWeight::BOLD)
-            .text_size(px(st.pt * 1.45))
-            .child(SharedString::from(bundle.graph.label())),
-    );
-
-    // Stats.
-    col = col.child(section_heading("Stats", st));
-    let mut meta = div().flex().flex_col().gap_1().w_full();
-    meta = meta.child(kv_row("Nodes", s.total.to_string(), st));
-    meta = meta.child(kv_row(
-        "By status",
-        format!(
-            "{} done · {} claimed · {} open · {} failed",
-            s.done, s.claimed, s.open, s.failed
-        ),
-        st,
-    ));
-    let dur = |v: Option<i64>| v.map(fmt_duration_ns).unwrap_or_else(|| "—".into());
-    meta = meta.child(kv_row(
-        "Completion",
-        format!(
-            "{} completed · quickest {} · longest {} · avg {}",
-            s.completed,
-            dur(s.quickest_ns),
-            dur(s.longest_ns),
-            dur(s.average_ns)
-        ),
-        st,
-    ));
-    col = col.child(meta);
-
-    // Graph render (ASCII DAG).
-    col = col.child(section_heading("Graph", st));
-    let render = if bundle.render.trim().is_empty() {
-        "(no render)".to_string()
-    } else {
-        bundle.render.clone()
-    };
-    col = col.child(
-        div()
-            .w_full()
-            .p_2()
-            .rounded_md()
+            .gap_2()
+            .p_3()
+            .rounded_lg()
             .border_1()
             .border_color(card_border(st))
-            .bg(code_bg(st))
-            .child(multiline_text(&render, st.fg, &st.mono, px(st.pt * 0.9))),
-    );
-    col
+            .bg(code_bg(st));
+
+        for (layer_no, indices) in layers.iter().enumerate() {
+            let mut layer = div()
+                .id(SharedString::from(format!("cog-graph-layer-{layer_no}")))
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .items_start()
+                .justify_center()
+                .gap_2()
+                .w_full();
+            for &index in indices {
+                let node = &bundle.nodes[index];
+                let label = if node.name.trim().is_empty() {
+                    node.id.clone()
+                } else {
+                    node.name.clone()
+                };
+                let eff = bundle.effective_status(node);
+                let card = div()
+                    .id(SharedString::from(format!("cog-graph-node-{index}")))
+                    .cursor_pointer()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .min_w(px(150.0))
+                    .max_w(px(240.0))
+                    .p_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(status_color(eff, st))
+                    .bg(card_bg(st))
+                    .child(
+                        div()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .font_family(st.prose.clone())
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(st.fg)
+                            .text_size(px(st.pt * 0.94))
+                            .child(SharedString::from(label)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .font_family(st.mono.clone())
+                            .text_size(px(st.pt * 0.76))
+                            .text_color(st.dim)
+                            .child(SharedString::from(node.id.clone()))
+                            .child(status_badge(eff, st)),
+                    )
+                    .on_click(cx.listener(move |view, _ev, _window, cx| {
+                        view.click_node(index, cx);
+                    }));
+                layer = layer.child(probe_bounds_dyn(
+                    format!("cog-graph-node-probe-{index}"),
+                    card.into_any_element(),
+                ));
+            }
+            diagram = diagram.child(layer);
+
+            let edges: Vec<_> = bundle
+                .edges
+                .iter()
+                .filter(|edge| {
+                    by_id
+                        .get(edge.from.as_str())
+                        .and_then(|index| node_layer.get(index))
+                        == Some(&layer_no)
+                })
+                .collect();
+            if !edges.is_empty() {
+                let mut lanes = div()
+                    .id(SharedString::from(format!("cog-graph-edges-{layer_no}")))
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .justify_center()
+                    .gap_2()
+                    .w_full();
+                for (edge_no, edge) in edges.into_iter().enumerate() {
+                    let from = by_id
+                        .get(edge.from.as_str())
+                        .and_then(|i| bundle.nodes.get(*i))
+                        .map(|n| if n.name.is_empty() { &n.id } else { &n.name })
+                        .unwrap_or(&edge.from);
+                    let to = by_id
+                        .get(edge.to.as_str())
+                        .and_then(|i| bundle.nodes.get(*i))
+                        .map(|n| if n.name.is_empty() { &n.id } else { &n.name })
+                        .unwrap_or(&edge.to);
+                    lanes = lanes.child(probe_bounds_dyn(
+                        format!("cog-graph-edge-probe-{layer_no}-{edge_no}"),
+                        div()
+                            .id(SharedString::from(format!(
+                                "cog-graph-edge-{layer_no}-{edge_no}"
+                            )))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .px_2()
+                            .py(px(2.0))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(card_border(st))
+                            .font_family(st.mono.clone())
+                            .text_size(px(st.pt * 0.7))
+                            .text_color(st.dim)
+                            .child(SharedString::from(from.clone()))
+                            .child(div().w(px(28.0)).h(px(2.0)).bg(st.accent))
+                            .child(SharedString::new_static("▶"))
+                            .child(SharedString::from(to.clone()))
+                            .into_any_element(),
+                    ));
+                }
+                diagram = diagram.child(lanes);
+            }
+        }
+        col.child(diagram)
+    }
 }
 
 fn graph_preview(g: &CogGraph, st: &DetailStyle) -> gpui::Div {
