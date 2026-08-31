@@ -852,6 +852,10 @@ is covered by `tests.rs::preferences_round_trip_with_text_scale`.
 
 ### UXI-JumpPanel-14 — Every project has Waiting / Working / All ordinary agent tabs
 
+> **Panel-superseded by `UXI-JumpPanel-32`.** The sidebar no longer renders or
+> selects activity/archive tabs. The activity projections remain internal for
+> `Cmd-P`, telemetry, and compatibility callers.
+>
 > **Panel-superseded in part by `UXI-JumpPanel-20`.** In the sidebar, the **All**
 > tab no longer paints the Working/Waiting/Unavailable activity partition described
 > in clause 3 — sessions there group under **tag folders** and sort by label. The
@@ -951,6 +955,8 @@ presentation order is also applied to empty-query `Cmd-P`, preserving
 
 ### UXI-JumpPanel-15 — Agent tabs are a separated neutral two-row control
 
+> **Superseded by `UXI-JumpPanel-32`.** The two-row control is removed.
+>
 **Statement.** Waiting / Working / All / Archived render as a single bounded
 2×2 segmented control, not four floating words or one crowded strip:
 
@@ -995,6 +1001,9 @@ its internal vertical and horizontal hairlines.
 
 ### UXI-JumpPanel-16 — Archived sessions enter durable cold storage
 
+> **Panel-superseded by `UXI-JumpPanel-32`.** Archive remains a durable lifecycle
+> and session-menu action, but archived sessions no longer have a sidebar-only tab.
+>
 **Statement.** Archiving is a durable server-owned lifecycle state on a
 server-backed agent session, not a third operational activity:
 
@@ -1082,6 +1091,8 @@ navigation and never expose Archived.
 
 ### UXI-JumpPanel-17 — Waiting and Working tabs show their live session totals
 
+> **Superseded by `UXI-JumpPanel-32`.** The counters leave with the tab control.
+>
 **Statement.** Every expanded project's Waiting and Working tab carries an
 always-visible number indicator, including when the total is **0**. Each number
 is derived from that project's current, deduplicated session projection:
@@ -1820,3 +1831,33 @@ false; setting the REAL `AgentState.unread` → true; clearing it → false. Neg
 control observed RED by forcing `has_unread = false` at its construction site.
 Working derivation stays covered by
 `workspace_folder_marks_contained_working_agent` (`UXI-JumpPanel-30`).
+
+### UXI-JumpPanel-32 — The sidebar has no agent-state tab widget
+
+**Statement.** The Jump panel does not render the Waiting / Working / All /
+Archived segmented control or its count badges. Expanded projects directly show
+their ordinary, non-archived session/tile content using the existing All
+projection and tag-folder presentation. Activity remains visible through each
+row and workspace folder's semantic status color; filtering live agents by
+activity remains available to non-panel consumers such as `Cmd-P` ordering.
+
+Archiving remains available from the Agent Tile session menu and the jump-row
+context menu. Archived sessions remain durable and can be unarchived from an
+already-open transcript/session action, but the Jump panel no longer provides an
+Archived-only browsing mode. The retired per-project tab selection may remain in
+the persistence model for backward compatibility, but it cannot affect sidebar
+paint.
+
+**Applies to.** `jump_panel_view.rs` (`render_jump_panel` uses the All projection
+directly and omits `compact_tab` / `compact_count_indicator`); `Cmd-P` continues
+to use the activity grouping helpers independently.
+
+**Why.** The four-way widget consumed a large, visually heavy block in every
+project and duplicated activity already carried by row/folder status styling.
+
+**Status.** `implemented` (2026-08-30; Cog graph `k2z`).
+
+**Enforcement.** A headless render guard expands a project and proves the project
+content paints while the former tab-group and all four tab probes are absent.
+Observed RED against the prior renderer: the guard found
+`jump-agent-tabs-<project>` painted. Removing the render block returned it GREEN.

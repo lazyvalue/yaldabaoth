@@ -984,7 +984,7 @@ impl YaldaGpuiView {
                 id,
                 name: p.name.clone(),
                 cwd_display: shorten_cwd_for_display(&p.cwd),
-                agent_tab: selected_tab,
+                agent_tab,
                 waiting_count,
                 working_count,
                 workspaces,
@@ -1852,16 +1852,16 @@ impl YaldaGpuiView {
         // WORKSPACES sublist (workspaces whose `wsp.project()` is it; the ctrl-<n>
         // number moves to a dim right-edge hint) and its UNBOUND tiles. Bound
         // tiles are children of workspace folders; detached tiles live below the
-        // activity tabs and optional tag folders. See `jump_panel_sections`.
-        let (sections, unfiled) = self.jump_panel_sections(cx);
+        // optional tag folders. The panel always paints the ordinary All
+        // projection; activity-specific projections remain available to Cmd-P
+        // and compatibility callers (UXI-JumpPanel-32).
+        let (sections, unfiled) = self.jump_panel_sections_with_tab(cx, Some(JumpAgentTab::All));
         let drag_fg = st.fg;
         let drag_font = st.mono.clone();
 
         for section in sections {
             let pid = section.id;
             let agent_tab = section.agent_tab;
-            let waiting_count = section.waiting_count;
-            let working_count = section.working_count;
             let cwd_key = section.cwd_display.clone();
             let project_name = section.name.clone();
             let folded = self.jump_folded_projects.contains(&project_name);
@@ -2108,71 +2108,6 @@ impl YaldaGpuiView {
                     group.into_any_element(),
                 ));
             }
-
-            // Per-project state tabs sit directly under the workspace list.
-            // Their selection is independent across projects.
-            let tab_edge = border;
-            let mut tabs = div()
-                .flex()
-                .flex_col()
-                .w_full()
-                .p(px(2.0))
-                .border_1()
-                .border_color(tab_edge)
-                .rounded_md();
-            for (row_idx, row_tabs) in [
-                [JumpAgentTab::Waiting, JumpAgentTab::Working],
-                [JumpAgentTab::All, JumpAgentTab::Archived],
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                if row_idx > 0 {
-                    tabs = tabs.child(div().h(px(1.0)).mx_1().bg(tab_edge));
-                }
-                let mut row = div().flex().flex_row().w_full();
-                for (tab_idx, tab) in row_tabs.into_iter().enumerate() {
-                    if tab_idx > 0 {
-                        row = row.child(div().w(px(1.0)).my_1().bg(tab_edge));
-                    }
-                    let tab_probe =
-                        format!("jump-agent-tab-{}-{}", pid.0, tab.label().to_lowercase());
-                    let indicator = match tab {
-                        JumpAgentTab::Waiting => Some(("waiting", waiting_count, ready)),
-                        JumpAgentTab::Working => Some(("working", working_count, working_orange)),
-                        JumpAgentTab::All | JumpAgentTab::Archived => None,
-                    }
-                    .map(|(slug, count, tint)| {
-                        let probe = format!("jump-agent-tab-count-{}-{slug}", pid.0);
-                        let indicator = compact_count_indicator(
-                            SharedString::from(probe.clone()),
-                            count,
-                            tint,
-                            &st,
-                        );
-                        probe_bounds_dyn(probe, indicator.into_any_element())
-                    });
-                    let button = compact_tab(
-                        SharedString::from(tab_probe.clone()),
-                        tab.label(),
-                        indicator,
-                        tab == agent_tab,
-                        sel_bg,
-                        &st,
-                    )
-                    .on_click(cx.listener(move |this, _ev, _window, cx| {
-                        this.select_jump_agent_tab(pid, tab, cx)
-                    }));
-                    row = row.child(probe_bounds_dyn(tab_probe, button.into_any_element()));
-                }
-                tabs = tabs.child(row);
-            }
-            col = col.child(div().w_full().px_3().pt(px(10.0)).pb(px(6.0)).child(
-                probe_bounds_dyn(
-                    format!("jump-agent-tabs-{}", pid.0),
-                    tabs.into_any_element(),
-                ),
-            ));
 
             // DETACHED is tile-native: attached tiles cannot enter it,
             // non-Agent tiles participate, and tag

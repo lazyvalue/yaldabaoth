@@ -812,11 +812,17 @@ addresses from the installation-wide Topic catalog:
    address order. `/token` remains exclusively the slash-command completion from
    `UXI-AgentTile-42`. Empty matches mean no popup.
 3. **Keys and replacement.** While Topic rows are visible, `Up`/`Down` move the
-   clamped selection before history recall; `Tab` or `Enter` accepts the selected
-   row without submitting and replaces the whole `%…` query token with the raw
-   Topic address, preserving all text around it and placing the caret immediately
-   after the full address; a second Enter submits normally. `Esc` dismisses the
-   current query. Any compose edit
+   clamped selection before history recall. `Tab` or `Enter` advances the selected
+   row only through its **next path segment**, matching shell completion: from the
+   typed prefix it includes characters through the next `/`, or through the next
+   `::` separator, and includes the final segment when no separator remains. The
+   whole `%…` query token is replaced with that incremental prefix, preserving the
+   leading `%` while the address is partial so another acceptance remains eligible,
+   preserving all surrounding text, and placing the caret immediately after it.
+   The leading `%` is removed when the final segment is accepted.
+   Repeated acceptance therefore walks a long address one segment at a time; only
+   accepting its final segment closes the popup, and a later Enter submits normally.
+   `Esc` dismisses the current query. Any compose edit
    re-filters, resets selection, and clears dismissal.
 4. **Render.** The popup uses the same tail completion region above the input as
    slash commands in both placements. Each row shows the full address,
@@ -841,9 +847,10 @@ glyph/color appearance remains gap #1.
 
 **Enforcement.** Headless guards in `verify_harness.rs` drive the real
 `handle_claude_key` path in Message Box and Worksheet, asserting popup navigation,
-token-local acceptance, no accidental submit, and painted placement above the
-compose. A pure `tests.rs` guard pins query extraction, deterministic filtering,
-slash-command priority, and surrounding-text preservation. Each behavioral guard
+token-local segment-wise acceptance, no accidental submit, and painted placement
+above the compose. A pure `tests.rs` guard pins query extraction, deterministic
+filtering, slash-command priority, separator boundaries, and surrounding-text
+preservation. Each behavioral guard
 was observed RED: the tests first failed to compile against the missing Topic
 state/methods; disabling Topic key dispatch failed the Message Box selection
 assertion; disabling the Topic paint gate failed the Worksheet paint assertion.

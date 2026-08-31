@@ -12010,9 +12010,9 @@ fn viewing_a_waiting_agent_does_not_change_waiting_order(cx: &mut TestAppContext
     );
 }
 
-/// UXI-JumpPanel-14, real per-project projection: each project defaults to All,
-/// selects its own state slice, preserves custom All order through state
-/// changes, and appends a newly discovered sid.
+/// UXI-JumpPanel-14/32, compatibility projection: per-project activity slices
+/// remain available without painting their retired selector; custom All order
+/// survives state changes and appends a newly discovered sid.
 #[gpui::test]
 fn jump_project_agent_tabs_are_independent_and_all_appends(cx: &mut TestAppContext) {
     use crate::JumpAgentTab;
@@ -12055,34 +12055,7 @@ fn jump_project_agent_tabs_are_independent_and_all_appends(cx: &mut TestAppConte
         v.jump_session_order = vec!["S-quiet".into(), "S-work".into(), "S-wait".into()];
     });
 
-    crate::layout_probe_begin();
-    for _ in 0..3 {
-        view.update(vcx, |_, cx| cx.notify());
-        vcx.run_until_parked();
-    }
-    let outer_label = format!("jump-agent-tabs-{}", pid.0);
-    let (outer_x, outer_y, outer_w, outer_h) = crate::layout_probe_get(&outer_label)
-        .expect("the tabs must paint inside one enclosing segmented-control box");
-    let (_, workspace_y, _, workspace_h) =
-        crate::layout_probe_get(&format!("jump-workspace-row-{workspace_idx}"))
-            .expect("the project's workspace row must paint above its tabs");
-    assert!(
-        outer_y - (workspace_y + workspace_h) >= 8.0,
-        "tabs need visible breathing room after workspaces"
-    );
-    for tab in ["waiting", "working", "all", "archived"] {
-        let label = format!("jump-agent-tab-{}-{tab}", pid.0);
-        let (x, y, w, h) = crate::layout_probe_get(&label)
-            .unwrap_or_else(|| panic!("the per-project {tab} tab must paint"));
-        assert!(
-            x >= outer_x
-                && y >= outer_y
-                && x + w <= outer_x + outer_w
-                && y + h <= outer_y + outer_h,
-            "the {tab} tab must sit inside the shared segmented-control boundary"
-        );
-    }
-    crate::layout_probe_end();
+    let _workspace_idx = workspace_idx;
 
     let labels = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
         view.update(vcx, |v, cx| {
@@ -12323,10 +12296,13 @@ fn jump_panel_session_rows_paint_provider_ownership_marks(cx: &mut TestAppContex
     crate::layout_probe_end();
 }
 
-/// UXI-JumpPanel-15: the four agent tabs paint as a bounded 2×2 control,
-/// Waiting / Working above All / Archived.
+/// UXI-JumpPanel-32: expanded project content paints directly, without the
+/// former Waiting / Working / All / Archived widget.
+///
+/// Negative control: restoring the segmented-control render block makes the
+/// former tab-group probe present and fails this guard.
 #[gpui::test]
-fn jump_agent_tabs_paint_as_two_by_two_grid(cx: &mut TestAppContext) {
+fn jump_agent_state_widget_does_not_paint(cx: &mut TestAppContext) {
     let (view, vcx) = boot_browser(cx);
     let pid = view.update(vcx, |v, _| {
         v.workspace.active_workspace().expect("workspace").project()
@@ -12338,58 +12314,25 @@ fn jump_agent_tabs_paint_as_two_by_two_grid(cx: &mut TestAppContext) {
         vcx.run_until_parked();
     }
 
-    let bounds = |tab: &str| {
-        crate::layout_probe_get(&format!("jump-agent-tab-{}-{tab}", pid.0))
-            .unwrap_or_else(|| panic!("the {tab} tab must paint"))
-    };
-    let waiting = bounds("waiting");
-    let working = bounds("working");
-    let all = bounds("all");
-    let archived = bounds("archived");
-    let outer = crate::layout_probe_get(&format!("jump-agent-tabs-{}", pid.0))
-        .expect("the shared tab control must paint");
-    crate::layout_probe_end();
-
-    let same_row = |a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)| {
-        (a.1 - b.1).abs() < 1.0 && (a.3 - b.3).abs() < 1.0
-    };
     assert!(
-        same_row(waiting, working),
-        "Waiting and Working must share the first row"
+        crate::layout_probe_get(&format!("jump-workspace-group-0")).is_some(),
+        "project content must paint, making widget absence non-vacuous"
     );
     assert!(
-        same_row(all, archived),
-        "All and Archived must share the second row"
+        crate::layout_probe_get(&format!("jump-agent-tabs-{}", pid.0)).is_none(),
+        "the retired agent-state widget must not paint"
     );
-    assert!(
-        all.1 >= waiting.1 + waiting.3,
-        "All / Archived must paint below Waiting / Working"
-    );
-    assert!(
-        (waiting.0 - all.0).abs() < 1.0
-            && (working.0 - archived.0).abs() < 1.0
-            && (waiting.2 - all.2).abs() < 1.0
-            && (working.2 - archived.2).abs() < 1.0,
-        "the two rows must align into two equal columns"
-    );
-    for (label, (x, y, w, h)) in [
-        ("Waiting", waiting),
-        ("Working", working),
-        ("All", all),
-        ("Archived", archived),
-    ] {
+    for tab in ["waiting", "working", "all", "archived"] {
         assert!(
-            x >= outer.0
-                && y >= outer.1
-                && x + w <= outer.0 + outer.2
-                && y + h <= outer.1 + outer.3,
-            "{label} must stay inside the shared tab-control boundary"
+            crate::layout_probe_get(&format!("jump-agent-tab-{}-{tab}", pid.0)).is_none(),
+            "the retired {tab} target must not paint"
         );
     }
+    crate::layout_probe_end();
 }
 
-/// UXI-JumpPanel-17: Waiting and Working expose their live project totals in
-/// the painted tab strip, including when one side reaches zero.
+/// UXI-JumpPanel-17/32: live totals remain correctly derived for compatibility
+/// consumers even though their retired count badges do not paint.
 #[gpui::test]
 fn jump_waiting_working_tabs_paint_live_counts(cx: &mut TestAppContext) {
     use yalda::session_proto::SessionInfo;
@@ -12453,25 +12396,6 @@ fn jump_waiting_working_tabs_paint_live_counts(cx: &mut TestAppContext) {
         "archived and unavailable sessions contribute to neither live total"
     );
 
-    crate::layout_probe_begin();
-    for _ in 0..3 {
-        view.update(vcx, |_, cx| cx.notify());
-        vcx.run_until_parked();
-    }
-    for tab in ["waiting", "working"] {
-        let tab_bounds = crate::layout_probe_get(&format!("jump-agent-tab-{}-{tab}", pid.0))
-            .expect("the counted tab must paint");
-        let (x, y, w, h) =
-            crate::layout_probe_get(&format!("jump-agent-tab-count-{}-{tab}", pid.0))
-                .unwrap_or_else(|| panic!("the {tab} tab's live total must paint"));
-        let (tab_x, tab_y, tab_w, tab_h) = tab_bounds;
-        assert!(
-            x >= tab_x && y >= tab_y && x + w <= tab_x + tab_w && y + h <= tab_y + tab_h,
-            "the {tab} total must stay inside its tab target"
-        );
-    }
-    crate::layout_probe_end();
-
     view.update(vcx, |v, _| {
         v.agent_roster.set_busy("count-work", false);
     });
@@ -12481,16 +12405,7 @@ fn jump_waiting_working_tabs_paint_live_counts(cx: &mut TestAppContext) {
         "a live state change updates both derived totals"
     );
 
-    crate::layout_probe_begin();
-    for _ in 0..3 {
-        view.update(vcx, |_, cx| cx.notify());
-        vcx.run_until_parked();
-    }
-    assert!(
-        crate::layout_probe_get(&format!("jump-agent-tab-count-{}-working", pid.0)).is_some(),
-        "the Working indicator must remain painted when its value is zero"
-    );
-    crate::layout_probe_end();
+    assert_eq!(counts(&view, vcx), (3, 0));
 }
 
 /// UXI-JumpPanel-14: All is a headed stable partition of the durable custom
@@ -12688,17 +12603,17 @@ fn jump_session_archive_filters_tabs_palette_and_persists(cx: &mut TestAppContex
 }
 
 /// UXI-JumpPanel-16 controls: a real right-click on a painted session row opens
-/// the cursor menu, whose real painted item toggles the durable flag in both
-/// directions. The underlying archive dispatcher remains callable after
-/// UXI-Menu-8 removes archive from the intentionally small Agent menu.
+/// the cursor menu, whose real painted item archives through the durable path.
+/// An archived session is unarchived from its reopened local session action now
+/// that UXI-JumpPanel-32 removes the Archived browsing tab.
 #[gpui::test]
 fn jump_session_archive_controls_toggle_the_same_durable_flag(cx: &mut TestAppContext) {
-    use crate::{JumpAgentTab, JumpTarget};
+    use crate::JumpTarget;
     use gpui::{Modifiers, MouseButton};
     use yalda::session_proto::SessionInfo;
     let (view, vcx) = boot_browser(cx);
     install_agent_slot(&view, vcx, Some("S-menu"));
-    let pid = view.update(vcx, |v, _| {
+    view.update(vcx, |v, _| {
         let pid = v.workspace.active_workspace().expect("workspace").project();
         let cwd = v.projects.cwd_of(pid).expect("project cwd").to_path_buf();
         v.agent_roster.upsert(SessionInfo {
@@ -12713,7 +12628,6 @@ fn jump_session_archive_controls_toggle_the_same_durable_flag(cx: &mut TestAppCo
             busy: false,
             archived: false,
         });
-        pid
     });
     vcx.run_until_parked();
 
@@ -12755,16 +12669,21 @@ fn jump_session_archive_controls_toggle_the_same_durable_flag(cx: &mut TestAppCo
     click_context_toggle(&view, vcx);
     assert!(view.read_with(vcx, |v, _| v.jump_archived_sessions.contains("S-menu")));
 
-    // Archived row → right click → Unarchive.
+    // Archived sessions no longer have a Jump-only browsing tab
+    // (UXI-JumpPanel-32). Reopen the still-live local transcript and use its
+    // contextual session action to unarchive.
     view.update(vcx, |v, cx| {
-        v.select_jump_agent_tab(pid, JumpAgentTab::Archived, cx)
+        let id = v
+            .sessions
+            .locate(&ServerSid::new("S-menu"))
+            .expect("archived session remains open locally");
+        v.jump_to_agent(JumpTarget::Local(id), cx);
     });
-    let at = row_center(&view, vcx);
-    vcx.simulate_mouse_move(at, None, Modifiers::default());
-    vcx.simulate_mouse_down(at, MouseButton::Right, Modifiers::default());
-    vcx.simulate_mouse_up(at, MouseButton::Right, Modifiers::default());
-    vcx.run_until_parked();
-    click_context_toggle(&view, vcx);
+    view.update(vcx, |v, cx| v.open_local_menu_inner(cx));
+    view.update(vcx, |v, cx| {
+        v.clear_overlay();
+        v.dispatch_menu_command("unarchive-session", cx);
+    });
     assert!(!view.read_with(vcx, |v, _| v.jump_archived_sessions.contains("S-menu")));
 
     // Unarchiving does not silently reclaim a tile. Explicitly visit the
@@ -19084,12 +19003,20 @@ fn topic_popup_message_box_navigates_and_accepts_without_submit(cx: &mut TestApp
         v.read_session(id, cx, |c| {
             assert_eq!(
                 c.input_surface.compose().text(),
-                "ask projects/cog::roadmap"
+                "ask %projects/cog::"
             );
             assert!(
                 matches!(c.turn_phase, crate::TurnPhase::Idle),
                 "accepting a completion does not submit"
             );
+            assert!(!c.topic_popup_rows(&v.topic_completions).is_empty());
+        })
+        .unwrap();
+    });
+    key(&view, vcx, "enter");
+    view.read_with(vcx, |v, cx| {
+        v.read_session(id, cx, |c| {
+            assert_eq!(c.input_surface.compose().text(), "ask projects/cog::roadmap");
             assert!(c.topic_popup_rows(&v.topic_completions).is_empty());
         })
         .unwrap();
@@ -19148,7 +19075,7 @@ fn topic_popup_worksheet_accepts_and_paints(cx: &mut TestAppContext) {
         v.read_session(id, cx, |c| {
             assert_eq!(
                 c.input_surface.compose().text(),
-                "route projects/cog/mail::chat"
+                "route %projects/cog/mail::"
             );
             assert!(
                 matches!(c.turn_phase, crate::TurnPhase::Idle),

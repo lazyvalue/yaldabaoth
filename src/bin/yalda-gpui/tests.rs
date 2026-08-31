@@ -6484,7 +6484,8 @@ fn slash_query_and_popup_rows_filter() {
 
 /// UXI-AgentTile-43 (pure): Topic completion is caret-token-local, requires an
 /// explicit percent trigger, filters raw address prefixes deterministically,
-/// and replaces the whole trigger token while preserving surrounding text.
+/// and advances through one `/` or `::` boundary at a time while preserving
+/// surrounding text.
 #[test]
 fn topic_query_filters_and_replaces_caret_token() {
     use crate::agent::AgentState;
@@ -6528,11 +6529,18 @@ fn topic_query_filters_and_replaces_caret_token() {
     s.accept_topic_completion("projects/cog/mail::chat");
     assert_eq!(
         s.input_surface.compose().text(),
-        "ask projects/cog/mail::chat tomorrow",
-        "only the token under the caret is replaced",
+        "ask %projects/cog/ tomorrow",
+        "the first acceptance stops at the next path boundary",
     );
     let cursor = s.input_surface.compose().editor.cursor();
-    assert_eq!((cursor.line, cursor.col), (0, 27));
+    assert_eq!((cursor.line, cursor.col), (0, 18));
+    assert!(!s.topic_popup_dismissed, "a partial completion stays open");
+
+    s.accept_topic_completion("projects/cog/mail::chat");
+    assert_eq!(s.input_surface.compose().text(), "ask %projects/cog/mail:: tomorrow");
+    s.accept_topic_completion("projects/cog/mail::chat");
+    assert_eq!(s.input_surface.compose().text(), "ask projects/cog/mail::chat tomorrow");
+    assert!(s.topic_popup_dismissed, "the final segment closes the popup");
 
     s.input_surface.compose_mut().set_recalled("ordinary prose");
     assert!(s.topic_query().is_none(), "ordinary prose stays quiet");

@@ -311,7 +311,14 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
   produced the expected RED on the Working row. The full suite and all-bin build
   are green.
 
-- **Lay out Jump Panel agent tabs in two rows** — `DONE` (2026-07-28 via
+- **Remove the Jump Panel agent-state widget** — `DONE` (2026-08-30;
+  `UXI-JumpPanel-32`). Captured verbatim: *"remove the waiting/working/all/archived
+  widget on jump panel. it's ugly."* The sidebar always paints the ordinary All
+  projection and removes the segmented control plus counts; underlying activity
+  projections remain for Cmd-P and other non-panel consumers. The real paint
+  guard was observed RED with the old widget and GREEN after removal.
+
+- **Lay out Jump Panel agent tabs in two rows** — `SUPERSEDED` (2026-07-28 via
   `/new-ux`; extends `UXI-JumpPanel-15`). Captured verbatim: *"Tabs look
   crowded. Let's put Waiting and Working on one line, All and Archived on
   another line."* Every expanded project renders one bounded 2×2 tab control:

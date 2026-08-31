@@ -4297,27 +4297,45 @@ impl AgentState {
             .collect()
     }
 
-    /// Accept one Topic completion by replacing only the token under the caret,
-    /// preserving every surrounding character and placing the caret immediately
-    /// after the inserted raw address.
+    /// Advance one Topic completion through the next `/` or `::` boundary.
+    /// Partial completions retain the `%` trigger so another Tab can continue;
+    /// the final segment removes it and closes the popup.
     pub(crate) fn accept_topic_completion(&mut self, address: &str) {
         let Some(query) = self.topic_query() else {
             return;
+        };
+        let Some(remainder) = address.strip_prefix(&query.text) else {
+            return;
+        };
+        let slash = remainder.find('/').map(|idx| (idx, 1));
+        let binding = remainder.find("::").map(|idx| (idx, 2));
+        let boundary = match (slash, binding) {
+            (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        let complete = boundary.is_none();
+        let accepted = if let Some((idx, separator_len)) = boundary {
+            let end = query.text.len() + idx + separator_len;
+            format!("%{}", &address[..end])
+        } else {
+            address.to_string()
         };
         let text = self.input_surface.compose().text();
         let chars: Vec<char> = text.chars().collect();
         let mut replaced = String::new();
         replaced.extend(chars[..query.start].iter());
-        replaced.push_str(address);
+        replaced.push_str(&accepted);
         replaced.extend(chars[query.end..].iter());
-        let caret = query.start + address.chars().count();
+        let caret = query.start + accepted.chars().count();
         let compose = self.input_surface.compose_mut();
         compose.set_recalled(&replaced);
         let line = compose.editor.document().rope().char_to_line(caret);
         let line_start = compose.editor.document().rope().line_to_char(line);
         compose.editor.cursor_mut().line = line;
         compose.editor.cursor_mut().col = caret - line_start;
-        self.topic_popup_dismissed = true;
+        self.topic_popup_dismissed = complete;
         self.history_reset();
     }
 
