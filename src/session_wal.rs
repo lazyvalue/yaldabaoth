@@ -36,6 +36,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -120,18 +121,34 @@ pub enum PromptOutcome {
 ///   new `agent` records (carrying `turn`/`seq` per-event in the §2 envelope) with
 ///   the legacy variants kept for the additive rollout (spec §9).
 ///
-/// `recover_one` discards any header whose version != `WAL_VERSION` (no
-/// converter — locked decision), so pre-v3 logs are dropped and those sessions
-/// resume empty (re-load from the agent). This reuses the EXACT phase-4 v1→v2
-/// discard-on-read machinery: the `Header` is always the first record, so the
-/// version gate fires before any incompatible `Event` line reaches serde.
+/// Versions 1 through 3 remain readable. Both migrations were wire-level
+/// changes to records that either were never WAL-appended (v1→v2) or remain as
+/// legacy `Notification` variants (v2→v3), so dropping an older file would
+/// destroy recoverable data for no technical reason. Unknown future versions
+/// fail closed while leaving the original file untouched.
 const WAL_VERSION: u32 = 3;
+const MIN_READABLE_WAL_VERSION: u32 = 1;
 
 /// A live write handle to one session's WAL file. The session server's
 /// `ManagedSession` owns exactly one of these and is its only writer.
 pub struct SessionWal {
     file: File,
     path: PathBuf,
+}
+
+fn lock_writer(file: &File, path: &Path) -> std::io::Result<()> {
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(());
+    }
+    let source = std::io::Error::last_os_error();
+    Err(std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        format!(
+            "WAL {} already has a live writer; refusing concurrent access: {source}",
+            path.display()
+        ),
+    ))
 }
 
 impl SessionWal {
@@ -165,13 +182,14 @@ impl SessionWal {
     ) -> std::io::Result<SessionWal> {
         std::fs::create_dir_all(dir)?;
         let path = wal_path(dir, server_session_id);
-        // Truncate: a fresh session starts a fresh log. (A reused id would be a
-        // bug; truncating is the safe choice.)
+        // A session id collision must never overwrite durable history. UUID
+        // reuse is extraordinarily unlikely, but create-new makes the WAL's
+        // sacredness structural rather than probabilistic.
         let file = OpenOptions::new()
-            .create(true)
+            .create_new(true)
             .write(true)
-            .truncate(true)
             .open(&path)?;
+        lock_writer(&file, &path)?;
         let mut wal = SessionWal { file, path };
         let header = WalRecord::Header {
             version: WAL_VERSION,
@@ -190,6 +208,7 @@ impl SessionWal {
     /// session keeps logging to the same file.
     pub fn reopen(path: PathBuf) -> std::io::Result<SessionWal> {
         let file = OpenOptions::new().append(true).open(&path)?;
+        lock_writer(&file, &path)?;
         Ok(SessionWal { file, path })
     }
 
@@ -352,12 +371,44 @@ pub fn recover_each(dir: &Path, mut visit: impl FnMut(RecoveredSession)) {
     }
 }
 
+/// Strict production recovery. Unlike [`recover_each`], this never turns a WAL
+/// problem into a missing session: one unreadable, unsupported, headerless, or
+/// corrupt file fails the whole startup recovery while leaving every file
+/// untouched. A server must not advertise an incomplete roster as success.
+pub fn try_recover_each(
+    dir: &Path,
+    mut visit: impl FnMut(RecoveredSession) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let mut paths = entries
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    paths.sort();
+    for path in paths {
+        if path.extension().and_then(|extension| extension.to_str()) != Some("log") {
+            continue;
+        }
+        let session = recover_one(&path)?.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("WAL is empty or headerless: {}", path.display()),
+            )
+        })?;
+        visit(session)?;
+    }
+    Ok(())
+}
+
 /// Replay a single WAL file. Returns `Ok(None)` if the file has no valid
 /// header. A torn/partial final line (interrupted write on power loss) is
 /// skipped — that is the bounded data loss the contract permits.
 pub fn recover_one(path: &Path) -> std::io::Result<Option<RecoveredSession>> {
     let file = File::open(path)?;
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
 
     let mut header: Option<(String, String, PathBuf, PermissionMode, AgentProvider)> = None;
     let mut event_log: Vec<Notification> = Vec::new();
@@ -372,21 +423,31 @@ pub fn recover_one(path: &Path) -> std::io::Result<Option<RecoveredSession>> {
     let mut prompt_terminal = std::collections::HashSet::new();
     let mut max_prompt_id: Option<u64> = None;
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            // An I/O error mid-file (e.g. a torn final line on power loss):
-            // stop replaying here, keep what we have.
-            Err(_) => break,
-        };
-        if line.trim().is_empty() {
+    let mut line_number = 0usize;
+    loop {
+        let mut bytes = Vec::new();
+        let read = reader.read_until(b'\n', &mut bytes)?;
+        if read == 0 {
+            break;
+        }
+        line_number += 1;
+        let terminated = bytes.last() == Some(&b'\n');
+        if bytes.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let rec: WalRecord = match serde_json::from_str(&line) {
+        let rec: WalRecord = match serde_json::from_slice(&bytes) {
             Ok(r) => r,
-            // A partial/corrupt line (almost always the last, torn by a crash
-            // mid-write): skip it. Earlier lines already parsed are intact.
-            Err(_) => continue,
+            // Only an unterminated malformed final record is a tolerable torn
+            // write. A newline-terminated malformed record is durable interior
+            // corruption and must fail visibly instead of silently punching a
+            // hole in the transcript.
+            Err(_) if !terminated => break,
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("malformed WAL record at line {line_number}: {error}"),
+                ));
+            }
         };
         match rec {
             WalRecord::Header {
@@ -397,24 +458,14 @@ pub fn recover_one(path: &Path) -> std::io::Result<Option<RecoveredSession>> {
                 permission_mode,
                 provider,
             } => {
-                // Version gate: a header from any prior schema is discarded
-                // wholesale — the session resumes empty and re-loads from the
-                // live agent on the next attach (locked decision: no converter).
-                // This validates the v1/v2 → v3 discard: an older log can carry
-                // Event variants that the current `Notification` enum no longer
-                // deserializes, so loading it line-by-line would silently drop
-                // them; discarding at the header (always the FIRST record) avoids
-                // a half-parsed log. (The retired `owner_changed`/`lease_changed`
-                // control notes were broadcast-only and never appended to the
-                // event_log, so the gate is NOT what keeps them out — they simply
-                // were never WAL records.)
-                if version != WAL_VERSION {
-                    eprintln!(
-                        "[session-wal] discarding pre-v{WAL_VERSION} WAL {} (version {version}); \
-                         session resumes empty",
-                        path.display()
-                    );
-                    return Ok(None);
+                if !(MIN_READABLE_WAL_VERSION..=WAL_VERSION).contains(&version) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "unsupported WAL version {version} at line {line_number}; \
+                             supported versions are {MIN_READABLE_WAL_VERSION}..={WAL_VERSION}"
+                        ),
+                    ));
                 }
                 header = Some((server_session_id, label, cwd, permission_mode, provider));
             }
@@ -682,6 +733,163 @@ mod tests {
     }
 
     #[test]
+    fn recovery_is_byte_preserving_and_repeatable() {
+        let dir = tmp_dir("read-only-repeatable");
+        let path = {
+            let mut wal = SessionWal::create(
+                &dir,
+                "s-repeat",
+                "l",
+                Path::new("/tmp"),
+                PermissionMode::Yolo,
+            )
+            .unwrap();
+            wal.append(&attached("acp-repeat"), false).unwrap();
+            wal.append(&chunk("one"), false).unwrap();
+            wal.append(&chunk("two"), true).unwrap();
+            wal.path().to_path_buf()
+        };
+        let before = std::fs::read(&path).unwrap();
+        let first = recover_one(&path).unwrap().unwrap();
+        let second = recover_one(&path).unwrap().unwrap();
+        assert_eq!(first.event_log.len(), 3);
+        assert_eq!(second.event_log.len(), first.event_log.len());
+        assert_eq!(second.server_session_id, first.server_session_id);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "recovery must never rewrite, migrate in place, or truncate the WAL"
+        );
+    }
+
+    #[test]
+    fn create_collision_refuses_without_changing_existing_wal() {
+        let dir = tmp_dir("collision");
+        let path = {
+            let mut wal = SessionWal::create(
+                &dir,
+                "same-id",
+                "first",
+                Path::new("/tmp"),
+                PermissionMode::Yolo,
+            )
+            .unwrap();
+            wal.append(&chunk("irreplaceable"), true).unwrap();
+            wal.path().to_path_buf()
+        };
+        let before = std::fs::read(&path).unwrap();
+        let error = match SessionWal::create(
+            &dir,
+            "same-id",
+            "replacement",
+            Path::new("/tmp"),
+            PermissionMode::ReadOnly,
+        ) {
+            Ok(_) => panic!("an existing WAL identity must make fresh creation fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let recovered = recover_one(&path).unwrap().unwrap();
+        assert_eq!(recovered.label, "first");
+        assert_eq!(recovered.event_log.len(), 1);
+    }
+
+    #[test]
+    fn second_live_writer_is_refused_without_changing_wal() {
+        let dir = tmp_dir("exclusive-writer");
+        let mut owner = SessionWal::create(
+            &dir,
+            "owned",
+            "owner",
+            Path::new("/tmp"),
+            PermissionMode::Yolo,
+        )
+        .unwrap();
+        owner.append(&chunk("before"), true).unwrap();
+        let path = owner.path().to_path_buf();
+        let before = std::fs::read(&path).unwrap();
+
+        let error = match SessionWal::reopen(path.clone()) {
+            Ok(_) => panic!("a second live WAL writer must be refused"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        drop(owner);
+        SessionWal::reopen(path).expect("the lease must release when its owner drops");
+    }
+
+    #[test]
+    fn malformed_interior_record_fails_visibly_without_mutating_wal() {
+        let dir = tmp_dir("interior-corruption");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = wal_path(&dir, "corrupt");
+        let bytes = concat!(
+            r#"{"t":"header","version":3,"server_session_id":"corrupt","label":"l","cwd":"/tmp","permission_mode":"Yolo"}"#,
+            "\n",
+            "{definitely not json}\n",
+            r#"{"t":"event","type":"user_prompt","session_id":"corrupt","text":"must not skip over corruption"}"#,
+            "\n",
+        )
+        .as_bytes()
+        .to_vec();
+        std::fs::write(&path, &bytes).unwrap();
+
+        let error = recover_one(&path).expect_err("interior corruption must not be skipped");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("line 2"));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn future_version_fails_closed_without_mutating_wal() {
+        let dir = tmp_dir("future-version");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = wal_path(&dir, "future");
+        let bytes = format!(
+            "{{\"t\":\"header\",\"version\":{},\"server_session_id\":\"future\",\"label\":\"l\",\"cwd\":\"/tmp\",\"permission_mode\":\"Yolo\"}}\n",
+            WAL_VERSION + 1
+        )
+        .into_bytes();
+        std::fs::write(&path, &bytes).unwrap();
+
+        let error = recover_one(&path).expect_err("future WAL must fail visibly");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("unsupported WAL version"));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn strict_recovery_refuses_an_incomplete_roster() {
+        let dir = tmp_dir("strict-roster");
+        std::fs::create_dir_all(&dir).unwrap();
+        let corrupt_path = wal_path(&dir, "00-corrupt");
+        let corrupt = b"not a WAL\n".to_vec();
+        std::fs::write(&corrupt_path, &corrupt).unwrap();
+        SessionWal::create(
+            &dir,
+            "99-valid",
+            "must not publish alone",
+            Path::new("/tmp"),
+            PermissionMode::Yolo,
+        )
+        .unwrap();
+
+        let mut published = Vec::new();
+        let error = try_recover_each(&dir, |session| {
+            published.push(session.server_session_id);
+            Ok(())
+        })
+        .expect_err("one bad WAL must abort the complete roster recovery");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(published.is_empty(), "no partial roster may be advertised");
+        assert_eq!(std::fs::read(&corrupt_path).unwrap(), corrupt);
+        assert!(wal_path(&dir, "99-valid").exists());
+    }
+
+    #[test]
     fn reopen_appends_to_existing() {
         let dir = tmp_dir("reopen");
         let path = {
@@ -726,76 +934,51 @@ mod tests {
     }
 
     #[test]
-    fn v1_wal_is_discarded_on_read() {
-        // Hand-write a pre-v3 (version:1) log with a header + a couple events,
-        // including the retired `owner_changed` control line. The current reader
-        // must discard the whole file (Ok(None)) and not crash.
-        let dir = tmp_dir("v1discard");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = wal_path(&dir, "old1");
-        let mut f = std::fs::File::create(&path).unwrap();
-        writeln!(
-            f,
-            r#"{{"t":"header","version":1,"server_session_id":"old1","label":"l","cwd":"/tmp","permission_mode":"yolo"}}"#
-        )
-        .unwrap();
-        writeln!(
-            f,
-            r#"{{"t":"event","type":"owner_changed","session_id":"old1","has_owner":true}}"#
-        )
-        .unwrap();
-        writeln!(
-            f,
-            r#"{{"t":"event","type":"user_prompt","session_id":"old1","text":"hi"}}"#
-        )
-        .unwrap();
-        drop(f);
+    fn historical_wals_preserve_session_identity_and_every_decodable_event() {
+        for version in [1, 2] {
+            let dir = tmp_dir(&format!("v{version}-preserved"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let sid = format!("old-v{version}");
+            let path = wal_path(&dir, &sid);
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(
+                f,
+                r#"{{"t":"header","version":{version},"server_session_id":"{sid}","label":"historical","cwd":"/tmp","permission_mode":"Yolo"}}"#
+            )
+            .unwrap();
+            writeln!(
+                f,
+                r#"{{"t":"event","type":"session_attached","session_id":"{sid}","acp_session_id":"acp-{version}"}}"#
+            )
+            .unwrap();
+            writeln!(
+                f,
+                r#"{{"t":"event","type":"user_prompt","session_id":"{sid}","text":"preserve me"}}"#
+            )
+            .unwrap();
+            writeln!(
+                f,
+                r#"{{"t":"event","type":"reply_event","session_id":"{sid}","event":{{"Chunk":"complete history"}}}}"#
+            )
+            .unwrap();
+            drop(f);
 
-        let one = recover_one(&path).expect("recover_one must not error on a v1 log");
-        assert!(one.is_none(), "v1 log must be discarded (Ok(None))");
-        assert!(
-            recover_all(&dir).is_empty(),
-            "discarded v1 session must be absent from recovery"
-        );
-
-        // A fresh v3 create→append→recover round-trip still works afterward.
-        {
-            let mut wal =
-                SessionWal::create(&dir, "new3", "l", Path::new("/tmp"), PermissionMode::Yolo)
-                    .unwrap();
-            wal.append(&attached("acp-v3"), false).unwrap();
-            wal.append(&turn_ended(1), true).unwrap();
+            let one = recover_one(&path)
+                .unwrap_or_else(|error| panic!("v{version} recovery failed: {error}"))
+                .unwrap_or_else(|| panic!("v{version} session was discarded"));
+            assert_eq!(one.server_session_id, sid);
+            assert_eq!(one.label, "historical");
+            assert_eq!(
+                one.acp_session_id.as_deref(),
+                Some(&*format!("acp-{version}"))
+            );
+            assert_eq!(
+                one.event_log.len(),
+                3,
+                "v{version} recovery must retain every decodable event"
+            );
+            assert_eq!(recover_all(&dir).len(), 1);
         }
-        let recovered = recover_all(&dir);
-        assert_eq!(recovered.len(), 1, "v3 session must recover normally");
-        assert_eq!(recovered[0].server_session_id, "new3");
-    }
-
-    /// Phase-8 Stage A: a pre-v3 (version:2) log — which may carry a legacy
-    /// `reply_event` line that the post-collapse reader still understands but
-    /// whose schema is nonetheless retired — is discarded wholesale by the
-    /// version gate before any Event line is parsed (mirrors `v1_wal_is_...`).
-    #[test]
-    fn v2_wal_is_discarded_on_read() {
-        let dir = tmp_dir("v2discard");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = wal_path(&dir, "old2");
-        let mut f = std::fs::File::create(&path).unwrap();
-        writeln!(
-            f,
-            r#"{{"t":"header","version":2,"server_session_id":"old2","label":"l","cwd":"/tmp","permission_mode":"yolo"}}"#
-        )
-        .unwrap();
-        writeln!(
-            f,
-            r#"{{"t":"event","type":"reply_event","session_id":"old2","event":{{"Chunk":"hi"}}}}"#
-        )
-        .unwrap();
-        drop(f);
-
-        let one = recover_one(&path).expect("recover_one must not error on a v2 log");
-        assert!(one.is_none(), "v2 log must be discarded (Ok(None))");
-        assert!(recover_all(&dir).is_empty());
     }
 
     /// Phase-8 Stage A: a v3 log persists the `Agent { AgentEvent }` record and

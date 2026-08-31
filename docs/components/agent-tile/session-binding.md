@@ -337,3 +337,55 @@ commands ambiguous.
 tiles across both domains, tag migration, archive-to-Unbound, and duplicate-sid
 restore rejection. Real Cmd-P, bind, unbind, archive-menu, and jump-row paths
 exercise the production handlers (Cog graph `9k2`).
+
+### UXI-AgentTile-44 — The session WAL is sacred across every restart boundary
+
+**Statement.** A GUI restart, session-server restart or crash, agent-process
+restart, self-rebuild, supervision handoff, or binary upgrade must never discard
+a recognized session or omit any valid durable WAL record from its first replay.
+Restart recovery begins at the WAL's durable base and publishes every decoded
+event in append order for active and archived sessions alike. The live
+ring-buffer cap is not a license to compact history before the first attach.
+
+Known historical WAL versions are read compatibly. An unknown future version,
+an unreadable/headerless file, or malformed interior record is a visible
+per-session recovery failure: the original file remains byte-for-byte untouched
+and Yalda must not create a replacement session at the same identity. The sole
+bounded exception is an unterminated malformed final line from a torn write; the
+complete durable prefix before it is recovered and the file is retained.
+
+Creating a session must use create-new semantics and refuse an existing WAL
+path; it must never truncate or overwrite an existing identity. Recovery is
+read-only and repeatable. Manual repair backups are never silently merged with
+or substituted for an active WAL because divergent histories require an
+explicit, separately verified operator choice.
+
+Server ownership is an OS lifetime lease acquired before socket inspection or
+removal, WAL recovery, and agent spawn. Socket existence, PID text, and a trial
+connection are not ownership primitives. Every live WAL handle independently
+holds an exclusive writer lock. A competing server or writer fails closed
+without unlinking the owner's socket, publishing a roster, resuming an agent,
+or appending a byte.
+
+**Applies to.** `session_wal.rs`: WAL creation, version compatibility, parsing,
+and recovery; `yalda-session-server/main.rs`: startup restoration, replay
+publication, restart/respawn transitions, archive/unarchive, and close ordering;
+`launchd.rs` and GPUI restart/self-rebuild entry points insofar as they rely on
+the same server recovery contract.
+
+**Why.** A session transcript and its resume identity are irrecoverable working
+memory. Provider-side `session/load`, a summary marker, or a backup copy is not
+equivalent to the exact Yalda WAL. Restart is an implementation boundary and
+must be observationally lossless for durable state.
+
+**Status.** `implemented` (bug-0064, Cog graph `xtt`).
+
+**Enforcement.** Historical v1/v2 fixtures, current v3 round trips, oversized
+active/archived complete-replay guards, byte-immutability and repeat-recovery
+checks, collision refusal, torn-tail versus interior-corruption tests,
+unknown-version preservation, real server-start roster recovery, negative
+controls for the former version gate and startup compaction, mutation testing,
+real competing-server socket-inode preservation, concurrent-writer refusal,
+full relevant suites, and a release build. All fixtures are hermetic;
+verification must not restart a live Yalda process or read/write the user's live
+WAL contents.

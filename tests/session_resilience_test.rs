@@ -23,6 +23,7 @@
 //! these tests pin down that it is NOT the bare socket path.
 
 use std::path::PathBuf;
+use std::os::unix::fs::MetadataExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -151,6 +152,7 @@ impl Drop for TestServer {
         // Clean up durable state (WAL dir + any state file) colocated with the
         // socket so repeated runs don't accumulate.
         let _ = std::fs::remove_file(self.socket.with_extension("state.json"));
+        let _ = std::fs::remove_file(self.socket.with_extension("pid"));
         let _ = std::fs::remove_dir_all(self.socket.with_extension("wal"));
         // Leave the log on disk for post-mortem if a test failed; temp dir is
         // cleaned by the OS. (Removing here would hide failures.)
@@ -175,6 +177,37 @@ fn serial_lock() -> std::sync::MutexGuard<'static, ()> {
 
 fn drain_log_lines(log: &str) -> Vec<String> {
     log.lines().map(|l| l.to_string()).collect()
+}
+
+#[test]
+fn competing_server_cannot_steal_socket_or_touch_owner_state() {
+    let _g = serial_lock();
+    let server = TestServer::start();
+    server.activate_env();
+
+    let socket_before = std::fs::metadata(&server.socket)
+        .expect("owner socket metadata")
+        .ino();
+    let bin = env!("CARGO_BIN_EXE_yalda-session-server");
+    let output = Command::new(bin)
+        .env("YALDA_SESSION_SOCKET", &server.socket)
+        .env("YALDA_ACP_AGENT", "/usr/bin/false")
+        .env("YALDA_CONFIG", "/nonexistent/yalda-test-config.kdl")
+        .output()
+        .expect("launch competing server");
+    assert!(output.status.success(), "loser should exit cleanly: {output:?}");
+    let loser_log = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        loser_log.contains("owns the lifetime lease"),
+        "loser did not refuse at the lifetime lease: {loser_log}"
+    );
+
+    let socket_after = std::fs::metadata(&server.socket)
+        .expect("competing server must not unlink owner socket")
+        .ino();
+    assert_eq!(socket_after, socket_before, "owner socket inode was replaced");
+    let client = connect_as("still-owner");
+    client.list_sessions().expect("original owner still serves requests");
 }
 
 /// Drain server notifications into a `Vec` until `done(accumulated)` holds or
@@ -414,14 +447,15 @@ fn second_server_does_not_steal_socket() {
         "intruder server exited non-zero: {status:?}"
     );
 
-    // The intruder's stderr should say it deferred to the running server.
+    // The intruder's stderr should say it failed at the lifetime lease, before
+    // it could inspect/unlink the socket or touch WAL/agent state.
     let mut err = String::new();
     if let Some(mut e) = intruder.stderr.take() {
         use std::io::Read;
         let _ = e.read_to_string(&mut err);
     }
     assert!(
-        err.contains("already listening"),
+        err.contains("owns the lifetime lease"),
         "intruder should report deferring to the live server; stderr:\n{err}"
     );
 
@@ -770,12 +804,11 @@ fn admin_prompt_works_with_no_client_attached() {
         .expect("admin_prompt still works after a client attaches");
 }
 
-/// WAL v1 discard on startup: pre-seed the WAL dir with a hand-written v1 log
-/// (header version:1 + an old owner_changed event), start the v2 server → the
-/// stale session is absent from recovery (resumes empty) and the server does not
-/// crash on the stale log.
+/// Upgrade boundary: pre-seed the WAL dir with a hand-written v1 log, start the
+/// current server, and prove the production startup path retains the durable
+/// session identity instead of silently discarding it.
 #[test]
-fn v1_wal_discarded_on_server_start() {
+fn v1_wal_session_survives_server_upgrade() {
     let _g = serial_lock();
     // Build the socket + WAL dir paths the way TestServer would, but seed the
     // WAL dir BEFORE the server starts.
@@ -791,9 +824,7 @@ fn v1_wal_discarded_on_server_start() {
     std::fs::write(
         &stale,
         concat!(
-            r#"{"t":"header","version":1,"server_session_id":"stale-session","label":"old","cwd":"/tmp","permission_mode":"yolo"}"#,
-            "\n",
-            r#"{"t":"event","type":"owner_changed","session_id":"stale-session","has_owner":true}"#,
+            r#"{"t":"header","version":1,"server_session_id":"stale-session","label":"old","cwd":"/tmp","permission_mode":"Yolo"}"#,
             "\n",
             r#"{"t":"event","type":"session_attached","session_id":"stale-session","acp_session_id":"acp-old"}"#,
             "\n",
@@ -817,7 +848,7 @@ fn v1_wal_discarded_on_server_start() {
         .spawn()
         .expect("spawn server");
 
-    // Wait for socket, then assert the stale session was NOT recovered.
+    // Wait for socket, then assert the historical session was recovered.
     let deadline = Instant::now() + Duration::from_secs(10);
     while std::os::unix::net::UnixStream::connect(&socket).is_err() {
         if Instant::now() > deadline {
@@ -828,10 +859,11 @@ fn v1_wal_discarded_on_server_start() {
     }
     let client = SessionServerClient::connect().expect("connect");
     let sessions = client.list_sessions().expect("list");
-    assert!(
-        !sessions.iter().any(|s| s.session_id == "stale-session"),
-        "v1 WAL session must be discarded (absent from recovery); sessions={sessions:?}"
-    );
+    let recovered = sessions
+        .iter()
+        .find(|s| s.session_id == "stale-session")
+        .unwrap_or_else(|| panic!("v1 WAL session vanished during upgrade; sessions={sessions:?}"));
+    assert_eq!(recovered.acp_session_id.as_deref(), Some("acp-old"));
 
     // Cleanup.
     drop(client);

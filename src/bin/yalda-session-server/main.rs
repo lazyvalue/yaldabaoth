@@ -11,7 +11,9 @@
 //! The GUI auto-launches this binary if not already running.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::io;
+use std::fs::OpenOptions;
+use std::io::{self, Seek, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -534,19 +536,19 @@ fn compact_event_log(
     Some(trim.dropped)
 }
 
-/// Rebuild and immediately bound one WAL transcript.  Keeping construction and
-/// compaction behind one function makes it impossible for recovery callers to
-/// accidentally publish the raw, unbounded `Vec` again.
+/// Rebuild a WAL transcript without dropping its durable prefix.
+///
+/// Restart recovery is a fidelity boundary, not a steady-state memory policy:
+/// every valid WAL event must be available to the first attaching client. Live
+/// appends may compact only after subscribers have advanced their floors, but
+/// startup must never replace durable history with a synthetic summary.
 fn event_log_from_recovery(
     entries: Vec<Notification>,
-    session_id: &str,
-    generation: u64,
-    cap: usize,
+    _session_id: &str,
+    _generation: u64,
+    _cap: usize,
 ) -> (yalda::event_log::EventLog, usize) {
-    let mut event_log = yalda::event_log::EventLog::from_recovered(entries, 0);
-    let dropped =
-        compact_event_log(&mut event_log, session_id, generation, cap, u64::MAX).unwrap_or(0);
-    (event_log, dropped)
+    (yalda::event_log::EventLog::from_recovered(entries, 0), 0)
 }
 
 impl ManagedSession {
@@ -1329,41 +1331,33 @@ impl SessionManager {
 /// into the actor). Runs once at startup before accepting connections.
 fn restore_seed_from_disk(
     bridge_tx: Option<BridgeTx>,
-) -> (HashMap<ServerSessionId, ManagedSession>, Vec<ResumeJob>) {
+) -> io::Result<(HashMap<ServerSessionId, ManagedSession>, Vec<ResumeJob>)> {
     let mut sessions = HashMap::new();
     let mut jobs = Vec::new();
     let Some(dir) = session_wal_dir() else {
-        return (sessions, jobs);
+        return Ok((sessions, jobs));
     };
-    yalda::session_wal::recover_each(&dir, |rs| {
+    yalda::session_wal::try_recover_each(&dir, |rs| {
         let sid = rs.server_session_id.clone();
         let acp_session_id = rs.acp_session_id.clone();
         let wal = if rs.archived {
             None
         } else {
-            match yalda::session_wal::SessionWal::reopen(rs.path.clone()) {
-                Ok(w) => Some(w),
-                Err(e) => {
-                    tracing::error!(
-                        session_id = %&sid[..8.min(sid.len())],
-                        error = %e,
-                        "WAL reopen failed"
-                    );
-                    None
-                }
-            }
+            Some(yalda::session_wal::SessionWal::reopen(rs.path.clone()).map_err(
+                |error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!("could not reopen WAL for session {sid}: {error}"),
+                    )
+                },
+            )?)
         };
 
         let (channel_generation, agent_seq) = recovered_stream_position(&rs.event_log);
-        // Stage B: recovery always starts from `log_base == 0` — the on-disk WAL
-        // is never trimmed, so the restored transcript is a faithful append-
-        // ordered prefix from seq 0 (spec §6 / ringbuffer note: on restart
-        // log_base resets to the seq of the first recovered event, which is 0).
-        // Recovery previously exposed the entire WAL image until the first live
-        // append.  A fast GUI attach could install a floor at seq 0 first,
-        // preventing the trim and replaying hundreds of thousands of events.
-        // Compact while there are no subscribers, before the watch/actor/accept
-        // loop can publish this session.  The durable WAL remains untouched.
+        // Restart fidelity is absolute: expose the complete durable WAL image
+        // to the first client. `log_base == 0`, so every persisted event keeps
+        // its append-order position. Steady-state compaction resumes only after
+        // attached clients have consumed this recovered prefix.
         let (event_log, recovered_dropped) =
             event_log_from_recovery(rs.event_log, &sid, 0, yalda::event_log::event_log_cap());
         // Seed the watch with the recovered log so the first tail sees history.
@@ -1439,8 +1433,9 @@ fn restore_seed_from_disk(
                 expected_generation: channel_generation,
             });
         }
-    });
-    (sessions, jobs)
+        Ok(())
+    })?;
+    Ok((sessions, jobs))
 }
 
 /// Spawn the OS thread that re-spawns a recovered session's ACP subprocess with
@@ -3918,6 +3913,38 @@ async fn main() -> io::Result<()> {
     let socket_path = socket_path();
     let pid_path = pid_file_path();
 
+    // Acquire an OS-enforced lifetime lease before inspecting or unlinking the
+    // socket and, critically, before opening WALs or spawning agents. Socket
+    // existence is not a lock: a concurrent launcher can observe a transient
+    // connect failure, unlink the live owner's pathname, and become a second
+    // WAL writer. Keep this descriptor alive for the entire process. The lock
+    // file itself is deliberately persistent so ownership cannot jump to a new
+    // inode during shutdown cleanup.
+    let mut server_lease = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&pid_path)?;
+    let lease_result = unsafe {
+        libc::flock(
+            server_lease.as_raw_fd(),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+    };
+    if lease_result != 0 {
+        let error = io::Error::last_os_error();
+        tracing::warn!(
+            %error,
+            lease = %pid_path.display(),
+            "another session server owns the lifetime lease; refusing to touch socket, WALs, or agents"
+        );
+        return Ok(());
+    }
+    server_lease.set_len(0)?;
+    server_lease.rewind()?;
+    write!(server_lease, "{}\n", std::process::id())?;
+    server_lease.sync_data()?;
+
     // Single-instance guard. If a server is ALREADY listening on this socket,
     // exit cleanly instead of removing the socket and re-binding — which would
     // silently steal it from the live server and orphan every session that
@@ -3951,9 +3978,6 @@ async fn main() -> io::Result<()> {
     unsafe { libc::umask(prev_umask) };
     let listener = bind_result?;
     let _ = std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600));
-
-    // Write PID file.
-    let _ = std::fs::write(&pid_path, std::process::id().to_string());
 
     tracing::info!("listening on {}", socket_path.display());
 
@@ -3991,7 +4015,7 @@ async fn main() -> io::Result<()> {
     // precede the accept loop). The seed map is moved into the actor; the resume
     // jobs spawn workers that re-spawn ACP subprocesses and post `PublishChannel`
     // back into the actor once it's running.
-    let (seed_sessions, resume_jobs) = restore_seed_from_disk(session_bridge_tx.clone());
+    let (seed_sessions, resume_jobs) = restore_seed_from_disk(session_bridge_tx.clone())?;
 
     // Spawn the single-writer manager actor: it OWNS the sessions map and drains
     // the inlet (external requests, spawn-worker publishes, pump-sourced records)
@@ -4029,7 +4053,6 @@ async fn main() -> io::Result<()> {
     // Listen for both SIGINT (Ctrl-C) and SIGTERM (kill / process manager).
     let mgr_shutdown = Arc::clone(&manager);
     let socket_path_cleanup = socket_path.clone();
-    let pid_path_cleanup = pid_path.clone();
     tokio::spawn(async move {
         let ctrl_c = tokio::signal::ctrl_c();
         #[cfg(unix)]
@@ -4056,7 +4079,6 @@ async fn main() -> io::Result<()> {
         let _ = &mgr_shutdown;
         tracing::info!("shutting down (WALs are durable)");
         let _ = std::fs::remove_file(&socket_path_cleanup);
-        let _ = std::fs::remove_file(&pid_path_cleanup);
         std::process::exit(0);
     });
 
@@ -4192,12 +4214,11 @@ mod lifecycle_tests {
         );
     }
 
-    /// Recovery must apply the same cap to active and archived WAL images
-    /// before either can be attached.  Archived sessions never produce the
-    /// later live append that used to trigger trimming, so covering both states
-    /// pins the production failure rather than only its active-session face.
+    /// Restart recovery must publish every valid WAL event for both active and
+    /// archived sessions. The in-memory cap is a live steady-state mechanism;
+    /// applying it before first attach silently amputates durable history.
     #[test]
-    fn recovery_compacts_oversized_active_and_archived_logs_before_attach() {
+    fn recovery_replays_complete_active_and_archived_logs_before_attach() {
         use yalda::agent_event::{AgentEvent, AgentEventKind, ChunkRole};
 
         for archived in [false, true] {
@@ -4219,20 +4240,23 @@ mod lifecycle_tests {
             }
             let (log, dropped) = event_log_from_recovery(entries, sid, 0, 8);
 
-            assert_eq!(dropped, 14, "20 entries compact to the ¾-cap target");
-            assert_eq!(log.len(), 7, "six survivors plus one honest marker");
-            assert!(log.len() <= 8, "recovered log is bounded before attach");
+            assert_eq!(dropped, 0, "restart recovery must not drop durable events");
+            assert_eq!(log.len(), 20, "every WAL event must reach first attach");
+            assert_eq!(log.log_base(), 0, "full replay starts at the durable base");
             assert_eq!(log.tip_seq(), 20, "compaction keeps the logical tip stable");
-            match &log.tail_from(0)[0] {
-                Notification::Agent { event } => match &event.kind {
-                    AgentEventKind::CompactedSummary { summary, .. } => {
-                        assert!(summary.contains("14 earlier event(s) trimmed"));
-                        assert_eq!(event.seq, log.log_base());
-                    }
-                    other => panic!("first recovered entry must be summary, got {other:?}"),
-                },
-                other => panic!("first recovered entry must be Agent marker, got {other:?}"),
-            }
+            let recovered = log.tail_from(0);
+            let texts: Vec<_> = recovered
+                .iter()
+                .filter_map(|note| match note {
+                    Notification::Agent { event } => match &event.kind {
+                        AgentEventKind::Chunk { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(texts.first(), Some(&"chunk-0"));
+            assert_eq!(texts.last(), Some(&"chunk-19"));
         }
     }
 
