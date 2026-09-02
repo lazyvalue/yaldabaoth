@@ -13,6 +13,20 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Stale archived-waiting-tab guard fails on main** — `READY` (found
+  2026-09-01 during the agent-header redesign, Cog graph `y8m`; see
+  [worklog](worklog/2026-09-01-agent-header-redesign.md)).
+  `verify_harness::archived_waiting_session_is_removed_from_the_painted_waiting_tab`
+  fails on a clean main (15d780c) — it asserts the Waiting/Archived segmented
+  widget that graph `k2z` removed from the jump panel. Fix or retire the test to
+  get the suite fully green.
+
+- **Agent header redesign: pixel pass** — `NEEDS-RUNTIME` (gap 1,
+  pixels/colors; shipped 2026-09-01, graph `y8m`, main e1aa51f). The two-deck
+  header's look — dot halo, state-tinted hairline, chip colors, truncation at
+  narrow widths — needs Scott's eye after a GUI restart (release binary built;
+  process not touched).
+
 - **Linux port follow-ups** — `READY` (from
   [worklog](worklog/2026-08-26-linux-port.md)). The app now builds, links, runs,
   and tests on Linux (x86-64). Remaining hardening: (1) make the two
