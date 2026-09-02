@@ -115,3 +115,20 @@ frontier 3: omega [done] (omega)
 - Scott: restart the GUI when convenient (`./dev-gui.sh`; release binary is
   built) and judge the pixels; tweaks welcome.
 - Fix or retire the stale archived-waiting-tab test (follow-up to `k2z`).
+
+## Follow-up: polish pass (Cog graph g10, complete)
+
+Scott's runtime verdict on the first pass: "OK but nothing special" — stop
+button unwanted; the left/right split alignment reads badly on wide screens.
+Changes (commit `f86957f`, merged `19bb51f`):
+
+- **Stop chip removed.** Esc / ⌘. / the space menu remain the stop
+  affordances; the fixed-slot state word now says `stopping` (same orange)
+  while a requested stop winds down. Slot widened 52→60px to fit.
+- **Single left flow.** Both decks drop their `flex_1` spacers — no
+  right-aligned cluster; deck 2 reads state · turn/timer · edit status ·
+  meter · location as one group.
+- Specs reconciled (`UXI-AgentTile-28/31`), vocabulary guard extended
+  (`stopping`, and the unreachable `(working=false, stop_requested=true)`
+  degrades to `ready`). 764/765 green on main; same pre-existing
+  archived-waiting failure only.
