@@ -11189,8 +11189,14 @@ fn agent_row_marks_name_the_live_states() {
 
 #[test]
 fn agent_header_uses_compact_activity_and_transient_editor_vocabulary() {
-    assert_eq!(crate::screens::agent_header_activity(true, false), "working");
-    assert_eq!(crate::screens::agent_header_activity(true, true), "stopping");
+    assert_eq!(
+        crate::screens::agent_header_activity(true, false),
+        "working"
+    );
+    assert_eq!(
+        crate::screens::agent_header_activity(true, true),
+        "stopping"
+    );
     assert_eq!(crate::screens::agent_header_activity(false, false), "ready");
     // stop_requested ⇒ awaiting, so (false, true) is unreachable; it must
     // still degrade to the idle word, never a stale `stopping`.
@@ -28271,6 +28277,7 @@ fn cog_overview_native_graph_click_opens_node_detail(cx: &mut TestAppContext) {
         vec![vec![0, 1], vec![2]],
         "two roots share a layer and their successor follows"
     );
+    crate::cog_connector_paint_reset();
     view.update(vcx, |v, cx| {
         v.cog_apply(wid, req, Ok(crate::CogFetch::Graph(Box::new(bundle))), cx);
     });
@@ -28281,15 +28288,21 @@ fn cog_overview_native_graph_click_opens_node_detail(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     let node = crate::layout_probe_get("cog-graph-node-probe-2")
         .expect("native Build node card paints in Overview");
-    let edge0 = crate::layout_probe_get("cog-graph-edge-probe-0-0")
-        .expect("first native dependency connector paints");
-    let edge1 = crate::layout_probe_get("cog-graph-edge-probe-0-1")
-        .expect("fan-in's second dependency connector paints");
+    let connector_canvas = crate::layout_probe_get("cog-graph-connector-canvas")
+        .expect("the GPUI connector canvas paints behind node cards");
     crate::layout_probe_end();
     assert!(node.2 > 100.0 && node.3 > 20.0, "node card has real size");
-    assert!(
-        edge0.2 > 40.0 && edge1.2 > 40.0,
-        "edge lanes have real size"
+    assert!(connector_canvas.2 > node.2 && connector_canvas.3 > node.3);
+    let connector_paint = crate::cog_connector_paint_snapshot();
+    assert_eq!(connector_paint.routes.len(), 2, "both fan-in edges paint");
+    for route in &connector_paint.routes {
+        assert!(route.from_y < route.lane_y && route.lane_y < route.to_y);
+        assert!(route.from_x > 0.0 && route.to_x > 0.0);
+        assert!(route.arrowhead, "every directed connector has an arrowhead");
+    }
+    assert_ne!(
+        connector_paint.routes[0].lane_y, connector_paint.routes[1].lane_y,
+        "fan-in edges use distinct traceable lanes"
     );
 
     let at = gpui::point(
@@ -28347,6 +28360,30 @@ fn cog_native_graph_layout_keeps_islands_missing_edges_and_cycles(_cx: &mut Test
         crate::graph_diagram_layers(&bundle),
         vec![vec![0, 1], vec![2, 3]],
         "roots/islands paint first and the cyclic remainder paints stably"
+    );
+    let (width, routes, outer_routes) = crate::graph_connector_geometry_summary(&bundle);
+    assert_eq!(routes, 2, "both valid cyclic edges remain visible");
+    assert_eq!(outer_routes, 2, "cyclic/back edges use outer routes");
+    assert!(width >= 456.0, "two-card ranks retain fixed anchor spacing");
+
+    let mut wide = cog_test_bundle(
+        (0..6)
+            .map(|i| {
+                cog_test_node(
+                    &format!("wide-{i}"),
+                    &format!("Wide {i}"),
+                    "open",
+                    serde_json::Value::Null,
+                )
+            })
+            .collect(),
+    );
+    wide.edges = vec![];
+    let (wide_width, routes, _) = crate::graph_connector_geometry_summary(&wide);
+    assert_eq!(routes, 0);
+    assert!(
+        wide_width > 1_300.0,
+        "wide ranks expand the scroll surface instead of wrapping away from ports"
     );
 }
 

@@ -541,13 +541,27 @@ current-key snapshot lands (negative control: remove the exact-key guard).
 
 **Statement.** A loaded graph's Overview renders its nodes and dependency edges
 as native GPUI elements, not the textual `cog graph render` ASCII output. Nodes
-are arranged in dependency layers from roots toward omega; peers share a layer,
+are arranged in dependency ranks from roots toward omega; peers share a rank,
 and cycles, islands, or missing edge endpoints degrade to stable additional
 layers instead of hiding nodes or preventing paint. Each node card shows its
 human label and effective status with the same status semantics and colours as
-the selector. Edges visibly connect predecessor and successor cards, including
-fan-in and fan-out, while remaining legible in a constrained, scrollable detail
-pane.
+the selector. Cards retain their existing size, content, and click behavior.
+
+Edges are actual GPUI-painted orthogonal connectors behind the cards, not
+standalone labels or pills. Every valid dependency starts at the predecessor
+card's bottom-center port, travels vertically to a deterministic per-edge lane,
+turns horizontally, then terminates at the successor card's top-center port with
+a downward arrowhead. Separate lanes keep fan-in and fan-out visually traceable.
+Long edges cross intervening rank bands without being relabeled as nodes. Edges
+whose endpoint is absent are omitted because no honest card anchor exists; their
+present nodes still paint through the stable fallback layout. Cyclic/back edges
+use the same stable endpoint ports and a distinct outer lane rather than hiding
+the edge or overlapping a card.
+
+Ranks never wrap independently of their connector geometry. The diagram owns a
+minimum width derived from its widest rank and becomes horizontally scrollable
+inside a constrained detail pane, so card centers and connector ports remain
+aligned at every supported pane width.
 
 Every node card is clickable. Activating one selects that exact node, leaves
 Overview, resets the right-pane scroll, and presents the standard node detail
@@ -564,16 +578,18 @@ in `CogView::right_pane` / `overview_body` (`cog_view.rs`), derived solely from
 edge relationships difficult to scan and cannot provide a direct path from a
 visual node to the detail already available elsewhere in the tile.
 
-**Status.** `implemented` (2026-08-30; Cog graph `i1z`).
+**Status.** `implemented` (2026-09-01; edge redesign Cog graph `frh`; supersedes the
+edge-pill portion of graph `i1z`).
 
 **Enforcement.** `cog_overview_native_graph_click_opens_node_detail` applies a
-fan-in DAG through the real Cog reducer, probes native node and edge paint,
-clicks the painted card through GPUI's mouse dispatcher, and asserts that the
-existing detail surface opens for that exact node. Its negative control removed
-the card click handler and failed with Overview still selected.
+fan-in DAG through the real Cog reducer, probes the connector canvas and card,
+reads its paint tap, and proves two distinct orthogonal lanes with arrowheads
+before clicking the real card through GPUI's mouse dispatcher.
 `cog_native_graph_layout_keeps_islands_missing_edges_and_cycles` guards stable
-fallback layering without dropping nodes. Exact pixels and colours remain
-runtime gap #1.
+fallback layers, omission of missing endpoints, outer cyclic routes, and a wide
+non-wrapping scroll surface. `cog_body_is_cached` remains green. Removing the
+canvas fails the production-path paint guard. Exact anti-aliasing and colours
+remain runtime gap #1.
 
 ### UXI-Cog-19 — Agent identities are human-readable everywhere
 

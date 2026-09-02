@@ -13,6 +13,39 @@
 //! primitives (`multiline_text`, `kv_row`, `section_heading`, `note_block`).
 
 use super::*;
+use gpui::{PathBuilder, canvas};
+
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CogConnectorPaint {
+    pub(crate) routes: Vec<CogConnectorRoute>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct CogConnectorRoute {
+    pub(crate) from_x: f32,
+    pub(crate) from_y: f32,
+    pub(crate) lane_y: f32,
+    pub(crate) to_x: f32,
+    pub(crate) to_y: f32,
+    pub(crate) arrowhead: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static COG_CONNECTOR_PAINT: std::cell::RefCell<CogConnectorPaint> = Default::default();
+}
+
+#[cfg(test)]
+pub(crate) fn cog_connector_paint_reset() {
+    COG_CONNECTOR_PAINT.with(|paint| *paint.borrow_mut() = CogConnectorPaint::default());
+}
+
+#[cfg(test)]
+pub(crate) fn cog_connector_paint_snapshot() -> CogConnectorPaint {
+    COG_CONNECTOR_PAINT.with(|paint| paint.borrow().clone())
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CogSourceTab {
@@ -2686,6 +2719,148 @@ pub(crate) fn graph_diagram_layers(bundle: &CogBundle) -> Vec<Vec<usize>> {
     layers
 }
 
+const COG_GRAPH_CARD_W: f32 = 220.0;
+const COG_GRAPH_CARD_H: f32 = 72.0;
+const COG_GRAPH_CARD_GAP: f32 = 16.0;
+const COG_GRAPH_PAD: f32 = 20.0;
+const COG_GRAPH_ROW_TOP: f32 = 8.0;
+const COG_GRAPH_LANE_STEP: f32 = 7.0;
+
+#[derive(Clone, Debug)]
+struct GraphConnectorRoute {
+    points: Vec<(f32, f32)>,
+    from_x: f32,
+    from_y: f32,
+    lane_y: f32,
+    to_x: f32,
+    to_y: f32,
+}
+
+struct GraphDiagramGeometry {
+    width: f32,
+    height: f32,
+    layer_tops: Vec<f32>,
+    routes: Vec<GraphConnectorRoute>,
+}
+
+fn graph_diagram_geometry(bundle: &CogBundle, layers: &[Vec<usize>]) -> GraphDiagramGeometry {
+    let max_rank = layers.iter().map(Vec::len).max().unwrap_or(1);
+    let width = (max_rank as f32 * COG_GRAPH_CARD_W
+        + max_rank.saturating_sub(1) as f32 * COG_GRAPH_CARD_GAP
+        + COG_GRAPH_PAD * 2.0)
+        .max(360.0);
+    let node_place: std::collections::HashMap<usize, (usize, usize)> = layers
+        .iter()
+        .enumerate()
+        .flat_map(|(rank, nodes)| {
+            nodes
+                .iter()
+                .enumerate()
+                .map(move |(slot, node)| (*node, (rank, slot)))
+        })
+        .collect();
+    let by_id: std::collections::HashMap<&str, usize> = bundle
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (node.id.as_str(), index))
+        .collect();
+    let valid_edges: Vec<(usize, usize)> = bundle
+        .edges
+        .iter()
+        .filter_map(|edge| {
+            Some((
+                *by_id.get(edge.from.as_str())?,
+                *by_id.get(edge.to.as_str())?,
+            ))
+        })
+        .collect();
+    let mut edges_per_rank = vec![0usize; layers.len()];
+    for (from, _) in &valid_edges {
+        if let Some((rank, _)) = node_place.get(from) {
+            edges_per_rank[*rank] += 1;
+        }
+    }
+    let mut layer_tops = Vec::with_capacity(layers.len());
+    let mut cursor = 0.0;
+    for (rank, _) in layers.iter().enumerate() {
+        layer_tops.push(cursor);
+        let lanes = edges_per_rank[rank].max(1) as f32;
+        cursor += COG_GRAPH_ROW_TOP + COG_GRAPH_CARD_H + 16.0 + lanes * COG_GRAPH_LANE_STEP;
+    }
+    let height = cursor.max(COG_GRAPH_CARD_H + COG_GRAPH_PAD * 2.0);
+    let center_x = |rank: usize, slot: usize| {
+        let count = layers[rank].len();
+        let used =
+            count as f32 * COG_GRAPH_CARD_W + count.saturating_sub(1) as f32 * COG_GRAPH_CARD_GAP;
+        (width - used) / 2.0
+            + slot as f32 * (COG_GRAPH_CARD_W + COG_GRAPH_CARD_GAP)
+            + COG_GRAPH_CARD_W / 2.0
+    };
+    let mut lane_slots = vec![0usize; layers.len()];
+    let mut routes = Vec::with_capacity(valid_edges.len());
+    for (from, to) in valid_edges {
+        let Some(&(from_rank, from_slot)) = node_place.get(&from) else {
+            continue;
+        };
+        let Some(&(to_rank, to_slot)) = node_place.get(&to) else {
+            continue;
+        };
+        let from_x = center_x(from_rank, from_slot);
+        let to_x = center_x(to_rank, to_slot);
+        let from_y = layer_tops[from_rank] + COG_GRAPH_ROW_TOP + COG_GRAPH_CARD_H;
+        let to_y = layer_tops[to_rank] + COG_GRAPH_ROW_TOP;
+        let slot = lane_slots[from_rank];
+        lane_slots[from_rank] += 1;
+        let lane_y = from_y + 9.0 + slot as f32 * COG_GRAPH_LANE_STEP;
+        let points = if to_y > lane_y {
+            vec![
+                (from_x, from_y),
+                (from_x, lane_y),
+                (to_x, lane_y),
+                (to_x, to_y),
+            ]
+        } else {
+            let outer_x = COG_GRAPH_PAD / 2.0 + slot as f32 * 3.0;
+            let target_lane = (to_y - 8.0).max(2.0);
+            vec![
+                (from_x, from_y),
+                (from_x, lane_y),
+                (outer_x, lane_y),
+                (outer_x, target_lane),
+                (to_x, target_lane),
+                (to_x, to_y),
+            ]
+        };
+        routes.push(GraphConnectorRoute {
+            points,
+            from_x,
+            from_y,
+            lane_y,
+            to_x,
+            to_y,
+        });
+    }
+    GraphDiagramGeometry {
+        width,
+        height,
+        layer_tops,
+        routes,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn graph_connector_geometry_summary(bundle: &CogBundle) -> (f32, usize, usize) {
+    let layers = graph_diagram_layers(bundle);
+    let geometry = graph_diagram_geometry(bundle, &layers);
+    let outer_routes = geometry
+        .routes
+        .iter()
+        .filter(|route| route.to_y <= route.lane_y)
+        .count();
+    (geometry.width, geometry.routes.len(), outer_routes)
+}
+
 impl CogView {
     /// The Overview detail: aggregate stats plus a native, clickable GPUI DAG.
     fn overview_body(
@@ -2739,40 +2914,85 @@ impl CogView {
             return col.child(dim_line("No nodes.", st));
         }
 
-        let by_id: std::collections::HashMap<&str, usize> = bundle
-            .nodes
-            .iter()
-            .enumerate()
-            .map(|(i, node)| (node.id.as_str(), i))
-            .collect();
-        let node_layer: std::collections::HashMap<usize, usize> = layers
-            .iter()
-            .enumerate()
-            .flat_map(|(layer, nodes)| nodes.iter().map(move |index| (*index, layer)))
-            .collect();
+        let geometry = graph_diagram_geometry(bundle, &layers);
+        let routes = geometry.routes.clone();
+        let accent = st.accent;
+        let connector_canvas = canvas(
+            move |_, _, _| routes,
+            move |bounds, routes, window, _| {
+                #[cfg(test)]
+                COG_CONNECTOR_PAINT.with(|paint| {
+                    let mut paint = paint.borrow_mut();
+                    paint.routes = routes
+                        .iter()
+                        .map(|route| CogConnectorRoute {
+                            from_x: route.from_x,
+                            from_y: route.from_y,
+                            lane_y: route.lane_y,
+                            to_x: route.to_x,
+                            to_y: route.to_y,
+                            arrowhead: true,
+                        })
+                        .collect();
+                });
+                let ox = f32::from(bounds.origin.x);
+                let oy = f32::from(bounds.origin.y);
+                for route in routes {
+                    let mut line = PathBuilder::stroke(px(1.5));
+                    for (index, (x, y)) in route.points.iter().copied().enumerate() {
+                        let point = point(px(ox + x), px(oy + y));
+                        if index == 0 {
+                            line.move_to(point);
+                        } else {
+                            line.line_to(point);
+                        }
+                    }
+                    if let Ok(path) = line.build() {
+                        window.paint_path(path, accent);
+                    }
+                    let tip = point(px(ox + route.to_x), px(oy + route.to_y));
+                    let mut arrow = PathBuilder::fill();
+                    arrow.move_to(tip);
+                    arrow.line_to(point(px(ox + route.to_x - 5.0), px(oy + route.to_y - 7.0)));
+                    arrow.line_to(point(px(ox + route.to_x + 5.0), px(oy + route.to_y - 7.0)));
+                    arrow.close();
+                    if let Ok(path) = arrow.build() {
+                        window.paint_path(path, accent);
+                    }
+                }
+            },
+        )
+        .absolute()
+        .size_full();
 
-        let mut diagram = div()
-            .id("cog-graph-diagram")
+        let mut surface = div()
+            .relative()
             .flex()
             .flex_col()
-            .w_full()
-            .gap_2()
-            .p_3()
-            .rounded_lg()
-            .border_1()
-            .border_color(card_border(st))
-            .bg(code_bg(st));
+            .w(px(geometry.width))
+            .h(px(geometry.height))
+            .child(probe_bounds(
+                "cog-graph-connector-canvas",
+                connector_canvas.into_any_element(),
+            ));
 
         for (layer_no, indices) in layers.iter().enumerate() {
+            let layer_height = if layer_no + 1 < geometry.layer_tops.len() {
+                geometry.layer_tops[layer_no + 1] - geometry.layer_tops[layer_no]
+            } else {
+                geometry.height - geometry.layer_tops[layer_no]
+            };
             let mut layer = div()
                 .id(SharedString::from(format!("cog-graph-layer-{layer_no}")))
                 .flex()
                 .flex_row()
-                .flex_wrap()
+                .flex_none()
                 .items_start()
                 .justify_center()
-                .gap_2()
-                .w_full();
+                .gap(px(COG_GRAPH_CARD_GAP))
+                .w_full()
+                .h(px(layer_height))
+                .pt(px(COG_GRAPH_ROW_TOP));
             for &index in indices {
                 let node = &bundle.nodes[index];
                 let label = if node.name.trim().is_empty() {
@@ -2786,9 +3006,10 @@ impl CogView {
                     .cursor_pointer()
                     .flex()
                     .flex_col()
+                    .flex_none()
                     .gap_1()
-                    .min_w(px(150.0))
-                    .max_w(px(240.0))
+                    .w(px(COG_GRAPH_CARD_W))
+                    .h(px(COG_GRAPH_CARD_H))
                     .p_2()
                     .rounded_md()
                     .border_1()
@@ -2826,66 +3047,19 @@ impl CogView {
                     card.into_any_element(),
                 ));
             }
-            diagram = diagram.child(layer);
-
-            let edges: Vec<_> = bundle
-                .edges
-                .iter()
-                .filter(|edge| {
-                    by_id
-                        .get(edge.from.as_str())
-                        .and_then(|index| node_layer.get(index))
-                        == Some(&layer_no)
-                })
-                .collect();
-            if !edges.is_empty() {
-                let mut lanes = div()
-                    .id(SharedString::from(format!("cog-graph-edges-{layer_no}")))
-                    .flex()
-                    .flex_row()
-                    .flex_wrap()
-                    .justify_center()
-                    .gap_2()
-                    .w_full();
-                for (edge_no, edge) in edges.into_iter().enumerate() {
-                    let from = by_id
-                        .get(edge.from.as_str())
-                        .and_then(|i| bundle.nodes.get(*i))
-                        .map(|n| if n.name.is_empty() { &n.id } else { &n.name })
-                        .unwrap_or(&edge.from);
-                    let to = by_id
-                        .get(edge.to.as_str())
-                        .and_then(|i| bundle.nodes.get(*i))
-                        .map(|n| if n.name.is_empty() { &n.id } else { &n.name })
-                        .unwrap_or(&edge.to);
-                    lanes = lanes.child(probe_bounds_dyn(
-                        format!("cog-graph-edge-probe-{layer_no}-{edge_no}"),
-                        div()
-                            .id(SharedString::from(format!(
-                                "cog-graph-edge-{layer_no}-{edge_no}"
-                            )))
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_1()
-                            .px_2()
-                            .py(px(2.0))
-                            .rounded_full()
-                            .border_1()
-                            .border_color(card_border(st))
-                            .font_family(st.mono.clone())
-                            .text_size(px(st.pt * 0.7))
-                            .text_color(st.dim)
-                            .child(SharedString::from(from.clone()))
-                            .child(div().w(px(28.0)).h(px(2.0)).bg(st.accent))
-                            .child(SharedString::new_static("▶"))
-                            .child(SharedString::from(to.clone()))
-                            .into_any_element(),
-                    ));
-                }
-                diagram = diagram.child(lanes);
-            }
+            surface = surface.child(layer);
         }
+
+        let diagram = div()
+            .id("cog-graph-diagram")
+            .w_full()
+            .overflow_x_scroll()
+            .p_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(card_border(st))
+            .bg(code_bg(st))
+            .child(surface);
         col.child(diagram)
     }
 }
