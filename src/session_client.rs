@@ -7,7 +7,6 @@
 
 use std::io::{self, BufRead, Write};
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
@@ -111,14 +110,19 @@ fn request_response(
 }
 
 impl SessionServerClient {
-    /// Connect to the session server. Auto-launches it if not running.
+    /// Connect to an ALREADY-RUNNING session server. **Never launches one.**
+    ///
+    /// The server's lifecycle belongs to its supervisor (the systemd user
+    /// service on Linux, launchd on macOS) — bug-0064's split-brain recurrence
+    /// was a frozen GUI auto-launching a second server from a stale binary, so
+    /// client-side launching is banned outright (ADR: server-lifecycle). Fails
+    /// fast with `ConnectionRefused` when no server is listening; the GUI shows
+    /// the start-the-server instruction and retries in its pump.
     pub fn connect() -> io::Result<Self> {
-        let path = socket_path();
-        let stream = Self::connect_or_launch(&path)?;
-        Self::from_stream(stream)
+        Self::connect_existing()
     }
 
-    /// Connect to an ALREADY-RUNNING server only — never auto-launch one.
+    /// Connect to an ALREADY-RUNNING server only — never launch one.
     /// Used by non-GUI CLI callers (e.g. the headless `prompt` subcommand,
     /// ADR-0015) that want to drive an existing server's existing session, not
     /// spin up a throwaway daemon. Fails fast with `ConnectionRefused` if no
@@ -127,89 +131,6 @@ impl SessionServerClient {
         let path = socket_path();
         let stream = UnixStream::connect(&path)?;
         Self::from_stream(stream)
-    }
-
-    fn connect_or_launch(path: &std::path::Path) -> io::Result<UnixStream> {
-        // Try connecting first.
-        if let Ok(s) = UnixStream::connect(path) {
-            return Ok(s);
-        }
-
-        // Launch the server DETACHED so it outlives this GUI: its own process
-        // group (no SIGINT/SIGHUP from the terminal that launched the GUI), and
-        // stdout/stderr go to a log file rather than the GUI's terminal so the
-        // daemon is fully decoupled from the launching session.
-        let server_bin = Self::find_server_binary()?;
-        let mut cmd = std::process::Command::new(&server_bin);
-        cmd.stdin(std::process::Stdio::null());
-        match Self::server_log_file() {
-            Some(log) => {
-                let err = log.try_clone().ok();
-                cmd.stdout(std::process::Stdio::from(log));
-                match err {
-                    Some(err) => {
-                        cmd.stderr(std::process::Stdio::from(err));
-                    }
-                    None => {
-                        cmd.stderr(std::process::Stdio::null());
-                    }
-                }
-            }
-            None => {
-                cmd.stdout(std::process::Stdio::null());
-                cmd.stderr(std::process::Stdio::null());
-            }
-        }
-        cmd.process_group(0); // detach from the GUI's process group
-        cmd.spawn().map_err(|e| {
-            io::Error::other(format!(
-                "failed to launch session server at {}: {e}",
-                server_bin.display()
-            ))
-        })?;
-
-        // Retry with backoff.
-        let backoffs = [50, 100, 200, 400, 800, 1600];
-        for ms in backoffs {
-            std::thread::sleep(Duration::from_millis(ms));
-            if let Ok(s) = UnixStream::connect(path) {
-                return Ok(s);
-            }
-        }
-
-        Err(io::Error::new(
-            io::ErrorKind::ConnectionRefused,
-            "session server did not start in time",
-        ))
-    }
-
-    /// Append-mode log file for the detached server's stdout/stderr, so the
-    /// daemon's output survives the terminal that launched the GUI. Lives at
-    /// `~/.yalda/session-server.log` (the durable yalda home, ADR-0018).
-    /// `None` if the home dir or file can't be opened (caller falls back to
-    /// discarding output).
-    fn server_log_file() -> Option<std::fs::File> {
-        let path = crate::paths::yalda_home()?.join("session-server.log");
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .ok()
-    }
-
-    fn find_server_binary() -> io::Result<PathBuf> {
-        // Try the same directory as the current executable first.
-        if let Ok(exe) = std::env::current_exe() {
-            let sibling = exe.with_file_name("yalda-session-server");
-            if sibling.exists() {
-                return Ok(sibling);
-            }
-        }
-        // Fall back to PATH lookup.
-        Ok(PathBuf::from("yalda-session-server"))
     }
 
     fn from_stream(stream: UnixStream) -> io::Result<Self> {
@@ -350,7 +271,9 @@ impl SessionServerClient {
         futures::channel::mpsc::UnboundedReceiver<()>,
     )> {
         let path = socket_path();
-        let stream = Self::connect_or_launch(&path)?;
+        // Connect-only, same as `connect()`: a reconnect must never spawn a
+        // server either (the supervisor owns restarts).
+        let stream = UnixStream::connect(&path)?;
         let fresh = Self::from_stream(stream)?;
         // Replace our internals wholesale. Assigning `*self` drops the old
         // value (its threads have already exited — that's why we're

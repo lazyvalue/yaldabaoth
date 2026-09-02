@@ -1,6 +1,6 @@
 # bug-0064: restart-discards-or-partially-replays-wal
 
-**Status:** FIXED
+**Status:** RECURRED→FIXED
 **First seen:** 2026-08-30
 **Component:** `docs/components/agent-tile/session-binding.md` (`UXI-AgentTile-44`)
 
@@ -140,3 +140,60 @@ server-ownership regression cannot create concurrent appenders.
   progress at time of writing (merge to `main` pending). No yalda process was
   restarted; activation is build-only and left to Scott.
 - Status stays FIXED.
+
+### 2026-09-01 — RECURRED in production: the fix had never run. Lifecycle redesign (graph f5x)
+
+- **Recurrence.** ~19:29, seconds after a hypridle screen lock froze the GUI:
+  the GUI's `connect_or_launch` reconnect path auto-launched a second
+  `yalda-session-server` from `~/.local/bin` — an **Aug 27 binary predating
+  `8eef3b1`** (no lifetime lease, no writer locks, old connect-then-unlink
+  socket check). It stole the socket pathname from the resident server (pid
+  897160, also pre-fix), recovered the same 44-session roster, and resumed
+  **twin `claude --resume` workers** for ~12 ACP identities. Session
+  `66dd9fad` was published with `recovered_dropped=122296`. The GUI froze and
+  restarted into the new server; every old session read as frozen. With
+  explicit operator approval the stale server tree (897160 + ~40 descendants)
+  was SIGTERMed (clean "shutting down (WALs are durable)"); the GUI-connected
+  server was untouched.
+- **Why the fix didn't protect us:** it existed only in git. The Aug 30/Sep 1
+  work verified in a worktree `target/`; neither `target/release` in the main
+  checkout nor `~/.local/bin` was ever rebuilt (`deploy-server.sh` existed,
+  never ran). Both servers in the incident were pre-fix binaries — the lease
+  code had never executed on this machine. Compounding it, the lease can only
+  exclude servers that *take* it: a pre-lease binary is invisible to it, and
+  the GUI retained the authority to launch such a binary at any transient
+  connect failure.
+- **Fix (Scott's directive, ADR-0037, Cog graph `f5x`):**
+  1. GUI launch authority DELETED — `connect_or_launch`/`find_server_binary`
+     removed; connect/reconnect are connect-only; serverless boot restores
+     tiles as reconnectable placeholders and the pump retries until the server
+     appears, then re-attaches.
+  2. systemd user service owns the lifecycle; `dev-server.sh` delegates to
+     `deploy-server.sh` (build → atomic install to `~/.local/bin` →
+     `systemctl --user restart`); the in-app Rebuild&Restart does the same
+     install+restart instead of pkill+GUI-respawn — "merged but never
+     installed" can no longer be silent.
+  3. **Highlander guard**: the server scans `/proc` for ANY other
+     `yalda-session-server` process (` (deleted)` exe suffix included — the
+     stale-reinstalled case) before touching lease/socket/WAL/agents, and
+     refuses to boot with a clean exit(0) (`Restart=on-failure` cannot loop
+     it). `--force` for deliberate side-by-side runs (tests).
+  4. Splash instruction when no server is reachable (UXI-Workspace-29).
+- **Guards (all observed RED with the fix reverted, then green restored):**
+  `highlander_refuses_boot_while_another_server_process_exists` (RED = the
+  guard-disabled server boots alongside a live one),
+  `highlander_force_boots_side_by_side`,
+  `client_connect_never_launches_a_server` (RED = reintroduced spawn makes the
+  socket appear), `splash_paints_start_server_instruction_when_server_missing`
+  (RED = probe miss with `server_missing()` hard-wired false). Existing
+  lease-layer tests keep their coverage via explicit `--force`.
+- Suites on the branch: lib 223, server bin 68, resilience 14 (incl. 3 new),
+  transcript 14, GUI 765 passed / 1 failed —
+  `archived_waiting_session_is_removed_from_the_painted_waiting_tab`, which
+  fails identically on unmodified `main` (pre-existing, live-server-state
+  dependent; tracked separately). Mutation gate left to CI `--in-diff`.
+- **Activation (NOT done by the agent — no process touched):** merge + release
+  build + install to `~/.local/bin`, then Scott: stop the unmanaged server
+  (`kill <pid>`), `./install-service.sh` once, service starts under systemd.
+  The Highlander guard makes starting the new server while the old one runs a
+  loud no-op instead of a split-brain.

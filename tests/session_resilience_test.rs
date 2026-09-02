@@ -84,6 +84,11 @@ impl TestServer {
         for (k, v) in knobs {
             builder.env(k, v);
         }
+        // `--force` skips the Highlander single-process guard: test servers run
+        // on private sockets, deliberately side-by-side with each other AND
+        // with whatever live server the dev box is running. The guard itself is
+        // exercised by the dedicated `highlander_*` tests below.
+        builder.arg("--force");
         let child = builder
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -189,7 +194,10 @@ fn competing_server_cannot_steal_socket_or_touch_owner_state() {
         .expect("owner socket metadata")
         .ino();
     let bin = env!("CARGO_BIN_EXE_yalda-session-server");
+    // `--force` gets past the Highlander process scan so this test still
+    // exercises the LEASE layer specifically.
     let output = Command::new(bin)
+        .arg("--force")
         .env("YALDA_SESSION_SOCKET", &server.socket)
         .env("YALDA_ACP_AGENT", "/usr/bin/false")
         .env("YALDA_CONFIG", "/nonexistent/yalda-test-config.kdl")
@@ -420,7 +428,10 @@ fn second_server_does_not_steal_socket() {
     // Start a SECOND server on the very same socket. It must detect the live
     // one and exit cleanly rather than rebinding.
     let bin = env!("CARGO_BIN_EXE_yalda-session-server");
+    // `--force` gets past the Highlander process scan so this test still
+    // exercises the LEASE layer specifically.
     let mut intruder = Command::new(bin)
+        .arg("--force")
         .env("YALDA_SESSION_SOCKET", &server.socket)
         .env("YALDA_ACP_AGENT", "/usr/bin/true")
         .stdin(Stdio::null())
@@ -839,6 +850,7 @@ fn v1_wal_session_survives_server_upgrade() {
     let logfile = std::fs::File::create(&log).expect("server log");
     let bin = env!("CARGO_BIN_EXE_yalda-session-server");
     let mut child = Command::new(bin)
+        .arg("--force")
         .env("YALDA_SESSION_SOCKET", &socket)
         .env("YALDA_ACP_AGENT", "/usr/bin/true")
         .env("YALDA_CONFIG", "/nonexistent/yalda-test-config.kdl")
@@ -872,4 +884,127 @@ fn v1_wal_session_survives_server_upgrade() {
     let _ = std::fs::remove_file(&socket);
     let _ = std::fs::remove_dir_all(&wal_dir);
     let _ = std::fs::remove_file(&log);
+}
+
+// ── Highlander guard (bug-0064 recurrence, graph f5x) ──────────────────────
+//
+// The 2026-09-01 split-brain: a frozen GUI auto-launched a second server from
+// a stale pre-lease binary, which stole the socket pathname. The lease only
+// excludes servers that cooperate in taking it — the Highlander guard is the
+// process-scan backstop that refuses to boot while ANY other
+// yalda-session-server process exists, regardless of build, socket, or lease.
+
+/// A server started WITHOUT `--force` while another server process exists must
+/// refuse to boot: clean exit(0), the refusal logged, and its socket never
+/// created. The other server here is on a DIFFERENT private socket, proving
+/// the refusal comes from the process scan — not the socket or lease guards.
+#[test]
+fn highlander_refuses_boot_while_another_server_process_exists() {
+    let _g = serial_lock();
+    // Guarantee at least one live server process exists (hermetic on CI; on a
+    // dev box the user's real server would match too).
+    let other = TestServer::start();
+
+    let n = SEQ.fetch_add(1, Ordering::SeqCst);
+    let pid = std::process::id();
+    let socket = std::env::temp_dir().join(format!("yalda-restest-{pid}-{n}-highlander.sock"));
+    let _ = std::fs::remove_file(&socket);
+
+    let bin = env!("CARGO_BIN_EXE_yalda-session-server");
+    // Bounded wait, NOT `.output()`: a regressed (guard-less) server BOOTS and
+    // runs forever, and this test must fail cleanly instead of hanging.
+    let mut guarded = Command::new(bin)
+        .env("YALDA_SESSION_SOCKET", &socket)
+        .env("YALDA_ACP_AGENT", "/usr/bin/true")
+        .env("YALDA_CONFIG", "/nonexistent/yalda-test-config.kdl")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("launch guarded server");
+    let status = {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match guarded.try_wait().expect("try_wait") {
+                Some(s) => break s,
+                None if Instant::now() > deadline => {
+                    let _ = guarded.kill();
+                    let _ = guarded.wait();
+                    panic!(
+                        "guarded server did not exit — the Highlander guard \
+                         let it boot alongside a live server"
+                    );
+                }
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    };
+    assert!(
+        status.success(),
+        "Highlander refusal must be a CLEAN exit (systemd Restart=on-failure \
+         must not respawn-loop it): {status:?}"
+    );
+    let mut log = String::new();
+    if let Some(mut e) = guarded.stderr.take() {
+        use std::io::Read;
+        let _ = e.read_to_string(&mut log);
+    }
+    assert!(
+        log.contains("Highlander"),
+        "expected the Highlander refusal in stderr; got:\n{log}"
+    );
+    assert!(
+        !socket.exists(),
+        "refusing server must never create its socket"
+    );
+    drop(other);
+}
+
+/// `--force` really overrides the guard: a forced server boots to a
+/// connectable socket while another server process is running.
+#[test]
+fn highlander_force_boots_side_by_side() {
+    let _g = serial_lock();
+    let a = TestServer::start();
+    let b = TestServer::start(); // start() passes --force and waits for the socket
+    assert!(
+        std::os::unix::net::UnixStream::connect(&b.socket).is_ok(),
+        "forced second server must be connectable"
+    );
+    drop(b);
+    drop(a);
+}
+
+/// ADR-0037: `SessionServerClient::connect()` must NEVER launch a server. With
+/// no server on the socket it fails fast with a connect error, the socket file
+/// stays absent, and no yalda-session-server process appears. (Before the
+/// bug-0064 recurrence fix, this call spawned a detached server from PATH —
+/// the exact mechanism that booted a stale pre-lease binary into a
+/// split-brain.)
+#[test]
+fn client_connect_never_launches_a_server() {
+    let _g = serial_lock();
+    let n = SEQ.fetch_add(1, Ordering::SeqCst);
+    let pid = std::process::id();
+    let socket = std::env::temp_dir().join(format!("yalda-restest-{pid}-{n}-nolaunch.sock"));
+    let _ = std::fs::remove_file(&socket);
+    unsafe { std::env::set_var("YALDA_SESSION_SOCKET", &socket) };
+
+    let before = Instant::now();
+    let result = SessionServerClient::connect();
+    let elapsed = before.elapsed();
+
+    assert!(result.is_err(), "connect() with no server must fail");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "connect() must fail FAST, not wait out a launch-retry backoff \
+         (took {elapsed:?})"
+    );
+    // The old auto-launch path spawned a server that would create the socket
+    // within its startup window. Give any such regression time to manifest.
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        !socket.exists(),
+        "a server appeared on the socket — connect() launched one"
+    );
 }

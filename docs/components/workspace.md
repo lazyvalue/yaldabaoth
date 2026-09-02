@@ -1423,3 +1423,39 @@ control reverses the restore/roster order and reproduces the empty-workspace
 plus Detached result. The full `yalda-gpui` suite and changed-helper mutation
 gate also pass. Native process restart timing remains a runtime observation,
 not a correctness gap in the deterministically exercised ordering boundary.
+
+### UXI-Workspace-29 — Splash instructs the user to start the missing session server
+
+**Statement.** The GUI never starts a session server — not at boot, not on a
+failed reconnect, not from any dev flow (ADR-0037). When the GUI expects a
+server (the `YALDA_SESSION_SERVER=0` legacy opt-out is not set) and has no
+connection, the boot splash must (1) paint an instruction naming the exact
+command to start it (`systemctl --user start yalda-session-server`) and (2) not
+auto-expire while that condition holds — it stays up until the server appears
+(the pump's late-connect notifies and clears it) or the user dismisses it with
+a key/click. When the server path is explicitly disabled, the message must not
+paint and the splash expires normally.
+
+**Applies to.** `main.rs`: `render_splash`, the splash auto-clear in `render`,
+`server_missing()`; `agent_ui.rs`: `start_server_pump` /
+`reconnect_session_server` (the serverless retry that eventually clears the
+condition); `persist.rs`: `connect_session_server` (connect-only, never
+launches).
+
+**Why.** bug-0064's 2026-09-01 recurrence: a frozen GUI auto-launched a second
+server from a stale pre-lease binary and split-brained every session. Removing
+the GUI's launch authority means "no server" is now a reachable, ordinary state
+— the splash instruction is the user's only signal and must be unmissable.
+
+**Status.** `implemented (headless)`.
+
+**Enforcement.** Layout-probe regression
+`splash_paints_start_server_instruction_when_server_missing`
+(`verify_harness.rs`): a hermetic serverless view with an expired splash
+deadline must still paint the probe-tagged `splash-no-server` element at
+non-zero size; the in-test control flips `YALDA_SESSION_SERVER=0` and asserts
+the message does not paint. Negative control observed RED with
+`server_missing()` hard-wired false (probe miss). The client side is pinned by
+`client_connect_never_launches_a_server`
+(`tests/session_resilience_test.rs`), observed RED with the launch code
+reintroduced.

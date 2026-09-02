@@ -66,6 +66,9 @@ impl TestServer {
         let server_bin = env!("CARGO_BIN_EXE_yalda-session-server");
         let stub_bin = env!("CARGO_BIN_EXE_yalda-acp-stub");
         let mut cmd = Command::new(server_bin);
+        // `--force` skips the Highlander single-process guard (test servers run
+        // side-by-side with the dev box's live server on private sockets).
+        cmd.arg("--force");
         cmd.env("YALDA_SESSION_SOCKET", &socket)
             .env("YALDA_ACP_AGENT", stub_bin);
         for (k, v) in knobs {

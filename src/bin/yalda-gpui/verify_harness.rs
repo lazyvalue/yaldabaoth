@@ -31056,3 +31056,59 @@ fn diff_projection_survives_diff_tile_close(cx: &mut TestAppContext) {
         "the jump-panel badge must still show via the session's remaining Agent tile"
     );
 }
+
+/// UXI-Workspace-29 (ADR-0037, bug-0064 recurrence): when the GUI expects a
+/// session server but has none, the SPLASH paints the start-the-server
+/// instruction, and the splash does not auto-expire while that holds. The GUI
+/// never starts a server itself, so this message is the user's only signal.
+///
+/// Phase B is the in-test control: with the server path explicitly disabled
+/// (`YALDA_SESSION_SERVER=0`, the legacy direct-spawn mode) the same serverless
+/// view must NOT show the message — proving the paint is gated on
+/// `server_missing()`, not on the splash itself.
+#[gpui::test]
+fn splash_paints_start_server_instruction_when_server_missing(cx: &mut TestAppContext) {
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+
+    // Force the splash active far past the boot auto-expire deadline: while
+    // the server is missing it must STAY up (the auto-clear is gated).
+    view.update(vcx, |view, _| {
+        assert!(view.server_missing(), "hermetic view must have no server");
+        view.splash_until =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+    });
+
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let hit = crate::layout_probe_get("splash-no-server");
+    crate::layout_probe_end();
+    let (_, _, w, h) = hit.expect(
+        "no-server instruction did not paint on the splash (and the splash \
+         auto-expired despite the missing server)",
+    );
+    assert!(w > 0.0 && h > 0.0, "no-server instruction painted zero-sized");
+
+    // Phase B: explicit opt-out (legacy direct-spawn mode) → no message, and
+    // the splash auto-expire works again (deadline is already in the past).
+    // Thread-local seam, NOT a process-global env write (which races every
+    // concurrently running live-connection test in this binary).
+    let hit = crate::with_server_path_disabled(|| {
+        view.update(vcx, |view, _| {
+            assert!(!view.server_missing(), "opt-out must clear server_missing");
+            view.splash_until =
+                Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        });
+        crate::layout_probe_begin();
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+        let hit = crate::layout_probe_get("splash-no-server");
+        crate::layout_probe_end();
+        hit
+    });
+    assert!(
+        hit.is_none(),
+        "no-server instruction must not paint when the server path is \
+         explicitly disabled"
+    );
+}

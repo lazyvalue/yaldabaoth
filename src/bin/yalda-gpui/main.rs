@@ -2720,7 +2720,19 @@ impl YaldaGpuiView {
         let proc_cwd = process_cwd();
         let persisted = load_persisted_acp_sessions(&proc_cwd);
 
-        if self.session_server.is_some() {
+        // Server-managed restore whenever a session server is EXPECTED — even
+        // if the boot connect failed (the server may simply not be started;
+        // the GUI never starts one — ADR-0037). Tiles then restore as
+        // reconnectable placeholders, the splash shows the start-the-server
+        // instruction, and the pump retries the connect until the server
+        // appears, at which point `reconnect_session_server` re-attaches every
+        // slot. The legacy direct-spawn branch below is only for the explicit
+        // `YALDA_SESSION_SERVER=0` opt-out (and hermetic tests, which force
+        // `session_server = None` and must not take server-shaped paths unless
+        // they opt in via their seams).
+        let server_expected =
+            cfg!(not(test)) && std::env::var("YALDA_SESSION_SERVER").as_deref() != Ok("0");
+        if self.session_server.is_some() || server_expected {
             self.start_server_pump(cx);
             // Identity, not index: each leaf rebinds to ITS OWN persisted session
             // (UXI-AgentTile-18). Details (mode/draft/cwd) come from the id-keyed
@@ -9369,9 +9381,74 @@ impl YaldaGpuiView {
                                 a: 1.0,
                             })
                             .child("a markdown editor"),
-                    ),
+                    )
+                    // UXI-Workspace-29: when no session server is reachable the
+                    // splash says so and tells the user how to start it — the
+                    // GUI never starts a server itself (ADR-0037; bug-0064
+                    // split-brain recurrence). The splash also doesn't
+                    // auto-expire while this holds (see `render`).
+                    .children(self.server_missing().then(|| {
+                        probe_bounds(
+                            "splash-no-server",
+                            div()
+                                .mt_4()
+                                .px_4()
+                                .py_2()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(Hsla {
+                                    h: 30.0 / 360.0,
+                                    s: 0.85,
+                                    l: 0.45,
+                                    a: 1.0,
+                                })
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .font_family(self.body_font.clone())
+                                        .text_size(px(14.0))
+                                        .text_color(Hsla {
+                                            h: 30.0 / 360.0,
+                                            s: 0.9,
+                                            l: 0.6,
+                                            a: 1.0,
+                                        })
+                                        .child("no session server is running"),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(self.code_font.clone())
+                                        .text_size(px(13.0))
+                                        .text_color(Hsla {
+                                            h: 0.0,
+                                            s: 0.0,
+                                            l: 0.62,
+                                            a: 1.0,
+                                        })
+                                        .child(
+                                            "start it:  systemctl --user start yalda-session-server",
+                                        ),
+                                )
+                                .into_any_element(),
+                        )
+                    })),
             )
             .into_any_element()
+    }
+
+    /// True when the GUI expects a session server but has no client for one —
+    /// the boot connect failed (or the server is not yet started). False when
+    /// the server path is explicitly disabled (`YALDA_SESSION_SERVER=0`, the
+    /// legacy direct-spawn mode; in tests, the thread-local
+    /// [`persist::with_server_path_disabled`] seam — never a process-global
+    /// env write, which would race concurrently running tests). The GUI NEVER
+    /// starts a server itself; this predicate drives the splash instruction +
+    /// the pump's connect retry.
+    pub(crate) fn server_missing(&self) -> bool {
+        self.session_server.is_none() && !crate::persist::server_path_disabled()
     }
 }
 
@@ -9386,9 +9463,13 @@ impl Render for YaldaGpuiView {
         self.viewport_width_px = f32::from(_window.viewport_size().width);
         self.viewport_height_px = f32::from(_window.viewport_size().height);
 
-        // Auto-clear expired splash.
+        // Auto-clear expired splash — but NOT while the session server is
+        // missing: the splash then carries the start-the-server instruction
+        // (UXI-Workspace-29) and must stay up until the server appears (the
+        // pump's late-connect notifies) or the user dismisses it by key/click.
         if let Some(deadline) = self.splash_until
             && std::time::Instant::now() >= deadline
+            && !self.server_missing()
         {
             self.splash_until = None;
         }

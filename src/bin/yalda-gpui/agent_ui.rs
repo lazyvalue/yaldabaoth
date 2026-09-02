@@ -2621,11 +2621,39 @@ impl YaldaGpuiView {
         std::sync::mpsc::Receiver<ServerNotification>,
         futures::channel::mpsc::UnboundedReceiver<()>,
     )> {
-        let (note_rx, wake_rx) = match self.session_server.as_mut()?.reconnect() {
-            Ok(rx) => rx,
-            Err(e) => {
-                eprintln!("[yalda-gpui] session-server reconnect failed: {e}");
-                return None;
+        let (note_rx, wake_rx) = match self.session_server.as_mut() {
+            Some(server) => match server.reconnect() {
+                Ok(rx) => rx,
+                Err(e) => {
+                    eprintln!("[yalda-gpui] session-server reconnect failed: {e}");
+                    return None;
+                }
+            },
+            // No client at all: the boot connect failed (server not started
+            // yet). Try a FRESH connect — never a launch (ADR-0037); the
+            // server's lifecycle belongs to systemd. Excluded under cfg(test)
+            // so hermetic harness views can never reach out to a live dev-box
+            // server from the pump.
+            None => {
+                #[cfg(test)]
+                {
+                    return None;
+                }
+                #[cfg(not(test))]
+                {
+                    let mut client = match SessionServerClient::connect() {
+                        Ok(c) => c,
+                        Err(_) => return None, // still not started — retry on backoff
+                    };
+                    eprintln!("[yalda-gpui] session server appeared; connecting");
+                    let note = client.take_notification_receiver();
+                    let wake = client.take_wake_receiver();
+                    self.session_server = Some(client);
+                    match (note, wake) {
+                        (Some(n), Some(w)) => (n, w),
+                        _ => return None,
+                    }
+                }
             }
         };
 
@@ -2693,7 +2721,19 @@ impl YaldaGpuiView {
                     .map(|s| (s.take_notification_receiver(), s.take_wake_receiver()))
             }) {
                 Ok(Some((Some(rx), wake))) => (rx, wake),
-                // No server, or receivers already taken — nothing to pump.
+                // No client yet — the boot connect failed because the server
+                // isn't started (the GUI never starts one, ADR-0037). Enter
+                // the loop in disconnected mode: a dead dummy note channel and
+                // no wake channel, so the RECONNECT branch below polls
+                // `reconnect_session_server` on its backoff until the server
+                // appears. cfg(test) keeps the old bail-out so hermetic views
+                // never poll a live dev-box server.
+                Ok(None) if cfg!(not(test)) => {
+                    let (_dead_tx, dead_rx) = std::sync::mpsc::channel::<ServerNotification>();
+                    (dead_rx, None)
+                }
+                // Receivers already taken (defensive; the singleton guard
+                // prevents this) or a test-mode serverless boot.
                 _ => return,
             };
 

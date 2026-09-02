@@ -368,19 +368,52 @@ pub(crate) fn spawn_self_build(
         match status {
             Ok(status) if status.success() => {
                 if restart_server {
-                    // Mirror dev-server.sh: the new GUI must launch the binary
-                    // just built, not reconnect to an older resident server.
-                    for pat in [
-                        "target/debug/yalda-session-server",
-                        "target/release/yalda-session-server",
-                    ] {
-                        let _ = std::process::Command::new("pkill")
-                            .args(["-f", pat])
-                            .status();
+                    // ADR-0037: the systemd user service owns the server's
+                    // lifecycle. Publish the fresh build to the STABLE
+                    // installed path (atomic rename — the running service keeps
+                    // its old inode until the restart), then restart the unit.
+                    // No pkill, no socket/pid clearing, and the GUI never
+                    // launches a server: if the unit isn't installed the user
+                    // is told to run install-service.sh.
+                    match install_server_binary(&manifest_dir) {
+                        Ok(dest) => {
+                            let _ = tx.send(BuildEvent::Line(
+                                ConsoleLevel::Info,
+                                format!("installed server binary → {}", dest.display()),
+                            ));
+                            let restart = std::process::Command::new("systemctl")
+                                .args(["--user", "restart", "yalda-session-server"])
+                                .status();
+                            match restart {
+                                Ok(s) if s.success() => {
+                                    let _ = tx.send(BuildEvent::Line(
+                                        ConsoleLevel::Info,
+                                        "systemctl --user restart yalda-session-server: ok"
+                                            .to_string(),
+                                    ));
+                                }
+                                Ok(s) => {
+                                    let _ = tx.send(BuildEvent::Finished(Err(format!(
+                                        "systemctl restart failed ({s}); is the unit \
+                                         installed? run ./install-service.sh once"
+                                    ))));
+                                    return;
+                                }
+                                Err(error) => {
+                                    let _ = tx.send(BuildEvent::Finished(Err(format!(
+                                        "could not run systemctl: {error}"
+                                    ))));
+                                    return;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            let _ = tx.send(BuildEvent::Finished(Err(format!(
+                                "could not install server binary: {error}"
+                            ))));
+                            return;
+                        }
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(300));
-                    let _ = std::fs::remove_file(yalda::session_proto::socket_path());
-                    let _ = std::fs::remove_file(yalda::session_proto::pid_file_path());
                 }
                 let _ = tx.send(BuildEvent::Finished(Ok(())));
             }
@@ -397,6 +430,25 @@ pub(crate) fn spawn_self_build(
         }
     });
     rx
+}
+
+/// Atomically publish the just-built release server binary to the stable
+/// installed path the systemd unit executes (`~/.local/bin`), mirroring
+/// deploy-server.sh: copy to a temp name, then rename over the destination so
+/// the running service's mapped inode is never truncated mid-copy.
+#[cfg(not(test))]
+fn install_server_binary(manifest_dir: &str) -> std::io::Result<PathBuf> {
+    let built = PathBuf::from(manifest_dir).join("target/release/yalda-session-server");
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| std::io::Error::other("no HOME"))?;
+    let bin_dir = home.join(".local/bin");
+    std::fs::create_dir_all(&bin_dir)?;
+    let dest = bin_dir.join("yalda-session-server");
+    let staged = bin_dir.join("yalda-session-server.new");
+    std::fs::copy(&built, &staged)?;
+    std::fs::rename(&staged, &dest)?;
+    Ok(dest)
 }
 
 fn console_log_path() -> Option<PathBuf> {

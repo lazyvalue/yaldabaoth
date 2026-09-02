@@ -313,8 +313,9 @@ enum Command {
     },
 }
 
-/// CLI: with no subcommand the binary runs the server (the default the GUI
-/// auto-launches); subcommands manage launchd supervision.
+/// CLI: with no subcommand the binary runs the server (started by its
+/// supervisor — the systemd user service on Linux, launchd on macOS; the GUI
+/// never launches it); subcommands manage launchd supervision.
 #[derive(clap::Parser)]
 #[command(
     name = "yalda-session-server",
@@ -323,6 +324,12 @@ enum Command {
 struct Cli {
     #[command(subcommand)]
     command: Option<Subcmd>,
+    /// Skip the Highlander guard (the startup refusal when any other
+    /// yalda-session-server process exists for this user). For tests and
+    /// deliberate side-by-side runs on private sockets only — two servers
+    /// against the same socket/WAL home is exactly the bug-0064 split-brain.
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(clap::Subcommand)]
@@ -3827,6 +3834,44 @@ fn raise_open_file_limit() -> io::Result<(libc::rlim_t, libc::rlim_t)> {
     Ok((old, limit.rlim_cur))
 }
 
+/// Every OTHER process on this box (any path, any build) whose executable is
+/// named `yalda-session-server`, as `(pid, exe)` pairs. Linux-only evidence
+/// source (`/proc`); on other platforms this returns empty and the Highlander
+/// guard is a no-op (macOS runs under launchd's single-instance supervision).
+///
+/// Matching is by `/proc/<pid>/exe` basename — with a ` (deleted)` suffix
+/// tolerated, so a server still running an unlinked (since-reinstalled) binary
+/// is caught too; that stale-binary survivor is precisely the 2026-09-01
+/// split-brain culprit. Foreign-user procs fail the readlink and are skipped.
+fn other_session_server_processes() -> Vec<(u32, String)> {
+    let me = std::process::id();
+    let mut hits = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return hits;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        if pid == me {
+            continue;
+        }
+        let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
+            continue;
+        };
+        let exe = exe.to_string_lossy().into_owned();
+        let base = exe
+            .trim_end_matches(" (deleted)")
+            .rsplit('/')
+            .next()
+            .unwrap_or("");
+        if base == "yalda-session-server" {
+            hits.push((pid, exe));
+        }
+    }
+    hits
+}
+
 #[tokio::main]
 async fn main() -> io::Result<()> {
     // Structured logging FIRST, before any other work. Route to STDERR (the
@@ -3868,8 +3913,9 @@ async fn main() -> io::Result<()> {
 
     use clap::Parser;
     // Subcommands manage launchd supervision and exit; no subcommand = run the
-    // server (the default path the GUI auto-launches).
-    if let Some(command) = Cli::parse().command {
+    // server (started by systemd/launchd — the GUI never launches it).
+    let cli = Cli::parse();
+    if let Some(command) = cli.command {
         return match command {
             Subcmd::Install => launchd::install(),
             Subcmd::Uninstall => launchd::uninstall(),
@@ -3901,6 +3947,32 @@ async fn main() -> io::Result<()> {
                 }
             }
         };
+    }
+
+    // Highlander guard (bug-0064 recurrence): refuse to boot while ANY other
+    // yalda-session-server process exists for this user — before the lease,
+    // socket, WALs, or agents are touched. The 2026-09-01 split-brain was a
+    // stale pre-lease binary that a frozen GUI auto-launched; the lease can
+    // only exclude servers that cooperate in taking it, so an explicit process
+    // scan is the belt-and-suspenders that also catches old/foreign builds.
+    // Refusal is a CLEAN exit(0): under systemd `Restart=on-failure` a clean
+    // exit must not respawn-loop (mirrors the socket/lease guards below).
+    if !cli.force {
+        let others = other_session_server_processes();
+        if !others.is_empty() {
+            for (pid, exe) in &others {
+                tracing::warn!(pid, exe = %exe, "found another yalda-session-server process");
+            }
+            tracing::warn!(
+                "refusing to boot: {} other yalda-session-server process(es) running \
+                 (Highlander rule). Stop them (or pass --force for a deliberate \
+                 side-by-side run on a private socket) and start again.",
+                others.len()
+            );
+            return Ok(());
+        }
+    } else {
+        tracing::warn!("--force: skipping the Highlander single-process guard");
     }
 
     let socket_path = socket_path();

@@ -351,6 +351,36 @@ pub(crate) fn with_server_roster_jump_branch<R>(f: impl FnOnce() -> R) -> R {
     r
 }
 
+/// Whether the session-server path is explicitly disabled
+/// (`YALDA_SESSION_SERVER=0` — the legacy direct-spawn opt-out). Tests use the
+/// thread-local seam instead of writing the process-global env var, which
+/// would race every concurrently running test that touches the live-connection
+/// path.
+pub(crate) fn server_path_disabled() -> bool {
+    #[cfg(test)]
+    if FORCE_SERVER_PATH_DISABLED.with(|c| c.get()) {
+        return true;
+    }
+    std::env::var("YALDA_SESSION_SERVER").as_deref() == Ok("0")
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FORCE_SERVER_PATH_DISABLED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with the server path treated as explicitly disabled on this thread
+/// (test-only): `server_missing()` goes false, so e.g. the splash no-server
+/// instruction must not paint.
+#[cfg(test)]
+pub(crate) fn with_server_path_disabled<R>(f: impl FnOnce() -> R) -> R {
+    FORCE_SERVER_PATH_DISABLED.with(|c| c.set(true));
+    let r = f();
+    FORCE_SERVER_PATH_DISABLED.with(|c| c.set(false));
+    r
+}
+
 pub(crate) fn connect_session_server() -> Option<SessionServerClient> {
     // NOTE (clear-worksheet-invisible critique R4): under `cfg(test)` this still
     // falls through to a LIVE `SessionServerClient::connect()` unless a test wraps
@@ -373,8 +403,12 @@ pub(crate) fn connect_session_server() -> Option<SessionServerClient> {
             Some(client)
         }
         Err(e) => {
+            // The GUI NEVER starts a server (ADR-0037; bug-0064 split-brain
+            // recurrence). The splash shows the start-the-server instruction
+            // and the pump retries this connect until the server appears.
             eprintln!(
-                "[yalda-gpui] session server connect failed: {e}; falling back to direct spawn"
+                "[yalda-gpui] no session server reachable ({e}); waiting — start it with: \
+                 systemctl --user start yalda-session-server"
             );
             None
         }
