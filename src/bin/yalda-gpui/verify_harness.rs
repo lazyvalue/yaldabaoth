@@ -13061,6 +13061,10 @@ fn archived_waiting_session_is_removed_from_the_painted_waiting_tab(cx: &mut Tes
     );
     crate::layout_probe_end();
 
+    // UXI-JumpPanel-32 (the k2z declutter): the sidebar no longer renders or
+    // selects archive tabs — the painted panel always shows ordinary
+    // non-archived content, even if a compatibility caller selects Archived.
+    // The archived row must NOT resurrect in paint.
     view.update(vcx, |v, cx| {
         v.select_jump_agent_tab(pid, JumpAgentTab::Archived, cx)
     });
@@ -13068,10 +13072,36 @@ fn archived_waiting_session_is_removed_from_the_painted_waiting_tab(cx: &mut Tes
     view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
     assert!(
-        crate::layout_probe_get("jump-session-row-0").is_some(),
-        "the archived row remains available in Archived"
+        crate::layout_probe_get("jump-session-row-0").is_none(),
+        "the painted sidebar never shows archived content (UXI-JumpPanel-32)"
     );
     crate::layout_probe_end();
+
+    // The archive machinery itself must survive the widget's removal: the
+    // internal Archived projection (kept for Cmd-P / compatibility callers)
+    // still carries the archived session — archive hides, never loses.
+    let archived_rows = view.update(vcx, |v, cx| {
+        let section = v
+            .jump_panel_sections_with_tab(cx, Some(JumpAgentTab::Archived))
+            .0
+            .into_iter()
+            .find(|section| section.id == pid)
+            .expect("project section");
+        section
+            .sessions
+            .into_iter()
+            .map(|(_, row)| (row.label, row.archived))
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        archived_rows.len(),
+        1,
+        "the internal Archived projection retains the session: {archived_rows:?}"
+    );
+    assert!(
+        archived_rows[0].1,
+        "the retained row carries the durable archived flag: {archived_rows:?}"
+    );
 }
 
 /// Unit (jump-reorder): `reorder_move` drops the dragged item into the target's
