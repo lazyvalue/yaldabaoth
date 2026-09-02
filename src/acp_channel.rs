@@ -709,6 +709,42 @@ fn allow_tool_kind(mode: PermissionMode, kind: ToolKind) -> bool {
 /// SDK prompt, so a stale install must fail loud ("no ACP agent on PATH")
 /// rather than silently launch a worse agent.
 pub const DEFAULT_AGENT_FALLBACKS: &[&str] = &["claude-agent-acp"];
+
+/// Claude models Yalda asks `claude-agent-acp` to expose in its model picker.
+/// The adapter resolves aliases, supplies display labels/capabilities, validates
+/// switches, and deduplicates this list before advertising it over ACP.
+const YALDA_CLAUDE_AVAILABLE_MODELS: &[&str] = &[
+    "claude-opus-4-8",
+    "claude-fable-5[1m]",
+    "claude-fable-5-1[1m]",
+    "sonnet",
+];
+
+fn agent_session_meta(
+    provider: AgentProvider,
+    claude_code_append: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    // These are Claude-adapter extensions, not ACP. Codex reads its durable
+    // guidance from AGENTS.md / Codex config, so keep its request neutral.
+    if provider == AgentProvider::Codex {
+        return serde_json::Map::new();
+    }
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        "systemPrompt".to_string(),
+        serde_json::json!({"append": claude_code_append}),
+    );
+    meta.insert(
+        "claudeCode".to_string(),
+        serde_json::json!({
+            "options": {
+                "settingSources": ["user", "project", "local"],
+                "settings": {"availableModels": YALDA_CLAUDE_AVAILABLE_MODELS}
+            }
+        }),
+    );
+    meta
+}
 pub const DEFAULT_CODEX_AGENT_FALLBACKS: &[&str] = &["codex-acp"];
 const CODEX_CONFIG_ENV: &str = "CODEX_CONFIG";
 const CODEX_PATH_ENV: &str = "CODEX_PATH";
@@ -2876,18 +2912,6 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                         body = CLAUDE_CODE_APPEND_BODY,
                     );
                     let agent_meta = || {
-                        // `_meta.claudeCode` and `_meta.systemPrompt.append` are
-                        // Claude-adapter extensions, not ACP. Codex reads its
-                        // durable guidance from AGENTS.md / Codex config, so keep
-                        // its session request provider-neutral.
-                        if provider == AgentProvider::Codex {
-                            return serde_json::Map::new();
-                        }
-                        let mut m = serde_json::Map::new();
-                        m.insert(
-                            "systemPrompt".to_string(),
-                            serde_json::json!({"append": claude_code_append.as_str()}),
-                        );
                         // Pin the SDK's filesystem setting sources so the hosted
                         // agent loads CLAUDE.md + .claude/settings.json (incl. the
                         // `model` pin) exactly like the Claude Code TUI. The
@@ -2896,18 +2920,10 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                         // `...userProvidedOptions` only overrides when the client
                         // sends `_meta.claudeCode.options`), but stating it here
                         // makes yalda's intent durable against an adapter default
-                        // change. We set ONLY `settingSources` under `options` —
-                        // `tools`/`settings` stay unset so they keep the adapter's
-                        // own defaults (preset `claude_code` tools, etc.).
-                        m.insert(
-                            "claudeCode".to_string(),
-                            serde_json::json!({
-                                "options": {
-                                    "settingSources": ["user", "project", "local"]
-                                }
-                            }),
-                        );
-                        m
+                        // change. `settings.availableModels` is the adapter's
+                        // supported, per-session route for augmenting its picker;
+                        // unlike user settings it affects only Yalda sessions.
+                        agent_session_meta(provider, &claude_code_append)
                     };
 
                     // === Bring up a session: try resume first if we were
@@ -3546,6 +3562,38 @@ mod tests {
         }))
         .expect("deserialize incapable initialize response");
         assert!(!supports_native_steering(&incapable));
+    }
+
+    /// Claude sessions carry Yalda's supported model allowlist in the adapter's
+    /// per-session settings tier, so Fable 5.1 is advertised and accepted by the
+    /// real `set_config_option` path. Codex must receive none of this extension.
+    /// Negative control: remove the Fable 5.1 entry (or leak Claude metadata to
+    /// Codex) and the corresponding assertion fails.
+    #[test]
+    fn session_meta_advertises_fable_5_1_only_to_claude() {
+        let meta = agent_session_meta(AgentProvider::Claude, "host guidance");
+        let models = meta["claudeCode"]["options"]["settings"]["availableModels"]
+            .as_array()
+            .expect("Claude availableModels array");
+        assert!(
+            models.iter().any(|model| model == "claude-fable-5-1[1m]"),
+            "Fable 5.1 must reach the adapter's model allowlist: {meta:?}"
+        );
+        let unique: std::collections::HashSet<_> = models.iter().collect();
+        assert_eq!(unique.len(), models.len(), "model ids must not duplicate");
+
+        let request = NewSessionRequest::new(std::path::PathBuf::from("/tmp/x")).meta(meta);
+        let wire = serde_json::to_value(request).expect("serialize session/new request");
+        assert_eq!(
+            wire["_meta"]["claudeCode"]["options"]["settings"]["availableModels"][2],
+            "claude-fable-5-1[1m]",
+            "Fable 5.1 must reach the actual session/new wire payload"
+        );
+
+        assert!(
+            agent_session_meta(AgentProvider::Codex, "ignored").is_empty(),
+            "Claude-specific settings must not leak into Codex sessions"
+        );
     }
 
     /// Pin the installed Codex adapter extension's wire method and camelCase

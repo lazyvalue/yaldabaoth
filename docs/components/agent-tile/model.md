@@ -5,7 +5,7 @@ Facet of the [Agent Tile](README.md) component. Owns `UXI-AgentTile-16`.
 ## Description
 
 A per-session model switcher: each agent session can switch its model live from
-the exact picklist the agent advertises — never a hardcoded list — sourced from
+the picklist the agent advertises, sourced from
 the model `Select` config option the agent returns on `session/new` /
 `session/load`. Switching issues an ACP `session/set_config_option` rather than
 recreating the session, so the conversation is preserved, and the refreshed
@@ -20,19 +20,26 @@ path: the keyboard `space → M → <n>` submenu and clicking the status-strip
 
 ## UX invariants
 
-### UXI-AgentTile-16 — The agent model is switchable per session, from what the agent advertises
+### UXI-AgentTile-16 — The agent model is switchable per session, from what Yalda asks the agent to advertise
 
 **Statement.** Each agent session can switch its model live (Opus / Fable /
-Sonnet / …) from **the exact picklist the agent advertises** — never a hardcoded
-list. The list is the model `Select` config option (id `"model"`, category
+Sonnet / …) from the model picklist the agent advertises. The list is the model
+`Select` config option (id `"model"`, category
 `Model`) the agent returns on `session/new` / `session/load`; yalda parses its
 `current_value` + `options` into `AgentState.available_models` + `agent_model`.
+For Claude sessions, Yalda supplies its supported-model allowlist in the
+per-session `_meta.claudeCode.options.settings.availableModels` tier. This keeps
+the menu Yalda-specific while making `claude-fable-5-1[1m]` (labelled by the
+adapter as Fable 5.1) selectable even before it enters the adapter's default
+picker. Codex and other providers receive no Claude metadata. The adapter
+remains authoritative for validation, labels, ordering, and deduplication.
 Switching issues an ACP `session/set_config_option` for the `model` option (NOT a
 new session — the conversation is preserved); the agent applies it and echoes the
 refreshed selector back, which updates the badge. Three properties:
 
-1. **Agent-sourced, never hardcoded.** The offered models are exactly
-   `available_models`, populated from the advertised `Select.options`. An adapter
+1. **Agent-validated.** The offered models are exactly `available_models`,
+   populated from the advertised `Select.options`. Claude's advertised options
+   may be constrained by Yalda's per-session supported-model allowlist. An adapter
    that surfaces no model selector shows no switcher (plain label, no `▾`).
 2. **Live, conversation-preserving.** A switch is `set_config_option`, applied
    mid-session (even mid-turn); it does not clear or re-create the session. The
@@ -55,8 +62,8 @@ document zoom).
 
 **Why.** The model is a first-class per-task choice (Opus for hard work, Sonnet
 for routine, Fable for the longest runs), and it must reflect what the agent
-actually offers rather than drifting from a hand-maintained list — the agent's
-advertised picklist is the single source of truth.
+actually accepts. The agent's advertised picklist remains the UI source of
+truth; Yalda's Claude-only allowlist is an input to that advertisement.
 
 **Status.** `implemented` (headless for the config parse, reducer capture, dynamic
 menu, and the channel-dispatch; the live ACP `session/set_config_option`
