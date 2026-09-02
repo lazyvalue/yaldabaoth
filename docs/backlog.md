@@ -13,6 +13,19 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Activate the server-lifecycle redesign (bug-0064 RECURRED fix)** —
+  `NEEDS-RUNTIME` (2026-09-01, ADR-0037, Cog graph `f5x`; see
+  [worklog](worklog/2026-09-01-server-lifecycle-highlander.md)). Merged
+  (cfd990a), release built, server binary installed to `~/.local/bin` — but no
+  process was restarted (activation boundary). Scott's steps: kill the five
+  leaked old-binary servers (968767, 1166646, 1281509, 1286826, 1459868 —
+  pids from that session; re-verify before killing) and then the GUI-attached
+  521644, run `./install-service.sh` once, confirm
+  `systemctl --user status yalda-session-server`, and restart the GUI via
+  `./dev-gui.sh` so the running GUI stops carrying the deleted auto-launch
+  code. Live checks: splash instruction with the unit stopped; auto-reattach
+  when it starts; in-app Rebuild&Restart-all goes through systemctl.
+
 - **Stale archived-waiting-tab guard fails on main** — `READY` (found
   2026-09-01 during the agent-header redesign, Cog graph `y8m`; see
   [worklog](worklog/2026-09-01-agent-header-redesign.md)).
