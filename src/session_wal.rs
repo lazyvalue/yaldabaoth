@@ -28,7 +28,12 @@
 //!   is an in-flight stream tail (some `Chunk`s of an unfinished turn)
 //!   truncating.
 //! - Recovery tolerates a torn final line (a partial write interrupted by power
-//!   loss): it is skipped rather than aborting the whole replay.
+//!   loss): it is skipped rather than aborting the whole replay. `reopen`
+//!   REPAIRS a torn final line (terminating it if parseable, truncating it
+//!   away otherwise) before resuming appends, so the next record can never
+//!   land directly after the torn bytes and turn a tolerated torn tail into
+//!   newline-terminated interior corruption — which `recover_one` treats as
+//!   fatal — on the following restart.
 //!
 //! Log compaction / snapshotting is deferred (ADR-0009) until a long session
 //! measurably hurts memory or recovery latency; until then the full log is
@@ -68,9 +73,15 @@ enum WalRecord {
     /// transcript events, so they are persisted as their own record rather than
     /// pushed through the event_log — which keeps them out of the replay stream
     /// and immune to event-log compaction. `recover_one` applies the LAST
-    /// rename over the header label. Older binaries that don't know this variant
-    /// skip it on the `serde` error path and fall back to the header label
-    /// (graceful downgrade), so no version bump is needed.
+    /// rename over the header label.
+    ///
+    /// Current policy: under the strict reader, an unknown variant on a
+    /// newline-terminated line is a FATAL startup error (durable interior
+    /// corruption), not a skippable graceful-downgrade path — there is no
+    /// "older binaries silently ignore it" escape hatch anymore. Any
+    /// additive record variant, this one included, therefore requires a
+    /// `WAL_VERSION` bump; an older binary fails closed on a newer-format
+    /// record instead of silently ignoring it.
     Rename {
         label: String,
     },
@@ -142,13 +153,53 @@ fn lock_writer(file: &File, path: &Path) -> std::io::Result<()> {
         return Ok(());
     }
     let source = std::io::Error::last_os_error();
+    // Preserve whatever `flock` actually failed with (e.g. ENOLCK, EBADF)
+    // instead of flattening every failure to WouldBlock; the real-contention
+    // case (EWOULDBLOCK/EAGAIN) still maps to `ErrorKind::WouldBlock` via the
+    // platform's standard errno→kind mapping, so existing callers are unaffected.
+    let kind = source.kind();
     Err(std::io::Error::new(
-        std::io::ErrorKind::WouldBlock,
+        kind,
         format!(
             "WAL {} already has a live writer; refusing concurrent access: {source}",
             path.display()
         ),
     ))
+}
+
+/// Repair a torn (unterminated) final line left by a crash mid-append, so a
+/// subsequent `append` cannot land directly after it and glue the next
+/// record onto the torn bytes — which would turn a tolerated torn tail into
+/// newline-terminated interior corruption (fatal on the next `recover_one`).
+///
+/// Only ever touches bytes after the LAST `\n` in the file — exactly the
+/// bytes `recover_one` already either accepts (a parseable unterminated
+/// final record) or discards (an unparseable one), so this repairs the file
+/// to match what recovery already keeps rather than losing anything new.
+fn repair_torn_tail(file: &mut File, path: &Path) -> std::io::Result<()> {
+    let contents = std::fs::read(path)?;
+    if contents.is_empty() || contents.last() == Some(&b'\n') {
+        return Ok(()); // nothing torn: empty file, or already newline-terminated
+    }
+    let tail_start = contents
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |newline_pos| newline_pos + 1);
+    let tail = &contents[tail_start..];
+    if serde_json::from_slice::<WalRecord>(tail).is_ok() {
+        // The tail is a complete, parseable record simply missing its
+        // trailing newline (the crash landed between `write_all` and the
+        // NEXT append's write). `recover_one` already accepts this shape as
+        // the final line, so terminating it changes nothing recovery keeps.
+        file.write_all(b"\n")?;
+    } else {
+        // The tail is genuinely torn mid-record. The durability contract
+        // already declares these bytes lost (recovery stops here and drops
+        // them), so truncating is not new data loss — it just prevents the
+        // next append from being silently concatenated onto them.
+        file.set_len(tail_start as u64)?;
+    }
+    file.sync_data()
 }
 
 impl SessionWal {
@@ -206,9 +257,22 @@ impl SessionWal {
 
     /// Re-open an existing WAL in append mode after recovery, so the restored
     /// session keeps logging to the same file.
+    ///
+    /// Before returning the handle, repairs a torn (unterminated) final line
+    /// left by a crash mid-append: `recover_one` tolerates such a line by
+    /// keeping the intact prefix, but a plain append would land the next
+    /// record directly after the torn bytes, producing ONE newline-terminated
+    /// malformed line — which the next recovery treats as fatal durable
+    /// interior corruption instead of a tolerable torn tail. See
+    /// `repair_torn_tail`.
     pub fn reopen(path: PathBuf) -> std::io::Result<SessionWal> {
-        let file = OpenOptions::new().append(true).open(&path)?;
+        // `.read(true)` so the repair scan below can read back what's on disk
+        // through the same handle's underlying file; `.append(true)` keeps
+        // every subsequent write landing at the true end regardless of the
+        // read position (O_APPEND).
+        let mut file = OpenOptions::new().read(true).append(true).open(&path)?;
         lock_writer(&file, &path)?;
+        repair_torn_tail(&mut file, &path)?;
         Ok(SessionWal { file, path })
     }
 
@@ -372,9 +436,19 @@ pub fn recover_each(dir: &Path, mut visit: impl FnMut(RecoveredSession)) {
 }
 
 /// Strict production recovery. Unlike [`recover_each`], this never turns a WAL
-/// problem into a missing session: one unreadable, unsupported, headerless, or
-/// corrupt file fails the whole startup recovery while leaving every file
-/// untouched. A server must not advertise an incomplete roster as success.
+/// problem into a MISSING session: one unreadable, unsupported, or corrupt
+/// file fails the whole startup recovery while leaving every file untouched —
+/// a server must not advertise an incomplete roster as success.
+///
+/// The one deliberate exception is a headerless file (`recover_one` returning
+/// `Ok(None)`): that shape is produced only by a create-crash artifact — a
+/// zero-byte file (crash between `create_new` and the header write) or a
+/// file torn mid-write on its very first line — and carries no recoverable
+/// data either way. Failing the ENTIRE roster over a file with nothing to
+/// lose is pure availability loss, so it is skipped with a visible warning
+/// instead. Newline-terminated garbage (durable interior corruption) is
+/// unaffected: `recover_one` still returns `Err` for that, which still
+/// aborts the whole recovery via `?` below.
 pub fn try_recover_each(
     dir: &Path,
     mut visit: impl FnMut(RecoveredSession) -> std::io::Result<()>,
@@ -392,13 +466,16 @@ pub fn try_recover_each(
         if path.extension().and_then(|extension| extension.to_str()) != Some("log") {
             continue;
         }
-        let session = recover_one(&path)?.ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("WAL is empty or headerless: {}", path.display()),
-            )
-        })?;
-        visit(session)?;
+        match recover_one(&path)? {
+            Some(session) => visit(session)?,
+            None => {
+                eprintln!(
+                    "[session-wal] skipping {}: empty or headerless (create-crash artifact, \
+                     no recoverable data)",
+                    path.display()
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -890,6 +967,70 @@ mod tests {
     }
 
     #[test]
+    fn strict_recovery_skips_headerless_create_crash_artifacts_instead_of_failing_the_roster() {
+        // A zero-byte file is exactly what a crash between `create_new` and
+        // the header write leaves behind: no header, no data, nothing
+        // recoverable. Unlike durable interior corruption (a newline-
+        // terminated malformed line), there is nothing to lose by skipping
+        // it — failing the WHOLE roster over it is pure availability loss.
+        let dir = tmp_dir("headerless-skip");
+        std::fs::create_dir_all(&dir).unwrap();
+        let empty_path = wal_path(&dir, "00-empty-create-crash");
+        std::fs::write(&empty_path, b"").unwrap();
+        SessionWal::create(
+            &dir,
+            "99-valid",
+            "the only real session",
+            Path::new("/tmp"),
+            PermissionMode::Yolo,
+        )
+        .unwrap();
+
+        let mut visited = Vec::new();
+        try_recover_each(&dir, |session| {
+            visited.push(session.server_session_id);
+            Ok(())
+        })
+        .expect("a headerless create-crash artifact must not fail the whole roster");
+        assert_eq!(
+            visited,
+            vec!["99-valid".to_string()],
+            "exactly the valid session must be visited"
+        );
+        // The artifact itself is left completely untouched.
+        assert_eq!(std::fs::read(&empty_path).unwrap(), b"");
+    }
+
+    #[test]
+    fn strict_recovery_skips_torn_unterminated_header_only_artifact() {
+        // A crash mid-write on the very first line: torn, unterminated, and
+        // unparseable as a header. `recover_one` returns `Ok(None)` for this
+        // (same as empty) — no header ever landed, so nothing is recoverable.
+        let dir = tmp_dir("headerless-torn-skip");
+        std::fs::create_dir_all(&dir).unwrap();
+        let torn_path = wal_path(&dir, "00-torn-header-only");
+        let torn_bytes = b"{\"t\":\"header\",\"version\":3,\"server_sess".to_vec();
+        std::fs::write(&torn_path, &torn_bytes).unwrap();
+        SessionWal::create(
+            &dir,
+            "99-valid",
+            "the only real session",
+            Path::new("/tmp"),
+            PermissionMode::Yolo,
+        )
+        .unwrap();
+
+        let mut visited = Vec::new();
+        try_recover_each(&dir, |session| {
+            visited.push(session.server_session_id);
+            Ok(())
+        })
+        .expect("a torn header-only artifact must not fail the whole roster");
+        assert_eq!(visited, vec!["99-valid".to_string()]);
+        assert_eq!(std::fs::read(&torn_path).unwrap(), torn_bytes);
+    }
+
+    #[test]
     fn reopen_appends_to_existing() {
         let dir = tmp_dir("reopen");
         let path = {
@@ -905,6 +1046,89 @@ mod tests {
         }
         let recovered = recover_all(&dir);
         assert_eq!(recovered[0].event_log.len(), 2);
+    }
+
+    #[test]
+    fn reopen_truncates_unparseable_torn_tail_so_later_recovery_survives() {
+        // The two-restart poison sequence this guards: (1) a crash mid-append
+        // leaves an unterminated, unparseable torn final line — tolerated by
+        // `recover_one` (prefix kept). (2) The server restarts, recovers the
+        // session, and `reopen`s the WAL. A plain append-mode open would land
+        // the NEXT record directly after the torn bytes, producing one
+        // newline-terminated MALFORMED line. (3) The next restart's
+        // `recover_one` would then hard-error ("malformed WAL record"),
+        // which `try_recover_each` turns into a fatal, whole-server-refuses-
+        // to-start error. `reopen`'s repair must truncate the unparseable
+        // torn tail so step (3) never happens.
+        let dir = tmp_dir("torn-tail-unparseable");
+        let path = {
+            let mut wal =
+                SessionWal::create(&dir, "s5", "l", Path::new("/tmp"), PermissionMode::Yolo)
+                    .unwrap();
+            wal.append(&chunk("good-one"), true).unwrap();
+            wal.path().to_path_buf()
+        };
+        // Hand-append a torn, unparseable record (no trailing newline).
+        {
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(b"{\"t\":\"event\",\"Event\":{\"type\":\"reply_ev")
+                .unwrap();
+        }
+        // First restart's recovery: tolerated, prefix kept.
+        let first = recover_one(&path)
+            .expect("a torn unparseable tail must not be fatal")
+            .expect("the header + good event must still recover");
+        assert_eq!(first.event_log.len(), 1);
+
+        // `reopen` (as the restarted server does) must repair the torn tail
+        // before the caller appends the next record.
+        {
+            let mut wal = SessionWal::reopen(path.clone()).unwrap();
+            wal.append(&chunk("good-two"), true).unwrap();
+        }
+
+        // Second restart's recovery must succeed cleanly with BOTH good
+        // events and no error — the poison sequence is broken.
+        let second = recover_one(&path)
+            .expect("repaired WAL must recover without error on the next restart")
+            .expect("session must still be present");
+        assert_eq!(second.event_log.len(), 2);
+    }
+
+    #[test]
+    fn reopen_terminates_parseable_unterminated_tail_and_keeps_it() {
+        // A torn tail that happens to be a COMPLETE, parseable record just
+        // missing its trailing newline (crash landed between the write and
+        // the newline, or between two back-to-back appends) — `recover_one`
+        // already accepts this as the final line, so `reopen`'s repair must
+        // terminate (not discard) it, and recovery must keep it.
+        let dir = tmp_dir("torn-tail-parseable");
+        let path = {
+            let wal = SessionWal::create(&dir, "s6", "l", Path::new("/tmp"), PermissionMode::Yolo)
+                .unwrap();
+            wal.path().to_path_buf()
+        };
+        let unterminated = serde_json::to_string(&WalRecord::Event(chunk("no-newline-yet")))
+            .unwrap()
+            .into_bytes();
+        {
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(&unterminated).unwrap();
+        }
+        assert_ne!(
+            std::fs::read(&path).unwrap().last(),
+            Some(&b'\n'),
+            "test setup must actually leave the tail unterminated"
+        );
+
+        {
+            let mut wal = SessionWal::reopen(path.clone()).unwrap();
+            wal.append(&chunk("after"), true).unwrap();
+        }
+
+        let recovered = recover_one(&path).unwrap().unwrap();
+        // Both the repaired-and-kept event and the newly appended one survive.
+        assert_eq!(recovered.event_log.len(), 2);
     }
 
     #[test]

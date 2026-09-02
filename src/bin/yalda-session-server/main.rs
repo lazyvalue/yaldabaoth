@@ -542,13 +542,8 @@ fn compact_event_log(
 /// every valid WAL event must be available to the first attaching client. Live
 /// appends may compact only after subscribers have advanced their floors, but
 /// startup must never replace durable history with a synthetic summary.
-fn event_log_from_recovery(
-    entries: Vec<Notification>,
-    _session_id: &str,
-    _generation: u64,
-    _cap: usize,
-) -> (yalda::event_log::EventLog, usize) {
-    (yalda::event_log::EventLog::from_recovered(entries, 0), 0)
+fn event_log_from_recovery(entries: Vec<Notification>) -> yalda::event_log::EventLog {
+    yalda::event_log::EventLog::from_recovered(entries, 0)
 }
 
 impl ManagedSession {
@@ -1358,8 +1353,7 @@ fn restore_seed_from_disk(
         // to the first client. `log_base == 0`, so every persisted event keeps
         // its append-order position. Steady-state compaction resumes only after
         // attached clients have consumed this recovered prefix.
-        let (event_log, recovered_dropped) =
-            event_log_from_recovery(rs.event_log, &sid, 0, yalda::event_log::event_log_cap());
+        let event_log = event_log_from_recovery(rs.event_log);
         // Seed the watch with the recovered log so the first tail sees history.
         let (log_tx, _) = watch::channel(LogSnapshot {
             log: event_log.clone(),
@@ -1416,7 +1410,6 @@ fn restore_seed_from_disk(
         tracing::info!(
             session_id = %&sid[..8.min(sid.len())],
             events = session.event_log.len(),
-            recovered_dropped,
             turns = rs.turns,
             acp_session_id = %acp_session_id.as_deref().unwrap_or("<none>"),
             archived = rs.archived,
@@ -3942,7 +3935,7 @@ async fn main() -> io::Result<()> {
     }
     server_lease.set_len(0)?;
     server_lease.rewind()?;
-    write!(server_lease, "{}\n", std::process::id())?;
+    writeln!(server_lease, "{}", std::process::id())?;
     server_lease.sync_data()?;
 
     // Single-instance guard. If a server is ALREADY listening on this socket,
@@ -4238,9 +4231,8 @@ mod lifecycle_tests {
                     ),
                 });
             }
-            let (log, dropped) = event_log_from_recovery(entries, sid, 0, 8);
+            let log = event_log_from_recovery(entries);
 
-            assert_eq!(dropped, 0, "restart recovery must not drop durable events");
             assert_eq!(log.len(), 20, "every WAL event must reach first attach");
             assert_eq!(log.log_base(), 0, "full replay starts at the durable base");
             assert_eq!(log.tip_seq(), 20, "compaction keeps the logical tip stable");
