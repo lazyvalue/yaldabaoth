@@ -477,49 +477,69 @@ extraction + its Markdown (not Json) planning — NC observed RED by deleting th
 
 ### UXI-AgentTile-28 — The tile always says whether the agent is working or ready
 
-**Statement.** The agent tile's activity row always carries a fixed-width status
-pill. It uses compact header-specific vocabulary:
+**Statement.** The agent tile header always says whether the agent is working
+or ready, twice, in the same color: a haloed **status dot** at the head of the
+identity deck and a fixed-slot **state word** at the head of the activity deck.
+Compact header-specific vocabulary:
 
-| Condition | Pill |
+| Condition | Dot + word |
 |---|---|
-| A reply is in flight (`turn_phase.is_awaiting()`) | **`* working`** in `agent.jump_working` orange |
-| Idle, including a brand-new session | **`+ ready`** in `agent.tool_completed` green |
+| A reply is in flight (`turn_phase.is_awaiting()`) | **`working`** in `agent.jump_working` orange |
+| Idle, including a brand-new session | **`ready`** in `agent.tool_completed` green |
 
-The pill is 88px wide in both states, followed by `turn N · M:SS` and the
-conditional `■ Stop ⌘.` button. The editing readout does not duplicate activity
-with an `awaiting reply` suffix.
+The state word owns a fixed `AGENT_ACTIVITY_STATE_WIDTH` (52px) slot in both
+states, followed by `turn N · M:SS` and the conditional `■ stop ⌘.` chip. The
+header's bottom hairline carries the same state color. The editing readout does
+not duplicate activity with an `awaiting reply` suffix.
 
 **Applies to.** `screens.rs`: `agent_header_activity` and `render_agent`'s
-`agent-status-pill`.
+`agent-status-pill` probe (the state-word slot).
 
 **Why.** With a wall of transcript above it, the only "the agent is running" signals
 were a dim status-strip suffix and an elapsed clock — easy to miss, and there was no
-positive "it's finished, it's on you" signal at all. One loud, colored, worded pill
-in a fixed place answers both questions without reading the transcript.
+positive "it's finished, it's on you" signal at all. A colored, worded state in a
+fixed place answers both questions without reading the transcript; the fixed slot
+keeps the timer from shifting when the state flips.
 
 **Status.** `implemented`.
 
 **Enforcement.** `verify_harness.rs::agent_tile_paints_a_status_pill_while_working`
 — layout probe `"agent-status-pill"` on the real `render_agent`: present on a
 virgin session and exactly the same width after entering the working state. The
-word/glyph mapping is pinned by
+word mapping is pinned by
 `agent_header_uses_compact_activity_and_transient_editor_vocabulary`.
 
-### UXI-AgentTile-31 — Header information has stable semantic rows
+### UXI-AgentTile-31 — Header information has two stable decks
 
-**Statement.** Header information renders in this order: identity/model/
-permission/transient compose state; activity/turn/stop with optional context
-usage; linked worktree name or working directory. Each group owns a row. Rows
-may wrap their own contents on narrow tiles and remain unaffected by document
-zoom.
+**Statement.** The header is two compact decks, in this order:
+
+1. **Identity deck** — status dot · session label (truncates with an ellipsis
+   so chips never clip) · model chip (`▾`, opens the model picker) ·
+   **exception-based permission chip**: the permissive default (Yolo) renders
+   *nothing*; a restricted mode (`read-only` / `auto-edit` / `ask-each`) wears
+   an amber chip. `perm: yolo` on every session was noise.
+2. **Activity deck** — fixed-slot state word · `turn N · M:SS` (suppressed on a
+   virgin session — no `turn 0`) · `■ stop ⌘.` chip while working · transient
+   compose state (`•`/`EXT`) · context meter (slim bar + percent; a
+   `NNk left` figure joins only at ≥85% full; session cost `$X.XX` when the
+   provider reports one) · location, right-aligned — linked worktree name as
+   `in <name>` (emphasized), otherwise the shortened cwd with no `CWD` label.
+
+Deck 2 wraps whole clusters on narrow tiles; both decks are unaffected by
+document zoom.
 
 **Applies to.** `screens.rs::render_agent` (`identity_row`, `activity_row`,
-usage meter, `location_row`, and `header`).
+usage meter, location, and `header`); `agent_header_permission_label`.
 
 **Status.** `implemented`.
 
 **Enforcement.** `verify_harness.rs::agent_usage_paints_on_the_activity_header_line`
-paints real usage state and proves identity → activity+usage → location order.
+paints real usage state and proves identity-deck → activity-deck order with the
+meter and location contained on the activity deck.
+`agent_permission_chip_paints_only_when_restricted` probes the chip absent under
+the Yolo default and painted on the identity deck under `ReadOnly` (negative
+control: always-show reverted ⇒ observed RED). Copy pinned by
+`agent_header_uses_compact_activity_and_transient_editor_vocabulary`.
 
 ### UXI-AgentTile-34 — `V`/`v` select agent text in the worksheet transcript
 

@@ -11177,11 +11177,28 @@ fn agent_row_marks_name_the_live_states() {
 
 #[test]
 fn agent_header_uses_compact_activity_and_transient_editor_vocabulary() {
+    assert_eq!(crate::screens::agent_header_activity(true), "working");
+    assert_eq!(crate::screens::agent_header_activity(false), "ready");
+
+    // Exception-based permission copy: the permissive default (Yolo) says
+    // nothing; only a restricted agent earns a chip (UXI-AgentTile-31).
+    use yalda::acp_channel::PermissionMode;
     assert_eq!(
-        crate::screens::agent_header_activity(true),
-        ("*", "working")
+        crate::screens::agent_header_permission_label(PermissionMode::Yolo),
+        None
     );
-    assert_eq!(crate::screens::agent_header_activity(false), ("+", "ready"));
+    assert_eq!(
+        crate::screens::agent_header_permission_label(PermissionMode::ReadOnly),
+        Some("read-only")
+    );
+    assert_eq!(
+        crate::screens::agent_header_permission_label(PermissionMode::AutoEdit),
+        Some("auto-edit")
+    );
+    assert_eq!(
+        crate::screens::agent_header_permission_label(PermissionMode::AskEachTime),
+        Some("ask-each")
+    );
 
     assert_eq!(crate::screens::agent_editing_status_label(false, false), "");
     assert_eq!(crate::screens::agent_editing_status_label(true, false), "•");
@@ -11232,8 +11249,8 @@ fn agent_location_names_linked_worktrees_else_cwd() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// The Agent Tile activity pill is always painted and keeps exactly the same
-/// width when it changes from `+ ready` to `* working`.
+/// The Agent Tile activity state word is always painted and keeps exactly the
+/// same slot width when it changes from `ready` to `working`.
 #[gpui::test]
 fn agent_tile_paints_a_status_pill_while_working(cx: &mut TestAppContext) {
     let (view, vcx, id, _session) = boot_with_transcript(cx);
@@ -11243,11 +11260,11 @@ fn agent_tile_paints_a_status_pill_while_working(cx: &mut TestAppContext) {
     view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
     let ready = crate::layout_probe_get("agent-status-pill")
-        .expect("a virgin session must paint its ready pill");
+        .expect("a virgin session must paint its ready state word");
     crate::layout_probe_end();
     assert!(
-        (ready.2 - crate::screens::AGENT_ACTIVITY_PILL_WIDTH).abs() < 0.5,
-        "ready pill has the fixed width: {ready:?}"
+        (ready.2 - crate::screens::AGENT_ACTIVITY_STATE_WIDTH).abs() < 0.5,
+        "ready state word has the fixed slot width: {ready:?}"
     );
 
     // A reply in flight changes the state, never the geometry.
@@ -11261,14 +11278,53 @@ fn agent_tile_paints_a_status_pill_while_working(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     let working = crate::layout_probe_get("agent-status-pill");
     crate::layout_probe_end();
-    let (_, _, w, h) = working.expect("the working pill must paint while a reply is in flight");
+    let (_, _, w, h) = working.expect("the working state word must paint while a reply is in flight");
     assert!(
         (w - ready.2).abs() < 0.5 && h > 6.0,
-        "ready and working pills must share a fixed width: ready={ready:?}, working={working:?}"
+        "ready and working state words must share a fixed slot: ready={ready:?}, working={working:?}"
     );
 }
 
-/// The context-window usage meter joins the activity header line.
+/// The permission chip is exception-based: the permissive default (Yolo)
+/// paints NO chip; a restricted session paints one (UXI-AgentTile-31).
+#[gpui::test]
+fn agent_permission_chip_paints_only_when_restricted(cx: &mut TestAppContext) {
+    let (view, vcx, id, _session) = boot_with_transcript(cx);
+
+    // Default (Yolo): no chip anywhere in the header.
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let default_chip = crate::layout_probe_get("agent-permission-chip");
+    crate::layout_probe_end();
+    assert!(
+        default_chip.is_none(),
+        "the permissive default must not wear a permission chip: {default_chip:?}"
+    );
+
+    // A restricted session wears the chip on the identity deck.
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| {
+            c.permission_mode = yalda::acp_channel::PermissionMode::ReadOnly;
+        });
+    });
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let chip = crate::layout_probe_get("agent-permission-chip");
+    let identity = crate::layout_probe_get("agent-status-row");
+    crate::layout_probe_end();
+    let (cx_, cy, cw, ch) = chip.expect("a read-only session must paint its permission chip");
+    let (ix, iy, iw, ih) = identity.expect("identity deck paints");
+    assert!(cw > 10.0 && ch > 6.0, "chip has real size: {cw}x{ch}");
+    assert!(
+        cy >= iy - 0.5 && cy + ch <= iy + ih + 0.5 && cx_ >= ix && cx_ + cw <= ix + iw + 0.5,
+        "the chip lives on the identity deck: chip=({cx_},{cy},{cw},{ch}), deck=({ix},{iy},{iw},{ih})"
+    );
+}
+
+/// The context meter and the location both live on the activity deck, below
+/// the identity deck (UXI-AgentTile-31's two-deck order).
 #[gpui::test]
 fn agent_usage_paints_on_the_activity_header_line(cx: &mut TestAppContext) {
     let (view, vcx, id, _session) = boot_with_transcript(cx);
@@ -11285,28 +11341,31 @@ fn agent_usage_paints_on_the_activity_header_line(cx: &mut TestAppContext) {
     crate::layout_probe_begin();
     view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
-    let status = crate::layout_probe_get("agent-status-row").expect("primary status row paints");
-    let activity = crate::layout_probe_get("agent-activity-row").expect("activity row paints");
-    let usage = crate::layout_probe_get("agent-usage-row").expect("usage row paints");
-    let location = crate::layout_probe_get("agent-location-row").expect("location row paints");
+    let status = crate::layout_probe_get("agent-status-row").expect("identity deck paints");
+    let activity = crate::layout_probe_get("agent-activity-row").expect("activity deck paints");
+    let usage = crate::layout_probe_get("agent-usage-row").expect("usage meter paints");
+    let location = crate::layout_probe_get("agent-location-row").expect("location paints");
     crate::layout_probe_end();
 
     assert!(
         activity.1 >= status.1 + status.3 - 0.5,
-        "activity must start below identity: status={status:?}, activity={activity:?}"
+        "activity deck must start below identity: status={status:?}, activity={activity:?}"
+    );
+    for (name, el) in [("usage", usage), ("location", location)] {
+        assert!(
+            el.1 >= activity.1 - 0.5 && el.1 + el.3 <= activity.1 + activity.3 + 0.5,
+            "{name} must be vertically contained by the activity deck: \
+             activity={activity:?}, {name}={el:?}"
+        );
+    }
+    assert!(
+        usage.2 > 60.0 && usage.3 > 4.0,
+        "usage meter has real size: {usage:?}"
     );
     assert!(
-        usage.1 >= activity.1 - 0.5 && usage.1 + usage.3 <= activity.1 + activity.3 + 0.5,
-        "usage must be vertically contained by the activity line: \
-         activity={activity:?}, usage={usage:?}"
-    );
-    assert!(
-        location.1 >= activity.1 + activity.3 - 0.5,
-        "location must start below activity: activity={activity:?}, location={location:?}"
-    );
-    assert!(
-        usage.2 > 100.0 && usage.3 > 6.0,
-        "usage line has real size: {usage:?}"
+        location.0 >= usage.0 + usage.2 - 0.5,
+        "location sits right of the usage meter on a wide tile: \
+         usage={usage:?}, location={location:?}"
     );
 }
 

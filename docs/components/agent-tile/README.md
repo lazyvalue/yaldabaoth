@@ -79,7 +79,7 @@ strip**, the **transcript** (a cached child, `TranscriptView`), the **compose** 
 | UXI-AgentTile-27 | naming | A session names + summarizes itself once; an explicit rename wins forever | implemented |
 | UXI-AgentTile-28 | transcript | The tile says whether the agent is working or waiting on you | implemented |
 | UXI-AgentTile-30 | providers | Claude and Codex sessions coexist with durable provider identity | implemented |
-| UXI-AgentTile-31 | transcript | Narrow tiles wrap header chrome; usage owns a line | implemented |
+| UXI-AgentTile-31 | transcript | Two-deck header; exception-based permission chip; meter+location on the activity deck | implemented |
 | UXI-AgentTile-32 | picker | Archived sessions never appear in the session picker | implemented |
 | UXI-AgentTile-33 | session-binding | Tagging a session opens a two-column add/remove dialog | implemented |
 | UXI-AgentTile-34 | session-binding | Session selection and workspace ownership are independent | implemented |

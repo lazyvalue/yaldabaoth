@@ -74,9 +74,10 @@ fn push_edit_render_line(line_idx: usize, text: &str, segs: &[Segment], code_bg:
     });
 }
 
-/// Stable width for both Agent Tile activity states. `* working` and `+ ready`
-/// must not shove the turn timer sideways when a reply starts or finishes.
-pub(crate) const AGENT_ACTIVITY_PILL_WIDTH: f32 = 88.0;
+/// Stable slot width for both Agent Tile activity state words. `working` and
+/// `ready` must not shove the turn timer sideways when a reply starts or
+/// finishes.
+pub(crate) const AGENT_ACTIVITY_STATE_WIDTH: f32 = 52.0;
 
 /// Only transient compose state belongs in the Agent Tile header. Editor mode
 /// and cursor position stay in the editor itself.
@@ -90,8 +91,22 @@ pub(crate) fn agent_editing_status_label(dirty: bool, extend: bool) -> &'static 
 }
 
 /// Compact header activity vocabulary, always shown even on a new session.
-pub(crate) fn agent_header_activity(working: bool) -> (&'static str, &'static str) {
-    if working { ("*", "working") } else { ("+", "ready") }
+/// The glyph half of the old `* working` / `+ ready` pill is gone — the
+/// identity deck's colored dot carries the glanceable signal now.
+pub(crate) fn agent_header_activity(working: bool) -> &'static str {
+    if working { "working" } else { "ready" }
+}
+
+/// Exception-based permission chip copy: the permissive default (Yolo) prints
+/// nothing — a chip appears only when the agent is RESTRICTED, which is the
+/// state worth noticing at a glance. `perm: yolo` on every session was noise.
+pub(crate) fn agent_header_permission_label(
+    mode: yalda::acp_channel::PermissionMode,
+) -> Option<&'static str> {
+    match mode {
+        yalda::acp_channel::PermissionMode::Yolo => None,
+        restricted => Some(restricted.short_label()),
+    }
 }
 
 /// Cool neutral copy for the Agent Tile header. In particular, Folio's `dim`
@@ -1081,7 +1096,12 @@ impl YaldaGpuiView {
         let top = self.theme.top_bar;
 
         // ---- Agent header ----
-        // Three semantic rows: identity/editor, live activity + usage, location.
+        // Two compact decks over a state-tinted hairline (UXI-AgentTile-31):
+        //   deck 1 (identity): live-state dot · session label (truncating) ·
+        //     model chip · restricted-permission chip (exception-based — the
+        //     permissive default renders nothing);
+        //   deck 2 (activity): fixed-slot state word · turn/timer · stop ·
+        //     transient compose state · context meter + cost · location.
         // Cool agent prose colors replace the old gold/tan header accents.
         let supporting: Hsla = nc(agent_header_supporting_text_color(at));
         let muted = supporting.opacity(0.78);
@@ -1089,26 +1109,45 @@ impl YaldaGpuiView {
         let ready_green: Hsla = nc(at.tool_completed);
         let strip_fg = fg_or(top, STATUS_FG);
         let header_bg = bg_or(top, STATUS_BG);
-        let base_row = || {
-            div()
-                .w_full()
-                .flex()
-                .flex_row()
-                .flex_wrap()
-                .items_center()
-                .gap_2()
-                .px_4()
-                .py_1()
-                .min_h(px(27.0))
-                .bg(header_bg)
-                .text_size(px(12.0))
-        };
 
-        // Row 1: session label · model badge · permission badge · editor state.
-        let mut identity_row = base_row()
+        let working = c.turn_phase.is_awaiting();
+        let activity_word = agent_header_activity(working);
+        let activity_color = if working { working_orange } else { ready_green };
+
+        // Deck 1: identity. The haloed dot is the always-on activity beacon
+        // (same color as deck 2's state word); the label truncates so the
+        // right-side chips never clip on narrow tiles.
+        let status_dot = div()
+            .flex_none()
+            .size(px(12.0))
+            .rounded_full()
+            .bg(activity_color.opacity(0.22))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(div().size(px(6.0)).rounded_full().bg(activity_color));
+        let mut identity_row = div()
+            .w_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .pt(px(6.0))
+            .pb(px(2.0))
+            .text_size(px(13.0))
             .text_color(strip_fg)
-            .font_weight(FontWeight::BOLD)
-            .child(SharedString::from(active_slot_label.clone()));
+            .child(status_dot)
+            .child(
+                div()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(SharedString::from(active_slot_label.clone())),
+            )
+            .child(div().flex_1());
 
         let model_label = c
             .agent_model
@@ -1120,20 +1159,20 @@ impl YaldaGpuiView {
             let model_text = if has_models { format!("{model} ▾") } else { model };
             let badge = div()
                 .id("agent-model-badge")
+                .flex_none()
                 .px_2()
-                .py(px(1.0))
+                .py(px(2.0))
                 .rounded_md()
-                .bg(supporting.opacity(0.12))
-                .border_1()
-                .border_color(supporting.opacity(0.38))
+                .bg(supporting.opacity(0.10))
+                .text_size(px(11.0))
                 .text_color(supporting)
-                .font_weight(FontWeight::NORMAL)
+                .font_weight(FontWeight::MEDIUM)
                 .child(SharedString::from(model_text));
             identity_row = if has_models {
                 identity_row.child(probe_bounds(
                     "agent-model-badge",
                     badge
-                        .hover(|s| s.border_color(supporting).bg(supporting.opacity(0.2)))
+                        .hover(|s| s.bg(supporting.opacity(0.2)))
                         .cursor_pointer()
                         .on_click(|_ev, window, cx| {
                             window.dispatch_action(Box::new(crate::OpenLocalMenu), cx);
@@ -1145,59 +1184,41 @@ impl YaldaGpuiView {
             };
         }
 
-        let permission = c.permission_mode;
-        let is_yolo = matches!(permission, yalda::acp_channel::PermissionMode::Yolo);
-        let permission_glyph = if is_yolo { "⚡" } else { "🔒" };
-        let permission_badge = div()
-            .px_2()
-            .py(px(1.0))
-            .rounded_md()
-            .bg(supporting.opacity(0.11))
-            .border_1()
-            .border_color(supporting.opacity(0.38))
-            .text_color(strip_fg)
-            .font_weight(FontWeight::NORMAL)
-            .child(SharedString::from(format!(
-                "{permission_glyph} perm: {}",
-                permission.short_label()
-            )));
-        identity_row = identity_row.child(permission_badge);
+        // Exception-based permission chip (UXI-AgentTile-31): the permissive
+        // default renders nothing; a RESTRICTED agent wears an amber chip.
+        if let Some(perm) = agent_header_permission_label(c.permission_mode) {
+            identity_row = identity_row.child(probe_bounds(
+                "agent-permission-chip",
+                div()
+                    .flex_none()
+                    .px_2()
+                    .py(px(2.0))
+                    .rounded_md()
+                    .bg(working_orange.opacity(0.14))
+                    .text_size(px(11.0))
+                    .text_color(working_orange)
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(SharedString::new_static(perm))
+                    .into_any_element(),
+            ));
+        }
 
+        // Deck 2: activity + context. Whole clusters wrap on narrow tiles;
+        // the state word keeps a fixed slot so the timer never shifts when
+        // `ready` flips to `working`.
         let compose = c.input_surface.compose();
         let edit_status = agent_editing_status_label(
             compose.editor.document().is_modified(),
             compose.editor.extend_mode(),
         );
-        if !edit_status.is_empty() {
-            identity_row = identity_row.child(
-                div()
-                    .text_color(muted)
-                    .font_weight(FontWeight::NORMAL)
-                    .child(SharedString::new_static(edit_status)),
-            );
-        }
-
-        // Row 2: fixed-width activity pill · turn/timer · Stop · usage.
-        let working = c.turn_phase.is_awaiting();
-        let (activity_glyph, activity_word) = agent_header_activity(working);
-        let activity_color = if working { working_orange } else { ready_green };
-        let activity_pill = probe_bounds(
+        let state_word = probe_bounds(
             "agent-status-pill",
             div()
-                .w(px(AGENT_ACTIVITY_PILL_WIDTH))
+                .w(px(AGENT_ACTIVITY_STATE_WIDTH))
                 .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .px_2()
-                .py(px(1.0))
-                .rounded_md()
-                .bg(activity_color.opacity(0.14))
-                .border_1()
-                .border_color(activity_color.opacity(0.52))
                 .text_color(activity_color)
-                .font_weight(FontWeight::BOLD)
-                .child(SharedString::from(format!("{activity_glyph} {activity_word}")))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(SharedString::new_static(activity_word))
                 .into_any_element(),
         );
         let display_turn = if working {
@@ -1205,40 +1226,52 @@ impl YaldaGpuiView {
         } else {
             c.current_turn().saturating_sub(1)
         };
-        let turn_label = match c.turn_phase.turn_started() {
-            Some(started) => {
-                let seconds = started.elapsed().as_secs();
-                format!("turn {display_turn} · {}:{:02}", seconds / 60, seconds % 60)
-            }
-            None => format!("turn {display_turn}"),
-        };
-        let mut activity_row = base_row()
+        let mut activity_row = div()
+            .w_full()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .gap_x_3()
+            .gap_y_1()
+            .px_3()
+            .pt(px(1.0))
+            .pb(px(6.0))
+            .text_size(px(11.0))
             .text_color(muted)
             .font_weight(FontWeight::NORMAL)
-            .child(activity_pill)
-            .child(SharedString::from(turn_label));
+            .child(state_word);
+        // A virgin session has no turn to report — omit `turn 0` noise.
+        if working || display_turn > 0 {
+            let turn_label = match c.turn_phase.turn_started() {
+                Some(started) => {
+                    let seconds = started.elapsed().as_secs();
+                    format!("turn {display_turn} · {}:{:02}", seconds / 60, seconds % 60)
+                }
+                None => format!("turn {display_turn}"),
+            };
+            activity_row = activity_row.child(SharedString::from(turn_label));
+        }
 
         if working {
             let stop_fg: Hsla = nc(at.tool_failed);
             let stop_label = if c.turn_phase.stop_requested() {
-                "■ Force-restart ⌘."
+                "■ force-restart ⌘."
             } else {
-                "■ Stop ⌘."
+                "■ stop ⌘."
             };
             let weak_stop = weak_self.clone();
             activity_row = activity_row.child(
                 div()
                     .id("agent-stop-btn")
-                    .flex()
-                    .flex_row()
-                    .items_center()
+                    .flex_none()
                     .px_2()
                     .py(px(1.0))
                     .rounded_md()
-                    .border_1()
-                    .border_color(stop_fg)
+                    .bg(stop_fg.opacity(0.12))
                     .text_color(stop_fg)
                     .cursor_pointer()
+                    .hover(|s| s.bg(stop_fg.opacity(0.22)))
                     .on_click(
                         move |_ev: &gpui::ClickEvent, window: &mut Window, app: &mut GpuiApp| {
                             let _ = weak_stop.update(app, |this, cx| {
@@ -1250,72 +1283,90 @@ impl YaldaGpuiView {
             );
         }
 
-        // Context-window usage joins the activity row when supplied by the agent.
+        if !edit_status.is_empty() {
+            activity_row = activity_row.child(SharedString::new_static(edit_status));
+        }
+
+        activity_row = activity_row.child(div().flex_1());
+
+        // Context meter: a slim bar + percent. The tokens-left figure joins
+        // only when the window is nearly full — the moment it's actionable.
+        // Session cost tags along when the provider reports one.
         if let Some(usage) = c.usage.as_ref() {
-            let used_k = usage.tokens_used as f64 / 1000.0;
-            let total_k = usage.tokens_total as f64 / 1000.0;
             let frac = if usage.tokens_total > 0 {
                 (usage.tokens_used as f64 / usage.tokens_total as f64).clamp(0.0, 1.0)
             } else {
                 0.0
             };
             let pct = frac * 100.0;
-            const BAR_W: f32 = 64.0;
+            let nearly_full = pct >= 85.0;
+            const BAR_W: f32 = 56.0;
             let fill_w = (BAR_W * frac as f32).max(if frac > 0.0 { 2.0 } else { 0.0 });
-            let fill_color = if pct >= 85.0 { working_orange } else { ready_green };
+            let fill_color = if nearly_full { working_orange } else { ready_green };
             let track = div()
+                .flex_none()
                 .w(px(BAR_W))
-                .h(px(5.0))
+                .h(px(4.0))
                 .rounded_full()
-                .bg(supporting.opacity(0.18))
+                .bg(supporting.opacity(0.16))
                 .child(div().w(px(fill_w)).h_full().rounded_full().bg(fill_color));
-            let label = format!("{used_k:.0}k/{total_k:.0}k ({pct:.0}%)");
-            let meter = div()
+            let pct_label = if nearly_full {
+                let left_k = usage.tokens_total.saturating_sub(usage.tokens_used) / 1000;
+                format!("{pct:.0}% · {left_k}k left")
+            } else {
+                format!("{pct:.0}%")
+            };
+            let mut meter = div()
+                .flex_none()
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap_2()
-                .text_size(px(11.0))
-                .child(
-                    div()
-                        .flex_none()
-                        .text_color(supporting)
-                        .font_weight(FontWeight::BOLD)
-                        .child(SharedString::new_static("USAGE")),
-                )
+                .gap(px(6.0))
                 .child(track)
                 .child(
                     div()
-                        .text_color(muted)
-                        .font_weight(FontWeight::NORMAL)
-                        .child(SharedString::from(label)),
+                        .text_color(if nearly_full { working_orange } else { muted })
+                        .child(SharedString::from(pct_label)),
                 );
+            if let Some(cost) = usage.cost_usd {
+                meter = meter.child(
+                    div()
+                        .text_color(muted)
+                        .child(SharedString::from(format!("${cost:.2}"))),
+                );
+            }
             activity_row = activity_row.child(probe_bounds(
                 "agent-usage-row",
                 meter.into_any_element(),
             ));
         }
 
-        // Row 3: linked worktree name, otherwise the working directory.
+        // Location, right-aligned on the activity deck: a linked worktree name
+        // (emphasized — it says which branch's world the agent lives in),
+        // otherwise the shortened cwd. No `CWD` label; the path speaks.
         let location_label = agent_location_label(&active_slot_cwd);
-        let mut location_row = base_row().text_color(muted);
-        if let Some(path) = location_label.strip_prefix("CWD ") {
-            location_row = location_row
-                .child(
-                    div()
-                        .font_weight(FontWeight::BOLD)
-                        .child(SharedString::new_static("CWD")),
-                )
-                .child(
-                    div()
-                        .font_weight(FontWeight::NORMAL)
-                        .child(SharedString::from(path.to_owned())),
-                );
+        let location = if let Some(name) = location_label.strip_prefix("WORKTREE ") {
+            div()
+                .text_color(supporting)
+                .font_weight(FontWeight::MEDIUM)
+                .child(SharedString::from(format!("in {name}")))
         } else {
-            location_row = location_row
-                .font_weight(FontWeight::NORMAL)
-                .child(SharedString::from(location_label));
-        }
+            let path = location_label
+                .strip_prefix("CWD ")
+                .unwrap_or(&location_label)
+                .to_owned();
+            div().text_color(muted).child(SharedString::from(path))
+        };
+        activity_row = activity_row.child(probe_bounds(
+            "agent-location-row",
+            location
+                .flex_none()
+                .max_w(px(320.0))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .into_any_element(),
+        ));
 
         let header = div()
             .w_full()
@@ -1323,11 +1374,12 @@ impl YaldaGpuiView {
             .flex_col()
             .flex_none()
             .bg(header_bg)
+            .border_b_1()
+            .border_color(activity_color.opacity(0.35))
             .child(probe_bounds("agent-status-row", identity_row.into_any_element()))
-            .child(probe_bounds("agent-activity-row", activity_row.into_any_element()))
             .child(probe_bounds(
-                "agent-location-row",
-                location_row.into_any_element(),
+                "agent-activity-row",
+                activity_row.into_any_element(),
             ));
 
         // Chatbox panel — rendered between body and the bottom edge when active.
