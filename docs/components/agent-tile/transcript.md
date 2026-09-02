@@ -485,12 +485,14 @@ Compact header-specific vocabulary:
 | Condition | Dot + word |
 |---|---|
 | A reply is in flight (`turn_phase.is_awaiting()`) | **`working`** in `agent.jump_working` orange |
+| A stop was requested and the turn is still winding down | **`stopping`** in the same orange |
 | Idle, including a brand-new session | **`ready`** in `agent.tool_completed` green |
 
-The state word owns a fixed `AGENT_ACTIVITY_STATE_WIDTH` (52px) slot in both
-states, followed by `turn N · M:SS` and the conditional `■ stop ⌘.` chip. The
-header's bottom hairline carries the same state color. The editing readout does
-not duplicate activity with an `awaiting reply` suffix.
+The state word owns a fixed `AGENT_ACTIVITY_STATE_WIDTH` (60px) slot in every
+state, followed by `turn N · M:SS`. There is NO stop button — stopping is
+Esc / ⌘. (and the space menu), and `stopping` is the header's acknowledgement.
+The header's bottom hairline carries the same state color. The editing readout
+does not duplicate activity with an `awaiting reply` suffix.
 
 **Applies to.** `screens.rs`: `agent_header_activity` and `render_agent`'s
 `agent-status-pill` probe (the state-word slot).
@@ -519,14 +521,16 @@ word mapping is pinned by
    *nothing*; a restricted mode (`read-only` / `auto-edit` / `ask-each`) wears
    an amber chip. `perm: yolo` on every session was noise.
 2. **Activity deck** — fixed-slot state word · `turn N · M:SS` (suppressed on a
-   virgin session — no `turn 0`) · `■ stop ⌘.` chip while working · transient
-   compose state (`•`/`EXT`) · context meter (slim bar + percent; a
-   `NNk left` figure joins only at ≥85% full; session cost `$X.XX` when the
-   provider reports one) · location, right-aligned — linked worktree name as
-   `in <name>` (emphasized), otherwise the shortened cwd with no `CWD` label.
+   virgin session — no `turn 0`) · transient compose state (`•`/`EXT`) ·
+   context meter (slim bar + percent; a `NNk left` figure joins only at ≥85%
+   full; session cost `$X.XX` when the provider reports one) · location —
+   linked worktree name as `in <name>` (emphasized), otherwise the shortened
+   cwd with no `CWD` label.
 
-Deck 2 wraps whole clusters on narrow tiles; both decks are unaffected by
-document zoom.
+**Both decks flow left with no right-aligned cluster** — on a wide tile the
+information reads as one line-start group per deck instead of fragments pinned
+to opposite edges. Deck 2 wraps whole clusters on narrow tiles; both decks are
+unaffected by document zoom.
 
 **Applies to.** `screens.rs::render_agent` (`identity_row`, `activity_row`,
 usage meter, location, and `header`); `agent_header_permission_label`.

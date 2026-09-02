@@ -74,10 +74,10 @@ fn push_edit_render_line(line_idx: usize, text: &str, segs: &[Segment], code_bg:
     });
 }
 
-/// Stable slot width for both Agent Tile activity state words. `working` and
-/// `ready` must not shove the turn timer sideways when a reply starts or
-/// finishes.
-pub(crate) const AGENT_ACTIVITY_STATE_WIDTH: f32 = 52.0;
+/// Stable slot width for every Agent Tile activity state word. `working`,
+/// `stopping`, and `ready` must not shove the turn timer sideways when a
+/// reply starts, is interrupted, or finishes.
+pub(crate) const AGENT_ACTIVITY_STATE_WIDTH: f32 = 60.0;
 
 /// Only transient compose state belongs in the Agent Tile header. Editor mode
 /// and cursor position stay in the editor itself.
@@ -92,9 +92,14 @@ pub(crate) fn agent_editing_status_label(dirty: bool, extend: bool) -> &'static 
 
 /// Compact header activity vocabulary, always shown even on a new session.
 /// The glyph half of the old `* working` / `+ ready` pill is gone — the
-/// identity deck's colored dot carries the glanceable signal now.
-pub(crate) fn agent_header_activity(working: bool) -> &'static str {
-    if working { "working" } else { "ready" }
+/// identity deck's colored dot carries the glanceable signal now. There is no
+/// stop button; `stopping` is the header's acknowledgement of Esc / ⌘.
+pub(crate) fn agent_header_activity(working: bool, stop_requested: bool) -> &'static str {
+    match (working, stop_requested) {
+        (true, true) => "stopping",
+        (true, false) => "working",
+        (false, _) => "ready",
+    }
 }
 
 /// Exception-based permission chip copy: the permissive default (Yolo) prints
@@ -1111,7 +1116,7 @@ impl YaldaGpuiView {
         let header_bg = bg_or(top, STATUS_BG);
 
         let working = c.turn_phase.is_awaiting();
-        let activity_word = agent_header_activity(working);
+        let activity_word = agent_header_activity(working, c.turn_phase.stop_requested());
         let activity_color = if working { working_orange } else { ready_green };
 
         // Deck 1: identity. The haloed dot is the always-on activity beacon
@@ -1146,8 +1151,7 @@ impl YaldaGpuiView {
                     .text_ellipsis()
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(SharedString::from(active_slot_label.clone())),
-            )
-            .child(div().flex_1());
+            );
 
         let model_label = c
             .agent_model
@@ -1253,41 +1257,9 @@ impl YaldaGpuiView {
             activity_row = activity_row.child(SharedString::from(turn_label));
         }
 
-        if working {
-            let stop_fg: Hsla = nc(at.tool_failed);
-            let stop_label = if c.turn_phase.stop_requested() {
-                "■ force-restart ⌘."
-            } else {
-                "■ stop ⌘."
-            };
-            let weak_stop = weak_self.clone();
-            activity_row = activity_row.child(
-                div()
-                    .id("agent-stop-btn")
-                    .flex_none()
-                    .px_2()
-                    .py(px(1.0))
-                    .rounded_md()
-                    .bg(stop_fg.opacity(0.12))
-                    .text_color(stop_fg)
-                    .cursor_pointer()
-                    .hover(|s| s.bg(stop_fg.opacity(0.22)))
-                    .on_click(
-                        move |_ev: &gpui::ClickEvent, window: &mut Window, app: &mut GpuiApp| {
-                            let _ = weak_stop.update(app, |this, cx| {
-                                this.stop_agent(&StopAgent, window, cx);
-                            });
-                        },
-                    )
-                    .child(SharedString::from(stop_label)),
-            );
-        }
-
         if !edit_status.is_empty() {
             activity_row = activity_row.child(SharedString::new_static(edit_status));
         }
-
-        activity_row = activity_row.child(div().flex_1());
 
         // Context meter: a slim bar + percent. The tokens-left figure joins
         // only when the window is nearly full — the moment it's actionable.
@@ -1341,8 +1313,8 @@ impl YaldaGpuiView {
             ));
         }
 
-        // Location, right-aligned on the activity deck: a linked worktree name
-        // (emphasized — it says which branch's world the agent lives in),
+        // Location, closing the activity deck's left flow: a linked worktree
+        // name (emphasized — it says which branch's world the agent lives in),
         // otherwise the shortened cwd. No `CWD` label; the path speaks.
         let location_label = agent_location_label(&active_slot_cwd);
         let location = if let Some(name) = location_label.strip_prefix("WORKTREE ") {

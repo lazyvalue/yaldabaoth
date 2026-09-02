@@ -11177,8 +11177,12 @@ fn agent_row_marks_name_the_live_states() {
 
 #[test]
 fn agent_header_uses_compact_activity_and_transient_editor_vocabulary() {
-    assert_eq!(crate::screens::agent_header_activity(true), "working");
-    assert_eq!(crate::screens::agent_header_activity(false), "ready");
+    assert_eq!(crate::screens::agent_header_activity(true, false), "working");
+    assert_eq!(crate::screens::agent_header_activity(true, true), "stopping");
+    assert_eq!(crate::screens::agent_header_activity(false, false), "ready");
+    // stop_requested ⇒ awaiting, so (false, true) is unreachable; it must
+    // still degrade to the idle word, never a stale `stopping`.
+    assert_eq!(crate::screens::agent_header_activity(false, true), "ready");
 
     // Exception-based permission copy: the permissive default (Yolo) says
     // nothing; only a restricted agent earns a chip (UXI-AgentTile-31).
