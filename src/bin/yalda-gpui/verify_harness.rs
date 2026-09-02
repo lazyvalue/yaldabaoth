@@ -2180,7 +2180,9 @@ fn replay_on_background_session_does_not_mark_unread(cx: &mut TestAppContext) {
         };
         v.apply_server_batch(
             vec![
-                ev(ReplyEvent::Chunk("old agent reply from before restart\n".into())),
+                ev(ReplyEvent::Chunk(
+                    "old agent reply from before restart\n".into(),
+                )),
                 ev(ReplyEvent::ReplayComplete),
             ],
             cx,
@@ -9772,7 +9774,11 @@ fn roster_reconciliation_retires_duplicate_detached_session_tiles(cx: &mut TestA
     let (view, vcx) = boot_browser(cx);
     view.update(vcx, |v, cx| {
         let project = v.workspace.inherited_project();
-        let cwd = v.projects.cwd_of(project).expect("project cwd").to_path_buf();
+        let cwd = v
+            .projects
+            .cwd_of(project)
+            .expect("project cwd")
+            .to_path_buf();
         let attached_sid = "DUPLICATE-ATTACHED";
         let attached = v
             .workspace
@@ -9865,12 +9871,18 @@ fn roster_reconciliation_retires_duplicate_detached_session_tiles(cx: &mut TestA
             .filter_map(|row| row.order_sid.as_deref())
             .collect::<Vec<_>>();
         assert_eq!(
-            destinations.iter().filter(|sid| **sid == attached_sid).count(),
+            destinations
+                .iter()
+                .filter(|sid| **sid == attached_sid)
+                .count(),
             1,
             "the Attached session has one jump-panel destination"
         );
         assert_eq!(
-            destinations.iter().filter(|sid| **sid == detached_sid).count(),
+            destinations
+                .iter()
+                .filter(|sid| **sid == detached_sid)
+                .count(),
             1,
             "the Detached session has one jump-panel destination"
         );
@@ -11282,7 +11294,8 @@ fn agent_tile_paints_a_status_pill_while_working(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     let working = crate::layout_probe_get("agent-status-pill");
     crate::layout_probe_end();
-    let (_, _, w, h) = working.expect("the working state word must paint while a reply is in flight");
+    let (_, _, w, h) =
+        working.expect("the working state word must paint while a reply is in flight");
     assert!(
         (w - ready.2).abs() < 0.5 && h > 6.0,
         "ready and working state words must share a fixed slot: ready={ready:?}, working={working:?}"
@@ -19064,10 +19077,7 @@ fn topic_popup_message_box_navigates_and_accepts_without_submit(cx: &mut TestApp
     key(&view, vcx, "enter");
     view.read_with(vcx, |v, cx| {
         v.read_session(id, cx, |c| {
-            assert_eq!(
-                c.input_surface.compose().text(),
-                "ask %projects/cog::"
-            );
+            assert_eq!(c.input_surface.compose().text(), "ask %projects/cog::");
             assert!(
                 matches!(c.turn_phase, crate::TurnPhase::Idle),
                 "accepting a completion does not submit"
@@ -19079,7 +19089,10 @@ fn topic_popup_message_box_navigates_and_accepts_without_submit(cx: &mut TestApp
     key(&view, vcx, "enter");
     view.read_with(vcx, |v, cx| {
         v.read_session(id, cx, |c| {
-            assert_eq!(c.input_surface.compose().text(), "ask projects/cog::roadmap");
+            assert_eq!(
+                c.input_surface.compose().text(),
+                "ask projects/cog::roadmap"
+            );
             assert!(c.topic_popup_rows(&v.topic_completions).is_empty());
         })
         .unwrap();
@@ -27721,9 +27734,9 @@ fn cog_topic_browser_hierarchy_collapses_and_renders_typed_detail(cx: &mut TestA
 /// name-first label while retaining the exact address.
 ///
 /// NEGATIVE CONTROL: removing the address-directory lookup from
-/// `communication_author_label` makes the label assertion return bare `ncz`.
+/// `agent_identity_label` makes the creator paint under bare `ncz`.
 #[gpui::test]
-fn cog_communication_author_uses_registered_agent_name(cx: &mut TestAppContext) {
+fn cog_agent_identities_use_registered_names_everywhere(cx: &mut TestAppContext) {
     let (view, vcx, cv, wid) = boot_with_cog(cx);
     let mut home = cog_test_home(vec![cog_test_topic(
         "projects/schema::coordination",
@@ -27747,17 +27760,17 @@ fn cog_communication_author_uses_registered_agent_name(cx: &mut TestAppContext) 
     });
     vcx.run_until_parked();
     assert_eq!(
-        cv.update(vcx, |c, _| c.communication_author_label("ncz")),
+        cv.update(vcx, |c, _| c.agent_identity_label("ncz")),
         "l11-schema-cleanup-worker · ncz",
         "registered name is primary and stable address remains secondary"
     );
     assert_eq!(
-        cv.update(vcx, |c, _| c.communication_author_label("external-actor")),
+        cv.update(vcx, |c, _| c.agent_identity_label("external-actor")),
         "external-actor",
         "unknown actors remain readable"
     );
     assert_eq!(
-        cv.update(vcx, |c, _| c.communication_author_label("")),
+        cv.update(vcx, |c, _| c.agent_identity_label("")),
         "—",
         "empty authors have an explicit fallback"
     );
@@ -27800,10 +27813,60 @@ fn cog_communication_author_uses_registered_agent_name(cx: &mut TestAppContext) 
     vcx.run_until_parked();
     let author = crate::layout_probe_get("cog-communication-author");
     let entry = crate::layout_probe_get("cog-chat-entry");
+    let creator = crate::layout_probe_get("cog-chat-creator-l11-schema-cleanup-worker · ncz");
+    let members = crate::layout_probe_get("cog-chat-members-l11-schema-cleanup-worker · ncz");
     crate::layout_probe_end();
     let (_, _, width, height) = author.expect("resolved communication author paints");
-    assert!(width > 20.0 && height > 5.0, "author label has real painted size");
+    assert!(
+        width > 20.0 && height > 5.0,
+        "author label has real painted size"
+    );
     assert!(entry.is_some(), "the containing communication card paints");
+    assert!(
+        creator.is_some(),
+        "Chat creator paints with its registered name"
+    );
+    assert!(
+        members.is_some(),
+        "Chat members paint with registered names"
+    );
+
+    let mut bundle = cog_test_bundle(vec![cog_test_node(
+        "node-1",
+        "Schema cleanup",
+        "done",
+        serde_json::json!({"purpose":"clean schema"}),
+    )]);
+    bundle.logs.get_mut("node-1").unwrap()[0].actor = "ncz".into();
+    bundle.notes.get_mut("node-1").unwrap()[0].actor = "ncz".into();
+    let graph_req = cog_tile_req(&view, vcx);
+    view.update(vcx, |v, cx| {
+        v.cog_apply(
+            wid,
+            graph_req,
+            Ok(crate::CogFetch::Graph(Box::new(bundle))),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    cv.update(vcx, |c, cx| c.click_node(0, cx));
+    vcx.run_until_parked();
+    crate::layout_probe_begin();
+    cv.update(vcx, |_, cx| cx.notify());
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let transition =
+        crate::layout_probe_get("cog-transition-actor-l11-schema-cleanup-worker · ncz");
+    let note = crate::layout_probe_get("cog-note-author-l11-schema-cleanup-worker · ncz");
+    crate::layout_probe_end();
+    assert!(
+        transition.is_some(),
+        "graph transition actor paints with its registered name"
+    );
+    assert!(
+        note.is_some(),
+        "graph note author paints with its registered name"
+    );
 }
 
 /// UXI-Cog-15: the real Agents tab selects a registered address, folds delivery
@@ -27832,7 +27895,19 @@ fn cog_agents_tab_reads_delivery_and_mail(cx: &mut TestAppContext) {
             req,
             Ok(crate::CogFetch::Home(Box::new(crate::CogHomeData {
                 topics: crate::CogTopicTree::default(),
-                agents: vec![agent.clone()],
+                agents: vec![
+                    agent.clone(),
+                    crate::CogAgentAddress {
+                        id: "addr-2".into(),
+                        name: "Reviewer".into(),
+                        provider: "claude".into(),
+                        session: "session-2".into(),
+                        cwd: "/work".into(),
+                        created_at: 1,
+                        retired_at: None,
+                        retired_reason: None,
+                    },
+                ],
                 agent_presence: [("addr-1".into(), "online".into())].into(),
             }))),
             cx,
@@ -27846,10 +27921,15 @@ fn cog_agents_tab_reads_delivery_and_mail(cx: &mut TestAppContext) {
         c.set_source_tab(crate::CogSourceTab::Agents, cx)
     });
     vcx.run_until_parked();
-    assert_eq!(cv.update(vcx, |c, _| c.list_len()), 1);
+    assert_eq!(cv.update(vcx, |c, _| c.list_len()), 2);
     assert_eq!(
         cv.update(vcx, |c, _| c.selected_agent().map(|a| a.id)),
         Some("addr-1".into())
+    );
+    assert_eq!(
+        cv.update(vcx, |c, _| c
+            .agent_identity_list_label(&["addr-1".into(), "addr-2".into(),])),
+        "Builder · addr-1, Reviewer · addr-2",
     );
 
     let detail_req = cog_tile_req(&view, vcx);
@@ -27901,6 +27981,8 @@ fn cog_agents_tab_reads_delivery_and_mail(cx: &mut TestAppContext) {
     let (_, _, _, mail_height) =
         crate::layout_probe_get("cog-agent-mail").expect("agent mail did not paint");
     let mail_entry = crate::layout_probe_get("cog-agent-mail-entry");
+    let participants =
+        crate::layout_probe_get("cog-mail-participants-Builder · addr-1, Reviewer · addr-2");
     crate::layout_probe_end();
     assert!(
         detail_height > 180.0,
@@ -27908,6 +27990,10 @@ fn cog_agents_tab_reads_delivery_and_mail(cx: &mut TestAppContext) {
     );
     assert!(mail_height > 80.0, "mail cards are readable: {mail_height}");
     assert!(mail_entry.is_some(), "a readable mail-entry card paints");
+    assert!(
+        participants.is_some(),
+        "mail participants paint with registered names"
+    );
 
     // Empty mail and an empty directory remain explicit, distinct states.
     cv.update(vcx, |c, cx| c.click_agent(0, cx));
@@ -28201,9 +28287,15 @@ fn cog_overview_native_graph_click_opens_node_detail(cx: &mut TestAppContext) {
         .expect("fan-in's second dependency connector paints");
     crate::layout_probe_end();
     assert!(node.2 > 100.0 && node.3 > 20.0, "node card has real size");
-    assert!(edge0.2 > 40.0 && edge1.2 > 40.0, "edge lanes have real size");
+    assert!(
+        edge0.2 > 40.0 && edge1.2 > 40.0,
+        "edge lanes have real size"
+    );
 
-    let at = gpui::point(gpui::px(node.0 + node.2 / 2.0), gpui::px(node.1 + node.3 / 2.0));
+    let at = gpui::point(
+        gpui::px(node.0 + node.2 / 2.0),
+        gpui::px(node.1 + node.3 / 2.0),
+    );
     vcx.simulate_mouse_move(at, None, gpui::Modifiers::default());
     vcx.simulate_click(at, gpui::Modifiers::default());
     vcx.run_until_parked();

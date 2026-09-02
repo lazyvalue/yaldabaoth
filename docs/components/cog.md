@@ -575,12 +575,15 @@ the card click handler and failed with Overview still selected.
 fallback layering without dropping nodes. Exact pixels and colours remain
 runtime gap #1.
 
-### UXI-Cog-19 — Agent communication authors are human-readable
+### UXI-Cog-19 — Agent identities are human-readable everywhere
 
-**Statement.** Mail and Chat entry headers resolve an author that matches a
-registered Cog agent address through the address directory already loaded with
-the Topics/Agents home snapshot. The registered agent name is the primary label
-and the stable short address remains secondary—for example,
+**Statement.** Every semantic agent identity rendered by the Cog window resolves
+a value that matches a registered Cog agent address through the address directory
+already loaded with the Topics/Agents home snapshot. This includes Chat creators
+and members, Note/mail participants and entry authors, registered-agent rows and
+detail/loading labels, graph status-transition actors, and graph-note authors.
+The registered agent name is the primary label and the stable short address
+remains secondary—for example,
 `l11-schema-cleanup-worker · ncz`—so communication is immediately attributable
 without losing exact identity. If the registered name is empty or identical to
 the id, the id renders once. Unknown non-empty actors remain unchanged; an empty
@@ -592,22 +595,24 @@ so the same label rule is available to graph-owned communication surfaces. A
 live Home refresh updates the directory and author labels atomically through the
 existing cached `CogView` invalidation; rendering performs no fetch or notify.
 
-**Applies to.** `CogView` address lookup / author formatting and
-`communication_card` callers for Note, Chat, inbox, and agent thread entries
-(`cog_view.rs`); the `CogHomeData.agents` directory loaded by `load_home`
-(`cog.rs`).
+**Applies to.** `CogView` address lookup / identity and identity-list formatting;
+Chat, Note/mail, Agents, and graph node-detail renderers (`cog_view.rs`); the
+`CogHomeData.agents` directory loaded by `load_home` (`cog.rs`). Stable routing
+keys, object ids, graph node ids, topic addresses, provider names, and arbitrary
+JSON payload strings are not semantic agent labels and remain unchanged.
 
 **Why.** Cog address ids are deliberately short stable routing identifiers, not
 human-facing names. A header such as `ncz` gives the operator no useful context
 even though the same loaded address record already names it
 `l11-schema-cleanup-worker`.
 
-**Status.** `implemented` (2026-08-30; Cog graph `k4v`).
+**Status.** `implemented` (2026-09-01; repair Cog graph `m72`; bug-0065).
 
-**Enforcement.** `cog_communication_author_uses_registered_agent_name` loads an
-address named `l11-schema-cleanup-worker` through the real Home reducer, opens a
-typed Chat detail through the real click/fetch reducer, probes the painted author
-and card, and proves the name-first label retains `ncz`. It also guards unknown
-and empty-author fallbacks. Its negative control removed directory resolution
-and failed because the result regressed to bare `ncz`. Exact pixels and colours
-remain runtime gap #1.
+**Enforcement.** `cog_agent_identities_use_registered_names_everywhere` loads
+registered agents through the real Home reducer, opens representative Chat and
+graph details through real click/fetch reducers, and uses label-keyed paint
+probes to prove creators, members, entry authors, transitions, and notes use
+name-first labels while retaining stable ids. `cog_agents_tab_reads_delivery_and_mail`
+also proves registered mail participants paint name-first. Unknown and empty
+fallbacks are guarded. Bypassing directory lookup fails with bare `ncz`. Exact
+pixels and colours remain runtime gap #1.

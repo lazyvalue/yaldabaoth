@@ -1116,9 +1116,15 @@ impl CogView {
             CogAgentDetailState::Empty => div().child(section_heading("Agents", st)).child(
                 dim_line("Select a registered agent to inspect its mail.", st),
             ),
-            CogAgentDetailState::Loading(address) => div()
-                .child(section_heading("Loading agent", st))
-                .child(dim_line(address, st)),
+            CogAgentDetailState::Loading(address) => {
+                let label = self.agent_identity_label(address);
+                div()
+                    .child(section_heading("Loading agent", st))
+                    .child(probe_bounds_dyn(
+                        format!("cog-agent-loading-{label}"),
+                        dim_line(&label, st).into_any_element(),
+                    ))
+            }
             CogAgentDetailState::Loaded(detail) => {
                 let address = &detail.address;
                 let mut col = div()
@@ -1184,9 +1190,13 @@ impl CogView {
         match &detail.threads {
             Ok(threads) if !threads.is_empty() => {
                 for mail in threads {
+                    let participants = self.agent_identity_list_label(&mail.participants);
                     col = col
                         .child(title_line(&mail.name, &mail.id, st))
-                        .child(kv_row("Participants", mail.participants.join(", "), st));
+                        .child(probe_bounds_dyn(
+                            format!("cog-mail-participants-{participants}"),
+                            kv_row("Participants", participants, st).into_any_element(),
+                        ));
                     if mail.entries.is_empty() {
                         col = col.child(dim_line("No entries in this thread.", st));
                     }
@@ -1282,15 +1292,17 @@ impl CogView {
             .gap_2()
             .child(topic_type_heading(kind, address, st))
             .child(title_line(&mail.name, &mail.id, st))
-            .child(kv_row(
-                "Participants",
-                if mail.participants.is_empty() {
+            .child({
+                let participants = if mail.participants.is_empty() {
                     "bulletin".into()
                 } else {
-                    mail.participants.join(", ")
-                },
-                st,
-            ))
+                    self.agent_identity_list_label(&mail.participants)
+                };
+                probe_bounds_dyn(
+                    format!("cog-mail-participants-{participants}"),
+                    kv_row("Participants", participants, st).into_any_element(),
+                )
+            })
             .child(section_heading(
                 &format!("Entries ({})", mail.entries.len()),
                 st,
@@ -1320,6 +1332,7 @@ impl CogView {
         st: &DetailStyle,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
+        let creator = self.agent_identity_label(&chat.creator);
         let mut col = div()
             .flex()
             .flex_col()
@@ -1327,7 +1340,10 @@ impl CogView {
             .gap_2()
             .child(topic_type_heading("CHAT", address, st))
             .child(title_line(&chat.name, &chat.id, st))
-            .child(kv_row("Creator", chat.creator.clone(), st))
+            .child(probe_bounds_dyn(
+                format!("cog-chat-creator-{creator}"),
+                kv_row("Creator", creator, st).into_any_element(),
+            ))
             .child(kv_row(
                 "Addresses",
                 if chat.addresses.is_empty() {
@@ -1337,15 +1353,17 @@ impl CogView {
                 },
                 st,
             ))
-            .child(kv_row(
-                "Members",
-                if chat.members.is_empty() {
+            .child({
+                let members = if chat.members.is_empty() {
                     "none".into()
                 } else {
-                    chat.members.join(", ")
-                },
-                st,
-            ))
+                    self.agent_identity_list_label(&chat.members)
+                };
+                probe_bounds_dyn(
+                    format!("cog-chat-members-{members}"),
+                    kv_row("Members", members, st).into_any_element(),
+                )
+            })
             .child(section_heading(
                 &format!("History ({})", chat.entries.len()),
                 st,
@@ -1384,7 +1402,7 @@ impl CogView {
         st: &DetailStyle,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let author = self.communication_author_label(from);
+        let author = self.agent_identity_label(from);
         let mut body = card(st)
             .child(
                 div()
@@ -1419,8 +1437,8 @@ impl CogView {
     /// Human-facing label for a communication sender. Cog's short address is a
     /// routing identity, so keep it for precision but lead with the registered
     /// name already present in the loaded Home directory.
-    pub(crate) fn communication_author_label(&self, from: &str) -> String {
-        if from.trim().is_empty() {
+    pub(crate) fn agent_identity_label(&self, id: &str) -> String {
+        if id.trim().is_empty() {
             return "—".into();
         }
         let agents = match &self.state {
@@ -1433,9 +1451,9 @@ impl CogView {
         let Some(address) = agents
             .unwrap_or_default()
             .iter()
-            .find(|address| address.id == from)
+            .find(|address| address.id == id)
         else {
-            return from.into();
+            return id.into();
         };
         let name = address.name.trim();
         if name.is_empty() || name == address.id {
@@ -1443,6 +1461,13 @@ impl CogView {
         } else {
             format!("{name} · {}", address.id)
         }
+    }
+
+    pub(crate) fn agent_identity_list_label(&self, ids: &[String]) -> String {
+        ids.iter()
+            .map(|id| self.agent_identity_label(id))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     /// Click a node row: select it (its detail fills the right pane) and put
@@ -3018,7 +3043,8 @@ impl CogView {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("?")
                                 .to_string();
-                            b = b.child(transition_card(&to, &e.actor, fmt_epoch_ns(e.at), st));
+                            let actor = self.agent_identity_label(&e.actor);
+                            b = b.child(transition_card(&to, &actor, fmt_epoch_ns(e.at), st));
                         }
                         b
                     };
@@ -3048,7 +3074,8 @@ impl CogView {
                     } else {
                         let mut b = div().flex().flex_col().w_full().gap_2();
                         for note in notes {
-                            b = b.child(note_card(note, st));
+                            let author = self.agent_identity_label(&note.actor);
+                            b = b.child(note_card(note, &author, st));
                         }
                         b
                     };
@@ -3098,13 +3125,15 @@ fn transition_card(to: &str, actor: &str, when: String, st: &DetailStyle) -> gpu
                     .text_color(status_color(eff, st))
                     .child(SharedString::from(format!("→ {to}"))),
             )
-            .child(
+            .child(probe_bounds_dyn(
+                format!("cog-transition-actor-{actor}"),
                 div()
                     .flex_1()
                     .min_w_0()
                     .text_color(st.fg)
-                    .child(SharedString::from(actor.to_string())),
-            )
+                    .child(SharedString::from(actor.to_string()))
+                    .into_any_element(),
+            ))
             .child(
                 div()
                     .flex_none()
@@ -3117,12 +3146,7 @@ fn transition_card(to: &str, actor: &str, when: String, st: &DetailStyle) -> gpu
 
 /// One note as a stylish card: a header row (topic badge · author, then the
 /// timestamp) above the note prose.
-fn note_card(note: &CogNote, st: &DetailStyle) -> gpui::Div {
-    let author = if note.actor.trim().is_empty() {
-        "—".to_string()
-    } else {
-        note.actor.clone()
-    };
+fn note_card(note: &CogNote, author: &str, st: &DetailStyle) -> gpui::Div {
     let when = fmt_epoch_ns(note.at);
     let topic = note.topic.clone().filter(|t| !t.is_empty());
 
@@ -3147,12 +3171,14 @@ fn note_card(note: &CogNote, st: &DetailStyle) -> gpui::Div {
                 .child(SharedString::from(t)),
         );
     }
-    left = left.child(
+    left = left.child(probe_bounds_dyn(
+        format!("cog-note-author-{author}"),
         div()
             .flex_none()
             .text_color(st.dim)
-            .child(SharedString::from(author)),
-    );
+            .child(SharedString::from(author.to_string()))
+            .into_any_element(),
+    ));
     head = head.child(left).child(
         div()
             .flex_none()
