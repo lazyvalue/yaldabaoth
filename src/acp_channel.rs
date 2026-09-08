@@ -715,6 +715,7 @@ pub const DEFAULT_AGENT_FALLBACKS: &[&str] = &["claude-agent-acp"];
 /// switches, and deduplicates this list before advertising it over ACP.
 const YALDA_CLAUDE_AVAILABLE_MODELS: &[&str] = &[
     "claude-opus-4-8",
+    "astra",
     "claude-fable-5[1m]",
     "claude-fable-5-1[1m]",
     "sonnet",
@@ -3565,16 +3566,20 @@ mod tests {
     }
 
     /// Claude sessions carry Yalda's supported model allowlist in the adapter's
-    /// per-session settings tier, so Fable 5.1 is advertised and accepted by the
-    /// real `set_config_option` path. Codex must receive none of this extension.
-    /// Negative control: remove the Fable 5.1 entry (or leak Claude metadata to
-    /// Codex) and the corresponding assertion fails.
+    /// per-session settings tier, so Astra and Fable 5.1 are advertised and
+    /// accepted by the real `set_config_option` path. Codex must receive none of
+    /// this extension. Negative control: remove either added model entry (or leak
+    /// Claude metadata to Codex) and the corresponding assertion fails.
     #[test]
-    fn session_meta_advertises_fable_5_1_only_to_claude() {
+    fn session_meta_advertises_yalda_models_only_to_claude() {
         let meta = agent_session_meta(AgentProvider::Claude, "host guidance");
         let models = meta["claudeCode"]["options"]["settings"]["availableModels"]
             .as_array()
             .expect("Claude availableModels array");
+        assert!(
+            models.iter().any(|model| model == "astra"),
+            "Astra must reach the adapter's model allowlist: {meta:?}"
+        );
         assert!(
             models.iter().any(|model| model == "claude-fable-5-1[1m]"),
             "Fable 5.1 must reach the adapter's model allowlist: {meta:?}"
@@ -3585,7 +3590,12 @@ mod tests {
         let request = NewSessionRequest::new(std::path::PathBuf::from("/tmp/x")).meta(meta);
         let wire = serde_json::to_value(request).expect("serialize session/new request");
         assert_eq!(
-            wire["_meta"]["claudeCode"]["options"]["settings"]["availableModels"][2],
+            wire["_meta"]["claudeCode"]["options"]["settings"]["availableModels"][1],
+            "astra",
+            "Astra must reach the actual session/new wire payload"
+        );
+        assert_eq!(
+            wire["_meta"]["claudeCode"]["options"]["settings"]["availableModels"][3],
             "claude-fable-5-1[1m]",
             "Fable 5.1 must reach the actual session/new wire payload"
         );

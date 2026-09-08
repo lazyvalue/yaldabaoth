@@ -29,10 +29,10 @@ Sonnet / …) from the model picklist the agent advertises. The list is the mode
 `current_value` + `options` into `AgentState.available_models` + `agent_model`.
 For Claude sessions, Yalda supplies its supported-model allowlist in the
 per-session `_meta.claudeCode.options.settings.availableModels` tier. This keeps
-the menu Yalda-specific while making `claude-fable-5-1[1m]` (labelled by the
-adapter as Fable 5.1) selectable even before it enters the adapter's default
-picker. Codex and other providers receive no Claude metadata. The adapter
-remains authoritative for validation, labels, ordering, and deduplication.
+the menu Yalda-specific while making `astra` and `claude-fable-5-1[1m]`
+(labelled by the adapter) selectable even before they enter the adapter's
+default picker. Codex and other providers receive no Claude metadata. The
+adapter remains authoritative for validation, labels, ordering, and deduplication.
 Switching issues an ACP `session/set_config_option` for the `model` option (NOT a
 new session — the conversation is preserved); the agent applies it and echoes the
 refreshed selector back, which updates the badge. Three properties:
