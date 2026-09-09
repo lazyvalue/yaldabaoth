@@ -876,16 +876,18 @@ fn v1_wal_session_survives_server_upgrade() {
     let log = socket.with_extension("log");
     let logfile = std::fs::File::create(&log).expect("server log");
     let bin = env!("CARGO_BIN_EXE_yalda-session-server");
-    let mut child = ReapOnDrop(Command::new(bin)
-        .arg("--force")
-        .env("YALDA_SESSION_SOCKET", &socket)
-        .env("YALDA_ACP_AGENT", "/usr/bin/true")
-        .env("YALDA_CONFIG", "/nonexistent/yalda-test-config.kdl")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(logfile))
-        .spawn()
-        .expect("spawn server"));
+    let mut child = ReapOnDrop(
+        Command::new(bin)
+            .arg("--force")
+            .env("YALDA_SESSION_SOCKET", &socket)
+            .env("YALDA_ACP_AGENT", "/usr/bin/true")
+            .env("YALDA_CONFIG", "/nonexistent/yalda-test-config.kdl")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(logfile))
+            .spawn()
+            .expect("spawn server"),
+    );
 
     // Wait for socket, then assert the historical session was recovered.
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -971,16 +973,18 @@ fn interior_corrupt_wal_is_skipped_and_the_server_still_boots() {
     let log = socket.with_extension("log");
     let logfile = std::fs::File::create(&log).expect("server log");
     let bin = env!("CARGO_BIN_EXE_yalda-session-server");
-    let mut child = ReapOnDrop(Command::new(bin)
-        .arg("--force")
-        .env("YALDA_SESSION_SOCKET", &socket)
-        .env("YALDA_ACP_AGENT", "/usr/bin/true")
-        .env("YALDA_CONFIG", "/nonexistent/yalda-test-config.kdl")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(logfile))
-        .spawn()
-        .expect("spawn server"));
+    let mut child = ReapOnDrop(
+        Command::new(bin)
+            .arg("--force")
+            .env("YALDA_SESSION_SOCKET", &socket)
+            .env("YALDA_ACP_AGENT", "/usr/bin/true")
+            .env("YALDA_CONFIG", "/nonexistent/yalda-test-config.kdl")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(logfile))
+            .spawn()
+            .expect("spawn server"),
+    );
 
     // The bug's exact symptom is the process exiting during recovery, so a
     // dead child is reported as such (with its log) rather than as a timeout.
@@ -1056,12 +1060,14 @@ fn spawn_server_on(
     for (k, v) in knobs {
         builder.env(k, v);
     }
-    let mut child = ReapOnDrop(builder
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(logfile))
-        .spawn()
-        .expect("spawn server"));
+    let mut child = ReapOnDrop(
+        builder
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(logfile))
+            .spawn()
+            .expect("spawn server"),
+    );
     let deadline = Instant::now() + Duration::from_secs(10);
     while std::os::unix::net::UnixStream::connect(socket).is_err() {
         if let Ok(Some(status)) = child.try_wait() {
