@@ -375,8 +375,15 @@ pub struct RecoveredSession {
     /// Last durable model selection, if the user chose one.
     pub model_id: Option<String>,
     pub provider: AgentProvider,
-    /// The replayed transcript, in order.
-    pub event_log: Vec<Notification>,
+    /// Number of transcript events on disk — the length of the session's
+    /// durable prefix, logical event-log positions `[0, durable_events)`. The
+    /// events themselves stay on disk; see [`stream_durable_prefix`].
+    pub durable_events: u64,
+    /// The channel generation the first post-recovery channel must use:
+    /// strictly newer than every durable `Agent` event (`max + 1`), or 0 for a
+    /// log with none. Kept at the recovery boundary so seed state, watch
+    /// channels, and the resume worker cannot choose different generations.
+    pub next_generation: u64,
     /// Re-derived from the last `SessionAttached` event — the id needed to
     /// `--resume` the agent. `None` if the agent never finished its handshake
     /// before the crash (nothing to resume).
@@ -498,18 +505,48 @@ pub fn try_recover_each(
     Ok(())
 }
 
-/// Replay a single WAL file. Returns `Ok(None)` if the file has no valid
-/// header. A torn/partial final line (interrupted write on power loss) is
-/// skipped — that is the bounded data loss the contract permits.
-pub fn recover_one(path: &Path) -> std::io::Result<Option<RecoveredSession>> {
+/// The non-transcript state of one WAL file, folded record by record by
+/// [`walk_wal`]. Everything here is metadata: a handful of small values per
+/// file, whatever the transcript's size.
+struct WalMeta {
+    /// `(server_session_id, label, cwd, permission_mode, provider)` from the
+    /// header record.
+    header: (String, String, PathBuf, PermissionMode, AgentProvider),
+    /// The most recent rename, if any. Applied over the header label so a
+    /// session recovered after a server restart keeps its renamed name rather
+    /// than reverting to the creation-time label.
+    renamed_label: Option<String>,
+    archived: bool,
+    permission_override: Option<PermissionMode>,
+    model_id: Option<String>,
+    prompt_intents: Vec<RecoveredPrompt>,
+    prompt_terminal: std::collections::HashSet<u64>,
+    max_prompt_id: Option<u64>,
+}
+
+/// Walk one WAL file record by record without retaining the transcript.
+///
+/// Metadata records fold into the returned [`WalMeta`]; every transcript
+/// `Event` record is handed to `on_event` in file order, which returns
+/// `Ok(false)` to stop the walk early. Returns `Ok(None)` if the file has no
+/// valid header. A torn/partial final line (interrupted write on power loss)
+/// is skipped — that is the bounded data loss the contract permits — while a
+/// newline-terminated malformed record is durable interior corruption and
+/// fails with `InvalidData`.
+///
+/// This is the ONE reader over the on-disk format: [`recover_one`] folds a
+/// summary through it at startup, and [`stream_durable_prefix`] streams the
+/// transcript through it at attach time. Neither ever holds more than one
+/// record in memory — the whole point (a 1.1 GB WAL directory used to cost
+/// 7.2 GB of RSS at boot when every event was decoded into a `Vec`).
+fn walk_wal(
+    path: &Path,
+    mut on_event: impl FnMut(Notification) -> std::io::Result<bool>,
+) -> std::io::Result<Option<WalMeta>> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
 
     let mut header: Option<(String, String, PathBuf, PermissionMode, AgentProvider)> = None;
-    let mut event_log: Vec<Notification> = Vec::new();
-    // The most recent rename, if any. Applied over the header label so a
-    // session recovered after a server restart keeps its renamed name rather
-    // than reverting to the creation-time label.
     let mut renamed_label: Option<String> = None;
     let mut archived = false;
     let mut permission_override: Option<PermissionMode> = None;
@@ -564,7 +601,11 @@ pub fn recover_one(path: &Path) -> std::io::Result<Option<RecoveredSession>> {
                 }
                 header = Some((server_session_id, label, cwd, permission_mode, provider));
             }
-            WalRecord::Event(note) => event_log.push(note),
+            WalRecord::Event(note) => {
+                if !on_event(note)? {
+                    break;
+                }
+            }
             WalRecord::Rename { label } => renamed_label = Some(label),
             WalRecord::Archive { archived: value } => archived = value,
             WalRecord::Permission { mode } => permission_override = Some(mode),
@@ -592,27 +633,37 @@ pub fn recover_one(path: &Path) -> std::io::Result<Option<RecoveredSession>> {
         }
     }
 
-    let Some((server_session_id, header_label, cwd, header_permission_mode, provider)) = header
-    else {
+    let Some(header) = header else {
         return Ok(None);
     };
-    // Last rename wins over the creation-time header label.
-    let label = renamed_label.unwrap_or(header_label);
-    let permission_mode = permission_override.unwrap_or(header_permission_mode);
-    let pending_prompts = prompt_intents
-        .into_iter()
-        .filter(|intent| !prompt_terminal.contains(&intent.id))
-        .collect();
-    let next_prompt_id = max_prompt_id.map_or(1, |id| id.saturating_add(1));
+    Ok(Some(WalMeta {
+        header,
+        renamed_label,
+        archived,
+        permission_override,
+        model_id,
+        prompt_intents,
+        prompt_terminal,
+        max_prompt_id,
+    }))
+}
 
-    // Re-derive the agent resume id from the last SessionAttached. KEPT as a
+/// Recover a single WAL file's session SUMMARY: identity, settings, prompt
+/// state, the durable transcript length, and the stream position the next
+/// channel must resume from. The transcript itself is NOT loaded — it stays on
+/// disk as the session's durable prefix and is streamed to a client on attach
+/// by [`stream_durable_prefix`]. Memory is O(1) per file regardless of size.
+///
+/// Returns `Ok(None)` for a headerless file; see [`walk_wal`] for the torn-
+/// tail / interior-corruption semantics.
+pub fn recover_one(path: &Path) -> std::io::Result<Option<RecoveredSession>> {
+    use crate::agent_event::{AgentEventKind, TurnOutcome};
+
+    let mut durable_events = 0u64;
+    // Re-derived from the LAST `SessionAttached` carrying an id. KEPT as a
     // control variant in the collapse (spec §1) precisely so this recovery
     // dependency survives — folding it into ChannelOpened would lose the id.
-    let acp_session_id = event_log.iter().rev().find_map(|n| match n {
-        Notification::SessionAttached { acp_session_id, .. } => acp_session_id.clone(),
-        _ => None,
-    });
-
+    let mut acp_session_id: Option<String> = None;
     // Completed-turn count = the durable tip (spec §5). During the additive
     // rollout (spec §9) a log may carry BOTH legacy `TurnEnded` records AND the
     // new `Agent { TurnEnded }` records describing the SAME boundaries, so we
@@ -620,30 +671,60 @@ pub fn recover_one(path: &Path) -> std::io::Result<Option<RecoveredSession>> {
     // double-count). Legacy: count of `TurnEnded`. Agent: `max(turn)+1` over
     // `Agent` events whose kind is a real `TurnEnded` (excluding `ReplayEnd`,
     // which marks the end of a replayed prefix, not a completed live turn).
-    use crate::agent_event::{AgentEventKind, TurnOutcome};
-    let legacy_turns = event_log
-        .iter()
-        .filter(|n| matches!(n, Notification::TurnEnded { .. }))
-        .count();
-    let agent_turns = event_log
-        .iter()
-        .filter_map(|n| match n {
-            Notification::Agent { event } => match &event.kind {
-                AgentEventKind::TurnEnded { outcome }
-                    if !matches!(outcome, TurnOutcome::ReplayEnd) =>
+    let mut legacy_turns = 0usize;
+    let mut agent_max_turn: Option<u64> = None;
+    // Highest `Agent` channel generation on disk: the next channel is strictly
+    // newer, so a recovered server never re-uses a generation whose seqs
+    // already exist durably.
+    let mut max_generation: Option<u64> = None;
+
+    let Some(meta) = walk_wal(path, |note| {
+        durable_events += 1;
+        match &note {
+            Notification::SessionAttached {
+                acp_session_id: Some(id),
+                ..
+            } => acp_session_id = Some(id.clone()),
+            Notification::TurnEnded { .. } => legacy_turns += 1,
+            Notification::Agent { event } => {
+                max_generation =
+                    Some(max_generation.map_or(event.generation, |g| g.max(event.generation)));
+                if let AgentEventKind::TurnEnded { outcome } = &event.kind
+                    && !matches!(outcome, TurnOutcome::ReplayEnd)
                 {
-                    Some(event.turn)
+                    agent_max_turn = Some(agent_max_turn.map_or(event.turn, |t| t.max(event.turn)));
                 }
-                _ => None,
-            },
-            _ => None,
-        })
-        .max()
-        // `turn` is 0-based in the envelope; a completed turn `k` means `k+1`
-        // turns have settled. `max(turn)+1` is the count.
-        .map(|max_turn| (max_turn + 1) as usize)
-        .unwrap_or(0);
+            }
+            _ => {}
+        }
+        Ok(true)
+    })?
+    else {
+        return Ok(None);
+    };
+
+    let (server_session_id, header_label, cwd, header_permission_mode, provider) = meta.header;
+    // Last rename wins over the creation-time header label.
+    let label = meta.renamed_label.unwrap_or(header_label);
+    let permission_mode = meta.permission_override.unwrap_or(header_permission_mode);
+    let pending_prompts = meta
+        .prompt_intents
+        .into_iter()
+        .filter(|intent| !meta.prompt_terminal.contains(&intent.id))
+        .collect();
+    let next_prompt_id = meta.max_prompt_id.map_or(1, |id| id.saturating_add(1));
+
+    // `turn` is 0-based in the envelope; a completed turn `k` means `k+1`
+    // turns have settled. `max(turn)+1` is the count.
+    let agent_turns = agent_max_turn.map_or(0, |max_turn| (max_turn + 1) as usize);
     let turns = legacy_turns.max(agent_turns);
+    // `AgentEvent.seq` is per generation. A recovered server channel is a new
+    // generation, so its first `ChannelOpened` starts at seq 0 rather than
+    // continuing the maximum seq of an older generation.
+    let next_generation = max_generation.map_or(0, |g| {
+        g.checked_add(1)
+            .expect("durable channel generation exhausted")
+    });
 
     Ok(Some(RecoveredSession {
         path: path.to_path_buf(),
@@ -651,15 +732,68 @@ pub fn recover_one(path: &Path) -> std::io::Result<Option<RecoveredSession>> {
         label,
         cwd,
         permission_mode,
-        model_id,
+        model_id: meta.model_id,
         provider,
-        event_log,
+        durable_events,
+        next_generation,
         acp_session_id,
         turns,
-        archived,
+        archived: meta.archived,
         pending_prompts,
         next_prompt_id,
     }))
+}
+
+/// Stream the first `len` transcript events of a WAL file — the session's
+/// durable prefix, positions `[0, len)` of its logical event log — to `sink`
+/// in order, one record in memory at a time. Used by the forwarder to serve a
+/// from-base attach straight from disk instead of from a resident copy.
+///
+/// `len` is the `durable_events` recorded at recovery (or folded at archive);
+/// the appender only ever writes PAST it, so reading `[0, len)` through a
+/// separate handle is race-free against a live writer (the writer's advisory
+/// flock is untouched). Returns the number streamed. A file that yields fewer
+/// than `len` events (truncated, or a WAL-degraded session whose resident
+/// events never reached disk) streams what exists and then fails with
+/// `InvalidData` naming the shortfall, so the caller can be loud rather than
+/// silently gap the client. `len == 0` reads nothing.
+pub fn stream_durable_prefix(
+    path: &Path,
+    len: u64,
+    mut sink: impl FnMut(Notification) -> std::io::Result<()>,
+) -> std::io::Result<u64> {
+    if len == 0 {
+        return Ok(0);
+    }
+    let mut streamed = 0u64;
+    walk_wal(path, |note| {
+        sink(note)?;
+        streamed += 1;
+        Ok(streamed < len)
+    })?;
+    if streamed < len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "WAL {} holds {streamed} transcript event(s) but its durable prefix expects {len}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(streamed)
+}
+
+/// Every transcript event of a WAL file, decoded into memory. Test/diagnostic
+/// helper only — production never materialises a whole transcript (that is
+/// exactly what this module's streaming design exists to avoid).
+#[cfg(test)]
+pub(crate) fn read_all_events(path: &Path) -> std::io::Result<Vec<Notification>> {
+    let mut out = Vec::new();
+    walk_wal(path, |note| {
+        out.push(note);
+        Ok(true)
+    })?;
+    Ok(out)
 }
 
 fn wal_path(dir: &Path, server_session_id: &str) -> PathBuf {
@@ -728,7 +862,7 @@ mod tests {
         assert_eq!(s.acp_session_id.as_deref(), Some("acp-123"));
         assert_eq!(s.turns, 1);
         // header is not an event; 4 events were appended.
-        assert_eq!(s.event_log.len(), 4);
+        assert_eq!(s.durable_events, 4);
         assert_eq!(s.provider, AgentProvider::Claude);
     }
 
@@ -777,7 +911,7 @@ mod tests {
         assert_eq!(s.label, "final-name");
         // Rename records are metadata, not transcript events: the event_log
         // holds only the two real events (attached + chunk).
-        assert_eq!(s.event_log.len(), 2);
+        assert_eq!(s.durable_events, 2);
     }
 
     #[test]
@@ -824,7 +958,7 @@ mod tests {
         let s = &recovered[0];
         assert_eq!(s.acp_session_id.as_deref(), Some("acp-x"));
         // The two good events survive; the torn one is dropped.
-        assert_eq!(s.event_log.len(), 2);
+        assert_eq!(s.durable_events, 2);
     }
 
     #[test]
@@ -847,8 +981,8 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
         let first = recover_one(&path).unwrap().unwrap();
         let second = recover_one(&path).unwrap().unwrap();
-        assert_eq!(first.event_log.len(), 3);
-        assert_eq!(second.event_log.len(), first.event_log.len());
+        assert_eq!(first.durable_events, 3);
+        assert_eq!(second.durable_events, first.durable_events);
         assert_eq!(second.server_session_id, first.server_session_id);
         assert_eq!(
             std::fs::read(&path).unwrap(),
@@ -887,7 +1021,7 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), before);
         let recovered = recover_one(&path).unwrap().unwrap();
         assert_eq!(recovered.label, "first");
-        assert_eq!(recovered.event_log.len(), 1);
+        assert_eq!(recovered.durable_events, 1);
     }
 
     #[test]
@@ -1101,7 +1235,7 @@ mod tests {
             wal.append(&chunk("b"), true).unwrap();
         }
         let recovered = recover_all(&dir);
-        assert_eq!(recovered[0].event_log.len(), 2);
+        assert_eq!(recovered[0].durable_events, 2);
     }
 
     #[test]
@@ -1134,7 +1268,7 @@ mod tests {
         let first = recover_one(&path)
             .expect("a torn unparseable tail must not be fatal")
             .expect("the header + good event must still recover");
-        assert_eq!(first.event_log.len(), 1);
+        assert_eq!(first.durable_events, 1);
 
         // `reopen` (as the restarted server does) must repair the torn tail
         // before the caller appends the next record.
@@ -1148,7 +1282,7 @@ mod tests {
         let second = recover_one(&path)
             .expect("repaired WAL must recover without error on the next restart")
             .expect("session must still be present");
-        assert_eq!(second.event_log.len(), 2);
+        assert_eq!(second.durable_events, 2);
     }
 
     #[test]
@@ -1184,7 +1318,7 @@ mod tests {
 
         let recovered = recover_one(&path).unwrap().unwrap();
         // Both the repaired-and-kept event and the newly appended one survive.
-        assert_eq!(recovered.event_log.len(), 2);
+        assert_eq!(recovered.durable_events, 2);
     }
 
     #[test]
@@ -1202,7 +1336,7 @@ mod tests {
         let cold = recover_one(&path).unwrap().unwrap();
         assert!(cold.archived);
         assert_eq!(cold.acp_session_id.as_deref(), Some("acp-cold"));
-        assert_eq!(cold.event_log.len(), 1, "archive is metadata, not a turn");
+        assert_eq!(cold.durable_events, 1, "archive is metadata, not a turn");
 
         {
             let mut wal = SessionWal::reopen(path.clone()).unwrap();
@@ -1210,7 +1344,7 @@ mod tests {
         }
         let live = recover_one(&path).unwrap().unwrap();
         assert!(!live.archived, "the last lifecycle marker is authoritative");
-        assert_eq!(live.event_log.len(), 1);
+        assert_eq!(live.durable_events, 1);
     }
 
     #[test]
@@ -1253,8 +1387,7 @@ mod tests {
                 Some(&*format!("acp-{version}"))
             );
             assert_eq!(
-                one.event_log.len(),
-                3,
+                one.durable_events, 3,
                 "v{version} recovery must retain every decodable event"
             );
             assert_eq!(recover_all(&dir).len(), 1);
@@ -1312,8 +1445,11 @@ mod tests {
         // One completed turn at envelope turn 0 ⇒ turns == 1.
         assert_eq!(s.turns, 1, "turns derive from agent TurnEnded max(turn)+1");
 
-        // The Agent record's envelope survived intact.
-        let agent_ev = s.event_log.iter().find_map(|n| match n {
+        // The Agent record's envelope survived intact (on disk — the summary
+        // holds no events; read them back through the same walker).
+        let events = read_all_events(&s.path).unwrap();
+        assert_eq!(events.len() as u64, s.durable_events);
+        let agent_ev = events.iter().find_map(|n| match n {
             Notification::Agent { event } => Some(event),
             _ => None,
         });
@@ -1414,5 +1550,151 @@ mod tests {
             SessionWal::create(&dir, "s4", "l", Path::new("/tmp"), PermissionMode::Yolo).unwrap();
         wal.remove().unwrap();
         assert!(recover_all(&dir).is_empty());
+    }
+
+    /// ADR-0038: the boot-time summary and the attach-time prefix stream are
+    /// two views of ONE walker over the file, and they must agree — the
+    /// summary's `durable_events` is exactly what `stream_durable_prefix`
+    /// yields, in order, equal to a full decode; and the folded fields
+    /// (`turns`, `acp_session_id`, `next_generation`) equal what a fold over
+    /// the fully decoded events computes. Mixed legacy + Agent records, a
+    /// rename, an archive flip and a torn tail are all in the fixture.
+    #[test]
+    fn summary_and_prefix_stream_agree_with_a_full_decode() {
+        use crate::agent_event::{AgentEvent, AgentEventKind, ChunkRole, TurnOutcome};
+
+        let dir = tmp_dir("summary-vs-stream");
+        let path = {
+            let mut wal = SessionWal::create(
+                &dir,
+                "s1",
+                "before",
+                Path::new("/tmp"),
+                PermissionMode::Yolo,
+            )
+            .unwrap();
+            wal.append(&attached("acp-first"), false).unwrap();
+            wal.append(&chunk("legacy chunk"), false).unwrap();
+            wal.append(&turn_ended(1), true).unwrap();
+            wal.append_rename("after").unwrap();
+            for (g, turn, seq) in [(0u64, 0u64, 0u64), (0, 1, 1), (2, 3, 0)] {
+                wal.append(
+                    &Notification::Agent {
+                        event: AgentEvent::new(
+                            "s1".into(),
+                            g,
+                            turn,
+                            seq,
+                            AgentEventKind::Chunk {
+                                text: format!("g{g}t{turn}"),
+                                role: ChunkRole::Message,
+                            },
+                        ),
+                    },
+                    false,
+                )
+                .unwrap();
+                wal.append(
+                    &Notification::Agent {
+                        event: AgentEvent::new(
+                            "s1".into(),
+                            g,
+                            turn,
+                            seq + 1,
+                            AgentEventKind::TurnEnded {
+                                outcome: TurnOutcome::Completed,
+                            },
+                        ),
+                    },
+                    true,
+                )
+                .unwrap();
+            }
+            wal.append(&attached("acp-last"), false).unwrap();
+            wal.append_archived(true).unwrap();
+            wal.append_archived(false).unwrap();
+            wal.path().to_path_buf()
+        };
+        // A torn tail: tolerated by every reader, counted by none.
+        {
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(b"{\"t\":\"event\",\"type\":\"reply_ev")
+                .unwrap();
+        }
+
+        let full = read_all_events(&path).unwrap();
+        let summary = recover_one(&path).unwrap().unwrap();
+        assert_eq!(summary.durable_events, full.len() as u64);
+        assert_eq!(summary.durable_events, 10);
+        assert_eq!(summary.label, "after");
+        assert!(!summary.archived);
+        assert_eq!(summary.acp_session_id.as_deref(), Some("acp-last"));
+        // legacy: one TurnEnded; agent: max(turn)=3 ⇒ 4. max ⇒ 4.
+        assert_eq!(summary.turns, 4);
+        // max Agent generation 2 ⇒ next 3.
+        assert_eq!(summary.next_generation, 3);
+
+        let mut streamed = Vec::new();
+        let n = stream_durable_prefix(&path, summary.durable_events, |note| {
+            streamed.push(note);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(n, 10);
+        assert_eq!(
+            serde_json::to_string(&streamed).unwrap(),
+            serde_json::to_string(&full).unwrap(),
+            "the streamed prefix must be the full decode, in order"
+        );
+
+        // A shorter prefix stops early — it never reads past `len`.
+        let mut head = Vec::new();
+        assert_eq!(
+            stream_durable_prefix(&path, 3, |note| {
+                head.push(note);
+                Ok(())
+            })
+            .unwrap(),
+            3
+        );
+        assert_eq!(
+            serde_json::to_string(&head).unwrap(),
+            serde_json::to_string(&full[..3]).unwrap()
+        );
+        assert_eq!(stream_durable_prefix(&path, 0, |_| Ok(())).unwrap(), 0);
+
+        // A file shorter than the prefix it is expected to hold streams what
+        // exists and then fails loudly, naming the shortfall.
+        let mut partial = Vec::new();
+        let error = stream_durable_prefix(&path, 11, |note| {
+            partial.push(note);
+            Ok(())
+        })
+        .expect_err("a short file must not silently gap the prefix");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("holds 10"), "{error}");
+        assert!(error.to_string().contains("expects 11"), "{error}");
+        assert_eq!(
+            partial.len(),
+            10,
+            "everything that exists was still streamed"
+        );
+
+        // A sink error aborts the stream at that record.
+        let mut seen = 0;
+        let error = stream_durable_prefix(&path, 10, |_| {
+            seen += 1;
+            if seen == 4 {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "client gone",
+                ))
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("sink errors propagate");
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(seen, 4);
     }
 }

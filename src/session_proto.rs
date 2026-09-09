@@ -262,6 +262,12 @@ pub struct AdminSessionInfo {
     /// it additive for pre-trim admin clients.
     #[serde(default)]
     pub log_base: u64,
+    /// Transcript events that live ONLY on disk as the session's durable prefix
+    /// (ADR-0038): logical positions `[0, durable_events)`, streamed from the
+    /// WAL on a from-base attach and never resident. `0` for a session created
+    /// in this server process. Additive (`#[serde(default)]`).
+    #[serde(default)]
+    pub durable_events: u64,
     /// Active broadcast receivers — `0` or `1` under strict 1:1 (the single
     /// attached client's forwarder, if any).
     pub subscriber_count: usize,

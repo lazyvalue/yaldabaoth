@@ -72,6 +72,34 @@ mod launchd;
 //   does a clean from-base reconnect (NOT a silent gap). The owner is NOT exempt:
 //   a wedged owner that crosses the mark is cleanly bounced and reclaims its
 //   lease deterministically via same-`client_id` reclaim on reconnect (phase 4).
+/// Where a session's recovered history lives: on disk, as the first `len`
+/// transcript records of the WAL at `path` (ADR-0038). Handed from `do_attach`
+/// to the forwarder for a from-base replay.
+#[derive(Clone, Debug)]
+struct DurablePrefix {
+    path: PathBuf,
+    len: u64,
+}
+
+/// What `do_attach` hands a new forwarder.
+struct AttachGrant {
+    /// The session's transcript watch (wake signal + latest resident snapshot).
+    log_rx: watch::Receiver<LogSnapshot>,
+    /// The forwarder's initial position as a LOGICAL `sent_seq` (Bug 1a), NOT a
+    /// `Vec` index, so a later trim can't re-alias it: `log_base` for a
+    /// from-base replay, or the cursor's resolved seq for an incremental
+    /// reconnect.
+    initial_sent_seq: u64,
+    /// The forwarder's shared trim-floor handle (Bug 1b).
+    progress: ForwarderProgress,
+    /// ADR-0038: for a from-base replay of a recovered session, the durable
+    /// prefix the forwarder must stream from disk BEFORE tailing the resident
+    /// log (whose first entry sits at `initial_sent_seq == prefix.len`, or
+    /// later after a trim). `None` when the client already holds the prefix
+    /// (incremental reconnect) or the session's history is fully resident.
+    durable_prefix: Option<DurablePrefix>,
+}
+
 #[derive(Clone)]
 struct LogSnapshot {
     log: yalda::event_log::EventLog,
@@ -173,15 +201,8 @@ enum Command {
         /// `u64` in the reply): the tail starts there. `None` / stale /
         /// out-of-range ⇒ `0` ⇒ full replay (unchanged behavior).
         cursor: Option<(u64, u64)>,
-        // On success: (log watch, initial forwarder cursor, forwarder progress
-        // handle). The forwarder cursor is a LOGICAL `sent_seq` (Bug 1a), NOT a
-        // `Vec` index, so a later trim can't re-alias it; the progress handle is
-        // the shared `AtomicU64` the actor reads for the trim floor (Bug 1b).
-        // type alias would hurt readability here more than help
-        #[allow(clippy::type_complexity)]
-        reply: tokio::sync::oneshot::Sender<
-            Result<(watch::Receiver<LogSnapshot>, u64, ForwarderProgress), String>,
-        >,
+        // On success: the forwarder's grant — see `AttachGrant`.
+        reply: tokio::sync::oneshot::Sender<Result<AttachGrant, String>>,
     },
     Detach {
         sid: ServerSessionId,
@@ -481,6 +502,14 @@ struct ManagedSession {
     /// Stable path retained while `wal` is closed so unarchive can reopen it
     /// and explicit close can still remove it.
     wal_path: Option<PathBuf>,
+    /// The session's durable prefix (ADR-0038): logical event-log positions
+    /// `[0, len)` live ONLY on disk at `path` — the resident `event_log` was
+    /// seeded empty at `log_base == len`, so nothing of the recovered history
+    /// is in memory. A from-base attach streams them from the file
+    /// (`session_wal::stream_durable_prefix`) before tailing the resident log;
+    /// archive folds the resident tail into it. `None` for a session created
+    /// in this process (its whole log is resident from base 0).
+    durable_prefix: Option<DurablePrefix>,
     /// Phase-8 Stage A (spec §2/§3): the authoritative durable `seq` for the
     /// canonical `AgentEvent` envelope — monotonic per `(session, generation)`,
     /// assigned at the server's `record()` chokepoint. During the additive
@@ -541,16 +570,6 @@ fn compact_event_log(
     );
     event_log.prepend(Notification::Agent { event: marker });
     Some(trim.dropped)
-}
-
-/// Rebuild a WAL transcript without dropping its durable prefix.
-///
-/// Restart recovery is a fidelity boundary, not a steady-state memory policy:
-/// every valid WAL event must be available to the first attaching client. Live
-/// appends may compact only after subscribers have advanced their floors, but
-/// startup must never replace durable history with a synthetic summary.
-fn event_log_from_recovery(entries: Vec<Notification>) -> yalda::event_log::EventLog {
-    yalda::event_log::EventLog::from_recovered(entries, 0)
 }
 
 impl ManagedSession {
@@ -1009,6 +1028,7 @@ fn new_managed_session(
         replay_fence: 0,
         wal,
         wal_path,
+        durable_prefix: None,
         agent_seq: 0,
         bridge_tx,
     }
@@ -1022,29 +1042,6 @@ struct ResumeJob {
     provider: AgentProvider,
     acp_session_id: Option<String>,
     expected_generation: u64,
-}
-
-/// Resolve the canonical stream position for the first channel published after
-/// durable recovery. This is kept at the recovery boundary so the seed state,
-/// watch channels, and resume worker cannot choose different generations.
-fn recovered_stream_position(event_log: &[Notification]) -> (u64, u64) {
-    let generation = event_log
-        .iter()
-        .filter_map(|note| match note {
-            Notification::Agent { event } => Some(event.generation),
-            _ => None,
-        })
-        .max()
-        .map(|generation| {
-            generation
-                .checked_add(1)
-                .expect("durable channel generation exhausted")
-        })
-        .unwrap_or(0);
-    // `AgentEvent.seq` is per generation. A recovered server channel is a new
-    // generation, so its first `ChannelOpened` must start at seq 0 rather than
-    // continuing the maximum seq from an older generation.
-    (generation, 0)
 }
 
 /// The single-writer actor state: it OWNS the sessions map (no Mutex). Mutated
@@ -1147,7 +1144,7 @@ impl SessionManager {
         &self,
         sid: &str,
         cursor: Option<(u64, u64)>,
-    ) -> Result<(watch::Receiver<LogSnapshot>, u64, ForwarderProgress), String> {
+    ) -> Result<AttachGrant, String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         let _ = self.cmd_tx.send(Command::Attach {
             sid: sid.to_string(),
@@ -1334,12 +1331,21 @@ impl SessionManager {
 fn restore_seed_from_disk(
     bridge_tx: Option<BridgeTx>,
 ) -> io::Result<(HashMap<ServerSessionId, ManagedSession>, Vec<ResumeJob>)> {
+    let Some(dir) = session_wal_dir() else {
+        return Ok((HashMap::new(), Vec::new()));
+    };
+    restore_seed_from_dir(&dir, bridge_tx)
+}
+
+/// [`restore_seed_from_disk`] over an explicit WAL directory — the real seed
+/// path, callable from tests against a tempdir.
+fn restore_seed_from_dir(
+    dir: &std::path::Path,
+    bridge_tx: Option<BridgeTx>,
+) -> io::Result<(HashMap<ServerSessionId, ManagedSession>, Vec<ResumeJob>)> {
     let mut sessions = HashMap::new();
     let mut jobs = Vec::new();
-    let Some(dir) = session_wal_dir() else {
-        return Ok((sessions, jobs));
-    };
-    yalda::session_wal::try_recover_each(&dir, |rs| {
+    yalda::session_wal::try_recover_each(dir, |rs| {
         let sid = rs.server_session_id.clone();
         let acp_session_id = rs.acp_session_id.clone();
         let wal = if rs.archived {
@@ -1355,13 +1361,19 @@ fn restore_seed_from_disk(
             )?)
         };
 
-        let (channel_generation, agent_seq) = recovered_stream_position(&rs.event_log);
-        // Restart fidelity is absolute: expose the complete durable WAL image
-        // to the first client. `log_base == 0`, so every persisted event keeps
-        // its append-order position. Steady-state compaction resumes only after
-        // attached clients have consumed this recovered prefix.
-        let event_log = event_log_from_recovery(rs.event_log);
-        // Seed the watch with the recovered log so the first tail sees history.
+        // A recovered server channel is a new generation, strictly newer than
+        // every durable Agent event, and its per-generation seq restarts at 0.
+        let (channel_generation, agent_seq) = (rs.next_generation, 0);
+        // Restart fidelity is absolute, but it is served from DISK (ADR-0038):
+        // the resident log starts EMPTY at `log_base == durable_events`, so
+        // every persisted event keeps its append-order position `[0, len)`
+        // without a byte of it in memory. A from-base attach streams that
+        // prefix from the WAL before tailing the resident log.
+        let event_log = yalda::event_log::EventLog::from_recovered(Vec::new(), rs.durable_events);
+        let durable_prefix = Some(DurablePrefix {
+            path: rs.path.clone(),
+            len: rs.durable_events,
+        });
         let (log_tx, _) = watch::channel(LogSnapshot {
             log: event_log.clone(),
             generation: channel_generation,
@@ -1407,6 +1419,7 @@ fn restore_seed_from_disk(
             replay_fence: rs.turns,
             wal,
             wal_path: Some(rs.path.clone()),
+            durable_prefix,
             agent_seq,
             // Recovered sessions must stream too (spec §5): hand each the same
             // canonical bridge sender so a resumed session's transcript folds
@@ -1416,7 +1429,7 @@ fn restore_seed_from_disk(
 
         tracing::info!(
             session_id = %&sid[..8.min(sid.len())],
-            events = session.event_log.len(),
+            durable_events = rs.durable_events,
             turns = rs.turns,
             acp_session_id = %acp_session_id.as_deref().unwrap_or("<none>"),
             archived = rs.archived,
@@ -2029,7 +2042,7 @@ impl Manager {
         &mut self,
         session_id: &str,
         cursor: Option<(u64, u64)>,
-    ) -> Result<(watch::Receiver<LogSnapshot>, u64, ForwarderProgress), String> {
+    ) -> Result<AttachGrant, String> {
         let session = self
             .sessions
             .get_mut(session_id)
@@ -2056,15 +2069,26 @@ impl Manager {
         // BACK-COMPAT: before any trim `log_base == 0`, so `acked_seq == Vec
         // index` and this is byte-identical to the phase-5 steady state — a
         // never-force-restarted (gen 0, idx) cursor tails exactly `[idx..]`.
-        let initial_vec_index = session
+        let resolution = session
             .event_log
-            .resolve_cursor(cursor, session.channel_generation)
-            .initial_vec_index();
+            .resolve_cursor(cursor, session.channel_generation);
+        let from_base = matches!(resolution, yalda::event_log::CursorResolution::FromBase);
+        let initial_vec_index = resolution.initial_vec_index();
         // Hand the forwarder a LOGICAL `sent_seq` (Bug 1a), not the raw `Vec`
         // index, so a later trim re-resolves it correctly: the entries up to
         // `initial_vec_index` are considered already-sent, so `sent_seq` is the
         // seq of the FIRST not-yet-sent entry == `log_base + initial_vec_index`.
         let initial_sent_seq = session.event_log.seq_of(initial_vec_index);
+        // ADR-0038: a recovered session's history is NOT resident — it is the
+        // durable prefix on disk, logical positions `[0, len)` below the
+        // resident `log_base`. A from-base replay must begin with it; an
+        // incremental reconnect (`Tail`) resolved at/after `log_base >= len`
+        // already holds it.
+        let durable_prefix = if from_base {
+            session.durable_prefix.clone()
+        } else {
+            None
+        };
 
         // Register the latest forwarder's progress handle (Bug 1b): one clone
         // goes to the forwarder task (returned), one is retained on the session
@@ -2076,7 +2100,12 @@ impl Manager {
         let progress: ForwarderProgress = Arc::new(ForwarderHandle::new(initial_sent_seq));
         session.forwarder = Some(Arc::clone(&progress));
 
-        Ok((log_rx, initial_sent_seq, progress))
+        Ok(AttachGrant {
+            log_rx,
+            initial_sent_seq,
+            progress,
+            durable_prefix,
+        })
     }
 
     fn do_detach(&mut self, session_id: &str) -> Result<(), String> {
@@ -2763,6 +2792,19 @@ impl Manager {
                         // stop exactly one forwarder.
                         forwarder.released.store(true, Ordering::Release);
                     }
+                    // ADR-0038: fold the resident tail into the durable prefix.
+                    // Every push went through the open WAL handle (checked
+                    // above), so logical positions `[0, tip)` are all on disk
+                    // — an archived session holds ZERO resident events, and an
+                    // unarchive + attach streams them back from the file. A
+                    // trim marker is in-memory only and stands in for a real
+                    // on-disk record, so the on-disk count is exactly `tip`.
+                    if let Some(path) = session.wal.as_ref().map(|w| w.path().to_path_buf()) {
+                        let tip = session.event_log.tip_seq();
+                        session.durable_prefix = Some(DurablePrefix { path, len: tip });
+                        session.event_log =
+                            yalda::event_log::EventLog::from_recovered(Vec::new(), tip);
+                    }
                     session.publish_snapshot();
                     drop(session.wal.take());
                 } else {
@@ -2933,6 +2975,7 @@ impl Manager {
                 turns: s.turns,
                 event_log_len: s.event_log.len(),
                 log_base: s.event_log.log_base(),
+                durable_events: s.durable_prefix.as_ref().map_or(0, |p| p.len),
                 subscriber_count: s.log_tx.receiver_count(),
                 channel_generation: s.channel_generation,
                 permission_mode: s.permission_mode,
@@ -3367,7 +3410,12 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
 
             Request::Attach { session_id, cursor } => {
                 match manager.send_attach(&session_id, cursor).await {
-                    Ok((log_rx, initial_sent_seq, progress)) => {
+                    Ok(AttachGrant {
+                        log_rx,
+                        initial_sent_seq,
+                        progress,
+                        durable_prefix,
+                    }) => {
                         // `initial_sent_seq` is the actor-resolved tail start as a
                         // LOGICAL seq (Bug 1a): the seq of the first not-yet-sent
                         // entry. `log_base` for a from-replay attach (so the first
@@ -3376,10 +3424,13 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
                         // it to a `Vec` offset against the CURRENT `log_base` on
                         // every wake, so a Stage-B trim can't make it slice a stale
                         // offset. `progress` is its shared trim-floor handle (Bug 1b).
+                        // `durable_prefix` (ADR-0038) is the on-disk history a
+                        // from-base replay streams before that first tail.
                         tracing::info!(
                             session_id = %&session_id[..8],
                             initial_sent_seq,
                             cursor = ?cursor,
+                            durable_prefix = durable_prefix.as_ref().map_or(0, |p| p.len),
                             "attach: forwarder tail start resolved"
                         );
                         let w = Arc::clone(&writer);
@@ -3389,6 +3440,7 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
                             log_rx,
                             initial_sent_seq,
                             progress,
+                            durable_prefix,
                         ));
                         if let Some(previous) = subscribed.insert(session_id, handle) {
                             previous.abort();
@@ -3620,6 +3672,7 @@ async fn forward_notifications(
     mut log_rx: watch::Receiver<LogSnapshot>,
     initial_sent_seq: u64,
     progress: ForwarderProgress,
+    durable_prefix: Option<DurablePrefix>,
 ) {
     use std::sync::atomic::Ordering;
 
@@ -3649,34 +3702,8 @@ async fn forward_notifications(
         sent_seq: &mut u64,
         progress: &ForwarderProgress,
     ) -> bool {
-        // High-water disconnect (spec §6): the actor set `evicted` because this
-        // forwarder's backlog crossed the high-water bound. Shut down the write
-        // half so the CLIENT sees a clean EOF and does a from-base reconnect
-        // (NOT a silent gap) — merely returning would only stop this forwarder
-        // task while the connection's read loop kept the socket open (a wedged
-        // GUI under App Nap would never notice). The progress handle drops on
-        // return (the actor already cleared `forwarder`, so the trim resumed).
-        match forwarder_stop_action(progress) {
-            Some(ForwarderStop::ShutdownConnection) => {
-                tracing::warn!(
-                    session_id = %&session_id[..8.min(session_id.len())],
-                    "high-water disconnect: backlog past threshold — closing wedged forwarder's socket"
-                );
-                use tokio::io::AsyncWriteExt as _;
-                let _ = writer.lock().await.shutdown().await;
-                return false;
-            }
-            // bug-0028: this session was archived. Stop tailing it, but leave
-            // the shared per-connection write half open — every OTHER session on
-            // this connection is still streaming through it.
-            Some(ForwarderStop::ThisSessionOnly) => {
-                tracing::info!(
-                    session_id = %&session_id[..8.min(session_id.len())],
-                    "forwarder released (session archived); connection stays up"
-                );
-                return false;
-            }
-            None => {}
+        if !apply_stop_action(progress, writer, session_id).await {
+            return false;
         }
         let offset = match snap.log.resolve_sent(*sent_seq, snap.generation) {
             yalda::event_log::CursorResolution::FromBase => 0,
@@ -3692,6 +3719,17 @@ async fn forward_notifications(
             progress.sent_seq.store(*sent_seq, Ordering::Release);
         }
         true
+    }
+
+    // ADR-0038: a from-base replay of a recovered session begins with its
+    // durable prefix — logical positions `[0, len)`, which live only on disk.
+    // Stream them from the WAL file now, one record in memory at a time; the
+    // resident tail below starts at `sent_seq` (== `len`, or later after a
+    // trim), so the client sees one ordered stream with no replay/live seam.
+    if let Some(prefix) = durable_prefix
+        && !stream_prefix_to_client(&prefix, &writer, &session_id, &progress).await
+    {
+        return;
     }
 
     // First pass: `watch::Sender::subscribe()` marks the current value as
@@ -3754,6 +3792,139 @@ fn slow_sub_write_timeout() -> std::time::Duration {
     })
 }
 
+/// Honour an actor-set stop flag on this forwarder. Shared by the disk-prefix
+/// stream and the resident tail so both react the same way between writes.
+/// Returns `false` when the caller must stop forwarding this session.
+async fn apply_stop_action(
+    progress: &ForwarderProgress,
+    writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    session_id: &str,
+) -> bool {
+    // High-water disconnect (spec §6): the actor set `evicted` because this
+    // forwarder's backlog crossed the high-water bound. Shut down the write
+    // half so the CLIENT sees a clean EOF and does a from-base reconnect
+    // (NOT a silent gap) — merely returning would only stop this forwarder
+    // task while the connection's read loop kept the socket open (a wedged
+    // GUI under App Nap would never notice). The progress handle drops on
+    // return (the actor already cleared `forwarder`, so the trim resumed).
+    match forwarder_stop_action(progress) {
+        Some(ForwarderStop::ShutdownConnection) => {
+            tracing::warn!(
+                session_id = %&session_id[..8.min(session_id.len())],
+                "high-water disconnect: backlog past threshold — closing wedged forwarder's socket"
+            );
+            use tokio::io::AsyncWriteExt as _;
+            let _ = writer.lock().await.shutdown().await;
+            false
+        }
+        // bug-0028: this session was archived. Stop tailing it, but leave
+        // the shared per-connection write half open — every OTHER session on
+        // this connection is still streaming through it.
+        Some(ForwarderStop::ThisSessionOnly) => {
+            tracing::info!(
+                session_id = %&session_id[..8.min(session_id.len())],
+                "forwarder released (session archived); connection stays up"
+            );
+            false
+        }
+        None => true,
+    }
+}
+
+/// Serialized-frame batch size for the disk-prefix stream (ADR-0038): the
+/// reader hands the forwarder ~1 MiB of newline-framed notifications at a
+/// time over a 2-slot channel, so a multi-hundred-MB transcript streams with
+/// a few MiB resident instead of a decoded copy of the whole file.
+const PREFIX_BATCH_BYTES: usize = 1 << 20;
+
+/// Stream a recovered session's durable prefix — the first `prefix.len`
+/// transcript records of its WAL — to the client, in order, without ever
+/// holding more than a batch in memory (ADR-0038). A blocking reader decodes
+/// and serializes records into batches; this task writes each batch through
+/// the same timeout-bounded path as the resident tail, honouring the actor's
+/// stop flags between batches. Returns `false` when the client is gone (the
+/// caller drops the forwarder). A short or unreadable file forwards what
+/// exists and logs an ERROR naming the shortfall — loud, never a silent gap —
+/// and still returns `true` so the resident tail is served.
+async fn stream_prefix_to_client(
+    prefix: &DurablePrefix,
+    writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    session_id: &str,
+    progress: &ForwarderProgress,
+) -> bool {
+    if prefix.len == 0 {
+        return true;
+    }
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, usize)>(2);
+    let path = prefix.path.clone();
+    let expected = prefix.len;
+    let reader = tokio::task::spawn_blocking(move || {
+        let mut buf = String::new();
+        let mut count = 0usize;
+        let result = yalda::session_wal::stream_durable_prefix(&path, expected, |note| {
+            let frame = Frame::Notification { note };
+            if let Ok(line) = serde_json::to_string(&frame) {
+                buf.push_str(&line);
+                buf.push('\n');
+                count += 1;
+            }
+            if buf.len() >= PREFIX_BATCH_BYTES {
+                let batch = (std::mem::take(&mut buf), std::mem::take(&mut count));
+                // The forwarder dropped its receiver: the client is gone, stop
+                // reading. Reported as `BrokenPipe` so it is never mistaken for
+                // a short file.
+                tx.blocking_send(batch)
+                    .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "forwarder gone"))?;
+            }
+            Ok(())
+        });
+        if !buf.is_empty() {
+            let _ = tx.blocking_send((buf, count));
+        }
+        result
+    });
+
+    let mut client_alive = true;
+    while let Some((batch, this_pass)) = rx.recv().await {
+        if !apply_stop_action(progress, writer, session_id).await
+            || !write_frames(writer, session_id, &batch, this_pass).await
+        {
+            client_alive = false;
+            break;
+        }
+    }
+    // Dropping the receiver unblocks a reader still mid-file.
+    drop(rx);
+    match reader.await {
+        Ok(Ok(streamed)) => {
+            tracing::info!(
+                session_id = %&session_id[..8.min(session_id.len())],
+                streamed,
+                "attach: durable prefix streamed from disk"
+            );
+        }
+        Ok(Err(error)) if error.kind() == io::ErrorKind::BrokenPipe => {
+            // Our own early exit; the write failure was already logged.
+        }
+        Ok(Err(error)) => {
+            tracing::error!(
+                session_id = %&session_id[..8.min(session_id.len())],
+                expected,
+                error = %error,
+                "attach: durable prefix short or unreadable — the client's transcript is INCOMPLETE (ADR-0038)"
+            );
+        }
+        Err(join) => {
+            tracing::error!(
+                session_id = %&session_id[..8.min(session_id.len())],
+                error = %join,
+                "attach: durable prefix reader panicked — the client's transcript is INCOMPLETE"
+            );
+        }
+    }
+    client_alive
+}
+
 /// Serialize and write a tail slice of notifications in one buffered write.
 /// Returns `false` if the write failed (client gone) or stalled past the
 /// slow-subscriber timeout (non-draining peer), in which case the caller drops
@@ -3771,6 +3942,17 @@ async fn flush_tail(
             buf.push('\n');
         }
     }
+    write_frames(writer, session_id, &buf, tail.len()).await
+}
+
+/// Write one batch of already-serialized, newline-framed notifications under
+/// the slow-subscriber timeout. `this_pass` is the frame count, for the log.
+async fn write_frames(
+    writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    session_id: &str,
+    buf: &str,
+    this_pass: usize,
+) -> bool {
     let dur = slow_sub_write_timeout();
     let mut w = writer.lock().await;
     match tokio::time::timeout(dur, w.write_all(buf.as_bytes())).await {
@@ -3779,7 +3961,7 @@ async fn flush_tail(
             // Socket error — client gone.
             tracing::warn!(
                 session_id = %&session_id[..8.min(session_id.len())],
-                this_pass = tail.len(),
+                this_pass,
                 "forwarder write failed — client gone"
             );
             false
@@ -3788,7 +3970,7 @@ async fn flush_tail(
             // Elapsed — the peer's socket buffer is full and not draining.
             tracing::warn!(
                 session_id = %&session_id[..8.min(session_id.len())],
-                this_pass = tail.len(),
+                this_pass,
                 "slow subscriber: write stalled >{}ms — disconnecting",
                 dur.as_millis()
             );
@@ -4253,14 +4435,33 @@ mod lifecycle_tests {
             .expect("read WAL")
             .expect("recover session");
         assert_eq!(
-            recovered_stream_position(&recovered.event_log),
-            (2, 0),
-            "the first post-restart channel must be newer than durable history, \
-             and its per-generation sequence must restart at zero"
+            recovered.next_generation, 2,
+            "the first post-restart channel must be newer than durable history \
+             (its per-generation sequence restarts at zero in the seed)"
         );
+        // The REAL seed path commits exactly that generation.
+        let (sessions, jobs) = restore_seed_from_dir(dir.path(), None).expect("seed");
+        let seeded = &sessions["recovered-generation"];
+        assert_eq!((seeded.channel_generation, seeded.agent_seq), (2, 0));
+        assert_eq!(jobs[0].expected_generation, 2);
+
+        let empty_dir = tempfile::tempdir().expect("empty WAL tempdir");
+        let empty = yalda::session_wal::SessionWal::create(
+            empty_dir.path(),
+            "no-agent-events",
+            "empty",
+            std::path::Path::new("/tmp/project"),
+            PermissionMode::ReadOnly,
+        )
+        .expect("create empty WAL");
+        let empty_path = empty.path().to_path_buf();
+        drop(empty);
         assert_eq!(
-            recovered_stream_position(&[]),
-            (0, 0),
+            yalda::session_wal::recover_one(&empty_path)
+                .unwrap()
+                .unwrap()
+                .next_generation,
+            0,
             "a legacy/empty WAL keeps brand-new generation-zero behavior"
         );
         let fresh = new_managed_session(
@@ -4279,48 +4480,98 @@ mod lifecycle_tests {
         );
     }
 
-    /// Restart recovery must publish every valid WAL event for both active and
-    /// archived sessions. The in-memory cap is a live steady-state mechanism;
-    /// applying it before first attach silently amputates durable history.
+    /// Restart recovery must make every valid WAL event available to the first
+    /// attaching client for both active and archived sessions — but from DISK
+    /// (ADR-0038): the resident log is seeded EMPTY at the durable base, the
+    /// durable prefix names the file and its length, and streaming that prefix
+    /// yields the complete history in order. (Startup compaction stays gone:
+    /// the logical tip is the full durable length.)
     #[test]
-    fn recovery_replays_complete_active_and_archived_logs_before_attach() {
+    fn recovery_keeps_history_on_disk_and_seeds_an_empty_resident_log_at_the_durable_base() {
         use yalda::agent_event::{AgentEvent, AgentEventKind, ChunkRole};
+
+        let dir = tempfile::tempdir().expect("WAL tempdir");
+        for archived in [false, true] {
+            let sid = if archived { "archived" } else { "active" };
+            let mut wal = yalda::session_wal::SessionWal::create(
+                dir.path(),
+                sid,
+                sid,
+                std::path::Path::new("/tmp/project"),
+                PermissionMode::ReadOnly,
+            )
+            .expect("create WAL");
+            for seq in 0..20 {
+                wal.append(
+                    &Notification::Agent {
+                        event: AgentEvent::new(
+                            sid.into(),
+                            0,
+                            seq / 2,
+                            seq,
+                            AgentEventKind::Chunk {
+                                text: format!("chunk-{seq}"),
+                                role: ChunkRole::Message,
+                            },
+                        ),
+                    },
+                    false,
+                )
+                .expect("append");
+            }
+            if archived {
+                wal.append_archived(true).expect("archive marker");
+            }
+        }
+
+        let (sessions, jobs) = restore_seed_from_dir(dir.path(), None).expect("seed");
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(jobs.len(), 1, "only the active session resumes an agent");
+        assert_eq!(jobs[0].session_id, "active");
 
         for archived in [false, true] {
             let sid = if archived { "archived" } else { "active" };
-            let mut entries = Vec::new();
-            for seq in 0..20 {
-                entries.push(Notification::Agent {
-                    event: AgentEvent::new(
-                        sid.into(),
-                        0,
-                        seq / 2,
-                        seq,
-                        AgentEventKind::Chunk {
-                            text: format!("chunk-{seq}"),
-                            role: ChunkRole::Message,
-                        },
-                    ),
-                });
-            }
-            let log = event_log_from_recovery(entries);
-
-            assert_eq!(log.len(), 20, "every WAL event must reach first attach");
-            assert_eq!(log.log_base(), 0, "full replay starts at the durable base");
-            assert_eq!(log.tip_seq(), 20, "compaction keeps the logical tip stable");
-            let recovered = log.tail_from(0);
-            let texts: Vec<_> = recovered
-                .iter()
-                .filter_map(|note| match note {
-                    Notification::Agent { event } => match &event.kind {
-                        AgentEventKind::Chunk { text, .. } => Some(text.as_str()),
-                        _ => None,
-                    },
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(texts.first(), Some(&"chunk-0"));
-            assert_eq!(texts.last(), Some(&"chunk-19"));
+            let s = &sessions[sid];
+            assert_eq!(s.archived, archived);
+            assert_eq!(
+                s.wal.is_some(),
+                !archived,
+                "archived sessions own no WAL handle"
+            );
+            assert_eq!(s.event_log.len(), 0, "recovered history is never resident");
+            assert_eq!(
+                s.event_log.log_base(),
+                20,
+                "the resident log starts after the prefix"
+            );
+            assert_eq!(
+                s.event_log.tip_seq(),
+                20,
+                "the logical tip is the full durable length"
+            );
+            assert_eq!(
+                (s.channel_generation, s.agent_seq),
+                (1, 0),
+                "the next channel is newer than durable generation 0"
+            );
+            let prefix = s
+                .durable_prefix
+                .as_ref()
+                .expect("recovered sessions carry a prefix");
+            assert_eq!(prefix.len, 20);
+            let mut texts = Vec::new();
+            yalda::session_wal::stream_durable_prefix(&prefix.path, prefix.len, |note| {
+                if let Notification::Agent { event } = note
+                    && let AgentEventKind::Chunk { text, .. } = event.kind
+                {
+                    texts.push(text);
+                }
+                Ok(())
+            })
+            .expect("stream the prefix");
+            assert_eq!(texts.len(), 20, "every WAL event must reach first attach");
+            assert_eq!(texts.first().map(String::as_str), Some("chunk-0"));
+            assert_eq!(texts.last().map(String::as_str), Some("chunk-19"));
         }
     }
 
@@ -4607,10 +4858,33 @@ mod lifecycle_tests {
         assert!(session.pending_prompts.is_empty());
         assert_eq!(session.acp_session_id.as_deref(), Some("acp-cold-1"));
         assert!(wal_path.exists(), "archive retains the durable transcript");
+        // ADR-0038: the resident tail folded into the on-disk durable prefix.
+        assert_eq!(
+            session.event_log.len(),
+            0,
+            "an archived session holds zero resident events"
+        );
+        let prefix = session
+            .durable_prefix
+            .as_ref()
+            .expect("archive folds the log into a durable prefix");
+        assert_eq!(prefix.path, wal_path);
+        assert_eq!(
+            prefix.len, 1,
+            "the one recorded event (SessionAttached) lives on disk"
+        );
+        assert_eq!(session.event_log.log_base(), 1);
+        assert_eq!(
+            session.event_log.tip_seq(),
+            1,
+            "the logical tip is unchanged by the fold"
+        );
 
         let admin = manager.do_admin_status();
         assert!(admin.sessions[0].archived);
         assert!(!admin.sessions[0].wal_open);
+        assert_eq!(admin.sessions[0].event_log_len, 0);
+        assert_eq!(admin.sessions[0].durable_events, 1);
         assert!(
             manager
                 .enqueue_prompt("cold-1", "must fail", Vec::new())
@@ -5014,14 +5288,72 @@ mod lifecycle_tests {
         );
         let mut manager = manager_with_session(session);
 
-        let (_, _, first) = manager.do_attach("attach-replace", None).unwrap();
-        let (_, _, second) = manager.do_attach("attach-replace", None).unwrap();
+        let first = manager.do_attach("attach-replace", None).unwrap().progress;
+        let second = manager.do_attach("attach-replace", None).unwrap().progress;
 
         assert!(
             !first.released.load(Ordering::Acquire),
             "the actor cannot assume an attach came from the same connection"
         );
         assert!(!second.released.load(Ordering::Acquire));
+    }
+
+    /// ADR-0038: a recovered session's history lives on disk as its durable
+    /// prefix. A from-base attach must hand the forwarder that prefix (and a
+    /// tail start right after it); an incremental reconnect at/after the
+    /// prefix must not (the client already holds it); a session created in
+    /// this process has no prefix at all.
+    #[test]
+    fn from_base_attach_grants_the_durable_prefix_and_tail_attach_does_not() {
+        let mut session = new_managed_session(
+            "lazy".into(),
+            "lazy".into(),
+            PathBuf::from("/tmp/project"),
+            AgentProvider::Codex,
+            PermissionMode::ReadOnly,
+            None,
+            None,
+        );
+        session.event_log = yalda::event_log::EventLog::from_recovered(Vec::new(), 40);
+        session.durable_prefix = Some(DurablePrefix {
+            path: PathBuf::from("/tmp/project/lazy.log"),
+            len: 40,
+        });
+        let mut manager = manager_with_session(session);
+
+        let grant = manager.do_attach("lazy", None).unwrap();
+        assert_eq!(
+            grant.initial_sent_seq, 40,
+            "the resident tail starts right after the on-disk prefix"
+        );
+        assert_eq!(grant.durable_prefix.as_ref().map(|p| p.len), Some(40));
+
+        // Same generation, acked exactly at the prefix boundary: the client
+        // already holds `[0, 40)`, so it gets an incremental tail and no prefix.
+        let grant = manager.do_attach("lazy", Some((0, 40))).unwrap();
+        assert_eq!(grant.initial_sent_seq, 40);
+        assert!(grant.durable_prefix.is_none());
+
+        // A stale generation forces a from-base rebuild: prefix again.
+        let grant = manager.do_attach("lazy", Some((7, 40))).unwrap();
+        assert!(grant.durable_prefix.is_some());
+
+        let fresh = new_managed_session(
+            "fresh".into(),
+            "fresh".into(),
+            PathBuf::from("/tmp/project"),
+            AgentProvider::Codex,
+            PermissionMode::ReadOnly,
+            None,
+            None,
+        );
+        let mut manager = manager_with_session(fresh);
+        let grant = manager.do_attach("fresh", None).unwrap();
+        assert_eq!(grant.initial_sent_seq, 0);
+        assert!(
+            grant.durable_prefix.is_none(),
+            "a fresh session's log is fully resident"
+        );
     }
 
     struct CaptureFailSpawner {

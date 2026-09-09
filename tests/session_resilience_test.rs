@@ -1006,6 +1006,297 @@ fn interior_corrupt_wal_is_skipped_and_the_server_still_boots() {
     let _ = std::fs::remove_file(&log);
 }
 
+// ── History streams from disk (ADR-0038, graph aop) ────────────────────────
+
+/// Spawn the real server binary on an explicit socket (so a second boot can
+/// reuse the first boot's WAL dir), with the given agent + env knobs, stderr to
+/// `log`. Waits until the socket is connectable; a child that exits first is
+/// reported with its log.
+fn spawn_server_on(
+    socket: &std::path::Path,
+    agent: &str,
+    knobs: &[(&str, &str)],
+    log: &std::path::Path,
+) -> Child {
+    let logfile = std::fs::File::create(log).expect("server log");
+    let bin = env!("CARGO_BIN_EXE_yalda-session-server");
+    let mut builder = Command::new(bin);
+    builder
+        .arg("--force")
+        .env("YALDA_SESSION_SOCKET", socket)
+        .env("YALDA_ACP_AGENT", agent)
+        .env("YALDA_CONFIG", "/nonexistent/yalda-test-config.kdl");
+    for (k, v) in knobs {
+        builder.env(k, v);
+    }
+    let mut child = builder
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(logfile))
+        .spawn()
+        .expect("spawn server");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::os::unix::net::UnixStream::connect(socket).is_err() {
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!(
+                "server exited during boot ({status}); log:\n{}",
+                std::fs::read_to_string(log).unwrap_or_default()
+            );
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            panic!(
+                "server never came up; log:\n{}",
+                std::fs::read_to_string(log).unwrap_or_default()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child
+}
+
+/// The text of every streamed agent chunk, in order.
+fn chunk_texts(notes: &[Notification]) -> Vec<String> {
+    notes
+        .iter()
+        .filter_map(|n| match n {
+            Notification::ReplyEvent {
+                event: yalda::acp_channel::ReplyEvent::Chunk(text),
+                ..
+            } => Some(text.to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The admin row for `sid`, or a panic carrying the server log.
+fn admin_row(
+    client: &SessionServerClient,
+    sid: &str,
+    log: &std::path::Path,
+) -> yalda::session_proto::AdminSessionInfo {
+    client
+        .admin_status()
+        .expect("admin_status")
+        .sessions
+        .into_iter()
+        .find(|s| s.session_id == sid)
+        .unwrap_or_else(|| {
+            panic!(
+                "session {sid} missing from admin snapshot; log:\n{}",
+                std::fs::read_to_string(log).unwrap_or_default()
+            )
+        })
+}
+
+/// ADR-0038 (restart fidelity, served from disk): a real streamed turn lands
+/// in the WAL; after a server restart the session's history is NOT resident
+/// (`event_log_len == 0`, `log_base == durable_events`), yet a from-base
+/// attach replays the entire transcript — the same chunks, in the same order —
+/// and STILL leaves nothing resident afterwards.
+#[test]
+fn restart_replays_full_history_from_disk_without_a_resident_copy() {
+    let _g = serial_lock();
+    const CHUNKS: usize = 6;
+    let n = SEQ.fetch_add(1, Ordering::SeqCst);
+    let pid = std::process::id();
+    let dir = std::env::temp_dir();
+    let socket = dir.join(format!("yalda-restest-{pid}-{n}-disk.sock"));
+    let wal_dir = socket.with_extension("wal");
+    let log1 = socket.with_extension("boot1.log");
+    let log2 = socket.with_extension("boot2.log");
+    let _ = std::fs::remove_file(&socket);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    unsafe { std::env::set_var("YALDA_SESSION_SOCKET", &socket) };
+
+    // Boot 1: the real stub agent streams a turn into the WAL.
+    let mut boot1 = spawn_server_on(
+        &socket,
+        env!("CARGO_BIN_EXE_yalda-acp-stub"),
+        &[("STUB_CHUNKS", "6")],
+        &log1,
+    );
+    let live_texts = {
+        let client = connect_as("gui-disk-1");
+        let info = client
+            .create_session(std::env::temp_dir(), "disk".into(), None)
+            .expect("create_session");
+        let sid = info.session_id.clone();
+        client.attach(&sid).expect("attach");
+        client.prompt(&sid, "hello").expect("prompt");
+        let live = drain_until(&client, Duration::from_secs(15), |n| {
+            saw_turn_ended(n, &sid)
+        });
+        let texts = chunk_texts(&live);
+        assert_eq!(
+            texts.len(),
+            CHUNKS,
+            "live turn must stream all {CHUNKS} chunks; log:\n{}",
+            std::fs::read_to_string(&log1).unwrap_or_default()
+        );
+        (sid, texts)
+    };
+    let (sid, live_texts) = live_texts;
+    let _ = boot1.kill();
+    let _ = boot1.wait();
+    let _ = std::fs::remove_file(&socket);
+
+    // Boot 2 on the SAME WAL dir. `/usr/bin/true` as the agent: the resume
+    // spawn fails harmlessly, so nothing but the durable history can reach the
+    // client.
+    let mut boot2 = spawn_server_on(&socket, "/usr/bin/true", &[], &log2);
+    let client = connect_as("gui-disk-2");
+    let before = admin_row(&client, &sid, &log2);
+    assert!(
+        before.durable_events as usize > CHUNKS,
+        "the WAL holds the chunks plus the turn boundary; row={before:?}"
+    );
+    assert_eq!(
+        before.log_base, before.durable_events,
+        "the resident log starts right after the on-disk prefix; row={before:?}"
+    );
+    // The resumed spawn (`/usr/bin/true`) fails and records a post-boot
+    // lifecycle event or two — legitimately resident. The recovered history
+    // (the whole streamed turn) must not be.
+    assert!(
+        before.event_log_len < CHUNKS,
+        "recovered history must not be resident before attach; row={before:?}"
+    );
+
+    client.attach(&sid).expect("attach after restart");
+    let replay = drain_until(&client, Duration::from_secs(15), |n| {
+        saw_turn_ended(n, &sid)
+    });
+    assert_eq!(
+        chunk_texts(&replay),
+        live_texts,
+        "the from-base replay must be the entire durable transcript in order; log:\n{}",
+        std::fs::read_to_string(&log2).unwrap_or_default()
+    );
+    assert!(
+        saw_turn_ended(&replay, &sid),
+        "replay must include the turn boundary"
+    );
+
+    let after = admin_row(&client, &sid, &log2);
+    assert_eq!(
+        after.log_base, before.log_base,
+        "no trim, no materialisation"
+    );
+    assert!(
+        after.event_log_len < CHUNKS,
+        "streaming the prefix must not materialise it; row={after:?}"
+    );
+    let server_log = std::fs::read_to_string(&log2).unwrap_or_default();
+    assert!(
+        server_log.contains("durable prefix streamed from disk"),
+        "the forwarder must report the disk stream; log:\n{server_log}"
+    );
+
+    drop(client);
+    let _ = boot2.kill();
+    let _ = boot2.wait();
+    let _ = std::fs::remove_file(&socket);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    let _ = std::fs::remove_file(&log1);
+    let _ = std::fs::remove_file(&log2);
+}
+
+/// ADR-0038 (archived sessions are cold): a large archived WAL costs nothing
+/// resident at boot — zero events in memory, the full count on disk — and a
+/// client that attaches to read it still receives every event, in order, with
+/// the log staying empty afterwards.
+#[test]
+fn archived_session_stays_cold_across_restart_and_still_replays_in_full() {
+    let _g = serial_lock();
+    const EVENTS: usize = 20_000;
+    let n = SEQ.fetch_add(1, Ordering::SeqCst);
+    let pid = std::process::id();
+    let dir = std::env::temp_dir();
+    let socket = dir.join(format!("yalda-restest-{pid}-{n}-cold.sock"));
+    let wal_dir = socket.with_extension("wal");
+    let log = socket.with_extension("log");
+    let _ = std::fs::remove_file(&socket);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    std::fs::create_dir_all(&wal_dir).expect("mk wal dir");
+    let sid = "cold-archive";
+    {
+        use std::io::Write as _;
+        let mut f = std::io::BufWriter::new(
+            std::fs::File::create(wal_dir.join(format!("{sid}.log"))).expect("seed wal"),
+        );
+        writeln!(
+            f,
+            r#"{{"t":"header","version":3,"server_session_id":"{sid}","label":"{sid}","cwd":"/tmp","permission_mode":"Yolo","provider":"claude"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"t":"event","type":"session_attached","session_id":"{sid}","acp_session_id":"acp-{sid}"}}"#
+        )
+        .unwrap();
+        for i in 0..EVENTS {
+            writeln!(
+                f,
+                r#"{{"t":"event","type":"reply_event","session_id":"{sid}","event":{{"Chunk":"c{i}"}}}}"#
+            )
+            .unwrap();
+        }
+        writeln!(f, r#"{{"t":"archive","archived":true}}"#).unwrap();
+        f.flush().unwrap();
+    }
+    unsafe { std::env::set_var("YALDA_SESSION_SOCKET", &socket) };
+
+    let mut child = spawn_server_on(&socket, "/usr/bin/true", &[], &log);
+    let client = connect_as("gui-cold");
+    let row = admin_row(&client, sid, &log);
+    assert!(row.archived);
+    assert_eq!(
+        row.event_log_len, 0,
+        "an archived transcript is never resident; row={row:?}"
+    );
+    assert_eq!(
+        row.durable_events as usize,
+        EVENTS + 1,
+        "every event is on disk; row={row:?}"
+    );
+    assert_eq!(row.log_base as usize, EVENTS + 1);
+
+    client.attach(sid).expect("attach to the archived session");
+    let replay = drain_until(&client, Duration::from_secs(30), |n| {
+        chunk_texts(n).len() >= EVENTS
+    });
+    let texts = chunk_texts(&replay);
+    assert_eq!(
+        texts.len(),
+        EVENTS,
+        "the whole archived transcript must stream from disk; got {}; log:\n{}",
+        texts.len(),
+        std::fs::read_to_string(&log).unwrap_or_default()
+    );
+    assert_eq!(texts.first().map(String::as_str), Some("c0"));
+    assert_eq!(
+        texts.last().map(String::as_str),
+        Some(&*format!("c{}", EVENTS - 1))
+    );
+    assert!(
+        texts.windows(2).all(|w| w[0] != w[1]),
+        "no duplicated frames in the stream"
+    );
+    let row = admin_row(&client, sid, &log);
+    assert_eq!(
+        row.event_log_len, 0,
+        "reading an archived session materialises nothing"
+    );
+
+    drop(client);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&socket);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    let _ = std::fs::remove_file(&log);
+}
+
 // ── Highlander guard (bug-0064 recurrence, graph f5x) ──────────────────────
 //
 // The 2026-09-01 split-brain: a frozen GUI auto-launched a second server from

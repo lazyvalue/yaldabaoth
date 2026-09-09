@@ -24,12 +24,24 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
   `~/.yalda/wal-backup-torn-20260909T005200/` (488 MB, the two pre-repair
   files) once satisfied.
 
-- **Startup replay memory: 1.1 GB of WAL → 7.2 GB peak RSS** — `READY`
-  (observed 2026-09-09 00:52 on the 55-session recovery; `systemctl --user
-  status` `Mem peak: 7.2G`). Recovery holds every replay image as
-  `Vec<Notification>` per session before publishing; worth a profile
-  (`recover_one` allocations, `event_log_from_recovery` clones, the seeded
-  `watch` snapshot holding a second copy) before the WAL dir grows further.
+- **Deploy WAL history streaming (ADR-0038, Cog graph `aop`)** —
+  `NEEDS-RUNTIME` (2026-09-09; see
+  [worklog](worklog/2026-09-09-wal-history-streaming.md)). Fixes the 7.2 GB
+  peak / 1.9 GB steady recovery memory: boot folds a summary per WAL, the
+  resident log starts empty at `log_base = durable_events`, a from-base attach
+  streams the prefix from disk, archive folds the tail. On `main`, release
+  server binary built; the running service is the pre-fix binary. Scott:
+  `./deploy-server.sh` (same restart caveats as the bug-0064 deploy above,
+  which this supersedes — one deploy covers both). Gap 3 check afterwards:
+  `systemctl --user status yalda-session-server` should show a peak well
+  under 1 GB on the 55-session roster, and the GUI's first attach to a big
+  session should stream (watch `attach: durable prefix streamed from disk` in
+  `~/.yalda/session-server.log`).
+
+- **Resident-tail follow-ups (deferred)** — recorded as Cog bulletin `an7` at
+  `yaldabaoth/session-server::follow-ups`: (3) resident events as wire bytes;
+  (4) never replay history into the Cog bridge at boot / bound the bridge
+  channel. Not scheduled.
 
 - **Server-lifecycle redesign activation (bug-0064 RECURRED #2)** — mostly
   `DONE` (2026-09-01, ADR-0037, graph `f5x`). Observed 2026-09-09: the
