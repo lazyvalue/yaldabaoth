@@ -13,18 +13,31 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
-- **Activate the server-lifecycle redesign (bug-0064 RECURRED fix)** —
-  `NEEDS-RUNTIME` (2026-09-01, ADR-0037, Cog graph `f5x`; see
-  [worklog](worklog/2026-09-01-server-lifecycle-highlander.md)). Merged
-  (cfd990a), release built, server binary installed to `~/.local/bin` — but no
-  process was restarted (activation boundary). Scott's steps: kill the five
-  leaked old-binary servers (968767, 1166646, 1281509, 1286826, 1459868 —
-  pids from that session; re-verify before killing) and then the GUI-attached
-  521644, run `./install-service.sh` once, confirm
-  `systemctl --user status yalda-session-server`, and restart the GUI via
-  `./dev-gui.sh` so the running GUI stops carrying the deleted auto-launch
-  code. Live checks: splash instruction with the unit stopped; auto-reattach
-  when it starts; in-app Rebuild&Restart-all goes through systemctl.
+- **Deploy the bug-0064 per-file corrupt-WAL skip** — `NEEDS-RUNTIME`
+  (2026-09-09, Cog graph `fgb`; see
+  [worklog](worklog/2026-09-09-wal-interior-corruption-skip.md)). On `main`
+  (a0af02c), release server binary built; the running systemd service is the
+  00:46 PRE-fix binary and will crash-loop again on any future
+  interior-corrupt WAL. Scott: `./deploy-server.sh` (restarts the service —
+  every attached GUI session reconnects; WAL replay is lossless). Gap 2: the
+  fixed binary has not run against the real `~/.yalda/wal`. Afterwards delete
+  `~/.yalda/wal-backup-torn-20260909T005200/` (488 MB, the two pre-repair
+  files) once satisfied.
+
+- **Startup replay memory: 1.1 GB of WAL → 7.2 GB peak RSS** — `READY`
+  (observed 2026-09-09 00:52 on the 55-session recovery; `systemctl --user
+  status` `Mem peak: 7.2G`). Recovery holds every replay image as
+  `Vec<Notification>` per session before publishing; worth a profile
+  (`recover_one` allocations, `event_log_from_recovery` clones, the seeded
+  `watch` snapshot holding a second copy) before the WAL dir grows further.
+
+- **Server-lifecycle redesign activation (bug-0064 RECURRED #2)** — mostly
+  `DONE` (2026-09-01, ADR-0037, graph `f5x`). Observed 2026-09-09: the
+  systemd user unit is installed, enabled and running; the six leaked
+  old-binary servers were SIGTERMed Sep 8 21:24 and the Highlander guard
+  refused a side-by-side boot as designed. Residual live checks still open:
+  splash instruction with the unit stopped; auto-reattach when it starts;
+  in-app Rebuild&Restart-all goes through systemctl.
 
 - **Stale archived-waiting-tab guard fails on main** — `READY` (found
   2026-09-01 during the agent-header redesign, Cog graph `y8m`; see
