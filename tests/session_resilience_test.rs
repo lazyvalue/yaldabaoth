@@ -886,6 +886,126 @@ fn v1_wal_session_survives_server_upgrade() {
     let _ = std::fs::remove_file(&log);
 }
 
+/// bug-0064 (2026-09-09): one WAL carrying durable interior corruption — the
+/// production shape left by the Sep 1–2 twin-writer split-brain: a complete
+/// record, then a newline-terminated orphan tail fragment, then more complete
+/// records — must NOT crash-loop the whole server. This drives the REAL
+/// startup path (`restore_seed_from_disk` → `try_recover_each`) of the real
+/// binary: the server must come up, publish every other session, skip the
+/// corrupt one loudly, and leave its bytes untouched.
+#[test]
+fn interior_corrupt_wal_is_skipped_and_the_server_still_boots() {
+    let _g = serial_lock();
+    let n = SEQ.fetch_add(1, Ordering::SeqCst);
+    let pid = std::process::id();
+    let dir = std::env::temp_dir();
+    let socket = dir.join(format!("yalda-restest-{pid}-{n}-corrupt.sock"));
+    let wal_dir = socket.with_extension("wal");
+    let _ = std::fs::remove_file(&socket);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    std::fs::create_dir_all(&wal_dir).expect("mk wal dir");
+
+    let header = |sid: &str| {
+        format!(
+            r#"{{"t":"header","version":3,"server_session_id":"{sid}","label":"{sid}","cwd":"/tmp","permission_mode":"Yolo","provider":"claude"}}"#
+        )
+    };
+    let attached = |sid: &str| {
+        format!(
+            r#"{{"t":"event","type":"session_attached","session_id":"{sid}","acp_session_id":"acp-{sid}"}}"#
+        )
+    };
+    // Sorted FIRST so the corrupt file is met before the valid one — exactly
+    // the production order (0b319323 failed with the rest of the roster
+    // still unread).
+    let corrupt_path = wal_dir.join("00-corrupt-session.log");
+    let corrupt_bytes = format!(
+        "{}\n{}\n{}\n{}\n",
+        header("00-corrupt-session"),
+        attached("00-corrupt-session"),
+        // Verbatim a1204e30 line 11811: the surviving tail of a record whose
+        // head the concurrent appender clobbered.
+        r#"pected":false},"toolName":"Bash"}}}}}"#,
+        attached("00-corrupt-session"),
+    );
+    std::fs::write(&corrupt_path, &corrupt_bytes).expect("seed corrupt wal");
+    let valid_path = wal_dir.join("99-valid-session.log");
+    std::fs::write(
+        &valid_path,
+        format!(
+            "{}\n{}\n",
+            header("99-valid-session"),
+            attached("99-valid-session")
+        ),
+    )
+    .expect("seed valid wal");
+
+    unsafe { std::env::set_var("YALDA_SESSION_SOCKET", &socket) };
+    let log = socket.with_extension("log");
+    let logfile = std::fs::File::create(&log).expect("server log");
+    let bin = env!("CARGO_BIN_EXE_yalda-session-server");
+    let mut child = Command::new(bin)
+        .arg("--force")
+        .env("YALDA_SESSION_SOCKET", &socket)
+        .env("YALDA_ACP_AGENT", "/usr/bin/true")
+        .env("YALDA_CONFIG", "/nonexistent/yalda-test-config.kdl")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(logfile))
+        .spawn()
+        .expect("spawn server");
+
+    // The bug's exact symptom is the process exiting during recovery, so a
+    // dead child is reported as such (with its log) rather than as a timeout.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::os::unix::net::UnixStream::connect(&socket).is_err() {
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!(
+                "server exited during recovery ({status}) instead of skipping the corrupt WAL; log:\n{}",
+                std::fs::read_to_string(&log).unwrap_or_default()
+            );
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            panic!(
+                "server never came up; log:\n{}",
+                std::fs::read_to_string(&log).unwrap_or_default()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let client = SessionServerClient::connect().expect("connect");
+    let sessions = client.list_sessions().expect("list");
+    let ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
+    assert!(
+        ids.contains(&"99-valid-session"),
+        "the healthy session must be recovered alongside a corrupt neighbour; got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"00-corrupt-session"),
+        "a corrupt WAL must not be advertised as a recovered session; got {ids:?}"
+    );
+    // Retained byte-for-byte for manual repair, and the skip is loud.
+    assert_eq!(
+        std::fs::read(&corrupt_path).unwrap(),
+        corrupt_bytes.as_bytes()
+    );
+    let server_log = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        server_log.contains("SKIPPING CORRUPT WAL")
+            && server_log.contains("00-corrupt-session.log")
+            && server_log.contains("malformed WAL record at line 3"),
+        "the skip must name the file and the line; log:\n{server_log}"
+    );
+
+    drop(client);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&socket);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    let _ = std::fs::remove_file(&log);
+}
+
 // ── Highlander guard (bug-0064 recurrence, graph f5x) ──────────────────────
 //
 // The 2026-09-01 split-brain: a frozen GUI auto-launched a second server from

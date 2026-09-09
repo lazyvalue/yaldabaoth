@@ -435,20 +435,30 @@ pub fn recover_each(dir: &Path, mut visit: impl FnMut(RecoveredSession)) {
     }
 }
 
-/// Strict production recovery. Unlike [`recover_each`], this never turns a WAL
-/// problem into a MISSING session: one unreadable, unsupported, or corrupt
-/// file fails the whole startup recovery while leaving every file untouched —
-/// a server must not advertise an incomplete roster as success.
+/// Strict production recovery. Unlike [`recover_each`], this never silently
+/// turns a WAL problem into a MISSING session, and never modifies a file.
 ///
-/// The one deliberate exception is a headerless file (`recover_one` returning
-/// `Ok(None)`): that shape is produced only by a create-crash artifact — a
-/// zero-byte file (crash between `create_new` and the header write) or a
-/// file torn mid-write on its very first line — and carries no recoverable
-/// data either way. Failing the ENTIRE roster over a file with nothing to
-/// lose is pure availability loss, so it is skipped with a visible warning
-/// instead. Newline-terminated garbage (durable interior corruption) is
-/// unaffected: `recover_one` still returns `Err` for that, which still
-/// aborts the whole recovery via `?` below.
+/// What fails the WHOLE startup: an I/O error reading the directory or a
+/// file, and any `visit` error (e.g. the writer reopen finding another
+/// process holding the WAL). Those are environment problems a supervisor
+/// restart can plausibly clear, and a server must not advertise a roster it
+/// could not actually read.
+///
+/// What is skipped PER FILE, with a loud `[session-wal]` warning on stderr
+/// (→ `session-server.log`), the bytes left untouched for surgery:
+///
+/// - a headerless file (`recover_one` → `Ok(None)`): a create-crash artifact
+///   (zero bytes, or torn on its very first line) with nothing to lose;
+/// - a file `recover_one` refuses as `InvalidData` — durable interior
+///   corruption (a newline-terminated malformed record) or an unsupported
+///   header version. bug-0064, 2026-09-09: the Sep 1–2 twin-writer
+///   split-brain left one orphan tail fragment mid-file in two week-old WALs;
+///   the first restart since then crash-looped the systemd service and took
+///   all 55 sessions offline. A restart loop can never repair content, so
+///   failing the roster over it buys no safety — it converts one session's
+///   visibility problem into everyone's availability loss. `recover_one`
+///   itself stays strict per record (the hole is never silent): the warning
+///   names the file and the exact line, and the file is retained.
 pub fn try_recover_each(
     dir: &Path,
     mut visit: impl FnMut(RecoveredSession) -> std::io::Result<()>,
@@ -466,15 +476,23 @@ pub fn try_recover_each(
         if path.extension().and_then(|extension| extension.to_str()) != Some("log") {
             continue;
         }
-        match recover_one(&path)? {
-            Some(session) => visit(session)?,
-            None => {
+        match recover_one(&path) {
+            Ok(Some(session)) => visit(session)?,
+            Ok(None) => {
                 eprintln!(
                     "[session-wal] skipping {}: empty or headerless (create-crash artifact, \
                      no recoverable data)",
                     path.display()
                 );
             }
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                eprintln!(
+                    "[session-wal] SKIPPING CORRUPT WAL {}: {error} — this session is NOT \
+                     recovered; the file is retained untouched for manual repair (bug-0064)",
+                    path.display()
+                );
+            }
+            Err(error) => return Err(error),
         }
     }
     Ok(())
@@ -939,31 +957,69 @@ mod tests {
     }
 
     #[test]
-    fn strict_recovery_refuses_an_incomplete_roster() {
-        let dir = tmp_dir("strict-roster");
+    fn strict_recovery_skips_interior_corrupt_file_and_recovers_the_rest() {
+        // bug-0064 (2026-09-09): the production shape left by the Sep 1–2
+        // twin-writer split-brain — a complete record, then ONE
+        // newline-terminated orphan tail fragment (the head of that record
+        // was clobbered by the concurrent appender), then more complete
+        // records. `recover_one` must still refuse the file (durable interior
+        // corruption is never silently skipped per record), but ONE such file
+        // must not take every other session offline: a restart loop can never
+        // repair content, so failing the whole roster buys no safety.
+        let dir = tmp_dir("interior-corrupt-skip");
         std::fs::create_dir_all(&dir).unwrap();
         let corrupt_path = wal_path(&dir, "00-corrupt");
-        let corrupt = b"not a WAL\n".to_vec();
-        std::fs::write(&corrupt_path, &corrupt).unwrap();
+        SessionWal::create(
+            &dir,
+            "00-corrupt",
+            "twin-writer victim",
+            Path::new("/tmp"),
+            PermissionMode::Yolo,
+        )
+        .unwrap();
+        let good = serde_json::to_string(&WalRecord::Event(chunk("complete record"))).unwrap();
+        {
+            let mut f = OpenOptions::new().append(true).open(&corrupt_path).unwrap();
+            f.write_all(good.as_bytes()).unwrap();
+            f.write_all(b"\n").unwrap();
+            // Verbatim from a1204e30 line 11811: the surviving tail of a
+            // ToolCallUpdated record, newline-terminated.
+            f.write_all(b"pected\":false},\"toolName\":\"Bash\"}}}}}\n")
+                .unwrap();
+            f.write_all(good.as_bytes()).unwrap();
+            f.write_all(b"\n").unwrap();
+        }
+        let corrupt = std::fs::read(&corrupt_path).unwrap();
         SessionWal::create(
             &dir,
             "99-valid",
-            "must not publish alone",
+            "must stay reachable",
             Path::new("/tmp"),
             PermissionMode::Yolo,
         )
         .unwrap();
 
-        let mut published = Vec::new();
-        let error = try_recover_each(&dir, |session| {
-            published.push(session.server_session_id);
+        // Per-file strictness is unchanged: the corrupt file itself is refused.
+        let error = recover_one(&corrupt_path).expect_err("interior corruption must be refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("malformed WAL record at line 3"),
+            "unexpected error: {error}"
+        );
+
+        let mut visited = Vec::new();
+        try_recover_each(&dir, |session| {
+            visited.push(session.server_session_id);
             Ok(())
         })
-        .expect_err("one bad WAL must abort the complete roster recovery");
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert!(published.is_empty(), "no partial roster may be advertised");
+        .expect("one interior-corrupt WAL must not take the whole roster offline");
+        assert_eq!(
+            visited,
+            vec!["99-valid".to_string()],
+            "every other session is recovered; the corrupt one is skipped"
+        );
+        // The damaged file is retained byte-for-byte for manual surgery.
         assert_eq!(std::fs::read(&corrupt_path).unwrap(), corrupt);
-        assert!(wal_path(&dir, "99-valid").exists());
     }
 
     #[test]

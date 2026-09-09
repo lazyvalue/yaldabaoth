@@ -1,6 +1,6 @@
 # bug-0064: restart-discards-or-partially-replays-wal
 
-**Status:** RECURRED→FIXED
+**Status:** RECURRED→FIXED (third recurrence 2026-09-09, graph `fgb`)
 **First seen:** 2026-08-30
 **Component:** `docs/components/agent-tile/session-binding.md` (`UXI-AgentTile-44`)
 
@@ -197,3 +197,80 @@ server-ownership regression cannot create concurrent appenders.
   (`kill <pid>`), `./install-service.sh` once, service starts under systemd.
   The Highlander guard makes starting the new server while the old one runs a
   loud no-op instead of a split-brain.
+
+### 2026-09-09 00:46 — RECURRED: the Sep 1–2 twin-writer damage bricks the first restart since
+
+- **Symptom.** `yalda-session-server.service` crash-looped (exit 1 in ~140 ms,
+  five restarts, systemd gave up with "Start request repeated too quickly");
+  all 55 sessions offline. Timeline from `~/.yalda/session-server.log`: 21:22
+  PDT Sep 8 the GUI disconnected from the 7-day-old resident server; 21:24 a
+  fresh server refused to boot (Highlander: 6 other servers, all `exe=…
+  (deleted)` — the twin zombies from Sep 1); 21:24:43 all six SIGTERMed
+  cleanly; the server was DOWN from here. 00:18 Sep 9 the first start of the
+  post-`8eef3b1` reader hit
+  `Error: Custom { kind: InvalidData, error: "malformed WAL record at line
+  10820: expected value at line 1 column 1" }`; 00:46 `deploy-server.sh`
+  reinstalled the binary and hit the same wall.
+- **Root cause.** Two WALs written during the Sep 1–2 split-brain (the stale
+  pre-lease binary appending alongside the live server) each carry ONE
+  newline-terminated **orphan tail fragment** mid-file — the tail of a record
+  whose head was clobbered by the concurrent writer:
+  `0b319323-…log` line 10820 (248 bytes, session "simplification lead iter 2
+  (fable)", archived, last written Sep 1 22:05) and `a1204e30-…log` line 11811
+  (38 bytes, `pected":false},"toolName":"Bash"}}}}}`, session "ingest
+  simplification iter 3", last written Sep 2 19:08). Both neighbours are
+  complete, valid records; the fragments rejoin with neither. The strict reader
+  (`recover_one`, by design since 08-30) hard-errors on newline-terminated
+  garbage, `try_recover_each` propagates via `?`, `restore_seed_from_disk`
+  fails, `main` exits 1. The 09-01 follow-up covered only torn TAILS and
+  headerless files, not a mid-file fragment. It never bit until now because
+  the resident server had booted (Sep 1 21:22) *before* the damage was
+  written and then ran 7 days without a restart.
+- **Hand repair (approved by Scott, option "both"):** each file backed up
+  byte-for-byte to `~/.yalda/wal-backup-torn-20260909T005200/`, the single
+  orphan line removed via a verify-every-line python pass + atomic rename
+  (48322 and 78946 lines kept, all parse; whole-dir rescan clean). Service
+  started with explicit approval: `active (running)` 00:52:12, 55 sessions
+  recovered, no errors. Peak replay memory 7.2 GB over 1.1 GB of WALs —
+  backlog item, separate.
+- **Planned code fix (this entry; graph `fgb`).** Reverse the 08-30 "one
+  corrupt file fails the whole startup" clause for *durable content
+  corruption* only: `try_recover_each` skips a file whose `recover_one`
+  returns `InvalidData` with a loud `[session-wal]` warning naming the file and
+  the error, leaves the bytes untouched for surgery, and recovers every other
+  session. Real I/O errors and `visit`/reopen failures stay fatal. Rationale:
+  a restart loop can never fix content corruption, so failing the roster buys
+  no safety — it converts one session's visibility problem into 54 sessions'
+  availability loss and an operator doing file surgery at 1 AM. The
+  per-record strictness of `recover_one` is unchanged (still pinned by a
+  direct assert), so the hole is never silent.
+- How this differs from earlier attempts: 08-30 chose whole-roster
+  fail-closed; 09-01 carved out headerless artifacts (nothing to lose). This
+  carves out interior corruption (something to lose, but nothing a restart
+  can recover) — the file is retained and the warning is the visibility.
+- **Shipped (branch `bug-0064-skip-corrupt-wal`, worktree).** `src/session_wal.rs`
+  `try_recover_each`: `recover_one` `Err(InvalidData)` → `[session-wal]
+  SKIPPING CORRUPT WAL <path>: <error> — … retained untouched for manual
+  repair (bug-0064)` and continue; every other `Err` and every `visit` error
+  still propagates. Doc comment rewritten to state the fail-whole vs
+  skip-per-file split and why.
+- **Guards.** `strict_recovery_refuses_an_incomplete_roster` (asserted the
+  old whole-roster policy) replaced by
+  `strict_recovery_skips_interior_corrupt_file_and_recovers_the_rest`
+  (production shape: complete record / verbatim `a1204e30` fragment /
+  complete record; asserts `recover_one` still refuses the file at line 3,
+  `try_recover_each` visits only the valid session, bytes untouched). Real
+  entry point: `tests/session_resilience_test.rs::
+  interior_corrupt_wal_is_skipped_and_the_server_still_boots` boots the REAL
+  binary against a seeded WAL dir where the corrupt file sorts first, asserts
+  it comes up, `list_sessions` has the valid session and NOT the corrupt one,
+  bytes untouched, and the log names the file + line.
+- **Negative control observed RED** (fix arm disabled with `if false &&`):
+  unit guard — `InvalidData "malformed WAL record at line 3"` aborted the
+  roster; server guard — `server exited during recovery (exit status: 1)`
+  with the production log line verbatim. Fix restored, both green.
+- Suites: `cargo test --lib` 223 passed; `--bin yalda-session-server` 68;
+  `--test session_resilience_test` 15 (14 + the new guard).
+- **Activation (NOT done — no process touched):** merge to `main`, release
+  build; Scott runs `./deploy-server.sh` (restarts the service; WAL replay is
+  lossless but every attached GUI session reconnects).
