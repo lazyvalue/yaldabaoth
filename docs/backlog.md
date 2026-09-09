@@ -24,19 +24,14 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
   `~/.yalda/wal-backup-torn-20260909T005200/` (488 MB, the two pre-repair
   files) once satisfied.
 
-- **Deploy WAL history streaming (ADR-0038, Cog graph `aop`)** —
-  `NEEDS-RUNTIME` (2026-09-09; see
-  [worklog](worklog/2026-09-09-wal-history-streaming.md)). Fixes the 7.2 GB
-  peak / 1.9 GB steady recovery memory: boot folds a summary per WAL, the
-  resident log starts empty at `log_base = durable_events`, a from-base attach
-  streams the prefix from disk, archive folds the tail. On `main`, release
-  server binary built; the running service is the pre-fix binary. Scott:
-  `./deploy-server.sh` (same restart caveats as the bug-0064 deploy above,
-  which this supersedes — one deploy covers both). Gap 3 check afterwards:
-  `systemctl --user status yalda-session-server` should show a peak well
-  under 1 GB on the 55-session roster, and the GUI's first attach to a big
-  session should stream (watch `attach: durable prefix streamed from disk` in
-  `~/.yalda/session-server.log`).
+- **WAL history streaming (ADR-0038, Cog graph `aop`) — ACTIVATED** 2026-09-09
+  01:47 (see [worklog](worklog/2026-09-09-wal-history-streaming.md), addendum).
+  Scott's `./deploy-server.sh` at 01:39 was blocked by five leaked test
+  servers (bug-0067, graph `cl8`); after they were killed with approval the
+  new binary booted: 55 sessions recovered, 26 GUI attaches streamed from
+  disk, server RSS **0.38 GB** (was 1.9 GB; the earlier "7.2 GB" was the unit
+  cgroup including agent subprocesses). Nothing open here; the bug-0064 skip
+  fix is live in the same binary.
 
 - **Resident-tail follow-ups (deferred)** — recorded as Cog bulletin `an7` at
   `yaldabaoth/session-server::follow-ups`: (3) resident events as wire bytes;

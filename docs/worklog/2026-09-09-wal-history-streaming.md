@@ -166,3 +166,22 @@ and `tip_seq` are untouched — they were always over logical seqs.
 - Scott: `./deploy-server.sh`, then watch peak RSS and the first attach of
   the 320 MB session.
 - If a GUI restart's re-stream of ~26 sessions feels slow: bulletin item 3.
+
+## Addendum — 01:39–01:50: activation, an outage I caused, and a correction
+
+- Scott ran `./deploy-server.sh` at 01:39:36. The new binary **refused to
+  boot** (Highlander, clean exit 0 → unit `inactive`, no socket): five
+  `yalda-session-server` processes were alive — **test servers leaked by my
+  resilience runs** (hand-spawned children whose explicit `kill()` was
+  skipped when the negative-control runs panicked). Scott: "I'm not seeing any
+  session replaying." Filed as bug-0067; fixed on Cog graph `cl8`
+  (`ReapOnDrop` + a `catch_unwind` guard, NC observed RED).
+- With Scott's explicit approval the five test PIDs (verified by their
+  `/tmp/yalda-restest-*` sockets) were SIGTERMed and the unit started:
+  `active (running)` 01:47:52, 55 sessions recovered, **26 GUI attaches
+  streamed from disk** (`66dd9fad`: 159,812 events in <0.5 s), 0 errors.
+- **Correction to the numbers above and in the earlier session:** "7.2 GB
+  peak" was `systemctl status` `Mem peak`, i.e. the unit **cgroup** — server
+  plus ~26 resumed `claude`/`codex` subprocesses (~6.5 GB right now). The
+  server *process* was 1.9 GB RSS (`ps`) before and is **0.38 GB** after.
+  ADR-0038 and the backlog are corrected in the same commit.

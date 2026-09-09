@@ -9,8 +9,10 @@ no startup compaction), Cog graph `aop`, Cog bulletin
 ## Context
 
 On 2026-09-09 the session server's first restart in a week replayed 55
-sessions (1.1 GB of WAL, 29 archived) and peaked at **7.2 GB RSS**, settling
-at **1.9 GB**. `restore_seed_from_disk` decoded every WAL line into a
+sessions (1.1 GB of WAL, 29 archived). The unit's cgroup peaked at 7.2 GB
+(that figure includes the ~26 resumed `claude`/`codex` subprocesses, which
+alone run ~6.5 GB); the server *process* settled at **1.9 GB RSS**, all of it
+recovered history. `restore_seed_from_disk` decoded every WAL line into a
 `Notification` (2–4× the JSON size once every string, `Vec`, and
 `serde_json::Value` map is a separate heap object), collected each file into
 a `Vec`, copied it into the `imbl::Vector` behind `EventLog`, and kept all of
@@ -59,6 +61,9 @@ file does not already provide.
 
 ## Consequences
 
+- Measured after activation (2026-09-09 01:47, same 55-session roster): the
+  server process at **0.38 GB RSS** (from 1.9 GB); the GUI's 26 attaches all
+  streamed from disk, the largest (159,812 events) in under half a second.
 - Boot memory no longer scales with transcript size; steady-state memory
   scales with the *post-boot* tail (bounded by `event_log_cap`) of live
   sessions only.

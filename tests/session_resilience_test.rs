@@ -164,6 +164,33 @@ impl Drop for TestServer {
     }
 }
 
+/// A hand-spawned server child that is killed and reaped when dropped — on
+/// the happy path AND when the test panics first (bug-0067: five test
+/// servers leaked past `panic!`s in negative-control runs, and the production
+/// Highlander guard then refused to boot after a deploy). Every test that
+/// spawns the binary outside `TestServer` must hold its child in this.
+struct ReapOnDrop(Child);
+
+impl std::ops::Deref for ReapOnDrop {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ReapOnDrop {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for ReapOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// Connect a client. Under the strict 1:1 model there is no client_id / lease,
 /// so this is just a thin wrapper over `connect()`. The `_label` arg is ignored
 /// (kept so call sites that documented "which GUI" don't have to change).
@@ -849,7 +876,7 @@ fn v1_wal_session_survives_server_upgrade() {
     let log = socket.with_extension("log");
     let logfile = std::fs::File::create(&log).expect("server log");
     let bin = env!("CARGO_BIN_EXE_yalda-session-server");
-    let mut child = Command::new(bin)
+    let mut child = ReapOnDrop(Command::new(bin)
         .arg("--force")
         .env("YALDA_SESSION_SOCKET", &socket)
         .env("YALDA_ACP_AGENT", "/usr/bin/true")
@@ -858,7 +885,7 @@ fn v1_wal_session_survives_server_upgrade() {
         .stdout(Stdio::null())
         .stderr(Stdio::from(logfile))
         .spawn()
-        .expect("spawn server");
+        .expect("spawn server"));
 
     // Wait for socket, then assert the historical session was recovered.
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -944,7 +971,7 @@ fn interior_corrupt_wal_is_skipped_and_the_server_still_boots() {
     let log = socket.with_extension("log");
     let logfile = std::fs::File::create(&log).expect("server log");
     let bin = env!("CARGO_BIN_EXE_yalda-session-server");
-    let mut child = Command::new(bin)
+    let mut child = ReapOnDrop(Command::new(bin)
         .arg("--force")
         .env("YALDA_SESSION_SOCKET", &socket)
         .env("YALDA_ACP_AGENT", "/usr/bin/true")
@@ -953,7 +980,7 @@ fn interior_corrupt_wal_is_skipped_and_the_server_still_boots() {
         .stdout(Stdio::null())
         .stderr(Stdio::from(logfile))
         .spawn()
-        .expect("spawn server");
+        .expect("spawn server"));
 
     // The bug's exact symptom is the process exiting during recovery, so a
     // dead child is reported as such (with its log) rather than as a timeout.
@@ -1017,7 +1044,7 @@ fn spawn_server_on(
     agent: &str,
     knobs: &[(&str, &str)],
     log: &std::path::Path,
-) -> Child {
+) -> ReapOnDrop {
     let logfile = std::fs::File::create(log).expect("server log");
     let bin = env!("CARGO_BIN_EXE_yalda-session-server");
     let mut builder = Command::new(bin);
@@ -1029,12 +1056,12 @@ fn spawn_server_on(
     for (k, v) in knobs {
         builder.env(k, v);
     }
-    let mut child = builder
+    let mut child = ReapOnDrop(builder
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(logfile))
         .spawn()
-        .expect("spawn server");
+        .expect("spawn server"));
     let deadline = Instant::now() + Duration::from_secs(10);
     while std::os::unix::net::UnixStream::connect(socket).is_err() {
         if let Ok(Some(status)) = child.try_wait() {
@@ -1053,6 +1080,52 @@ fn spawn_server_on(
         std::thread::sleep(Duration::from_millis(20));
     }
     child
+}
+
+/// bug-0067: a server spawned by hand must not outlive a test that panics
+/// before its explicit `kill()`. Leaked test servers are not harmless — the
+/// production Highlander guard counts ANY `yalda-session-server` process and
+/// refuses to boot, which took the real service down after a deploy.
+#[test]
+fn hand_spawned_server_is_reaped_when_the_test_panics() {
+    let _g = serial_lock();
+    let n = SEQ.fetch_add(1, Ordering::SeqCst);
+    let pid = std::process::id();
+    let dir = std::env::temp_dir();
+    let socket = dir.join(format!("yalda-restest-{pid}-{n}-reap.sock"));
+    let log = socket.with_extension("log");
+    let _ = std::fs::remove_file(&socket);
+
+    let child_pid = std::sync::Mutex::new(None::<u32>);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let child = spawn_server_on(&socket, "/usr/bin/true", &[], &log);
+        *child_pid.lock().unwrap() = Some(child.id());
+        panic!("simulated mid-test failure before the explicit kill");
+    }));
+    assert!(outcome.is_err(), "the closure must have panicked");
+    let child_pid = child_pid.lock().unwrap().expect("the server was spawned");
+
+    // The guard's Drop ran during unwinding: the process is gone (killed AND
+    // reaped — not a zombie), and its socket no longer accepts connections.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let alive = std::path::Path::new(&format!("/proc/{child_pid}")).exists();
+        if !alive {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "leaked test server pid {child_pid} survived the panic (bug-0067)"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        std::os::unix::net::UnixStream::connect(&socket).is_err(),
+        "the leaked server's socket must be dead"
+    );
+    let _ = std::fs::remove_file(&socket);
+    let _ = std::fs::remove_dir_all(socket.with_extension("wal"));
+    let _ = std::fs::remove_file(&log);
 }
 
 /// The text of every streamed agent chunk, in order.
