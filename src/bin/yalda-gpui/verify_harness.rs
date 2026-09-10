@@ -1844,50 +1844,55 @@ fn workspace_cycle_works_from_the_agent_screen(cx: &mut TestAppContext) {
     });
 }
 
-/// bug-0063: an empty workspace still owns the shell focus surface. Its real
-/// painted root must route both menu leaders; with no focused App, Space falls
-/// back to the shell menu rather than attempting a nonexistent local menu.
+/// bug-0063 (recurrence): reaching an empty workspace by CLOSING the last tile
+/// — the real user path — must leave the menu leaders working. The dedicated
+/// `Layout::Empty` render branch (added after the original fix) built a bare
+/// root with no focus handle or leader handler, so the shared focus handle held
+/// by the just-closed tile landed on nothing painted and `.` dispatched into a
+/// handler-less window root. Unlike `empty_workspace_dot_and_space_open_the_shell_menu`
+/// (which pushes an empty workspace beside a still-focused browser and so never
+/// exercised the empty root's own focus), this drives the actual close + real
+/// keystroke through the painted empty branch.
 #[gpui::test]
-fn empty_workspace_dot_and_space_open_the_shell_menu(cx: &mut TestAppContext) {
+fn empty_workspace_after_close_last_tile_keeps_menu_leaders(cx: &mut TestAppContext) {
     cx.update(crate::register_keymap);
-    let (view, vcx) = boot_browser(cx);
-    view.update(vcx, |v, _| {
-        let project = v.workspace.inherited_project();
-        v.push_empty_workspace(project);
-        v.workspace.set_active_workspace(1);
-        assert!(matches!(
-            v.workspace.active_workspace().unwrap().layout,
-            crate::workspace::Layout::Empty
-        ));
-    });
+    let (view, vcx, _session, _) = boot_with_transcript(cx);
+    view.update(vcx, |v, cx| v.dispatch_menu_command("close-window", cx));
     vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert!(
+            matches!(
+                v.workspace.active_workspace().unwrap().layout,
+                crate::workspace::Layout::Empty
+            ),
+            "closing the sole tile must leave an empty workspace"
+        );
+    });
 
+    // Press the shell leader on the REAL painted empty root (focus was held by
+    // the tile we just closed — the empty root must re-claim it).
     vcx.simulate_keystrokes(".");
     vcx.run_until_parked();
     view.read_with(vcx, |v, _| {
         let menu = v
             .menu_ref()
-            .expect("dot opens a menu from the empty workspace");
+            .expect("`.` opens the shell menu on an empty workspace reached by closing the last tile");
         assert_eq!(menu.header, "MENU");
         assert_eq!(menu.leader, '.');
     });
 
-    // Use a fresh painted shell surface for the second leader. This keeps the
-    // assertion about empty-workspace routing independent of overlay focus
-    // restoration, which is covered by the menu lifecycle tests.
-    let (space_view, space_vcx) = boot_browser(cx);
-    space_view.update(space_vcx, |v, _| {
-        let project = v.workspace.inherited_project();
-        v.push_empty_workspace(project);
-        v.workspace.set_active_workspace(1);
-    });
+    // Space, with no focused App, falls back to the shell menu. Use a fresh
+    // close-to-empty surface so overlay-focus restoration from the first menu
+    // can't confound the routing assertion.
+    let (space_view, space_vcx, _s, _) = boot_with_transcript(cx);
+    space_view.update(space_vcx, |v, cx| v.dispatch_menu_command("close-window", cx));
     space_vcx.run_until_parked();
     space_vcx.simulate_keystrokes("space");
     space_vcx.run_until_parked();
     space_view.read_with(space_vcx, |v, _| {
         let menu = v
             .menu_ref()
-            .expect("Space opens a useful menu from the empty workspace");
+            .expect("Space falls back to the shell menu on an empty workspace");
         assert_eq!(menu.header, "MENU");
         assert_eq!(menu.leader, '.');
     });

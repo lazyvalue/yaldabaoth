@@ -163,7 +163,7 @@ impl YaldaGpuiView {
             // A valid empty workspace has no App leaf to carry the shared focus
             // handle or screen-level action listeners. Make the visible empty
             // state that shell input root so leaders and global workspace keys
-            // remain live after closing the sole tile (bug-0060).
+            // remain live after closing the sole tile (bug-0060 / bug-0063).
             let empty_root = div()
                 .size_full()
                 .key_context("EmptyWorkspaceView")
@@ -195,7 +195,14 @@ impl YaldaGpuiView {
                 empty_root
             };
             return div()
+                .id("empty-layout-root")
+                .key_context("EmptyWorkspaceView")
+                .track_focus(&self.focus_handle)
                 .size_full()
+                .on_key_down(cx.listener(Self::handle_empty_workspace_key))
+                .on_action(cx.listener(Self::open_menu))
+                .on_action(cx.listener(Self::open_local_menu))
+                .workspace_nav(cx)
                 .ctrl_w_shell_actions(cx)
                 .child(empty_root)
                 .into_any_element();
