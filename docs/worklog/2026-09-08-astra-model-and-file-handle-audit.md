@@ -1,6 +1,12 @@
 # Worklog: Astra model and file-handle audit
 
 **Date:** 2026-09-08
+
+> **Correction (2026-09-10):** The Astra portion of this worklog targeted the
+> wrong provider. Astra is Codex model `gpt-6-astra`, not a Claude model. The
+> Claude allowlist code and filesystem setting were reverted. Bug 0068 records
+> the corrected Codex diagnosis and real-path verification. The file-handle
+> audit below is unaffected.
 ## Cog execution evidence
 
 - Graph id: `8a8`
@@ -58,18 +64,12 @@ series.
 
 ## Astra model availability
 
-Claude sessions now include `astra` in
-`_meta.claudeCode.options.settings.availableModels`. The existing adapter still
-owns validation, labels, ordering, and the advertised ACP model selector; Codex
-sessions remain free of Claude-specific metadata.
-
-The focused metadata test passed. For the mandatory negative control, removing
-the `astra` entry made the same test fail at its Astra allowlist assertion; the
-entry was restored and the test passed again.
+This original conclusion was incorrect and is superseded by bug 0068. Astra is
+Codex model `gpt-6-astra`; no Astra entry belongs in Claude session metadata.
 
 ## Verification status
 
-- `cargo test --lib acp_channel::tests::session_meta_advertises_yalda_models_only_to_claude`
+- `cargo test --lib acp_channel::tests::session_meta_advertises_fable_5_1_only_to_claude`
 - `cargo test --lib second_live_writer_is_refused_without_changing_wal`
 - `cargo test --bin yalda-session-server archive_releases_runtime_state_and_wal_but_keeps_durable_session`
 - `cargo build --release --bin yalda-gpui`
@@ -82,9 +82,8 @@ model entry and observed the intended guard failure.
 
 ## Runtime status
 
-The GUI and session server were not restarted. The release binary was rebuilt
-only; newly created Claude sessions will receive Astra after the operator next
-activates that binary.
+The GUI and session server were not restarted. The original activation claim
+about new Claude sessions receiving Astra is withdrawn; see bug 0068.
 
 ### Final status
 

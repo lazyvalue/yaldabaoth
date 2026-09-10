@@ -14,7 +14,7 @@
 //!     cargo test --test model_switch_live -- --ignored --nocapture
 
 use std::time::{Duration, Instant};
-use yalda::acp_channel::{AcpChannelClient, ReplyEvent};
+use yalda::acp_channel::{AcpChannelClient, AgentProvider, ReplyEvent, YaldaFrontend};
 
 #[test]
 #[ignore = "live: needs claude-agent-acp on PATH + auth + network"]
@@ -27,7 +27,10 @@ fn set_model_round_trips_against_real_agent_live() {
     while client.session_id().is_none() && start.elapsed() < Duration::from_secs(25) {
         std::thread::sleep(Duration::from_millis(100));
     }
-    assert!(client.session_id().is_some(), "agent never opened a session");
+    assert!(
+        client.session_id().is_some(),
+        "agent never opened a session"
+    );
 
     // Drain the initial `ModelsAvailable` the worker emits from session/new's
     // config_options. Pick a target model that ISN'T the current one so the
@@ -37,7 +40,11 @@ fn set_model_round_trips_against_real_agent_live() {
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
         while let Some(ev) = client.try_recv() {
-            if let ReplyEvent::ModelsAvailable { current: c, options: o } = ev {
+            if let ReplyEvent::ModelsAvailable {
+                current: c,
+                options: o,
+            } = ev
+            {
                 current = Some(c);
                 options = o;
             }
@@ -79,4 +86,67 @@ fn set_model_round_trips_against_real_agent_live() {
         Some(target.as_str()),
         "agent must confirm the model switch to {target} (got {switched_to:?})"
     );
+}
+
+#[test]
+#[ignore = "live: needs codex-acp on PATH + Codex auth + network"]
+fn codex_advertises_astra_to_the_model_switcher_live() {
+    let client = AcpChannelClient::spawn_with_resume_in_for(
+        AgentProvider::Codex,
+        "codex-acp",
+        Some("/tmp".into()),
+        None,
+        YaldaFrontend::Gpui,
+    )
+    .expect("spawn authenticated Codex adapter");
+
+    let start = Instant::now();
+    while client.session_id().is_none() && start.elapsed() < Duration::from_secs(25) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        client.session_id().is_some(),
+        "Codex never opened a session"
+    );
+
+    let mut options = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        while let Some(event) = client.try_recv() {
+            if let ReplyEvent::ModelsAvailable {
+                options: advertised,
+                ..
+            } = event
+            {
+                options = advertised;
+            }
+        }
+        if !options.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    assert!(
+        options.iter().any(|model| model.id == "gpt-6-astra"),
+        "Codex must advertise gpt-6-astra to the switch-model menu; got {options:?}"
+    );
+
+    client.set_model("gpt-6-astra");
+    let mut switched_to = None;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        while let Some(event) = client.try_recv() {
+            match event {
+                ReplyEvent::ModelChanged(model) => switched_to = Some(model),
+                ReplyEvent::ModelsAvailable { current, .. } => switched_to = Some(current),
+                _ => {}
+            }
+        }
+        if switched_to.as_deref() == Some("gpt-6-astra") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(switched_to.as_deref(), Some("gpt-6-astra"));
 }
