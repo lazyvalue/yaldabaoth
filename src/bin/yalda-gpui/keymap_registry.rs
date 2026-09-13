@@ -123,7 +123,6 @@ const DEFAULT_BINDINGS: &[DefaultBinding] = &[
     b!("ctrl-w s",          "SplitH",          GLOBAL, "Splits & focus", "Split horizontally"),
     b!("ctrl-w v",          "SplitV",          GLOBAL, "Splits & focus", "Split vertically"),
     b!("ctrl-w c",          "CloseWindow",     GLOBAL, "Splits & focus", "Close tile"),
-    b!("cmd-w",             "CloseWindow",     GLOBAL, "Splits & focus", "Close tile"),
     b!("ctrl-w o",          "OnlyWindow",      GLOBAL, "Splits & focus", "Close other tiles"),
     b!("ctrl-w m",          "MoveTile",        GLOBAL, "Workspaces", "Send tile to workspace"),
     b!("ctrl-w shift-m",    "MoveTileAndFollow", GLOBAL, "Workspaces", "Send tile and follow"),
@@ -170,6 +169,14 @@ const DEFAULT_BINDINGS: &[DefaultBinding] = &[
     b!("cmd-c",             "CopyDocSelection", YV,    "Clipboard", "Copy doc-view selection"),
     b!("cmd-c",             "CopySelection",   GLOBAL, "Clipboard", "Copy selection"),
     b!("cmd-v",             "PasteFromClipboard", GLOBAL, "Clipboard", "Paste"),
+    // Linux/niri fallbacks: the compositor reserves Super (GPUI's `cmd` on
+    // Linux) — Super+C is niri's `center-column`, Super+V is the clipboard
+    // picker — so `cmd-c`/`cmd-v` never reach the app under niri. The
+    // terminal-style `ctrl-shift-*` chords are compositor-safe and match what
+    // sfig's `clipboard-paste` picker synthesizes into this window.
+    b!("ctrl-shift-c",      "CopyDocSelection", YV,    "Clipboard", "Copy doc-view selection (Linux)"),
+    b!("ctrl-shift-c",      "CopySelection",   GLOBAL, "Clipboard", "Copy selection (Linux)"),
+    b!("ctrl-shift-v",      "PasteFromClipboard", GLOBAL, "Clipboard", "Paste (Linux)"),
     b!("cmd-shift-r",       "RenameWorkspace",       GLOBAL, "Workspaces", "Rename workspace"),
     b!("cmd-b",             "ToggleFileBrowserRail", GLOBAL, "Rails", "Toggle file-browser rail"),
     // AgentView-scoped cmd-b shadows the global rail toggle (same precedent as
