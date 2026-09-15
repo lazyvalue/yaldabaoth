@@ -236,10 +236,11 @@ Object is the distinction the operator feels, and it maps to exactly two menus.
 menu overlay; former `?` command names (`new-workspace`, `rename-workspace`,
 `new-project`, `open-system-console`, `toggle-jump-panel`) dispatch and are
 reachable under `.`. `empty_workspace_keeps_both_command_leaders_live` and
-`empty_workspace_dot_and_space_open_the_shell_menu` drive the real empty-state
-key-dispatch path for `space` and `.` (the latter paints the production empty
-root). Negative control: restore the `?` route ⇒ the "no overlay" assert goes
-RED; remove the empty-state focus/key listener ⇒ the empty-workspace guards go RED.
+`empty_workspace_after_close_last_tile_keeps_menu_leaders` drive the real
+empty-state key-dispatch path for `space` and `.` (the latter closes the last
+tile to reach the real empty root). Negative control: restore the `?` route ⇒ the
+"no overlay" assert goes RED; remove the empty-state focus/key listener ⇒ the
+empty-workspace guards go RED.
 
 ### UXI-Menu-7 — no duplicate key at any one menu level
 
