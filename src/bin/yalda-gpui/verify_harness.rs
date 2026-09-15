@@ -1881,9 +1881,10 @@ fn empty_workspace_after_close_last_tile_keeps_menu_leaders(cx: &mut TestAppCont
         assert_eq!(menu.leader, '.');
     });
 
-    // Space, with no focused App, falls back to the shell menu. Use a fresh
-    // close-to-empty surface so overlay-focus restoration from the first menu
-    // can't confound the routing assertion.
+    // Space, with no focused App, falls back to the shell menu CONTENT while
+    // keeping Space in the trail (the leader glyph stays ' '; see
+    // `open_local_menu_inner`). Use a fresh close-to-empty surface so
+    // overlay-focus restoration from the first menu can't confound the routing.
     let (space_view, space_vcx, _s, _) = boot_with_transcript(cx);
     space_view.update(space_vcx, |v, cx| v.dispatch_menu_command("close-window", cx));
     space_vcx.run_until_parked();
@@ -1894,7 +1895,7 @@ fn empty_workspace_after_close_last_tile_keeps_menu_leaders(cx: &mut TestAppCont
             .menu_ref()
             .expect("Space falls back to the shell menu on an empty workspace");
         assert_eq!(menu.header, "MENU");
-        assert_eq!(menu.leader, '.');
+        assert_eq!(menu.leader, ' ');
     });
 }
 
@@ -31060,14 +31061,16 @@ fn diff_projection_survives_diff_tile_close(cx: &mut TestAppContext) {
     let expected = view.read_with(vcx, |v, _| v.diff_projections.get(&worktree).copied());
     assert!(matches!(expected, Some(n) if n > 0), "fixture must derive unreviewed hunks");
 
-    // The Diff tile is focused (split_focused focuses the new leaf) — cmd-w
+    // The Diff tile is focused (split_focused focuses the new leaf) — `ctrl-w c`
     // closes exactly it via the real binding, not `diff_unbind`/a hand teardown.
+    // (`cmd-w` was retired for Linux/niri, where the compositor reserves Super;
+    // `ctrl-w c` is the surviving CloseWindow chord — see `keymap_registry.rs`.)
     assert_eq!(
         view.read_with(vcx, |v, _| v.workspace.focused_window_id()),
         Some(diff_id),
         "the split Diff tile must be the focused window before closing it"
     );
-    vcx.simulate_keystrokes("cmd-w");
+    vcx.simulate_keystrokes("ctrl-w c");
     vcx.run_until_parked();
     assert!(
         view.read_with(vcx, |v, _| v.diff_tile_ref(diff_id).is_none()),
