@@ -5,21 +5,42 @@ use crate::chrome::{DESKTOP_CELL_H, DESKTOP_CELL_W, DESKTOP_GUTTER};
 
 /// Linux windowing backend choice (fix: GNOME/Wayland forces client-side
 /// decorations Yalda doesn't draw, so the window can't be moved/resized). We
-/// route onto X11 (working server-side decorations) ONLY when on Wayland with an
-/// X fallback and no override.
+/// route onto X11 (working server-side decorations) ONLY on an SSD-refusing
+/// compositor (GNOME), on Wayland with an X fallback and no override. Every
+/// other compositor stays native Wayland (bug-0070: on niri the Xwayland Vulkan
+/// surface failed and the GUI panicked at launch).
 #[cfg(target_os = "linux")]
 #[test]
 fn prefer_x11_only_on_wayland_with_x_fallback_and_no_override() {
-    // The fix case: Wayland session with XWayland available, no override.
-    assert!(should_prefer_x11(true, true, false, false));
-    // User forced native Wayland — leave it alone (SSD compositors, or once CSD lands).
-    assert!(!should_prefer_x11(true, true, true, false));
+    // The fix case: GNOME Wayland session with XWayland available, no override.
+    assert!(should_prefer_x11(true, true, false, false, true));
+    // bug-0070: an SSD-capable compositor (niri/sway/KDE) — stay native Wayland.
+    assert!(!should_prefer_x11(true, true, false, false, false));
+    // User forced native Wayland — leave it alone even on GNOME (or once CSD lands).
+    assert!(!should_prefer_x11(true, true, true, false, true));
     // Headless — never touch the backend.
-    assert!(!should_prefer_x11(true, true, false, true));
+    assert!(!should_prefer_x11(true, true, false, true, true));
     // Already on X11 (no Wayland display) — nothing to switch.
-    assert!(!should_prefer_x11(false, true, false, false));
+    assert!(!should_prefer_x11(false, true, false, false, true));
     // Pure Wayland with no X server to fall back to — can't help, don't strand it.
-    assert!(!should_prefer_x11(true, false, false, false));
+    assert!(!should_prefer_x11(true, false, false, false, true));
+}
+
+/// `XDG_CURRENT_DESKTOP` → does the compositor refuse SSD? Only GNOME does;
+/// the value is a colon-separated list and case varies by distro.
+#[cfg(target_os = "linux")]
+#[test]
+fn desktop_refuses_ssd_matches_only_gnome() {
+    assert!(desktop_refuses_ssd(Some("GNOME")));
+    assert!(desktop_refuses_ssd(Some("ubuntu:GNOME")));
+    assert!(desktop_refuses_ssd(Some("gnome")));
+    assert!(!desktop_refuses_ssd(Some("niri")));
+    assert!(!desktop_refuses_ssd(Some("KDE")));
+    assert!(!desktop_refuses_ssd(Some("sway")));
+    assert!(!desktop_refuses_ssd(Some("COSMIC")));
+    // Unset / empty — assume SSD-capable; native Wayland is the safe default.
+    assert!(!desktop_refuses_ssd(None));
+    assert!(!desktop_refuses_ssd(Some("")));
 }
 
 #[test]

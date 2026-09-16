@@ -10310,26 +10310,43 @@ fn run_hash_diff_subcommand(args: &[String]) -> i32 {
 /// (native or XWayland) the window manager always provides server-side
 /// decorations, so move/resize just work.
 ///
-/// So until Yalda grows its own CSD, prefer X11 whenever an X server is
-/// reachable: unset `WAYLAND_DISPLAY` before GPUI reads it so `guess_compositor`
-/// falls to X11. Escape hatch: set `YALDA_WAYLAND=1` to keep native Wayland
-/// (correct on SSD-capable compositors — KDE, COSMIC, wlroots — or once CSD
-/// lands). No-op when already on X11, headless, or when there's no `DISPLAY`
-/// (a pure-Wayland session with no XWayland — nothing to fall back to).
+/// So until Yalda grows its own CSD, prefer X11 **on a compositor that refuses
+/// SSD** (GNOME) when an X server is reachable: unset `WAYLAND_DISPLAY` before
+/// GPUI reads it so `guess_compositor` falls to X11. Every other compositor
+/// (KDE, COSMIC, wlroots — sway/Hyprland/niri) provides SSD and stays native
+/// Wayland; routing those onto Xwayland is not just unnecessary, it can be
+/// fatal (bug-0070: Xwayland's Vulkan surface failed under a driver mismatch on
+/// niri, so every launch panicked before a window existed). Escape hatch: set
+/// `YALDA_WAYLAND=1` to keep native Wayland everywhere. No-op when already on
+/// X11, headless, or when there's no `DISPLAY` (a pure-Wayland session with no
+/// XWayland — nothing to fall back to).
+///
 /// Pure decision for [`prefer_x11_for_window_decorations`]: given the relevant
 /// environment (is a Wayland display set, is an X server reachable, did the user
-/// force Wayland, is GPUI headless), should we drop `WAYLAND_DISPLAY` to route
-/// GPUI onto X11? Only when on Wayland with an X fallback available and no
-/// override — never when the user forced Wayland, when headless, or when there's
-/// no X server to fall back to.
+/// force Wayland, is GPUI headless, does the compositor refuse SSD), should we
+/// drop `WAYLAND_DISPLAY` to route GPUI onto X11? Only on an SSD-refusing
+/// compositor, on Wayland, with an X fallback available and no override.
 #[cfg(target_os = "linux")]
 fn should_prefer_x11(
     on_wayland: bool,
     x11_available: bool,
     force_wayland: bool,
     headless: bool,
+    desktop_refuses_ssd: bool,
 ) -> bool {
-    !force_wayland && !headless && on_wayland && x11_available
+    !force_wayland && !headless && on_wayland && x11_available && desktop_refuses_ssd
+}
+
+/// Does the running desktop refuse server-side decorations? Reads the
+/// `XDG_CURRENT_DESKTOP` value (a colon-separated list, e.g. `ubuntu:GNOME`,
+/// `niri`, `KDE`). Only GNOME/Mutter is known to refuse SSD; unknown or unset
+/// desktops are assumed SSD-capable (native Wayland is the safe default —
+/// bug-0070).
+#[cfg(target_os = "linux")]
+fn desktop_refuses_ssd(xdg_current_desktop: Option<&str>) -> bool {
+    xdg_current_desktop
+        .map(|v| v.split(':').any(|d| d.trim().eq_ignore_ascii_case("gnome")))
+        .unwrap_or(false)
 }
 
 #[cfg(target_os = "linux")]
@@ -10339,6 +10356,7 @@ fn prefer_x11_for_window_decorations() {
         std::env::var_os("DISPLAY").is_some_and(|d| !d.is_empty()),
         std::env::var_os("YALDA_WAYLAND").is_some(),
         std::env::var_os("ZED_HEADLESS").is_some(),
+        desktop_refuses_ssd(std::env::var("XDG_CURRENT_DESKTOP").ok().as_deref()),
     );
     if prefer {
         // SAFETY: single-threaded — this runs at the very top of `main`, before
