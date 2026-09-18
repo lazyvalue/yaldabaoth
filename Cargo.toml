@@ -125,3 +125,8 @@ required-features = ["test-support"]
 # build); incremental builds of our code are fast thereafter.
 [profile.dev.package."*"]
 opt-level = 3
+
+# bug-0071: gpui 0.2.2 (latest release) pins blade-graphics 0.7.1, whose Vulkan
+# backend never recreates an OUT_OF_DATE swapchain. See vendor/blade-graphics/YALDA-PATCH.md.
+[patch.crates-io]
+blade-graphics = { path = "vendor/blade-graphics" }
