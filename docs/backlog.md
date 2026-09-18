@@ -950,6 +950,16 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ## Bugs
 
+- **bug-0071 follow-ups (vendored blade patch)** — `OPEN` (2026-09-18). The GUI
+  boot freeze is fixed by `vendor/blade-graphics` (`[patch.crates-io]`; recreate
+  the swapchain on `VK_ERROR_OUT_OF_DATE_KHR`). Open: (1) report upstream
+  (blade-graphics 0.7.1 / gpui 0.2.2) and drop the vendored crate when a gpui
+  release carries a fix — re-run the bug-0071 real-path probe then; (2) Yalda
+  installs no `log` backend, so dependency warnings (blade's "surface is out of
+  date") are invisible — add an env-gated logger; (3) real-path boot probes must
+  assert a post-splash window screenshot, not "process stays up" (bug-0070's
+  probe passed on a frozen window).
+
 - **Worksheet resume: cursor lost / undo erased the buffer / tool calls at the
   bottom** — `FIXED` + `NEEDS-RUNTIME` (2026-06-22, merged `1560db7`/`a7beb83`;
   worksheet-frozen-blocks ticket 001). Data was always safe (server WAL). Three

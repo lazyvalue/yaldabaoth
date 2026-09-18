@@ -14,6 +14,13 @@ when Scott killed it.
 
 ## Context / root cause
 
+> **Corrected 2026-09-18 11:10.** The headline below ("not a Yalda code
+> regression — the NVIDIA WSI stops presenting") was the first-pass conclusion and
+> is WRONG about the layer. The driver legally returns `VK_ERROR_OUT_OF_DATE_KHR`;
+> blade-graphics 0.7.1 (gpui 0.2.2's renderer) never recreates the swapchain. The
+> evidence listed here stands; its interpretation is superseded by the second log
+> entry. Kept verbatim as the record of what was believed and why.
+
 **Not a Yalda code regression — the NVIDIA 580.178.04 Vulkan WSI stops presenting
 on native Wayland (niri 26.04) after the swapchain's first pass.** The process is
 healthy; only the picture is frozen.
@@ -130,7 +137,10 @@ change.
   created (6 initial + 3 from the recreate).
 - Negative control, same probe, unpatched `main` binary: splash frozen (159
   colours), **3** attaches, 6 dmabufs. RED for the right reason.
-- `cargo test --bin yalda-gpui`: result pasted in the worklog.
+- `cargo test --bin yalda-gpui` with the patched dependency: `836 passed; 0 failed;
+  1 ignored`.
+- Rebuilt `target/release/yalda-gpui` on `main` (`f02ff63`) re-probed the same
+  way: 80 attaches in 9 s, full workspace painted.
 - **NEEDS-RUNTIME (genuine gaps 1+2):** no headless guard is possible — the
   defect only exists with a real driver WSI returning OUT_OF_DATE; the harness
   has no GPU presentation path. The guard is the real-path probe above; repeat
