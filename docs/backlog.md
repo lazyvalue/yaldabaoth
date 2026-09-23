@@ -13,6 +13,17 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Claude Opus 5.5 in the model allowlist** — `NEEDS-RUNTIME` (built
+  2026-09-22, Cog graph `7r9`, branch `add-opus-5-5-model` →`main`; see
+  [worklog](worklog/2026-09-22-opus-5-5-model.md), UXI-AgentTile-16). Added
+  `claude-opus-5-5` (Opus 5.5, released 2026-09-22) to
+  `YALDA_CLAUDE_AVAILABLE_MODELS` so it is offered in the Claude session model
+  picker. Headless test green + negative-controlled. Gap 2: the installed
+  `claude-agent-acp` adapter/SDK must recognize the id over the live
+  `session/new` / `set_config_option` round-trip — an older adapter build may
+  drop it until updated. Rebuild + restart to pick it up; human check: Opus 5.5
+  appears in the `space M` / `model ▾` picker and a switch takes effect.
+
 - **Deploy the bug-0064 per-file corrupt-WAL skip** — `NEEDS-RUNTIME`
   (2026-09-09, Cog graph `fgb`; see
   [worklog](worklog/2026-09-09-wal-interior-corruption-skip.md)). On `main`

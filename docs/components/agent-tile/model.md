@@ -29,10 +29,12 @@ Sonnet / …) from the model picklist the agent advertises. The list is the mode
 `current_value` + `options` into `AgentState.available_models` + `agent_model`.
 For Claude sessions, Yalda supplies its supported-model allowlist in the
 per-session `_meta.claudeCode.options.settings.availableModels` tier. This keeps
-the menu Yalda-specific while making `claude-fable-5-1[1m]` (labelled by the
-adapter as Fable 5.1) selectable even before it enters the adapter's default
-picker. Codex and other providers receive no Claude metadata. The adapter
-remains authoritative for validation, labels, ordering, and deduplication.
+the menu Yalda-specific while making the newest Claude models — `claude-opus-5-5`
+(labelled by the adapter as Opus 5.5, released 2026-09-22) and
+`claude-fable-5-1[1m]` (labelled Fable 5.1) — selectable even before they enter
+the adapter's default picker. Codex and other providers receive no Claude
+metadata. The adapter remains authoritative for validation, labels, ordering, and
+deduplication.
 Switching issues an ACP `session/set_config_option` for the `model` option (NOT a
 new session — the conversation is preserved); the agent applies it and echoes the
 refreshed selector back, which updates the badge. Three properties:
@@ -71,7 +73,10 @@ round-trip is the sole `NEEDS-RUNTIME` gap — dev-system § Verification harnes
 gap 2 — covered by the `#[ignore]` `tests/model_switch_live.rs`).
 
 **Enforcement.** `acp_channel.rs`: `model_state_parses_select_current_and_options`
-(config parse + `model_reply_events`). `verify_harness.rs`:
+(config parse + `model_reply_events`);
+`session_meta_advertises_latest_claude_models_only_to_claude` (Opus 5.5 + Fable
+5.1 reach the `session/new` wire payload, no duplicates, none leak to Codex).
+`verify_harness.rs`:
 `agent_reply_models_available_captures_picklist` (reducer capture),
 `agent_menu_lists_advertised_models_and_marks_current` (dynamic submenu + `✓` +
 `set-model:<id>` commands), `set_agent_model_issues_set_config_on_channel` (the
