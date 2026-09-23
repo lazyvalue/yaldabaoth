@@ -714,6 +714,7 @@ pub const DEFAULT_AGENT_FALLBACKS: &[&str] = &["claude-agent-acp"];
 /// The adapter resolves aliases, supplies display labels/capabilities, validates
 /// switches, and deduplicates this list before advertising it over ACP.
 const YALDA_CLAUDE_AVAILABLE_MODELS: &[&str] = &[
+    "claude-opus-5-5",
     "claude-opus-4-8",
     "claude-fable-5[1m]",
     "claude-fable-5-1[1m]",
@@ -3565,12 +3566,13 @@ mod tests {
     }
 
     /// Claude sessions carry Yalda's supported model allowlist in the adapter's
-    /// per-session settings tier, so Fable 5.1 is advertised and accepted by the
-    /// real `set_config_option` path. Codex must receive none of this extension.
-    /// Negative control: remove the Fable 5.1 entry (or leak Claude metadata to
+    /// per-session settings tier, so the newest Claude models (Opus 5.5, Fable
+    /// 5.1) are advertised and accepted by the real `set_config_option` path.
+    /// Codex must receive none of this extension. Negative control: remove either
+    /// entry from `YALDA_CLAUDE_AVAILABLE_MODELS` (or leak Claude metadata to
     /// Codex) and the corresponding assertion fails.
     #[test]
-    fn session_meta_advertises_fable_5_1_only_to_claude() {
+    fn session_meta_advertises_latest_claude_models_only_to_claude() {
         let meta = agent_session_meta(AgentProvider::Claude, "host guidance");
         let models = meta["claudeCode"]["options"]["settings"]["availableModels"]
             .as_array()
@@ -3579,15 +3581,25 @@ mod tests {
             models.iter().any(|model| model == "claude-fable-5-1[1m]"),
             "Fable 5.1 must reach the adapter's model allowlist: {meta:?}"
         );
+        assert!(
+            models.iter().any(|model| model == "claude-opus-5-5"),
+            "Opus 5.5 must reach the adapter's model allowlist: {meta:?}"
+        );
         let unique: std::collections::HashSet<_> = models.iter().collect();
         assert_eq!(unique.len(), models.len(), "model ids must not duplicate");
 
         let request = NewSessionRequest::new(std::path::PathBuf::from("/tmp/x")).meta(meta);
         let wire = serde_json::to_value(request).expect("serialize session/new request");
-        assert_eq!(
-            wire["_meta"]["claudeCode"]["options"]["settings"]["availableModels"][2],
-            "claude-fable-5-1[1m]",
-            "Fable 5.1 must reach the actual session/new wire payload"
+        let wire_models = wire["_meta"]["claudeCode"]["options"]["settings"]["availableModels"]
+            .as_array()
+            .expect("availableModels reaches the session/new wire payload");
+        assert!(
+            wire_models.iter().any(|model| model == "claude-fable-5-1[1m]"),
+            "Fable 5.1 must reach the actual session/new wire payload: {wire:?}"
+        );
+        assert!(
+            wire_models.iter().any(|model| model == "claude-opus-5-5"),
+            "Opus 5.5 must reach the actual session/new wire payload: {wire:?}"
         );
 
         assert!(
