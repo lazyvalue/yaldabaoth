@@ -710,9 +710,13 @@ fn allow_tool_kind(mode: PermissionMode, kind: ToolKind) -> bool {
 /// rather than silently launch a worse agent.
 pub const DEFAULT_AGENT_FALLBACKS: &[&str] = &["claude-agent-acp"];
 
-/// Claude models Yalda asks `claude-agent-acp` to expose in its model picker.
-/// The adapter resolves aliases, supplies display labels/capabilities, validates
-/// switches, and deduplicates this list before advertising it over ACP.
+/// Compiled default set of Claude models Yalda asks `claude-agent-acp` to expose
+/// in its model picker. This is the fallback list; per-install additions come from
+/// the [`claude_models_config_path`] file and are merged over it by
+/// [`claude_available_models`]. The adapter resolves aliases, supplies display
+/// labels/capabilities, validates switches, and deduplicates before advertising
+/// over ACP — an id its SDK does not recognize is surfaced verbatim (not dropped),
+/// so a brand-new model id works before the adapter ships a label for it.
 const YALDA_CLAUDE_AVAILABLE_MODELS: &[&str] = &[
     "claude-opus-5-5",
     "claude-opus-4-8",
@@ -720,6 +724,73 @@ const YALDA_CLAUDE_AVAILABLE_MODELS: &[&str] = &[
     "claude-fable-5-1[1m]",
     "sonnet",
 ];
+
+/// Optional per-install file of extra Claude model ids to advertise (one id per
+/// line; `#` comments and blank lines ignored), merged over the compiled defaults
+/// by [`claude_available_models`]. Resolution: `$YALDA_CLAUDE_MODELS`, else
+/// `~/.config/yalda/claude-models.conf` (the `config.rs` XDG convention). Absent
+/// file ⇒ just the defaults. Edit it with `scripts/yalda-add-claude-model.sh`.
+/// Under `cfg(test)` a thread-local override is honoured (default `None`) so tests
+/// never read the real user file.
+fn claude_models_config_path() -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    {
+        return CLAUDE_MODELS_PATH_OVERRIDE.with(|c| c.borrow().clone());
+    }
+    #[cfg(not(test))]
+    {
+        if let Ok(p) = std::env::var("YALDA_CLAUDE_MODELS") {
+            if !p.is_empty() {
+                return Some(std::path::PathBuf::from(p));
+            }
+        }
+        dirs::home_dir().map(|h| h.join(".config").join("yalda").join("claude-models.conf"))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static CLAUDE_MODELS_PATH_OVERRIDE: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with [`claude_models_config_path`] pointed at `path` (test-only seam).
+#[cfg(test)]
+fn with_claude_models_path<R>(path: std::path::PathBuf, f: impl FnOnce() -> R) -> R {
+    CLAUDE_MODELS_PATH_OVERRIDE.with(|c| *c.borrow_mut() = Some(path));
+    let r = f();
+    CLAUDE_MODELS_PATH_OVERRIDE.with(|c| *c.borrow_mut() = None);
+    r
+}
+
+/// The Claude model ids to advertise: the compiled [`YALDA_CLAUDE_AVAILABLE_MODELS`]
+/// defaults followed by any ids from [`claude_models_config_path`], de-duplicated
+/// (first occurrence wins, so a default is never shadowed by a file duplicate).
+/// Read fresh per call, so a config edit is picked up by the next `session/new`
+/// with no recompile or process restart.
+fn claude_available_models() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for &m in YALDA_CLAUDE_AVAILABLE_MODELS {
+        if seen.insert(m.to_string()) {
+            out.push(m.to_string());
+        }
+    }
+    if let Some(path) = claude_models_config_path() {
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            for line in contents.lines() {
+                let id = line.trim();
+                if id.is_empty() || id.starts_with('#') {
+                    continue;
+                }
+                if seen.insert(id.to_string()) {
+                    out.push(id.to_string());
+                }
+            }
+        }
+    }
+    out
+}
 
 fn agent_session_meta(
     provider: AgentProvider,
@@ -740,7 +811,7 @@ fn agent_session_meta(
         serde_json::json!({
             "options": {
                 "settingSources": ["user", "project", "local"],
-                "settings": {"availableModels": YALDA_CLAUDE_AVAILABLE_MODELS}
+                "settings": {"availableModels": claude_available_models()}
             }
         }),
     );
@@ -3605,6 +3676,101 @@ mod tests {
         assert!(
             agent_session_meta(AgentProvider::Codex, "ignored").is_empty(),
             "Claude-specific settings must not leak into Codex sessions"
+        );
+    }
+
+    /// Adding a model is a config-file edit: ids in the per-install
+    /// `claude-models.conf` are appended to the compiled defaults, de-duplicated,
+    /// with `#` comments and blank lines skipped. Drives the real
+    /// `claude_available_models` merge through the `cfg(test)` path override so it
+    /// never reads the user's real file. Negative control: drop the config-file
+    /// read (or the dedup) in `claude_available_models` and these assertions fail.
+    #[test]
+    fn claude_available_models_merges_config_file_over_defaults() {
+        // No config file → exactly the compiled defaults, in order.
+        let defaults = claude_available_models();
+        assert_eq!(
+            defaults,
+            YALDA_CLAUDE_AVAILABLE_MODELS
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            "with no config file the advertised list is the compiled defaults"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("claude-models.conf");
+        std::fs::write(
+            &path,
+            "# my extra models\n\
+             claude-opus-6\n\
+             \n\
+             claude-opus-5-5\n\
+             claude-opus-6\n",
+        )
+        .expect("write config");
+
+        let merged = with_claude_models_path(path, claude_available_models);
+
+        // Defaults preserved and first.
+        assert_eq!(
+            &merged[..YALDA_CLAUDE_AVAILABLE_MODELS.len()],
+            &YALDA_CLAUDE_AVAILABLE_MODELS
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()[..],
+            "compiled defaults stay first: {merged:?}"
+        );
+        // The new file id is appended exactly once.
+        assert!(
+            merged.iter().any(|m| m == "claude-opus-6"),
+            "config-file id must be advertised: {merged:?}"
+        );
+        assert_eq!(
+            merged.iter().filter(|m| *m == "claude-opus-6").count(),
+            1,
+            "duplicate file lines collapse: {merged:?}"
+        );
+        // A file line duplicating a default does not appear twice.
+        assert_eq!(
+            merged.iter().filter(|m| *m == "claude-opus-5-5").count(),
+            1,
+            "a file id equal to a default is not duplicated: {merged:?}"
+        );
+        // Comments and blank lines are not advertised.
+        assert!(
+            !merged.iter().any(|m| m.contains('#') || m.is_empty()),
+            "comments/blanks must be skipped: {merged:?}"
+        );
+    }
+
+    /// The config-file addition reaches the REAL `session/new` wire payload through
+    /// `agent_session_meta` (the path a new Claude session actually sends), not just
+    /// the helper in isolation. Negative control: revert `agent_session_meta` to the
+    /// static const and the config-added id vanishes from the wire.
+    #[test]
+    fn session_meta_reflects_config_file_addition() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("claude-models.conf");
+        std::fs::write(&path, "claude-opus-6\n").expect("write config");
+
+        let wire = with_claude_models_path(path, || {
+            let meta = agent_session_meta(AgentProvider::Claude, "host guidance");
+            let request = NewSessionRequest::new(std::path::PathBuf::from("/tmp/x")).meta(meta);
+            serde_json::to_value(request).expect("serialize session/new request")
+        });
+
+        let wire_models = wire["_meta"]["claudeCode"]["options"]["settings"]["availableModels"]
+            .as_array()
+            .expect("availableModels reaches the session/new wire payload");
+        assert!(
+            wire_models.iter().any(|m| m == "claude-opus-6"),
+            "a config-file model must reach the real session/new payload: {wire:?}"
+        );
+        // Defaults still present alongside the addition.
+        assert!(
+            wire_models.iter().any(|m| m == "claude-opus-5-5"),
+            "defaults remain advertised alongside config additions: {wire:?}"
         );
     }
 

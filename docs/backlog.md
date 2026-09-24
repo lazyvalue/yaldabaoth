@@ -13,6 +13,20 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Config-file-driven Claude model list** — `NEEDS-RUNTIME` (built 2026-09-24,
+  Cog graph `2qm`, branch `config-driven-claude-models` → `main`; see
+  [worklog](worklog/2026-09-24-config-driven-claude-models.md), UXI-AgentTile-16).
+  Adding a Claude picker model is now a one-line edit to
+  `~/.config/yalda/claude-models.conf` (or `scripts/yalda-add-claude-model.sh
+  <id>`) merged over the compiled defaults — no Rust change, recompile, or
+  restart; a new session picks it up. Also upgraded the global `claude-agent-acp`
+  0.75.1→0.81.2 and corrected the `7r9` claim: the adapter surfaces unknown ids
+  verbatim (passthrough), it does not drop them. Gap 2: the live
+  server-reads-conf → spawn-adapter → picker path is human-verified. Rebuild +
+  restart the server to run the new lib code (the running server still has the
+  `7r9` compiled list, which already includes `claude-opus-5-5`); human check:
+  add an id via the script, open a new Claude session, confirm it appears.
+
 - **Claude Opus 5.5 in the model allowlist** — `NEEDS-RUNTIME` (built
   2026-09-22, Cog graph `7r9`, branch `add-opus-5-5-model` →`main`; see
   [worklog](worklog/2026-09-22-opus-5-5-model.md), UXI-AgentTile-16). Added
