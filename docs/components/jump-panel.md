@@ -1501,8 +1501,13 @@ ownership/Cmd-P/jump-panel mutants were caught (Cog graph `9k2`).
 
 **Statement.** Tag folders and the tile rows nested beneath them use explicit,
 fixed jump-panel typography. A tag-folder header uses the panel's compact
-monospace subheader size; tagged tile rows use the same 13px monospace navigation
-row as untagged tiles. Neither surface may inherit the document font, a GPUI
+subheader size; tagged tile rows use the same 13px navigation
+row as untagged tiles. **Amended 2026-09-27:** the panel's chrome typeface is
+the UI font (`body_font`), never the code font — rows were only ever monospace
+on paper (on Linux the code font fell back to the proportional UI face until
+d9c4c6d made it resolve to JetBrains Mono). `jump_panel_style` supplies the UI
+font for both of the panel's font slots; guard
+`jump_panel_rows_use_the_ui_font_not_the_code_font`. Neither surface may inherit the document font, a GPUI
 default size, or document zoom. A tag folder therefore never becomes taller than
 an ordinary navigation row merely because the tile carries a tag.
 

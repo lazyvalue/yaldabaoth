@@ -9426,6 +9426,31 @@ fn jump_panel_active_workspace_keeps_folio_foreground(cx: &mut TestAppContext) {
 /// UXI-JumpPanel-26: a primary tile name is one line of navigation chrome.
 /// A constrained real paint with an intentionally huge multi-word title must
 /// have exactly the same row height as an ordinary jump-panel row.
+/// UXI-JumpPanel-24 (amended 2026-09-27): the jump panel is UI chrome, so its
+/// style's font slots — including the `mono` slot every row/header/drag
+/// preview reads — are the UI font, never the code font. With the code font a
+/// real monospace face (JetBrains Mono since d9c4c6d), reading it made the
+/// panel monospace ("fonts in jump panel are very ugly now").
+///
+/// Negative control: set `mono: self.code_font.clone()` in `jump_panel_style`;
+/// the first assertion fails. Exact glyph appearance is harness gap 1.
+#[gpui::test]
+fn jump_panel_rows_use_the_ui_font_not_the_code_font(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_browser(cx);
+    view.update(vcx, |v, _| {
+        v.code_font = gpui::SharedString::new_static("JetBrains Mono");
+        v.body_font = gpui::SharedString::new_static(".SystemUIFont");
+    });
+    vcx.run_until_parked();
+    let (mono, prose, code, body) = view.update(vcx, |v, _| {
+        let st = v.jump_panel_style(gpui::black());
+        (st.mono, st.prose, v.code_font.clone(), v.body_font.clone())
+    });
+    assert_eq!(mono, body, "jump rows read `st.mono`; it must be the UI font");
+    assert_ne!(mono, code, "never the code font");
+    assert_eq!(prose, body);
+}
+
 #[gpui::test]
 fn jump_panel_long_tile_names_stay_single_line(cx: &mut TestAppContext) {
     use crate::{App, LinearTile};
