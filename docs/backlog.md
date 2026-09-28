@@ -13,6 +13,18 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Text-editing code review + fixes** — `NEEDS-DECISION` (built 2026-09-27, Cog
+  graph `exa`, branch `text-edit-review`, **not merged** per Scott; see
+  [review](research/2026-09-27-text-editing-review.md),
+  [worklog](worklog/2026-09-27-text-editing-review.md), UXI-TextEditing-5).
+  36 findings fixed (shared `LineInput` for all 14 single-line fields, undo/frozen
+  engine bugs, highlight cache O(changed), tab caret, clipboard via GPUI, compose
+  hot path, Diff paste). Decision: review + merge to `main`. After merge,
+  NEEDS-RUNTIME: gap 1 (caret/font pixels), and the Restart-path draft save order.
+  Deferred follow-ups listed in the review's Outcome section (B2/B8/B9/B14, C3,
+  C10/D11 cached Edit body + You-block, compose typing not undoable, tab-line
+  mouse hit-test, A8 async file-filter search).
+
 - **Diff Review rework (rev 2)** — `NEEDS-RUNTIME` (built 2026-09-27, Cog graph
   `8g7`, branch `diff-rework` → `main`; see
   [worklog](worklog/2026-09-27-diff-review-rework.md), ADR-0040, UXI-Diff-8..17).

@@ -99,14 +99,39 @@ browser screen AND the rail) · `NewProjectOverlay.cwd` · `RenameOverlay.text` 
 | E4 | nit | Diff comment compose has no max height/scroll — a long comment squeezes the diff to nothing. |
 | — | ok | Review JSON is not rewritten per keystroke (writes on save/viewed/delete/send, background, gen-guarded). |
 
-## Implementation packages
+## Outcome (branch `text-edit-review`, not merged)
 
-- **P1 line-input** (A1–A7): shared `yalda::line_input::LineInput` + one typed-char
-  policy (`KeyPress::typed_char`); all 14 sites migrated; `UXI-TextEditing-5`.
-  A1–A7 **fixed** (A5: Cog keeps clamp, doc comment corrected; every other site
-  resets on edit). A8/A9 **deferred** (A8 needs an async search task).
-- **P2 engine** (B1, B3–B7, B10, B11, B13, B15, B16 + D1 bulk paste).
-- **P3 render pipeline** (C1, C2, C4, C5, D2, D5, D6).
-- **P4 compose hot path** (D3, D4, D7–D10).
-- **P5 clipboard + diff** (C6, C7, E1, E2).
-- **Deferred** (documented, not done here): B2/B12 (frozen snapshot in undo — needs replaying shifts), B8 (ropey features + CRLF normalization touches file save), B9, B14 (removing tree-sitter is a product decision), B17, C3, C8, C9, C10, C11, D11–D15, E3, E4.
+**Fixed — 36 findings, each bugfix guarded by a test observed RED without the fix.**
+
+| Package | IDs fixed | Key guards |
+|---|---|---|
+| P1 line-input | A1–A7 | `line_input::tests`, `line_input_overlay_rejects_chords_and_edits_at_caret`; `UXI-TextEditing-5` |
+| P2 engine | B1, B3–B7, B10, B11, B13, B15, B16, D1 | `edit_insert_delete_then_undo_reverts_whole_session`, `enter_one_char_before_frozen_line_end_is_rejected`, `dd_on_empty_last_line_respects_frozen_previous_line`, `backspace_with_stale_col_deletes_the_validated_char`, `modified_tracks_the_save_point_not_an_empty_undo_stack`, `word_end_from_last_word_crosses_to_next_line`, `paste_str_is_one_splice_and_one_undo_step`, `shift_for_delete_tail_only_matches_full_rebuild`, `frozen_guards_match_linear_oracle_exhaustively`, `compose_cmd_v_pastes_at_caret_as_one_undo_step` |
+| P3 render | C1, C2, C4, C5, D2, D5, D6 | `insert_near_top_rehighlights_only_the_new_line`, `wp_kinds_incremental_matches_full_fold`, `edit_caret_after_tab_paints_at_expanded_column`, `compose_caret_after_tab_paints_at_expanded_column`, `wp_selected_prose_stays_in_body_font`, `frozen_line_caret_maps_raw_col_through_stripped_markdown`, `compose_idle_render_does_not_rebuild_lines` |
+| P4 compose | D3, D4, D7–D10 | `slash_popup_undismisses_only_on_a_real_edit`, `prompt_rejected_restores_draft_in_worksheet`, `app_quit_hook_persists_unsaved_compose_draft`, `is_blank_matches_trimmed_full_text` |
+| P5 clipboard + diff | C6, C7, E1, E2 | `counted_delete_char_is_one_undo_step_and_yanks_all`, `diff_compose_cmd_v_pastes_clipboard`, `diff_card_snapshot_is_shared_across_cursor_moves` |
+
+New shared code: `src/line_input.rs` (`LineInput`, `KeyPress::typed_char`),
+`yux/line_input.rs`, `yux/display_text.rs` (`display_line(s)`, `display_col`,
+`display_selection`), `yux::common_prefix_suffix` (list splice + highlight cache),
+`Document::is_blank`, the bulk `insert_str` editor path, the
+`focused_text_input()` clipboard resolver, and `persist::write_atomic`.
+
+Corrections to the findings found while fixing: C6's looping `delete-char` only runs
+under a custom binding (`x` defaults to `extend-line`); D1's `paste_into_compose` is
+not what a real Cmd-V runs (the global paste action wins, bug-0039) — the real path
+already pasted at the caret, but recorded no undo; both were fixed.
+
+**Deferred (not done here):**
+
+- B2/B12 — undo restores a stale frozen-lines snapshot; needs replaying anchor shifts.
+- B8 — ropey `unicode_lines`/`cr_lines` vs `\n`-only engine; needs CRLF normalization on load/save.
+- B9 — undo stack never trimmed; `shift_recorded_splices` walks all of it per chunk.
+- B14 — tree-sitter reparse copies the whole doc for an unused tree (removal is a product call).
+- B17, C8, C9, C11, D12–D15, E3, E4, A8 (sync FS walk per file-filter keystroke), A9.
+- C3 (every Doc tile re-parses on sibling edits) and C10 / D11 (Edit body and
+  You-block not cached yux entities) — the remaining large per-frame costs.
+- Found during implementation: typed text in the agent compose isn't undoable
+  (Insert entered without `begin_insert`); mouse hit-test on tab lines still uses
+  display columns (the inverse of C4); restart-path draft save ordering (D3) has no
+  automated test because it spawns a real process.
