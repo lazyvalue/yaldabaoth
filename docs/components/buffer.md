@@ -109,3 +109,32 @@ versa. Primary code home: `screens.rs::render_doc` / `render_edit` /
   (or a no-op touch) and is ignored — it neither reloads the buffer nor raises a
   conflict, even if the user kept typing after the save. Status: implemented.
   Guard: `verify_harness.rs` `file_sync_own_write_echo_does_not_reload_or_conflict`.
+- **`UXI-Buffer-8` (Viewing → Editing keeps your place).** Toggling a
+  source-mapped Doc into Edit (`Ctrl-E` / `Ctrl-Shift-E` / the `enter-edit` /
+  `enter-wp` menu entries — all `enter_edit_with`) lands the caret at column 0 of
+  the **focused block's first source line** (`spans[cursor_block].lines.start`),
+  and the edit list starts with the **top visible block's first source line** as
+  its top row. The caret is then guaranteed painted inside the edit viewport
+  (UXI-TextEditing-1 wins): raw rows are usually taller than the rendered blocks
+  (blank separator lines, monospace wrap), so when the caret would fall below the
+  fold the list settles down only as far as needed to show it. Unmapped Docs
+  (`spans` empty — string-backed help/welcome) keep the old top-of-file landing.
+  Mechanism: `ScrollAnchoredList::land(top, focus)` + `settle()` (a fresh list's
+  rows are unmeasured until laid out once; the follow-up frame is scheduled via
+  `cx.defer`, never a notify in render). Status: implemented. Guards:
+  `md_harness.rs` `doc_to_edit_lands_caret_on_focused_block`,
+  `doc_to_edit_keeps_top_block_on_top_when_caret_fits`.
+- **`UXI-Buffer-9` (Editing → Viewing keeps your place).** Leaving Edit
+  (`Ctrl-V` / the `back-to-doc` menu entry — `back_to_doc`) sets the Doc cursor
+  to the block holding the caret line (`Rendered::block_at_line`; blank lines
+  between blocks map to the preceding block) and makes the block holding the top
+  visible edit line the Doc's top block; the cursor block is guaranteed painted
+  inside the Doc viewport (same land/settle). Status: implemented. Guard:
+  `md_harness.rs` `edit_to_doc_lands_cursor_on_caret_block`.
+- **`UXI-Buffer-10` (a no-op round trip is exact).** Doc → Edit → Doc with no
+  edit and no caret motion in between returns to the same cursor block **and**
+  the same Doc scroll offset (top block + in-block offset), even when the Edit
+  landing had to settle its top to show the caret. The Doc position is stashed on
+  the `EditState` (`doc_return`, keyed on `edit_seq` + caret) and restored
+  verbatim; any edit or caret move falls back to UXI-Buffer-9's mapping. Status:
+  implemented. Guard: `md_harness.rs` `doc_edit_doc_round_trip_keeps_place`.

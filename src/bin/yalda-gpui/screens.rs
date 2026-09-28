@@ -193,6 +193,13 @@ impl YaldaGpuiView {
                 d.list.state().scroll_to_reveal_item(d.cursor_block);
             }
         }
+        // A Doc landed from Edit (UXI-Buffer-5) re-checks, against the last
+        // layout, that the cursor block painted on-screen; the follow-up frame
+        // is scheduled via defer — never a notify inside render.
+        if d.list.settle() {
+            let me = cx.entity_id();
+            cx.defer(move |app| app.notify(me));
+        }
 
         // Owned snapshots for the `'static` per-row render closure — all cheap
         // (Theme clone once per frame, Rc pointer clones, SharedString refcount
@@ -417,6 +424,11 @@ impl YaldaGpuiView {
                 v
             }
         };
+        // A Doc→Edit landing (UXI-Buffer-8) goes to the body's list before
+        // its first render (the body settles it itself; no notify here).
+        if let Some((top, focus)) = e.pending_land.take() {
+            body_view.update(cx, |b, _| b.list.land(top, focus));
+        }
         // Touch the entity every frame: gpui only routes a child's own
         // `cx.notify()` to a redraw if the entity was ACCESSED during the last
         // draw (`window_invalidators_by_entity`). A cache-hit frame whose

@@ -1334,6 +1334,26 @@ struct EditState {
     /// replacement character (vim `r{char}`) rather than a normal-mode action.
     /// Cleared after that next key (Esc / non-char cancels).
     pending_replace: bool,
+    /// Where the Doc this Edit was entered from stood (UXI-Buffer-6): restored
+    /// verbatim by `back_to_doc` when nothing was edited and the caret never
+    /// moved, so a no-op Doc→Edit→Doc round trip is exact. `None` when entered
+    /// from an unmapped Doc (or not from a Doc).
+    doc_return: Option<DocReturn>,
+    /// A Doc→Edit landing (`(list top, focus line)`) waiting for the lazily
+    /// created body entity: `render_edit` hands it to the body's list the
+    /// first time it has one (UXI-Buffer-8).
+    pending_land: Option<(gpui::ListOffset, usize)>,
+}
+
+/// The Doc position a fresh Edit view was entered from (see
+/// `EditState::doc_return`), keyed on the edit state it's valid for.
+#[derive(Clone, Copy)]
+struct DocReturn {
+    /// `edit_seq` + caret at entry — any change invalidates the stash.
+    edit_seq: u64,
+    caret: (usize, usize),
+    cursor_block: usize,
+    top: gpui::ListOffset,
 }
 
 impl EditState {
@@ -1347,6 +1367,8 @@ impl EditState {
             view,
             body: None,
             pending_replace: false,
+            doc_return: None,
+            pending_land: None,
         }
     }
 }

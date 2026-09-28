@@ -75,6 +75,12 @@ style bundle so a caller themes once:
   compose box). All methods take `&self` (interior-mutable), so a `&self` render
   path reconciles fine. `reconcile(items, seq)` is gated on `seq` (idle frames
   are no-ops). Consume via `.state()` (paint/reveal/scroll) + `.len()`.
+  **`land(top, focus)`** parks a scroll position for a not-yet-populated list
+  (applied by the first non-empty `reconcile`); **`settle()`** — call from render
+  after reconcile — re-reveals `focus` against the previous frame's layout and
+  returns `true` while another frame is needed (schedule it with
+  `cx.defer(move |app| app.notify(id))`, never a notify in render). Used to carry
+  the reading position across the Doc ⇄ Edit swap (UXI-Buffer-4/5).
 - **`splice_list_to_items(&ListState, old, new)`** — the bare splice primitive,
   unit-testable against a raw `ListState`. The agent transcript's
   `TranscriptScroll` reconciles by item COUNT (streaming tail + follow-output),

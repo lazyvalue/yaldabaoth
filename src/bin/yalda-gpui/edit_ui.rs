@@ -139,13 +139,15 @@ impl YaldaGpuiView {
         // undo), so edits show live in any Doc tile of the file and there's no
         // stash to shuttle. Snapshot the (id, core) without holding the borrow
         // across the pool mutation below.
-        let (shared, label): (
+        let (shared, label, place): (
             Option<(workspace::FileBufferId, workspace::SharedCore)>,
             SharedString,
+            Option<DocPlace>,
         ) = match self.workspace.focused_content_mut() {
             Some(App::Buffer(BufferApp::Viewing(d))) => (
                 d.source.as_ref().map(|s| (s.buffer_id, s.core.clone())),
                 d.file_label.clone(),
+                DocPlace::of(d),
             ),
             _ => return,
         };
@@ -163,6 +165,28 @@ impl YaldaGpuiView {
         };
         let mut edit_state = EditState::new(SharedEditor::new(id, core), label, view);
         edit_state.view = view;
+        // UXI-Buffer-4: keep the reading position — caret at the focused
+        // block's first source line, the top visible block's first line at the
+        // top of the edit viewport. Unmapped Docs keep the 0,0 landing.
+        if let Some(place) = place {
+            let last_line = edit_state.editor.line_count().saturating_sub(1);
+            let caret_line = place.cursor_line.min(last_line);
+            let top_line = place.top_line.min(caret_line);
+            edit_state.editor.set_cursor(caret_line, 0);
+            edit_state.pending_land = Some((
+                gpui::ListOffset {
+                    item_ix: top_line,
+                    offset_in_item: px(0.0),
+                },
+                caret_line,
+            ));
+            edit_state.doc_return = Some(DocReturn {
+                edit_seq: edit_state.editor.edit_seq(),
+                caret: (caret_line, 0),
+                cursor_block: place.cursor_block,
+                top: place.top,
+            });
+        }
         self.set_screen(App::Buffer(BufferApp::Editing(edit_state)));
         cx.notify();
     }
@@ -170,8 +194,10 @@ impl YaldaGpuiView {
     /// Edit → Doc round trip. The new Doc keeps the SAME pooled core (5c), so
     /// it shows the buffer's *current* (unsaved) text and shares undo with any
     /// other view of the file. No stash — the shared core IS the live state.
-    /// (Step-2 TODO: stash the EditorView cursor so re-entering Edit lands
-    /// where the user left off; today the cursor resets to the top.)
+    /// Position carries over (UXI-Buffer-5/6): the Doc's cursor block is the
+    /// block holding the caret line and its top block the one holding the top
+    /// visible edit line — or, after a no-op round trip, exactly where the Doc
+    /// stood when Edit was entered.
     pub(crate) fn back_to_doc(&mut self, cx: &mut Context<Self>) {
         let Some(prev) = self.workspace.replace_focused_content(
             // Placeholder; overwritten in every match arm below.
@@ -192,11 +218,17 @@ impl YaldaGpuiView {
                 // 5c: the new Doc keeps the SAME pooled core the Edit view held
                 // (shared text + undo). No stash — the core IS the live state.
                 let source = DocSource::new(edit.editor.buffer_id, edit.editor.core.clone());
-                self.set_screen(App::Buffer(BufferApp::Viewing(DocState::viewing(
-                    blocks,
-                    file_label,
-                    Some(source),
-                ))));
+                let edit_top = edit
+                    .body
+                    .as_ref()
+                    .map(|b| b.read(cx).list.state().logical_scroll_top().item_ix);
+                let landing = doc_landing_from_edit(&edit, edit_top, &blocks);
+                let mut doc = DocState::viewing(blocks, file_label, Some(source));
+                if let Some((cursor_block, top)) = landing {
+                    doc.cursor_block = cursor_block;
+                    doc.list.land(top, cursor_block);
+                }
+                self.set_screen(App::Buffer(BufferApp::Viewing(doc)));
             }
             other => {
                 self.set_screen(other);
@@ -1027,6 +1059,70 @@ impl YaldaGpuiView {
             None => false,
         }
     }
+}
+
+/// A source-mapped Doc's reading position, projected onto source lines
+/// (UXI-Buffer-4). `None` for an unmapped Doc (no `spans`).
+struct DocPlace {
+    cursor_block: usize,
+    /// First source line of the focused block — where the Edit caret lands.
+    cursor_line: usize,
+    /// First source line of the top visible block — the Edit view's top row.
+    top_line: usize,
+    /// The Doc list's logical scroll top, stashed for an exact round trip.
+    top: gpui::ListOffset,
+}
+
+impl DocPlace {
+    fn of(d: &DocState) -> Option<Self> {
+        let n = d.blocks.len();
+        if n == 0 || d.spans.len() != n {
+            return None;
+        }
+        let cursor_block = d.cursor_block.min(n - 1);
+        let top = d.list.state().logical_scroll_top();
+        let top_block = top.item_ix.min(n - 1);
+        Some(Self {
+            cursor_block,
+            cursor_line: d.spans[cursor_block].lines.start,
+            top_line: d.spans[top_block].lines.start,
+            top,
+        })
+    }
+}
+
+/// Where the Doc rebuilt by `back_to_doc` lands (UXI-Buffer-5/6):
+/// `(cursor_block, list top)`. A no-op round trip (no edit, caret unmoved since
+/// Doc→Edit) restores the stashed Doc position exactly; otherwise the cursor is
+/// the block holding the caret line and the top is the block holding the top
+/// visible edit line. `None` for unmapped output (keeps the top-of-doc landing).
+fn doc_landing_from_edit(
+    edit: &EditState,
+    edit_top: Option<usize>,
+    rendered: &Rendered,
+) -> Option<(usize, gpui::ListOffset)> {
+    let n = rendered.blocks.len();
+    if n == 0 || rendered.spans.len() != n {
+        return None;
+    }
+    let caret = edit.editor.cursor();
+    if let Some(r) = edit.doc_return
+        && r.edit_seq == edit.editor.edit_seq()
+        && r.caret == (caret.line, caret.col)
+        && r.cursor_block < n
+    {
+        return Some((r.cursor_block, r.top));
+    }
+    let cursor_block = rendered.block_at_line(caret.line)?;
+    let top_line = edit_top.unwrap_or(caret.line);
+    let top_block = rendered.block_at_line(top_line)?.min(cursor_block);
+    Some((
+        cursor_block,
+        gpui::ListOffset {
+            item_ix: top_block,
+            offset_in_item: px(0.0),
+        },
+    ))
 }
 
 /// What pressing Enter should do on a list/TODO line.

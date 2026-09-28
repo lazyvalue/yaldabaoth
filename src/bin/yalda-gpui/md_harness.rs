@@ -190,3 +190,213 @@ fn outline_rail_selected_row_stays_painted_in_short_window(cx: &mut TestAppConte
     let (_, ry, _, rh) = row.expect("selected outline row painted");
     assert!(ry >= ly && ry + rh <= ly + lh + 0.5, "row {ry}+{rh} inside list {ly}+{lh}");
 }
+
+// ---------------------------------------------------------------------------
+// View ⇄ Edit position (UXI-Buffer-8/9/10)
+// ---------------------------------------------------------------------------
+
+/// `n` one-line paragraphs separated by blank lines: block `i` is source line
+/// `2 * i`. Long enough that the rendered Doc and the raw Edit list both
+/// overflow the test viewport (asserted non-vacuously in each test).
+fn long_doc(n: usize) -> String {
+    (0..n)
+        .map(|i| format!("Paragraph number {i} of the position fixture."))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+        + "\n"
+}
+
+/// Force frames until any post-landing settle passes have run.
+fn paint(view: &Entity<YaldaGpuiView>, vcx: &mut VisualTestContext) {
+    for _ in 0..3 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+}
+
+/// `(cursor_block, top item, doc list viewport (top, bottom))` of the focused Doc.
+fn doc_pos(view: &Entity<YaldaGpuiView>, vcx: &mut VisualTestContext) -> (usize, usize, (f32, f32)) {
+    view.read_with(vcx, |v, _| match v.workspace.focused_content() {
+        Some(App::Buffer(BufferApp::Viewing(d))) => {
+            let vp = d.list.state().viewport_bounds();
+            (
+                d.cursor_block,
+                d.list.state().logical_scroll_top().item_ix,
+                (f32::from(vp.top()), f32::from(vp.bottom())),
+            )
+        }
+        _ => panic!("expected a Doc"),
+    })
+}
+
+/// `(caret line, caret col, top item, edit list viewport (top, bottom))` of the focused Edit.
+fn edit_pos(
+    view: &Entity<YaldaGpuiView>,
+    vcx: &mut VisualTestContext,
+) -> (usize, usize, usize, (f32, f32)) {
+    view.read_with(vcx, |v, cx| match v.workspace.focused_content() {
+        Some(App::Buffer(BufferApp::Editing(e))) => {
+            let c = e.editor.cursor();
+            let list = &e.body.as_ref().expect("edit body built").read(cx).list;
+            let vp = list.state().viewport_bounds();
+            (
+                c.line,
+                c.col,
+                list.state().logical_scroll_top().item_ix,
+                (f32::from(vp.top()), f32::from(vp.bottom())),
+            )
+        }
+        _ => panic!("expected an Edit view"),
+    })
+}
+
+/// Paint one frame with the layout probe on and return `tag`'s painted rect.
+fn probe(view: &Entity<YaldaGpuiView>, vcx: &mut VisualTestContext, tag: &str) -> Option<(f32, f32, f32, f32)> {
+    crate::layout_probe_begin();
+    // The Edit body is a cached child: a root notify alone replays its last
+    // paint (no probes recorded), so invalidate it too.
+    view.update(vcx, |v, cx| {
+        if let Some(App::Buffer(BufferApp::Editing(e))) = v.workspace.focused_content()
+            && let Some(body) = &e.body
+        {
+            body.update(cx, |_, bcx| bcx.notify());
+        }
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    let r = crate::layout_probe_get(tag);
+    crate::layout_probe_end();
+    r
+}
+
+fn assert_painted_inside(r: Option<(f32, f32, f32, f32)>, vp: (f32, f32), what: &str) {
+    let (_, y, _, h) = r.unwrap_or_else(|| panic!("{what} was not painted (off-screen)"));
+    assert!(
+        y >= vp.0 - 0.5 && y + h <= vp.1 + 0.5,
+        "{what} painted at y={y}..{} outside the viewport {vp:?}",
+        y + h
+    );
+}
+
+/// UXI-Buffer-8: Ctrl-E from a Doc whose cursor is deep in the file lands the
+/// Edit caret at the focused block's first source line, painted inside the
+/// edit viewport, with the Doc's top block's first line at the top.
+///
+/// Negative control (observed RED): without the landing in `enter_edit_with`
+/// the caret is (0, 0) and the edit list shows line 0.
+#[gpui::test]
+fn doc_to_edit_lands_caret_on_focused_block(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (view, vcx, _file) = boot_doc(cx, "d2e", &long_doc(150));
+    for _ in 0..40 {
+        vcx.simulate_keystrokes("j");
+    }
+    paint(&view, vcx);
+    let (cursor_block, top_block, _) = doc_pos(&view, vcx);
+    assert_eq!(cursor_block, 40);
+    assert!(top_block > 0, "non-vacuous: the doc must have scrolled (top={top_block})");
+
+    vcx.simulate_keystrokes("ctrl-e");
+    paint(&view, vcx);
+    let (line, col, top_line, vp) = edit_pos(&view, vcx);
+    assert_eq!((line, col), (80, 0), "caret at block 40's first source line");
+    // Raw rows (line + blank per block) are taller than the rendered blocks, so
+    // the doc's top line can't stay on top AND keep the caret visible: the
+    // landing starts at the mapped top and settles only as far as the caret.
+    assert!(
+        top_line >= 2 * top_block && top_line <= 80,
+        "edit top {top_line} between the mapped top {} and the caret",
+        2 * top_block
+    );
+    assert!(
+        probe(&view, vcx, "code-line-0").is_none(),
+        "non-vacuous: line 0 is scrolled out of the edit viewport"
+    );
+    assert_painted_inside(probe(&view, vcx, "code-line-80"), vp, "caret line 80");
+}
+
+/// UXI-Buffer-8 (top mapping): when the caret fits below it, the Doc's top
+/// visible block's first source line becomes the top visible edit line.
+///
+/// Negative control (observed RED): without the landing the edit top is 0.
+#[gpui::test]
+fn doc_to_edit_keeps_top_block_on_top_when_caret_fits(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (view, vcx, _file) = boot_doc(cx, "d2e-top", &long_doc(150));
+    for _ in 0..40 {
+        vcx.simulate_keystrokes("j");
+    }
+    paint(&view, vcx);
+    let (_, top_block, _) = doc_pos(&view, vcx);
+    // Walk the cursor back up to 3 blocks under the top (no doc scroll).
+    for _ in 0..(40 - (top_block + 3)) {
+        vcx.simulate_keystrokes("k");
+    }
+    paint(&view, vcx);
+    let (cursor_block, top_again, _) = doc_pos(&view, vcx);
+    assert_eq!((cursor_block, top_again), (top_block + 3, top_block));
+    assert!(top_block > 0, "non-vacuous: the doc must have scrolled");
+
+    vcx.simulate_keystrokes("ctrl-e");
+    paint(&view, vcx);
+    let (line, _, top_line, vp) = edit_pos(&view, vcx);
+    assert_eq!(line, 2 * cursor_block);
+    assert_eq!(top_line, 2 * top_block, "edit top line = the doc's top block's first line");
+    assert_painted_inside(probe(&view, vcx, &format!("code-line-{line}")), vp, "caret line");
+}
+
+/// UXI-Buffer-9: Ctrl-V from Edit lands the Doc cursor on the block holding the
+/// caret line, painted inside the doc viewport.
+///
+/// Negative control (observed RED): without the landing in `back_to_doc` the
+/// cursor is block 0 and block 50 is never painted.
+#[gpui::test]
+fn edit_to_doc_lands_cursor_on_caret_block(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (view, vcx, _file) = boot_doc(cx, "e2d", &long_doc(150));
+    vcx.simulate_keystrokes("ctrl-e");
+    paint(&view, vcx);
+    for _ in 0..101 {
+        vcx.simulate_keystrokes("j");
+    }
+    paint(&view, vcx);
+    let (line, _, edit_top, _) = edit_pos(&view, vcx);
+    assert_eq!(line, 101, "caret moved by real keystrokes (blank line after block 50)");
+    assert!(edit_top > 0, "non-vacuous: the edit view must have scrolled");
+
+    vcx.simulate_keystrokes("ctrl-v");
+    paint(&view, vcx);
+    let (cursor_block, top_block, vp) = doc_pos(&view, vcx);
+    assert_eq!(cursor_block, 50, "cursor = the block holding caret line 101");
+    assert_eq!(top_block, edit_top / 2, "doc top block = the block holding the top edit line");
+    assert!(
+        probe(&view, vcx, "doc-block-0").is_none(),
+        "non-vacuous: block 0 is scrolled out of the doc viewport"
+    );
+    assert_painted_inside(probe(&view, vcx, "doc-block-50"), vp, "cursor block 50");
+}
+
+/// UXI-Buffer-10: a Doc→Edit→Doc round trip with no edit and no caret motion
+/// returns to the same cursor block AND the same top block.
+///
+/// Negative control (observed RED): without the `doc_return` restore the top
+/// block drifts / the cursor resets.
+#[gpui::test]
+fn doc_edit_doc_round_trip_keeps_place(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (view, vcx, _file) = boot_doc(cx, "rt", &long_doc(150));
+    for _ in 0..40 {
+        vcx.simulate_keystrokes("j");
+    }
+    paint(&view, vcx);
+    let before = doc_pos(&view, vcx);
+    assert!(before.1 > 0, "non-vacuous: the doc must have scrolled");
+
+    vcx.simulate_keystrokes("ctrl-e");
+    paint(&view, vcx);
+    vcx.simulate_keystrokes("ctrl-v");
+    paint(&view, vcx);
+    let after = doc_pos(&view, vcx);
+    assert_eq!((after.0, after.1), (before.0, before.1), "same cursor block + top block");
+    assert_painted_inside(probe(&view, vcx, "doc-block-40"), after.2, "cursor block 40");
+}

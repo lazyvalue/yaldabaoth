@@ -273,10 +273,19 @@ impl Render for EditBodyView {
         };
         let focused = r.workspace.focused_window_id() == Some(self.window_id);
         self.last_rendered = EditSeqs::of(e, focused, r);
-        match e.view {
+        let body = match e.view {
             EditView::Code => self.build_code(r, e, focused, window).into_any_element(),
             EditView::WordProcessor => self.build_wp(r, e, focused).into_any_element(),
+        };
+        // An Edit landed from a Doc (UXI-Buffer-8) re-checks, against the last
+        // layout, that the caret line painted on-screen (the build above
+        // reconciled the list); the follow-up frame is scheduled via defer —
+        // never a notify inside render.
+        if self.list.settle() {
+            let me = cx.entity_id();
+            cx.defer(move |app| app.notify(me));
         }
+        body
     }
 }
 
