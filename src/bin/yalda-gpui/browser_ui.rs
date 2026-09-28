@@ -5,6 +5,73 @@
 use super::*;
 
 impl YaldaGpuiView {
+    /// Visit every live `FileBrowser` — each Picking tile in every workspace
+    /// (visible or hidden) and every workspace's file-browser rail.
+    pub(crate) fn for_each_file_browser_mut(&mut self, f: &mut impl FnMut(&mut FileBrowser)) {
+        for wsp in &mut self.workspace.workspaces {
+            wsp.for_each_attached_window_mut(&mut |w| {
+                if let App::Buffer(BufferApp::Picking(b)) = &mut w.content {
+                    f(&mut b.fb);
+                }
+            });
+            if let Some(r) = wsp.rail.as_mut()
+                && let workspace::RailContent::FileBrowser(fb) = &mut r.content
+            {
+                f(fb);
+            }
+        }
+    }
+
+    /// A8: hand every queued recursive file search to the background executor.
+    /// The keystroke path (`FileBrowser::filter_key`, re-lists while filtering)
+    /// only queues a `SearchRequest`; the walk runs off the UI thread and lands
+    /// via `apply_file_browser_search` from the task completion (never from
+    /// render). Stale generations are dropped there. Call after any browser
+    /// mutation that can re-filter.
+    pub(crate) fn pump_file_browser_searches(&mut self, cx: &mut Context<Self>) {
+        let mut reqs = Vec::new();
+        self.for_each_file_browser_mut(&mut |fb| {
+            if let Some(r) = fb.take_pending_search() {
+                reqs.push(r);
+            }
+        });
+        for req in reqs {
+            cx.spawn(async move |this, cx| {
+                let generation = req.generation;
+                let results = cx
+                    .background_executor()
+                    .spawn(async move { req.run() })
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    this.apply_file_browser_search(generation, results, cx);
+                });
+            })
+            .detach();
+        }
+    }
+
+    /// Fold a completed recursive search into whichever browser issued it
+    /// (generations are process-unique); a superseded one is ignored.
+    pub(crate) fn apply_file_browser_search(
+        &mut self,
+        generation: u64,
+        results: Vec<BrowserEntry>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut results = Some(results);
+        let mut applied = false;
+        self.for_each_file_browser_mut(&mut |fb| {
+            if fb.accepts_search(generation)
+                && let Some(r) = results.take()
+            {
+                applied = fb.apply_search_results(generation, r);
+            }
+        });
+        if applied {
+            cx.notify();
+        }
+    }
+
     pub(crate) fn browser_down(
         &mut self,
         _: &BrowserDown,
@@ -107,6 +174,7 @@ impl YaldaGpuiView {
         }
         if let Some(b) = self.browser_mut() {
             b.fb.toggle_hidden();
+            self.pump_file_browser_searches(cx);
             cx.notify();
         }
     }
@@ -125,6 +193,7 @@ impl YaldaGpuiView {
             b.fb.sort_order
         });
         let Some(order) = order else { return };
+        self.pump_file_browser_searches(cx);
         // Remember this tile's chosen order so reopening the explorer in the
         // same tile restores it (the picker itself is short-lived).
         if let Some(id) = id {
@@ -231,6 +300,17 @@ impl YaldaGpuiView {
 
     /// Key-down handler for browser filter text input.
     pub(crate) fn handle_browser_filter_key(
+        &mut self,
+        ev: &KeyDownEvent,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.handle_browser_filter_key_inner(ev, w, cx);
+        // A8: a filter edit queued its recursive walk — run it off-thread.
+        self.pump_file_browser_searches(cx);
+    }
+
+    fn handle_browser_filter_key_inner(
         &mut self,
         ev: &KeyDownEvent,
         _w: &mut Window,
@@ -650,6 +730,7 @@ impl YaldaGpuiView {
             && let workspace::RailContent::FileBrowser(fb) = &mut r.content
         {
             fb.toggle_hidden();
+            self.pump_file_browser_searches(cx);
             cx.notify();
         }
     }
@@ -664,6 +745,7 @@ impl YaldaGpuiView {
             && let workspace::RailContent::FileBrowser(fb) = &mut r.content
         {
             fb.cycle_sort();
+            self.pump_file_browser_searches(cx);
             cx.notify();
         }
     }
@@ -684,6 +766,17 @@ impl YaldaGpuiView {
 
     /// Key-down handler for rail filter text input.
     pub(crate) fn handle_rail_filter_key(
+        &mut self,
+        ev: &KeyDownEvent,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.handle_rail_filter_key_inner(ev, w, cx);
+        // A8: a filter edit queued its recursive walk — run it off-thread.
+        self.pump_file_browser_searches(cx);
+    }
+
+    fn handle_rail_filter_key_inner(
         &mut self,
         ev: &KeyDownEvent,
         _w: &mut Window,

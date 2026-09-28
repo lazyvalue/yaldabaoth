@@ -1,5 +1,7 @@
+use std::cell::Cell;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::keys::KeyPress;
 use crate::line_input::{LineEdit, LineInput};
@@ -80,6 +82,71 @@ pub fn fuzzy_score(text: &str, query: &str) -> Option<i32> {
     Some(score)
 }
 
+thread_local! {
+    /// Per-thread count of recursive filesystem walks ([`search`] calls). A
+    /// perf probe for A8: the UI-thread keystroke path must never walk
+    /// synchronously, so a test reads this before/after a keystroke on the
+    /// thread that handled it. Thread-local so parallel tests don't race.
+    static RECURSIVE_WALKS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// How many recursive walks ([`search`]) have run on the calling thread.
+pub fn recursive_walk_count() -> usize {
+    RECURSIVE_WALKS.with(Cell::get)
+}
+
+/// Process-wide generation counter for recursive searches. Globally unique (not
+/// per browser) so a completed search can be offered to every live browser and
+/// only the one that issued it — and only if nothing re-filtered since — takes it.
+static NEXT_SEARCH_GEN: AtomicU64 = AtomicU64::new(1);
+
+/// A recursive search the browser wants run off the UI thread (A8). Produced by
+/// the keystroke path ([`FileBrowser::filter_key`]) and handed out by
+/// [`FileBrowser::take_pending_search`]; run it with [`search`] anywhere, then
+/// fold the result back with [`FileBrowser::apply_search_results`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchRequest {
+    pub generation: u64,
+    pub dir: PathBuf,
+    pub query: String,
+    pub show_hidden: bool,
+}
+
+impl SearchRequest {
+    /// Run the recursive walk for this request (blocking — call it on a
+    /// background thread from a UI).
+    pub fn run(&self) -> Vec<BrowserEntry> {
+        search(&self.dir, &self.query, self.show_hidden)
+    }
+}
+
+/// The recursive fuzzy find under `dir`: walk (depth-capped, result-capped,
+/// skipping [`IGNORED_DIRS`]) and rank by fuzzy score of the filename (or whole
+/// relative path for a `/` query). Pure w.r.t. the browser — touches only the
+/// filesystem — so it can run on any thread. Each row's `name` is the path
+/// relative to `dir`.
+pub fn search(dir: &Path, query: &str, show_hidden: bool) -> Vec<BrowserEntry> {
+    RECURSIVE_WALKS.with(|c| c.set(c.get() + 1));
+    let query = query.to_lowercase();
+    let mut results = Vec::new();
+    FileBrowser::search_recursive(dir, dir, &query, &mut results, 0, show_hidden);
+    rank_results(&mut results, &query);
+    results
+}
+
+/// Rank search rows by fuzzy score of the filename (DESC — higher is better),
+/// then shorter path, then alphabetical. `search_target` picks the same field
+/// the matcher matched on, so ranking and inclusion agree. `query` lowercased.
+fn rank_results(results: &mut [BrowserEntry], query: &str) {
+    results.sort_by(|a, b| {
+        let sa = fuzzy_score(FileBrowser::search_target(&a.name, query), query).unwrap_or(i32::MIN);
+        let sb = fuzzy_score(FileBrowser::search_target(&b.name, query), query).unwrap_or(i32::MIN);
+        sb.cmp(&sa)
+            .then_with(|| a.name.len().cmp(&b.name.len()))
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortOrder {
     Name,
@@ -157,8 +224,17 @@ pub struct FileBrowser {
     selected: usize,
     filter: LineInput,
     filtered_indices: Vec<usize>,
-    /// Recursive search results (populated when filter is non-empty).
+    /// Recursive search results (populated when filter is non-empty). While a
+    /// deferred search is in flight this holds the provisional shallow
+    /// (current-dir) matches.
     search_results: Vec<BrowserEntry>,
+    /// Generation of the current `(dir, filter, show_hidden)` search. Bumped on
+    /// every rebuild so an in-flight result for an older query is dropped.
+    search_gen: u64,
+    /// A deferred recursive search not yet handed to an executor.
+    pending_search: Option<SearchRequest>,
+    /// True from a deferred rebuild until its results are applied.
+    search_in_flight: bool,
     pub filter_mode: bool,
     pub show_hidden: bool,
     pub sort_order: SortOrder,
@@ -179,6 +255,9 @@ impl FileBrowser {
             filter: LineInput::new(),
             filtered_indices: Vec::new(),
             search_results: Vec::new(),
+            search_gen: 0,
+            pending_search: None,
+            search_in_flight: false,
             filter_mode: false,
             show_hidden: false,
             sort_order: SortOrder::Name,
@@ -283,21 +362,71 @@ impl FileBrowser {
         }
     }
 
+    /// Set the filter programmatically and run the recursive search
+    /// synchronously (a blocking walk — not for the UI keystroke path, which
+    /// goes through [`Self::filter_key`] and defers the walk).
     pub fn set_filter(&mut self, text: &str) {
         self.filter.set_text(text);
-        self.rebuild_filtered();
+        self.rebuild_filtered(false);
         self.selected = 0;
     }
 
     /// Route an editing key to the filter field; an edit re-filters and
-    /// resets the selection to the first match.
+    /// resets the selection to the first match. A8: this is the keystroke path,
+    /// so it NEVER walks the filesystem recursively — it shows the shallow
+    /// (current-dir) matches immediately and queues a [`SearchRequest`]
+    /// (collect it with [`Self::take_pending_search`], run it off-thread, and
+    /// fold it back with [`Self::apply_search_results`]).
     pub fn filter_key(&mut self, press: &KeyPress) -> LineEdit {
         let edit = self.filter.handle(press);
         if edit.edited() {
-            self.rebuild_filtered();
+            self.rebuild_filtered(true);
             self.selected = 0;
         }
         edit
+    }
+
+    /// Hand out the queued deferred recursive search, if any (A8).
+    pub fn take_pending_search(&mut self) -> Option<SearchRequest> {
+        self.pending_search.take()
+    }
+
+    /// True while a deferred recursive search for the current query has not
+    /// yet been applied.
+    pub fn search_in_flight(&self) -> bool {
+        self.search_in_flight
+    }
+
+    /// Whether a search result of `generation` is current for this browser
+    /// (i.e. [`Self::apply_search_results`] would take it).
+    pub fn accepts_search(&self, generation: u64) -> bool {
+        generation == self.search_gen && !self.filter.is_empty()
+    }
+
+    /// Fold a completed recursive search back in. Returns `false` (and changes
+    /// nothing) when `generation` is not this browser's current search — the
+    /// query / dir / hidden-toggle changed since it was issued, or it belongs to
+    /// another browser. Keeps the selected row selected when it survives.
+    pub fn apply_search_results(&mut self, generation: u64, results: Vec<BrowserEntry>) -> bool {
+        if !self.accepts_search(generation) {
+            return false;
+        }
+        let keep = self.selected_entry().map(|e| e.path.clone());
+        self.search_results = results;
+        self.search_in_flight = false;
+        self.selected = keep
+            .and_then(|p| self.search_results.iter().position(|e| e.path == p))
+            .unwrap_or(0);
+        true
+    }
+
+    /// Run any queued deferred search right here, blocking (for non-UI
+    /// consumers that want `filter_key` to behave synchronously).
+    pub fn run_pending_search_blocking(&mut self) {
+        if let Some(req) = self.take_pending_search() {
+            let results = req.run();
+            self.apply_search_results(req.generation, results);
+        }
     }
 
     /// The filter field (text + caret) for rendering.
@@ -308,7 +437,7 @@ impl FileBrowser {
     pub fn clear_filter(&mut self) {
         self.filter.clear();
         self.filter_mode = false;
-        self.rebuild_filtered();
+        self.rebuild_filtered(false);
         self.selected = 0;
     }
 
@@ -343,7 +472,9 @@ impl FileBrowser {
     /// lists so they always reflect the current `(entries, filter_text)`.
     fn refresh(&mut self) {
         self.entries = Self::list_directory(&self.current_dir, self.show_hidden, self.sort_order);
-        self.rebuild_filtered();
+        // A re-list while filtering (hidden toggle, sort, rename) happens on the
+        // UI thread too — defer its recursive walk like a keystroke (A8).
+        self.rebuild_filtered(true);
     }
 
     fn list_directory(dir: &Path, show_hidden: bool, sort_order: SortOrder) -> Vec<BrowserEntry> {
@@ -428,9 +559,17 @@ impl FileBrowser {
     /// `filtered_indices` (indices into `entries` whose name matches the
     /// filter) and `search_results` (recursive matches) from the current
     /// `(entries, filter_text)`. Call this at every filter/dir-change site.
-    fn rebuild_filtered(&mut self) {
+    ///
+    /// `defer` (A8): when true the recursive walk is NOT run here — the
+    /// shallow current-dir matches become the provisional `search_results`
+    /// and a [`SearchRequest`] is queued; when false the walk runs inline.
+    /// Either way the generation bumps, so any in-flight result is stale.
+    fn rebuild_filtered(&mut self, defer: bool) {
         self.filtered_indices.clear();
         self.search_results.clear();
+        self.pending_search = None;
+        self.search_in_flight = false;
+        self.search_gen = NEXT_SEARCH_GEN.fetch_add(1, Ordering::Relaxed);
         if self.filter.is_empty() {
             return;
         }
@@ -445,26 +584,29 @@ impl FileBrowser {
             .map(|(i, _)| i)
             .collect();
 
-        // Recursive search results.
-        Self::search_recursive(
-            &self.current_dir,
-            &self.current_dir,
-            &query,
-            &mut self.search_results,
-            0,
-            self.show_hidden,
-        );
-        // Rank by fuzzy score of the filename (DESC — higher is better), then
-        // shorter path, then alphabetical. `search_target` picks the same field
-        // the recursive matcher matched on, so ranking and inclusion agree.
-        let q = query.clone();
-        self.search_results.sort_by(|a, b| {
-            let sa = fuzzy_score(Self::search_target(&a.name, &q), &q).unwrap_or(i32::MIN);
-            let sb = fuzzy_score(Self::search_target(&b.name, &q), &q).unwrap_or(i32::MIN);
-            sb.cmp(&sa)
-                .then_with(|| a.name.len().cmp(&b.name.len()))
-                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        });
+        if defer {
+            // Provisional rows: the depth-0 slice of what the recursive walk
+            // will find (same matcher + ranking), from the already-listed
+            // entries — no filesystem access.
+            let mut shallow: Vec<BrowserEntry> = self
+                .entries
+                .iter()
+                .filter(|e| e.name != "..")
+                .filter(|e| fuzzy_score(Self::search_target(&e.name, &query), &query).is_some())
+                .cloned()
+                .collect();
+            rank_results(&mut shallow, &query);
+            self.search_results = shallow;
+            self.search_in_flight = true;
+            self.pending_search = Some(SearchRequest {
+                generation: self.search_gen,
+                dir: self.current_dir.clone(),
+                query,
+                show_hidden: self.show_hidden,
+            });
+        } else {
+            self.search_results = search(&self.current_dir, &query, self.show_hidden);
+        }
     }
 
     /// Which string a `search_results` row (whose `name` is a path relative to
@@ -804,5 +946,87 @@ mod tests {
         fb.select_path(&root.join("target.md"));
         let sel = fb.selected_entry().expect("a selection");
         assert_eq!(sel.path, root.join("target.md"), "cursor lands on the file we came from");
+    }
+
+    fn type_char(fb: &mut FileBrowser, c: char) {
+        use crate::keys::{Key, Modifiers};
+        let edit = fb.filter_key(&KeyPress::new(Key::Char(c), Modifiers::NONE));
+        assert!(edit.edited(), "typing {c:?} edits the filter");
+    }
+
+    /// A8: the filter KEYSTROKE path never walks the tree synchronously — it
+    /// shows shallow matches and queues a request; running + applying it lands
+    /// the nested match. Negative control: make `filter_key` call
+    /// `rebuild_filtered(false)` → the walk counter moves on the keystroke.
+    #[test]
+    fn filter_key_defers_recursive_walk_and_applies_results() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        touch(&root.join("zeta.md"));
+        touch(&root.join("deep/er/zebra.md"));
+        let mut fb = FileBrowser::new(root.to_path_buf());
+        fb.filter_mode = true;
+
+        let before = recursive_walk_count();
+        type_char(&mut fb, 'z');
+        assert_eq!(
+            recursive_walk_count(),
+            before,
+            "a filter keystroke must not run the recursive walk synchronously"
+        );
+        let names: Vec<String> = fb.visible_entries().iter().map(|e| e.name.clone()).collect();
+        assert_eq!(names, vec!["zeta.md".to_string()], "shallow matches show immediately");
+        assert!(fb.search_in_flight());
+
+        let req = fb.take_pending_search().expect("a deferred search is queued");
+        assert_eq!(req.query, "z");
+        let results = req.run();
+        assert_eq!(recursive_walk_count(), before + 1);
+        assert!(fb.apply_search_results(req.generation, results));
+        assert!(!fb.search_in_flight());
+        let names: Vec<String> = fb
+            .visible_entries()
+            .iter()
+            .map(|e| e.name.replace('\\', "/"))
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "deep/er/zebra.md"),
+            "the nested match lands after apply: {names:?}"
+        );
+    }
+
+    /// A8: results for a superseded query are dropped. Negative control: remove
+    /// the `generation != self.search_gen` check → the stale `z` results land.
+    #[test]
+    fn stale_generation_search_results_are_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        touch(&root.join("deep/zebra.md"));
+        touch(&root.join("deep/zq.md"));
+        let mut fb = FileBrowser::new(root.to_path_buf());
+        fb.filter_mode = true;
+        type_char(&mut fb, 'z');
+        let stale = fb.take_pending_search().unwrap();
+        type_char(&mut fb, 'q');
+        let fresh = fb.take_pending_search().unwrap();
+        assert_ne!(stale.generation, fresh.generation);
+
+        let stale_results = stale.run();
+        assert!(!stale_results.is_empty());
+        assert!(
+            !fb.apply_search_results(stale.generation, stale_results),
+            "a stale generation must be rejected"
+        );
+        assert!(
+            fb.visible_entries().is_empty(),
+            "stale results must not replace the current (zq) provisional rows"
+        );
+        assert!(fb.apply_search_results(fresh.generation, fresh.run()));
+        let names: Vec<String> = fb
+            .visible_entries()
+            .iter()
+            .map(|e| e.name.replace('\\', "/"))
+            .collect();
+        assert_eq!(names, vec!["deep/zq.md".to_string()]);
     }
 }

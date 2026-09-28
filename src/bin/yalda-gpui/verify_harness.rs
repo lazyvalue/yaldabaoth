@@ -16203,6 +16203,92 @@ fn browser_filter_arrow_key_does_not_open_file(cx: &mut TestAppContext) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A8: typing a file-picker filter character does NO recursive filesystem walk
+/// on the UI thread. The real keymap dispatches the key (`dispatch_keystroke`,
+/// deliberately NOT `simulate_keystrokes`, which parks the executor) — right
+/// after it, the walk counter is flat and only the shallow match shows; after
+/// `run_until_parked` the background search's nested match has landed via the
+/// view (task completion → `apply_file_browser_search` → notify).
+///
+/// Negative control (observed RED): make `FileBrowser::filter_key` call
+/// `rebuild_filtered(false)` → the counter moves on the keystroke itself.
+#[gpui::test]
+fn browser_filter_keystroke_defers_recursive_walk(cx: &mut TestAppContext) {
+    use crate::{App, BufferApp};
+    use yalda::file_browser::recursive_walk_count;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_path_buf();
+    std::fs::write(dir.join("qqshallow.txt"), b"x\n").unwrap();
+    std::fs::create_dir_all(dir.join("nested/deeper")).unwrap();
+    std::fs::write(dir.join("nested/deeper/qqnested.txt"), b"x\n").unwrap();
+
+    cx.update(crate::register_keymap);
+    let dir_for_view = dir.clone();
+    let (view, vcx) = cx.add_window_view(move |window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        crate::with_no_session_server(|| {
+            YaldaGpuiView::new_browser(dir_for_view.clone(), Theme::default(), focus_handle)
+        })
+    });
+    view.update(vcx, |v, cx| {
+        v.splash_until = None;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("/ q");
+    vcx.run_until_parked();
+
+    let visible = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.read_with(vcx, |v, _| match v.workspace.focused_content() {
+            Some(App::Buffer(BufferApp::Picking(bw))) => bw
+                .fb
+                .visible_entries()
+                .iter()
+                .map(|e| e.name.replace('\\', "/"))
+                .collect::<Vec<_>>(),
+            _ => panic!("expected the picker"),
+        })
+    };
+    assert!(
+        visible(&view, vcx).contains(&"nested/deeper/qqnested.txt".to_string()),
+        "precondition: after parking, the recursive search for `q` landed"
+    );
+
+    // The operative keystroke — dispatched through the real keymap, NOT parked.
+    let before = recursive_walk_count();
+    vcx.update(|window, cx| {
+        window.dispatch_keystroke(gpui::Keystroke::parse("q").unwrap(), cx);
+    });
+    assert_eq!(
+        recursive_walk_count(),
+        before,
+        "a filter keystroke must not walk the tree on the UI thread"
+    );
+    let rows = visible(&view, vcx);
+    assert_eq!(
+        rows,
+        vec!["qqshallow.txt".to_string()],
+        "only the shallow (current-dir) match shows before the background search lands"
+    );
+
+    vcx.run_until_parked();
+    assert_eq!(recursive_walk_count(), before + 1, "exactly one background walk ran");
+    let rows = visible(&view, vcx);
+    assert!(
+        rows.contains(&"nested/deeper/qqnested.txt".to_string()),
+        "the background search's nested match lands via the view: {rows:?}"
+    );
+    view.read_with(vcx, |v, _| match v.workspace.focused_content() {
+        Some(App::Buffer(BufferApp::Picking(bw))) => {
+            assert_eq!(bw.fb.filter_text(), "qq");
+            assert!(!bw.fb.search_in_flight());
+        }
+        _ => panic!("expected the picker"),
+    });
+}
+
 /// bug-0038 (rail face): the file-browser RAIL has the same defect. `RailView`
 /// binds `s`/`w`/`-`/enter/j/k as actions, and GPUI dispatches those before the
 /// rail's capture filter handler, so pre-fix typing them in `/` search fired the
