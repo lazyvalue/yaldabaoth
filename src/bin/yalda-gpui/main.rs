@@ -2194,7 +2194,11 @@ impl YaldaGpuiView {
         Self {
             theme,
             body_font: SharedString::new_static(".SystemUIFont"),
-            code_font: SharedString::new_static("SF Mono"),
+            // Startup replaces this with `choose_code_font` once the platform
+            // text system is available (main() probes `all_font_names()`);
+            // this default only matters for tests, which construct the view
+            // without that probe — kept consistent with the chain's first pick.
+            code_font: SharedString::new_static("JetBrains Mono"),
             text_scale: 1.0,
             window_width_px: DEFAULT_WINDOW_WIDTH_PX,
             window_height_px: DEFAULT_WINDOW_HEIGHT_PX,
@@ -2267,7 +2271,10 @@ impl YaldaGpuiView {
         Self {
             theme,
             body_font: SharedString::new_static(".SystemUIFont"),
-            code_font: SharedString::new_static("SF Mono"),
+            // See the matching comment in `new_doc`: replaced by
+            // `choose_code_font` at real startup; this is the test-construction
+            // default.
+            code_font: SharedString::new_static("JetBrains Mono"),
             text_scale: 1.0,
             window_width_px: DEFAULT_WINDOW_WIDTH_PX,
             window_height_px: DEFAULT_WINDOW_HEIGHT_PX,
@@ -3839,11 +3846,17 @@ impl YaldaGpuiView {
     /// Each settings mutation just calls this instead of re-listing every field
     /// at its own `save_preferences(...)`
     /// site — the structural cause of "added a setting, forgot to persist it at
-    /// one of N sites" drift. Fonts are not yet user-settable, so not persisted.
+    /// one of N sites" drift. `code_font` has no UI mutation path yet (hand-edit
+    /// the file only), so it isn't tracked on `self` — read the current on-disk
+    /// value and carry it through unchanged rather than default-clobbering a
+    /// hand-set preference on the next unrelated settings save (window resize,
+    /// zoom, jump-panel reorder, …).
     fn save_settings(&self) {
+        let code_font = load_preferences().code_font;
         save_preferences(&Preferences {
             theme: Some(self.theme.name.as_kebab().to_string()),
             text_scale: Some(self.text_scale),
+            code_font,
             window_width_px: Some(self.window_width_px),
             window_height_px: Some(self.window_height_px),
             desktop_grid_cols: Some(self.desktop_grid_cols),
@@ -10316,18 +10329,21 @@ fn main() {
                                 focus_handle,
                             ),
                         };
-                        // Code font: "SF Mono" is only available to third-
-                        // party apps if the user installed it (the system's
-                        // built-in copy is the hidden ".SF NS Mono", which
-                        // can't be requested by name) — otherwise GPUI falls
-                        // back to a *proportional* face and code stops
-                        // looking like code. Probe the registry and fall
-                        // back to Menlo, which always ships with macOS.
+                        // Code font: a hardcoded name can silently resolve to a
+                        // *proportional* fallback face if it isn't registered
+                        // (e.g. "SF Mono" is only nameable on macOS if the user
+                        // installed it separately — the system's built-in copy
+                        // is the hidden ".SF NS Mono" — and neither "SF Mono"
+                        // nor "Menlo" exist at all on Linux), and then code
+                        // stops looking like code. Probe the registry and pick
+                        // the best installed match via `choose_code_font`:
+                        // the user's saved preference if installed, else the
+                        // first installed name of a fallback chain (JetBrains
+                        // Mono first), else the generic "monospace" family.
                         {
                             let names = cx.text_system().all_font_names();
-                            if !names.iter().any(|n| n == "SF Mono") {
-                                view.code_font = SharedString::new_static("Menlo");
-                            }
+                            view.code_font =
+                                crate::persist::choose_code_font(&names, prefs.code_font.as_deref());
                         }
                         // Restore the saved text zoom (clamped so a hand-edited
                         // preferences file can't push the body off-screen).
