@@ -69,6 +69,53 @@ fn prompt_rejected_settles_agent_turn_idle(cx: &mut TestAppContext) {
     }));
 }
 
+/// REGRESSION (D4, text-editing review): a rejected prompt's text is put back
+/// in the compose in the WORKSHEET too, not only the chatbox, and — since an
+/// idle worksheet draft is only visible as a You-block — it lands in a visible,
+/// typeable tail block. Drives the REAL reducer (`apply_server_batch` with a
+/// `PromptRejected` notification).
+///
+/// Negative control: restore the `chatbox_mut()`-gated restore → in Worksheet
+/// the compose stays empty → the text assert fails RED.
+#[gpui::test]
+fn prompt_rejected_restores_draft_in_worksheet(cx: &mut TestAppContext) {
+    use crate::{AgentFocus, InputModeKind, InputSurface};
+    use crate::TurnPhase;
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let (view, vcx, id, _session) = boot_with_transcript(cx);
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| {
+            c.input_surface = InputSurface::new(InputModeKind::Worksheet);
+            c.focus = AgentFocus::Transcript;
+            c.turn_phase = TurnPhase::begin(std::time::Instant::now());
+        });
+        v.apply_server_batch(
+            vec![ServerNotification::PromptRejected {
+                session_id: "S1".into(),
+                reason: "agent disconnected".into(),
+                text: "please retry".into(),
+            }],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    let (text, worksheet, visible) = view.read_with(vcx, |v, cx| {
+        v.read_session(id, cx, |c| {
+            (
+                c.input_surface.compose().text(),
+                !c.input_surface.is_chatbox(),
+                c.inline_you_block_active(),
+            )
+        })
+        .expect("session")
+    });
+    assert!(worksheet, "placement stays Worksheet");
+    assert_eq!(text, "please retry", "the rejected text is restored in Worksheet");
+    assert!(visible, "the restored worksheet draft is a visible inline You-block");
+}
+
 /// A detach is another terminal lifecycle event: the transport is gone, so a
 /// locally awaiting turn cannot remain live after the notification is folded.
 #[gpui::test]

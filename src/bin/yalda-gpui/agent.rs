@@ -2263,9 +2263,10 @@ impl InputSurface {
     pub(crate) fn compose_mut(&mut self) -> &mut Compose {
         &mut self.compose
     }
-    /// Back-compat shim: `Some` only in Chatbox mode. Retained for the
-    /// not-delivered resubmit path, which only refills the box in chatbox mode.
-    /// New code uses the total `compose()`/`compose_mut()`.
+    /// Back-compat shim: `Some` only in Chatbox mode. Test-only now — the
+    /// not-delivered resubmit path restores in both placements (D4). New code
+    /// uses the total `compose()`/`compose_mut()`.
+    #[cfg(test)]
     pub(crate) fn chatbox_mut(&mut self) -> Option<&mut Compose> {
         if self.is_chatbox() {
             Some(&mut self.compose)

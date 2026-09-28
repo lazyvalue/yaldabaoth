@@ -3106,14 +3106,16 @@ impl YaldaGpuiView {
                         // restored draft is retryable, but no agent work is in
                         // flight until that retry succeeds.
                         slot.state.turn_phase = TurnPhase::Idle;
-                        if let Some(cb) = slot.state.input_surface.chatbox_mut()
-                            && cb.is_blank()
-                        {
-                            let mut fresh = Compose::new();
-                            for ch in text.chars() {
-                                fresh.editor.insert_char(ch);
+                        // D4: restore in BOTH placements (was chatbox-only via
+                        // `chatbox_mut`, so a Worksheet user lost the rejected
+                        // text). In the worksheet the idle draft is only visible
+                        // as a You-block, so settle opens a tail block around it.
+                        if slot.state.input_surface.compose().is_blank() {
+                            let mode = slot.state.input_surface.mode();
+                            slot.state.input_surface = InputSurface::with_draft(mode, &text);
+                            if !slot.state.input_surface.is_chatbox() {
+                                slot.state.settle_input_focus();
                             }
-                            *cb = fresh;
                         }
                     });
                     warn_unrouted(routed, &session_id);
