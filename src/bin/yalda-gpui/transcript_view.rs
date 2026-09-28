@@ -1766,6 +1766,7 @@ impl TranscriptView {
                             (true, Some(sink)) => block.child(crate::CaptureBounds {
                                 inner: inner.into_any_element(),
                                 sink,
+                                rerender_on_width_change: true,
                             }),
                             _ => block.child(inner),
                         };

@@ -1519,6 +1519,7 @@ impl YaldaGpuiView {
                     .child(CaptureBounds {
                         inner: inner.into_any_element(),
                         sink: compose_bounds_sink,
+                        rerender_on_width_change: true,
                     })
                     .into_any_element()
             } else {
@@ -1528,6 +1529,10 @@ impl YaldaGpuiView {
                 let lines_snap = compose_lines.clone();
                 // Splice the changed range (never `reset()`, which snaps the box
                 // to its top on every newline).
+                // (A wrap-width change alone needs no splice: gpui re-measures
+                // every VISIBLE item each frame, and the window below places the
+                // caret by (item, offset) — D12's fix is the follow-up frame
+                // `CaptureBounds::rerender_on_width_change` schedules.)
                 let compose_edit_seq = tb.editor.document().edit_seq();
                 tb.list.reconcile(&lines_snap, compose_edit_seq);
                 // UXI-TextEditing-1 under UXI-AgentTile-9: once lines wrap, the box scrolls in
@@ -1603,6 +1608,7 @@ impl YaldaGpuiView {
                             .w_full()
                             .into_any_element(),
                         sink: compose_bounds_sink,
+                        rerender_on_width_change: true,
                     })
                     .into_any_element()
             };

@@ -55,6 +55,11 @@ row widths are terminal CELLS (`char_cells`, `unicode-width`): CJK / emoji take 
 columns, combining marks 0 (they ride on their base char's row); the Normal-mode
 block caret spans a wide char's 2 cells. Pasted text (Cmd-V and vim `p`/`P`) is
 normalized `\r\n`/`\r` → `\n` (`normalize_pasted_newlines`) for every compose.
+**D12 (2026-09-27):** the wrap width comes from the box's PAINTED width, so a
+width change (resize, split, sidepanel) now schedules the follow-up frame that
+re-wraps at the new width (`CaptureBounds::rerender_on_width_change`, a
+`cx.defer`red notify — never mid-draw); before, that frame kept the old width's
+wrap + window until an unrelated event.
 
 **Enforcement.** Headless: `wrap_line_cols_word_wraps_and_covers_every_char`
 (wraps, hard-breaks, covers every char, ≥1 row, makes progress, last row keeps a
@@ -63,6 +68,7 @@ free caret column) + `compose_eol_caret_on_full_wrapped_row_paints_inside_box`
 `wrap_line_cols_counts_wide_and_zero_width_cells` +
 `compose_wide_chars_wrap_by_cells_caret_inside_box` (D15, painted) +
 `compose_cmd_v_normalizes_crlf` (D15, real Cmd-V) +
+`compose_virtualized_rewraps_after_width_change` (D12, painted, resize + sidepanel) +
 `caret_visual_row_places_caret_on_a_rendered_row` (caret always on a rendered
 row). `verify_harness.rs::worksheet_r_first_paint_uses_transcript_width` drives
 the real `r` reply path and asserts from painted geometry that a newly opened,

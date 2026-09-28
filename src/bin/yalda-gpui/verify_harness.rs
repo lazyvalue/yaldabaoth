@@ -32241,3 +32241,78 @@ fn diff_compose_long_comment_is_height_capped_with_caret_inside(cx: &mut TestApp
         "caret {caret:?} inside the editor {editor:?}"
     );
 }
+
+/// D12 (text-editing review): the VIRTUALIZED (long-draft) compose must
+/// relayout when its wrap width changes. The wrap width is derived from the
+/// box's PAINTED width (`CaptureBounds`), known only after the frame that
+/// changed it — so without a follow-up frame, the frame after a resize/split
+/// keeps the previous width's wrap (and window top) until an unrelated event.
+/// (The list's item heights are NOT the problem: gpui re-measures every
+/// visible item each frame, and the existing `(edit_seq, visible_cols)` render
+/// snapshot re-wraps correctly once a frame runs.) Drives the real chatbox
+/// render through two user actions — a window resize, then opening the Plan
+/// sidepanel (one notify) — with NO extra notify, and proves from paint that
+/// the caret row lands exactly where the fresh wrap puts it:
+/// `box inner top + (caret visual row − window top) × 18px`.
+///
+/// Negative control (observed RED): drop `CaptureBounds`' width-change
+/// re-render → [resize] the caret row paints at the OLD width's window
+/// (top_vrow stale).
+#[gpui::test]
+fn compose_virtualized_rewraps_after_width_change(cx: &mut TestAppContext) {
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
+    vcx.simulate_resize(gpui::size(px(1400.0), px(800.0)));
+    vcx.run_until_parked();
+    // 100-char lines: one row in the wide box, two after the resize, ~four
+    // once the sidepanel opens — every step moves every line's row count.
+    let text: String = (0..30)
+        .map(|i| format!("{i:02} {}", "word ".repeat(19)).trim_end().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let last = 29;
+    let eol = text.lines().last().unwrap().chars().count();
+    q4_paint_compose_caret(&view, vcx, &text, last, eol, crate::EditMode::Insert);
+
+    // Where the caret row paints after `act` (the ONLY event — no extra
+    // notify), vs where a fresh wrap at the box's current width puts it.
+    let mut check = |label: &str, act: &mut dyn FnMut(&mut gpui::VisualTestContext)| {
+        let before = view
+            .update(vcx, |v, cx| v.agent_read(cx, |c| c.input_surface.compose().bounds.get()))
+            .expect("agent");
+        crate::layout_probe_begin();
+        act(vcx);
+        vcx.run_until_parked();
+        let caret_row = crate::layout_probe_get("compose-cursor-row");
+        crate::layout_probe_end();
+        let (b, top_vrow, caret_vrow, total, rows_before) = view
+            .update(vcx, |v, cx| {
+                v.agent_read(cx, |c| {
+                    let tb = c.input_surface.compose();
+                    let b = tb.bounds.get();
+                    let cols = |w: f32| (w / crate::CHATBOX_CHAR_W).floor().max(1.0) as usize;
+                    let lines = crate::display_lines(tb.editor.document());
+                    let (cv, total, _) = crate::compose_visual_metrics(&lines, last, eol, cols(b.2));
+                    let (_, rows_before, _) = crate::compose_visual_metrics(&lines, last, eol, cols(before.2));
+                    (b, tb.top_vrow.get(), cv, total, rows_before)
+                })
+            })
+            .expect("agent");
+        assert!(b.2 < before.2 - 100.0, "[{label}] non-vacuous: the box narrowed {before:?} -> {b:?}");
+        assert!(total > rows_before, "[{label}] non-vacuous: the row count moved ({rows_before} -> {total})");
+        let (_, y, _, _) = caret_row.unwrap_or_else(|| panic!("[{label}] caret row painted"));
+        let want = b.1 + (caret_vrow - top_vrow) as f32 * 18.0;
+        assert!(
+            (y - want).abs() < 1.5,
+            "[{label}] caret row painted at y={y}, fresh wrap puts it at {want} (vrow {caret_vrow}, top {top_vrow}, box {b:?})"
+        );
+        // (+3: the box's 1px borders make the inner height 2px short of 8 rows —
+        // the same slack `compose_caret_row_painted_inside_box_when_wrapped` allows.)
+        assert!(y >= b.1 - 1.0 && y + 18.0 <= b.1 + b.3 + 3.0, "[{label}] caret row {y} inside the box {b:?}");
+    };
+    // The user drags the window narrower …
+    check("resize", &mut |vcx| vcx.simulate_resize(gpui::size(px(900.0), px(800.0))));
+    // … then opens the Plan sidepanel (Cmd-1 → `toggle_tasklist`: ONE notify).
+    let v2 = view.clone();
+    check("sidepanel", &mut |vcx| v2.update(vcx, |v, cx| v.toggle_tasklist(cx)));
+}

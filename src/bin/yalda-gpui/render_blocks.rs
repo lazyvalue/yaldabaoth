@@ -699,6 +699,14 @@ pub(crate) struct BlockHits {
 pub(crate) struct CaptureBounds {
     pub(crate) inner: AnyElement,
     pub(crate) sink: std::rc::Rc<std::cell::Cell<(f32, f32, f32, f32)>>,
+    /// D12: the enclosing view LAYS OUT from this width next frame (the
+    /// compose wraps at `floor(w / CHATBOX_CHAR_W)` columns), so a width change
+    /// must schedule that frame — otherwise the frame after a resize/split
+    /// keeps the previous width's wrap until an unrelated event. When set, a
+    /// painted width that differs from the sink's previous value notifies the
+    /// current view via `cx.defer` (runs after the draw — never a mid-draw,
+    /// parked notify).
+    pub(crate) rerender_on_width_change: bool,
 }
 
 impl IntoElement for CaptureBounds {
@@ -752,12 +760,18 @@ impl Element for CaptureBounds {
         window: &mut Window,
         cx: &mut GpuiApp,
     ) {
+        let old_w = self.sink.get().2;
+        let new_w = f32::from(bounds.size.width);
         self.sink.set((
             f32::from(bounds.origin.x),
             f32::from(bounds.origin.y),
-            f32::from(bounds.size.width),
+            new_w,
             f32::from(bounds.size.height),
         ));
+        if self.rerender_on_width_change && (old_w - new_w).abs() > 0.5 {
+            let view = window.current_view();
+            cx.defer(move |cx| cx.notify(view));
+        }
         self.inner.paint(window, cx);
     }
 }
