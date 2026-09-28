@@ -140,7 +140,7 @@ impl<T: PartialEq> ScrollAnchoredList<T> {
     /// `focus` guaranteed on-screen: the next `reconcile` scrolls to `top`, and
     /// subsequent [`Self::settle`] calls reveal `focus` if the first layout left
     /// it outside the viewport. Used to carry a reading position across a
-    /// surface swap (Doc ⇄ Edit, UXI-Buffer-4/5) — the target list's row
+    /// surface swap (Doc ⇄ Edit, UXI-Buffer-8/9) — the target list's row
     /// heights are unknown until it has been laid out once.
     pub(crate) fn land(&self, top: ListOffset, focus: usize) {
         self.pending_land.set(Some((top, focus)));

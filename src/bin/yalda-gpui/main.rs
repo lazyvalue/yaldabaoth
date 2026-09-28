@@ -1336,7 +1336,7 @@ struct EditState {
     /// replacement character (vim `r{char}`) rather than a normal-mode action.
     /// Cleared after that next key (Esc / non-char cancels).
     pending_replace: bool,
-    /// Where the Doc this Edit was entered from stood (UXI-Buffer-6): restored
+    /// Where the Doc this Edit was entered from stood (UXI-Buffer-10): restored
     /// verbatim by `back_to_doc` when nothing was edited and the caret never
     /// moved, so a no-op Doc→Edit→Doc round trip is exact. `None` when entered
     /// from an unmapped Doc (or not from a Doc).

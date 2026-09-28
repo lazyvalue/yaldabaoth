@@ -165,7 +165,7 @@ impl YaldaGpuiView {
         };
         let mut edit_state = EditState::new(SharedEditor::new(id, core), label, view);
         edit_state.view = view;
-        // UXI-Buffer-4: keep the reading position — caret at the focused
+        // UXI-Buffer-8: keep the reading position — caret at the focused
         // block's first source line, the top visible block's first line at the
         // top of the edit viewport. Unmapped Docs keep the 0,0 landing.
         if let Some(place) = place {
@@ -194,7 +194,7 @@ impl YaldaGpuiView {
     /// Edit → Doc round trip. The new Doc keeps the SAME pooled core (5c), so
     /// it shows the buffer's *current* (unsaved) text and shares undo with any
     /// other view of the file. No stash — the shared core IS the live state.
-    /// Position carries over (UXI-Buffer-5/6): the Doc's cursor block is the
+    /// Position carries over (UXI-Buffer-9/10): the Doc's cursor block is the
     /// block holding the caret line and its top block the one holding the top
     /// visible edit line — or, after a no-op round trip, exactly where the Doc
     /// stood when Edit was entered.
@@ -1062,7 +1062,7 @@ impl YaldaGpuiView {
 }
 
 /// A source-mapped Doc's reading position, projected onto source lines
-/// (UXI-Buffer-4). `None` for an unmapped Doc (no `spans`).
+/// (UXI-Buffer-8). `None` for an unmapped Doc (no `spans`).
 struct DocPlace {
     cursor_block: usize,
     /// First source line of the focused block — where the Edit caret lands.
@@ -1091,7 +1091,7 @@ impl DocPlace {
     }
 }
 
-/// Where the Doc rebuilt by `back_to_doc` lands (UXI-Buffer-5/6):
+/// Where the Doc rebuilt by `back_to_doc` lands (UXI-Buffer-9/10):
 /// `(cursor_block, list top)`. A no-op round trip (no edit, caret unmoved since
 /// Doc→Edit) restores the stashed Doc position exactly; otherwise the cursor is
 /// the block holding the caret line and the top is the block holding the top
