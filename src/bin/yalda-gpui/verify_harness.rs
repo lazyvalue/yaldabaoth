@@ -1352,6 +1352,98 @@ fn boot_browser<'a>(
     (view, vcx)
 }
 
+/// C3 (text-editing review): a Doc tile that is NOT painted (it lives in a
+/// background workspace) must do ZERO re-parses while an Edit tile of the same
+/// pooled file takes keystrokes — and when the user switches to it, it must show
+/// the up-to-date content (never stale). Drives the real paths: `open_file` +
+/// `make_doc_content` (pooled core), `enter_edit_with` (Edit bound to the SAME
+/// core), real keystrokes through the keymap, the real root render, and the
+/// real workspace switch (`select_workspace`, the strip-click entry point).
+///
+/// Negative control (observed RED): restore the pre-C3 per-frame loop that ran
+/// `refresh_blocks` over EVERY attached window of EVERY workspace → the hidden
+/// Doc's parse count is 3 (one per keystroke frame), not 0.
+#[gpui::test]
+fn c3_hidden_doc_does_not_reparse_on_sibling_edit_and_is_fresh_when_shown(
+    cx: &mut TestAppContext,
+) {
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_browser(cx);
+    let dir = std::env::temp_dir().join(format!("yalda_c3_hidden_doc_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("c3.md");
+    std::fs::write(&path, "first para\n\nsecond para\n").unwrap();
+    let label = path.canonicalize().unwrap().display().to_string();
+
+    view.update(vcx, |v, cx| {
+        // Workspace 0: the focused browser is replaced in place by a Doc of F.
+        assert!(v.open_file(path.clone()), "open F as a Doc");
+        // Workspace 1 (active): a second tile of F, pooled onto the SAME core,
+        // toggled into Edit (Insert) — the surface the user types into.
+        let content = v.make_doc_content(&path).expect("doc content");
+        let project = v.workspace.inherited_project();
+        v.workspace.push_initial_workspace(content, project);
+        v.enter_edit_with(crate::EditView::Code, cx);
+        v.edit_mut().expect("edit tile").mode = crate::EditMode::Insert;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert_eq!(v.workspace.workspaces.len(), 2);
+        assert_eq!(v.workspace.active_workspace, 1, "the Edit workspace is active");
+        let mut hidden_doc = false;
+        v.workspace.workspaces[0].for_each_attached_window(&mut |w| {
+            if let crate::App::Buffer(crate::BufferApp::Viewing(d)) = &w.content {
+                hidden_doc |= d.file_label.as_ref() == label;
+            }
+        });
+        assert!(hidden_doc, "workspace 0 holds a (now hidden) Doc of F");
+    });
+
+    crate::test_reset_doc_refresh_parses();
+    for key in ["q", "u", "x"] {
+        vcx.simulate_keystrokes(key);
+        vcx.run_until_parked();
+    }
+    let core_text = view.update(vcx, |v, _| v.edit_mut().unwrap().editor.full_text());
+    assert!(core_text.contains("qux"), "the keystrokes reached the shared core: {core_text:?}");
+    assert_eq!(
+        crate::test_doc_refresh_parses(&label),
+        0,
+        "a Doc tile that is not painted (background workspace) must not re-parse \
+         on a sibling Edit tile's keystrokes"
+    );
+
+    // Switch to the Doc's workspace through the real strip-click entry point.
+    crate::YaldaGpuiView::test_reset_doc_render_tap();
+    view.update(vcx, |v, cx| v.select_workspace(0, cx));
+    vcx.run_until_parked();
+    assert_eq!(
+        crate::test_doc_refresh_parses(&label),
+        1,
+        "the Doc re-parses exactly once, lazily, when it becomes visible"
+    );
+    view.read_with(vcx, |v, _| {
+        let Some(crate::App::Buffer(crate::BufferApp::Viewing(d))) =
+            v.workspace.focused_content()
+        else {
+            panic!("workspace 0's focused tile must be the Doc");
+        };
+        let rendered = format!("{:?}", d.blocks);
+        assert!(
+            rendered.contains("qux"),
+            "the shown Doc must reflect the sibling edit, not stale content: {rendered}"
+        );
+    });
+    let tap = crate::YaldaGpuiView::test_doc_render_tap();
+    assert!(
+        tap.painted.iter().any(|&(b, _)| b == 0),
+        "the refreshed Doc's first block painted after the switch: {:?}",
+        tap.painted
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Add a **free** agent session to the store (the focused tile is a browser, so
 /// `show_local_session` binds nothing). Returns its `SessionId`.
 #[cfg(test)]
