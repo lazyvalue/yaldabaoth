@@ -3,7 +3,8 @@ use syntect::highlighting::{
     Color as SynColor, ScopeSelectors, StyleModifier, Theme as SynTheme, ThemeItem, ThemeSet,
     ThemeSettings,
 };
-use syntect::parsing::SyntaxSet;
+use syntect::parsing::{SyntaxReference, SyntaxSet};
+use std::sync::OnceLock;
 
 use crate::blocks::{StyledLine, StyledSpan};
 use crate::style::{Color, Style};
@@ -87,8 +88,54 @@ pub fn folio_theme() -> SynTheme {
     }
 }
 
+/// The process-wide syntax set: syntect's defaults PLUS the `two-face` extra
+/// set (bat's syntaxes — TypeScript, TSX, TOML, Dockerfile, …; MIT/Apache-2.0).
+/// Built once, lazily, and shared by every [`Highlighter`] (a `SyntaxSet` is
+/// several MB of compiled definitions — never rebuild it per theme / per
+/// refresh). Callers that care about latency warm it off the UI thread with
+/// [`warm_syntax_set`].
+pub fn syntax_set() -> &'static SyntaxSet {
+    SYNTAX_SET.get_or_init(two_face::syntax::extra_newlines)
+}
+
+static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
+
+/// Whether [`syntax_set`] is already built (a UI-thread caller that must not
+/// block on the load checks this first and defers to a background warm-up).
+pub fn syntax_set_loaded() -> bool {
+    SYNTAX_SET.get().is_some()
+}
+
+/// Force the lazy [`syntax_set`] load (call from a background thread at
+/// startup so the first highlight doesn't pay the deserialization).
+pub fn warm_syntax_set() {
+    let _ = syntax_set();
+}
+
+/// The syntax for a file path, resolved by extension (`rs`, `ts`, `tsx`,
+/// `mts`, `cts`, `md`, `markdown`, and everything else the extended set
+/// knows), falling back to the bare file name (`Dockerfile`, `Makefile`).
+/// `None` = unknown ⇒ render plain.
+pub fn syntax_for_path(path: &std::path::Path) -> Option<&'static SyntaxReference> {
+    let set = syntax_set();
+    let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
+    let by_ext = |e: &str| set.find_syntax_by_extension(e);
+    let found = match ext.as_deref() {
+        // Node's module-flavoured TypeScript extensions aren't in the grammar's
+        // extension list.
+        Some("mts") | Some("cts") => by_ext("ts"),
+        Some(e) => by_ext(e),
+        None => None,
+    };
+    found
+        .or_else(|| path.file_name().and_then(|n| n.to_str()).and_then(by_ext))
+        .filter(|s| s.name != "Plain Text")
+}
+
+/// A token's byte range within its line and its foreground color.
+pub type LineSpan = (std::ops::Range<usize>, Color);
+
 pub struct Highlighter {
-    syntax_set: SyntaxSet,
     theme: SynTheme,
 }
 
@@ -104,13 +151,51 @@ impl Highlighter {
     }
 
     pub fn with_syntect_theme(name: &str) -> Self {
-        let syntax_set = SyntaxSet::load_defaults_newlines();
         let theme = if name == FOLIO_SYNTECT_THEME {
             folio_theme()
         } else {
             ThemeSet::load_defaults().themes[name].clone()
         };
-        Self { syntax_set, theme }
+        Self { theme }
+    }
+
+    /// The theme's default foreground (plain, un-scoped text).
+    pub fn default_fg(&self) -> Option<Color> {
+        self.theme.settings.foreground.map(|c| Color::Rgb(c.r, c.g, c.b))
+    }
+
+    /// Highlight a WHOLE file with `syntax` (parse state carries across lines,
+    /// so block comments / multi-line strings are right) and return, per line
+    /// (0-based, `\n`-split like `str::lines`), the byte ranges whose color
+    /// differs from the theme's default foreground. Plain-colored text is
+    /// omitted so a caller paints it in its own foreground. `None` when
+    /// syntect fails mid-file.
+    pub fn highlight_file_spans(&self, syntax: &SyntaxReference, text: &str) -> Option<Vec<Vec<LineSpan>>> {
+        let set = syntax_set();
+        let mut h = HighlightLines::new(syntax, &self.theme);
+        let default = self.theme.settings.foreground;
+        let mut out = Vec::new();
+        for line in syntect::util::LinesWithEndings::from(text) {
+            let body_len = line.trim_end_matches(['\n', '\r']).len();
+            let ranges = h.highlight_line(line, set).ok()?;
+            let mut spans: Vec<LineSpan> = Vec::new();
+            let mut at = 0usize;
+            for (style, tok) in ranges {
+                let start = at;
+                at += tok.len();
+                let end = at.min(body_len);
+                if start >= end || Some(style.foreground) == default {
+                    continue;
+                }
+                let fg = Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
+                match spans.last_mut() {
+                    Some((r, c)) if *c == fg && r.end == start => r.end = end,
+                    _ => spans.push((start..end, fg)),
+                }
+            }
+            out.push(spans);
+        }
+        Some(out)
     }
 
     pub fn highlight(
@@ -119,12 +204,13 @@ impl Highlighter {
         code: &str,
         bg_style: Style,
     ) -> Option<Vec<StyledLine>> {
-        let syntax = self.syntax_set.find_syntax_by_token(language)?;
+        let set = syntax_set();
+        let syntax = set.find_syntax_by_token(language)?;
         let mut h = HighlightLines::new(syntax, &self.theme);
         let mut lines = Vec::new();
 
         for line in code.lines() {
-            let ranges = h.highlight_line(line, &self.syntax_set).ok()?;
+            let ranges = h.highlight_line(line, set).ok()?;
             let spans: Vec<StyledSpan> = ranges
                 .into_iter()
                 .map(|(style, text)| {
@@ -154,9 +240,10 @@ impl Highlighter {
         line: &str,
         bg_style: Style,
     ) -> Option<Vec<(String, Style)>> {
-        let syntax = self.syntax_set.find_syntax_by_token(language)?;
+        let set = syntax_set();
+        let syntax = set.find_syntax_by_token(language)?;
         let mut h = HighlightLines::new(syntax, &self.theme);
-        let ranges = h.highlight_line(line, &self.syntax_set).ok()?;
+        let ranges = h.highlight_line(line, set).ok()?;
         let segs: Vec<(String, Style)> = ranges
             .into_iter()
             .map(|(style, text)| {
@@ -223,6 +310,48 @@ mod tests {
             .find(|(t, _)| t.trim() == needle)
             .unwrap_or_else(|| panic!("no token == {needle:?}"))
             .1
+    }
+
+    fn syntax_name(p: &str) -> Option<&'static str> {
+        syntax_for_path(std::path::Path::new(p)).map(|s| s.name.as_str())
+    }
+
+    /// The Diff tile's resolver: Rust / TypeScript / TSX / Markdown by
+    /// extension. TS + TSX come from the two-face extra set — syntect's own
+    /// defaults have no TypeScript (negative control: `syntax_set()` built from
+    /// `SyntaxSet::load_defaults_newlines()` ⇒ this goes RED on `a.ts`).
+    #[test]
+    fn syntax_for_path_resolves_rust_ts_tsx_md() {
+        assert_eq!(syntax_name("src/main.rs"), Some("Rust"));
+        assert_eq!(syntax_name("web/app.ts"), Some("TypeScript"));
+        assert_eq!(syntax_name("web/a.mts"), Some("TypeScript"));
+        assert_eq!(syntax_name("web/a.cts"), Some("TypeScript"));
+        assert_eq!(syntax_name("web/App.tsx"), Some("TypeScriptReact"));
+        assert_eq!(syntax_name("README.md"), Some("Markdown"));
+        assert_eq!(syntax_name("notes.markdown"), Some("Markdown"));
+        assert_eq!(syntax_name("UPPER.RS"), Some("Rust"), "extension match is case-insensitive");
+        assert_eq!(syntax_name("data.xyz"), None, "unknown ext ⇒ plain");
+        assert_eq!(syntax_name("LICENSE"), None);
+    }
+
+    /// Whole-file spans: state carries across lines (a line inside a block
+    /// comment is comment-colored), keyword ≠ default fg, and plain-fg text is
+    /// omitted.
+    #[test]
+    fn highlight_file_spans_carries_state_and_skips_default_fg() {
+        let hl = Highlighter::with_syntect_theme(FOLIO_SYNTECT_THEME);
+        let rust = syntax_for_path(std::path::Path::new("a.rs")).unwrap();
+        let text = "/* open\nstill comment */\nfn main() {}\n";
+        let lines = hl.highlight_file_spans(rust, text).unwrap();
+        assert_eq!(lines.len(), 3);
+        let comment = Color::Rgb(0x8a, 0x81, 0x72);
+        assert_eq!(lines[1], vec![(0..16, comment)], "line 2 is inside the block comment");
+        let wine = Color::Rgb(0x9d, 0x2b, 0x4e);
+        assert_eq!(lines[2][0], (0..2, wine), "`fn` keyword span");
+        assert!(lines[2].iter().all(|(_, c)| Some(*c) != hl.default_fg()), "default fg omitted");
+        let ts = syntax_for_path(std::path::Path::new("a.ts")).unwrap();
+        let ts_lines = hl.highlight_file_spans(ts, "const x: number = 1;\n").unwrap();
+        assert!(ts_lines[0].iter().any(|(r, c)| *r == (0..5) && *c == wine), "TS `const` keyword: {ts_lines:?}");
     }
 
     #[test]

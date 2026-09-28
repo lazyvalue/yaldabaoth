@@ -41,13 +41,26 @@ impl YaldaGpuiView {
         }
     }
 
+    /// Every attached Diff tile's id (theme switch re-highlight walk).
+    pub(crate) fn diff_tile_ids(&self) -> Vec<workspace::WindowId> {
+        let mut ids = Vec::new();
+        for wsp in self.workspace.workspaces.iter() {
+            wsp.for_each_attached_window(&mut |w| {
+                if matches!(w.content, App::Diff(_)) {
+                    ids.push(w.id());
+                }
+            });
+        }
+        ids
+    }
+
     /// The live render-input fingerprint for the Diff tile at `id` (used by
     /// `DiffView`'s root-observe filter — see `diff_view.rs` module docs).
     /// `DiffSeqs::default()` for a tile that's gone / not a Diff tile — a
     /// transient state a torn-down view's next (and last) render tolerates.
     pub(crate) fn diff_seqs_for(&self, id: workspace::WindowId) -> DiffSeqs {
         match self.diff_tile_ref(id) {
-            Some(tile) => DiffSeqs::of(tile, self.text_scale),
+            Some(tile) => DiffSeqs::of(tile, self.text_scale, self.theme.name),
             None => DiffSeqs::default(),
         }
     }
@@ -380,6 +393,7 @@ impl YaldaGpuiView {
                 // whose `file_hash` is unchanged; the derive's reads seed the
                 // cache.
                 tile.texts.invalidate(&model);
+                tile.highlights.invalidate(&model);
                 tile.expansions.retain_for(&model);
                 for (path, hash, text) in derived.texts {
                     tile.texts.insert_ready(&path, CommentSide::New, hash, text);
@@ -416,6 +430,7 @@ impl YaldaGpuiView {
         for path in missing {
             self.diff_load_file_text(id, path, CommentSide::New, cx);
         }
+        self.diff_ensure_highlights(id, cx);
         if persist {
             self.diff_persist_review(id, cx);
         }
@@ -500,7 +515,100 @@ impl YaldaGpuiView {
                 self.diff_hint(format!("Couldn't read {}: {e}", path.display()), cx);
             }
         }
+        self.diff_ensure_highlights(id, cx);
         cx.notify();
+    }
+
+    /// Syntax highlighting (spec B2b, UXI-Diff-19): make sure every side of
+    /// every file of a known language in tile `id`'s diff has (or is getting)
+    /// its whole-file spans under the current theme. Missing text is loaded
+    /// through the shared cache ([`diff_load_file_text`](Self::diff_load_file_text),
+    /// whose landing calls back here); loaded text is highlighted ONCE per
+    /// (path, side, file_hash, theme) on the background executor, landing via
+    /// [`diff_highlight_apply`](Self::diff_highlight_apply). Nothing here runs
+    /// syntect or loads the syntax set on the foreground thread: until the
+    /// set is warm, a background warm-up runs first and re-enters. Event /
+    /// spawned-task only (it may notify).
+    pub(crate) fn diff_ensure_highlights(&mut self, id: workspace::WindowId, cx: &mut Context<Self>) {
+        let theme = self.theme.name.syntect_theme();
+        let Some(tile) = self.diff_tile_mut(id) else {
+            return;
+        };
+        let Some(model) = tile.model.clone() else {
+            return;
+        };
+        if tile.highlights.set_theme(theme) {
+            tile.hl_gen = tile.hl_gen.wrapping_add(1);
+        }
+        if !yalda::highlight::syntax_set_loaded() {
+            if !tile.highlights.warming {
+                tile.highlights.warming = true;
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().spawn(async { yalda::highlight::warm_syntax_set() }).await;
+                    let _ = this.update(cx, |v, cx| {
+                        if let Some(t) = v.diff_tile_mut(id) {
+                            t.highlights.warming = false;
+                        }
+                        v.diff_ensure_highlights(id, cx);
+                    });
+                })
+                .detach();
+            }
+            return;
+        }
+        let mut loads: Vec<(PathBuf, CommentSide)> = Vec::new();
+        let mut jobs: Vec<(PathBuf, CommentSide, u64, std::sync::Arc<FileContent>)> = Vec::new();
+        for f in &model.files {
+            for side in highlight_sides(f) {
+                if !tile.highlights.wants(&f.path, side, f.file_hash) {
+                    continue;
+                }
+                if let Some(c) = tile.texts.content(&f.path, side) {
+                    tile.highlights.begin(&f.path, side, f.file_hash, HlSlot::Pending);
+                    jobs.push((f.path.clone(), side, f.file_hash, c.clone()));
+                } else if tile.texts.is_failed(&f.path, side) {
+                    tile.highlights.begin(&f.path, side, f.file_hash, HlSlot::Plain);
+                } else if !tile.texts.is_loading(&f.path, side) {
+                    loads.push((f.path.clone(), side));
+                }
+            }
+        }
+        for (path, side, hash, content) in jobs {
+            cx.spawn(async move |this, cx| {
+                let p = path.clone();
+                let spans = cx
+                    .background_executor()
+                    .spawn(async move { highlight_file(&p, theme, content) })
+                    .await;
+                let _ = this.update(cx, |v, cx| v.diff_highlight_apply(id, path, side, hash, theme, spans, cx));
+            })
+            .detach();
+        }
+        for (path, side) in loads {
+            self.diff_load_file_text(id, path, side, cx);
+        }
+    }
+
+    /// Land a highlight pass (dropped when stale): store the spans and bump
+    /// `hl_gen` so the cached body repaints with them.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn diff_highlight_apply(
+        &mut self,
+        id: workspace::WindowId,
+        path: PathBuf,
+        side: CommentSide,
+        hash: u64,
+        theme: &str,
+        spans: Option<FileSpans>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tile) = self.diff_tile_mut(id) else {
+            return;
+        };
+        if tile.highlights.finish(&path, side, hash, theme, spans) {
+            tile.hl_gen = tile.hl_gen.wrapping_add(1);
+            cx.notify();
+        }
     }
 
     /// Expand gap `gap` of file `file` of tile `id` in `dir` (spec B2a) —

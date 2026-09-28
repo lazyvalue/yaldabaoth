@@ -1197,9 +1197,47 @@ pub(crate) fn probe_text(tag: impl FnOnce() -> String, text: SharedString) -> An
     }
     let styled = gpui::StyledText::new(text);
     let layout = styled.layout().clone();
+    let label = tag();
+    LAYOUT_PROBE_RUNS.with(|p| p.borrow_mut().remove(&label));
     ProbeText {
-        label: tag(),
+        label,
         layout,
+        runs: None,
+        inner: styled.into_any_element(),
+    }
+    .into_any_element()
+}
+
+/// [`probe_text`] for a text leaf with per-range foreground colors (syntax
+/// highlighting): a `StyledText` whose `highlights` override the inherited
+/// text color. With the probe active it also records the colored ranges it
+/// PAINTED, read back via [`layout_probe_runs`] — the headless proof that the
+/// spans reached the painted element (colors themselves are gap 1).
+pub(crate) fn probe_styled_text(
+    tag: impl FnOnce() -> String,
+    text: SharedString,
+    highlights: Vec<(std::ops::Range<usize>, Hsla)>,
+) -> AnyElement {
+    let runs = layout_probe_active().then(|| highlights.clone());
+    let styled = gpui::StyledText::new(text).with_highlights(highlights.into_iter().map(|(r, c)| {
+        (
+            r,
+            gpui::HighlightStyle {
+                color: Some(c),
+                ..Default::default()
+            },
+        )
+    }));
+    let Some(runs) = runs else {
+        return styled.into_any_element();
+    };
+    let label = tag();
+    LAYOUT_PROBE_RUNS.with(|p| p.borrow_mut().remove(&label));
+    let layout = styled.layout().clone();
+    ProbeText {
+        label,
+        layout,
+        runs: Some(runs),
         inner: styled.into_any_element(),
     }
     .into_any_element()
@@ -1208,6 +1246,16 @@ pub(crate) fn probe_text(tag: impl FnOnce() -> String, text: SharedString) -> An
 thread_local! {
     static LAYOUT_PROBE_TEXT: RefCell<HashMap<String, (String, (f32, f32, f32, f32))>> =
         RefCell::new(HashMap::new());
+    static LAYOUT_PROBE_RUNS: RefCell<HashMap<String, Vec<(std::ops::Range<usize>, Hsla)>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// The colored ranges the [`probe_styled_text`] leaf tagged `label` last
+/// painted (`None` when it never painted with the probe active, or painted
+/// as a plain [`probe_text`]).
+#[cfg(test)]
+pub(crate) fn layout_probe_runs(label: &str) -> Option<Vec<(std::ops::Range<usize>, Hsla)>> {
+    LAYOUT_PROBE_RUNS.with(|p| p.borrow().get(label).cloned())
 }
 
 /// The last painted `(shaped_text, (x, y, w, h))` of the [`probe_text`] leaf
@@ -1220,6 +1268,8 @@ pub(crate) fn layout_probe_text(label: &str) -> Option<(String, (f32, f32, f32, 
 struct ProbeText {
     label: String,
     layout: gpui::TextLayout,
+    /// The colored ranges of a [`probe_styled_text`] leaf.
+    runs: Option<Vec<(std::ops::Range<usize>, Hsla)>>,
     inner: AnyElement,
 }
 
@@ -1284,6 +1334,9 @@ impl Element for ProbeText {
             );
             let text = self.layout.text();
             LAYOUT_PROBE_TEXT.with(|p| p.borrow_mut().insert(self.label.clone(), (text, rect)));
+            if let Some(runs) = self.runs.take() {
+                LAYOUT_PROBE_RUNS.with(|p| p.borrow_mut().insert(self.label.clone(), runs));
+            }
         }
     }
 }

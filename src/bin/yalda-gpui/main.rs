@@ -4077,6 +4077,12 @@ impl YaldaGpuiView {
         self.notify_keymap_views(MissReason::Refresh, cx);
         self.notify_agent_stats_view(MissReason::Refresh, cx);
         self.notify_system_console(MissReason::Refresh, cx);
+        // Diff tiles: token colors are theme-keyed (spec B2b) — drop the
+        // spans and re-highlight every bound diff under the new theme (the
+        // body repaints via `DiffSeqs::{theme, hl_gen}`).
+        for wid in self.diff_tile_ids() {
+            self.diff_ensure_highlights(wid, cx);
+        }
         self.save_settings();
         cx.notify();
     }
@@ -10308,6 +10314,11 @@ fn main() {
     Application::new().run(move |app: &mut GpuiApp| {
         install_yaldabaoth_app_icon();
         register_keymap(app);
+        // Deserialize the (extended, TypeScript-bearing) syntect syntax set
+        // off the UI thread so the first highlight doesn't stall a frame.
+        app.background_executor()
+            .spawn(async { yalda::highlight::warm_syntax_set() })
+            .detach();
 
         // Quit when the last window closes. macOS apps typically stay
         // alive in the menu bar after every window is dismissed, but

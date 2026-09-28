@@ -103,6 +103,26 @@ uncommitted + untracked), base = the repo's default branch.
   on a revealed line stays live (its snippet is checked against the file's full
   new text) and its line is re-revealed after a re-derive.
 
+- **B2b. Syntax highlighting. [ACTIVE]** Code in the diff (added, removed,
+  context and revealed lines) is syntax-highlighted for **Rust** (`.rs`),
+  **TypeScript** (`.ts`, `.mts`, `.cts`), **TSX** (`.tsx`) and **Markdown**
+  (`.md`, `.markdown`) — and any other language the extended syntax set knows
+  (syntect defaults + the `two-face` extra set). Each side of a file is
+  highlighted as a WHOLE (so block comments / multi-line strings are right):
+  new side = the worktree file, old side = `git show <merge-base>:<path>`, both
+  through the B2a text cache (loaded eagerly for highlightable files when a
+  model derives). Added + context lines take new-side spans by new line number,
+  removed lines old-side spans by old line number; a row whose text differs
+  from the file line stays plain. The syntect pass runs once per (path, side,
+  `file_hash`, theme) on the background executor; the syntax set is a lazy
+  process global warmed off the UI thread. Token colors paint over the
+  add/remove row tints (tints, gutters and the colored `+`/`−` sign are kept;
+  plain-colored text on a highlighted line takes the editor fg). Until spans
+  land a line renders plain (the old look). Unknown extensions stay plain;
+  files over 20,000 lines / 2 MB, or with any line over 10,000 bytes, stay
+  plain. A theme switch re-highlights under the new theme's syntect palette
+  (Folio uses its hand-built palette).
+
 - **B3. Refresh. [ACTIVE]** The diff re-derives by re-running git (async, off
   the paint path) when the tile **gains focus** and on `r`. The previous model
   stays on screen until the new one lands (a quiet "refreshing" indicator in
@@ -183,6 +203,7 @@ struct DiffTile {
     send_picker: Option<SendPicker>,
     texts: FileTexts,                // (path, side) → full text @ file_hash (B2a)
     expansions: Expansions,          // path → per-gap revealed {top, bottom} (B2a)
+    highlights: Highlights,          // (path, side) → per-line spans @ (file_hash, theme) (B2b)
     refreshing: bool, error: Option<String>,
 }
 
@@ -316,6 +337,9 @@ are **removed** (ADR-0040).
   compose moved from a bottom-pinned panel to an inline GitHub-style box under
   the commented line (`e` edits in place of the card); cards became bordered
   boxes with status pills; the 💬 emoji was removed.
+- 2026-09-27 — B2b added (graph `kfa` node syntax-highlight, Scott: "I want
+  syntax highlighting: Rust, Typescript, MD."): whole-file per-side syntect
+  spans over the B2a text cache, TS/TSX via `two-face`. UXI-Diff-19.
 - 2026-09-27 — B2a added (graph `kfa` node context-expand, Scott: "expand the
   view of the code above and below the visible hunk"): GitHub-style
   hidden-lines rows, Enter / click / `+`, per-file text cache, comments on

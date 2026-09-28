@@ -31585,6 +31585,238 @@ fn diff_expand_rerenders_body_and_unrelated_notify_is_flat(cx: &mut TestAppConte
     assert_eq!(crate::perf_render_count("diff"), after, "an unrelated root notify must stay render-flat");
 }
 
+// ── Graph kfa node `syntax-highlight`: spec B2b, UXI-Diff-19 ──────────────
+//
+// Fixture (`diff_hl_fixture`): `feature` vs `main` changes one file each of
+// Rust, TypeScript, TSX, Markdown and an unknown extension (`.xyz`). Files
+// sort by path: README.md, app.ts, data.xyz, lib.rs, view.tsx.
+
+fn diff_hl_fixture() -> tempfile::TempDir {
+    fn git_ok(dir: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .unwrap_or_else(|e| panic!("failed to run git {args:?}: {e}"));
+        assert!(status.success(), "git {args:?} failed in {}", dir.display());
+    }
+    let temp = tempfile::tempdir().expect("tempdir");
+    let dir = temp.path();
+    git_ok(dir, &["init", "--quiet"]);
+    git_ok(dir, &["config", "user.email", "test@example.com"]);
+    git_ok(dir, &["config", "user.name", "Test"]);
+    git_ok(dir, &["config", "commit.gpgsign", "false"]);
+    let write = |name: &str, text: &str| std::fs::write(dir.join(name), text).unwrap();
+    write("lib.rs", "/* a block\n   comment */\nfn main() {\n    let x = 1;\n}\n");
+    write("app.ts", "const a = 1;\n");
+    write("view.tsx", "const b = 1;\n");
+    write("README.md", "intro\n");
+    write("data.xyz", "fn plain\n");
+    git_ok(dir, &["add", "."]);
+    git_ok(dir, &["commit", "--quiet", "-m", "initial"]);
+    git_ok(dir, &["branch", "-M", "main"]);
+    git_ok(dir, &["checkout", "--quiet", "-b", "feature"]);
+    write("lib.rs", "/* a block\n   comment */\nfn main() {\n    let x = 2;\n}\nfn added() {}\n");
+    write("app.ts", "const a = 1;\nexport function f(): number { return 2; }\n");
+    write("view.tsx", "const b = 1;\nexport const V = () => <div className=\"x\">hi</div>;\n");
+    write("README.md", "intro\n# Heading\n");
+    write("data.xyz", "fn plain\nfn more\n");
+    git_ok(dir, &["add", "."]);
+    git_ok(dir, &["commit", "--quiet", "-m", "touch every language"]);
+    temp
+}
+
+/// The row index whose diff line text is `text` (a `Line` row).
+fn diff_row_with_text(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+    id: crate::workspace::WindowId,
+    text: &str,
+) -> usize {
+    view.read_with(vcx, |v, _| {
+        let t = v.diff_tile_ref(id).expect("Diff tile");
+        let m = t.model.as_ref().expect("derived");
+        t.rows
+            .iter()
+            .position(|r| match *r {
+                crate::RowRef::Line { file, hunk, line, .. } => {
+                    matches!(m.files[file].hunks[hunk].lines.get(line),
+                        Some(crate::DiffLine::Added(s) | crate::DiffLine::Removed(s) | crate::DiffLine::Context(s)) if s == text)
+                }
+                _ => false,
+            })
+            .unwrap_or_else(|| panic!("no row with text {text:?}"))
+    })
+}
+
+/// The tile's cached spans (the render input) for `path`'s `side` line `n`.
+fn diff_cached_spans(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+    id: crate::workspace::WindowId,
+    path: &str,
+    side: crate::CommentSide,
+    n: u32,
+    text: &str,
+) -> Option<Vec<crate::HlSpan>> {
+    view.read_with(vcx, |v, _| {
+        let t = v.diff_tile_ref(id)?;
+        Some(t.highlights.spans(std::path::Path::new(path), side)?.line(n, text)?.to_vec())
+    })
+}
+
+/// Force a probed repaint of the body and return the colored ranges the
+/// text leaf of row `ix` PAINTED (`None` ⇒ painted plain).
+fn painted_runs(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+    id: crate::workspace::WindowId,
+    ix: usize,
+) -> Option<Vec<(std::ops::Range<usize>, gpui::Hsla)>> {
+    let tag = format!("diff-row-{ix}-text");
+    let texts = paint_diff_texts(view, vcx, id, std::slice::from_ref(&tag));
+    assert!(texts[0].is_some(), "row {ix} text leaf never painted");
+    crate::layout_probe_runs(&tag)
+}
+
+fn distinct_colors(spans: &[(std::ops::Range<usize>, gpui::Hsla)]) -> usize {
+    let mut seen: Vec<gpui::Hsla> = Vec::new();
+    for (_, c) in spans {
+        if !seen.contains(c) {
+            seen.push(*c);
+        }
+    }
+    seen.len()
+}
+
+fn diff_boot_hl(cx: &mut TestAppContext, wt: PathBuf) -> (gpui::Entity<YaldaGpuiView>, &mut gpui::VisualTestContext, crate::workspace::WindowId) {
+    cx.update(crate::register_keymap);
+    let (view, vcx, id) = boot_with_diff(cx, wt);
+    view.update(vcx, |v, cx| v.set_theme(crate::ThemeName::Dracula, cx));
+    vcx.run_until_parked();
+    (view, vcx, id)
+}
+
+/// UXI-Diff-19 Rust, REAL derive: after the derive + background text loads +
+/// syntect pass, the added `fn added() {}` line has ≥2 distinct span colors
+/// in the tile's cache, the `fn` keyword span is not the plain fg, and the
+/// row PAINTS a styled text leaf with exactly those colored runs. The
+/// removed `let x = 1;` line is colored from the OLD side's spans.
+///
+/// Negative control (observed RED): `diff_line_row` always painting the
+/// plain `probe_text` leaf (spans dropped at render) ⇒ `painted_runs` None.
+#[gpui::test]
+fn diff_hl_rust_keyword_line_paints_colored_runs(cx: &mut TestAppContext) {
+    let temp = diff_hl_fixture();
+    let (view, vcx, id) = diff_boot_hl(cx, temp.path().to_path_buf());
+    let fg = view.read_with(vcx, |v, _| v.editor_fg());
+
+    let ix = diff_row_with_text(&view, vcx, id, "fn added() {}");
+    let spans = diff_cached_spans(&view, vcx, id, "lib.rs", crate::CommentSide::New, 6, "fn added() {}")
+        .expect("lib.rs new-side spans cached");
+    assert!(distinct_colors(&spans) >= 2, "≥2 distinct token colors: {spans:?}");
+    let kw = spans.iter().find(|(r, _)| *r == (0..2)).expect("a span covering `fn`").1;
+    assert_ne!(kw, fg, "keyword color must differ from the plain fg");
+
+    let painted = painted_runs(&view, vcx, id, ix).expect("row paints a styled (colored) text leaf");
+    assert_eq!(painted, spans, "the painted runs ARE the cached spans");
+
+    let rix = diff_row_with_text(&view, vcx, id, "    let x = 1;");
+    let old = diff_cached_spans(&view, vcx, id, "lib.rs", crate::CommentSide::Old, 4, "    let x = 1;")
+        .expect("old-side spans (removed line)");
+    assert!(old.iter().any(|(r, _)| *r == (4..7)), "`let` keyword span on the old side: {old:?}");
+    assert_eq!(painted_runs(&view, vcx, id, rix), Some(old), "removed line painted from OLD spans");
+}
+
+/// UXI-Diff-19 TypeScript / TSX / Markdown / unknown: `.ts` and `.tsx`
+/// resolve (two-face) and their added lines are highlighted; the Markdown
+/// heading line is highlighted; the `.xyz` file stays plain (no cache
+/// entry, painted with the plain leaf).
+#[gpui::test]
+fn diff_hl_ts_tsx_md_highlight_and_unknown_stays_plain(cx: &mut TestAppContext) {
+    let temp = diff_hl_fixture();
+    let (view, vcx, id) = diff_boot_hl(cx, temp.path().to_path_buf());
+    for (path, n, text) in [
+        ("app.ts", 2, "export function f(): number { return 2; }"),
+        ("view.tsx", 2, "export const V = () => <div className=\"x\">hi</div>;"),
+        ("README.md", 2, "# Heading"),
+    ] {
+        let spans = diff_cached_spans(&view, vcx, id, path, crate::CommentSide::New, n, text)
+            .unwrap_or_else(|| panic!("{path}: spans cached"));
+        assert!(!spans.is_empty(), "{path}: line {n} has colored tokens");
+        let ix = diff_row_with_text(&view, vcx, id, text);
+        assert_eq!(painted_runs(&view, vcx, id, ix), Some(spans), "{path}: painted colored");
+    }
+    assert!(
+        diff_cached_spans(&view, vcx, id, "data.xyz", crate::CommentSide::New, 2, "fn more").is_none(),
+        "unknown extension ⇒ no spans"
+    );
+    let ix = diff_row_with_text(&view, vcx, id, "fn more");
+    assert_eq!(painted_runs(&view, vcx, id, ix), None, "unknown extension paints the plain leaf");
+}
+
+/// UXI-Diff-19 theme: switching Dracula → Folio through the real
+/// `set_theme` re-highlights — the painted `fn` keyword color becomes
+/// Folio's wine.
+///
+/// Negative control (observed RED): the Diff re-highlight walk removed from
+/// `set_theme` ⇒ the spans stay keyed on the old theme and the row paints
+/// plain / the old color.
+#[gpui::test]
+fn diff_hl_theme_switch_rehighlights(cx: &mut TestAppContext) {
+    let temp = diff_hl_fixture();
+    let (view, vcx, id) = diff_boot_hl(cx, temp.path().to_path_buf());
+    let ix = diff_row_with_text(&view, vcx, id, "fn added() {}");
+    let kw = |runs: &[(std::ops::Range<usize>, gpui::Hsla)]| runs.iter().find(|(r, _)| *r == (0..2)).map(|(_, c)| *c);
+    let dark = kw(&painted_runs(&view, vcx, id, ix).expect("dark: colored")).expect("dark: fn span");
+    view.update(vcx, |v, cx| v.set_theme(crate::ThemeName::Folio, cx));
+    vcx.run_until_parked();
+    let folio = painted_runs(&view, vcx, id, ix).expect("folio: colored after the theme switch");
+    let wine = crate::nc(yalda::style::Color::Rgb(0x9d, 0x2b, 0x4e));
+    assert_eq!(kw(&folio), Some(wine), "Folio keyword = wine");
+    assert_ne!(dark, wine, "the theme switch changed the keyword color");
+}
+
+/// yux rule 2 / 5: a highlight pass LANDING busts the cached body
+/// (`DiffSeqs::hl_gen`), and an unrelated root notify stays render-flat.
+///
+/// Negative control (observed RED): `hl_gen` dropped from `DiffSeqs::of`
+/// ⇒ the landing leaves the render count at 0.
+#[gpui::test]
+fn diff_hl_landing_rerenders_body_and_unrelated_notify_is_flat(cx: &mut TestAppContext) {
+    let temp = diff_hl_fixture();
+    let (view, vcx, id) = diff_boot_hl(cx, temp.path().to_path_buf());
+    // Drop the landed spans WITHOUT a seq bump, then re-run the real ensure:
+    // only the landing's `hl_gen` bump can repaint.
+    view.update(vcx, |v, _| {
+        let t = v.diff_tile_mut(id).unwrap();
+        let theme = t.highlights.theme();
+        t.highlights = crate::Highlights::default();
+        t.highlights.set_theme(theme);
+        let m = t.model.clone().unwrap();
+        t.highlights.invalidate(&m);
+    });
+    vcx.run_until_parked();
+    crate::perf_reset("diff");
+    view.update(vcx, |v, cx| v.diff_ensure_highlights(id, cx));
+    vcx.run_until_parked();
+    let after = crate::perf_render_count("diff");
+    assert!(after >= 1, "a highlight landing must re-render the cached body");
+    assert!(
+        diff_cached_spans(&view, vcx, id, "lib.rs", crate::CommentSide::New, 6, "fn added() {}").is_some(),
+        "spans re-landed"
+    );
+    for _ in 0..5 {
+        view.update(vcx, |v, cx| {
+            v.transient_status = Some("unrelated".into());
+            cx.notify();
+        });
+        vcx.run_until_parked();
+    }
+    assert_eq!(crate::perf_render_count("diff"), after, "an unrelated root notify must stay render-flat");
+}
+
 // ── Cog graph 8g7 node `send-picker`: spec B6, UXI-Diff-16 ────────────────
 //
 // Sessions are FREE sessions in the store (the focused tile is the Diff tile,
