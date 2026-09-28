@@ -98,6 +98,7 @@ mod keymap_view;
 mod linear;
 mod linear_ui;
 mod linear_view;
+mod md_image;
 mod persist;
 mod project;
 mod render_blocks;
@@ -138,6 +139,7 @@ pub(crate) use keymap_tile::*;
 pub(crate) use keymap_view::*;
 pub(crate) use linear::*;
 pub(crate) use linear_view::*;
+pub(crate) use md_image::*;
 pub(crate) use persist::*;
 pub(crate) use project::*;
 pub(crate) use render_blocks::*;
@@ -10349,7 +10351,11 @@ fn main() {
         }
     };
 
-    Application::new().run(move |app: &mut GpuiApp| {
+    // Markdown `http(s)` images load through gpui's HTTP client (default: a
+    // null client that fails every request).
+    Application::new()
+        .with_http_client(std::sync::Arc::new(UreqImageClient))
+        .run(move |app: &mut GpuiApp| {
         install_yaldabaoth_app_icon();
         register_keymap(app);
         // Deserialize the (extended, TypeScript-bearing) syntect syntax set

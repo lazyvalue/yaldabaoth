@@ -138,3 +138,19 @@ versa. Primary code home: `screens.rs::render_doc` / `render_edit` /
   the `EditState` (`doc_return`, keyed on `edit_seq` + caret) and restored
   verbatim; any edit or caret move falls back to UXI-Buffer-9's mapping. Status:
   implemented. Guard: `md_harness.rs` `doc_edit_doc_round_trip_keeps_place`.
+- **`UXI-Buffer-11` (the Doc view renders GFM constructs, not their source
+  residue).** In `Viewing` (and wherever `block_inner` renders markdown, e.g. the
+  agent transcript): a task item (`- [ ]` / `- [x]`) shows a checkbox in place of
+  its bullet (done items dimmed; in the Doc view the box is addressable as
+  `md-task-<block>.<item…>` for a later click-to-toggle); an image alone in its
+  paragraph paints the picture — relative paths from the document's directory,
+  `http(s)` via the app HTTP client — never wider than the column, aspect kept,
+  alt text while loading or on failure (an image inside prose is its alt text as
+  a link); a hard break (two trailing spaces / `\`) starts a new line within the
+  paragraph; table columns honor `:--` / `:-:` / `--:`; `[^n]` footnote
+  references paint as link-styled superscript markers and their definitions as a
+  de-emphasized block. Status: implemented (graph 4f1 `render-fixes`). Guards:
+  `md_harness.rs` `task_list_items_paint_checkboxes`,
+  `images_paint_fitted_to_the_column`, `hard_breaks_paint_separate_lines`,
+  `table_columns_honor_alignment`, `footnote_definitions_paint_as_blocks`;
+  `render.rs` `render_fixes_tests::*`.

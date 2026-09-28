@@ -400,3 +400,202 @@ fn doc_edit_doc_round_trip_keeps_place(cx: &mut TestAppContext) {
     assert_eq!((after.0, after.1), (before.0, before.1), "same cursor block + top block");
     assert_painted_inside(probe(&view, vcx, "doc-block-40"), after.2, "cursor block 40");
 }
+
+// ---------------------------------------------------------------------------
+// render-fixes (graph 4f1): GFM constructs painted in the Doc view.
+// ---------------------------------------------------------------------------
+
+/// Force `n` frames (the real render + paint path).
+fn frames_n(view: &Entity<YaldaGpuiView>, vcx: &mut VisualTestContext, n: usize) {
+    for _ in 0..n {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+}
+
+/// Boot a Doc with the layout probe recording from the first frame.
+fn boot_probed<'a>(
+    cx: &'a mut TestAppContext,
+    tag: &str,
+    markdown: &str,
+) -> (Entity<YaldaGpuiView>, &'a mut VisualTestContext, PathBuf) {
+    crate::layout_probe_begin();
+    let (view, vcx, file) = boot_doc(cx, tag, markdown);
+    frames_n(&view, vcx, 1);
+    (view, vcx, file)
+}
+
+fn probe_get(tag: &str) -> Option<(f32, f32, f32, f32)> {
+    crate::layout_probe_get(tag)
+}
+
+/// A solid-color RGB PNG of `w`×`h` (stored-deflate zlib, no compressor dep).
+fn png(w: u32, h: u32) -> Vec<u8> {
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut c = 0xffff_ffffu32;
+        for &b in bytes {
+            c ^= b as u32;
+            for _ in 0..8 {
+                c = if c & 1 != 0 { 0xedb8_8320 ^ (c >> 1) } else { c >> 1 };
+            }
+        }
+        !c
+    }
+    fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        out.extend((data.len() as u32).to_be_bytes());
+        let mut body = kind.to_vec();
+        body.extend_from_slice(data);
+        out.extend_from_slice(&body);
+        out.extend(crc32(&body).to_be_bytes());
+    }
+    let mut raw = Vec::new();
+    for _ in 0..h {
+        raw.push(0u8); // filter: none
+        for _ in 0..w {
+            raw.extend_from_slice(&[0x20, 0x80, 0xc0]);
+        }
+    }
+    let mut z = vec![0x78, 0x01];
+    let blocks: Vec<&[u8]> = raw.chunks(65_535).collect();
+    for (i, b) in blocks.iter().enumerate() {
+        z.push(u8::from(i + 1 == blocks.len()));
+        let len = b.len() as u16;
+        z.extend(len.to_le_bytes());
+        z.extend((!len).to_le_bytes());
+        z.extend_from_slice(b);
+    }
+    let (mut a, mut b) = (1u32, 0u32);
+    for &x in &raw {
+        a = (a + x as u32) % 65_521;
+        b = (b + a) % 65_521;
+    }
+    z.extend(((b << 16) | a).to_be_bytes());
+    let mut ihdr = Vec::new();
+    ihdr.extend(w.to_be_bytes());
+    ihdr.extend(h.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+    chunk(&mut out, b"IHDR", &ihdr);
+    chunk(&mut out, b"IDAT", &z);
+    chunk(&mut out, b"IEND", &[]);
+    out
+}
+
+/// Task items paint a checkbox (addressable as `md-task-<block>.<item…>`)
+/// instead of a bullet; plain items don't. Negative control: in
+/// `list_item_element`, prefer `item.marker` over `item.checked` (the old
+/// order) → no checkbox paints.
+#[gpui::test]
+fn task_list_items_paint_checkboxes(cx: &mut TestAppContext) {
+    let md = "- [ ] todo\n- [x] done\n- plain\n\n* [ ] parent\n  * [x] child\n";
+    let (_view, _vcx, _file) = boot_probed(cx, "tasks", md);
+    for tag in ["md-task-0.0", "md-task-0.1", "md-task-1.0", "md-task-1.0.1.0"] {
+        let (_, _, w, h) = probe_get(tag).unwrap_or_else(|| panic!("{tag} checkbox painted"));
+        assert!(w > 0.0 && h > 0.0, "{tag} has area: {w}x{h}");
+    }
+    assert!(probe_get("md-task-0.2").is_none(), "a plain item has no checkbox");
+    // The box sits left of the item text, inside the block's column.
+    let (bx, _, bw, _) = probe_get("md-task-0.0").unwrap();
+    let (cx0, _, cw, _) = probe_get("doc-block-inner-0").expect("block column");
+    assert!(bx >= cx0 && bx + bw < cx0 + cw);
+    crate::layout_probe_end();
+}
+
+/// An image alone in its paragraph paints the picture: a wide one fitted to
+/// the column with its aspect kept, a small one at its own size; a missing
+/// file falls back to the alt text. Negative control: drop the lone-image
+/// lift in `render.rs`'s `Paragraph` arm → no image paints.
+#[gpui::test]
+fn images_paint_fitted_to_the_column(cx: &mut TestAppContext) {
+    let dir = temp_dir("images");
+    std::fs::create_dir_all(dir.join("img")).unwrap();
+    std::fs::write(dir.join("img/wide.png"), png(3000, 300)).unwrap();
+    std::fs::write(dir.join("small.png"), png(40, 20)).unwrap();
+    let md = "![wide](img/wide.png)\n\n![small](small.png)\n\n![gone](missing.png)\n";
+    let (view, vcx, _file) = boot_probed(cx, "images", md);
+    // Decoding is off-thread; the loader re-notifies. Pump until it lands.
+    for _ in 0..20 {
+        if probe_get("md-image-0").is_some() && probe_get("md-image-1").is_some() {
+            break;
+        }
+        frames_n(&view, vcx, 1);
+    }
+    let (_, _, col_w, _) = probe_get("doc-block-inner-0").expect("block column");
+    let (_, _, w, h) = probe_get("md-image-0").expect("wide image painted");
+    assert!(3000.0 > col_w, "non-vacuous: the image is wider than the column");
+    assert!(w <= col_w + 0.5 && w > 0.0, "fitted: {w} ≤ column {col_w}");
+    assert!((h - w / 10.0).abs() < 1.0, "aspect kept: {w}x{h}");
+    let (_, _, _, box_h) = probe_get("md-image-0-box").expect("image box");
+    assert!((box_h - h).abs() < 1.0, "the laid-out box is the fitted height: {box_h} vs {h}");
+    let (_, _, sw, sh) = probe_get("md-image-1").expect("small image painted");
+    assert_eq!((sw, sh), (40.0, 20.0), "never upscaled");
+    assert!(probe_get("md-image-alt-2").is_some(), "missing file shows its alt text");
+    assert!(probe_get("md-image-2").is_none());
+    crate::layout_probe_end();
+}
+
+/// A hard break (two trailing spaces / backslash) paints the next text on its
+/// own line; a soft break doesn't. Negative control: collapse `HardBreak` to
+/// a space in `collect_inline` → one painted line.
+#[gpui::test]
+fn hard_breaks_paint_separate_lines(cx: &mut TestAppContext) {
+    let md = "first  \nsecond\\\nthird\nsame line\n";
+    let (view, vcx, _file) = boot_doc(cx, "hardbreak", md);
+    let ys: Vec<Option<f32>> = view.read_with(vcx, |v, _| {
+        let layouts = v.line_layouts.borrow();
+        (0..4)
+            .map(|li| {
+                layouts
+                    .get(&(0, li))
+                    .and_then(|l| l.bounds().origin.y.into())
+                    .map(f32::from)
+            })
+            .collect()
+    });
+    assert!(ys[0].is_some() && ys[1].is_some() && ys[2].is_some(), "three lines: {ys:?}");
+    assert!(ys[3].is_none(), "the soft break stays inline: {ys:?}");
+    assert!(ys[0] < ys[1] && ys[1] < ys[2], "stacked top to bottom: {ys:?}");
+}
+
+/// Column alignment (`:--` / `:-:` / `--:`) places each cell's text. Negative
+/// control: make `table_element` ignore `alignments` (always Left) → the
+/// centered / right texts hug their columns' left edges.
+#[gpui::test]
+fn table_columns_honor_alignment(cx: &mut TestAppContext) {
+    let md = "| Left | Center | Right |\n|:--|:-:|--:|\n| a | b | c |\n";
+    let (_view, _vcx, _file) = boot_probed(cx, "tablealign", md);
+    let (x0, _, w, _) = probe_get("doc-block-inner-0").expect("block column");
+    // The table starts after the column's left padding (`pl_3`).
+    let (x0, w) = (x0 + 12.0, w - 12.0);
+    let col = w / 3.0;
+    let (ax, _, aw, _) = probe_get("md-cell-0.1.0").expect("a");
+    let (bx, _, bw, _) = probe_get("md-cell-0.1.1").expect("b");
+    let (cx_, _, cw, _) = probe_get("md-cell-0.1.2").expect("c");
+    assert!(aw < col / 2.0, "non-vacuous: cell text narrower than its column");
+    assert!(ax - x0 < 16.0, "left: hugs the left edge ({ax} vs {x0})");
+    let b_mid = bx + bw / 2.0;
+    let col_mid = x0 + col * 1.5;
+    assert!((b_mid - col_mid).abs() < 4.0, "center: {b_mid} ≈ {col_mid}");
+    assert!(x0 + w - (cx_ + cw) < 16.0, "right: hugs the right edge");
+    assert!(cx_ > x0 + 2.0 * col + col / 2.0, "right text in the right half of its column");
+    crate::layout_probe_end();
+}
+
+/// Footnote definitions paint as their own de-emphasized block; references
+/// stay inline. Negative control: drop `ENABLE_FOOTNOTES` → no footnote block.
+#[gpui::test]
+fn footnote_definitions_paint_as_blocks(cx: &mut TestAppContext) {
+    let md = "Claim[^1].\n\n[^1]: The source.\n";
+    let (view, vcx, _file) = boot_probed(cx, "footnotes", md);
+    let para = view.read_with(vcx, |v, _| match v.workspace.focused_content() {
+        Some(App::Buffer(BufferApp::Viewing(d))) => match &d.blocks[0] {
+            yalda::blocks::RenderedBlock::Paragraph { lines } => lines[0].text_content(),
+            other => panic!("paragraph first: {other:?}"),
+        },
+        _ => panic!("expected a Doc"),
+    });
+    assert_eq!(para, "Claim¹.");
+    let (_, _, w, h) = probe_get("md-footnote-1").expect("footnote block painted");
+    assert!(w > 0.0 && h > 0.0);
+    crate::layout_probe_end();
+}

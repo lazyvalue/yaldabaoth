@@ -19,6 +19,8 @@ fn options() -> Options {
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TASKLISTS);
+    // `[^1]` references + `[^1]: …` definitions → `RenderedBlock::Footnote`.
+    options.insert(Options::ENABLE_FOOTNOTES);
     // bug-0014: without these, a leading `---` … `---` frontmatter block parses as
     // CommonMark intends — thematic break, then a paragraph the CLOSING `---`
     // promotes to a setext `<h2>` — so every `.claude/agents/*.md` opened as one

@@ -132,6 +132,13 @@ pub enum RenderedBlock {
     Metadata {
         lines: Vec<StyledLine>,
     },
+    /// A footnote definition (`[^label]: text`). References to it render
+    /// inline as a link-styled marker (see `render::footnote_marker`); the
+    /// definition itself is de-emphasized — it is an aside, not body prose.
+    Footnote {
+        label: String,
+        blocks: Vec<RenderedBlock>,
+    },
 }
 
 impl StyledSpan {

@@ -1433,6 +1433,7 @@ impl TranscriptView {
                             show_heading_markers,
                             block_hits,
                             diagrams: Some(diagrams_snap.clone()),
+                            path: None,
                         };
                         let inner = block_inner(&ctx, rendered_block);
                         // UXI-ParagraphSpacing-1: base 4px plus HALF the readability

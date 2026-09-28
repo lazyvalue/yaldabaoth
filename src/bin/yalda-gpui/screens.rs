@@ -240,6 +240,8 @@ impl YaldaGpuiView {
                 // transcript code-block hit path.
                 block_hits: None,
                 diagrams: Some(diagrams.clone()),
+                // `block_element` addresses the block by its index.
+                path: None,
             };
             let el = block_element(&ctx, idx, block);
             // UXI-ParagraphSpacing-1 test seam: expose each doc block's painted

@@ -1906,6 +1906,31 @@ expression: blocks
                 marker: "•",
                 checked: None,
                 content: [
+                    Paragraph {
+                        lines: [
+                            StyledLine {
+                                spans: [
+                                    StyledSpan {
+                                        text: "Unordered item two",
+                                        style: Style {
+                                            fg: Some(
+                                                Rgb(
+                                                    204,
+                                                    204,
+                                                    204,
+                                                ),
+                                            ),
+                                            bg: None,
+                                            modifier: Modifier(
+                                                0,
+                                            ),
+                                        },
+                                        link: None,
+                                    },
+                                ],
+                            },
+                        ],
+                    },
                     List {
                         ordered: false,
                         start: None,
@@ -2918,30 +2943,9 @@ expression: blocks
             ],
         },
     },
-    Paragraph {
-        lines: [
-            StyledLine {
-                spans: [
-                    StyledSpan {
-                        text: "Yalda Logo",
-                        style: Style {
-                            fg: Some(
-                                Rgb(
-                                    204,
-                                    204,
-                                    204,
-                                ),
-                            ),
-                            bg: None,
-                            modifier: Modifier(
-                                0,
-                            ),
-                        },
-                        link: None,
-                    },
-                ],
-            },
-        ],
+    Image {
+        alt: "Yalda Logo",
+        url: "logo.png",
     },
     HorizontalRule,
     Heading {
