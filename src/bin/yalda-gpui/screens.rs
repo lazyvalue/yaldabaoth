@@ -2518,7 +2518,7 @@ impl YaldaGpuiView {
 
     /// Render a Diff tile (`App::Diff`): a slim header bar (title + key hints)
     /// over the cached scrollable body (`DiffView`). Navigation-only (spec
-    /// B9) — all keys route through `handle_diff_key`. `id` is the tile's
+    /// B8) — all keys route through `handle_diff_key`. `id` is the tile's
     /// stable `WindowId`, needed so the lazily-created `DiffView` can find its
     /// own `DiffTile` back through the root (see `diff_view.rs` module docs).
     pub(crate) fn render_diff(
@@ -2540,11 +2540,9 @@ impl YaldaGpuiView {
         let fg = self.editor_fg();
         let bg = self.editor_bg();
 
-        let hint = if tile.worktree.is_none() {
-            "space tile menu"
-        } else {
-            "j/k hunk · [ / ] file · z fold · r refresh · space tile menu"
-        };
+        // The bound body carries its own always-visible key-hint footer
+        // (`DIFF_KEY_HINTS`, diff_view.rs); the chrome bar only names the menu.
+        let hint = "space tile menu";
         let header = div()
             .flex()
             .flex_row()

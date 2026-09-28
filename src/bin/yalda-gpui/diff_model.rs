@@ -9,28 +9,13 @@
 //! `app-diff-tile`) is responsible for actually invoking `git` off the paint
 //! path and handing the raw stdout text to [`parse_diff`].
 //!
-//! ## `hunk_hash`
+//! ## `file_hash`
 //!
-//! Per spec § Data Model: "`hunk_hash` excludes `@@` positions (stable across
-//! unrelated edits) but is salted with the hunk's per-file occurrence index,
-//! so two identical hunks in one file review independently."
-//!
-//! Concretely, `hunk_hash` is computed from exactly three inputs, hashed via
-//! [`std::hash::Hash`] / [`std::collections::hash_map::DefaultHasher`]:
-//!
-//! 1. the file's repo-relative path,
-//! 2. the hunk's 0-based occurrence index within that file's `Vec<Hunk>`
-//!    (i.e. "this is the 2nd hunk in this file"), and
-//! 3. the hunk's content lines — the parsed `Vec<DiffLine>`, which hashes
-//!    both the `Context`/`Added`/`Removed` discriminant *and* the line text
-//!    (the `+`/`-`/` ` prefix is encoded via the enum variant rather than
-//!    kept literally in the string).
-//!
-//! The `@@ -a,b +c,d @@` header line itself is never fed to the hasher, so a
-//! change that only shifts line numbers (because an earlier, unrelated hunk
-//! in the same file grew or shrank) leaves the hash unchanged. Two hunks with
-//! byte-for-byte identical content lines still hash differently as long as
-//! they land at different occurrence indices in the file (input #2 differs).
+//! Each [`FileDiff`] carries a `file_hash` — its review identity (spec rev 2
+//! B4): a hash of the repo-relative path plus every hunk's content lines
+//! (kind + text), never the `@@` positions. A change that only shifts line
+//! numbers keeps it; any content change to the file's diff changes it, which
+//! is what clears Viewed. See [`compute_file_hash`].
 
 #![allow(dead_code)]
 
@@ -49,21 +34,6 @@ pub struct DiffModel {
     pub merge_base: String,
     pub dirty: bool,
     pub files: Vec<FileDiff>,
-}
-
-impl DiffModel {
-    /// Count of hunks across every file where `!reviewed` (spec B6: the
-    /// `DiffProjections` value written on every derive — `diff_apply`,
-    /// `diff_ui.rs`). Recomputed fresh from the just-joined `reviewed` flags,
-    /// so it always reflects the ReviewState join at THIS derive, not a
-    /// stale accounting.
-    pub fn unreviewed_hunk_count(&self) -> usize {
-        self.files
-            .iter()
-            .flat_map(|f| f.hunks.iter())
-            .filter(|h| !h.reviewed)
-            .count()
-    }
 }
 
 /// What happened to a file between `merge_base` and the working tree.
@@ -99,27 +69,60 @@ pub struct FileDiff {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hunk {
     /// The raw `@@ -a,b +c,d @@ ...` header line, kept verbatim for display.
-    /// Never fed into `hunk_hash` (see module docs).
+    /// Never fed into `file_hash` (see module docs).
     pub header: String,
     pub lines: Vec<DiffLine>,
-    pub hunk_hash: u64,
-    /// Always `false` out of this parser — joining with persisted
-    /// `ReviewState` is a later node's job (spec § Data Model: "joined from
-    /// ReviewState at derive time").
-    pub reviewed: bool,
 }
 
 impl Hunk {
     /// The inclusive new-file line range this hunk covers (spec B4: "the new
     /// line range"), parsed from the `+c,d` operand of the `@@ -a,b +c,d @@`
     /// header. `header` is display-only everywhere else in this module (never
-    /// fed to `hunk_hash`), but it is the ONLY place the new-file line numbers
+    /// fed to `file_hash`), but it is the ONLY place the new-file line numbers
     /// survive parsing — `DiffLine` content carries no position — so this is
     /// the one legitimate reader of it. Returns `(0, 0)` for a header that
     /// fails to parse (defensive; every hunk this parser emits has a
     /// well-formed header).
     pub fn new_line_range(&self) -> (usize, usize) {
         parse_new_line_range(&self.header).unwrap_or((0, 0))
+    }
+
+    /// The `(old_start, new_start)` line numbers from the `-a,b +c,d` header
+    /// operands — where this hunk's first old-side / new-side line sits. Line
+    /// numbering of every row (the Diff tile's gutters) counts up from here.
+    /// `(0, 0)` for an unparseable header (defensive).
+    pub fn starts(&self) -> (usize, usize) {
+        let operand = |sigil: &str| -> Option<usize> {
+            let after = self.header.split(sigil).nth(1)?;
+            after.split([',', ' ']).next()?.parse().ok()
+        };
+        (operand(" -").unwrap_or(0), operand(" +").unwrap_or(0))
+    }
+
+    /// Per content line, its `(old, new)` line numbers — `None` on the side
+    /// the line doesn't exist on (an added line has no old number, a removed
+    /// line no new number). Context lines carry both.
+    pub fn line_numbers(&self) -> Vec<(Option<usize>, Option<usize>)> {
+        let (mut o, mut n) = self.starts();
+        self.lines
+            .iter()
+            .map(|l| match l {
+                DiffLine::Context(_) => {
+                    let r = (Some(o), Some(n));
+                    o += 1;
+                    n += 1;
+                    r
+                }
+                DiffLine::Removed(_) => {
+                    o += 1;
+                    (Some(o - 1), None)
+                }
+                DiffLine::Added(_) => {
+                    n += 1;
+                    (None, Some(n - 1))
+                }
+            })
+            .collect()
     }
 
     /// Reconstruct the hunk's patch text verbatim: the header line, then each
@@ -203,21 +206,11 @@ pub fn parse_diff(
     }
 }
 
-/// Compute `hunk_hash` per the scheme documented at the top of this module.
-fn compute_hunk_hash(path: &Path, occurrence_index: usize, lines: &[DiffLine]) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    path.hash(&mut hasher);
-    occurrence_index.hash(&mut hasher);
-    lines.hash(&mut hasher);
-    hasher.finish()
-}
-
 /// Compute a file's `file_hash` (spec rev 2 B4): the repo-relative `path`
 /// plus, for each hunk in order, its content lines (`DiffLine` hashes both the
 /// Context/Added/Removed kind and the text; a slice hash is length-prefixed, so
 /// hunk boundaries are part of the identity). The `@@` header is never fed in,
-/// so a position-only shift leaves the hash unchanged — mirrors
-/// [`compute_hunk_hash`].
+/// so a position-only shift leaves the hash unchanged.
 pub fn compute_file_hash(path: &Path, hunks: &[Hunk]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     path.hash(&mut hasher);
@@ -315,7 +308,7 @@ fn parse_file_section(section: &[&str]) -> FileDiff {
         FileStatus::Modified
     };
 
-    let hunks = parse_hunks(&path, section);
+    let hunks = parse_hunks(section);
     let added = hunks
         .iter()
         .flat_map(|h| h.lines.iter())
@@ -349,12 +342,10 @@ fn parse_git_header_new_path(header_line: &str) -> Option<PathBuf> {
     Some(PathBuf::from(b_part))
 }
 
-/// Parse every `@@ ... @@` hunk in a file section, salting each hunk's hash
-/// with its 0-based occurrence index within this file.
-fn parse_hunks(path: &Path, section: &[&str]) -> Vec<Hunk> {
+/// Parse every `@@ ... @@` hunk in a file section.
+fn parse_hunks(section: &[&str]) -> Vec<Hunk> {
     let mut hunks = Vec::new();
     let mut i = 0;
-    let mut occurrence = 0usize;
     while i < section.len() {
         if !section[i].starts_with("@@") {
             i += 1;
@@ -382,14 +373,7 @@ fn parse_hunks(path: &Path, section: &[&str]) -> Vec<Hunk> {
             };
             lines.push(dl);
         }
-        let hunk_hash = compute_hunk_hash(path, occurrence, &lines);
-        hunks.push(Hunk {
-            header,
-            lines,
-            hunk_hash,
-            reviewed: false,
-        });
-        occurrence += 1;
+        hunks.push(Hunk { header, lines });
     }
     hunks
 }
@@ -559,88 +543,25 @@ index 1234567..0000000 100644
         assert_eq!(m.files[0].status, FileStatus::Deleted);
     }
 
-    /// Two hunks in the same file with byte-for-byte identical content
-    /// lines (only their `@@` position numbers differ) must still hash
-    /// DIFFERENTLY — the per-file occurrence-index salt is what distinguishes
-    /// them, since content alone would collide.
+    /// `starts` reads both header operands; `line_numbers` counts context on
+    /// both sides, removed on old only, added on new only.
     #[test]
-    fn duplicate_hunks_in_one_file_hash_differently() {
-        let raw = "\
-diff --git a/src/dup.rs b/src/dup.rs
-index 1111111..2222222 100644
---- a/src/dup.rs
-+++ b/src/dup.rs
-@@ -1,3 +1,3 @@
- fn a() {
--    old();
-+    new();
- }
-@@ -20,3 +20,3 @@
- fn a() {
--    old();
-+    new();
- }
-";
-        let m = model(raw);
-        assert_eq!(m.files.len(), 1);
-        let hunks = &m.files[0].hunks;
-        assert_eq!(hunks.len(), 2);
-        // Content lines are identical between the two hunks...
-        assert_eq!(hunks[0].lines, hunks[1].lines);
-        // ...but the occurrence-index salt must still make the hashes differ.
-        assert_ne!(hunks[0].hunk_hash, hunks[1].hunk_hash);
-    }
-
-    /// A position-only change — the `@@ -a,b +c,d @@` numbers move because an
-    /// earlier, unrelated hunk in the file grew/shrank — must NOT change the
-    /// hash of a hunk whose content lines and occurrence index are unchanged.
-    #[test]
-    fn position_only_change_keeps_hash_stable() {
-        let raw_before = "\
-diff --git a/src/pos.rs b/src/pos.rs
-index 1111111..2222222 100644
---- a/src/pos.rs
-+++ b/src/pos.rs
-@@ -5,3 +5,3 @@
- context
--old
-+new
-";
-        let raw_after = "\
-diff --git a/src/pos.rs b/src/pos.rs
-index 1111111..2222222 100644
---- a/src/pos.rs
-+++ b/src/pos.rs
-@@ -50,3 +52,3 @@
- context
--old
-+new
-";
-        let before = model(raw_before);
-        let after = model(raw_after);
-        assert_eq!(before.files[0].hunks[0].header, "@@ -5,3 +5,3 @@");
-        assert_eq!(after.files[0].hunks[0].header, "@@ -50,3 +52,3 @@");
+    fn line_numbers_count_each_side() {
+        let raw = one_file("src/n.rs", "@@ -10,3 +20,3 @@ fn x()", " a\n-b\n+c\n d\n");
+        let m = model(&raw);
+        let h = &m.files[0].hunks[0];
+        assert_eq!(h.starts(), (10, 20));
         assert_eq!(
-            before.files[0].hunks[0].hunk_hash,
-            after.files[0].hunks[0].hunk_hash
+            h.line_numbers(),
+            vec![
+                (Some(10), Some(20)),
+                (Some(11), None),
+                (None, Some(21)),
+                (Some(12), Some(22)),
+            ]
         );
-    }
-
-    /// Every hunk out of the parser starts unreviewed — joining with
-    /// persisted `ReviewState` is a later node's job (spec § Data Model).
-    #[test]
-    fn every_hunk_starts_unreviewed() {
-        let raw = "\
-diff --git a/src/foo.rs b/src/foo.rs
-index 1111111..2222222 100644
---- a/src/foo.rs
-+++ b/src/foo.rs
-@@ -1,1 +1,1 @@
--old
-+new
-";
-        let m = model(raw);
-        assert!(!m.files[0].hunks[0].reviewed);
+        let single = model(&one_file("src/n.rs", "@@ -1 +1 @@", "-x\n+y\n"));
+        assert_eq!(single.files[0].hunks[0].starts(), (1, 1));
     }
 
     /// An empty diff (nothing changed) parses to zero files and `dirty ==

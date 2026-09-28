@@ -36,9 +36,18 @@ Primary code homes:
 with line cursor. Overlays within bound: comment compose, send picker (the only
 text-input surfaces).
 
-**Keys (bound).** `j`/`k` line · `}`/`{` hunk · `]`/`[` file · `z` collapse ·
-`v` Viewed · `V` range · `c` comment · `e` edit · `x` delete · `s` send unsent ·
-`S` send all · `o` Zed · `r` refresh. Space = tile verbs, `.` = shell verbs.
+**Keys (bound).** `j`/`k` (and ↓/↑) line · `}`/`{` hunk · `]`/`[` file · `G` last
+row · `z` fold · `v` Viewed · `o` Zed · `r` refresh (implemented) · `V` range ·
+`c` comment · `e` edit · `x` delete · `s` send unsent · `S` send all (comments /
+send nodes). Space = tile verbs, `.` = shell verbs. The footer lists the live
+keys (`DIFF_KEY_HINTS`).
+
+**Row model.** The bound body is a virtualized `gpui::list` over the tile's
+cached `rows: Rc<Vec<RowRef>>` (`RowRef::{File, Hunk, Line{old,new}}`, from the
+pure `visible_rows(model, review, folds)`); the cursor is a flat index into it.
+Every row is one fixed height, so keeping the cursor in view is exact
+arithmetic (`compose_first_visible_line`), never gpui's unmeasured-row
+estimate. A viewed file folds unless `z`-expanded (`Folds`).
 
 ## References
 
@@ -73,7 +82,13 @@ click move it predictably across files, skipping collapsed content. An invalid
 worktree renders an inline error, never a panic; an empty diff renders an
 explicit "No changes" message. A key-hint footer is always visible.
 
-**Status.** `target`
+**Status.** `implemented` (graph 8g7 node file-viewed-ui). The header's unsent
+comment count arrives with UXI-Diff-15.
+
+**Enforcement.** `verify_harness.rs::{diff_tile_paints_rows_and_line_cursor_keys_move_it,
+diff_tile_click_row_moves_cursor, diff_tile_cursor_stays_painted_in_view_after_many_j,
+diff_empty_diff_paints_no_changes, diff_tile_invalid_worktree_is_inline_error_not_panic}`;
+`diff.rs::row_model_tests::*` (pure nav, folds, anchors).
 
 ### UXI-Diff-12 — Diff body is O(changed)
 
@@ -82,7 +97,12 @@ inputs change; an unrelated root notify leaves its render count flat; typing in
 the comment compose does not re-render the body. No `cx.notify()` on the render
 path.
 
-**Status.** `target`
+**Status.** `implemented` — the body is a cached child whose `DiffSeqs` covers
+`model_gen`, `rows_gen`, `cursor`, `review_gen`, refreshing/error, picker, zoom;
+rows are virtualized (O(visible)). The compose half is enforced with UXI-Diff-15.
+
+**Enforcement.** `verify_harness.rs::{diff_view_unrelated_root_notify_is_render_flat,
+diff_view_v_and_j_rerender_the_cached_body}`.
 
 ### UXI-Diff-13 — Refresh on focus and `r`; cursor survives
 
@@ -91,14 +111,14 @@ keeping the old model painted until the new one lands. The cursor stays on the
 same file (nearest line) when that file still exists. No session activity
 triggers a refresh.
 
-**Status.** `partial` — focus-gain + `r` refresh implemented (focus edge detected
-in the per-frame `diff_reconcile`, the one point every focus mutator funnels
-through); cursor survival is still hunk-grain until the line cursor lands
-(UXI-Diff-11).
+**Status.** `implemented` — focus-gain + `r` refresh (focus edge detected in the
+per-frame `diff_reconcile`); the line cursor re-resolves by `CursorAnchor`
+(same path, nearest new-side line, else old-side, else the file header; file
+gone ⇒ clamped).
 
 **Enforcement.** `verify_harness.rs::{diff_tile_rederives_on_focus_gain,
-diff_tile_refresh_preserves_focus_when_hunk_unchanged,
-diff_tile_refresh_moves_focus_to_nearest_when_hunk_hash_gone}`.
+diff_cursor_survives_refresh_on_same_file}`;
+`diff.rs::row_model_tests::anchor_survives_a_shift_and_falls_back_when_file_gone`.
 
 ### UXI-Diff-14 — Viewed is per file, persisted, and self-clearing
 
@@ -108,7 +128,13 @@ next unviewed file. Viewed is stored as `path → file_hash` in the review file,
 any change to that file's diff clears it on the next derive. Progress
 `N/M files viewed` is always accurate.
 
-**Status.** `target`
+**Status.** `implemented` (graph 8g7 node file-viewed-ui). The derive prunes
+stale entries and re-saves; a `v` during an in-flight derive wins over the
+derive's older load.
+
+**Enforcement.** `verify_harness.rs::{diff_v_marks_file_viewed_persists_folds_and_advances,
+diff_edit_clears_viewed_and_prunes_review_json, diff_checkbox_click_toggles_viewed}`;
+`diff.rs::row_model_tests::tile_toggle_viewed_advances_then_unmark_reexpands`.
 
 ### UXI-Diff-15 — Comments are saved drafts, shown inline, marked outdated
 
@@ -139,7 +165,15 @@ all worktrees of the repo; the first write adds `/.yaldabaoth/` to
 `<git-common-dir>/info/exclude`. Writes are atomic and never on the render path;
 tests never write outside a tempdir override.
 
-**Status.** `target`
+**Status.** `implemented` — every write is spawned on the background executor
+through `save_review_latest` (process-wide lock + per-tile generation, so an
+out-of-order stale snapshot never overwrites a newer one). Harness tests write
+only inside their tempdir fixture (the fixture IS the primary checkout).
+
+**Enforcement.** `review_state.rs::review_v2_tests::*` (layout, atomic write,
+exclude idempotence, override root, stale-save skip);
+`verify_harness.rs::diff_v_marks_file_viewed_persists_folds_and_advances`
+(the review file never shows up as an untracked change after a re-derive).
 
 ### UXI-Diff-8 — Open in Zed; open an unbound Diff tile
 
@@ -147,7 +181,8 @@ tests never write outside a tempdir override.
 missing `zed` surfaces a status hint, no panic. `OpenDiff` (`cmd-d` /
 `ctrl-shift-d` / File menu / `.` new tile) opens a new **unbound** Diff tile.
 
-**Status.** `implemented` (cursor-line target updates with UXI-Diff-11)
+**Status.** `implemented` — targets the cursor row (`zed_target`: a line's
+new-side number; a removed line's new-file position; a header's first new line).
 
 **Enforcement.** `verify_harness.rs::{diff_tile_o_key_missing_zed_binary_sets_status_hint_no_panic,
 diff_tile_o_key_with_no_model_is_noop_no_panic}` + the `open_diff_inner` open test.

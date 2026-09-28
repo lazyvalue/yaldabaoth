@@ -29763,75 +29763,374 @@ fn boot_with_diff<'a>(
     (view, vcx, id)
 }
 
-/// DONE_WHEN #1 (app-diff-tile, nd0e): a Diff tile bound to a tempdir git
-/// fixture derives a real diff (real `collect_raw_diff` subprocess + real
-/// `parse_diff`, off the paint path), PAINTS its file list + hunk blocks
-/// (layout probe — non-vacuous: painted bounds must be non-empty, per the
-/// anti-circling "assert PAINT, not state" rule), and `j`/`k` move the
-/// focused hunk through the REAL key-dispatch path (`register_keymap` +
-/// `simulate_keystrokes` → the real `on_key_down` → `handle_diff_key`), not a
-/// hand-called `move_hunk_focus`.
+// ── Cog graph 8g7 node `file-viewed-ui`: line cursor, Viewed, header ──────
+//
+// Fixture rows (diff_fixture_repo, `feature` vs `main`):
+//   0 File a.txt · 1 Hunk · 2 " line1" · 3 "+changed a"
+//   4 File b.txt · 5 Hunk · 6 " line1" · 7 "+changed b"
+
+fn diff_cursor(view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext, id: crate::workspace::WindowId) -> usize {
+    view.read_with(vcx, |v, _| v.diff_tile_ref(id).expect("Diff tile").cursor)
+}
+
+fn diff_rows(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+    id: crate::workspace::WindowId,
+) -> Vec<crate::RowRef> {
+    view.read_with(vcx, |v, _| v.diff_tile_ref(id).expect("Diff tile").rows.as_ref().clone())
+}
+
+/// The review JSON the tile persists to for the fixture's `feature` branch —
+/// resolved the production way (`review_path_for`), which lands INSIDE the
+/// fixture tempdir (`<fixture>/.yaldabaoth/reviews/feature.json`, spec C5).
+fn fixture_review_json(worktree: &std::path::Path) -> (PathBuf, serde_json::Value) {
+    let path = crate::review_path_for(worktree, Some("feature")).expect("fixture review path");
+    let root = worktree.canonicalize().unwrap();
+    assert!(
+        path.starts_with(&root) || path.starts_with(worktree),
+        "review file must live inside the fixture: {path:?}"
+    );
+    let v = std::fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or(serde_json::Value::Null);
+    (path, v)
+}
+
+/// A rect `inner` lies fully inside `outer` (±0.5px).
+fn rect_inside(inner: (f32, f32, f32, f32), outer: (f32, f32, f32, f32)) -> bool {
+    inner.1 >= outer.1 - 0.5 && inner.1 + inner.3 <= outer.1 + outer.3 + 0.5
+}
+
+/// UXI-Diff-11: a bound tile PAINTS its rows (file headers, hunk headers,
+/// lines) with the line cursor row painted inside the list, and the REAL
+/// keystrokes (`register_keymap` + `simulate_keystrokes` → `handle_diff_key`)
+/// move the cursor exactly as specified: `j`/`k` row, `}`/`{` hunk header,
+/// `]`/`[` file header (stopping at the ends), `z` folds the cursor's file and
+/// parks the cursor on its header, a second `z` unfolds, `G` → last row.
 #[gpui::test]
-fn diff_tile_paints_files_and_hunks_and_jk_moves_focus(cx: &mut TestAppContext) {
+fn diff_tile_paints_rows_and_line_cursor_keys_move_it(cx: &mut TestAppContext) {
     cx.update(crate::register_keymap);
     let temp = diff_fixture_repo();
-    let worktree = temp.path().to_path_buf();
-    let (view, vcx, id) = boot_with_diff(cx, worktree);
-    vcx.run_until_parked();
+    let (view, vcx, id) = boot_with_diff(cx, temp.path().to_path_buf());
 
-    let (files, hunk_count) = view.read_with(vcx, |v, _| {
-        let tile = v.diff_tile_ref(id).expect("Diff tile");
-        let model = tile.model.as_ref().expect("derive must have completed");
-        (
-            model.files.len(),
-            model.files.iter().map(|f| f.hunks.len()).sum::<usize>(),
-        )
-    });
-    assert_eq!(files, 2, "fixture touches two files");
-    assert!(
-        hunk_count >= 2,
-        "fixture must produce at least 2 hunks to move focus across, got {hunk_count}"
+    let rows = diff_rows(&view, vcx, id);
+    assert_eq!(rows.len(), 8, "fixture rows: {rows:?}");
+    assert!(rows[0].is_file() && rows[1].is_hunk() && rows[4].is_file() && rows[5].is_hunk());
+    assert_eq!(
+        rows[3],
+        crate::RowRef::Line { file: 0, hunk: 0, line: 1, old: None, new: Some(2) }
     );
+    assert_eq!(diff_cursor(&view, vcx, id), 0, "cursor starts on the first file header");
 
-    // PAINT assertion: the file list + hunk block must actually be painted,
-    // with non-empty bounds. The derive already settled (and self-notified
-    // the cached `DiffView` once) inside `boot_with_diff`/the extra settle
-    // above, both BEFORE the probe map existed — so a bare root `cx.notify()`
-    // here would be a no-op cache hit (the fingerprint hasn't moved) and the
-    // probe would miss even though the content is correctly painted.
-    // Force the cached body's OWN entity to redraw (a legitimate, explicit
-    // "please repaint" — not a state mutation) so this frame is the one
-    // that's actually probed.
-    let dv = view.read_with(vcx, |v, _| v.diff_tile_ref(id).and_then(|t| t.view.clone()));
-    crate::layout_probe_begin();
-    match dv {
-        Some(dv) => dv.update(vcx, |_, cx| cx.notify()),
-        None => view.update(vcx, |_, cx| cx.notify()),
+    let p = paint_diff_probes(
+        &view,
+        vcx,
+        id,
+        &["diff-list", "diff-cursor-row", "diff-row-0", "diff-row-3", "diff-row-7", "diff-checkbox-0"],
+    );
+    let list = p[0].expect("diff list did not paint");
+    let cur = p[1].expect("cursor row did not paint");
+    for (i, r) in p.iter().enumerate().skip(2) {
+        let r = r.unwrap_or_else(|| panic!("probe {i} did not paint"));
+        assert!(r.2 > 10.0 && r.3 > 4.0, "probe {i} painted too small: {r:?}");
     }
+    assert!(rect_inside(cur, list), "cursor row {cur:?} must paint inside the list {list:?}");
+    assert_eq!(cur.1, p[2].unwrap().1, "the cursor row IS row 0");
+
+    let steps: &[(&str, usize)] = &[
+        ("j", 1),
+        ("k", 0),
+        ("k", 0),
+        ("}", 1),
+        ("}", 5),
+        ("}", 5),
+        ("{", 1),
+        ("]", 4),
+        ("]", 4),
+        ("[", 0),
+        ("j j j", 3),
+        ("shift-g", 7),
+    ];
+    for (keys, want) in steps {
+        vcx.simulate_keystrokes(keys);
+        vcx.run_until_parked();
+        assert_eq!(diff_cursor(&view, vcx, id), *want, "after `{keys}`");
+    }
+
+    // z on a line of b.txt folds b and parks the cursor on its header.
+    vcx.simulate_keystrokes("z");
     vcx.run_until_parked();
-    let file0 = crate::layout_probe_get("diff-file-0");
-    let file1 = crate::layout_probe_get("diff-file-1");
-    let hunk00 = crate::layout_probe_get("diff-hunk-0-0");
-    crate::layout_probe_end();
+    let rows = diff_rows(&view, vcx, id);
+    assert_eq!(rows.len(), 5, "b.txt folded to its header");
+    assert_eq!(diff_cursor(&view, vcx, id), 4);
+    assert!(matches!(rows[4], crate::RowRef::File { collapsed: true, .. }));
+    let p = paint_diff_probes(&view, vcx, id, &["diff-row-4", "diff-row-5"]);
+    assert!(p[0].is_some() && p[1].is_none(), "folded rows are not painted");
+    vcx.simulate_keystrokes("z");
+    vcx.run_until_parked();
+    assert_eq!(diff_rows(&view, vcx, id).len(), 8, "second z unfolds");
+}
 
-    let (_, _, fw0, fh0) = file0.expect("file row 0 did not paint");
-    let (_, _, fw1, fh1) = file1.expect("file row 1 did not paint");
-    let (_, _, hw, hh) = hunk00.expect("hunk block 0-0 did not paint");
-    assert!(fw0 > 4.0 && fh0 > 4.0, "file row 0 has no painted area");
-    assert!(fw1 > 4.0 && fh1 > 4.0, "file row 1 has no painted area");
-    assert!(hw > 4.0 && hh > 4.0, "hunk block 0-0 has no painted area");
+/// UXI-Diff-11 click: a mouse-down on a PAINTED row moves the cursor there
+/// (the handler carries only the index, resolved at event time).
+#[gpui::test]
+fn diff_tile_click_row_moves_cursor(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let (view, vcx, id) = boot_with_diff(cx, temp.path().to_path_buf());
+    let r = paint_diff_probes(&view, vcx, id, &["diff-row-6"])[0].expect("row 6 painted");
+    let at = point(px(r.0 + r.2 / 2.0), px(r.1 + r.3 / 2.0));
+    vcx.simulate_mouse_move(at, None, gpui::Modifiers::default());
+    vcx.simulate_click(at, gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert_eq!(diff_cursor(&view, vcx, id), 6);
+}
 
-    // Real keystroke dispatch: j moves focus, k moves it back.
-    let before = view.read_with(vcx, |v, _| v.diff_tile_ref(id).unwrap().focus);
+/// UXI-Diff-11 "cursor always visible": in a diff far taller than the
+/// viewport (an untracked 400-line file), 150 real `j` presses keep the cursor
+/// row PAINTED inside the list viewport. Non-vacuous: the content is asserted
+/// taller than the viewport, and the cursor has left the first screenful.
+///
+/// Negative control (observed RED): with the `self.reveal_cursor(…)` call in
+/// `DiffView::render` commented out, the cursor row is never painted.
+#[gpui::test]
+fn diff_tile_cursor_stays_painted_in_view_after_many_j(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let long: String = (0..400).map(|i| format!("long line {i}\n")).collect();
+    std::fs::write(temp.path().join("long.txt"), long).unwrap();
+    let (view, vcx, id) = boot_with_diff(cx, temp.path().to_path_buf());
+    let n = diff_rows(&view, vcx, id).len();
+    assert!(n > 400, "long file rows present ({n})");
+
+    vcx.simulate_keystrokes(&vec!["j"; 150].join(" "));
+    vcx.run_until_parked();
+    assert_eq!(diff_cursor(&view, vcx, id), 150);
+
+    let p = paint_diff_probes(&view, vcx, id, &["diff-list", "diff-cursor-row", "diff-row-0"]);
+    let list = p[0].expect("list painted");
+    let row_h = p[1].map(|r| r.3).unwrap_or(22.0);
+    assert!(
+        n as f32 * row_h > list.3 * 2.0,
+        "non-vacuous: content ({n} rows × {row_h}) must be far taller than the viewport ({})",
+        list.3
+    );
+    assert!(150.0 * row_h > list.3, "cursor must be beyond the first screenful");
+    let cur = p[1].expect("the cursor row must be PAINTED after scrolling (it scrolled out of view)");
+    assert!(rect_inside(cur, list), "cursor row {cur:?} must be inside the viewport {list:?}");
+    assert!(p[2].is_none(), "row 0 scrolled out (the list really scrolled)");
+
+    // And back up: k past the top of the window scrolls up.
+    vcx.simulate_keystrokes(&vec!["k"; 140].join(" "));
+    vcx.run_until_parked();
+    let p = paint_diff_probes(&view, vcx, id, &["diff-list", "diff-cursor-row"]);
+    let cur = p[1].expect("cursor painted after scrolling back up");
+    assert!(rect_inside(cur, p[0].unwrap()));
+}
+
+/// UXI-Diff-14: `v` (REAL keystroke) marks the cursor's file Viewed: the
+/// review JSON on disk maps `a.txt → file_hash`; the header PAINTS
+/// "1/2 files viewed"; a.txt folds to its header (its line rows are no longer
+/// painted); the cursor jumps to the next unviewed file's header. `v` again on
+/// the (now last) unviewed file ⇒ "All files viewed ✓".
+///
+/// Negative control (observed RED): with the `Key::Char('v')` arm's
+/// `self.toggle_file_viewed(id, cx)` commented out, the JSON has no entry.
+#[gpui::test]
+fn diff_v_marks_file_viewed_persists_folds_and_advances(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let wt = temp.path().to_path_buf();
+    let (view, vcx, id) = boot_with_diff(cx, wt.clone());
+    let hash_a = view.read_with(vcx, |v, _| v.diff_tile_ref(id).unwrap().model.as_ref().unwrap().files[0].file_hash);
+    let p = paint_diff_probes(&view, vcx, id, &["diff-progress=0/2 files viewed"]);
+    assert!(p[0].is_some(), "header paints 0/2 before any mark");
+
+    vcx.simulate_keystrokes("j j v");
+    vcx.run_until_parked();
+
+    let (_, json) = fixture_review_json(&wt);
+    assert_eq!(
+        json["viewed"]["a.txt"].as_u64(),
+        Some(hash_a),
+        "the review JSON must record a.txt at its file_hash: {json}"
+    );
+    let rows = diff_rows(&view, vcx, id);
+    assert_eq!(rows.len(), 5, "a.txt folded to its header: {rows:?}");
+    assert!(matches!(rows[0], crate::RowRef::File { viewed: true, collapsed: true, .. }));
+    assert_eq!(diff_cursor(&view, vcx, id), 1, "cursor on b.txt's header (next unviewed)");
+    let p = paint_diff_probes(
+        &view,
+        vcx,
+        id,
+        &["diff-progress=1/2 files viewed", "diff-row-0", "diff-row-4", "diff-row-5"],
+    );
+    assert!(p[0].is_some(), "header must paint 1/2 files viewed");
+    assert!(p[1].is_some() && p[2].is_some() && p[3].is_none(), "a.txt's lines are gone");
+
+    vcx.simulate_keystrokes("v");
+    vcx.run_until_parked();
+    let p = paint_diff_probes(&view, vcx, id, &["diff-progress=All files viewed ✓"]);
+    assert!(p[0].is_some(), "all viewed ⇒ 'All files viewed ✓'");
+    let (_, json) = fixture_review_json(&wt);
+    assert_eq!(json["viewed"].as_object().map(|o| o.len()), Some(2));
+    // The review file never shows up in the diff (info/exclude written).
+    assert_eq!(view.read_with(vcx, |v, _| v.diff_tile_ref(id).unwrap().progress()), (2, 2));
+    vcx.simulate_keystrokes("r");
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(vcx, |v, _| v.diff_tile_ref(id).unwrap().progress()),
+        (2, 2),
+        "after a re-derive the review file must not appear as an untracked change"
+    );
+}
+
+/// UXI-Diff-14 self-clearing: after `v` on a.txt, editing a.txt on disk and
+/// pressing `r` re-derives — a.txt's `file_hash` changed, so progress drops
+/// back to 0/2 (painted) and the stale entry is PRUNED from the JSON.
+///
+/// Negative control (observed RED): with the derive's reconcile-save
+/// (`save_review_latest` in `refresh_diff`) commented out, the JSON keeps the
+/// stale `a.txt` entry.
+#[gpui::test]
+fn diff_edit_clears_viewed_and_prunes_review_json(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let wt = temp.path().to_path_buf();
+    let (view, vcx, id) = boot_with_diff(cx, wt.clone());
+    vcx.simulate_keystrokes("v");
+    vcx.run_until_parked();
+    let (_, json) = fixture_review_json(&wt);
+    assert!(json["viewed"]["a.txt"].is_u64(), "setup: a.txt viewed on disk");
+
+    std::fs::write(wt.join("a.txt"), "line1\nchanged a differently\n").unwrap();
+    vcx.simulate_keystrokes("r");
+    vcx.run_until_parked();
+
+    assert_eq!(view.read_with(vcx, |v, _| v.diff_tile_ref(id).unwrap().progress()), (0, 2));
+    let p = paint_diff_probes(&view, vcx, id, &["diff-progress=0/2 files viewed"]);
+    assert!(p[0].is_some(), "header must paint 0/2 after the edit");
+    assert_eq!(diff_rows(&view, vcx, id).len(), 8, "a.txt re-expanded (no longer viewed)");
+    let (_, json) = fixture_review_json(&wt);
+    assert!(
+        json["viewed"].as_object().is_some_and(|o| o.is_empty()),
+        "the stale viewed entry must be pruned from disk: {json}"
+    );
+}
+
+/// UXI-Diff-14 checkbox: a real click on b.txt's PAINTED checkbox marks it
+/// viewed (JSON + progress) and the cursor advances to the next unviewed file
+/// (a.txt, wrapping) — the row's own click handler must NOT also fire (it
+/// would pull the cursor back to b.txt). A second click unmarks.
+///
+/// Negative control (observed RED): with the checkbox's `.on_mouse_down(…)`
+/// removed in `diff_file_row`, the click marks nothing.
+#[gpui::test]
+fn diff_checkbox_click_toggles_viewed(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let wt = temp.path().to_path_buf();
+    let (view, vcx, id) = boot_with_diff(cx, wt.clone());
+    let click = |vcx: &mut gpui::VisualTestContext, r: (f32, f32, f32, f32)| {
+        let at = point(px(r.0 + r.2 / 2.0), px(r.1 + r.3 / 2.0));
+        vcx.simulate_mouse_move(at, None, gpui::Modifiers::default());
+        vcx.simulate_click(at, gpui::Modifiers::default());
+        vcx.run_until_parked();
+    };
+    let r = paint_diff_probes(&view, vcx, id, &["diff-checkbox-1"])[0].expect("b.txt checkbox painted");
+    click(vcx, r);
+    assert_eq!(view.read_with(vcx, |v, _| v.diff_tile_ref(id).unwrap().progress()), (1, 2));
+    let (_, json) = fixture_review_json(&wt);
+    assert!(json["viewed"]["b.txt"].is_u64(), "b.txt viewed on disk: {json}");
+    assert_eq!(diff_cursor(&view, vcx, id), 0, "cursor advanced (wrapped) to a.txt's header");
+
+    let r = paint_diff_probes(&view, vcx, id, &["diff-checkbox-1"])[0].expect("checkbox still painted");
+    click(vcx, r);
+    assert_eq!(view.read_with(vcx, |v, _| v.diff_tile_ref(id).unwrap().progress()), (0, 2));
+    let (_, json) = fixture_review_json(&wt);
+    assert!(json["viewed"].as_object().is_some_and(|o| o.is_empty()));
+}
+
+/// UXI-Diff-13: the cursor survives a refresh on the same file + nearest line:
+/// on b.txt's `+changed b` (new line 2), a.txt grows by three lines (shifting
+/// every b.txt row index) and `r` re-derives — the cursor is still on b.txt's
+/// new line 2. When b.txt then vanishes from the diff, the cursor falls back
+/// into range instead of pointing past the end.
+#[gpui::test]
+fn diff_cursor_survives_refresh_on_same_file(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let wt = temp.path().to_path_buf();
+    let (view, vcx, id) = boot_with_diff(cx, wt.clone());
+    vcx.simulate_keystrokes("shift-g");
+    vcx.run_until_parked();
+    assert_eq!(diff_cursor(&view, vcx, id), 7);
+    let gen0 = view.read_with(vcx, |v, _| v.diff_tile_ref(id).unwrap().model_gen);
+
+    std::fs::write(wt.join("a.txt"), "line1\nchanged a\nx\ny\nz\n").unwrap();
+    vcx.simulate_keystrokes("r");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        let t = v.diff_tile_ref(id).unwrap();
+        assert!(t.model_gen > gen0, "re-derived");
+        assert_eq!(t.cursor, 10, "b.txt's rows shifted by 3");
+        let a = t.cursor_anchor().expect("anchor");
+        assert!(a.path.ends_with("b.txt"));
+        assert_eq!(a.kind, crate::AnchorKind::Line { old: None, new: Some(2) });
+    });
+
+    std::fs::write(wt.join("b.txt"), "line1\n").unwrap();
+    vcx.simulate_keystrokes("r");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        let t = v.diff_tile_ref(id).unwrap();
+        assert_eq!(t.model.as_ref().unwrap().files.len(), 1, "b.txt left the diff");
+        assert!(t.cursor < t.rows.len(), "cursor clamped into range");
+    });
+}
+
+/// UXI-Diff-11: an empty diff paints an explicit, centered sentence.
+#[gpui::test]
+fn diff_empty_diff_paints_no_changes(cx: &mut TestAppContext) {
+    let temp = diff_fixture_repo();
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(temp.path())
+        .args(["checkout", "--quiet", "main"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let (view, vcx, id) = boot_with_diff(cx, temp.path().to_path_buf());
+    view.read_with(vcx, |v, _| {
+        assert!(v.diff_tile_ref(id).unwrap().model.as_ref().unwrap().files.is_empty());
+    });
+    let p = paint_diff_probes(&view, vcx, id, &["diff-empty=No changes on main vs main.", "diff-cursor-row"]);
+    let r = p[0].expect("the No changes message must paint");
+    assert!(r.2 > 20.0 && r.3 > 4.0);
+    assert!(p[1].is_none(), "no rows, no cursor");
+}
+
+/// UXI-Diff-12 / yux rule 2: the inputs `v` and `j` change (review_gen /
+/// rows_gen / cursor) are covered by `DiffSeqs`, so each keystroke DOES
+/// re-render the cached body (the flip side of the render-flat test).
+///
+/// Negative control (observed RED): with `review_gen`/`rows_gen`/`cursor`
+/// dropped from `DiffSeqs::of`, the count stays flat.
+#[gpui::test]
+fn diff_view_v_and_j_rerender_the_cached_body(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let (_view, vcx, _id) = boot_with_diff(cx, temp.path().to_path_buf());
+    crate::perf_reset("diff");
+    vcx.simulate_keystrokes("v");
+    vcx.run_until_parked();
+    let after_v = crate::perf_render_count("diff");
+    assert!(after_v >= 1, "v must re-render the cached body");
     vcx.simulate_keystrokes("j");
     vcx.run_until_parked();
-    let after_j = view.read_with(vcx, |v, _| v.diff_tile_ref(id).unwrap().focus);
-    assert_ne!(before, after_j, "j must move the focused hunk");
-
-    vcx.simulate_keystrokes("k");
-    vcx.run_until_parked();
-    let after_k = view.read_with(vcx, |v, _| v.diff_tile_ref(id).unwrap().focus);
-    assert_eq!(after_k, before, "k must move focus back to the start");
+    assert!(crate::perf_render_count("diff") > after_v, "j must re-render the cached body");
 }
 
 /// spec B1: a deleted/invalid worktree derives to an inline error, never a
@@ -29903,292 +30202,6 @@ fn diff_view_unrelated_root_notify_is_render_flat(cx: &mut TestAppContext) {
         "a real derive completion (model_gen bump) must re-render the cached body \
          (before {after}, after {after_refresh})"
     );
-}
-
-/// spec B3 "the cursor stays on the same file after a refresh": an `r`
-/// re-derive that changes a DIFFERENT file's hunk must leave the focused
-/// hunk's identity untouched. Paired with the "must re-derive" assert on
-/// `model_gen` so it can't pass vacuously.
-#[gpui::test]
-fn diff_tile_refresh_preserves_focus_when_hunk_unchanged(cx: &mut TestAppContext) {
-    cx.update(crate::register_keymap);
-    let temp = diff_fixture_repo();
-    let worktree = temp.path().to_path_buf();
-    let (view, vcx, diff_id) = boot_with_diff(cx, worktree.clone());
-
-    let (gen0, file0_name, prev_hash) = view.read_with(vcx, |v, _| {
-        let tile = v.diff_tile_ref(diff_id).expect("Diff tile");
-        let model = tile.model.as_ref().expect("first derive settled");
-        assert_eq!(model.files.len(), 2, "fixture touches two files");
-        // Default focus is (file 0, hunk 0).
-        (
-            tile.model_gen,
-            model.files[0].path.clone(),
-            tile.focused_hunk_hash().expect("a hunk is focused"),
-        )
-    });
-    assert!(
-        file0_name.ends_with("a.txt"),
-        "fixture's file 0 must be a.txt (stable git diff ordering), got {file0_name:?}"
-    );
-
-    // Change b.txt only — a.txt (the focused file) is untouched, so its hunk
-    // hash must be identical after the re-derive.
-    std::fs::write(worktree.join("b.txt"), "line1\nchanged b\nmore\n").unwrap();
-
-    vcx.simulate_keystrokes("r");
-    vcx.run_until_parked();
-
-    view.read_with(vcx, |v, _| {
-        let tile = v.diff_tile_ref(diff_id).expect("Diff tile");
-        assert!(
-            tile.model_gen > gen0,
-            "a real re-derive must have happened (gen0={gen0}, got {})",
-            tile.model_gen
-        );
-        assert_eq!(
-            tile.focus,
-            crate::DiffFocus { file: 0, hunk: 0 },
-            "focus must stay on a.txt's hunk (file 0 unchanged in the new model)"
-        );
-        assert_eq!(
-            tile.focused_hunk_hash(),
-            Some(prev_hash),
-            "an unchanged hunk's hash (and thus focus identity) must survive a \
-             refresh"
-        );
-    });
-}
-
-/// spec B3 "nearest line" fallback: a re-derive that removes the CURRENTLY
-/// FOCUSED hunk (its content changed back to match the merge-base, so the
-/// hunk disappears from the model entirely) must move focus to the nearest
-/// surviving hunk — not panic, not point at a stale/out-of-range index.
-#[gpui::test]
-fn diff_tile_refresh_moves_focus_to_nearest_when_hunk_hash_gone(cx: &mut TestAppContext) {
-    let temp = diff_fixture_repo();
-    let worktree = temp.path().to_path_buf();
-    let (view, vcx, diff_id) = boot_with_diff(cx, worktree.clone());
-
-    // Focus b.txt's hunk (file index 1) — the one about to disappear.
-    let (gen0, prev_hash) = view.update(vcx, |v, cx| {
-        let window = v.workspace.tile_mut(diff_id).expect("Diff tile window");
-        let crate::App::Diff(tile) = &mut window.content else {
-            panic!("tile at diff_id is not a Diff tile");
-        };
-        let model = tile.model.as_ref().expect("first derive settled");
-        assert_eq!(model.files.len(), 2, "fixture touches two files");
-        assert!(
-            model.files[1].path.ends_with("b.txt"),
-            "fixture's file 1 must be b.txt, got {:?}",
-            model.files[1].path
-        );
-        tile.focus = crate::DiffFocus { file: 1, hunk: 0 };
-        let hash = tile.focused_hunk_hash().expect("b.txt hunk focused");
-        cx.notify();
-        (tile.model_gen, hash)
-    });
-
-    // Revert b.txt to the merge-base content — its hunk vanishes from the
-    // next derive entirely (not just changes hash: the file itself drops out
-    // of the diff, since it now matches merge-base exactly).
-    std::fs::write(worktree.join("b.txt"), "line1\n").unwrap();
-
-    view.update(vcx, |v, cx| v.refresh_diff(diff_id, cx));
-    vcx.run_until_parked();
-
-    view.read_with(vcx, |v, _| {
-        let tile = v.diff_tile_ref(diff_id).expect("Diff tile");
-        assert!(
-            tile.model_gen > gen0,
-            "the refresh must have re-derived (gen0={gen0}, got {})",
-            tile.model_gen
-        );
-        let model = tile.model.as_ref().expect("re-derive settled");
-        assert_eq!(model.files.len(), 1, "b.txt's hunk must have vanished entirely");
-        assert_eq!(
-            tile.focus,
-            crate::DiffFocus { file: 0, hunk: 0 },
-            "focus must fall back to the nearest surviving hunk (a.txt), not panic \
-             or stay pointed at the now-gone file index 1"
-        );
-        assert_ne!(
-            tile.focused_hunk_hash(),
-            Some(prev_hash),
-            "the old (now-gone) hunk hash must not still read as focused"
-        );
-    });
-}
-
-// ── Cog node `review-marks-ui` (fb5x): spec B5 review marks ─────────────────
-
-/// `v` on the focused Diff tile toggles that hunk's reviewed state, through
-/// the REAL keystroke path (`register_keymap` + `simulate_keystrokes` →
-/// `on_key_down` → `handle_diff_key` → `toggle_hunk_reviewed`) — not a
-/// hand-called mutation. Verifies BOTH halves of spec B5: the in-memory
-/// `DiffModel` flips (so the view reflects it this frame) AND the mark
-/// actually reaches `ReviewState` on disk in the fixture repo's OWN git
-/// common dir (the fixture is already a tempdir, so this never touches a real
-/// repo — spec C5). Toggling again removes it from disk.
-///
-/// Negative control (observed RED — see report): commenting out the
-/// `Key::Char('v') => self.toggle_hunk_reviewed(id, cx),` arm in
-/// `handle_diff_key` leaves the hunk's `reviewed` flag `false` after the
-/// keystroke — the first assertion fails for the right reason.
-#[gpui::test]
-fn diff_tile_v_toggles_hunk_reviewed_and_persists(cx: &mut TestAppContext) {
-    cx.update(crate::register_keymap);
-    let temp = diff_fixture_repo();
-    let worktree = temp.path().to_path_buf();
-    let (view, vcx, id) = boot_with_diff(cx, worktree.clone());
-
-    let (hash, branch) = view.read_with(vcx, |v, _| {
-        let tile = v.diff_tile_ref(id).expect("Diff tile");
-        let model = tile.model.as_ref().expect("derive settled");
-        assert!(
-            !model.files[0].hunks[0].reviewed,
-            "fixture hunk must start unreviewed"
-        );
-        (tile.focused_hunk_hash().expect("a hunk is focused"), model.branch.clone())
-    });
-
-    let common = crate::resolve_git_common_dir(&worktree).expect("fixture is a real git repo");
-
-    vcx.simulate_keystrokes("v");
-    vcx.run_until_parked();
-
-    view.read_with(vcx, |v, _| {
-        let tile = v.diff_tile_ref(id).expect("Diff tile");
-        let model = tile.model.as_ref().expect("model still present");
-        assert!(
-            model.files[0].hunks[0].reviewed,
-            "toggling `v` must flip the focused hunk's in-memory reviewed flag"
-        );
-    });
-    let state = crate::load_review_state(&common, &branch);
-    assert!(
-        state.is_reviewed(hash),
-        "the mark must reach ReviewState on disk in the fixture's own git common dir"
-    );
-
-    // Toggle again — must remove the mark, both in memory and on disk.
-    vcx.simulate_keystrokes("v");
-    vcx.run_until_parked();
-
-    view.read_with(vcx, |v, _| {
-        let tile = v.diff_tile_ref(id).expect("Diff tile");
-        let model = tile.model.as_ref().expect("model still present");
-        assert!(
-            !model.files[0].hunks[0].reviewed,
-            "toggling `v` a second time must flip the hunk back to unreviewed"
-        );
-    });
-    let state = crate::load_review_state(&common, &branch);
-    assert!(
-        !state.is_reviewed(hash),
-        "the second toggle must remove the mark from disk"
-    );
-}
-
-/// spec B5 staleness: "Any edit that changes a hunk's content changes its
-/// hash, so it reverts to unreviewed automatically." Marks a hunk reviewed,
-/// edits the underlying file so that hunk's content (and thus `hunk_hash`)
-/// changes, re-derives through the real `refresh_diff` path, and asserts the
-/// NEW hash reads unreviewed — no timestamp/SHA-comparison logic involved, it
-/// falls out of the join-by-hash at derive time (already exercised by
-/// `join_reviewed_flags`/`review_state.rs`'s own unit tests; this is the
-/// end-to-end path through a live `DiffTile`).
-#[gpui::test]
-fn diff_tile_content_edit_reverts_hunk_to_unreviewed(cx: &mut TestAppContext) {
-    cx.update(crate::register_keymap);
-    let temp = diff_fixture_repo();
-    let worktree = temp.path().to_path_buf();
-    let (view, vcx, id) = boot_with_diff(cx, worktree.clone());
-
-    // Mark a.txt's (file 0) sole hunk reviewed via the real keystroke path.
-    view.update(vcx, |v, cx| {
-        if let Some(tile) = v.workspace.tile_mut(id) {
-            let crate::App::Diff(t) = &mut tile.content else {
-                panic!("not a Diff tile");
-            };
-            t.focus = crate::DiffFocus { file: 0, hunk: 0 };
-        }
-        cx.notify();
-    });
-    vcx.simulate_keystrokes("v");
-    vcx.run_until_parked();
-
-    let old_hash = view.read_with(vcx, |v, _| {
-        let tile = v.diff_tile_ref(id).expect("Diff tile");
-        assert!(
-            tile.model.as_ref().unwrap().files[0].hunks[0].reviewed,
-            "setup: hunk must be reviewed before the edit"
-        );
-        tile.model.as_ref().unwrap().files[0].hunks[0].hunk_hash
-    });
-
-    // Change a.txt's content — its hunk's hash must change.
-    std::fs::write(worktree.join("a.txt"), "line1\nchanged a differently\nextra\n").unwrap();
-
-    view.update(vcx, |v, cx| v.refresh_diff(id, cx));
-    vcx.run_until_parked();
-
-    view.read_with(vcx, |v, _| {
-        let tile = v.diff_tile_ref(id).expect("Diff tile");
-        let model = tile.model.as_ref().expect("re-derive settled");
-        let hunk = &model.files[0].hunks[0];
-        assert_ne!(
-            hunk.hunk_hash, old_hash,
-            "editing the hunk's content must change its hash"
-        );
-        assert!(
-            !hunk.reviewed,
-            "a hunk whose content changed (new hash) must read unreviewed, \
-             even though the OLD hash was marked reviewed"
-        );
-    });
-}
-
-/// spec B5 "File-level 'mark all' exists": `shift-v` on a focused Diff tile
-/// marks EVERY hunk in the focused file reviewed, not just the focused one —
-/// through the real keystroke path (`handle_diff_key` → `mark_file_reviewed`).
-/// The fixture's two files each carry exactly one hunk, so this also proves
-/// mark-all does NOT spill into the other (unfocused) file.
-///
-/// Negative control (observed RED — see report): commenting out the
-/// `Key::Char('V') => self.mark_file_reviewed(id, cx),` arm leaves file 0's
-/// hunk unreviewed after the keystroke.
-#[gpui::test]
-fn diff_tile_shift_v_marks_whole_file_reviewed(cx: &mut TestAppContext) {
-    cx.update(crate::register_keymap);
-    let temp = diff_fixture_repo();
-    let worktree = temp.path().to_path_buf();
-    let (view, vcx, id) = boot_with_diff(cx, worktree.clone());
-
-    view.read_with(vcx, |v, _| {
-        let tile = v.diff_tile_ref(id).expect("Diff tile");
-        let model = tile.model.as_ref().expect("derive settled");
-        assert_eq!(model.files.len(), 2, "fixture touches two files");
-        assert_eq!(tile.focus, crate::DiffFocus { file: 0, hunk: 0 }, "starts focused on file 0");
-        assert!(!model.files[0].hunks[0].reviewed);
-        assert!(!model.files[1].hunks[0].reviewed);
-    });
-
-    vcx.simulate_keystrokes("shift-v");
-    vcx.run_until_parked();
-
-    view.read_with(vcx, |v, _| {
-        let tile = v.diff_tile_ref(id).expect("Diff tile");
-        let model = tile.model.as_ref().expect("model still present");
-        assert!(
-            model.files[0].hunks[0].reviewed,
-            "mark-all must mark the focused file's hunk reviewed"
-        );
-        assert!(
-            !model.files[1].hunks[0].reviewed,
-            "mark-all must NOT mark the OTHER file's hunk reviewed"
-        );
-    });
 }
 
 // ── Cog node `worktree-picker` (j73t): spec rev 2 B1/B3, UXI-Diff-9/10/13 ────
@@ -30557,7 +30570,7 @@ fn diff_tile_unbound_persists_and_restores_unbound(cx: &mut TestAppContext) {
 
 /// spec B8 DONE_WHEN #2: `o` on the focused hunk (the REAL key-dispatch path
 /// — `register_keymap` + `simulate_keystrokes`, not a hand-called
-/// `open_hunk_in_zed`) spawns `zed_bin()`, which under `cfg(test)` is always
+/// `open_in_zed`) spawns `zed_bin()`, which under `cfg(test)` is always
 /// a deliberately-bogus binary name (`diff_ui.rs::zed_bin`) — so this test
 /// exercises the missing-binary/spawn-error branch by construction, with no
 /// dependency on whether the real `zed` editor happens to be installed on
@@ -30567,7 +30580,7 @@ fn diff_tile_unbound_persists_and_restores_unbound(cx: &mut TestAppContext) {
 /// hint").
 ///
 /// Negative control (observed RED — see report): commenting out the
-/// `self.transient_status = Some(...)` assignment in `open_hunk_in_zed`
+/// `self.transient_status = Some(...)` assignment in `open_in_zed`
 /// (`diff_ui.rs`) leaves `transient_status` `None` after the same keystroke.
 #[gpui::test]
 fn diff_tile_o_key_missing_zed_binary_sets_status_hint_no_panic(cx: &mut TestAppContext) {
@@ -30603,7 +30616,7 @@ fn diff_tile_o_key_missing_zed_binary_sets_status_hint_no_panic(cx: &mut TestApp
 
 /// spec B8: `o` on a Diff tile with no derived model yet (or no hunks) is a
 /// silent no-op — no panic, no spawn attempt, no spurious status hint. Guards
-/// the `and_then` chain in `open_hunk_in_zed` against an empty/absent model.
+/// the `and_then` chain in `open_in_zed` against an empty/absent model.
 #[gpui::test]
 fn diff_tile_o_key_with_no_model_is_noop_no_panic(cx: &mut TestAppContext) {
     cx.update(crate::register_keymap);

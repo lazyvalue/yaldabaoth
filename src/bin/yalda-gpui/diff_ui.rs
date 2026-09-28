@@ -5,6 +5,8 @@
 
 use super::*;
 
+use std::rc::Rc;
+
 impl YaldaGpuiView {
     /// Open a Diff tile (Cmd-D / Ctrl-Shift-D — spec-diff-review.md B1).
     /// Mirrors `open_linear` exactly: replaces the focused tile's content
@@ -84,10 +86,9 @@ impl YaldaGpuiView {
             return;
         };
         tile.worktree = Some(worktree);
-        tile.model = None;
+        tile.clear_derived();
         tile.error = None;
         tile.needs_load = false;
-        tile.focus = DiffFocus::default();
         tile.picker = WorktreePicker::default();
         self.refresh_diff(id, cx);
         self.save_workspace_state();
@@ -102,7 +103,7 @@ impl YaldaGpuiView {
             return;
         };
         tile.worktree = None;
-        tile.model = None;
+        tile.clear_derived();
         tile.error = None;
         tile.refreshing = false;
         tile.needs_load = false;
@@ -265,60 +266,86 @@ impl YaldaGpuiView {
         }
     }
 
-    /// Re-derive the diff for the bound tile at `id`: run `collect_raw_diff`
-    /// → `parse_diff` → `resolve_git_common_dir`/`load_review_state` →
-    /// `join_reviewed_flags` entirely on the background executor (spec C2 —
-    /// no git subprocess or review I/O on the foreground thread), swapping the
-    /// result in via `diff_apply`. No-op on an unbound tile.
+    /// Re-derive the diff for the bound tile at `id` (spec B3): on the
+    /// background executor run `collect_raw_diff` → `parse_diff`, resolve the
+    /// review file (`review_path_for` shells out to git), `load_review`, and
+    /// reconcile it against the new model (`recompute_outdated` + stale-Viewed
+    /// pruning, saving when either changed) — none of it on the foreground
+    /// thread (spec C2). The result lands via [`diff_apply`](Self::diff_apply).
+    /// No-op on an unbound tile.
     pub(crate) fn refresh_diff(&mut self, id: workspace::WindowId, cx: &mut Context<Self>) {
         let Some(worktree) = self.diff_tile_ref(id).and_then(|t| t.worktree.clone()) else {
             return;
         };
 
-        let req = {
+        let (req, review_gen, saved) = {
             let Some(tile) = self.diff_tile_mut(id) else {
                 return;
             };
             tile.req = tile.req.wrapping_add(1);
             tile.refreshing = true;
             tile.needs_load = false;
-            tile.req
+            (tile.req, tile.review_gen, tile.review_saved.clone())
         };
         cx.notify();
 
         cx.spawn(async move |this, cx| {
             let wt = worktree.clone();
-            let outcome: Result<DiffModel, GitDiffError> = cx
+            let outcome: Result<DiffDerived, GitDiffError> = cx
                 .background_executor()
                 .spawn(async move {
                     let raw = collect_raw_diff(wt.clone(), None).await?;
-                    let mut model =
+                    let model =
                         parse_diff(&raw.diff_text, wt.clone(), &raw.branch, &raw.base, &raw.merge_base);
-                    if let Some(common) = resolve_git_common_dir(&wt) {
-                        let state = load_review_state(&common, &raw.branch);
-                        join_reviewed_flags(&mut model, &state);
-                    }
-                    Ok(model)
+                    let review_path = review_path_for(&wt, Some(&raw.branch));
+                    let review = review_path.as_ref().map(|path| {
+                        let mut review = load_review(path);
+                        let stale_viewed = review.viewed.len();
+                        let outdated_moved = review.recompute_outdated(&model);
+                        review.prune_viewed(&model);
+                        if outdated_moved || review.viewed.len() != stale_viewed {
+                            if let Err(e) = save_review_latest(path, &mut review, Some(&model), review_gen, &saved) {
+                                eprintln!("[yalda-gpui] review: save {} failed: {e}", path.display());
+                            }
+                        }
+                        if review.branch.is_empty() {
+                            review.branch = model.branch.clone();
+                        }
+                        review.base = model.base.clone();
+                        review.worktree = model.worktree.clone();
+                        review
+                    });
+                    Ok(DiffDerived {
+                        model,
+                        review,
+                        review_path,
+                    })
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                this.diff_apply(id, req, outcome, cx);
+                this.diff_apply(id, req, review_gen, outcome, cx);
             });
         })
         .detach();
     }
 
     /// Fold a completed derive into the tile that requested it (by stable
-    /// `WindowId`), discarding a superseded (stale) request (spec §
-    /// Interfaces). Never panics on failure (spec B1) — an error just
-    /// replaces the inline error state; the previous model (if any) is
-    /// dropped only on success, per spec B3 "the previous model stays on
-    /// screen until the new one lands".
+    /// `WindowId`), discarding a superseded (stale) request. Never panics on
+    /// failure (spec B1) — an error just replaces the inline error state; the
+    /// previous model stays on screen until a new one lands (spec B3).
+    ///
+    /// `review_gen_at_start` is the tile's `review_gen` when the derive was
+    /// kicked: if the user toggled Viewed while it ran, the loaded review is
+    /// older than the in-memory one, so the in-memory review is kept
+    /// (reconciled against the new model) and re-persisted instead.
+    ///
+    /// The cursor survives (UXI-Diff-13): same file, nearest line.
     pub(crate) fn diff_apply(
         &mut self,
         id: workspace::WindowId,
         req: u64,
-        result: Result<DiffModel, GitDiffError>,
+        review_gen_at_start: u64,
+        result: Result<DiffDerived, GitDiffError>,
         cx: &mut Context<Self>,
     ) {
         let Some(tile) = self.diff_tile_mut(id) else {
@@ -328,19 +355,108 @@ impl YaldaGpuiView {
             return;
         }
         tile.refreshing = false;
+        let mut persist = false;
         match result {
-            Ok(model) => {
-                let prev_hash = tile.focused_hunk_hash();
-                tile.model = Some(model);
+            Ok(derived) => {
+                let anchor = tile.cursor_anchor();
+                let old_cursor = tile.cursor;
+                let model = Rc::new(derived.model);
+                let edited_meanwhile = tile.review_gen != review_gen_at_start
+                    && tile.review.is_some()
+                    && tile.review_path == derived.review_path;
+                if edited_meanwhile {
+                    if let Some(r) = tile.review.as_mut() {
+                        r.recompute_outdated(&model);
+                        r.prune_viewed(&model);
+                    }
+                    persist = true;
+                } else {
+                    tile.review = derived.review;
+                    tile.review_path = derived.review_path;
+                }
+                tile.review_gen = tile.review_gen.wrapping_add(1);
+                tile.model = Some(model.clone());
                 tile.error = None;
                 tile.model_gen = tile.model_gen.wrapping_add(1);
-                tile.restore_focus_by_hash(prev_hash);
+                tile.rebuild_rows();
+                tile.cursor = anchor
+                    .map(|a| resolve_anchor(&model, &tile.rows, &a, old_cursor))
+                    .unwrap_or(0);
             }
             Err(e) => {
                 tile.error = Some(e.to_string());
             }
         }
+        if persist {
+            self.diff_persist_review(id, cx);
+        }
         cx.notify();
+    }
+
+    /// Write the tile's review on the background executor (spec C2 / UXI-Diff-17
+    /// — never on the render path; atomic tmp + rename inside `save_review`).
+    /// Serialized + generation-guarded by `save_review_latest`, so rapid
+    /// toggles can't land out of order. No-op without a resolved review path.
+    fn diff_persist_review(&mut self, id: workspace::WindowId, cx: &mut Context<Self>) {
+        let Some(tile) = self.diff_tile_ref(id) else {
+            return;
+        };
+        let (Some(path), Some(review)) = (tile.review_path.clone(), tile.review.clone()) else {
+            return;
+        };
+        let save_gen = tile.review_gen;
+        let saved = tile.review_saved.clone();
+        cx.background_executor()
+            .spawn(async move {
+                let mut review = review;
+                if let Err(e) = save_review_latest(&path, &mut review, None, save_gen, &saved) {
+                    eprintln!("[yalda-gpui] review: save {} failed: {e}", path.display());
+                }
+            })
+            .detach();
+    }
+
+    /// `v` / the checkbox (spec B4, UXI-Diff-14): toggle Viewed on the cursor's
+    /// file, fold/advance per `DiffTile::toggle_viewed_at_cursor`, persist async.
+    pub(crate) fn toggle_file_viewed(&mut self, id: workspace::WindowId, cx: &mut Context<Self>) {
+        let Some(tile) = self.diff_tile_mut(id) else {
+            return;
+        };
+        if tile.toggle_viewed_at_cursor().is_none() {
+            return;
+        }
+        self.diff_persist_review(id, cx);
+        cx.notify();
+    }
+
+    /// A click on body row `index` (spec B2): move the cursor there. The index
+    /// is resolved against the tile's CURRENT rows at event time (yux rule 4).
+    pub(crate) fn diff_click_row(&mut self, id: workspace::WindowId, index: usize, cx: &mut Context<Self>) {
+        let Some(tile) = self.diff_tile_mut(id) else {
+            return;
+        };
+        if index < tile.rows.len() {
+            tile.set_cursor(index);
+            cx.notify();
+        }
+    }
+
+    /// A click on the Viewed checkbox of file-header row `index` (spec B4):
+    /// cursor to that header, then the same toggle as `v`.
+    pub(crate) fn diff_click_checkbox(
+        &mut self,
+        id: workspace::WindowId,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tile) = self.diff_tile_mut(id) else {
+            return;
+        };
+        if !tile.rows.get(index).is_some_and(RowRef::is_file) {
+            return;
+        }
+        tile.set_cursor(index);
+        self.toggle_file_viewed(id, cx);
     }
 
     /// `r` / the tile-menu "refresh" verb (spec B3 manual refresh) for the
@@ -365,106 +481,6 @@ impl YaldaGpuiView {
             return;
         }
         self.diff_unbind(id, cx);
-    }
-
-    /// Toggle the focused hunk's reviewed state (spec B5 `v`). Flips the
-    /// in-memory `DiffModel`'s hunk immediately (so the cached `DiffView`
-    /// re-renders off the `model_gen` bump — no new `DiffSeqs` field needed,
-    /// since a mark IS a model mutation, same bump path a refresh uses) and
-    /// persists the flip to `ReviewState` on the background executor (spec
-    /// C2 — `ReviewState` I/O never runs on the render path; this is an event
-    /// handler, not render, but the actual git/file I/O still moves off the
-    /// foreground thread to match `refresh_diff`'s discipline).
-    pub(crate) fn toggle_hunk_reviewed(&mut self, id: workspace::WindowId, cx: &mut Context<Self>) {
-        let Some(hash) = self.diff_tile_ref(id).and_then(|t| t.focused_hunk_hash()) else {
-            return;
-        };
-        let target = self
-            .diff_tile_ref(id)
-            .and_then(|t| t.model.as_ref())
-            .and_then(|m| {
-                m.files
-                    .iter()
-                    .flat_map(|f| f.hunks.iter())
-                    .find(|h| h.hunk_hash == hash)
-            })
-            .map(|h| !h.reviewed);
-        let Some(mark) = target else { return };
-        self.set_hunks_reviewed(id, &[hash], mark, cx);
-    }
-
-    /// File-level "mark all" (spec B5, bound to `V`/shift-v): marks every
-    /// hunk in the focused file reviewed. Unlike the single-hunk `v` toggle,
-    /// this always marks true — a blunt "I've reviewed this whole file" act,
-    /// not a per-hunk flip (a mixed file would otherwise have no well-defined
-    /// toggle direction).
-    pub(crate) fn mark_file_reviewed(&mut self, id: workspace::WindowId, cx: &mut Context<Self>) {
-        let Some(hashes) = self.diff_tile_ref(id).and_then(|t| {
-            let model = t.model.as_ref()?;
-            let file = model.files.get(t.focus.file)?;
-            Some(file.hunks.iter().map(|h| h.hunk_hash).collect::<Vec<_>>())
-        }) else {
-            return;
-        };
-        self.set_hunks_reviewed(id, &hashes, true, cx);
-    }
-
-    /// Shared core for `toggle_hunk_reviewed` / `mark_file_reviewed`: sets
-    /// every hash in `hashes` to reviewed = `mark` in BOTH the in-memory
-    /// `DiffModel` (so the view reflects it this frame, via a `model_gen`
-    /// bump) and the persisted `ReviewState` (spec B5: "Marks persist in
-    /// `ReviewState` across restarts"). The persistence half runs on the
-    /// background executor — `resolve_git_common_dir` shells out to git, and
-    /// `save_review_state` does file I/O, both of which must stay off the
-    /// paint path (spec C2) even though this is only called from a key
-    /// handler.
-    fn set_hunks_reviewed(
-        &mut self,
-        id: workspace::WindowId,
-        hashes: &[u64],
-        mark: bool,
-        cx: &mut Context<Self>,
-    ) {
-        if hashes.is_empty() {
-            return;
-        }
-        let Some(tile) = self.diff_tile_mut(id) else {
-            return;
-        };
-        let Some(model) = &mut tile.model else {
-            return;
-        };
-        let hash_set: HashSet<u64> = hashes.iter().copied().collect();
-        for file in &mut model.files {
-            for hunk in &mut file.hunks {
-                if hash_set.contains(&hunk.hunk_hash) {
-                    hunk.reviewed = mark;
-                }
-            }
-        }
-        tile.model_gen = tile.model_gen.wrapping_add(1);
-        let worktree = model.worktree.clone();
-        let branch = model.branch.clone();
-        let model_snapshot = model.clone();
-        let hashes = hashes.to_vec();
-        cx.notify();
-
-        cx.background_executor()
-            .spawn(async move {
-                let Some(common) = resolve_git_common_dir(&worktree) else {
-                    return;
-                };
-                let mut state = load_review_state(&common, &branch);
-                for h in &hashes {
-                    if mark {
-                        state.mark_reviewed(*h);
-                    } else {
-                        state.mark_unreviewed(*h);
-                    }
-                }
-                save_review_state(&common, &branch, &mut state, &model_snapshot);
-            })
-            .detach();
     }
 
     /// Key handler for a focused Diff tile. Unbound ⇒ the worktree picker
@@ -515,78 +531,51 @@ impl YaldaGpuiView {
             }
             return;
         }
+        let nav: Option<fn(&mut DiffTile)> = match press.key {
+            Key::Char('j') | Key::Down => Some(|t| t.move_cursor(1)),
+            Key::Char('k') | Key::Up => Some(|t| t.move_cursor(-1)),
+            Key::Char('}') => Some(|t| t.jump_hunk(true)),
+            Key::Char('{') => Some(|t| t.jump_hunk(false)),
+            Key::Char(']') => Some(|t| t.jump_file(true)),
+            Key::Char('[') => Some(|t| t.jump_file(false)),
+            Key::Char('G') => Some(|t| t.cursor_to_end()),
+            Key::Char('z') => Some(|t| t.toggle_fold_at_cursor()),
+            _ => None,
+        };
+        if let Some(nav) = nav {
+            if let Some(tile) = self.diff_tile_mut(id) {
+                nav(tile);
+            }
+            cx.notify();
+            return;
+        }
         match press.key {
-            Key::Char('j') | Key::Down => {
-                if let Some(tile) = self.diff_tile_mut(id) {
-                    tile.move_hunk_focus(1);
-                }
-                cx.notify();
-            }
-            Key::Char('k') | Key::Up => {
-                if let Some(tile) = self.diff_tile_mut(id) {
-                    tile.move_hunk_focus(-1);
-                }
-                cx.notify();
-            }
-            Key::Char(']') => {
-                if let Some(tile) = self.diff_tile_mut(id) {
-                    tile.jump_file(1);
-                }
-                cx.notify();
-            }
-            Key::Char('[') => {
-                if let Some(tile) = self.diff_tile_mut(id) {
-                    tile.jump_file(-1);
-                }
-                cx.notify();
-            }
-            Key::Char('z') => {
-                let path = self.diff_tile_ref(id).and_then(|t| {
-                    let m = t.model.as_ref()?;
-                    m.files.get(t.focus.file).map(|f| f.path.clone())
-                });
-                if let Some(path) = path
-                    && let Some(tile) = self.diff_tile_mut(id)
-                {
-                    tile.toggle_collapsed(&path);
-                }
-                cx.notify();
-            }
             Key::Char('r') => self.refresh_diff(id, cx),
-            Key::Char('v') => self.toggle_hunk_reviewed(id, cx),
-            Key::Char('V') => self.mark_file_reviewed(id, cx),
-            Key::Char('o') => self.open_hunk_in_zed(id, cx),
+            Key::Char('v') => self.toggle_file_viewed(id, cx),
+            Key::Char('o') => self.open_in_zed(id, cx),
             _ => {}
         }
     }
 
     // ── Cog node `open-in-zed` (oc72): spec B8 ──────────────────────────────
 
-    /// `o` on a focused hunk (spec B8 "Open in Zed"): spawn
-    /// `zed <abs-path>:<first-new-line>`, fire-and-forget — the child is
-    /// spawned and immediately detached (no wait, no captured output), so a
-    /// slow or hung `zed` can never block the UI thread. `abs-path` is the
-    /// bound worktree joined with the focused file's repo-relative path;
-    /// `first-new-line` is the hunk's first added/new line
-    /// (`Hunk::new_line_range().0`) — the pure composition of the two lives
-    /// in `zed_open_arg` (`diff.rs`) so it's unit-tested without spawning. A
-    /// missing/failing `zed` binary surfaces a `transient_status` hint
-    /// instead of panicking (spec B8, DONE_WHEN #2); the binary name is read
-    /// through `zed_bin()` below so a test always exercises that branch
-    /// rather than depending on whether the real editor happens to be
-    /// installed on the machine running the test.
-    pub(crate) fn open_hunk_in_zed(&mut self, id: workspace::WindowId, cx: &mut Context<Self>) {
+    /// `o` (spec B7 "Open in Zed"): spawn `zed <abs-path>:<line>` for the
+    /// cursor row, fire-and-forget — the child is spawned and immediately
+    /// detached, so a slow or hung `zed` can never block the UI thread. The
+    /// line is [`zed_target`]'s (a Line row's new-side number; a hunk/file
+    /// header's first new line). A missing/failing `zed` binary surfaces a
+    /// `transient_status` hint instead of panicking; the binary name is read
+    /// through `zed_bin()` so a test always exercises that branch.
+    pub(crate) fn open_in_zed(&mut self, id: workspace::WindowId, cx: &mut Context<Self>) {
         let target = self.diff_tile_ref(id).and_then(|t| {
             let worktree = t.worktree.clone()?;
-            let model = t.model.as_ref()?;
-            let file = model.files.get(t.focus.file)?;
-            let hunk = file.hunks.get(t.focus.hunk)?;
-            Some((worktree, file.path.clone(), hunk.new_line_range().0))
+            let (rel, line) = zed_target(t.model.as_ref()?, &t.rows, t.cursor)?;
+            Some((worktree, rel, line))
         });
-        let Some((worktree, rel_path, first_new_line)) = target else {
+        let Some((worktree, rel_path, line)) = target else {
             return;
         };
-        let arg = zed_open_arg(&worktree, &rel_path, first_new_line);
+        let arg = zed_open_arg(&worktree, &rel_path, line);
         if let Err(e) = std::process::Command::new(zed_bin()).arg(&arg).spawn() {
             self.transient_status = Some(format!("couldn't open zed: {e}").into());
             cx.notify();
@@ -594,10 +583,10 @@ impl YaldaGpuiView {
     }
 }
 
-/// The `zed` binary name (spec B8). Test-only seam: under `cfg(test)` this is
+/// The `zed` binary name (spec B7). Test-only seam: under `cfg(test)` this is
 /// always a deliberately-bogus name so no test can ever launch the real
 /// editor (even one installed on the machine running the test) — every test
-/// of `open_hunk_in_zed` therefore exercises the missing-binary/error branch
+/// of `open_in_zed` therefore exercises the missing-binary/error branch
 /// by construction, no environment-dependent skip needed.
 fn zed_bin() -> &'static str {
     #[cfg(test)]

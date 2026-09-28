@@ -203,6 +203,26 @@ pub(crate) fn single_line_ellipsis(label: &str) -> gpui::Div {
         .child(SharedString::from(label.to_string()))
 }
 
+/// A one-line keyboard-hint footer (`j/k move · enter select · …`) — the
+/// "every state has visible guidance" strip at the bottom of a keyboard-first
+/// surface. Chrome: fixed 12px mono, dimmed, never wraps (ellipsis instead),
+/// so it keeps one stable row regardless of zoom or tile width.
+pub(crate) fn key_hint_footer(text: &str, st: &DetailStyle) -> gpui::Div {
+    div()
+        .flex_none()
+        .w_full()
+        .min_w_0()
+        .px(px(10.0))
+        .py(px(6.0))
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_ellipsis()
+        .text_color(st.dim)
+        .font_family(st.mono.clone())
+        .text_size(px(12.0))
+        .child(SharedString::from(text.to_string()))
+}
+
 /// A quiet but explicit status mark for dense navigation rows. This is a
 /// semantic companion to [`compact_count_indicator`]: the caller chooses the
 /// label and tint while yux owns the compact pill geometry and typography.

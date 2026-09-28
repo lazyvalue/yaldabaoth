@@ -55,6 +55,9 @@ style bundle so a caller themes once:
 - **`completion_popup(id, rows, selected, colors, mono)`** — shared compact
   completion shell + primary/secondary rows for keyboard-owned input
   suggestions. The caller owns query/filter state and key dispatch.
+- **`key_hint_footer(text, &DetailStyle)`** — the one-line dimmed keyboard-hint
+  strip (fixed 12px mono, no wrap) at the foot of a keyboard-first surface
+  (Diff picker + diff body).
 - **`note_block(author, when, body, &DetailStyle)`** — author · timestamp over a
   multiline body (comments, updates, log entries).
 - **`fmt_iso_datetime(&Option<String>)`** — ISO-8601 → `YYYY-MM-DD HH:MM`.

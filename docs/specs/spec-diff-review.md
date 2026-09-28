@@ -133,9 +133,10 @@ struct DiffTile {
     picker: WorktreePickerState,     // rows + selection (unbound only)
     model: Option<DiffModel>,        // last derived diff (kept during refresh)
     review: Option<Review>,          // loaded review for model.branch
-    cursor: DiffCursor,              // (file, row) over visible rows
-    range_anchor: Option<DiffCursor>,// V-selection start
-    collapsed: HashSet<PathBuf>,     // user collapse (viewed files collapse implicitly)
+    rows: Rc<Vec<RowRef>>,           // visible rows: File / Hunk / Line{old,new}
+    cursor: usize,                   // flat index into rows
+    range_anchor: Option<usize>,     // V-selection start
+    folds: Folds,                    // user collapse / expand (viewed ⇒ folded unless expanded)
     compose: Option<CommentCompose>, // new or editing comment
     send_picker: Option<SendPicker>,
     refreshing: bool, error: Option<String>,

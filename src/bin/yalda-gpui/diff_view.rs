@@ -8,7 +8,7 @@
 //! `TranscriptView` observes its `Entity<AgentSession>`, and `LinearView` /
 //! `CogView` own their payload directly (no observe at all — their tile
 //! holds no content). `DiffTile` is neither: per spec § Data Model, the
-//! derived `DiffModel` + focus + collapse-set are the SPEC's data model
+//! derived `DiffModel` + review + cursor + folds are the SPEC's data model
 //! fields, owned by `DiffTile` itself — a plain struct living in the
 //! workspace layout tree (not a GPUI entity, like `LinearTile`/`CogTile`).
 //! There is no separate "model entity" to observe. The only entity through
@@ -24,22 +24,34 @@
 //! `verify_harness.rs`).
 //!
 //! `render()` reads `DiffTile` fields directly off the root's `&YaldaGpuiView`
-//! borrow for the whole element-tree build (no `DiffModel` clone) — the
-//! "reads, does not own" contract.
+//! borrow (no `DiffModel` clone — the model and rows are `Rc`s) — the "reads,
+//! does not own" contract. The one piece of UI state this view OWNS is the
+//! scroll of its virtualized row list (`list`, a `ScrollAnchoredList<RowRef>`):
+//! the bound body is a `gpui::list` over the tile's cached `rows`, so a
+//! thousands-of-lines diff paints O(visible rows). Every row has the SAME
+//! fixed height, which makes "keep the cursor row in view" exact integer
+//! arithmetic (`compose_first_visible_line`) instead of trusting gpui's
+//! estimate for unmeasured rows (which counts them as 0px).
 
 use super::*;
 
 /// The slice-version watermark the observe filter compares across renders.
 /// Mirrors `TranscriptSeqs` / the `RootSnapshot` fingerprint idea, but over
-/// `DiffTile` fields read off the root. Cheap: no field here costs more than
-/// a `Copy` read (the `DiffModel` itself is never hashed — `model_gen` is the
-/// proxy for "did the derived diff change").
+/// `DiffTile` fields read off the root. Cheap: every field is a `Copy` read
+/// (the `DiffModel`/`Review` themselves are never hashed — `model_gen` /
+/// `review_gen` / `rows_gen` are their proxies). EVERY `DiffTile` field the
+/// render reads must be covered here (yux rule 2).
 #[derive(Clone, Copy, PartialEq, Default)]
 pub(crate) struct DiffSeqs {
     bound: bool,
     model_gen: u64,
-    focus: DiffFocus,
-    collapsed_gen: u64,
+    /// `DiffTile::rows_gen` — bumped on every rows rebuild (derive, `z`
+    /// fold, Viewed toggle): covers the row list, fold glyphs, viewed flags.
+    rows_gen: u64,
+    /// `DiffTile::cursor` — the cursor row's highlight + scroll-into-view.
+    cursor: usize,
+    /// `DiffTile::review_gen` — the header's `N/M files viewed` progress.
+    review_gen: u64,
     refreshing: bool,
     has_error: bool,
     /// `WorktreePicker::gen_` — bumped by every picker mutation (rows loaded,
@@ -56,8 +68,9 @@ impl DiffSeqs {
         DiffSeqs {
             bound: tile.worktree.is_some(),
             model_gen: tile.model_gen,
-            focus: tile.focus,
-            collapsed_gen: tile.collapsed_gen,
+            rows_gen: tile.rows_gen,
+            cursor: tile.cursor,
+            review_gen: tile.review_gen,
             refreshing: tile.refreshing,
             has_error: tile.error.is_some(),
             picker_gen: tile.picker.gen_,
@@ -74,7 +87,14 @@ pub(crate) struct DiffView {
     /// its own `DiffTile` back through the root (see module docs).
     window_id: workspace::WindowId,
     last_rendered: DiffSeqs,
+    /// Scroll for the non-list bodies (picker / error / loading).
     scroll: ScrollHandle,
+    /// The virtualized bound body (module docs) — this view's own UI state.
+    list: ScrollAnchoredList<RowRef>,
+    /// The `(cursor, rows_gen)` the list was last scrolled to reveal — the
+    /// reveal runs only when either moves, so a wheel-scroll isn't undone by
+    /// an unrelated re-render.
+    revealed: Option<(usize, u64)>,
     perf_label: &'static str,
 }
 
@@ -104,6 +124,8 @@ impl DiffView {
             window_id,
             last_rendered: DiffSeqs::default(),
             scroll: ScrollHandle::new(),
+            list: ScrollAnchoredList::new(gpui::ListAlignment::Top, px(DIFF_ROW_BASE_H * 20.0)),
+            revealed: None,
             perf_label: "diff",
         }
     }
@@ -111,6 +133,59 @@ impl DiffView {
     pub(crate) fn perf_label(&self) -> &'static str {
         self.perf_label
     }
+
+    /// Keep the cursor row fully inside the list viewport with minimal
+    /// scrolling. Rows are uniform (`row_h`), so the top row is exact integer
+    /// arithmetic over the last laid-out viewport height. State-only (no
+    /// notify) — safe on the render path, like the Doc view's reveal.
+    fn reveal_cursor(&mut self, cursor: usize, rows_gen: u64, row_count: usize, row_h: f32) {
+        if self.revealed == Some((cursor, rows_gen)) || row_count == 0 {
+            return;
+        }
+        self.revealed = Some((cursor, rows_gen));
+        let state = self.list.state();
+        let vh = f32::from(state.viewport_bounds().size.height);
+        if vh <= 0.0 {
+            // Never laid out yet: fall back to gpui's own reveal.
+            state.scroll_to_reveal_item(cursor);
+            return;
+        }
+        let visible = ((vh / row_h).floor() as usize).max(1);
+        let prev = state.logical_scroll_top();
+        let top = compose_first_visible_line(cursor, prev.item_ix, row_count, visible);
+        if top != prev.item_ix || (cursor == top && prev.offset_in_item != px(0.0)) {
+            state.scroll_to(gpui::ListOffset {
+                item_ix: top,
+                offset_in_item: px(0.0),
+            });
+        }
+    }
+}
+
+/// Unscaled height of one diff row (every row — file header, hunk header,
+/// line — is exactly this × `text_scale`, see module docs).
+const DIFF_ROW_BASE_H: f32 = 22.0;
+
+/// Colors/fonts/sizes the `'static` row closure needs, snapshotted once per
+/// render (all `Copy`/refcounted).
+#[derive(Clone)]
+struct DiffRowStyle {
+    fg: Hsla,
+    dim: Hsla,
+    accent: Hsla,
+    add: Hsla,
+    remove: Hsla,
+    header: Hsla,
+    add_bg: Hsla,
+    remove_bg: Hsla,
+    file_bg: Hsla,
+    cursor_bg: Hsla,
+    cursor_bar: Hsla,
+    mono: SharedString,
+    text: Pixels,
+    small: Pixels,
+    row_h: Pixels,
+    gutter_w: Pixels,
 }
 
 impl Render for DiffView {
@@ -133,7 +208,73 @@ impl Render for DiffView {
         };
         let editor_bg = r.editor_bg();
         let selected_bg: Hsla = nc(r.theme.overlay.selected_bg);
+        let at = &r.theme.agent;
+        let tint = |c: Hsla, a: f32| Hsla { a, ..c };
+        let row_style = DiffRowStyle {
+            fg: st.fg,
+            dim: st.dim,
+            accent: st.accent,
+            add: nc(at.diff_add),
+            remove: nc(at.diff_remove),
+            header: nc(at.diff_header),
+            add_bg: tint(nc(at.diff_add), 0.10),
+            remove_bg: tint(nc(at.diff_remove), 0.10),
+            file_bg: tint(selected_bg, 0.45),
+            cursor_bg: tint(selected_bg, 0.70),
+            cursor_bar: rgb(CURSOR_BAR_COLOR).into(),
+            mono: st.mono.clone(),
+            text: px(13.0 * scale),
+            small: px(11.5 * scale),
+            row_h: px((DIFF_ROW_BASE_H * scale).round()),
+            gutter_w: px((40.0 * scale).round()),
+        };
         let tile = r.diff_tile_ref(self.window_id);
+        self.last_rendered = tile.map(|t| DiffSeqs::of(t, scale)).unwrap_or_default();
+
+        // The bound, derived body: header + virtualized rows + footer.
+        if let Some(t) = tile
+            && t.worktree.is_some()
+            && t.error.is_none()
+            && let Some(model) = t.model.clone()
+        {
+            let (viewed, total) = t.progress();
+            let header = diff_header(&model, viewed, total, t.refreshing, &row_style, &st);
+            let rows = t.rows.clone();
+            let (cursor, rows_gen) = (t.cursor, t.rows_gen);
+            let body: AnyElement = if model.files.is_empty() {
+                diff_empty_body(&model, &st).into_any_element()
+            } else {
+                self.list.reconcile(&rows, rows_gen);
+                self.reveal_cursor(cursor, rows_gen, rows.len(), f32::from(row_style.row_h));
+                let render_fn = diff_row_renderer(
+                    model,
+                    rows,
+                    cursor,
+                    row_style,
+                    self.root.clone(),
+                    self.window_id,
+                );
+                probe_bounds(
+                    "diff-list",
+                    gpui::list(self.list.state().clone(), render_fn)
+                        .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
+                        .size_full()
+                        .into_any_element(),
+                )
+            };
+            return div()
+                .id("diff-body")
+                .flex()
+                .flex_col()
+                .size_full()
+                .min_h_0()
+                .bg(editor_bg)
+                .text_color(st.fg)
+                .child(header)
+                .child(div().flex_1().min_h_0().w_full().overflow_hidden().child(body))
+                .child(key_hint_footer(DIFF_KEY_HINTS, &st))
+                .into_any_element();
+        }
 
         let body: AnyElement = match tile {
             None => div().size_full().into_any_element(),
@@ -143,15 +284,11 @@ impl Render for DiffView {
                         .into_any_element()
                 } else if let Some(err) = &t.error {
                     diff_error_body(err, &st).into_any_element()
-                } else if let Some(model) = &t.model {
-                    diff_model_body(model, t.focus, &t.collapsed, &st).into_any_element()
                 } else {
                     diff_loading_body(t.refreshing, &st).into_any_element()
                 }
             }
         };
-
-        self.last_rendered = tile.map(|t| DiffSeqs::of(t, scale)).unwrap_or_default();
 
         let scroll = self.scroll.clone();
         div()
@@ -168,6 +305,19 @@ impl Render for DiffView {
             .text_color(st.fg)
             .child(body)
             .into_any_element()
+    }
+}
+
+/// The bound body's always-visible key hints (spec C6 idiot-proof).
+pub(crate) const DIFF_KEY_HINTS: &str =
+    "j/k line · {/} hunk · [/] file · v viewed · z fold · r refresh · o zed · space menu";
+
+/// The header progress label (spec B2/B4).
+pub(crate) fn diff_progress_label(viewed: usize, total: usize) -> String {
+    if total > 0 && viewed == total {
+        "All files viewed ✓".to_string()
+    } else {
+        format!("{viewed}/{total} files viewed")
     }
 }
 
@@ -316,199 +466,381 @@ fn diff_picker_body(
     .on_mouse_down(MouseButton::Left, root_listener(folder));
     col = col.child(probe_bounds("diff-picker-folder-row", folder_row.into_any_element()));
 
-    col.child(
-        div()
-            .pt_3()
-            .px(px(10.0))
-            .text_color(st.dim)
-            .font_family(st.mono.clone())
-            .text_size(px(12.0))
-            .child(SharedString::from("j/k move · enter review · p pick folder")),
-    )
+    col.child(div().pt_2().child(key_hint_footer("j/k move · enter review · p pick folder", st)))
 }
 
-/// First 8 hex chars of a SHA (ASCII, safe to byte-slice).
-fn short_sha(s: &str) -> &str {
-    &s[..s.len().min(8)]
-}
-
-fn diff_model_body(
+/// The bound header (spec B2): branch (bold) · `vs <base>` dimmed · a quiet
+/// `refreshing…` while a derive is in flight · `N/M files viewed` (or "All
+/// files viewed ✓" in the success color) · a slim progress bar. Chrome — fixed
+/// sizes, doesn't zoom.
+fn diff_header(
     model: &DiffModel,
-    focus: DiffFocus,
-    collapsed: &HashSet<PathBuf>,
+    viewed: usize,
+    total: usize,
+    refreshing: bool,
+    rs: &DiffRowStyle,
     st: &DetailStyle,
 ) -> gpui::Div {
-    let green: Hsla = rgb(0x4caf50).into();
-    let red: Hsla = rgb(0xe57373).into();
-
-    let mut col = div().flex().flex_col().w_full().gap_3();
-    col = col.child(
-        div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .pb_2()
-            .child(
-                div()
-                    .text_color(st.fg)
-                    .font_family(st.prose.clone())
-                    .font_weight(FontWeight::BOLD)
-                    .text_size(px(st.pt * 1.2))
-                    .child(SharedString::from(format!("{} → working tree", model.base))),
-            )
-            .child(
-                div()
-                    .text_color(st.dim)
-                    .font_family(st.mono.clone())
-                    .text_size(px(st.pt * 0.85))
-                    .child(SharedString::from(format!(
-                        "branch {} · merge-base {} · {} file(s){}",
-                        model.branch,
-                        short_sha(&model.merge_base),
-                        model.files.len(),
-                        if model.dirty { " · dirty" } else { "" }
-                    ))),
-            ),
-    );
-
-    if model.files.is_empty() {
-        return col.child(
+    let label = diff_progress_label(viewed, total);
+    let done = total > 0 && viewed == total;
+    let frac = if total == 0 { 0.0 } else { viewed as f32 / total as f32 };
+    let mut track = rs.dim;
+    track.a *= 0.25;
+    let mut hairline = rs.dim;
+    hairline.a *= 0.35;
+    let mut top = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .w_full()
+        .child(
             div()
-                .text_color(st.dim)
+                .flex_none()
+                .font_family(st.prose.clone())
+                .font_weight(FontWeight::BOLD)
+                .text_size(px(15.0))
+                .text_color(st.fg)
+                .child(SharedString::from(model.branch.clone())),
+        )
+        .child(
+            div()
+                .flex_none()
                 .font_family(st.mono.clone())
-                .text_size(st.base)
-                .child(SharedString::from("No changes.")),
-        );
+                .text_size(px(12.0))
+                .text_color(st.dim)
+                .child(SharedString::from(format!("vs {}", model.base))),
+        )
+        .child(div().flex_1());
+    if refreshing {
+        top = top.child(probe_bounds(
+            "diff-refreshing",
+            div()
+                .flex_none()
+                .font_family(st.mono.clone())
+                .text_size(px(12.0))
+                .text_color(st.dim)
+                .child(SharedString::from("refreshing…"))
+                .into_any_element(),
+        ));
     }
+    top = top.child(probe_bounds_dyn(
+        format!("diff-progress={label}"),
+        div()
+            .flex_none()
+            .font_family(st.mono.clone())
+            .text_size(px(12.0))
+            .text_color(if done { rs.add } else { st.fg })
+            .child(SharedString::from(label))
+            .into_any_element(),
+    ));
+    div()
+        .flex_none()
+        .flex()
+        .flex_col()
+        .gap(px(7.0))
+        .w_full()
+        .px_4()
+        .pt_3()
+        .pb(px(10.0))
+        .border_b_1()
+        .border_color(hairline)
+        .child(top)
+        .child(
+            div()
+                .w_full()
+                .h(px(3.0))
+                .rounded(px(2.0))
+                .bg(track)
+                .child(
+                    div()
+                        .h_full()
+                        .w(gpui::relative(frac))
+                        .rounded(px(2.0))
+                        .bg(if done { rs.add } else { rs.accent }),
+                ),
+        )
+}
 
-    for (fi, file) in model.files.iter().enumerate() {
-        let is_collapsed = collapsed.contains(&file.path);
-        let status_tag = match &file.status {
-            FileStatus::Modified => "M".to_string(),
-            FileStatus::Added => "A".to_string(),
-            FileStatus::Deleted => "D".to_string(),
-            FileStatus::Renamed { from } => format!("R {} →", from.display()),
+/// Empty diff (spec B2): a centered, explicit sentence — never a blank pane.
+fn diff_empty_body(model: &DiffModel, st: &DetailStyle) -> gpui::Div {
+    let text = format!("No changes on {} vs {}.", model.branch, model.base);
+    div().size_full().flex().items_center().justify_center().child(probe_bounds_dyn(
+        format!("diff-empty={text}"),
+        div()
+            .text_color(st.dim)
+            .font_family(st.prose.clone())
+            .text_size(st.base)
+            .child(SharedString::from(text))
+            .into_any_element(),
+    ))
+}
+
+/// The virtualized list's `'static` per-row builder. Holds `Rc`s of the model
+/// and rows (no per-frame copy) plus the snapshotted style. Every row is the
+/// same fixed height (module docs); the cursor row gets the left accent bar +
+/// a tint. Clicks carry only the row INDEX and resolve it through the root at
+/// event time (yux rule 4).
+fn diff_row_renderer(
+    model: Rc<DiffModel>,
+    rows: Rc<Vec<RowRef>>,
+    cursor: usize,
+    rs: DiffRowStyle,
+    root: WeakEntity<YaldaGpuiView>,
+    wid: workspace::WindowId,
+) -> impl Fn(usize, &mut Window, &mut GpuiApp) -> AnyElement + 'static {
+    move |ix: usize, _w: &mut Window, _cx: &mut GpuiApp| -> AnyElement {
+        let Some(row) = rows.get(ix).copied() else {
+            return div().h(rs.row_h).into_any_element();
         };
-        let file_row = div()
+        let is_cursor = ix == cursor;
+        let (content, bg): (AnyElement, Option<Hsla>) = match row {
+            RowRef::File {
+                file,
+                viewed,
+                collapsed,
+            } => (
+                diff_file_row(&model, file, viewed, collapsed, ix, &rs, root.clone(), wid),
+                Some(rs.file_bg),
+            ),
+            RowRef::Hunk { file, hunk } => {
+                let header = model
+                    .files
+                    .get(file)
+                    .and_then(|f| f.hunks.get(hunk))
+                    .map(|h| h.header.clone())
+                    .unwrap_or_default();
+                (diff_hunk_row(header, &rs), None)
+            }
+            RowRef::Line {
+                file,
+                hunk,
+                line,
+                old,
+                new,
+            } => {
+                let dl = model
+                    .files
+                    .get(file)
+                    .and_then(|f| f.hunks.get(hunk))
+                    .and_then(|h| h.lines.get(line));
+                let (sign, text, color, bg) = match dl {
+                    Some(DiffLine::Added(t)) => ("+", t.as_str(), rs.add, Some(rs.add_bg)),
+                    Some(DiffLine::Removed(t)) => ("−", t.as_str(), rs.remove, Some(rs.remove_bg)),
+                    Some(DiffLine::Context(t)) => (" ", t.as_str(), rs.fg, None),
+                    None => (" ", "", rs.fg, None),
+                };
+                (diff_line_row(old, new, sign, text, color, &rs), bg)
+            }
+        };
+        let transparent: Hsla = rgba(0x00000000).into();
+        let click_root = root.clone();
+        let mut outer = div()
+            .id(("diff-row", ix))
             .flex()
             .flex_row()
-            .items_center()
-            .gap_2()
             .w_full()
-            .px_1()
-            .font_family(st.mono.clone())
-            .text_size(st.base)
+            .h(rs.row_h)
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, move |_ev, _w, cx| {
+                if let Some(r) = click_root.upgrade() {
+                    r.update(cx, |r, cx| r.diff_click_row(wid, ix, cx));
+                }
+            });
+        if let Some(bg) = bg {
+            outer = outer.bg(bg);
+        }
+        let el = outer
             .child(
                 div()
+                    .w(px(3.0))
+                    .h_full()
                     .flex_none()
-                    .w(px(18.0))
-                    .text_color(st.dim)
-                    .child(SharedString::from(if is_collapsed { "▸" } else { "▾" })),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .w(px(90.0))
-                    .text_color(st.accent)
-                    .child(SharedString::from(status_tag)),
+                    .bg(if is_cursor { rs.cursor_bar } else { transparent }),
             )
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
-                    .text_color(st.fg)
-                    .child(SharedString::from(file.path.display().to_string())),
+                    .h_full()
+                    .bg(if is_cursor { rs.cursor_bg } else { transparent })
+                    .child(content),
             )
-            .child(
-                div()
-                    .flex_none()
-                    .text_color(green)
-                    .child(SharedString::from(format!("+{}", file.added))),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .text_color(red)
-                    .child(SharedString::from(format!("-{}", file.removed))),
-            );
-        col = col.child(probe_bounds_dyn(
-            format!("diff-file-{fi}"),
-            file_row.into_any_element(),
-        ));
-
-        if is_collapsed {
-            continue;
-        }
-        for (hi, hunk) in file.hunks.iter().enumerate() {
-            let is_focused = focus.file == fi && focus.hunk == hi;
-            let block = diff_hunk_block(hunk, is_focused, st, green, red);
-            col = col.child(probe_bounds_dyn(
-                format!("diff-hunk-{fi}-{hi}"),
-                block.into_any_element(),
-            ));
-        }
+            .into_any_element();
+        let el = if is_cursor { probe_bounds("diff-cursor-row", el) } else { el };
+        #[cfg(test)]
+        let el = probe_bounds_dyn(format!("diff-row-{ix}"), el);
+        el
     }
-    col
 }
 
-fn diff_hunk_block(
-    hunk: &Hunk,
-    focused: bool,
-    st: &DetailStyle,
-    green: Hsla,
-    red: Hsla,
-) -> gpui::Div {
-    let transparent: Hsla = rgba(0x00000000).into();
-    let bar: Hsla = if focused { st.accent } else { transparent };
-    let header_color = if hunk.reviewed { st.dim } else { st.fg };
-
-    let mut lines_col = div().flex().flex_col().w_full().pl_2();
-    lines_col = lines_col.child(
-        div()
-            .text_color(header_color)
-            .font_family(st.mono.clone())
-            .text_size(px(st.pt * 0.85))
-            .child(SharedString::from(if hunk.reviewed {
-                format!("{}  ✓ reviewed", hunk.header)
-            } else {
-                hunk.header.clone()
-            })),
-    );
-    for line in &hunk.lines {
-        let (prefix, text, color): (&str, &str, Hsla) = match line {
-            DiffLine::Added(t) => ("+", t.as_str(), green),
-            DiffLine::Removed(t) => ("-", t.as_str(), red),
-            DiffLine::Context(t) => (" ", t.as_str(), st.fg),
-        };
-        lines_col = lines_col.child(
-            div()
-                .flex()
-                .flex_row()
-                .w_full()
-                .font_family(st.mono.clone())
-                .text_size(st.base)
-                .text_color(color)
-                .child(
-                    div()
-                        .flex_none()
-                        .w(px(14.0))
-                        .child(SharedString::from(prefix.to_string())),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(SharedString::from(text.to_string())),
-                ),
-        );
+/// A file header row: fold chevron, status glyph, path, `+a −r`, and the
+/// Viewed checkbox (clickable — toggles Viewed on this file, spec B4). A
+/// viewed file's header is dimmed.
+#[allow(clippy::too_many_arguments)]
+fn diff_file_row(
+    model: &DiffModel,
+    fi: usize,
+    viewed: bool,
+    collapsed: bool,
+    ix: usize,
+    rs: &DiffRowStyle,
+    root: WeakEntity<YaldaGpuiView>,
+    wid: workspace::WindowId,
+) -> AnyElement {
+    let Some(file) = model.files.get(fi) else {
+        return div().into_any_element();
+    };
+    let (glyph, glyph_color) = match &file.status {
+        FileStatus::Modified => ("M", rs.accent),
+        FileStatus::Added => ("A", rs.add),
+        FileStatus::Deleted => ("D", rs.remove),
+        FileStatus::Renamed { .. } => ("R", rs.header),
+    };
+    let path = match &file.status {
+        FileStatus::Renamed { from } => format!("{} → {}", from.display(), file.path.display()),
+        _ => file.path.display().to_string(),
+    };
+    let path_color = if viewed { rs.dim } else { rs.fg };
+    let mut box_border = rs.dim;
+    box_border.a *= if viewed { 0.0 } else { 0.9 };
+    let mut checkbox = div()
+        .id(("diff-checkbox", ix))
+        .flex_none()
+        .size(px(15.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(3.0))
+        .border_1()
+        .border_color(box_border)
+        .font_family(rs.mono.clone())
+        .font_weight(FontWeight::BOLD)
+        .text_size(px(11.0))
+        .cursor_pointer()
+        .child(SharedString::from(if viewed { "✓" } else { "" }))
+        .on_mouse_down(MouseButton::Left, move |_ev, _w, cx| {
+            cx.stop_propagation();
+            if let Some(r) = root.upgrade() {
+                r.update(cx, |r, cx| r.diff_click_checkbox(wid, ix, cx));
+            }
+        });
+    if viewed {
+        checkbox = checkbox.bg(rs.add).text_color(rgb(0x1e1f29));
     }
-
     div()
         .flex()
         .flex_row()
-        .w_full()
-        .gap_2()
-        .pb_1()
-        .child(div().flex_none().w(px(3.0)).bg(bar))
-        .child(div().flex_1().min_w_0().child(lines_col))
+        .items_center()
+        .gap(px(8.0))
+        .size_full()
+        .pl(px(6.0))
+        .pr(px(10.0))
+        .font_family(rs.mono.clone())
+        .text_size(rs.text)
+        .child(
+            div()
+                .flex_none()
+                .w(px(12.0))
+                .text_color(rs.dim)
+                .text_size(rs.small)
+                .child(SharedString::from(if collapsed { "▸" } else { "▾" })),
+        )
+        .child(
+            div()
+                .flex_none()
+                .w(px(12.0))
+                .font_weight(FontWeight::BOLD)
+                .text_color(if viewed { rs.dim } else { glyph_color })
+                .child(SharedString::from(glyph)),
+        )
+        .child(
+            single_line_ellipsis(&path)
+                .flex_1()
+                .font_weight(if viewed { FontWeight::NORMAL } else { FontWeight::SEMIBOLD })
+                .text_color(path_color),
+        )
+        .child(
+            div()
+                .flex_none()
+                .text_size(rs.small)
+                .text_color(if viewed { rs.dim } else { rs.add })
+                .child(SharedString::from(format!("+{}", file.added))),
+        )
+        .child(
+            div()
+                .flex_none()
+                .text_size(rs.small)
+                .text_color(if viewed { rs.dim } else { rs.remove })
+                .child(SharedString::from(format!("−{}", file.removed))),
+        )
+        .child(probe_bounds_dyn(format!("diff-checkbox-{fi}"), checkbox.into_any_element()))
+        .into_any_element()
+}
+
+/// A thin hunk header row: the `@@ -a,b +c,d @@ ctx` line, dimmed and small,
+/// indented past the gutters.
+fn diff_hunk_row(header: String, rs: &DiffRowStyle) -> AnyElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .size_full()
+        .pl(rs.gutter_w * 2.0 + px(22.0))
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .font_family(rs.mono.clone())
+        .text_size(rs.small)
+        .text_color(rs.header.opacity(0.75))
+        .child(SharedString::from(header))
+        .into_any_element()
+}
+
+/// One diff line: old / new line-number gutters (dimmed, fixed width), the
+/// `+`/`−` sign, then the text (no wrap — every row is one fixed height).
+fn diff_line_row(
+    old: Option<u32>,
+    new: Option<u32>,
+    sign: &'static str,
+    text: &str,
+    color: Hsla,
+    rs: &DiffRowStyle,
+) -> AnyElement {
+    let gutter = |n: Option<u32>| {
+        div()
+            .flex_none()
+            .w(rs.gutter_w)
+            .pr(px(6.0))
+            .text_right()
+            .text_size(rs.small)
+            .text_color(rs.dim.opacity(0.7))
+            .child(SharedString::from(n.map(|n| n.to_string()).unwrap_or_default()))
+    };
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .size_full()
+        .font_family(rs.mono.clone())
+        .text_size(rs.text)
+        .child(gutter(old))
+        .child(gutter(new))
+        .child(
+            div()
+                .flex_none()
+                .w(px(16.0))
+                .text_center()
+                .text_color(color)
+                .child(SharedString::from(sign)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_color(if sign == " " { rs.fg } else { color })
+                .child(SharedString::from(text.to_string())),
+        )
+        .into_any_element()
 }
