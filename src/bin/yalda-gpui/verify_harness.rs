@@ -32039,21 +32039,7 @@ fn q4_paint_compose_caret(
 #[gpui::test]
 fn compose_eol_caret_on_full_wrapped_row_paints_inside_box(cx: &mut TestAppContext) {
     let (view, vcx, _id, _session) = boot_with_transcript(cx);
-    view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
-    vcx.simulate_resize(gpui::size(px(560.0), px(600.0)));
-    vcx.run_until_parked();
-    // First paint measures the box; derive its column budget exactly as the
-    // render does.
-    let (_, b0) = q4_paint_compose_caret(&view, vcx, "x", 0, 1, crate::EditMode::Insert);
-    // Shrink the window by the box's fractional column so its width is an EXACT
-    // multiple of CHATBOX_CHAR_W — no spare pixels to absorb a spilled caret.
-    let spare = b0.2 % crate::CHATBOX_CHAR_W;
-    vcx.simulate_resize(gpui::size(px(560.0 - spare), px(600.0)));
-    vcx.run_until_parked();
-    let (_, b0) = q4_paint_compose_caret(&view, vcx, "x", 0, 1, crate::EditMode::Insert);
-    assert!(b0.2 % crate::CHATBOX_CHAR_W < 0.01, "box is a whole number of columns: {b0:?}");
-    let cols = (b0.2 / crate::CHATBOX_CHAR_W).floor() as usize;
-    assert!(cols >= 4 && cols < 60, "non-vacuous narrow box: {cols} cols ({b0:?})");
+    let cols = q4_whole_column_chatbox(&view, vcx);
     // Two FULL rows of an unbreakable word, caret at EOL (Insert).
     let text: String = "a".repeat(cols * 2);
     let (caret, b) = q4_paint_compose_caret(&view, vcx, &text, 0, cols * 2, crate::EditMode::Insert);
@@ -32065,4 +32051,80 @@ fn compose_eol_caret_on_full_wrapped_row_paints_inside_box(cx: &mut TestAppConte
         cx0 + cw
     );
     assert!(cx0 >= b.0 - 0.5, "caret {cx0} left of the box {}", b.0);
+}
+
+/// Resize so the chatbox compose box is a WHOLE number of `CHATBOX_CHAR_W`
+/// columns (no spare pixels to absorb an overflow) and return its column count.
+fn q4_whole_column_chatbox(view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext) -> usize {
+    view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
+    vcx.simulate_resize(gpui::size(px(560.0), px(600.0)));
+    vcx.run_until_parked();
+    let (_, b0) = q4_paint_compose_caret(view, vcx, "x", 0, 1, crate::EditMode::Insert);
+    let spare = b0.2 % crate::CHATBOX_CHAR_W;
+    vcx.simulate_resize(gpui::size(px(560.0 - spare), px(600.0)));
+    vcx.run_until_parked();
+    let (_, b0) = q4_paint_compose_caret(view, vcx, "x", 0, 1, crate::EditMode::Insert);
+    assert!(b0.2 % crate::CHATBOX_CHAR_W < 0.01, "box is a whole number of columns: {b0:?}");
+    let cols = (b0.2 / crate::CHATBOX_CHAR_W).floor() as usize;
+    assert!(cols >= 4 && cols < 60, "non-vacuous narrow box: {cols} cols ({b0:?})");
+    cols
+}
+
+/// D15 (text-editing review): the compose wraps by terminal CELLS, not chars —
+/// a run of 2-cell chars must not overflow the box. Drives the real chatbox
+/// render in a whole-column narrow window over a line of emoji (2 cells in
+/// both `unicode-width` and the headless text system; the headless system
+/// paints CJK at ONE advance — no CJK font — so CJK wrap is pinned at the
+/// unit level by `wrap_line_cols_counts_wide_and_zero_width_cells`) and
+/// asserts the PAINTED caret lands inside the box at every column, and that
+/// the caret right after the Nth emoji paints exactly N×2 columns in from the
+/// start of its row.
+///
+/// Negative control (observed RED): make `char_cells` return 1 for every char
+/// (the old 1 char = 1 column) → a row holds `cols` emoji (2× the box) and the
+/// caret paints far past the right edge.
+#[gpui::test]
+fn compose_wide_chars_wrap_by_cells_caret_inside_box(cx: &mut TestAppContext) {
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    let cols = q4_whole_column_chatbox(&view, vcx);
+    let n = cols * 2;
+    let text: String = "🎉".repeat(n);
+    let mut checked = 0;
+    for col in (0..=n).step_by(3) {
+        let (caret, b) = q4_paint_compose_caret(&view, vcx, &text, 0, col, crate::EditMode::Insert);
+        let (x, _, w, _) = caret.expect("caret paints");
+        assert!(
+            x >= b.0 - 0.5 && x + w <= b.0 + b.2 + 0.5,
+            "caret at col {col} painted at [{x}, {}] outside the box [{}, {}] ({cols} cols)",
+            x + w,
+            b.0,
+            b.0 + b.2
+        );
+        // Each row holds (cols-1)/2 emoji (the last row reserves the caret
+        // column; full rows hold cols/2): the caret's in-row cell is exact.
+        let per_row = cols / 2;
+        let in_row = col % per_row;
+        if col < n - n % per_row {
+            let want = b.0 + (in_row * 2) as f32 * 8.0;
+            assert!((x - want).abs() <= 2.0 + in_row as f32 * 0.5, "caret col {col}: x={x} want≈{want}");
+        }
+        checked += 1;
+    }
+    assert!(checked > 4, "non-vacuous sweep");
+}
+
+/// D15: a CRLF clipboard pasted into the compose through the REAL Cmd-V path
+/// (`cmd-v` → `PasteFromClipboard` → `paste_from_clipboard`) lands as `\n`-only
+/// text — no stray `\r` in the `\n`-only editor.
+///
+/// Negative control (observed RED): drop the `normalize_pasted_newlines` call
+/// in `paste_from_clipboard` → the compose reads "hela\r\nblo".
+#[gpui::test]
+fn compose_cmd_v_normalizes_crlf(cx: &mut TestAppContext) {
+    let (view, vcx, id) = compose_hello_caret_at_3(cx);
+    view.update(vcx, |_, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string("a\r\nb".into())));
+    vcx.simulate_keystrokes("cmd-v");
+    vcx.run_until_parked();
+    let text = view.update(vcx, |v, cx| v.read_session(id, cx, |c| c.input_surface.compose().text()).expect("session"));
+    assert_eq!(text, "hela\nblo", "CRLF normalized on paste");
 }

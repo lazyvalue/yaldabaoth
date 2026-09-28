@@ -64,6 +64,16 @@ pub(crate) fn display_lines(doc: &Document) -> Vec<String> {
         .collect()
 }
 
+/// Terminal-style CELL width of one (already tab-expanded) display char (D15):
+/// 2 for East-Asian wide / fullwidth chars and most emoji, 0 for combining
+/// marks and other zero-width code points, 1 otherwise. Control chars (no
+/// defined width) count as 0. The compose wraps rows by cells, not chars, so
+/// a CJK/emoji run can't overflow the box and a combining mark rides on its
+/// base char's row.
+pub(crate) fn char_cells(c: char) -> usize {
+    unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
+}
+
 /// RAW → DISPLAY column over a line's chars (TABs expanded). Columns past the
 /// line end (the EOL caret) map 1:1 past the expanded end.
 fn display_col_of_chars(chars: impl Iterator<Item = char>, raw_col: usize) -> usize {

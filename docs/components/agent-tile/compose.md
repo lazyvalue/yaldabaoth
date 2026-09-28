@@ -50,12 +50,19 @@ the vertical caret-containment is kept. **D13 (2026-09-27):** the LAST visual ro
 of a line reserves the caret's column (holds ≤ width−1 columns; a tail that would
 exactly fill it wraps, leaving an empty row after a hard break), so a caret at
 end-of-line on a full row paints inside the box instead of one column past it.
-Caret-independent, so rows never jump as the caret moves.
+Caret-independent, so rows never jump as the caret moves. **D15 (2026-09-27):**
+row widths are terminal CELLS (`char_cells`, `unicode-width`): CJK / emoji take 2
+columns, combining marks 0 (they ride on their base char's row); the Normal-mode
+block caret spans a wide char's 2 cells. Pasted text (Cmd-V and vim `p`/`P`) is
+normalized `\r\n`/`\r` → `\n` (`normalize_pasted_newlines`) for every compose.
 
 **Enforcement.** Headless: `wrap_line_cols_word_wraps_and_covers_every_char`
 (wraps, hard-breaks, covers every char, ≥1 row, makes progress, last row keeps a
 free caret column) + `compose_eol_caret_on_full_wrapped_row_paints_inside_box`
 (D13: painted EOL caret inside a whole-column narrow box) +
+`wrap_line_cols_counts_wide_and_zero_width_cells` +
+`compose_wide_chars_wrap_by_cells_caret_inside_box` (D15, painted) +
+`compose_cmd_v_normalizes_crlf` (D15, real Cmd-V) +
 `caret_visual_row_places_caret_on_a_rendered_row` (caret always on a rendered
 row). `verify_harness.rs::worksheet_r_first_paint_uses_transcript_width` drives
 the real `r` reply path and asserts from painted geometry that a newly opened,

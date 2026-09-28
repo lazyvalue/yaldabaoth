@@ -1880,6 +1880,44 @@ fn wrap_line_cols_word_wraps_and_covers_every_char() {
     }
 }
 
+/// D15: `wrap_line_cols` budgets terminal CELLS — CJK / emoji are 2 columns,
+/// combining marks 0 (they stay on their base char's row) — so a wide run can't
+/// overflow the box. Every row's cells ≤ width; the last row keeps its free
+/// caret column.
+#[test]
+fn wrap_line_cols_counts_wide_and_zero_width_cells() {
+    let w = |s: &str, width: usize| -> Vec<String> {
+        let chars: Vec<char> = s.chars().collect();
+        wrap_line_cols(&chars, width)
+            .into_iter()
+            .map(|(a, b)| chars[a..b].iter().collect())
+            .collect()
+    };
+    let cells = |s: &str| -> usize { s.chars().map(crate::char_cells).sum() };
+    assert_eq!(crate::char_cells('日'), 2);
+    assert_eq!(crate::char_cells('\u{301}'), 0);
+    assert_eq!(crate::char_cells('a'), 1);
+    // 5 cells hold two CJK chars (4 cells), not five.
+    assert_eq!(w("日本語日本", 5), vec!["日本", "語日", "本"]);
+    // A full CJK last row wraps its EOL caret onto an empty row (D13 in cells).
+    assert_eq!(w("日本", 4), vec!["日本", ""]);
+    // A combining mark rides with its base char, even at the row limit.
+    assert_eq!(w("abe\u{301}", 3), vec!["abe\u{301}", ""]);
+    assert_eq!(w("abe\u{301}x", 4), vec!["abe\u{301}x", ""]);
+    // A char wider than the row still gets a row (progress, no hang).
+    assert_eq!(w("日本", 1), vec!["日", "本", ""]);
+    // Spaces still break between wide words.
+    assert_eq!(w("日本 語日本語", 6), vec!["日本 ", "語日本", "語"]);
+    for (s, width) in [("日本語 abc 🎉🎉 e\u{301}", 5usize), ("🎉🎉🎉🎉🎉", 7), ("a日b本c", 3)] {
+        let rows = w(s, width);
+        assert_eq!(rows.concat(), s, "rows tile the line");
+        for r in &rows {
+            assert!(cells(r) <= width, "row {r:?} exceeds {width} cells");
+        }
+        assert!(cells(rows.last().unwrap()) < width, "last row keeps a caret column: {rows:?}");
+    }
+}
+
 /// UXI-TextEditing-1 over the wrapped compose: the caret resolves to the single visual row
 /// holding its column; a row-boundary column belongs to the NEXT row; end-of-line
 /// sits on the last row — so the caret is always on a rendered row (never lost).
@@ -1987,7 +2025,10 @@ fn chatbox_caret_cell_stays_in_window_for_every_edit_path() {
                 let (rs, _) = wrapped[caret_visual_row(&wrapped, col)];
                 // The caret column must fit inside the box: the row's cells before
                 // the caret plus the caret cell itself ≤ cols (D13).
-                let cells_before = col.min(chars.len()) - rs;
+                let cells_before: usize = chars[rs..col.min(chars.len())]
+                    .iter()
+                    .map(|&c| crate::char_cells(c))
+                    .sum();
                 assert!(
                     cells_before < cols.max(1),
                     "[{label}] caret col {col} paints at cell {cells_before} of a {cols}-col row (past the box)",

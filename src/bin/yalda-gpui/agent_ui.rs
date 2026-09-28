@@ -6653,6 +6653,8 @@ impl YaldaGpuiView {
             if let Some(text) = cx.read_from_clipboard().as_ref().and_then(|i| i.text())
                 && let Some(mut c) = self.agent_mut(cx)
             {
+                // D15: `\n`-only editor — normalize a CRLF clipboard.
+                let text = normalize_pasted_newlines(&text);
                 let cb = c.input_surface.compose_mut();
                 // D1: Insert mode pastes AT the caret (caret after the text, one
                 // undo step) — only Normal mode uses the vim `p` rules.

@@ -545,12 +545,18 @@ fn is_ctrl_w_shell_prefix(press: &KeyPress) -> bool {
 /// typical text caret because, on a wrapped row of monospace text, a 1-2px
 /// strip is easy to miss between adjacent glyphs.
 fn make_caret(mode: EditMode, cursor_char: char, cursor_color: Hsla) -> AnyElement {
+    make_caret_cells(mode, cursor_char, cursor_color, 1)
+}
+
+/// [`make_caret`] spanning `cells` monospace columns — the compose's Normal-mode
+/// block over a wide (CJK / emoji, 2-cell) char covers the whole glyph (D15).
+fn make_caret_cells(mode: EditMode, cursor_char: char, cursor_color: Hsla, cells: usize) -> AnyElement {
     // Block cursor in both modes. In insert mode the block is a solid
     // rectangle (character stays in the after-stream); in normal mode the
     // character under the cursor is drawn inside the block.
     let el = div()
         .flex_none()
-        .w(px(8.0))
+        .w(px(8.0 * cells.max(1) as f32))
         .h(px(18.0))
         .bg(cursor_color)
         .text_color(rgb(BG))
@@ -565,6 +571,16 @@ fn make_caret(mode: EditMode, cursor_char: char, cursor_color: Hsla) -> AnyEleme
     #[cfg(test)]
     let el = probe_bounds("caret", el);
     el
+}
+
+/// Normalize clipboard line endings to the editors' `\n`-only model (D15):
+/// `\r\n` → `\n`, then any lone `\r` (classic Mac) → `\n`. Every paste into
+/// a compose / buffer goes through this.
+pub(crate) fn normalize_pasted_newlines(text: &str) -> String {
+    if !text.contains('\r') {
+        return text.to_string();
+    }
+    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 /// The two-theme toggle decision (Nightfox ⇄ Folio): from Folio go to Nightfox,
@@ -4297,6 +4313,9 @@ impl YaldaGpuiView {
         if text.is_empty() {
             return;
         }
+        // D15: the editors are `\n`-only — a Windows/CRLF clipboard must not
+        // leave stray `\r`s in any compose / buffer.
+        let text = normalize_pasted_newlines(&text);
         // Agent tiles route through `self.sessions`, so the resolver hands back
         // the bound id and the workspace borrow is dropped before the store.
         let pasted = match target {

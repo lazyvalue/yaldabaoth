@@ -1608,7 +1608,13 @@ pub(crate) fn build_chatbox_line(
                 row = emit_chunk(row, before, 0);
             }
             let cursor_char = slice.get(rel).copied().unwrap_or(' ');
-            row = row.child(make_caret(mode, cursor_char, cursor_color));
+            // D15: in Normal mode the block covers the char's cells (a wide
+            // char is 2 columns); the Insert beam is always one column.
+            let caret_cells = match mode {
+                EditMode::Normal => char_cells(cursor_char).max(1),
+                EditMode::Insert => 1,
+            };
+            row = row.child(make_caret_cells(mode, cursor_char, cursor_color, caret_cells));
             // Normal mode consumes the char under the caret; Insert is a
             // zero-width beam so that char stays in the after-stream.
             let after_start = match mode {
@@ -1635,14 +1641,20 @@ pub(crate) fn build_chatbox_line(
 }
 
 /// Word-wrap a (tab-expanded) monospace line into visual-row char ranges of at
-/// most `width` columns each (UXI-AgentTile-9). Breaks at the last space strictly inside
-/// `[start, start+width)`; a word longer than `width` is hard-broken at the limit.
-/// Returns half-open `[start, end)` ranges over the line covering EVERY char
-/// (nothing dropped — the caret must be addressable at every column), always ≥1
-/// row (an empty line → one `(0, 0)` row). `width == 0` is treated as 1.
+/// most `width` CELLS each (UXI-AgentTile-9). Breaks after the last space
+/// inside the row; a word wider than the row is hard-broken at the limit.
+/// Returns half-open `[start, end)` CHAR ranges over the line covering EVERY
+/// char (nothing dropped — the caret must be addressable at every column),
+/// always ≥1 row (an empty line → one `(0, 0)` row). `width == 0` is treated
+/// as 1.
+///
+/// D15 — widths are terminal CELLS ([`char_cells`]), not chars: a CJK /
+/// emoji char takes 2 columns, a combining mark 0 (it stays on its base
+/// char's row). A single char wider than the whole row still gets a row of
+/// its own (progress over overflow).
 ///
 /// D13 — the LAST row reserves the caret's column: it holds at most
-/// `width - 1` columns, so a caret at end-of-line (one past the last char)
+/// `width - 1` cells, so a caret at end-of-line (one past the last char)
 /// still paints inside the box. A tail that would exactly fill the last row is
 /// wrapped like any other full row, which leaves a final EMPTY `(n, n)` row for
 /// the EOL caret (after a hard break) — a non-last row never needs this: a
@@ -1664,26 +1676,38 @@ pub(crate) fn wrap_line_cols(line: &[char], width: usize) -> Vec<(usize, usize)>
     let mut rows = Vec::new();
     let mut start = 0;
     loop {
+        // Greedy: the furthest `end` whose cells fit the row.
+        let mut cells = 0usize;
+        let mut end = start;
+        while end < n {
+            let w = char_cells(line[end]);
+            if cells + w > width {
+                break;
+            }
+            cells += w;
+            end += 1;
+        }
         // The tail fits AND leaves the reserved caret column free → last row.
         // (`start == n` lands here too: the empty row an EOL caret sits on
         // after a full hard-broken row.)
-        if n - start < width {
+        if end == n && cells < width {
             rows.push((start, n));
             break;
         }
-        let hard = start + width;
+        // A char wider than the whole row: give it a row anyway (progress).
+        let hard = end.max(start + 1);
         // Last space strictly inside (start, hard): break AFTER it so the space
         // trails this row and the next row begins at real content. None ⇒ a word
         // longer than the row, hard-break at the column limit.
-        let mut end = hard;
+        let mut brk = hard;
         for j in (start + 1..hard).rev() {
             if line[j] == ' ' {
-                end = j + 1;
+                brk = j + 1;
                 break;
             }
         }
-        rows.push((start, end));
-        start = end;
+        rows.push((start, brk));
+        start = brk;
     }
     rows
 }
