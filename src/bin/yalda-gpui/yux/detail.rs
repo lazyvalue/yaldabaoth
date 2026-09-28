@@ -191,16 +191,33 @@ pub(crate) fn compact_count_indicator(
 }
 
 /// A primary identity label for constrained navigation chrome. The containing
-/// row owns typography and width; this primitive owns the non-wrapping overflow
+/// row owns typography and width; this primitive owns the one-line overflow
 /// contract so long names cannot silently change row geometry.
 pub(crate) fn single_line_ellipsis(label: &str) -> gpui::Div {
+    single_line_ellipsis_box().child(SharedString::from(label.to_string()))
+}
+
+/// The childless [`single_line_ellipsis`] container, for callers that supply
+/// their own text leaf (e.g. a probed one).
+///
+/// One line via `line_clamp(1)` over NORMAL whitespace — deliberately NOT
+/// `whitespace_nowrap` (bug-0072). gpui 0.2.2's text leaf caches its FIRST
+/// taffy measurement whenever `wrap_width` is `None` (always, under nowrap),
+/// and computes the ellipsis truncation from that first call's available
+/// width. Taffy's first measure is rarely the final width: inside a
+/// `flex_col().flex_1()` wrapper it is `Definite(0)` (label shaped to a bare
+/// "…" — the blank worktree-picker rows), elsewhere `MinContent` (never
+/// truncated, just clipped). Under normal whitespace the leaf re-measures
+/// whenever the available width changes, so the final pass truncates at the
+/// row's real width; `line_clamp(1)` keeps it to one line.
+fn single_line_ellipsis_box() -> gpui::Div {
     div()
         .w_full()
         .min_w_0()
         .overflow_hidden()
-        .whitespace_nowrap()
+        .whitespace_normal()
+        .line_clamp(1)
         .text_ellipsis()
-        .child(SharedString::from(label.to_string()))
 }
 
 /// A one-line keyboard-hint footer (`j/k move · enter select · …`) — the
@@ -434,11 +451,18 @@ pub(crate) fn picker_option_row_detailed(
     body_font: &SharedString,
     mono_font: &SharedString,
 ) -> gpui::Stateful<gpui::Div> {
+    let id: ElementId = id.into();
+    // Probe tags (`<row id>-label` / `<row id>-detail`) are only built while the
+    // test layout probe records; production pays one branch.
+    let probe_tag = |suffix: &'static str| {
+        let id = id.clone();
+        move || format!("{id}-{suffix}")
+    };
     let transparent: Hsla = rgba(0x00000000).into();
     let mut hover_bg = selected_bg;
     hover_bg.a *= 0.62;
     let mut row = div()
-        .id(id)
+        .id(id.clone())
         .flex()
         .flex_row()
         .items_center()
@@ -469,7 +493,8 @@ pub(crate) fn picker_option_row_detailed(
                 .child(SharedString::from(glyph.to_string())),
         )
         .child({
-            let label_el = single_line_ellipsis(label)
+            let label_el = single_line_ellipsis_box()
+                .child(probe_text(probe_tag("label"), SharedString::from(label.to_string())))
                 .font_family(body_font.clone())
                 .font_weight(if selected {
                     FontWeight::SEMIBOLD
@@ -487,7 +512,11 @@ pub(crate) fn picker_option_row_detailed(
                     .min_w_0()
                     .child(label_el)
                     .child(
-                        single_line_ellipsis(detail)
+                        single_line_ellipsis_box()
+                            .child(probe_text(
+                                probe_tag("detail"),
+                                SharedString::from(detail.to_string()),
+                            ))
                             .font_family(mono_font.clone())
                             .text_size(px(11.0))
                             .text_color(detail_color),

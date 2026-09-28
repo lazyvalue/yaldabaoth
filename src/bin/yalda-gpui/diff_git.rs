@@ -206,6 +206,19 @@ pub(crate) struct WorktreeEntry {
     pub(crate) detached: bool,
     /// The first entry git lists — the primary checkout.
     pub(crate) is_primary: bool,
+    /// `HEAD`'s commit subject + committer time (unix seconds) — the picker
+    /// row's description line (UXI-Diff-10). `None` when unknown (fresh repo,
+    /// or the batched `git log` failed — errors-as-values, the row just shows
+    /// its path).
+    pub(crate) head_commit: Option<HeadCommit>,
+}
+
+/// The last commit on a worktree's `HEAD`, for the picker description.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HeadCommit {
+    pub(crate) subject: String,
+    /// Committer time, unix seconds.
+    pub(crate) time: i64,
 }
 
 impl WorktreeEntry {
@@ -262,6 +275,22 @@ pub(crate) fn parse_worktree_porcelain(text: &str) -> Vec<WorktreeEntry> {
             branch: r.branch,
             detached: r.detached,
             is_primary: i == 0,
+            head_commit: None,
+        })
+        .collect()
+}
+
+/// Parse `git log --no-walk=unsorted --format=%H%x00%ct%x00%s <shas…>` output
+/// into `sha → HeadCommit`. Pure (unit-tested without git); malformed lines
+/// are skipped.
+pub(crate) fn parse_head_commits(text: &str) -> std::collections::HashMap<String, HeadCommit> {
+    text.lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '\0');
+            let sha = parts.next()?.trim();
+            let time = parts.next()?.trim().parse::<i64>().ok()?;
+            let subject = parts.next()?.to_string();
+            (!sha.is_empty()).then(|| (sha.to_string(), HeadCommit { subject, time }))
         })
         .collect()
 }
@@ -274,7 +303,34 @@ pub(crate) fn list_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeEntry>, GitD
         return Err(GitDiffError::InvalidWorktree(repo_dir.to_path_buf()));
     }
     let out = run_git(repo_dir, &["worktree", "list", "--porcelain"])?;
-    Ok(parse_worktree_porcelain(&out))
+    let mut entries = parse_worktree_porcelain(&out);
+    attach_head_commits(repo_dir, &mut entries);
+    Ok(entries)
+}
+
+/// Fill each entry's `head_commit` with ONE batched `git log --no-walk` over
+/// every distinct `HEAD` (worktrees share one object store). Best-effort: a
+/// failure leaves every `head_commit` `None` — the picker still lists rows.
+fn attach_head_commits(repo_dir: &Path, entries: &mut [WorktreeEntry]) {
+    let mut heads: Vec<&str> = entries
+        .iter()
+        .map(|e| e.head.as_str())
+        .filter(|h| !h.is_empty())
+        .collect();
+    heads.sort_unstable();
+    heads.dedup();
+    if heads.is_empty() {
+        return;
+    }
+    let mut args = vec!["log", "--no-walk=unsorted", "--format=%H%x00%ct%x00%s"];
+    args.extend(heads.iter().copied());
+    let Ok(out) = run_git(repo_dir, &args) else {
+        return;
+    };
+    let commits = parse_head_commits(&out);
+    for e in entries.iter_mut() {
+        e.head_commit = commits.get(&e.head).cloned();
+    }
 }
 
 impl GitDiffError {
@@ -476,11 +532,32 @@ mod tests {
             linked.canonicalize().unwrap()
         );
         assert!(!rows[1].head.is_empty());
+        // UXI-Diff-10 description: each row carries HEAD's subject + time,
+        // from the ONE batched `git log --no-walk` (both share `feature`'s HEAD).
+        for r in &rows {
+            let c = r.head_commit.as_ref().expect("head commit attached");
+            assert_eq!(c.subject, "committed change");
+            assert!(c.time > 1_500_000_000, "plausible unix time: {}", c.time);
+        }
 
         // Listing from INSIDE the linked worktree finds the same set.
         let from_linked = list_worktrees(&linked).expect("list from linked");
         assert_eq!(from_linked.len(), 2);
         assert!(from_linked[0].is_primary);
+    }
+
+    /// `parse_head_commits`: NUL-separated `sha, ct, subject` (a subject may
+    /// itself contain separators like `·` or `:`); malformed lines skipped.
+    #[test]
+    fn parse_head_commits_reads_batched_log() {
+        let text = "aaa\x001700000000\x00feat(diff): a · b: c\nbad line\nbbb\x00notanumber\x00x\nccc\x001700000100\x00\n";
+        let m = parse_head_commits(text);
+        assert_eq!(m.len(), 2, "{m:?}");
+        assert_eq!(
+            m["aaa"],
+            HeadCommit { subject: "feat(diff): a · b: c".to_string(), time: 1_700_000_000 }
+        );
+        assert_eq!(m["ccc"].subject, "");
     }
 
     /// A worktree whose directory was deleted (prunable) is skipped, not

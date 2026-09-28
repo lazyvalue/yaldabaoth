@@ -58,8 +58,11 @@ uncommitted + untracked), base = the repo's default branch.
 - **B1. Pick a worktree. [ACTIVE]** An unbound tile renders the **worktree
   picker**: every entry of `git worktree list --porcelain` for the repo
   containing the active workspace's cwd (fallback: process cwd), one row each
-  — branch name prominent, path dimmed (home-relative), primary checkout
-  labelled. Rows are selectable with `j`/`k`/arrows + `Enter`, or a mouse click.
+  — two lines: the branch name prominent (primary checkout labelled), then a
+  dimmed description `<HEAD commit subject> · <relative age> · <~/path>`
+  (home-relative path; just the path when the commit is unknown). Subject +
+  commit time come from ONE batched `git log --no-walk` in the async worktree
+  load, never the paint path. Rows are selectable with `j`/`k`/arrows + `Enter`, or a mouse click.
   A final row "Pick a folder…" binds an arbitrary path. Not in a git repo ⇒ the
   picker says so plainly and offers only the folder row. `space → Switch
   worktree` returns a bound tile to the picker. A deleted/invalid worktree
