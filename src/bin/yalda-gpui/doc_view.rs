@@ -65,6 +65,8 @@ pub(crate) struct DocSeqs {
     /// Settled mermaid renders (`DiagramCache::generation`) — a diagram that
     /// finished rendering repaints its block.
     diagrams: u64,
+    /// The transient "Copied" flag of a code block's copy button.
+    code_copied_seq: u64,
 }
 
 impl DocSeqs {
@@ -85,6 +87,7 @@ impl DocSeqs {
             theme: root.theme.name,
             fonts: h.finish(),
             diagrams: root.diagrams.borrow().generation(),
+            code_copied_seq: d.code_copied_seq,
         }
     }
 }
@@ -132,7 +135,7 @@ impl DocView {
 }
 
 impl Render for DocView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         record_render(self.perf_label);
         let Some(root_ent) = self.root.upgrade() else {
             return div().size_full().into_any_element();
@@ -147,7 +150,13 @@ impl Render for DocView {
         // scheduled via defer below — never a notify inside render.
         let settling = d.list.settle();
         self.last_rendered = DocSeqs::of(d, r);
-        let body = build_doc_body(r, d, self.root.clone()).into_any_element();
+        // The reading measure derives from the body font + zoom — both
+        // already in the fingerprint — so it adds no new render input.
+        let measure = reading_measure(window, &r.body_font, r.text_scale);
+        let body = build_doc_body(r, d, self.root.clone(), self.window_id, measure)
+            .into_any_element();
+        #[cfg(test)]
+        let body = probe_bounds("doc-body", body);
         if settling {
             let me = cx.entity_id();
             cx.defer(move |app| app.notify(me));
@@ -163,10 +172,28 @@ impl Render for DocView {
 /// moved — a root notify from elsewhere is a cache hit. The hit-test sink
 /// (`d.line_layouts`) only holds the visible lines, so `doc_pos_in`'s scan is
 /// O(visible) too.
+/// The reading measure (`TYPE_SCALE.measure_ch` × the body font's `ch`
+/// advance at zoom `text_scale`): the widest the Doc's text column gets.
+fn reading_measure(window: &Window, body_font: &SharedString, text_scale: f32) -> Pixels {
+    let size = px(TYPE_SCALE.body_px * text_scale);
+    let ts = window.text_system();
+    let id = ts.resolve_font(&gpui::font(body_font.clone()));
+    // A font without a `0` glyph: a typical proportional ch (≈0.55em).
+    let ch = ts.ch_advance(id, size).unwrap_or(size * 0.55);
+    TYPE_SCALE.measure(ch)
+}
+
+/// Width of the chrome `block_element` puts left of a block's text (the 3px
+/// cursor bar + the content column's `pl_3`), so the TEXT gets the full
+/// measure.
+const DOC_BLOCK_CHROME_PX: f32 = 3.0 + 12.0;
+
 fn build_doc_body(
     r: &YaldaGpuiView,
     d: &DocState,
     weak_root: WeakEntity<YaldaGpuiView>,
+    tile: workspace::WindowId,
+    measure: Pixels,
 ) -> gpui::Stateful<gpui::Div> {
     // This render repaints every visible line and re-registers it; drop the
     // previous frame's entries so a line that scrolled away (or a removed
@@ -190,6 +217,11 @@ fn build_doc_body(
     let line_layouts = d.line_layouts.clone();
     let blocks_rc = d.blocks_rc();
     let diagrams = r.diagrams.clone();
+    let code_copy = CodeCopyCtx {
+        tile,
+        copied: d.code_copied.clone(),
+    };
+    let column_max = measure + px(DOC_BLOCK_CHROME_PX);
 
     let render_fn = move |idx: usize, _w: &mut Window, _app: &mut GpuiApp| -> AnyElement {
         let Some(block) = blocks_rc.get(idx) else {
@@ -205,11 +237,35 @@ fn build_doc_body(
             doc_dir: doc_dir.clone(),
             block_count: blocks_rc.len(),
             diagrams: Some(diagrams.clone()),
+            code_copy: Some(code_copy.clone()),
             // Doc view never shows raw markdown markers (agent chat only) and
             // `block_element` sets the structural path + current block itself.
             ..RenderCtx::new(&theme, body_font.clone(), code_font.clone(), text_scale)
         };
         let el = block_element(&ctx, idx, block);
+        // Reading measure: prose blocks sit in a column capped at the measure
+        // and centered in a wider tile (full width in a narrow one). A source
+        // file's lines (the code IS the document) keep the full width.
+        let el = if matches!(
+            block,
+            RenderedBlock::CodeBlock {
+                source_file: true,
+                ..
+            }
+        ) {
+            el
+        } else {
+            let column = div().w_full().max_w(column_max).child(el).into_any_element();
+            #[cfg(test)]
+            let column = probe_bounds_dyn(format!("doc-column-{idx}"), column);
+            div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .justify_center()
+                .child(column)
+                .into_any_element()
+        };
         // UXI-ParagraphSpacing-1 test seam: expose each doc block's painted
         // bounds so `verify_harness` can measure the inter-block gap.
         #[cfg(test)]

@@ -28,6 +28,10 @@
 //!    memo for a derived match list / ranking keyed on (query, source
 //!    generation), so renders reuse it instead of re-filtering every frame.
 //!
+//! 7. **Typography** (`typography`) — `TypeScale` / `TYPE_SCALE`: the one
+//!    type scale (heading sizes, heading leading + space-above, block gap,
+//!    reading measure, list gutter) shared by the Doc view and the WP editor.
+//!
 //! Read `yux/CLAUDE.md` before adding to it: it states the rules (state
 //! encapsulation, the never-notify-in-render law, the render-count test) and
 //! the contribution mandate — **all UX work lives here or is built from here.**
@@ -38,6 +42,7 @@ mod display_text;
 mod line_input;
 mod list;
 mod memo;
+mod typography;
 
 pub(crate) use cached::*;
 pub(crate) use detail::*;
@@ -45,3 +50,4 @@ pub(crate) use display_text::*;
 pub(crate) use line_input::*;
 pub(crate) use list::*;
 pub(crate) use memo::*;
+pub(crate) use typography::*;

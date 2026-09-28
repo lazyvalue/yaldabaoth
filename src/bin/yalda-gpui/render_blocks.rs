@@ -666,6 +666,18 @@ pub(crate) struct RenderCtx<'a> {
     /// Names per-item elements (task checkboxes: `md-task-<path>`) so later
     /// interactions can address them.
     pub(crate) path: Option<Vec<usize>>,
+    /// Doc view only: the tile whose `DocState` the code blocks' copy buttons
+    /// resolve against at click time (yux rule 4), and which code block (by
+    /// structural path) was just copied (the transient "Copied" label).
+    /// `None` elsewhere — the transcript and previews show no copy button.
+    pub(crate) code_copy: Option<CodeCopyCtx>,
+}
+
+/// See [`RenderCtx::code_copy`].
+#[derive(Clone, Debug)]
+pub(crate) struct CodeCopyCtx {
+    pub(crate) tile: workspace::WindowId,
+    pub(crate) copied: Option<std::rc::Rc<Vec<usize>>>,
 }
 
 impl<'a> RenderCtx<'a> {
@@ -697,6 +709,7 @@ impl<'a> RenderCtx<'a> {
             block_hits: None,
             diagrams: None,
             path: None,
+            code_copy: None,
         }
     }
 }
@@ -714,6 +727,7 @@ impl RenderCtx<'_> {
             doc_dir: self.doc_dir.clone(),
             show_heading_markers: self.show_heading_markers,
             diagrams: self.diagrams.clone(),
+            code_copy: self.code_copy.clone(),
             path: self.path.as_ref().map(|p| {
                 let mut p = p.clone();
                 p.extend_from_slice(extra);
@@ -1694,6 +1708,7 @@ pub(crate) fn block_element(ctx: &RenderCtx<'_>, idx: usize, block: &RenderedBlo
         block_hits: None,
         diagrams: ctx.diagrams.clone(),
         path: Some(vec![idx]),
+        code_copy: ctx.code_copy.clone(),
         ..RenderCtx::new(
             ctx.theme,
             ctx.body_font.clone(),
@@ -1721,7 +1736,15 @@ pub(crate) fn block_element(ctx: &RenderCtx<'_>, idx: usize, block: &RenderedBlo
         // stacks blocks in a `gpui::list`, which IGNORES item margins (the old
         // `mb_2` produced no visible gap) — padding is part of the box the list
         // measures and stacks by. Source-file lines are exempt (one block/line).
-        row = row.pb(px(8.0 * ctx.text_scale) + paragraph_gap(ctx.text_scale));
+        row = row.pb(px(TYPE_SCALE.block_gap_px * ctx.text_scale) + paragraph_gap(ctx.text_scale));
+    }
+    // Vertical rhythm: a heading gets extra space ABOVE it (the block gap
+    // below it is the normal one), so it binds to the section it opens. Not
+    // on the first block — the column's own top padding suffices there.
+    if let RenderedBlock::Heading { level, .. } = block
+        && idx > 0
+    {
+        row = row.pt(px(TYPE_SCALE.heading_space_above(*level) * ctx.text_scale));
     }
     // Source-file lines: add a full-row background tint so the focused line
     // is unmistakable (the 3px bar alone is too subtle in a wall of code).
@@ -1746,6 +1769,80 @@ pub(crate) fn block_element(ctx: &RenderCtx<'_>, idx: usize, block: &RenderedBlo
     row.child(bar).child(content_col).into_any_element()
 }
 
+/// The copy button of a fenced code block in the Doc view (`None` elsewhere).
+/// The click resolves the block by its structural path in the tile's CURRENT
+/// `DocState` at event time (yux rule 4 — a cache-hit frame replays this
+/// listener, so it must not close over the block's text), writes the block's
+/// plain text to the clipboard and shows a transient "Copied".
+fn code_copy_button(ctx: &RenderCtx<'_>) -> Option<AnyElement> {
+    let copy = ctx.code_copy.as_ref()?;
+    let path = ctx.path.clone()?;
+    let weak = ctx.weak_view.clone()?;
+    let tile = copy.tile;
+    let copied = copy.copied.as_deref() == Some(&path);
+    let id = ctx.path_id("code-copy", &[])?;
+    let btn = div()
+        .id(SharedString::from(id.clone()))
+        .px_1()
+        .rounded_sm()
+        .cursor_pointer()
+        .hover(|s| s.bg(rgba(0xffffff14)))
+        .child(if copied { "Copied" } else { "Copy" })
+        // Keep the press from starting a Doc text selection underneath.
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(move |_, _, app| {
+            let path = path.clone();
+            let _ = weak.update(app, |view, cx| view.copy_doc_code_block(tile, &path, cx));
+        })
+        .into_any_element();
+    Some(if layout_probe_active() {
+        probe_bounds_dyn(id, btn)
+    } else {
+        btn
+    })
+}
+
+/// The block at structural `path` (as built by [`RenderCtx::nested`]:
+/// `[top, …]` then a child index per blockquote / footnote step, and
+/// `[item, content_block]` per list step).
+pub(crate) fn block_at_path<'b>(
+    blocks: &'b [RenderedBlock],
+    path: &[usize],
+) -> Option<&'b RenderedBlock> {
+    let (&first, mut rest) = path.split_first()?;
+    let mut b = blocks.get(first)?;
+    while !rest.is_empty() {
+        match b {
+            RenderedBlock::BlockQuote { blocks } | RenderedBlock::Footnote { blocks, .. } => {
+                b = blocks.get(rest[0])?;
+                rest = &rest[1..];
+            }
+            RenderedBlock::List { items, .. } => {
+                let (&item, &child) = (rest.first()?, rest.get(1)?);
+                b = items.get(item)?.content.get(child)?;
+                rest = &rest[2..];
+            }
+            _ => return None,
+        }
+    }
+    Some(b)
+}
+
+/// The plain text of a code block (its lines joined with `\n`), `None` for
+/// any other block.
+pub(crate) fn code_block_text(block: &RenderedBlock) -> Option<String> {
+    match block {
+        RenderedBlock::CodeBlock { lines, .. } => Some(
+            lines
+                .iter()
+                .map(|l| l.text_content())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        _ => None,
+    }
+}
+
 /// Prepend the literal markdown heading markers (`## ` for h2, `### ` for h3,
 /// …) to a heading's already-parsed styled line. pulldown strips the markers
 /// during parse, so this re-inserts them as a leading span carrying the heading
@@ -1768,14 +1865,9 @@ pub(crate) fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElem
         RenderedBlock::Heading { level, content } => {
             let lvl = (*level as usize).clamp(1, 6) - 1;
             let style = ctx.theme.heading[lvl];
-            let size_px = match level {
-                1 => 28.0,
-                2 => 24.0,
-                3 => 20.0,
-                4 => 18.0,
-                5 => 16.0,
-                _ => 15.0,
-            };
+            // The shared type scale (`yux/typography.rs`) — the WP editor
+            // sizes its headings from the same tokens.
+            let size_px = TYPE_SCALE.heading(*level);
             // Optionally prepend the literal markdown markers (`## `, `### `)
             // ahead of the rendered heading text — pulldown strips them during
             // parse, so we re-insert a span carrying the same heading style.
@@ -1787,11 +1879,11 @@ pub(crate) fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElem
             } else {
                 content
             };
-            div()
+            let el = div()
                 .text_size(px(size_px * ctx.text_scale))
+                .line_height(TYPE_SCALE.heading_leading())
                 .font_weight(FontWeight::BOLD)
                 .text_color(fg_or(style, DEFAULT_FG))
-                .pb_1()
                 .child(doc_styled_line_element(
                     ctx,
                     content,
@@ -1800,8 +1892,11 @@ pub(crate) fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElem
                     &ctx.body_font,
                     &ctx.code_font,
                     0,
-                ))
-                .into_any_element()
+                ));
+            match ctx.path_id("heading", &[]) {
+                Some(tag) if layout_probe_active() => probe_bounds_dyn(tag, el.into_any_element()),
+                _ => el.into_any_element(),
+            }
         }
         RenderedBlock::Paragraph { lines } => {
             // GPUI flex wraps long text inside a fixed-width container — but
@@ -1845,17 +1940,30 @@ pub(crate) fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElem
                 let bg = ctx.theme.code_block_bg;
                 col = col.p_2().rounded_md().bg(bg_or(bg, BG));
             }
-            if !*source_file
-                && let Some(lang) = language
-                && !lang.is_empty()
-            {
-                col = col.child(
-                    div()
-                        .text_color(rgb(0x6272a4))
-                        .text_size(px(11.0))
+            if !*source_file {
+                // Header strip, right-aligned and muted: the language label,
+                // plus (Doc view only) a copy button.
+                let lang = language.as_deref().filter(|l| !l.is_empty());
+                let copy = code_copy_button(ctx);
+                if lang.is_some() || copy.is_some() {
+                    let mut header = div()
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .items_center()
+                        .gap_2()
                         .pb_1()
-                        .child(format!("[{}]", lang)),
-                );
+                        .font_family(ctx.body_font.clone())
+                        .text_color(rgb(0x6272a4))
+                        .text_size(px(TYPE_SCALE.label_px));
+                    if let Some(lang) = lang {
+                        header = header.child(lang.to_string());
+                    }
+                    if let Some(copy) = copy {
+                        header = header.child(copy);
+                    }
+                    col = col.child(header);
+                }
             }
             let row_style = NStyle::default();
             if *source_file {
@@ -1949,19 +2057,43 @@ pub(crate) fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElem
         RenderedBlock::BlockQuote { blocks } => {
             let bar = ctx.theme.blockquote_bar;
             let txt = ctx.theme.blockquote_text;
+            // The quoted blocks take the rest of the row (`flex_1` +
+            // `min_w_0`), so long quoted text wraps inside the column instead
+            // of sizing the row to its unwrapped width.
             let mut content = div()
                 .flex()
                 .flex_col()
+                .flex_1()
+                .min_w_0()
                 .pl_3()
                 .text_color(fg_or(txt, DEFAULT_FG))
                 .italic();
             for (i, b) in blocks.iter().enumerate() {
                 content = content.child(block_inner(&ctx.nested(&[i]), b));
             }
+            // The left rule: fixed width (`flex_none`, or the row squeezes it
+            // to 0) and STRETCHED to the quote's height by the row's default
+            // cross-axis alignment (a `h_full` against the auto-height row
+            // resolved to 0 — the rule never painted).
+            let bar_el = div()
+                .w(px(3.0))
+                .flex_none()
+                .rounded_sm()
+                .bg(fg_or(bar, 0xffb86c))
+                .into_any_element();
+            let bar_el = match ctx.path_id("quote-bar", &[]) {
+                Some(tag) if layout_probe_active() => probe_bounds_dyn(tag, bar_el),
+                _ => bar_el,
+            };
+            let content = content.into_any_element();
+            let content = match ctx.path_id("quote-text", &[]) {
+                Some(tag) if layout_probe_active() => probe_bounds_dyn(tag, content),
+                _ => content,
+            };
             div()
                 .flex()
                 .flex_row()
-                .child(div().w(px(3.0)).h_full().bg(fg_or(bar, 0xffb86c)))
+                .child(bar_el)
                 .child(content)
                 .into_any_element()
         }
@@ -1980,6 +2112,24 @@ pub(crate) fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElem
                 .flex_col()
                 .gap(paragraph_gap(ctx.text_scale));
             let first = start.unwrap_or(1);
+            // Hanging markers: ONE gutter width for the whole list, sized to
+            // its widest marker (`9.` vs `10.`), so every item's text — and
+            // every wrapped continuation line — starts at the same x.
+            let widest = items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| {
+                    if !item.marker.is_empty() {
+                        item.marker.chars().count()
+                    } else if *ordered {
+                        format!("{}.", first + i as u64).chars().count()
+                    } else {
+                        1
+                    }
+                })
+                .max()
+                .unwrap_or(1);
+            let gutter = TYPE_SCALE.list_gutter(widest, ctx.text_scale);
             for (item_idx, item) in items.iter().enumerate() {
                 col = col.child(list_item_element(
                     ctx,
@@ -1988,6 +2138,7 @@ pub(crate) fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElem
                     *ordered,
                     first + item_idx as u64,
                     marker_style,
+                    gutter,
                 ));
             }
             col.into_any_element()
@@ -2101,6 +2252,7 @@ pub(crate) fn list_item_element(
     ordered: bool,
     counter: u64,
     marker_style: NStyle,
+    gutter: gpui::Pixels,
 ) -> AnyElement {
     let marker_fg = fg_or(marker_style, 0x50fa7b);
     // A GFM task item (`- [ ]` / `- [x]`) shows a checkbox INSTEAD of its
@@ -2116,7 +2268,6 @@ pub(crate) fn list_item_element(
                 "•".into()
             };
             div()
-                .min_w(px(24.0))
                 .flex_none()
                 .text_color(marker_fg)
                 .font_weight(FontWeight::BOLD)
@@ -2134,12 +2285,30 @@ pub(crate) fn list_item_element(
         content_col = content_col.child(block_inner(&ctx.nested(&[item_idx, bi]), b));
     }
 
+    // Hanging marker: the marker sits right-aligned in a fixed-width gutter
+    // (shared by the whole list), the item's blocks in their own column — so
+    // wrapped lines align with the text, never under the marker.
+    let marker_el = div()
+        .w(gutter)
+        .flex_none()
+        .flex()
+        .flex_row()
+        .justify_end()
+        .child(marker_el)
+        .into_any_element();
+    let (marker_el, content_col) = match ctx.path_id("li", &[item_idx]) {
+        Some(tag) if layout_probe_active() => (
+            probe_bounds_dyn(format!("{tag}-marker"), marker_el),
+            probe_bounds_dyn(format!("{tag}-text"), content_col.into_any_element()),
+        ),
+        _ => (marker_el, content_col.into_any_element()),
+    };
     div()
         .flex()
         .flex_row()
         .items_start()
         .w_full()
-        .gap_2()
+        .gap(TYPE_SCALE.list_marker_gap(ctx.text_scale))
         .child(marker_el)
         .child(content_col)
         .into_any_element()

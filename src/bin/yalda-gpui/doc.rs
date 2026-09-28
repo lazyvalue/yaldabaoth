@@ -58,6 +58,12 @@ pub(crate) struct DocState {
     /// Per tile (the old root-global sink mixed two Docs' lines). Read by the
     /// root's mouse handlers (`doc_pos_in`).
     pub(crate) line_layouts: DocLineLayouts,
+    /// The code block (structural path) whose copy button was just clicked —
+    /// the transient "Copied" label; cleared by a timer. UI state of this Doc,
+    /// set/cleared only by `copy_doc_code_block` (`doc_ui.rs`).
+    pub(crate) code_copied: Option<Rc<Vec<usize>>>,
+    /// Bumped on every `code_copied` change — a `DocSeqs` input.
+    pub(crate) code_copied_seq: u64,
 }
 
 /// Per-Doc mouse hit-test sink: `(block_idx, line_idx)` → painted `TextLayout`.
@@ -122,6 +128,8 @@ impl DocState {
             source,
             body: None,
             line_layouts: DocLineLayouts::default(),
+            code_copied: None,
+            code_copied_seq: 0,
         };
         d.reconcile_list();
         d
