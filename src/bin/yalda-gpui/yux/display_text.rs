@@ -64,13 +64,8 @@ pub(crate) fn display_lines(doc: &Document) -> Vec<String> {
         .collect()
 }
 
-/// Map a RAW char column on a raw line string to its DISPLAY column (after TAB
-/// expansion). Columns past the line end (the EOL caret) map 1:1 past the
-/// expanded end.
-pub(crate) fn display_col_in(raw_line: &str, raw_col: usize) -> usize {
-    display_col_of_chars(raw_line.chars(), raw_col)
-}
-
+/// RAW → DISPLAY column over a line's chars (TABs expanded). Columns past the
+/// line end (the EOL caret) map 1:1 past the expanded end.
 fn display_col_of_chars(chars: impl Iterator<Item = char>, raw_col: usize) -> usize {
     let mut seen = 0usize;
     let mut disp = 0usize;
@@ -132,7 +127,7 @@ mod tests {
         assert_eq!(display_col(&doc, 0, 3), 9);
         // EOL caret (one past the last char) maps past the expanded end.
         assert_eq!(display_col(&doc, 0, 4), 10);
-        assert_eq!(display_col_in("x\ty", 2), 5);
+        assert_eq!(display_col_of_chars("x\ty".chars(), 2), 5);
         assert_eq!(
             display_selection(&doc, Some(((0, 1), (0, 3)))),
             Some(((0, 4), (0, 9)))
