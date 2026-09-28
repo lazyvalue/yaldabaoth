@@ -48,16 +48,16 @@ Primary code homes are `telemetry/`, `agent_stats_view.rs`, and
 **Statement.** The jump panel's System section contains an **Agent stats** row
 directly beside **System console**, and Cmd-P contains one matching **Agent
 stats** target. Both entry points call the same open-or-focus transition. The
-first activation creates one Detached Agent Stats tile and presents it solo;
-later activations focus that tile wherever it is attached, hidden, or Detached.
-No activation creates a duplicate or changes the active workspace layout.
+first activation creates one Agent Stats tile as a new tile in the active
+workspace (ADR-0039 / `UXI-Workspace-30`: every tile belongs to a workspace);
+later activations focus that tile wherever it lives, visible or hidden. No
+activation creates a duplicate.
 
 **Applies to.** `App::AgentStats`, `open_agent_stats`,
 `render_jump_panel`, `PaletteTarget::AgentStats`, and
 `activate_jump_palette_selection`.
 
-**Why.** A global monitor must stay reachable without consuming a workspace
-slot, and two global navigation surfaces must not create two copies of the same
+**Why.** A global monitor must stay reachable from every workspace, and two global navigation surfaces must not create two copies of the same
 stateful monitor.
 
 **Status.** `implemented`

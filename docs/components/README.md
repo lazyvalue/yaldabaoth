@@ -45,13 +45,14 @@ holds the detail for a slice. The UXI ids stay owned by the component, not the f
 - [diff.md](diff.md) — `Diff` (read-only diff-review tile: hash-keyed review
   marks, comment→steering, two-layer merge gate). `UXI-Diff-1..9`.
 - [cog.md](cog.md) — `Cog` (read-only Cog graph explorer tile). `UXI-Cog-1..11`.
-- [jump-panel.md](jump-panel.md) — `JumpPanel`. `UXI-JumpPanel-1..25` (the
-  sidebar navigator, its `Cmd-P` fuzzy palette `UXI-JumpPanel-9`, and the
-  workspace-attached / tag-grouped Detached tree in `UXI-JumpPanel-23/-25`).
+- [jump-panel.md](jump-panel.md) — `JumpPanel`. `UXI-JumpPanel-1..32` (the
+  sidebar navigator of workspaces and their tiles, and its `Cmd-P` fuzzy
+  palette `UXI-JumpPanel-9`, which also reaches tile-less sessions).
 - [workspace.md](workspace.md) — `Workspace` (the infinite-plane model: signed
   all-directions slot grid + pan/semantic-zoom camera + reset-to-origin;
-  layout-mode/split surface retired; attachment independent of visibility;
-  workspace close detaches tiles and never quits). `UXI-Workspace-1..24`.
+  layout-mode/split surface retired; every tile belongs to one workspace,
+  visible or hidden; workspace close retires its tiles and never quits).
+  `UXI-Workspace-1..30`.
 - [project.md](project.md) — `Project` (top-level org primitive: name+cwd-keyed
   store, workspaces/sessions hold a `ProjectId` FK, `Frame → Project → Workspace →
   Window`). `UXI-Project-1..8` — all implemented (ADR-0028).
@@ -70,22 +71,22 @@ holds the detail for a slice. The UXI ids stay owned by the component, not the f
 The vocabulary component specs are written in. These are the user's words — prefer
 them in specs, code comments, and UI copy over ad-hoc synonyms.
 
-- **attached tile** — a durable tile owned by exactly one workspace. It is
-  either **visible** in that workspace's layout or **hidden** while retaining
-  its workspace association.
-- **Detached tile** — a durable tile outside every workspace. It keeps its
-  `WindowId`, App state, project, and tags; it is directly reachable from the
-  jump panel and Cmd-P and can later be attached without recreation (ADR-0034).
+- **workspace ownership** — every durable tile is owned by exactly one
+  workspace (ADR-0039). There is no tile outside a workspace.
+- **visible / hidden** — a tile is either **visible** in its workspace's layout
+  or **hidden** while retaining its workspace ownership.
 - **empty Agent tile** — an Agent tile with no session selected (the picker).
   This replaces the old overloaded phrase “unbound Agent tile.”
-- **solo tile presentation** — focusing a Detached or attached-hidden tile in
-  the content area without changing attachment or visibility. It is navigation
+- **solo tile presentation** — focusing a hidden tile in the content area
+  without changing ownership or visibility. It is navigation
   state, not an ephemeral workspace.
 
 The old terms **bound tile**, **unbound tile**, **direct unbound view**,
-**scratchpad**, **stash**, **free session**, and **bare agent view** are retired. Agent
-sessions remain project-owned runtime entities, but every navigable roster
-session is represented by one stable Agent tile, either Attached or Detached.
+**scratchpad**, **stash**, **free session**, **bare agent view**, and
+**Detached tile** are retired. Agent sessions remain project-owned runtime
+entities; a server session no tile shows has no tile and is reached through
+Cmd-P or an Agent tile's session selector, which open it in its project's
+workspace (`UXI-Workspace-30`).
 
 ## Format of a component spec
 

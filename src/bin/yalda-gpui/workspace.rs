@@ -230,19 +230,6 @@ impl<C> Layout<C> {
         self.for_each_leaf(&mut |w| out.push(w.id));
         out
     }
-
-    /// Consume a layout into its leaves in tree order.
-    fn into_leaves(self, out: &mut Vec<Window<C>>) {
-        match self {
-            Layout::Empty => {}
-            Layout::Leaf(window) => out.push(window),
-            Layout::Split { children, .. } => {
-                for (_, child) in children {
-                    child.into_leaves(out);
-                }
-            }
-        }
-    }
 }
 
 /// Normalize a vector of weights so they sum to 1.0. If the sum is zero or
@@ -1380,22 +1367,6 @@ pub fn slot_at(point: (f32, f32), tile: (f32, f32), gutter: f32) -> Slot {
 /// A set of user-assigned tag names.
 pub type TagSet = BTreeSet<String>;
 
-/// A tile outside every workspace. Detachment is a complete placement state;
-/// visibility is intentionally absent because a Detached tile cannot be hidden.
-pub struct DetachedTile<C> {
-    pub window: Window<C>,
-}
-
-impl<C> DetachedTile<C> {
-    fn new(window: Window<C>) -> Self {
-        Self { window }
-    }
-
-    pub fn project(&self) -> ProjectId {
-        self.window.project()
-    }
-}
-
 /// A hidden tile remains owned by its workspace while its window is absent from
 /// the visible layout. The previous plane footprint is only a restoration hint:
 /// visible tiles may occupy it while this tile is hidden (ADR-0034).
@@ -1419,29 +1390,28 @@ pub enum AttachedVisibility {
     Hidden,
 }
 
-/// The exclusive placement classification for a live tile (ADR-0034).
+/// The placement classification for a live tile. Every tile is owned by
+/// exactly one workspace (ADR-0039); only its visibility there varies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TileMembership {
     Attached {
         workspace: usize,
         visibility: AttachedVisibility,
     },
-    Detached,
 }
 
-/// A temporary solo presentation can name only a tile whose normal owner does
-/// not currently paint it. The variant records why the tile is eligible; the
-/// ownership validator rejects a target whose live membership disagrees.
+/// A temporary solo presentation can name only a hidden tile — one whose
+/// owning workspace does not currently paint it. The ownership validator
+/// rejects a target whose live membership disagrees.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SoloPresentation {
-    Detached(WindowId),
     HiddenAttached(WindowId),
 }
 
 impl SoloPresentation {
     pub fn window_id(self) -> WindowId {
         match self {
-            Self::Detached(id) | Self::HiddenAttached(id) => id,
+            Self::HiddenAttached(id) => id,
         }
     }
 }
@@ -1489,8 +1459,7 @@ pub struct Workspace<C> {
     /// User-set display name. `None` means render `auto_name`.
     pub display_name: Option<String>,
     /// Attached tiles excluded from the visible layout. Keeping the complete
-    /// window here makes attachment structurally workspace-owned; there is no
-    /// boolean that could accidentally create a Detached + hidden tile.
+    /// window here makes attachment structurally workspace-owned.
     pub hidden_tiles: Vec<HiddenTile<C>>,
     pub layout: Layout<C>,
     pub focused: WindowId,
@@ -1832,9 +1801,7 @@ pub struct FileBuffer {
 pub struct Frame<C> {
     pub workspaces: Vec<Workspace<C>>,
     pub active_workspace: usize,
-    /// Stable tiles associated with no workspace, in user-visible Detached order.
-    pub detached_tiles: Vec<DetachedTile<C>>,
-    /// Non-owning navigation state for a Detached or attached-hidden tile.
+    /// Non-owning navigation state for an attached-hidden tile.
     /// The enum makes the eligibility reason explicit and validation catches a
     /// stale target after any ownership transition.
     pub solo_presentation: Option<SoloPresentation>,
@@ -1882,7 +1849,6 @@ impl<C> Frame<C> {
         Self {
             workspaces: Vec::new(),
             active_workspace: 0,
-            detached_tiles: Vec::new(),
             solo_presentation: None,
             file_buffers: HashMap::new(),
             path_index: HashMap::new(),
@@ -2010,23 +1976,22 @@ impl<C> Frame<C> {
         self.push_initial_workspace(content, project)
     }
 
-    /// Close the workspace at `idx`, moving every attached tile to Detached
-    /// without recreating it (ADR-0034). The sole durable workspace is a floor
-    /// and cannot be closed.
+    /// Close the workspace at `idx`, retiring every tile it owns, visible or
+    /// hidden (ADR-0039) — exactly like closing each tile; Agent sessions keep
+    /// running on the server. The sole durable workspace is a floor and cannot
+    /// be closed.
     pub fn close_workspace(&mut self, idx: usize) {
         if idx >= self.workspaces.len() || self.workspaces.len() <= 1 {
             return;
         }
         let removed = self.workspaces.remove(idx);
-        let project = removed.project();
-        let mut windows = Vec::new();
-        removed.layout.into_leaves(&mut windows);
-        windows.extend(removed.hidden_tiles.into_iter().map(|tile| tile.window));
-        self.detached_tiles
-            .extend(windows.into_iter().map(|window| {
-                assert_eq!(window.project(), project);
-                DetachedTile::new(window)
-            }));
+        if self
+            .solo_presentation
+            .is_some_and(|p| self.tile_membership(p.window_id()).is_none())
+        {
+            self.solo_presentation = None;
+        }
+        drop(removed);
         if self.active_workspace >= self.workspaces.len() {
             self.active_workspace = self.workspaces.len().saturating_sub(1);
         } else if idx < self.active_workspace {
@@ -2150,27 +2115,39 @@ impl<C> Frame<C> {
         id
     }
 
-    /// Create a stable tile outside every workspace and return its id.
-    pub fn push_detached(&mut self, content: C, project: ProjectId) -> WindowId {
+    /// Place a NEW tile of `project` visibly and focus it (ADR-0039): in the
+    /// active workspace when it belongs to `project` (or in the owning
+    /// workspace of a solo-presented hidden tile of `project`), else in the
+    /// project's first durable workspace, else in a new workspace for the
+    /// project. Clears any solo presentation. Returns the new tile's id.
+    pub fn open_tile_in_project(&mut self, content: C, project: ProjectId) -> WindowId {
+        let solo_owner = self
+            .solo_presentation
+            .and_then(|p| self.workspace_index_of_window(p.window_id()));
+        let target = solo_owner
+            .or(Some(self.active_workspace))
+            .filter(|&i| {
+                self.workspaces
+                    .get(i)
+                    .is_some_and(|w| !w.ephemeral && w.project() == project)
+            })
+            .or_else(|| {
+                self.workspaces
+                    .iter()
+                    .position(|w| !w.ephemeral && w.project() == project)
+            });
+        let Some(target) = target else {
+            return self.push_initial_workspace(content, project);
+        };
         let id = self.alloc_window_id();
-        self.detached_tiles
-            .push(DetachedTile::new(Window::new(id, project, content)));
+        self.solo_presentation = None;
+        self.insert_leaf_into_workspace(target, Window::new(id, project, content))
+            .expect("target workspace was validated above");
+        let leaves = self.workspaces[target].layout.leaf_ids();
+        self.workspaces[target].desktop.reconcile_near(&leaves, Some(id));
+        self.workspaces[target].focused = id;
+        self.set_active_workspace(target);
         id
-    }
-
-    /// Restore a fully-formed stable tile into the Detached ownership domain.
-    /// This is the only restore insertion boundary and refuses duplicate ids.
-    pub(crate) fn insert_restored_detached(
-        &mut self,
-        window: Window<C>,
-    ) -> Result<(), PlaceWindowError> {
-        let id = window.id;
-        if self.tile_membership(id).is_some() {
-            return Err(PlaceWindowError::DuplicateWindowId(id));
-        }
-        self.next_window_id = self.next_window_id.max(id.saturating_add(1));
-        self.detached_tiles.push(DetachedTile::new(window));
-        Ok(())
     }
 
     /// Restore a fully-formed tile as hidden under an existing workspace.
@@ -2206,9 +2183,6 @@ impl<C> Frame<C> {
     /// agrees with the reconstructed ownership graph.
     pub(crate) fn restore_solo_presentation(&mut self, presentation: SoloPresentation) -> bool {
         let valid = match presentation {
-            SoloPresentation::Detached(id) => {
-                self.tile_membership(id) == Some(TileMembership::Detached)
-            }
             SoloPresentation::HiddenAttached(id) => matches!(
                 self.tile_membership(id),
                 Some(TileMembership::Attached {
@@ -2221,32 +2195,19 @@ impl<C> Frame<C> {
         valid
     }
 
-    /// Classify a tile by its exclusive placement owner.
+    /// Classify a tile by its owning workspace and visibility there.
     pub fn tile_membership(&self, id: WindowId) -> Option<TileMembership> {
         if let Some(workspace) = self.visible_workspace_index_of_window(id) {
-            debug_assert!(
-                !self.detached_tiles.iter().any(|t| t.window.id == id),
-                "tile {id} cannot be both attached and detached"
-            );
             return Some(TileMembership::Attached {
                 workspace,
                 visibility: AttachedVisibility::Visible,
             });
         }
-        if let Some(workspace) = self.hidden_workspace_index_of_window(id) {
-            debug_assert!(
-                !self.detached_tiles.iter().any(|t| t.window.id == id),
-                "tile {id} cannot be both attached and detached"
-            );
-            return Some(TileMembership::Attached {
+        self.hidden_workspace_index_of_window(id)
+            .map(|workspace| TileMembership::Attached {
                 workspace,
                 visibility: AttachedVisibility::Hidden,
-            });
-        }
-        self.detached_tiles
-            .iter()
-            .any(|t| t.window.id == id)
-            .then_some(TileMembership::Detached)
+            })
     }
 
     /// Validate the complete exclusive-placement graph without relying on
@@ -2293,16 +2254,8 @@ impl<C> Frame<C> {
                 });
             }
         }
-        for tile in &self.detached_tiles {
-            if !ids.insert(tile.window.id) {
-                return Err(OwnershipViolation::DuplicateWindowId(tile.window.id));
-            }
-        }
         if let Some(presentation) = self.solo_presentation {
             let matches = match presentation {
-                SoloPresentation::Detached(id) => {
-                    self.tile_membership(id) == Some(TileMembership::Detached)
-                }
                 SoloPresentation::HiddenAttached(id) => matches!(
                     self.tile_membership(id),
                     Some(TileMembership::Attached {
@@ -2318,60 +2271,40 @@ impl<C> Frame<C> {
         Ok(())
     }
 
-    /// Find a tile across both ownership domains.
+    /// Find a tile in any workspace, visible or hidden.
     pub fn tile(&self, id: WindowId) -> Option<&Window<C>> {
-        self.workspaces
-            .iter()
-            .find_map(|wsp| {
-                wsp.layout.find_leaf(id).or_else(|| {
-                    wsp.hidden_tiles
-                        .iter()
-                        .find(|tile| tile.window.id == id)
-                        .map(|tile| &tile.window)
-                })
-            })
-            .or_else(|| {
-                self.detached_tiles
+        self.workspaces.iter().find_map(|wsp| {
+            wsp.layout.find_leaf(id).or_else(|| {
+                wsp.hidden_tiles
                     .iter()
                     .find(|tile| tile.window.id == id)
                     .map(|tile| &tile.window)
             })
+        })
     }
 
-    /// Mutably find a tile across both ownership domains.
+    /// Mutably find a tile in any workspace, visible or hidden.
     pub fn tile_mut(&mut self, id: WindowId) -> Option<&mut Window<C>> {
         if let Some(workspace) = self.visible_workspace_index_of_window(id) {
             return self.workspaces[workspace].layout.find_leaf_mut(id);
         }
-        if let Some(workspace) = self.hidden_workspace_index_of_window(id) {
-            return self.workspaces[workspace]
-                .hidden_tiles
-                .iter_mut()
-                .find(|tile| tile.window.id == id)
-                .map(|tile| &mut tile.window);
-        }
-        self.detached_tiles
+        let workspace = self.hidden_workspace_index_of_window(id)?;
+        self.workspaces[workspace]
+            .hidden_tiles
             .iter_mut()
             .find(|tile| tile.window.id == id)
             .map(|tile| &mut tile.window)
     }
 
-    /// Project of a tile, derived from its workspace while attached and retained
-    /// explicitly while Detached.
+    /// Project of a tile — its owning workspace's.
     pub fn tile_project(&self, id: WindowId) -> Option<ProjectId> {
-        if let Some(workspace) = self.workspace_index_of_window(id) {
-            return self.workspaces.get(workspace).map(Workspace::project);
-        }
-        self.detached_tiles
-            .iter()
-            .find(|tile| tile.window.id == id)
-            .map(DetachedTile::project)
+        let workspace = self.workspace_index_of_window(id)?;
+        self.workspaces.get(workspace).map(Workspace::project)
     }
 
-    /// Present a Detached or attached-hidden tile alone without changing its state.
+    /// Present an attached-hidden tile alone without changing its state.
     pub fn present_solo(&mut self, id: WindowId) -> bool {
         self.solo_presentation = match self.tile_membership(id) {
-            Some(TileMembership::Detached) => Some(SoloPresentation::Detached(id)),
             Some(TileMembership::Attached {
                 visibility: AttachedVisibility::Hidden,
                 ..
@@ -2395,24 +2328,9 @@ impl<C> Frame<C> {
             Some(TileMembership::Attached {
                 visibility: AttachedVisibility::Hidden,
                 ..
-            })
-            | Some(TileMembership::Detached) => self.present_solo(id),
+            }) => self.present_solo(id),
             None => false,
         }
-    }
-
-    /// Retire one Detached tile through the ownership boundary, clearing any
-    /// solo presentation atomically.
-    pub(crate) fn remove_detached_window(&mut self, id: WindowId) -> Option<Window<C>> {
-        let position = self
-            .detached_tiles
-            .iter()
-            .position(|tile| tile.window.id == id)?;
-        let removed = self.detached_tiles.remove(position).window;
-        if self.solo_presentation.map(SoloPresentation::window_id) == Some(id) {
-            self.solo_presentation = None;
-        }
-        Some(removed)
     }
 
     pub fn clear_solo_presentation(&mut self) {
@@ -2422,9 +2340,6 @@ impl<C> Frame<C> {
     pub fn presented_tile(&self) -> Option<SoloPresentation> {
         self.solo_presentation
             .filter(|presentation| match *presentation {
-                SoloPresentation::Detached(id) => {
-                    self.tile_membership(id) == Some(TileMembership::Detached)
-                }
                 SoloPresentation::HiddenAttached(id) => matches!(
                     self.tile_membership(id),
                     Some(TileMembership::Attached {
@@ -2433,51 +2348,6 @@ impl<C> Frame<C> {
                     })
                 ),
             })
-    }
-
-    /// Detach a tile from its workspace. Hidden state is cleared by moving the
-    /// complete window into the frame-owned Detached collection.
-    pub fn detach_window(&mut self, id: WindowId) -> Result<(), ()> {
-        let (source, visibility) = match self.tile_membership(id) {
-            Some(TileMembership::Attached {
-                workspace,
-                visibility,
-            }) => (workspace, visibility),
-            _ => return Err(()),
-        };
-        let project = self.workspaces[source].project();
-        self.solo_presentation = None;
-        let window = match visibility {
-            AttachedVisibility::Visible => {
-                let old_active = self.active_workspace;
-                self.active_workspace = source;
-                self.workspaces[source].focused = id;
-                let (window, source_empty) = self.detach_focused()?;
-                if source_empty {
-                    self.workspaces[source].focused = 0;
-                }
-                self.active_workspace = old_active;
-                window
-            }
-            AttachedVisibility::Hidden => {
-                let position = self.workspaces[source]
-                    .hidden_tiles
-                    .iter()
-                    .position(|tile| tile.window.id == id)
-                    .ok_or(())?;
-                self.workspaces[source].hidden_tiles.remove(position).window
-            }
-        };
-        if visibility == AttachedVisibility::Visible {
-            let leaves = self.workspaces[source].layout.leaf_ids();
-            self.workspaces[source].desktop.reconcile(&leaves);
-        }
-        debug_assert!(self.tile_membership(id).is_none());
-        debug_assert_eq!(window.project(), project);
-        self.detached_tiles.push(DetachedTile::new(window));
-        self.solo_presentation = Some(SoloPresentation::Detached(id));
-        debug_assert_eq!(self.tile_membership(id), Some(TileMembership::Detached));
-        Ok(())
     }
 
     /// Hide a visible attached tile while retaining its workspace owner.
@@ -2545,88 +2415,6 @@ impl<C> Frame<C> {
         Ok(())
     }
 
-    /// Move a Detached tile into a same-project workspace, preserving its
-    /// complete identity, content, and tags.
-    pub fn attach_detached(&mut self, id: WindowId, workspace: usize) -> Result<(), ()> {
-        let target_project = self.workspaces.get(workspace).ok_or(())?.project();
-        let pos = self
-            .detached_tiles
-            .iter()
-            .position(|tile| tile.window.id == id)
-            .ok_or(())?;
-        if self.detached_tiles[pos].project() != target_project {
-            return Err(());
-        }
-        if self.workspace_index_of_window(id).is_some() {
-            return Err(());
-        }
-        let tile = self.detached_tiles.remove(pos);
-        // The target index was validated above and no structural mutation can
-        // invalidate it between these lines.
-        self.insert_leaf_into_workspace(workspace, tile.window)
-            .expect("validated workspace index must remain present");
-        let leaves = self.workspaces[workspace].layout.leaf_ids();
-        self.workspaces[workspace].desktop.reconcile(&leaves);
-        self.set_active_workspace(workspace);
-        debug_assert_eq!(
-            self.tile_membership(id),
-            Some(TileMembership::Attached {
-                workspace,
-                visibility: AttachedVisibility::Visible,
-            })
-        );
-        Ok(())
-    }
-
-    /// Replace one attached layout leaf with an existing Detached tile. This is the
-    /// placement primitive for choosing a durable Detached tile from a temporary
-    /// in-workspace picker: the durable tile keeps its id, state, and tags while
-    /// taking the picker's exact layout slot, and the temporary leaf is retired.
-    pub fn replace_attached_with_detached(
-        &mut self,
-        attached: WindowId,
-        detached: WindowId,
-    ) -> Result<(), ()> {
-        let workspace = self.visible_workspace_index_of_window(attached).ok_or(())?;
-        let target_project = self.workspaces.get(workspace).ok_or(())?.project();
-        let pos = self
-            .detached_tiles
-            .iter()
-            .position(|tile| tile.window.id == detached)
-            .ok_or(())?;
-        if self.workspace_index_of_window(detached).is_some()
-            || self.detached_tiles[pos].project() != target_project
-            || self.workspaces[workspace]
-                .layout
-                .path_to(attached)
-                .is_none()
-        {
-            return Err(());
-        }
-
-        let replacement = self.detached_tiles.remove(pos).window;
-        let leaf = self.workspaces[workspace]
-            .layout
-            .find_leaf_mut(attached)
-            .expect("validated attached leaf must remain present");
-        *leaf = replacement;
-        self.workspaces[workspace].focused = detached;
-        let leaves = self.workspaces[workspace].layout.leaf_ids();
-        self.workspaces[workspace].desktop.reconcile(&leaves);
-        self.solo_presentation = None;
-        self.set_active_workspace(workspace);
-
-        debug_assert!(self.tile_membership(attached).is_none());
-        debug_assert_eq!(
-            self.tile_membership(detached),
-            Some(TileMembership::Attached {
-                workspace,
-                visibility: AttachedVisibility::Visible,
-            })
-        );
-        Ok(())
-    }
-
     /// Move a complete attached tile between same-project workspaces. When the
     /// source's last tile moves, its workspace is removed and the destination
     /// necessarily becomes active even for a no-follow send.
@@ -2681,8 +2469,8 @@ impl<C> Frame<C> {
     }
 
     /// Send any live tile to a workspace through one exhaustive membership
-    /// transition. Hidden attachment is cleared at the destination; Detached
-    /// and hidden sends are validated before removing the source owner.
+    /// transition. Hidden attachment is cleared at the destination; hidden
+    /// sends are validated before removing the source owner.
     pub fn send_tile_to_workspace(
         &mut self,
         id: WindowId,
@@ -2698,14 +2486,6 @@ impl<C> Frame<C> {
                 visibility: AttachedVisibility::Visible,
                 ..
             } => self.move_attached_to_workspace(id, target, follow),
-            TileMembership::Detached => {
-                let old_active = self.active_workspace;
-                self.attach_detached(id, target)?;
-                if !follow {
-                    self.set_active_workspace(old_active);
-                }
-                Ok(())
-            }
             TileMembership::Attached {
                 workspace: source,
                 visibility: AttachedVisibility::Hidden,
@@ -2756,15 +2536,6 @@ impl<C> Frame<C> {
     pub fn workspace_index_of_window(&self, id: WindowId) -> Option<usize> {
         self.visible_workspace_index_of_window(id)
             .or_else(|| self.hidden_workspace_index_of_window(id))
-    }
-
-    /// Legacy snapshot compatibility needs the direct Detached target without
-    /// conflating it with a hidden-attached solo presentation.
-    pub fn presented_detached_tile_id(&self) -> Option<WindowId> {
-        match self.presented_tile() {
-            Some(SoloPresentation::Detached(id)) => Some(id),
-            _ => None,
-        }
     }
 
     /// The workspace a dismissal should land on to STAY IN `project`
@@ -3100,9 +2871,6 @@ impl<C> Frame<C> {
         if let Some(presentation) = self.solo_presentation {
             let focused = presentation.window_id();
             match presentation {
-                SoloPresentation::Detached(_) => {
-                    self.remove_detached_window(focused).ok_or(())?;
-                }
                 SoloPresentation::HiddenAttached(_) => {
                     let workspace = self.hidden_workspace_index_of_window(focused).ok_or(())?;
                     let position = self.workspaces[workspace]
@@ -3371,7 +3139,6 @@ impl<C> Frame<C> {
                 out.extend(wsp.hidden_tiles.iter().map(|tile| tile.window.id));
             });
         }
-        out.extend(self.detached_tiles.iter().map(|tile| tile.window.id));
         out
     }
 

@@ -13,7 +13,7 @@ O(workspaces + tiles)), not cached. Primary code home:
 `jump_panel_view.rs`.
 
 **Palette.** Two header tiers, distinct hues: top-level section headers
-("SYSTEM CONSOLE" / "WORKSPACES" / "DETACHED") are **red** (`DetailStyle.err`,
+("SYSTEM CONSOLE" / "WORKSPACES") are **red** (`DetailStyle.err`,
 `0xff6b6b`, bold uppercase); per-cwd subheaders are **electric blue** (`0x3b9eff`,
 real path casing). Operational state uses two literal hues: **orange = working**
 and **green = ready for input**. The "you are here" active mark and selected tabs
@@ -40,28 +40,32 @@ Sections:
     `ctrl-<n>` jumps to (INV-UX-11).
   - Folder click folds/unfolds. A visible-tile click selects its workspace and
     focuses that tile; a hidden-tile click presents it alone without unhiding it.
-- **Detached** — only tiles outside every workspace, retaining the existing
-  activity tabs, tag folders, status, provider, ordering, and archive signals
-  where the tile is an Agent.
-  - **＋ New agent session** creates a Detached Agent tile and session.
-  - **Status dot** = what the AGENT is doing (INV-UX-10, UXI-JumpPanel-6) — the
+  - Agent tile rows carry the activity status, provider, and archive signals.
+    **Status dot** = what the AGENT is doing (INV-UX-10, UXI-JumpPanel-6) — the
     shape + color are one signal, not binding:
     - **● orange** — working (a reply is in flight).
     - **● green** — connected and idle → **ready for input / your turn**.
     - **○ dim** — disconnected or connecting. The whole row is also dimmed.
-  - Click → presents the Detached tile alone without attaching it.
   - The row corresponding to the **focused tile** carries a left accent bar
     (`UXI-JumpPanel-5`) — "this is where you are."
 
+The panel lists **only workspaces and their tiles** (ADR-0039). There is no
+Detached section, no tile tag folders, and no Detached ordering preference. A
+server session that no tile shows has no row here; it is reached through
+**Cmd-P** (`UXI-JumpPanel-9`) or an Agent tile's session selector, which open it
+as a tile in its project's workspace (`UXI-Workspace-30`).
+
 ## References
 
-- `docs/components/README.md` § Terminology — attached/detached ownership,
-  attached visibility, and solo presentation.
+- `docs/components/README.md` § Terminology — workspace ownership, visible /
+  hidden, and solo presentation.
 - `docs/specs/spec-jump-panel.md` — deeper design doc.
 - ADR-0033 — optional workspace ownership; supersedes ADR-0021's ephemeral
   virtual-workspace navigation.
 - ADR-0034 — attachment independent of visibility; Attached/Detached vocabulary
-  and typed solo presentation.
+  and typed solo presentation. Its Detached state is superseded by ADR-0039.
+- ADR-0039 — every tile belongs to a workspace; the Detached section, its tag
+  folders, and its ordering preference are removed (`UXI-Workspace-30`).
 - Migrated from `docs/ux-invariants.md` INV-UX-10, INV-UX-18. Those entries are
   now `→ migrated here`.
 
@@ -189,6 +193,12 @@ both mid-open and post-bind (negative controls observed RED on each arm).
 > `free_agent_cwd_overlay_*` are replaced by `global_cwd_session_overlay_is_gone`
 > (entry point removed) and `jump_panel_renders_per_project_sections` (per-project
 > ＋ rows).
+>
+> **Amended by `UXI-Workspace-30` / ADR-0039.** There is no free/Detached
+> projection and no ephemeral workspace: a newly created session opens as a tile
+> in its project's workspace (active workspace if same project, else the
+> project's first workspace, else a new one). A session with no tile is reached
+> via Cmd-P or the Agent tile session selector, not a panel row.
 
 **Statement.** The jump panel's "Agent sessions" section leads with a **＋ New
 agent session** action row. Clicking it creates an agent session bound to **no
@@ -250,6 +260,9 @@ _Note: as of UXI-JumpPanel-4 both entry points open a cwd overlay first; the cre
 > (`RenameTarget::FreeAgentSessionCwd` / `AgentNewSessionCwd`) and their commit
 > arms are deleted. The cwd is chosen once, when the **project** is created
 > (`UXI-Project-4`'s NEW PROJECT overlay).
+>
+> **See also `UXI-Workspace-30` / ADR-0039.** No free/Detached session state
+> remains; a new session opens as a tile in its project's workspace.
 
 **Statement.** Both free-session entry points (the jump-panel **＋ New agent
 session** row and the `?` menu "new agent session") do NOT spawn immediately.
@@ -573,6 +586,13 @@ the per-project menu is its natural, precise home. Placement is stored as a clam
 needed in the render).
 
 ### UXI-JumpPanel-9 — `Cmd-P` opens a fuzzy jump palette over the same list the panel shows
+
+> **Amended by `UXI-Workspace-30` / ADR-0039.** Besides the panel's workspaces
+> and tiles, Cmd-P also lists every **live, non-archived server session that no
+> tile shows**. Activating one opens it as a new focused tile in a workspace of
+> its project — the active workspace if it belongs to that project, else the
+> project's first workspace, else a new workspace for the project. Ephemeral
+> workspaces play no part in Cmd-P activation.
 
 **Statement.** `Cmd-P` opens a centered **jump palette** — a type-to-filter dialog
 over the *same* navigable set the sidebar projects: every **non-ephemeral
@@ -1004,6 +1024,11 @@ its internal vertical and horizontal hairlines.
 > **Panel-superseded by `UXI-JumpPanel-32`.** Archive remains a durable lifecycle
 > and session-menu action, but archived sessions no longer have a sidebar-only tab.
 >
+> **Amended by `UXI-Workspace-30` / ADR-0039.** Archiving returns every tile
+> showing the session to its session picker in place; it never detaches or moves
+> the tile. (The Archived-tab “bare ephemeral agent view” revisit below went
+> with the Archived tab under `UXI-JumpPanel-32`.)
+>
 **Statement.** Archiving is a durable server-owned lifecycle state on a
 server-backed agent session, not a third operational activity:
 
@@ -1252,7 +1277,8 @@ ephemeral view.
 
 **Superseded by `UXI-JumpPanel-23` / ADR-0033.** The folder behavior survives,
 but groups unbound **tiles** by tile-local tags rather than grouping all
-sessions by session-sidecar metadata.
+sessions by session-sidecar metadata. Tag folders are removed entirely by
+`UXI-Workspace-30` / ADR-0039.
 
 **Statement.** A session carries a set of user-assigned **tags** (`UXI-AgentTile-33`),
 keyed by server sid in the id-keyed `session_tags.json` sidecar. Within a project's
@@ -1329,7 +1355,8 @@ folder glyph/indent is harness gap #1.
 ### UXI-JumpPanel-21 — SUPERSEDED: session-tag folders reorder and fold
 
 **Superseded by `UXI-JumpPanel-23` / ADR-0033.** Order and fold persistence
-carry forward for the Unbound tile tag folders.
+carry forward for the Unbound tile tag folders. Tag folders (and their order /
+fold preferences) are removed entirely by `UXI-Workspace-30` / ADR-0039.
 
 **Statement.** Tag folders are user-curated like the project sections
 (`UXI-JumpPanel-2`, `-13`):
@@ -1427,6 +1454,8 @@ the trailing mark returned the guard to green.
 
 > **Superseded by `UXI-JumpPanel-25` / ADR-0034.** Workspace folders now include
 > visible and hidden Attached tiles, while Detached replaces Unbound.
+> Detached (and with it the out-of-workspace list, its tag folders, and roster
+> materialization) is in turn removed by `UXI-Workspace-30` / ADR-0039.
 
 **Statement.** The jump panel and Cmd-P project the frame's exclusive tile
 ownership:
@@ -1468,6 +1497,10 @@ ownership/Cmd-P/jump-panel mutants were caught (Cog graph `9k2`).
 
 ### UXI-JumpPanel-24 — Tagged navigation keeps fixed chrome typography
 
+> **Superseded by `UXI-Workspace-30` / ADR-0039.** Tile tags no longer drive a
+> sidebar folder view, so there are no tag-folder headers to style. The general
+> fixed-chrome typography rule for jump rows still holds.
+
 **Statement.** Tag folders and the tile rows nested beneath them use explicit,
 fixed jump-panel typography. A tag-folder header uses the panel's compact
 monospace subheader size; tagged tile rows use the same 13px monospace navigation
@@ -1491,7 +1524,12 @@ drives the production tagged and untagged Unbound paint paths, compares their
 real bounds to the standard jump navigation row, then changes document zoom and
 proves all of those chrome heights remain fixed.
 
-### UXI-JumpPanel-25 — Workspace folders include hidden tiles; Detached is separate
+### UXI-JumpPanel-25 — Workspace folders include hidden tiles
+
+> **Amended by `UXI-Workspace-30` / ADR-0039.** The former Detached clauses
+> (a Detached section with tag folders, roster duplicate-tile repair, and solo
+> activation of Detached tiles) are removed; the panel shows only workspaces and
+> their tiles. Clause numbers below are kept stable; removed clauses are struck.
 
 **Statement.** The jump panel and Cmd-P project attachment and visibility from
 the same typed source:
@@ -1500,15 +1538,11 @@ the same typed source:
    tiles, in the workspace's deterministic reading/restoration order.
 2. Hidden rows are visibly distinguishable from visible rows but retain the
    ordinary fixed chrome typography and tile metadata.
-3. **Detached** contains exactly Detached tiles. Detached tiles retain the tag
-   folder organization formerly used by Unbound. The universal-roster
-   reconciliation enforces one stable tile per durable Agent session before
-   projection: an Attached tile wins over any stale Detached copy; otherwise
-   one Detached tile wins, with duplicate tile tags merged into it. The panel
-   never masks conflicting owners with renderer-only row deduplication.
+3. ~~Detached section~~ — removed (ADR-0039). There is no out-of-workspace
+   tile list; tile-less sessions are reached via Cmd-P (`UXI-JumpPanel-9`).
 4. Activating an attached visible tile selects its workspace and focuses it.
 5. Activating an attached hidden tile presents it alone without unhiding it.
-6. Activating a Detached tile presents it alone without attaching it.
+6. ~~Detached activation~~ — removed (ADR-0039).
 7. Unhide is a separate command: it makes the hidden tile visible, follows to
    its owning workspace, and focuses it.
 
@@ -1516,7 +1550,7 @@ Mouse activation and Cmd-P/keyboard activation dispatch one typed target and
 therefore cannot disagree about any of these cases. An all-hidden workspace and
 all of its tile rows remain present and navigable.
 
-**Applies to.** `jump_panel_view.rs`: attached/hidden/Detached projections,
+**Applies to.** `jump_panel_view.rs`: attached/hidden projections,
 row state, clicks, and all-hidden folders; `jump_palette.rs`: the same typed
 targets and activation; `main.rs`: common navigation dispatcher.
 
@@ -1528,17 +1562,17 @@ mouse/Enter divergence class and prevents navigation from mutating placement.
 
 **Enforcement.** `hidden_tile_navigation_is_solo_until_explicit_unhide` drives
 the production jump-panel projection and Cmd-P target list, verifies that a
-hidden tile remains under its owning workspace and outside Detached, navigates
+hidden tile remains under its owning workspace, navigates
 to the typed solo presentation, then dispatches the real Unhide menu command and
-asserts workspace-follow plus visible focus. Existing
-`jump_panel_workspace_folders_and_unbound_rows_are_tile_native` and
-`jump_palette_opens_detached_tile_then_attaches_same_identity` cover visible and
-Detached activation, stable identity, tag grouping, and attachment.
-`roster_reconciliation_retires_duplicate_detached_session_tiles` constructs both
-an Attached+Detached and a Detached+Detached identity collision, drives the real
-roster materialization choke, and proves each durable session has one resulting
-jump-panel destination. Its negative control fails before projection because the
-old materializer treated the first owner as sufficient and left every duplicate.
+asserts workspace-follow plus visible focus. The Detached-era guards
+(`jump_palette_opens_detached_tile_then_attaches_same_identity`,
+`roster_reconciliation_retires_duplicate_detached_session_tiles`, and the
+Unbound/Detached parts of
+`jump_panel_workspace_folders_and_unbound_rows_are_tile_native`) are retired
+with ADR-0039; tile-less session activation is guarded by
+`jump_palette_opens_tileless_session_into_project_workspace` and the absence of
+roster materialization by `roster_refresh_creates_no_tiles`
+(`UXI-Workspace-30`).
 
 ### UXI-JumpPanel-26 — Navigation identity stays legible, compact, and explicit
 
@@ -1576,6 +1610,10 @@ against a standard navigation row; and
 requires its dedicated painted marker.
 
 ### UXI-JumpPanel-27 — Workspace ownership is a bounded blue group
+
+> **Clause 5 superseded by `UXI-Workspace-30` / ADR-0039.** There is no
+> `DETACHED` heading or collection; the cool-blue workspace family stands on its
+> own.
 
 **Statement.** Every workspace in the jump panel reads as one flat, bounded
 group rather than a header followed by visually ambiguous loose rows:
@@ -1622,6 +1660,10 @@ renderer to a 900×360 viewport with sixteen mixed expanded/collapsed workspaces
 and requires every group to retain its intrinsic height under scroll pressure.
 
 ### UXI-JumpPanel-28 — Tiles reorder by drag within their visible group; hidden is an icon
+
+> **Clause 4 (Detached rows, Detached tag folders,
+> `Preferences::jump_detached_tile_order`) superseded by `UXI-Workspace-30` /
+> ADR-0039.** Only workspace-folder reordering remains.
 
 **Statement.** Tiles in workspace folders and Detached groups are
 user-orderable by drag-and-drop, group-bounded, and the order survives restart:
@@ -1753,8 +1795,9 @@ own `tiles` (`row.activity() == AgentActivity::Working`), so it reuses the exact
 per-session status the session dot shows — including the union-of-authorities
 rule (`UXI-JumpPanel-12`): a session driven from elsewhere marks its folder
 working too. Hidden/attached tiles inside the folder count the same as visible
-ones (they are in `tiles`). Detached tiles are not part of any workspace folder
-and do not contribute.
+ones (they are in `tiles`). A server session no tile shows is not part of any
+workspace folder and does not contribute (there are no Detached tiles,
+ADR-0039).
 
 **Applies to.** `jump_panel_view.rs` (`JumpWorkspaceFolder::has_working_agent`,
 computed in `jump_panel_sections_with_tab`; the `◆` header child in
@@ -1794,7 +1837,7 @@ aggregate state of the sessions the folder owns, in this strict precedence:
    working. This is the resting workspace identity color.
 
 The flags aggregate over the folder's `tiles` (the same set `UXI-JumpPanel-30`
-uses — hidden and attached tiles count; detached tiles are not part of a folder),
+uses — hidden and visible tiles count; tile-less sessions are not part of a folder),
 so a session driven from elsewhere (`UXI-JumpPanel-12` union-of-authorities) and a
 session unread from a turn that ended while unfocused both tint the folder. A
 workspace with no agent tiles is idle → blue. There is **no** separate `◆` working

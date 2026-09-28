@@ -101,14 +101,14 @@ sessions)), not cached. Sections:
   - Each row's badge shows the **1-based workspace number** (`idx + 1`) — the
     digit `ctrl-<n>` jumps to (INV-UX-11).
   - Click → `select_tab`.
-- **Agent sessions** — the universal roster (every server session) ∪ local-only
-  mid-create sessions (`jump_panel_agent_rows`).
-  - **Dot shape** = binding: `●` in-use / `○` free.
-  - **Dot color** = per-session status light (INV-UX-10): **working** (reply in
-    flight) = warm accent, **waiting for you** (turn finished) = green,
-    **neutral/disconnected** = dim. Disconnected also dims the whole row.
-  - Click → every session opens in a detached ephemeral view (torn down on
-    switch-away); an existing workspace tile remains in place.
+- **Tiles** — each workspace row folds open to its tiles (visible and hidden).
+  Agent tile rows carry the per-session status light (INV-UX-10): **working**
+  (reply in flight) = warm accent, **waiting for you** (turn finished) = green,
+  **neutral/disconnected** = dim. Disconnected also dims the whole row.
+- There is no session list or Detached section (ADR-0039): a server session no
+  tile shows is reached via **Cmd-P** or an Agent tile's session selector, and
+  opens as a new tile in its project's workspace (`UXI-Workspace-30`). See
+  `docs/components/jump-panel.md` for the authoritative current behavior.
 
 ### Rail (`spec-rail.md`, `chrome.rs`)
 

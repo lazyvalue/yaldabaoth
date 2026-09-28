@@ -91,6 +91,10 @@ real shell-menu dispatcher in both attachment domains: a workspace adds a split
 Cog tile, while a solo-presented tile creates and presents a distinct Detached
 Cog tile without replacing the original. Its pre-fix control observed the solo
 command leave the original tile id unchanged.
+After ADR-0039 (`UXI-Workspace-30`) there are no Detached tiles: a new Cog tile
+created while a hidden tile is solo-presented lands as a new tile in that hidden
+tile's owning workspace, still without replacing the original. (The guard's
+Detached-era name above is historical; it may be renamed by that change.)
 
 ### UXI-Cog-14 — Topic leaves select a typed right-pane renderer
 

@@ -239,6 +239,10 @@ Numbered; external docs cite specific numbers (notably **12–13** for splits an
     exactly like `close_focused`. Reports whether the source workspace is now empty
     (focused leaf was the root → source `layout` left `Empty` for the caller to
     remove).
+    This is a layout-level step (e.g. the first half of a move, 18), not a
+    placement state: the removed `Window<C>` is re-inserted into a workspace or
+    retired. There is no resting "Detached tile" — every tile belongs to a
+    workspace (ADR-0039).
 
 17. **Insert into a target workspace (`insert_leaf_into_workspace`).** Adopts a detached
     leaf into another workspace, focusing it there: `Empty` → adopt as root; single
