@@ -548,7 +548,7 @@ fn make_caret(mode: EditMode, cursor_char: char, cursor_color: Hsla) -> AnyEleme
     // Block cursor in both modes. In insert mode the block is a solid
     // rectangle (character stays in the after-stream); in normal mode the
     // character under the cursor is drawn inside the block.
-    div()
+    let el = div()
         .flex_none()
         .w(px(8.0))
         .h(px(18.0))
@@ -559,7 +559,12 @@ fn make_caret(mode: EditMode, cursor_char: char, cursor_color: Hsla) -> AnyEleme
         } else {
             " ".into()
         })
-        .into_any_element()
+        .into_any_element();
+    // Headless harness: the PAINTED caret cell, so a test can assert where the
+    // caret actually lands on its row (C4 tab drift, D2 markdown drift).
+    #[cfg(test)]
+    let el = probe_bounds("caret", el);
+    el
 }
 
 /// The two-theme toggle decision (Nightfox ⇄ Folio): from Folio go to Nightfox,
@@ -1046,6 +1051,19 @@ impl SharedEditor {
     }
     fn selection_range(&self) -> Option<((usize, usize), (usize, usize))> {
         self.view.selection_range()
+    }
+    /// C4: the caret column and selection projected into DISPLAY columns (tabs
+    /// expanded, matching the rendered rows). The editor's own columns are raw
+    /// chars; painting them onto tab-expanded rows put the caret 3 columns left
+    /// per preceding tab.
+    fn display_caret_and_selection(
+        &self,
+    ) -> (CursorPos, Option<((usize, usize), (usize, usize))>) {
+        let mut cursor = self.cursor();
+        let core = self.core.borrow();
+        let doc = core.document();
+        cursor.col = display_col(doc, cursor.line, cursor.col);
+        (cursor, display_selection(doc, self.selection_range()))
     }
     fn selection_text(&self) -> Option<String> {
         self.view.selection_text(&self.core.borrow())

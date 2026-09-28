@@ -525,12 +525,12 @@ impl YaldaGpuiView {
     /// with the incremental highlight cache this makes a keystroke O(changed),
     /// not O(document).
     pub(crate) fn build_edit_body_code(&self, e: &mut EditState) -> impl IntoElement {
-        let cursor = e.editor.cursor();
+        // C4: caret + selection in DISPLAY columns (rows are tab-expanded).
+        let (cursor, sel) = e.editor.display_caret_and_selection();
         let cursor_line = cursor.line;
         let cursor_col = cursor.col;
         let cursor_color: Hsla = rgb(CURSOR_BAR_COLOR).into();
         let dim_fg: Hsla = rgb(0x6272a4).into();
-        let sel = e.editor.selection_range();
         let mode = e.mode;
         let edit_seq = e.editor.edit_seq();
 
@@ -638,11 +638,11 @@ impl YaldaGpuiView {
     /// modifiers, which `font_for` maps to FontWeight/FontStyle on render.
     /// No gutter — word processors don't show line numbers.
     pub(crate) fn build_edit_body_wp(&self, e: &mut EditState) -> impl IntoElement {
-        let cursor = e.editor.cursor();
+        // C4: caret + selection in DISPLAY columns (rows are tab-expanded).
+        let (cursor, sel) = e.editor.display_caret_and_selection();
         let cursor_line = cursor.line;
         let cursor_col = cursor.col;
         let cursor_color: Hsla = rgb(CURSOR_BAR_COLOR).into();
-        let sel = e.editor.selection_range();
         let mode = e.mode;
         let edit_seq = e.editor.edit_seq();
 
@@ -1417,9 +1417,16 @@ impl YaldaGpuiView {
             let max_visible_h = COMPOSE_MAX_VISIBLE_LINES as f32 * line_h;
 
             let compose_cursor_line = tb.editor.cursor().line;
-            let compose_cursor_col = tb.editor.cursor().col;
+            // C4: caret + selection in DISPLAY columns — the rows (and their
+            // word-wrap) are tab-expanded, the editor's columns are raw.
+            let compose_cursor_col = display_col(
+                tb.editor.document(),
+                compose_cursor_line,
+                tb.editor.cursor().col,
+            );
             let compose_mode = tb.mode;
-            let compose_sel = tb.editor.selection_range();
+            let compose_sel =
+                display_selection(tb.editor.document(), tb.editor.selection_range());
             let sep_color: Hsla = nc(at.compose_separator);
             let compose_cursor_color: Hsla = nc(at.cursor);
             // Worksheet accent = teal (the app accent), used for the left `›`

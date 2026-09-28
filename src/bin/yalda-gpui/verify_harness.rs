@@ -30850,3 +30850,105 @@ fn diff_send_picker_query_is_render_flat_and_filters(cx: &mut TestAppContext) {
         assert_eq!(v.diff_tile_ref(id).unwrap().unsent_count(), 1, "closing sends nothing");
     });
 }
+
+/// Measure the PAINTED caret x of an Edit view (`view_kind`) showing `text`
+/// with the caret at RAW `(0, col)`. Drives the real render path (highlight
+/// snapshot → build_edit_body_* → build_wrapped_line → make_caret).
+fn edit_caret_painted_x(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+    text: &str,
+    col: usize,
+    view_kind: crate::EditView,
+) -> f32 {
+    view.update(vcx, |v, _| {
+        v.test_open_edit(text);
+        let e = v.edit_mut().expect("edit view");
+        e.view = view_kind;
+        e.editor.set_cursor(0, col);
+    });
+    view.update(vcx, |v, cx| v.set_text_scale(1.0, cx));
+    for _ in 0..3 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let caret = crate::layout_probe_get("caret");
+    crate::layout_probe_end();
+    caret.expect("the edit caret must paint").0
+}
+
+/// C4 (text-editing review): tabs are expanded to 4 spaces for display, but the
+/// editor's caret column is RAW (a tab = 1 column). The caret on `f` of
+/// `"\tfoo"` (raw col 1) must paint exactly where the caret on `f` of
+/// `"    foo"` (col 4) paints — in BOTH the Code and WP Edit views. Asserted on
+/// PAINTED geometry (layout probe on `make_caret`).
+///
+/// Negative control (observed RED): feed the raw `e.editor.cursor()` column to
+/// `build_wrapped_line` (drop `display_caret_and_selection`) → the tab caret
+/// paints 3 columns left of the space caret.
+#[gpui::test]
+fn edit_caret_after_tab_paints_at_expanded_column(cx: &mut TestAppContext) {
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let fh = cx.focus_handle();
+        fh.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            fh,
+        )
+    });
+    vcx.run_until_parked();
+    for kind in [crate::EditView::Code, crate::EditView::WordProcessor] {
+        let spaces_x = edit_caret_painted_x(&view, vcx, "    foo\n", 4, kind);
+        let tab_x = edit_caret_painted_x(&view, vcx, "\tfoo\n", 1, kind);
+        let start_x = edit_caret_painted_x(&view, vcx, "    foo\n", 0, kind);
+        assert!(
+            spaces_x - start_x > 8.0,
+            "non-vacuous: col 4 must paint right of col 0 ({kind:?}: {start_x} vs {spaces_x})"
+        );
+        assert!(
+            (tab_x - spaces_x).abs() < 0.5,
+            "{kind:?}: caret after a TAB painted at x={tab_x}, but the same display \
+             column after 4 spaces paints at x={spaces_x} — raw/display column drift"
+        );
+    }
+}
+
+/// C4 in the agent compose (chatbox box): the caret after a TAB paints at the
+/// expanded column. Negative control (observed RED): pass the raw
+/// `tb.editor.cursor().col` as `compose_cursor_col` in `render_agent`.
+#[gpui::test]
+fn compose_caret_after_tab_paints_at_expanded_column(cx: &mut TestAppContext) {
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
+    let mut measure = |text: &str, col: usize| -> f32 {
+        view.update(vcx, |v, cx| {
+            let mut c = v.agent_mut(cx).expect("agent");
+            let tb = c.input_surface.compose_mut();
+            *tb = crate::Compose::seeded(text);
+            tb.editor.cursor_mut().line = 0;
+            tb.editor.cursor_mut().col = col;
+        });
+        for _ in 0..3 {
+            view.update(vcx, |_, cx| cx.notify());
+            vcx.run_until_parked();
+        }
+        crate::layout_probe_begin();
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+        let caret = crate::layout_probe_get("caret");
+        crate::layout_probe_end();
+        caret.expect("compose caret must paint").0
+    };
+    let start_x = measure("    foo", 0);
+    let spaces_x = measure("    foo", 4);
+    let tab_x = measure("\tfoo", 1);
+    assert!(spaces_x - start_x > 8.0, "non-vacuous: {start_x} vs {spaces_x}");
+    assert!(
+        (tab_x - spaces_x).abs() < 0.5,
+        "compose caret after a TAB painted at x={tab_x}; after 4 spaces x={spaces_x}"
+    );
+}
