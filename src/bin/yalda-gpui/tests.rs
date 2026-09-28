@@ -1822,7 +1822,7 @@ fn chatbox_turn_end_leaves_caret_put() {
     );
 }
 
-/// UXI-AgentTile-9 (ux-invariants.md): the compose word-wraps. `wrap_line_cols`
+/// UXI-AgentTile-9: the compose word-wraps. `wrap_line_cols`
 /// partitions a line into ≤width visual rows, breaking at spaces, hard-breaking
 /// over-long words, covering EVERY char (so the caret is addressable everywhere),
 /// always ≥1 row.
@@ -2074,7 +2074,7 @@ fn theme_switch_invalidate_reparses_code_blocks() {
     );
 }
 
-/// INV-UX-1 (cursor + text always visible): the WP edit view's code-line
+/// UXI-TextEditing-1 (cursor + text always visible): the WP edit view's code-line
 /// background MUST follow the active theme, not a hardcoded dark swatch. Folio's
 /// fenced-code syntax tokens are dark (designed for its linen `code_block_bg`);
 /// the old hardcoded `0x21222c` painted them — and the caret's character —
@@ -4283,7 +4283,7 @@ fn clear_then_empty_channel_open_keeps_worksheet_typeable() {
 /// `(you_block_open || focus==Compose) && !awaiting && !chatbox`. Every clause
 /// must be load-bearing (mutation testing found the original three operands
 /// untested); the `|| focus==Compose` clause closes the recurring
-/// "/clear worksheet-invisible" bug — see docs/projects/clear-worksheet-invisible.
+/// "/clear worksheet-invisible" bug — see docs/bugs/saga-clear-worksheet-invisible/.
 #[test]
 fn inline_you_block_active_truth_table() {
     let base = || {

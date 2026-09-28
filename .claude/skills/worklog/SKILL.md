@@ -1,40 +1,31 @@
 ---
 name: worklog
-description: Write a session worklog entry (what was built, what's open/unresolved, decisions made) and update the backlog — higher fidelity than git messages. Use at the end of a work session, when the user asks to "log", "checkpoint", "wrap up", or capture session state before context is lost.
+description: Write a short session worklog entry (what shipped, caveats, decisions, the Cog graph id + final render) and prune the backlog. Use at the end of a work session, when the user asks to "log", "checkpoint", "wrap up", or capture session state before context is lost.
 ---
 
 # Worklog
 
-Capture a session as a durable record so the next session (or agent) can pick up
-without re-deriving state from git. Worklog = the *past* (what happened);
-`docs/backlog.md` = the *future* (what's open); `docs/decisions/` = the *why*.
+A worklog is the human-readable **index card** for a finished piece of work. The
+Cog graph is the full record (per-node outputs, notes, deviations) — the worklog
+points at it; it does not restate it. `docs/decisions/` holds the *why*;
+`docs/backlog.md` holds only what's waiting on Scott.
 
 ## Process
 
-1. **Gather the session's reality** — don't guess. Check:
-   - `git branch` / `git worktree list` and `git log --oneline` per touched branch.
-   - What actually built/tested (re-verify "it's green" claims if unsure).
-   - What's runtime-verified vs only unit-tested (be honest — this is the
-     highest-value field; the GPUI app can't be driven headlessly).
-   - Decisions made this session that deserve an ADR (offer to run `/decision`).
-2. **Write the entry** to `docs/worklog/YYYY-MM-DD-<slug>.md` using
-   `docs/worklog/template.md`. Slug = a few words on the session's theme.
-   Convert relative dates to absolute. One line per branch with its commit.
-   Populate the mandatory **Cog execution evidence** from the actual graph: id,
-   initial render, claim/close outputs, note sequences/topics, complete status,
-   and final render.
-3. **Update `docs/backlog.md`** — move finished items out, add new open/deferred/
-   flagged ones with status (`IN-FLIGHT`/`READY`/`DEFERRED`/`NEEDS-DECISION`/
-   `NEEDS-RUNTIME`) and a reason. Cross-link ADRs.
-4. **Link, don't duplicate** — point at ADRs for rationale and the backlog for
-   open work; the worklog narrates, it doesn't restate them.
-5. **Validate Cog evidence** with
-   `scripts/check-cog-worklog.sh <worklog>`. Do not hand off non-trivial work
-   with a failing evidence check.
-
-## Constraints
-
-- Faithful over flattering: record what failed, what was skipped, what's
-  unverified. A worklog that only lists wins is useless for recovery.
-- Commit the files when done — no need to ask (push still needs an explicit ask).
-- Keep it scannable — statuses, commit shas, one-liners. Not prose walls.
+1. **Gather reality — don't guess.** `git log --oneline` on the merged branch;
+   `cog graph status <id>` (must be `complete`) and
+   `cog graph render <id> --frontiers`. Re-verify any "it's green" claim you're
+   unsure of.
+2. **Write** `docs/worklog/YYYY-MM-DD-<slug>.md` from `docs/worklog/template.md`:
+   - **Shipped** — one line per deliverable, each with the verifying test/command.
+   - **Caveats** — anything unverified (`NEEDS-RUNTIME` + which harness gap),
+     skipped, or failing. Faithful over flattering. "None" if none.
+   - **Decisions** — ADR one-liners (offer `/decision` for an unrecorded one);
+     deferred ideas go to a Cog bulletin, cited here by address.
+   - **Cog** — `Status: complete` + the final frontier render.
+   No build narrative, no per-node output dumps — those live in the graph.
+3. **Backlog** — add a `NEEDS-RUNTIME` / `NEEDS-DECISION` entry to
+   `docs/backlog.md` only if Scott must act; remove entries this work confirmed.
+   Nothing else goes there.
+4. **Validate** with `scripts/check-cog-worklog.sh <worklog>`.
+5. **Commit** — no need to ask (push still needs an explicit ask).

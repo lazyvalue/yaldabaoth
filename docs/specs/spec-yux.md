@@ -9,7 +9,7 @@ as the `yux` module (`yux.rs`, renamed from `cached_panel.rs`), superseding its
 ## Problem
 
 GPUI re-renders the root every frame and its only render-skip lever is
-`AnyView::cached` (see `docs/projects/gpui-responsiveness/project.md` for the
+`AnyView::cached` (see `docs/reference/gpui-render-model.md` for the
 six verified facts). Today the correct pattern exists but only as **discipline**:
 `cached_panel.rs` is free functions, and `TranscriptView` hand-assembles the
 model-handle + observe-subscription + fingerprint-diff + cached-embed dance.
@@ -121,7 +121,7 @@ onto it as the proof. Revisit (B) per-surface if coverage drift actually recurs.
 
 ## Links
 
-`docs/projects/gpui-responsiveness/project.md` (facts + component model),
+`docs/reference/gpui-render-model.md` (facts + component model),
 `cached_panel.rs` (→ `yux.rs`), `transcript_view.rs`, module `CLAUDE.md`.
 Warrants an ADR for the framework name (yux) and the (A)/(B) decision once made
 (`/decision`).

@@ -352,7 +352,7 @@ data, *module-internal* — called by the GPUI view layer):
 **Commands / bindings** (indicative — final keys are a runtime detail; note the
 macOS `Ctrl`+digit / `Ctrl-Tab` unreliability from CLAUDE.md, so prefer chord
 *sequences* or `Cmd`): workspace zoom out / in and reset are distinct from the
-`Cmd+=/-/0` **document text** zoom (INV-UX-13). Proposed:
+`Cmd+=/-/0` **document text** zoom (UXI-TextZoom-1). Proposed:
 `Ctrl-W -` zoom out · `Ctrl-W =` zoom in · `Ctrl-W 0` reset-to-origin (each a
 two-key sequence, so the digit is a plain key), plus `Cmd`/`Ctrl`+scroll to
 zoom and trackpad drag to pan. `Ctrl-W =` is **reclaimed** from the retired

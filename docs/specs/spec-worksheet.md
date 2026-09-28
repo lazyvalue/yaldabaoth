@@ -52,7 +52,7 @@ only, idle only) so the corruption case stays unrepresentable.
 3. **Empty insert is a no-op.** If you leave Insert having typed **no
    non-whitespace text**, the You-block — delimiter and all — **disappears**. The
    transcript is byte-identical to before you entered Insert. (No phantom "You"
-   turns; the no-empty-turn rule, INV-UX-4.)
+   turns; the no-empty-turn rule, UXI-AgentTile-5.)
 
 4. **Non-empty You-block persists and is sent.** If you typed non-whitespace text,
    the You-block **persists in place** as your pending reply. The next **Submit**
@@ -88,7 +88,7 @@ only, idle only) so the corruption case stays unrepresentable.
    the agent is **writing (mid-turn)** the transcript is fully read-only (no
    You-block can be opened) and a **chatbox appears pinned at the bottom of the
    tile**; everything you type goes there. Submitting from the chatbox steers /
-   queues per INV-UX-7 (turn steering). When the turn ends the chatbox is **not
+   queues per UXI-AgentTile-13 (turn steering). When the turn ends the chatbox is **not
    visible** (it hides when empty) and inline worksheet editing is available again.
 
 ## Frozen-text rules (the guard rails behind rule 5/7)
@@ -113,11 +113,11 @@ only, idle only) so the corruption case stays unrepresentable.
 
 ## Cursor / viewport (inherited invariants)
 
-- **INV-UX-1** holds: the caret is always visible and the viewport tracks it. The
+- **UXI-TextEditing-1** holds: the caret is always visible and the viewport tracks it. The
   worksheet is **cursor-anchored** — streaming output elsewhere does not yank the
   viewport away from where you are editing (sticky-bottom only when the caret is at
   EOF). See `spec-agent-window.md` §19.
-- **INV-UX-2** holds: the editable region word-wraps.
+- **UXI-AgentTile-9** holds: the editable region word-wraps.
 
 ## Default & the chatbox toggle
 
@@ -139,5 +139,5 @@ canonical mode.
 
 ## Enforcement
 
-`docs/ux-invariants.md` **INV-UX-9** states this as an invariant and names the
+**UXI-AgentTile-11** states this as an invariant and names the
 headless guards in `verify_harness.rs`.

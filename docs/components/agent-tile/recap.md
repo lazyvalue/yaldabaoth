@@ -15,7 +15,6 @@ summarizes.
 
 ## References
 
-- INV-UX-20 in docs/ux-invariants.md → migrated here.
 - `docs/components/agent-tile/README.md` — parent component.
 
 ## UX invariants

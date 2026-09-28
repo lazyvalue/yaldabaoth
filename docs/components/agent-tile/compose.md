@@ -18,11 +18,9 @@ placements are editable surfaces and obey the common `TextEditing` model
 - `docs/components/common/text-editing.md` — the compose buffer is an editable
   surface and obeys `TextEditing`.
 - `docs/specs/spec-worksheet.md` — the worksheet inline-edit design (AUTHORITATIVE
-  for INV-UX-9).
+  for UXI-AgentTile-11).
 - `docs/specs/spec-textbox-compose.md` — the compose-surface design.
 - `docs/specs/spec-turn-steering.md` — the v2-ready mid-turn steering shape.
-- Migrated from `docs/ux-invariants.md`: INV-UX-2, INV-UX-8, INV-UX-9, INV-UX-16,
-  INV-UX-7, INV-UX-21.
 
 ## UX invariants
 
@@ -80,7 +78,7 @@ switching "felt like nothing happened" and worksheet read as broken. The flush
 inline rendering is the deferred §7/v1 styling from `design-c.md` that makes the
 worksheet placement actually distinct and usable. The inner compose body (wrap,
 caret-containment window, virtualization) is **unchanged** — only the outer chrome
-differs — so INV-UX-1/INV-UX-2 are untouched.
+differs — so UXI-TextEditing-1/UXI-AgentTile-9 are untouched.
 
 **Status.** `implemented` — placement chrome implemented; the visible distinction is
 headless-tested via the captured compose bounds. Exact glyphs/colors are the one
@@ -91,13 +89,13 @@ human-eye item (harness gap #1).
 compose box's painted bounds via the `compose-box` layout probe, toggles to
 worksheet, re-captures, and asserts the worksheet box paints **~8px further left**
 (the chatbox `mx_2` margin is gone) — i.e. flush in the column. The border/bg/
-accent-bar differences are color-level (harness gap #1, a human eye). INV-UX-1's
+accent-bar differences are color-level (harness gap #1, a human eye). UXI-TextEditing-1's
 `compose_caret_row_painted_inside_box_when_wrapped` still passes in both
 placements (caret math unchanged).
 
-> **SUPERSEDED by INV-UX-9 (2026-06-28).** INV-UX-8 described the two compose
+> **SUPERSEDED by UXI-AgentTile-11 (2026-06-28).** UXI-AgentTile-10 described the two compose
 > *placements* of the Model C UX (always-present worksheet compose vs pinned
-> chatbox box). INV-UX-9 replaces that UX: the worksheet has **no always-present
+> chatbox box). UXI-AgentTile-11 replaces that UX: the worksheet has **no always-present
 > compose** — you edit **inline in the transcript buffer** (a You-block), and the
 > chatbox is **mid-turn-only**. The flush-vs-boxed distinction is retained only for
 > the mid-turn chatbox. The data substrate (Model C, ADR-0024) is unchanged.
@@ -119,7 +117,7 @@ per `spec-worksheet.md` (AUTHORITATIVE). Concretely:
    where typed text lives.
 3. **Empty insert is a no-op** — leaving Insert with only whitespace removes the
    You-block; the transcript is byte-identical to before (no phantom turn, cf.
-   INV-UX-4).
+   UXI-AgentTile-5).
 4. **Non-empty You-block persists and is sent** — real text stays in place as the
    pending reply; the next Submit sends it and freezes it as a committed user turn.
 5. **Insert is bounded** — a You-block can be opened **only within the most-recent
@@ -147,14 +145,14 @@ per `spec-worksheet.md` (AUTHORITATIVE). Concretely:
      typing in a little box). Keeping the caret visible is the TRANSCRIPT scroll's
      job: the reveal scrolls to the caret's visual ROW *within* the block (parked ~2
      rows above the viewport bottom, so earlier lines flow up the page), never by
-     truncating the block. This upholds INV-UX-1 for a block of any height. (Was
+     truncating the block. This upholds UXI-TextEditing-1 for a block of any height. (Was
      windowed to 10 logical lines — the "You div scrolls after a while" bug.) Pinned
      by the PAINTED guard `worksheet_tall_you_block_grows_caret_painted_in_viewport`
      (a block taller than the viewport, caret proven inside it) in
      `transcript_view.rs` (render: all lines) + the reveal in `TranscriptView`.
 7. **Mid-turn → chatbox.** While the agent is mid-turn the transcript is read-only
    and a chatbox appears **pinned at the bottom**; input goes there (steers/queues,
-   INV-UX-7). The chatbox is **not visible when the agent is idle**.
+   UXI-AgentTile-13). The chatbox is **not visible when the agent is idle**.
    - **The leaders stay universal mid-turn (revised 2026-07-01).** Suppressing all
      mid-turn keystrokes into the chatbox also killed the `<space>`/`.`/`?` leader
      menus — the reported "leaders don't work mid-turn" bug. The rule now keys off
@@ -184,7 +182,7 @@ visibility (`screens.rs` `render_agent`).
 **Why.** The Model C *UX* (read-only transcript + always-present separate compose)
 made the worksheet "functionally useless — can't place the cursor anywhere to
 respond." The inline-edit behavior is what the user actually wants and what
-`spec-agent-window.md` §9–§15 originally specified; INV-UX-9 restores it on the
+`spec-agent-window.md` §9–§15 originally specified; UXI-AgentTile-11 restores it on the
 durable Model C substrate.
 
 **Status.** `partial` — **stages 1 + 2** (tickets 001/002) landed:
@@ -195,8 +193,7 @@ freezes IN PLACE at the anchor on Submit (`freeze_as_user_turn_at`), and is gate
 the latest agent turn / tail (the legal-point guard). The bottom chatbox shows only
 mid-turn. **Deferred (ticket 003):** retiring the user-selected Worksheet⇄Chatbox
 toggle + defaulting new sessions to Worksheet. Do NOT mark `honored` until 003 +
-a human runtime check (the inline caret/colours are harness gap #1). See
-`docs/projects/worksheet-inline-edit/`.
+a human runtime check (the inline caret/colours are harness gap #1).
 
 **Enforcement.** Headless in `verify_harness.rs`:
 `worksheet_insert_opens_and_empty_esc_discards_you_block` (open + byte-identical
@@ -267,7 +264,7 @@ producer of the hole; the hole has many producers (e.g. `force_restart_agent`
 Idles without settle, agent_ui.rs:3602) and was never made unrepresentable.
 Deriving painting from routing makes the disagreement set empty for EVERY
 producer — no writer can strand focus on an unpainted compose without visibly
-breaking routing. See `docs/projects/clear-worksheet-invisible/` (spec + critique
+breaking routing. See `docs/bugs/saga-clear-worksheet-invisible/` (spec + critique
 + failure-log).
 
 **Status.** `implemented` (headless — the real key handler + real render, with the
@@ -331,10 +328,6 @@ CONTROL (boot session types + paints) makes it non-vacuous. **Negative control
 the exact user symptom.**
 
 ### UXI-AgentTile-13 — A mid-turn submit steers Claude and interrupts Codex; failed sends stay editable (stop is ⌘., not Esc)
-
-> **Numbering note:** `INV-UX-6` is reserved for the parallel `toolgroup-expand-key`
-> branch (tool-group collapse). This invariant is `INV-UX-7` to avoid a collision
-> at integrate time.
 
 **Statement.** Submitting a message sends it to the agent and commits it as a
 user turn even while work is in flight. The mid-turn behavior follows the

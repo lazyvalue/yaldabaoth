@@ -10,10 +10,12 @@ A **component spec** describes one component of the app — `Workspace`, `Tile`,
 references, and its list of **UX invariants** (`UXI-<Component>-N`). It answers
 "what is this component and what must always be true of it?"
 
-This is a reframing of the old split between `docs/ux-invariants.md` (a flat global
-`INV-UX-N` list) and `docs/specs/` (design docs). Instead of one giant invariant
-file, **each component owns its invariants**, next to its description. See
-**Migration** below for how the two coexist during the transition.
+**Each component owns its invariants**, next to its description. Rules that bind
+*every* surface without being referenced (the caret is always visible, a routed
+keystroke is always painted, …) are not component invariants — they live in
+`docs/ux-patterns/` as `UXP-N`. The **Index** below is also the catalog of every
+tile type and chrome surface: "what can this surface do?" is answered by its spec.
+`docs/specs/` holds the deeper design documents component specs link to.
 
 ## Layout
 
@@ -127,27 +129,13 @@ Every component spec has three parts:
   copy-on-select) → put it in `common/` and have each component **reference** it
   rather than duplicating the invariant.
 
-## Migration (how this coexists with the old harness)
+## Legacy crosswalk (INV-UX-N → UXI-<Component>-N)
 
-`docs/ux-invariants.md` (flat `INV-UX-N`) and the design specs in `docs/specs/` are
-**not deleted**. They are migrated INTO component specs incrementally, as `/new-ux`
-touches each component:
-
-- Until an `INV-UX-N` is migrated, it **remains authoritative** where it lives.
-- When a component spec absorbs it, the new `UXI-<Component>-N` becomes
-  authoritative and the old entry is marked `→ migrated to UXI-<Component>-N`.
-- `docs/specs/spec-*.md` stay as deeper design references; component specs link to
-  them under **References**.
-- The crosswalk of what has moved lives at the bottom of this file.
-
-**Do not attempt a big-bang migration.** Move invariants as you work on their
-component; the value is per-component locality, earned incrementally.
-
-### Crosswalk (INV-UX-N → UXI-<Component>-N)
-
-All 22 `INV-UX-N` entries have been migrated into component specs. The legacy
-`docs/ux-invariants.md` is frozen (kept for the `INV-UX-N` code/test references that
-still point at it); the component spec is now authoritative for each behavior.
+The old flat `docs/ux-invariants.md` was fully migrated here and removed
+(2026-09-27, graph `od4`; recover it with `git log --all -- docs/ux-invariants.md`).
+Live docs and code now cite `UXI` ids; worklogs, bugs, and ADRs are history and
+still say `INV-UX-N` — resolve them with this table. Universal, component-free laws
+live in `docs/ux-patterns/` as `UXP-N`.
 
 | Old | New | Home |
 |-----|-----|------|
@@ -174,5 +162,4 @@ still point at it); the component spec is now authoritative for each behavior.
 | INV-UX-22 | UXI-AgentTile-16 | `agent-tile/model.md` |
 | INV-UX-23 | UXI-AgentTile-7 | `agent-tile/transcript.md` |
 
-_(INV-UX-6 was never assigned. Cross-references inside migrated prose still read
-`INV-UX-N`; use this table to resolve them until a later pass rewrites them.)_
+_(INV-UX-6 was never assigned.)_
