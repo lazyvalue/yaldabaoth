@@ -52,6 +52,10 @@ style bundle so a caller themes once:
   owns the option model and dispatch.
 - **`picker_option_row_detailed(id, glyph, label, detail, badge, …)`** — the
   same row with a dimmed monospace second line (e.g. a path under a branch).
+  Both lines are `single_line_ellipsis` leaves — one line via `line_clamp(1)`
+  over NORMAL whitespace, never `whitespace_nowrap` (gpui 0.2.2 caches a nowrap
+  leaf's first taffy measure, which in a `flex_col` wrapper is width 0 ⇒ a
+  bare "…"; bug-0072).
 - **`completion_popup(id, rows, selected, colors, mono)`** — shared compact
   completion shell + primary/secondary rows for keyboard-owned input
   suggestions. The caller owns query/filter state and key dispatch.

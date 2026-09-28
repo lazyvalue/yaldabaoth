@@ -363,12 +363,41 @@ pub(crate) fn relative_time(at: &str, now: chrono::DateTime<chrono::Utc>) -> Str
     let Ok(t) = chrono::DateTime::parse_from_rfc3339(at) else {
         return at.to_string();
     };
-    let secs = (now - t.with_timezone(&chrono::Utc)).num_seconds().max(0);
-    match secs {
-        0..60 => "just now".to_string(),
-        60..3600 => format!("{}m ago", secs / 60),
-        3600..86400 => format!("{}h ago", secs / 3600),
-        _ => format!("{}d ago", secs / 86400),
+    relative_age((now - t.with_timezone(&chrono::Utc)).num_seconds())
+}
+
+/// Elapsed seconds → a compact age: "just now" / "5m ago" / "3h ago" /
+/// "2d ago" / "3w ago" / "4mo ago" / "2y ago". Pure (callers pass `now`);
+/// negative (clock skew) reads as "just now".
+pub(crate) fn relative_age(elapsed_secs: i64) -> String {
+    const MIN: i64 = 60;
+    const HOUR: i64 = 60 * MIN;
+    const DAY: i64 = 24 * HOUR;
+    const WEEK: i64 = 7 * DAY;
+    const MONTH: i64 = 30 * DAY;
+    const YEAR: i64 = 365 * DAY;
+    let s = elapsed_secs.max(0);
+    match s {
+        _ if s < MIN => "just now".to_string(),
+        _ if s < HOUR => format!("{}m ago", s / MIN),
+        _ if s < DAY => format!("{}h ago", s / HOUR),
+        _ if s < 2 * WEEK => format!("{}d ago", s / DAY),
+        _ if s < 2 * MONTH => format!("{}w ago", s / WEEK),
+        _ if s < YEAR => format!("{}mo ago", s / MONTH),
+        _ => format!("{}y ago", s / YEAR),
+    }
+}
+
+/// A worktree picker row's description line (UXI-Diff-10):
+/// `<HEAD subject> · <age> · <~/path>`, or just the path when the commit is
+/// unknown (fresh repo / git failure). `now_unix` is passed in (pure).
+pub(crate) fn worktree_row_description(row: &WorktreeEntry, path: &str, now_unix: i64) -> String {
+    match &row.head_commit {
+        Some(c) if !c.subject.trim().is_empty() => {
+            format!("{} · {} · {path}", c.subject.trim(), relative_age(now_unix - c.time))
+        }
+        Some(c) => format!("{} · {path}", relative_age(now_unix - c.time)),
+        None => path.to_string(),
     }
 }
 
@@ -432,8 +461,8 @@ fn home_relative(path: &std::path::Path) -> String {
 }
 
 /// The worktree picker (spec rev 2 B1, UXI-Diff-10): a title, one
-/// `picker_option_row_detailed` per worktree (branch prominent, home-relative
-/// path dimmed, a "primary" badge on the primary checkout), then the "Pick a
+/// `picker_option_row_detailed` per worktree (branch prominent; dimmed
+/// description `subject · age · ~/path`, a "primary" badge on the primary checkout), then the "Pick a
 /// folder…" row and the key-hint footer. Rows are clickable; the handler
 /// carries only the ROW INDEX and resolves the row at event time through the
 /// root (`diff_picker_activate`) — yux rule 4, since a cache hit replays this
@@ -487,14 +516,15 @@ fn diff_picker_body(
         })
     };
 
+    let now_unix = chrono::Utc::now().timestamp();
     for (i, row) in picker.rows.iter().enumerate() {
         let label = row.label();
-        let path = home_relative(&row.path);
+        let description = worktree_row_description(row, &home_relative(&row.path), now_unix);
         let el = picker_option_row_detailed(
             SharedString::from(format!("diff-picker-row-{window_id}-{i}")),
             "⎇",
             &label,
-            Some((&path, st.dim)),
+            Some((&description, st.dim)),
             row.is_primary.then_some(("primary", st.dim)),
             picker.selected == i,
             st.accent,
@@ -1044,4 +1074,52 @@ fn diff_comment_row(marks: &RowMarks, ci: usize, part: u8, parts: u8, rs: &DiffR
         card.child(el).into_any_element()
     };
     div().flex().flex_row().size_full().child(content).into_any_element()
+}
+
+#[cfg(test)]
+mod picker_description_tests {
+    use super::*;
+
+    #[test]
+    fn relative_age_buckets() {
+        const DAY: i64 = 86_400;
+        assert_eq!(relative_age(-5), "just now", "clock skew clamps");
+        assert_eq!(relative_age(0), "just now");
+        assert_eq!(relative_age(59), "just now");
+        assert_eq!(relative_age(60), "1m ago");
+        assert_eq!(relative_age(3_599), "59m ago");
+        assert_eq!(relative_age(3_600), "1h ago");
+        assert_eq!(relative_age(DAY - 1), "23h ago");
+        assert_eq!(relative_age(DAY), "1d ago");
+        assert_eq!(relative_age(13 * DAY), "13d ago");
+        assert_eq!(relative_age(14 * DAY), "2w ago");
+        assert_eq!(relative_age(59 * DAY), "8w ago");
+        assert_eq!(relative_age(60 * DAY), "2mo ago");
+        assert_eq!(relative_age(364 * DAY), "12mo ago");
+        assert_eq!(relative_age(365 * DAY), "1y ago");
+        assert_eq!(relative_age(800 * DAY), "2y ago");
+    }
+
+    fn entry(head_commit: Option<HeadCommit>) -> WorktreeEntry {
+        WorktreeEntry {
+            path: PathBuf::from("/x/wt"),
+            head: "abc".into(),
+            branch: Some("topic".into()),
+            detached: false,
+            is_primary: false,
+            head_commit,
+        }
+    }
+
+    #[test]
+    fn worktree_row_description_is_subject_age_path() {
+        let now = 1_700_000_000;
+        let c = |subject: &str| Some(HeadCommit { subject: subject.into(), time: now - 7_200 });
+        assert_eq!(
+            worktree_row_description(&entry(c("feat(diff): send picker")), "~/ws/wt", now),
+            "feat(diff): send picker · 2h ago · ~/ws/wt"
+        );
+        assert_eq!(worktree_row_description(&entry(c("  ")), "~/ws/wt", now), "2h ago · ~/ws/wt");
+        assert_eq!(worktree_row_description(&entry(None), "~/ws/wt", now), "~/ws/wt");
+    }
 }

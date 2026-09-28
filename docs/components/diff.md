@@ -70,7 +70,10 @@ estimate. A viewed file folds unless `z`-expanded (`Folds`).
 ### UXI-Diff-10 — Worktree picker binds by keyboard or click
 
 **Statement.** An unbound tile lists every `git worktree list` entry of the active
-repo (branch prominent, path dimmed, primary labelled) plus "Pick a folder…";
+repo — two lines per row: line 1 the branch (primary labelled), line 2 a dimmed
+description `<HEAD commit subject> · <relative age> · <~/path>` (just the path when
+the commit is unknown), each line one line with an ellipsis, never blank — plus
+"Pick a folder…";
 `j`/`k` + `Enter` or a mouse click binds the tile to that worktree and derives its
 diff. Outside a git repo the picker says so and offers only the folder row.
 `space → Switch worktree` returns to the picker.
@@ -78,9 +81,14 @@ diff. Outside a git repo the picker says so and offers only the folder row.
 **Status.** `implemented` (graph 8g7 node worktree-picker)
 
 **Enforcement.** `verify_harness.rs::{diff_picker_lists_and_paints_worktrees,
+diff_picker_rows_paint_label_and_description,
+diff_picker_long_branch_label_ellipsizes_with_visible_prefix,
 diff_picker_j_enter_binds_second_worktree_and_derives,
 diff_picker_click_row_binds_worktree, diff_picker_not_a_repo_offers_only_folder_row,
-diff_tile_bound_persists_and_restores_bound}`; `diff_git.rs::list_worktrees_*`.
+diff_tile_bound_persists_and_restores_bound}`; `diff_git.rs::{list_worktrees_*,
+parse_head_commits_reads_batched_log}`; `diff_view.rs::picker_description_tests`.
+The label/description guards read the SHAPED text through the `probe_text` seam
+(bug-0072: rows painted a bare "…" while their boxes had full width).
 
 ### UXI-Diff-11 — Diff paints with a line cursor; nav never strands it
 

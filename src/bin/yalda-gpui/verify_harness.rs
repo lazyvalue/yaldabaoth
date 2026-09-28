@@ -29922,6 +29922,97 @@ fn diff_picker_lists_and_paints_worktrees(cx: &mut TestAppContext) {
     assert_eq!(view.read_with(vcx, |v, _| v.diff_tile_ref(id).unwrap().picker.selected), 0);
 }
 
+/// bug-0072 / UXI-Diff-10: every worktree row PAINTS its name and its
+/// description — the label leaf's SHAPED text (after `text_ellipsis`
+/// truncation, read back through the `probe_text` seam) is the branch name and
+/// the detail leaf's shaped text is non-empty and carries the path; both
+/// leaves have non-zero painted size and sit horizontally inside their row.
+/// Real entry point (`open_diff_inner` → async `list_worktrees`), real layout.
+#[gpui::test]
+fn diff_picker_rows_paint_label_and_description(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (primary, _lp, _linked) = diff_worktree_fixture();
+    let (view, vcx, id) = boot_diff_picker(cx, primary.path().to_path_buf());
+    let rows = view.read_with(vcx, |v, _| v.diff_tile_ref(id).unwrap().picker.rows.clone());
+    assert_eq!(rows.len(), 2, "fixture has two worktrees");
+
+    let tags: Vec<String> = (0..rows.len()).map(|i| format!("diff-picker-row-{i}")).collect();
+    let tag_refs: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
+    let rects = paint_diff_probes(&view, vcx, id, &tag_refs);
+    for (i, row) in rows.iter().enumerate() {
+        let (rx, _ry, rw, _rh) = rects[i].unwrap_or_else(|| panic!("row {i} did not paint"));
+        let branch = row.branch.clone().expect("fixture rows are on branches");
+        // Fixture: primary `feature` HEAD = "two file change"; linked `topic`
+        // was cut from `main` = "initial".
+        let subject = if i == 0 { "two file change" } else { "initial" };
+        let wt_name = row.path.file_name().unwrap().to_string_lossy().to_string();
+        let detail_needs = [format!("{subject} · "), wt_name];
+        for (part, needs) in [("label", vec![branch.clone()]), ("detail", detail_needs.to_vec())] {
+            let tag = format!("diff-picker-row-{id}-{i}-{part}");
+            let (text, (x, _y, w, h)) = crate::layout_probe_text(&tag)
+                .unwrap_or_else(|| panic!("row {i} {part} text leaf never painted ({tag})"));
+            eprintln!("row {i} {part}: {text:?} at x={x} w={w} h={h} (row x={rx} w={rw})");
+            assert!(
+                w > 0.0 && h > 0.0,
+                "row {i} {part} painted with zero size: {text:?} w={w} h={h}"
+            );
+            assert!(
+                x >= rx - 0.5 && x + w <= rx + rw + 0.5,
+                "row {i} {part} leaf [{x}, {}] outside its row [{rx}, {}]",
+                x + w,
+                rx + rw
+            );
+            let visible = text.trim_end_matches('…');
+            assert!(
+                !visible.trim().is_empty(),
+                "row {i} {part} shaped to no visible text: {text:?}"
+            );
+            for need in &needs {
+                assert!(
+                    text.contains(need.as_str()),
+                    "row {i} {part} must paint {need:?}, painted {text:?}"
+                );
+            }
+        }
+    }
+}
+
+/// bug-0072 companion: the fix keeps the ellipsis contract — a branch name
+/// far wider than the tile paints as a visible PREFIX + "…" (truncated at the
+/// row's real width), not as a bare "…" and not as unclipped overflow.
+#[gpui::test]
+fn diff_picker_long_branch_label_ellipsizes_with_visible_prefix(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (primary, _lp, _linked) = diff_worktree_fixture();
+    let long_parent = tempfile::tempdir().expect("tempdir");
+    let long_branch = format!("long-{}", "x".repeat(235));
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(primary.path())
+        .args(["worktree", "add", "--quiet", "-b", &long_branch])
+        .arg(long_parent.path().join("wt-long"))
+        .arg("main")
+        .status()
+        .expect("git worktree add");
+    assert!(status.success());
+    let (view, vcx, id) = boot_diff_picker(cx, primary.path().to_path_buf());
+    let rows = view.read_with(vcx, |v, _| v.diff_tile_ref(id).unwrap().picker.rows.clone());
+    let i = rows
+        .iter()
+        .position(|r| r.branch.as_deref() == Some(long_branch.as_str()))
+        .expect("long-branch row listed");
+    let row_tag = format!("diff-picker-row-{i}");
+    let (rx, _, rw, _) = paint_diff_probes(&view, vcx, id, &[row_tag.as_str()])[0].expect("row painted");
+    let (text, (x, _, w, _)) =
+        crate::layout_probe_text(&format!("diff-picker-row-{id}-{i}-label")).expect("label painted");
+    assert!(text.ends_with('…'), "a too-wide label must ellipsize: {text:?}");
+    assert!(
+        text.starts_with("long-xxx") && text.chars().count() > 10,
+        "the ellipsized label must keep a visible prefix: {text:?}"
+    );
+    assert!(x >= rx && x + w <= rx + rw + 0.5, "label leaf inside its row");
+}
+
 /// UXI-Diff-10: `j` then `Enter` (REAL keystrokes through the keymap →
 /// `handle_diff_key`) binds the tile to the SECOND worktree and derives its
 /// diff — the linked worktree's untracked `topic.txt` is in the model.
