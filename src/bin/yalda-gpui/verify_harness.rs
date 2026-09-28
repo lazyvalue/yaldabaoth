@@ -30952,3 +30952,54 @@ fn compose_caret_after_tab_paints_at_expanded_column(cx: &mut TestAppContext) {
         "compose caret after a TAB painted at x={tab_x}; after 4 spaces x={spaces_x}"
     );
 }
+
+/// C5 (text-editing review): the WP Edit view paints selected prose with the
+/// selection bg; `styled_line_element` must not mistake that bg for the
+/// inline-code proxy and reflow the selection into the monospace code font.
+/// Drives the real WP render (build_edit_body_wp → build_wrapped_line →
+/// styled_line_element) and reads the font actually chosen for each run.
+///
+/// Negative control (observed RED): pass `None` as `selection_bg` to
+/// `build_wrapped_line` in `build_edit_body_wp` (the pre-C5 code) → the
+/// selected "hello" run is laid out in the code font.
+#[gpui::test]
+fn wp_selected_prose_stays_in_body_font(cx: &mut TestAppContext) {
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let fh = cx.focus_handle();
+        fh.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            fh,
+        )
+    });
+    vcx.run_until_parked();
+    let (body, code) = view.update(vcx, |v, _| {
+        v.test_open_edit("plain hello world\nsecond line\n");
+        let e = v.edit_mut().expect("edit view");
+        e.view = crate::EditView::WordProcessor;
+        e.mode = crate::EditMode::Normal;
+        // Select "hello": anchor at (0,6), caret at (0,11).
+        e.editor.set_cursor(0, 6);
+        e.editor.view.anchor_at_cursor();
+        e.editor.set_cursor(0, 11);
+        (v.body_font.clone(), v.code_font.clone())
+    });
+    assert_ne!(body, code, "non-vacuous: body and code fonts differ");
+    for _ in 0..2 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+    crate::font_run_tap_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let runs = crate::font_run_tap_end();
+    let selected: Vec<_> = runs.iter().filter(|(t, _)| t.contains("hello")).collect();
+    assert!(!selected.is_empty(), "the selected run must render: {runs:?}");
+    for (t, fam) in selected {
+        assert_eq!(
+            fam, &body,
+            "selected WP prose {t:?} reflowed into font {fam:?} (code font {code:?})"
+        );
+    }
+}

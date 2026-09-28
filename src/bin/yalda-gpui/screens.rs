@@ -731,7 +731,10 @@ impl YaldaGpuiView {
                 DEFAULT_FG,
                 line_font,
                 &code_font,
-                None,
+                // C5: the selection bg painted onto `segs` above must be
+                // excluded from the inline-code font proxy, or selected prose
+                // reflows into the monospace code font.
+                sel.map(|_| selection_bg),
                 None,
                 line_idx,
                 None,
