@@ -31071,3 +31071,45 @@ fn frozen_line_caret_maps_raw_col_through_stripped_markdown(cx: &mut TestAppCont
          the same rendered char on 'bold tail' paints at x={plain_t}"
     );
 }
+
+/// D5 (text-editing review): a very long single compose line (a pasted blob)
+/// wraps into hundreds of visual rows; each row is now sliced from ONE shared
+/// `&[char]` of the line instead of re-collecting the whole line per row
+/// (O(L) instead of O(L²/cols)). Pins the behavior across that refactor: the
+/// caret deep inside the long line still paints on its row, inside the box.
+/// (Perf-only change — behavior was already correct, so there is no RED; the
+/// O(L) bound holds by construction of `build_chatbox_line(chars: &[char], …)`.)
+#[gpui::test]
+fn compose_long_single_line_caret_paints_inside_box(cx: &mut TestAppContext) {
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
+    let text: String = (0..3000).map(|i| format!("w{i} ")).collect();
+    let n = text.chars().count();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        let tb = c.input_surface.compose_mut();
+        *tb = crate::Compose::seeded(&text);
+        tb.editor.cursor_mut().line = 0;
+        tb.editor.cursor_mut().col = n / 2;
+    });
+    for _ in 0..4 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let row = crate::layout_probe_get("compose-cursor-row");
+    let caret = crate::layout_probe_get("caret");
+    let box_bounds = view.update(vcx, |v, cx| {
+        v.agent_read(cx, |c| c.input_surface.compose().bounds.get())
+    });
+    crate::layout_probe_end();
+    let (bx, by, bw, bh) = box_bounds.expect("compose box painted");
+    let (_, ry, _, _) = row.expect("caret row must paint (not below the fold)");
+    let (cx_, _, _, _) = caret.expect("caret must paint");
+    // Non-vacuous: the line is far taller than the box when wrapped.
+    assert!(n as f32 / (bw / crate::CHATBOX_CHAR_W).max(1.0) * 18.0 > bh * 4.0);
+    assert!(ry >= by - 1.0 && ry < by + bh, "caret row y={ry} outside box [{by}, {}]", by + bh);
+    assert!(cx_ >= bx - 1.0 && cx_ < bx + bw, "caret x={cx_} outside box [{bx}, {}]", bx + bw);
+}

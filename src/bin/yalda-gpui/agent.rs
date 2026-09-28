@@ -1467,14 +1467,16 @@ pub(crate) fn build_wrapped_line(
 // builder/render fn — arg count is inherent, splitting would obscure
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_chatbox_line(
-    full_text: &str,
+    // D5: the WHOLE logical line's chars, collected ONCE by the caller. Each
+    // visual row only slices `[left_col, left_col + visible_cols)` out of it, so
+    // a wrapped line costs O(line) total — not O(line) per visual row.
+    chars: &[char],
     is_cursor_line: bool,
     cursor_col: usize,
     mode: EditMode,
     cursor_color: Hsla,
     sel: Option<((usize, usize), (usize, usize))>,
     line_idx: usize,
-    total_line_chars: usize,
     code_font: &SharedString,
     text_color: Hsla,
     selection_bg: Hsla,
@@ -1489,8 +1491,8 @@ pub(crate) fn build_chatbox_line(
     // light/non-Dracula themes.
     let sel_bg: Hsla = selection_bg;
 
-    let chars: Vec<char> = full_text.chars().collect();
     let char_count = chars.len();
+    let total_line_chars = char_count;
 
     // ── Horizontal window: slice the line to the visible columns. ──
     // `vs..ve` is the char range shown; rendering it from the row's LEFT edge
@@ -1498,7 +1500,7 @@ pub(crate) fn build_chatbox_line(
     // per-column drift can accumulate (spec Behavior 5).
     let vs = left_col.min(char_count);
     let ve = left_col.saturating_add(visible_cols.max(1)).min(char_count);
-    let slice: Vec<char> = chars[vs..ve].to_vec();
+    let slice: &[char] = &chars[vs..ve];
     let slice_len = slice.len();
 
     // Selection projected onto this line, then intersected with the slice and
@@ -1700,7 +1702,6 @@ pub(crate) fn build_chatbox_wrapped_line(
     wrap_cols: usize,
 ) -> AnyElement {
     let chars: Vec<char> = full_text.chars().collect();
-    let total_chars = chars.len();
     let rows = wrap_line_cols(&chars, wrap_cols);
     let caret_row = is_cursor_line.then(|| caret_visual_row(&rows, cursor_col));
 
@@ -1718,14 +1719,13 @@ pub(crate) fn build_chatbox_wrapped_line(
     }
     for (r, &(rs, re)) in rows.iter().enumerate() {
         col = col.child(build_chatbox_line(
-            full_text,
+            &chars,
             caret_row == Some(r),
             cursor_col,
             mode,
             cursor_color,
             sel,
             line_idx,
-            total_chars,
             code_font,
             text_color,
             selection_bg,
