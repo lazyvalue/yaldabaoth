@@ -4296,6 +4296,8 @@ impl YaldaGpuiView {
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::null());
+        // D3: persist drafts BEFORE the successor loads the sessions file.
+        self.save_agent_ring(cx);
         match cmd.spawn() {
             Ok(_) => cx.quit(),
             Err(e) => {

@@ -3462,6 +3462,9 @@ impl YaldaGpuiView {
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::null());
+        // D3: persist drafts BEFORE spawning the successor — it loads the
+        // sessions file at startup, which can race the quit-hook save.
+        self.save_agent_ring(cx);
         match cmd.spawn() {
             Ok(_) => cx.quit(),
             Err(e) => {
@@ -3591,6 +3594,9 @@ impl YaldaGpuiView {
                                 cmd.stdin(std::process::Stdio::null());
                                 cmd.stdout(std::process::Stdio::null());
                                 cmd.stderr(std::process::Stdio::inherit());
+                                // D3: persist drafts before the successor
+                                // starts reading the sessions file.
+                                this.save_agent_ring(cx);
                                 match cmd.spawn() {
                                     Ok(child) => {
                                         this.append_system_console(
@@ -4265,6 +4271,16 @@ impl YaldaGpuiView {
     /// usually finishes in time but the order is non-deterministic and
     /// lingering child agents have been observed at exit. Called from
     /// `on_app_quit` in `main`.
+    /// The `on_app_quit` hook body (registered in `main`): persist every live
+    /// session's draft/presentation state, THEN tear down the ACP channels.
+    /// D3: the ring is otherwise saved only on session mutations, so anything
+    /// typed since the last one was lost on Quit. Save first — before any
+    /// channel teardown — so the snapshot sees the full live state.
+    pub(crate) fn on_app_quit_hook(&mut self, cx: &mut Context<Self>) {
+        self.save_agent_ring(cx);
+        self.shutdown_acp(cx);
+    }
+
     fn shutdown_acp(&mut self, cx: &mut Context<Self>) {
         // Drop every session's channel so the worker thread shuts down its
         // child agent before GPUI's window teardown races with us. Sessions
@@ -10436,7 +10452,7 @@ fn main() {
         // future satisfies the async signature; the real work is sync.
         app.on_app_quit(move |cx| {
             let _ = window_handle.update(cx, |view, _w, ctx| {
-                view.shutdown_acp(ctx);
+                view.on_app_quit_hook(ctx);
             });
             async move {}
         })

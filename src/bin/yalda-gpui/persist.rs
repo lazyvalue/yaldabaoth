@@ -2221,8 +2221,26 @@ pub(crate) fn save_persisted_acp_sessions(cwd: &std::path::Path, snaps: &[Sessio
         }
     }
     if let Ok(serialized) = serde_json::to_string_pretty(&json) {
-        let _ = std::fs::write(&path, serialized);
+        // D3: atomic replace (tmp + rename) — this file holds every session's
+        // label + draft, and a crash/kill mid-`write` would truncate it.
+        let _ = write_atomic(&path, serialized.as_bytes());
     }
+}
+
+/// Write `bytes` to `path` atomically: write a sibling temp file, then rename
+/// it over `path` (same directory ⇒ same filesystem ⇒ atomic rename), so a
+/// reader never observes a truncated/partial file.
+pub(crate) fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "state".into());
+    let tmp = path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()));
+    let result = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 // Test-only counter: incremented every time `render_agent` rebuilds the

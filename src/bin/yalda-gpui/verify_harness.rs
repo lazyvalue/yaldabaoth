@@ -116,6 +116,74 @@ fn prompt_rejected_restores_draft_in_worksheet(cx: &mut TestAppContext) {
     assert!(visible, "the restored worksheet draft is a visible inline You-block");
 }
 
+/// REGRESSION (D3, text-editing review): a draft typed since the last ring save
+/// survives Quit. Typing never saves the ring, so the app-quit hook must. Types
+/// the draft through REAL keystrokes, proves nothing persisted it yet, then runs
+/// the REAL `on_app_quit` hook body and reads the on-disk sessions file back
+/// (redirected to a tempdir — never `~/.yalda`).
+///
+/// Negative control: drop `self.save_agent_ring(cx)` from `on_app_quit_hook` →
+/// the file never carries the draft → the final assert fails RED.
+#[gpui::test]
+fn app_quit_hook_persists_unsaved_compose_draft(cx: &mut TestAppContext) {
+    use crate::{AgentFocus, EditMode, InputModeKind, InputSurface};
+    use crate::persist::{ACP_PERSIST_PATH_OVERRIDE, load_persisted_acp_sessions};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("acp_sessions.json");
+    let cwd = std::env::current_dir().expect("cwd");
+    cx.update(crate::register_keymap);
+    let (view, vcx, id, _session) = boot_with_transcript(cx);
+    ACP_PERSIST_PATH_OVERRIDE.with(|c| *c.borrow_mut() = Some(file.clone()));
+
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| {
+            c.input_surface = InputSurface::new(InputModeKind::Chatbox);
+            c.input_surface.compose_mut().mode = EditMode::Insert;
+            c.focus = AgentFocus::Compose;
+        });
+        // Baseline save (as any earlier session mutation would have done).
+        v.save_agent_ring(cx);
+    });
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("h e l l o");
+    vcx.run_until_parked();
+
+    let typed = view.read_with(vcx, |v, cx| {
+        v.read_session(id, cx, |c| c.input_surface.compose().text())
+            .expect("session")
+    });
+    assert_eq!(typed, "hello", "keystrokes reached the compose");
+    let draft_of = |slots: Vec<crate::persist::PersistedSlot>| {
+        slots
+            .into_iter()
+            .find(|s| s.id.as_str() == "S1")
+            .and_then(|s| s.compose_draft)
+    };
+    assert_eq!(
+        draft_of(load_persisted_acp_sessions(&cwd)),
+        None,
+        "non-vacuous: typing alone has not persisted the draft"
+    );
+
+    view.update(vcx, |v, cx| v.on_app_quit_hook(cx));
+    let persisted = draft_of(load_persisted_acp_sessions(&cwd));
+    ACP_PERSIST_PATH_OVERRIDE.with(|c| *c.borrow_mut() = None);
+    assert_eq!(
+        persisted.as_deref(),
+        Some("hello"),
+        "the quit hook persists the draft typed since the last ring save"
+    );
+    // The atomic write (tmp + rename) leaves no temp file behind.
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        .expect("read tempdir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "acp_sessions.json")
+        .collect();
+    assert!(leftovers.is_empty(), "no temp files left behind: {leftovers:?}");
+}
+
 /// A detach is another terminal lifecycle event: the transport is gone, so a
 /// locally awaiting turn cannot remain live after the notification is folded.
 #[gpui::test]
