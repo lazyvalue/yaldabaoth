@@ -34,7 +34,7 @@ impl YaldaGpuiView {
         }
     }
 
-    fn diff_tile_mut(&mut self, id: workspace::WindowId) -> Option<&mut DiffTile> {
+    pub(crate) fn diff_tile_mut(&mut self, id: workspace::WindowId) -> Option<&mut DiffTile> {
         match &mut self.workspace.tile_mut(id)?.content {
             App::Diff(tile) => Some(tile),
             _ => None,

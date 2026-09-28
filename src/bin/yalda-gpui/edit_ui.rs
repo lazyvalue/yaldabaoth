@@ -601,12 +601,16 @@ impl YaldaGpuiView {
             return;
         }
 
-        match Self::dispatch_normal_core(
+        let mut register = None;
+        let outcome = Self::dispatch_normal_core(
             &mut edit.editor,
             &mut edit.mode,
             &mut edit.keybinds,
             press,
-        ) {
+            &mut register,
+        );
+        Self::write_register(register, cx);
+        match outcome {
             NormalOutcome::Skipped => {}
             NormalOutcome::Handled => cx.notify(),
             NormalOutcome::Yanked => {
@@ -616,8 +620,9 @@ impl YaldaGpuiView {
             NormalOutcome::Quit => cx.quit(),
             NormalOutcome::OpenMenu => self.open_menu_inner(cx),
             NormalOutcome::Paste { before } => {
+                let text = Self::clipboard_text(cx);
                 if let Some(e) = self.edit_mut() {
-                    if Self::apply_paste(&mut e.editor, before) {
+                    if Self::apply_paste(&mut e.editor, text, before) {
                         e.last_save_msg = Some("put".into());
                     }
                     cx.notify();
@@ -629,12 +634,16 @@ impl YaldaGpuiView {
     /// Normal-mode dispatch on raw `(editor, mode, keybinds)` references —
     /// shared by the Edit screen and the Claude (ACP) screen. Caller is
     /// responsible for `cx.notify()` and any post-action status messaging
-    /// based on the returned `NormalOutcome`.
+    /// based on the returned `NormalOutcome`, and for handing `register` (the
+    /// text a yank/delete put in vim's default register, if any) to
+    /// [`Self::write_register`] — the core has no `cx`, so it can't reach the
+    /// clipboard itself (C6: one clipboard path, GPUI's).
     pub(crate) fn dispatch_normal_core<E: EditOps>(
         editor: &mut E,
         mode: &mut EditMode,
         keybinds: &mut KeybindManager,
         press: KeyPress,
+        register: &mut Option<String>,
     ) -> NormalOutcome {
         // Esc clears any active selection and exits extend mode.
         if press.key == Key::Esc {
@@ -811,9 +820,9 @@ impl YaldaGpuiView {
                 *mode = EditMode::Insert;
             }
             // ---- Helix selection actions ----
-            "delete-selection" => Self::yank_then_delete_selection(editor),
+            "delete-selection" => Self::yank_then_delete_selection(editor, register),
             "change-selection" => {
-                Self::yank_then_delete_selection(editor);
+                Self::yank_then_delete_selection(editor, register);
                 editor.begin_insert();
                 *mode = EditMode::Insert;
             }
@@ -825,7 +834,7 @@ impl YaldaGpuiView {
                         .trim_end_matches('\n')
                         .to_string(),
                 };
-                Self::yank_to_clipboard(&text);
+                *register = Some(text);
                 return NormalOutcome::Yanked;
             }
             "collapse-selection" => editor.collapse_selection(),
@@ -842,18 +851,11 @@ impl YaldaGpuiView {
                 }
             }
             // ---- Direct-edit actions (still callable via custom config) ----
-            "delete-char" => {
-                for _ in 0..n {
-                    if let Some(t) = char_under_cursor(editor) {
-                        Self::yank_to_clipboard(&t);
-                    }
-                    editor.delete_char_at_cursor();
-                }
-            }
+            "delete-char" => Self::delete_chars(editor, n, register),
             "delete-line" => {
                 let line = editor.line_text_at_cursor();
                 if !line.is_empty() {
-                    Self::yank_to_clipboard(&line);
+                    *register = Some(line);
                 }
                 editor.delete_current_line();
             }
@@ -884,18 +886,58 @@ impl YaldaGpuiView {
     /// deleted text to the clipboard (yalda's yank buffer) before removing it,
     /// so a subsequent `p`/`P` puts it back. Deletes the active selection, or
     /// the single character under the cursor when there's no selection.
-    fn yank_then_delete_selection<E: EditOps>(editor: &mut E) {
+    fn yank_then_delete_selection<E: EditOps>(editor: &mut E, register: &mut Option<String>) {
         if editor.selection_anchor().is_some() {
             if let Some(t) = editor.yank_selection().filter(|s| !s.is_empty()) {
-                Self::yank_to_clipboard(&t);
+                *register = Some(t);
             }
             editor.delete_selection();
         } else {
             if let Some(t) = char_under_cursor(editor) {
-                Self::yank_to_clipboard(&t);
+                *register = Some(t);
             }
             editor.delete_char_at_cursor();
         }
+    }
+
+    /// Counted `delete-char` (`5x`): ONE range delete of up to `n` chars on
+    /// the cursor's line (vim `x` never crosses the newline) — one undo group,
+    /// one reparse — yanking the whole deleted run (C6). A single char keeps
+    /// the plain `delete_char_at_cursor` path.
+    fn delete_chars<E: EditOps>(editor: &mut E, n: usize, register: &mut Option<String>) {
+        let cur = editor.cursor();
+        let raw = editor.line_text_at_cursor();
+        let line_chars = raw.strip_suffix('\n').unwrap_or(&raw).chars().count();
+        let m = n.min(line_chars.saturating_sub(cur.col));
+        if m <= 1 {
+            if let Some(t) = char_under_cursor(editor) {
+                *register = Some(t);
+            }
+            editor.delete_char_at_cursor();
+            return;
+        }
+        // Selections are [anchor, cursor): anchor here, cursor `m` chars on.
+        editor.cursor_set(cur.line, cur.col);
+        editor.anchor_at_cursor();
+        editor.cursor_set(cur.line, cur.col + m);
+        if let Some(t) = editor.yank_selection().filter(|s| !s.is_empty()) {
+            *register = Some(t);
+        }
+        editor.delete_selection();
+        editor.clamp_cursor_col(false);
+    }
+
+    /// Put a yank/delete's `register` text on the system clipboard through
+    /// GPUI (the same path Cmd-C uses; C6 — no blocking CLI subprocess).
+    pub(crate) fn write_register(register: Option<String>, cx: &mut Context<Self>) {
+        if let Some(t) = register {
+            cx.write_to_clipboard(ClipboardItem::new_string(t));
+        }
+    }
+
+    /// The system clipboard's text through GPUI, for a `p`/`P` put.
+    pub(crate) fn clipboard_text(cx: &mut Context<Self>) -> Option<String> {
+        cx.read_from_clipboard().and_then(|item| item.text())
     }
 
     /// Charwise put of `text` at (P, `before=true`) or just after (p,
@@ -929,10 +971,11 @@ impl YaldaGpuiView {
         true
     }
 
-    /// Resolve a [`NormalOutcome::Paste`] by reading the system clipboard and
-    /// putting it into `editor`. Shared by the Edit and Agent dispatch sites.
-    pub(crate) fn apply_paste<E: EditOps>(editor: &mut E, before: bool) -> bool {
-        match Self::read_from_clipboard() {
+    /// Resolve a [`NormalOutcome::Paste`] by putting the clipboard `text`
+    /// ([`Self::clipboard_text`]) into `editor`. Shared by the Edit and Agent
+    /// dispatch sites.
+    pub(crate) fn apply_paste<E: EditOps>(editor: &mut E, text: Option<String>, before: bool) -> bool {
+        match text {
             Some(text) => Self::put_text(editor, &text, before),
             None => false,
         }

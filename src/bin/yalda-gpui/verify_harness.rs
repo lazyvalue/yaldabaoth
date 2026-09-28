@@ -15557,6 +15557,64 @@ fn count_prefix_repeats_normal_motion(cx: &mut TestAppContext) {
     assert_eq!(line, 10, "`10j` moves the caret ten lines down");
 }
 
+/// C6 (text-editing review): a counted `delete-char` (`5x` under a vim-style
+/// config binding `x` → `delete-char`) is ONE range delete — one undo step
+/// restores all five chars — and yanks the WHOLE deleted text to the GPUI
+/// clipboard (the same one `copy_selection` / Cmd-C use), not one subprocess
+/// per char leaving only the last. `P` then puts from that same clipboard.
+/// Drives the REAL `handle_edit_key` → `dispatch_normal` path.
+/// NEGATIVE CONTROL (observed RED): restore the per-char loop +
+/// `yank_to_clipboard` subprocess → the GPUI clipboard is empty and one `u`
+/// restores only one char.
+#[gpui::test]
+fn counted_delete_char_is_one_undo_step_and_yanks_all(cx: &mut TestAppContext) {
+    use crate::EditOps;
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let fh = cx.focus_handle();
+        fh.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            fh,
+        )
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |v, _| v.test_open_edit("abcdefghij\nkl\n"));
+    view.update(vcx, |v, _| {
+        let e = v.edit_mut().unwrap();
+        e.mode = crate::EditMode::Normal;
+        e.editor.cursor_set(0, 0);
+        e.keybinds.apply_bindings(&[(
+            vec![yalda::keys::KeyPress::new(yalda::keys::Key::Char('x'), yalda::keys::Modifiers::NONE)],
+            "delete-char".into(),
+        )]);
+    });
+    let key = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext, k: &str| {
+        view.update_in(vcx, |v, w, cx| v.handle_edit_key(&ws_bare_key(k), w, cx));
+    };
+    let line0 = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.update(vcx, |v, _| {
+            let e = v.edit_mut().unwrap();
+            e.editor.cursor_set(0, 0);
+            e.editor.line_text_at_cursor()
+        })
+    };
+    key(&view, vcx, "5");
+    key(&view, vcx, "x");
+    assert_eq!(line0(&view, vcx), "fghij\n", "`5x` deletes five chars");
+    let clip = view
+        .update(vcx, |_, cx| cx.read_from_clipboard())
+        .and_then(|i| i.text());
+    assert_eq!(clip.as_deref(), Some("abcde"), "the clipboard holds ALL five deleted chars");
+    key(&view, vcx, "u");
+    assert_eq!(line0(&view, vcx), "abcdefghij\n", "ONE undo restores the whole `5x`");
+
+    // `P` puts from the same GPUI clipboard.
+    view.update(vcx, |_, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string("ZZ".into())));
+    key(&view, vcx, "P");
+    assert_eq!(line0(&view, vcx), "ZZabcdefghij\n", "`P` reads the GPUI clipboard");
+}
+
 /// The Normal-mode block caret lands ON the char under the cursor, even when the
 /// cursor sits exactly on a word start (a token boundary — where `w`/`b` land).
 /// The old `<=` predicate handed the boundary to the PRECEDING token, drawing a
@@ -30582,6 +30640,107 @@ fn diff_compose_typing_is_render_flat(cx: &mut TestAppContext) {
         crate::perf_render_count("diff"),
         0,
         "typing in the compose must not re-render the cached Diff body"
+    );
+}
+
+/// C7 (text-editing review): Cmd-V pastes into an open Diff review-comment
+/// compose through the REAL keymap (`cmd-v` → `PasteFromClipboard` →
+/// `paste_from_clipboard`), routed by the single `focused_text_input`
+/// resolver (which Cmd-C's `copy_selection` shares). Paste stays render-flat for the
+/// cached body, like typing.
+/// NEGATIVE CONTROL (observed RED): drop the `TextInputTarget::DiffCompose`
+/// arm from `focused_text_input` → the compose stays "note: ".
+#[gpui::test]
+fn diff_compose_cmd_v_pastes_clipboard(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let (view, vcx, id) = boot_with_diff(cx, temp.path().to_path_buf());
+    vcx.simulate_keystrokes("j j j c");
+    vcx.run_until_parked();
+    diff_type(vcx, "note: ");
+    view.update(vcx, |_, cx| {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("pasted text".into()))
+    });
+    crate::perf_reset("diff");
+    vcx.simulate_keystrokes("cmd-v");
+    vcx.run_until_parked();
+    assert_eq!(
+        diff_compose_text(&view, vcx, id).as_deref(),
+        Some("note: pasted text"),
+        "Cmd-V must paste into the open comment compose"
+    );
+    assert_eq!(crate::perf_render_count("diff"), 0, "paste must not re-render the cached Diff body");
+    // Save still works on the pasted draft.
+    vcx.simulate_keystrokes("ctrl-enter");
+    vcx.run_until_parked();
+    let (_, json) = fixture_review_json(temp.path());
+    assert_eq!(json["comments"][0]["body"], "note: pasted text", "{json}");
+}
+
+/// E1 + E2 (text-editing review): the Diff body shares ONE comment-card
+/// snapshot (comments + their wrapped card lines) per `review_gen` — `j`/`k`
+/// (which re-render the body because `cursor` is in `DiffSeqs`) neither
+/// deep-clone the comments nor re-wrap any card body; a review mutation
+/// (editing the comment) rebuilds it and the card PAINTS the new text.
+/// NEGATIVE CONTROL (observed RED): build the snapshot unconditionally every
+/// render (drop the `review_gen` key check) → `comment_card_lines` runs on
+/// every j/k.
+#[gpui::test]
+fn diff_card_snapshot_is_shared_across_cursor_moves(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let (view, vcx, id) = boot_with_diff(cx, temp.path().to_path_buf());
+    diff_add_comment(vcx, "j j j", "first body");
+    // Settle a paint with the card on screen.
+    let p = paint_diff_probes(&view, vcx, id, &["diff-comment-c1"]);
+    assert!(p[0].is_some(), "card painted");
+
+    crate::card_lines_calls_reset();
+    crate::perf_reset("diff");
+    for k in ["j", "k", "j", "k", "j"] {
+        vcx.simulate_keystrokes(k);
+        vcx.run_until_parked();
+    }
+    let p = paint_diff_probes(&view, vcx, id, &["diff-comment-c1"]);
+    assert!(p[0].is_some(), "card still painted after cursor moves");
+    assert!(crate::perf_render_count("diff") >= 5, "j/k DO re-render the body (non-vacuous)");
+    assert_eq!(
+        crate::card_lines_calls(),
+        0,
+        "cursor moves must not re-wrap / re-snapshot comment cards"
+    );
+
+    // A review mutation (edit the comment) rebuilds the snapshot: the card
+    // shows the new body, not a stale cached one.
+    let card_row = diff_rows(&view, vcx, id)
+        .iter()
+        .position(|r| matches!(r, crate::RowRef::Comment { part: 0, .. }))
+        .expect("card row");
+    let cur = diff_cursor(&view, vcx, id);
+    let nav = if card_row > cur { vec!["j"; card_row - cur] } else { vec!["k"; cur - card_row] };
+    if !nav.is_empty() {
+        vcx.simulate_keystrokes(&nav.join(" "));
+    }
+    vcx.simulate_keystrokes("e");
+    vcx.run_until_parked();
+    diff_type(vcx, " edited");
+    vcx.simulate_keystrokes("ctrl-enter");
+    vcx.run_until_parked();
+    assert!(crate::card_lines_calls() > 0, "a review mutation rebuilds the card snapshot");
+    let body = view.read_with(vcx, |v, _| {
+        v.diff_tile_ref(id).unwrap().review.as_ref().unwrap().comments[0].body.clone()
+    });
+    assert_eq!(body, "first body edited");
+    let p = paint_diff_probes(&view, vcx, id, &["diff-comment-c1"]);
+    assert!(p[0].is_some(), "edited card painted");
+    let dv = view
+        .read_with(vcx, |v, _| v.diff_tile_ref(id).and_then(|t| t.view.clone()))
+        .expect("DiffView");
+    let painted = dv.read_with(vcx, |d, _| d.cached_card_line(0, 0));
+    assert_eq!(
+        painted,
+        Some(crate::CardLine::Body("first body edited".into())),
+        "the painted card row comes from a snapshot rebuilt at the new review_gen"
     );
 }
 

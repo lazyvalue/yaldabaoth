@@ -320,10 +320,29 @@ pub(crate) fn wrap_cols(text: &str, cols: usize) -> Vec<String> {
     out
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only count of [`comment_card_lines`] calls — the E2 guard that a
+    /// cursor move re-wraps no card body (`card_lines_calls*`).
+    static CARD_LINES_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn card_lines_calls() -> usize {
+    CARD_LINES_CALLS.with(|n| n.get())
+}
+
+#[cfg(test)]
+pub(crate) fn card_lines_calls_reset() {
+    CARD_LINES_CALLS.with(|n| n.set(0));
+}
+
 /// The content rows of `c`'s card (see [`CardLine`]): wrapped body capped at
 /// [`COMMENT_MAX_BODY_ROWS`] (last shown row becomes "…" when cut), then — for
 /// an outdated comment — its snippet capped at [`COMMENT_MAX_SNIPPET_ROWS`].
 pub(crate) fn comment_card_lines(c: &ReviewComment) -> Vec<CardLine> {
+    #[cfg(test)]
+    CARD_LINES_CALLS.with(|n| n.set(n.get() + 1));
     let mut body = wrap_cols(c.body.trim_end(), COMMENT_WRAP_COLS);
     let mut out: Vec<CardLine> = Vec::new();
     if body.len() > COMMENT_MAX_BODY_ROWS {
