@@ -30870,6 +30870,373 @@ fn diff_view_v_range_rerenders_the_cached_body(cx: &mut TestAppContext) {
     assert!(crate::perf_render_count("diff") > after_v, "Esc clearing the range must re-render");
 }
 
+// ── Graph kfa node `context-expand`: spec B2a, UXI-Diff-18 ────────────────
+//
+// Fixture (`diff_expand_fixture`): `code.txt`, 200 lines `line <i>` on
+// `main`; `feature` changes line 40, INSERTS a line after it, and changes line
+// 130 — two hunks ≥ 60 lines apart, and every new-side line after the insert
+// is old + 1. Rows before any expand:
+//   0 File · 1 Expander(top, new 1..=36) · 2 Hunk -37,7 +37,8 · 3..=11 lines
+//   (new 37..=44) · 12 Expander(between, new 45..=127, old 44..=126) ·
+//   13 Hunk -127,7 +128,7 · 14..=21 lines (new 128..=134) ·
+//   22 Expander(bottom, new 135.., unknown until the text loads; 201 lines).
+
+fn diff_expand_fixture() -> tempfile::TempDir {
+    fn git_ok(dir: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .unwrap_or_else(|e| panic!("failed to run git {args:?}: {e}"));
+        assert!(status.success(), "git {args:?} failed in {}", dir.display());
+    }
+    let temp = tempfile::tempdir().expect("tempdir");
+    let dir = temp.path();
+    git_ok(dir, &["init", "--quiet"]);
+    git_ok(dir, &["config", "user.email", "test@example.com"]);
+    git_ok(dir, &["config", "user.name", "Test"]);
+    git_ok(dir, &["config", "commit.gpgsign", "false"]);
+    let base: Vec<String> = (1..=200).map(|i| format!("line {i}")).collect();
+    std::fs::write(dir.join("code.txt"), base.join("\n") + "\n").unwrap();
+    git_ok(dir, &["add", "code.txt"]);
+    git_ok(dir, &["commit", "--quiet", "-m", "initial"]);
+    git_ok(dir, &["branch", "-M", "main"]);
+    git_ok(dir, &["checkout", "--quiet", "-b", "feature"]);
+    std::fs::write(dir.join("code.txt"), expand_fixture_feature_text("line 130 changed")).unwrap();
+    git_ok(dir, &["add", "code.txt"]);
+    git_ok(dir, &["commit", "--quiet", "-m", "two distant hunks"]);
+    temp
+}
+
+/// The fixture's `feature` text with line 130 replaced by `l130`.
+fn expand_fixture_feature_text(l130: &str) -> String {
+    let mut lines: Vec<String> = (1..=200).map(|i| format!("line {i}")).collect();
+    lines[129] = l130.to_string();
+    lines[39] = "line 40 changed".to_string();
+    lines.insert(40, "inserted after 40".to_string());
+    lines.join("\n") + "\n"
+}
+
+/// Paint (probes on) and read the SHAPED text of each `probe_text` tag.
+fn paint_diff_texts(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+    id: crate::workspace::WindowId,
+    tags: &[String],
+) -> Vec<Option<String>> {
+    let dv = view.read_with(vcx, |v, _| v.diff_tile_ref(id).and_then(|t| t.view.clone()));
+    crate::layout_probe_begin();
+    match dv {
+        Some(dv) => dv.update(vcx, |_, cx| cx.notify()),
+        None => view.update(vcx, |_, cx| cx.notify()),
+    }
+    vcx.run_until_parked();
+    let out = tags.iter().map(|t| crate::layout_probe_text(t).map(|(s, _)| s)).collect();
+    crate::layout_probe_end();
+    out
+}
+
+/// The painted `(old, new, text)` of body row `ix` (None when not painted).
+fn painted_code_row(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+    id: crate::workspace::WindowId,
+    ix: usize,
+) -> Option<(String, String, String)> {
+    let t = paint_diff_texts(
+        view,
+        vcx,
+        id,
+        &[format!("diff-row-{ix}-old"), format!("diff-row-{ix}-new"), format!("diff-row-{ix}-text")],
+    );
+    Some((t[0].clone()?, t[1].clone()?, t[2].clone()?))
+}
+
+fn ctx_new_numbers(rows: &[crate::RowRef]) -> Vec<u32> {
+    rows.iter()
+        .filter_map(|r| match r {
+            crate::RowRef::Ctx { new, .. } => Some(*new),
+            _ => None,
+        })
+        .collect()
+}
+
+/// UXI-Diff-18 between hunks, REAL keys: `j`×12 onto the between-hunks
+/// expander, Enter (moving down ⇒ `↓`) loads the file async and reveals
+/// EXACTLY the 20 lines under the first hunk — new 45..=64, old 44..=63 (the
+/// inserted line shifts the old side) — painted with those gutters and the
+/// right code text; the expander follows them reading "Show all 63 hidden
+/// lines" and keeps the cursor, so Enter again continues.
+///
+/// Negative controls (observed RED): (1) numbering — `Gap::old_delta` forced
+/// to 0 in `file_gaps` ⇒ row 12 paints old "45"; (2) reveal — `apply_expand`
+/// returning `false` without changing `r` ⇒ no Ctx rows.
+#[gpui::test]
+fn diff_expand_between_hunks_reveals_20_numbered_lines(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_expand_fixture();
+    let (view, vcx, id) = boot_with_diff(cx, temp.path().to_path_buf());
+    let rows = diff_rows(&view, vcx, id);
+    assert_eq!(rows.len(), 23, "fixture rows: {rows:?}");
+    assert!(
+        matches!(rows[12], crate::RowRef::Expander { gap: 1, first_hidden: 45, hidden: Some(83), .. }),
+        "between expander: {:?}",
+        rows[12]
+    );
+    let t = paint_diff_texts(&view, vcx, id, &["diff-expander-text-12-all".into(), "diff-expander-text-12-down".into()]);
+    assert_eq!(t[0].as_deref(), Some("Show all 83 hidden lines"), "expander paints its count");
+    assert_eq!(t[1].as_deref(), Some("↓ 20 more lines"));
+
+    vcx.simulate_keystrokes(&vec!["j"; 12].join(" "));
+    vcx.run_until_parked();
+    assert_eq!(diff_cursor(&view, vcx, id), 12);
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+
+    let rows = diff_rows(&view, vcx, id);
+    assert_eq!(ctx_new_numbers(&rows), (45..=64).collect::<Vec<_>>(), "exactly 20 lines revealed below hunk 1");
+    assert_eq!(rows[12], crate::RowRef::Ctx { file: 0, old: 44, new: 45 });
+    assert!(
+        matches!(rows[32], crate::RowRef::Expander { gap: 1, first_hidden: 65, hidden: Some(63), .. }),
+        "the expander follows the revealed lines: {:?}",
+        rows[32]
+    );
+    assert_eq!(diff_cursor(&view, vcx, id), 32, "the cursor stays on the expander");
+
+    // Painted: walk the cursor up over every revealed row; each paints its
+    // own old/new gutter and its code.
+    for ix in (12..=31).rev() {
+        vcx.simulate_keystrokes("k");
+        vcx.run_until_parked();
+        assert_eq!(diff_cursor(&view, vcx, id), ix);
+        let new = 45 + (ix - 12);
+        let got = painted_code_row(&view, vcx, id, ix).unwrap_or_else(|| panic!("row {ix} not painted"));
+        assert_eq!(
+            got,
+            (format!("{}", new - 1), format!("{new}"), format!("line {}", new - 1)),
+            "row {ix}: (old, new, text)"
+        );
+    }
+    let t = paint_diff_texts(&view, vcx, id, &["diff-expander-text-32-all".into()]);
+    assert_eq!(t[0].as_deref(), Some("Show all 63 hidden lines"));
+}
+
+/// UXI-Diff-18 top + bottom, REAL keys: Enter on the top expander reveals
+/// the 20 lines right ABOVE the first hunk (new/old 17..=36); Enter again
+/// (16 < 30 left) shows the rest, and the gap closing drops the first hunk's
+/// header. `G` then Enter on the bottom expander loads nothing new (cached)
+/// and reveals the 20 lines BELOW the last hunk (new 135..=154, old
+/// 134..=153); the file's real end is now known (47 hidden).
+#[gpui::test]
+fn diff_expand_top_and_bottom_expanders(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_expand_fixture();
+    let (view, vcx, id) = boot_with_diff(cx, temp.path().to_path_buf());
+    vcx.simulate_keystrokes("j enter");
+    vcx.run_until_parked();
+    let rows = diff_rows(&view, vcx, id);
+    assert_eq!(ctx_new_numbers(&rows), (17..=36).collect::<Vec<_>>(), "↑ reveals the 20 lines above hunk 1");
+    assert!(matches!(rows[1], crate::RowRef::Expander { gap: 0, hidden: Some(16), .. }), "{:?}", rows[1]);
+    assert_eq!(rows[2], crate::RowRef::Ctx { file: 0, old: 17, new: 17 });
+    assert!(rows[22].is_hunk(), "then the hunk header");
+    assert_eq!(
+        painted_code_row(&view, vcx, id, 2),
+        Some(("17".into(), "17".into(), "line 17".into())),
+        "revealed row painted with its numbers"
+    );
+    let t = paint_diff_texts(&view, vcx, id, &["diff-expander-text-1-all".into(), "diff-expander-text-1-up".into()]);
+    assert_eq!(t[0].as_deref(), Some("Show all 16 hidden lines"));
+    assert_eq!(t[1], None, "under 30 hidden ⇒ only 'Show all'");
+
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    let rows = diff_rows(&view, vcx, id);
+    assert_eq!(ctx_new_numbers(&rows), (1..=36).collect::<Vec<_>>(), "the whole top gap");
+    assert!(!rows.iter().any(|r| matches!(r, crate::RowRef::Expander { gap: 0, .. })));
+    assert!(!rows.contains(&crate::RowRef::Hunk { file: 0, hunk: 0 }), "gap closed ⇒ hunk header dropped");
+    assert_eq!(rows[1], crate::RowRef::Ctx { file: 0, old: 1, new: 1 });
+    assert_eq!(diff_cursor(&view, vcx, id), 1, "cursor on the first revealed line");
+
+    vcx.simulate_keystrokes("shift-g enter");
+    vcx.run_until_parked();
+    let rows = diff_rows(&view, vcx, id);
+    let bottom: Vec<u32> = ctx_new_numbers(&rows).into_iter().filter(|n| *n > 134).collect();
+    assert_eq!(bottom, (135..=154).collect::<Vec<_>>(), "↓ reveals the 20 lines below the last hunk");
+    let last = rows.len() - 1;
+    assert!(
+        matches!(rows[last], crate::RowRef::Expander { gap: 2, hidden: Some(47), .. }),
+        "bottom expander now knows the end: {:?}",
+        rows[last]
+    );
+    let first_bottom = rows.iter().position(|r| *r == crate::RowRef::Ctx { file: 0, old: 134, new: 135 }).unwrap();
+    vcx.simulate_keystrokes(&vec!["k"; last - first_bottom].join(" "));
+    vcx.run_until_parked();
+    assert_eq!(
+        painted_code_row(&view, vcx, id, first_bottom),
+        Some(("134".into(), "135".into(), "line 134".into()))
+    );
+}
+
+/// UXI-Diff-18 click + merge: a REAL mouse click on the painted "Show all 83
+/// hidden lines" segment of the between-hunks expander reveals the whole gap
+/// (new 45..=127): the expander and the second hunk's header disappear, so
+/// the two hunks read as one continuous run (…44, 45…127, 128…).
+///
+/// Negative control (observed RED): with the segment's `.on_mouse_down(…)`
+/// removed in `diff_expander_row`, the click only moves the cursor.
+#[gpui::test]
+fn diff_expand_click_show_all_merges_hunks(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_expand_fixture();
+    let (view, vcx, id) = boot_with_diff(cx, temp.path().to_path_buf());
+    let r = paint_diff_probes(&view, vcx, id, &["diff-expander-12-all"])[0].expect("'Show all' segment painted");
+    assert!(r.2 > 20.0 && r.3 > 4.0, "segment painted with a real box: {r:?}");
+    let at = point(px(r.0 + r.2 / 2.0), px(r.1 + r.3 / 2.0));
+    vcx.simulate_mouse_move(at, None, gpui::Modifiers::default());
+    vcx.simulate_click(at, gpui::Modifiers::default());
+    vcx.run_until_parked();
+
+    let rows = diff_rows(&view, vcx, id);
+    assert_eq!(ctx_new_numbers(&rows), (45..=127).collect::<Vec<_>>(), "the whole gap revealed");
+    assert!(!rows.iter().any(|r| matches!(r, crate::RowRef::Expander { gap: 1, .. })), "no expander left");
+    assert!(!rows.contains(&crate::RowRef::Hunk { file: 0, hunk: 1 }), "hunks merged");
+    assert!(matches!(rows[11], crate::RowRef::Line { new: Some(44), .. }));
+    assert_eq!(rows[12], crate::RowRef::Ctx { file: 0, old: 44, new: 45 });
+    assert_eq!(rows[94], crate::RowRef::Ctx { file: 0, old: 126, new: 127 });
+    assert!(matches!(rows[95], crate::RowRef::Line { hunk: 1, line: 0, new: Some(128), .. }));
+    assert_eq!(diff_cursor(&view, vcx, id), 12, "cursor on the first revealed line");
+}
+
+/// UXI-Diff-18 + UXI-Diff-15: a revealed line is commentable. Expand, `k`
+/// onto revealed new line 64, `c` + text + `ctrl-enter` ⇒ the review JSON
+/// anchors the comment at new-side line 64 with the line's text as the
+/// snippet, and its card paints under that revealed row. After a re-derive
+/// that CHANGES the file (another hunk edited ⇒ new `file_hash`, expansion
+/// reset) the comment is NOT outdated and its line is revealed again with the
+/// card under it.
+#[gpui::test]
+fn diff_expand_revealed_line_is_commentable(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_expand_fixture();
+    let wt = temp.path().to_path_buf();
+    let (view, vcx, id) = boot_with_diff(cx, wt.clone());
+    vcx.simulate_keystrokes(&vec!["j"; 12].join(" "));
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("k");
+    vcx.run_until_parked();
+    assert_eq!(diff_rows(&view, vcx, id)[31], crate::RowRef::Ctx { file: 0, old: 63, new: 64 });
+    assert_eq!(diff_cursor(&view, vcx, id), 31);
+    diff_add_comment(vcx, "", "why");
+    let (_, json) = fixture_review_json(&wt);
+    let c = &json["comments"][0];
+    assert_eq!(c["lines"], serde_json::json!([64, 64]), "anchored on the revealed line: {json}");
+    assert_eq!(c["side"], "new");
+    assert_eq!(c["snippet"], "line 63");
+    assert_eq!(c["outdated"], false);
+    let rows = diff_rows(&view, vcx, id);
+    assert!(matches!(rows[32], crate::RowRef::Comment { part: 0, .. }), "card under the revealed line: {rows:?}");
+    let p = paint_diff_probes(&view, vcx, id, &["diff-row-31", "diff-comment-c1"]);
+    let (line, card) = (p[0].expect("revealed row painted"), p[1].expect("card painted"));
+    assert!(card.1 > line.1 && card.1 <= line.1 + line.3 + 4.0, "card {card:?} directly under {line:?}");
+
+    std::fs::write(wt.join("code.txt"), expand_fixture_feature_text("line 130 changed again")).unwrap();
+    vcx.simulate_keystrokes("r");
+    vcx.run_until_parked();
+    let (_, json) = fixture_review_json(&wt);
+    assert_eq!(json["comments"][0]["outdated"], false, "a comment on context stays live: {json}");
+    let rows = diff_rows(&view, vcx, id);
+    let at = rows
+        .iter()
+        .position(|r| *r == crate::RowRef::Ctx { file: 0, old: 63, new: 64 })
+        .expect("the comment's line is revealed again after the re-derive");
+    assert!(matches!(rows[at + 1], crate::RowRef::Comment { part: 0, .. }), "card still under it: {rows:?}");
+}
+
+/// UXI-Diff-18 persistence: expansion survives a refresh (`r`) that leaves
+/// the file's `file_hash` unchanged — the same 20 revealed lines — and is
+/// dropped when the file's diff changes.
+///
+/// Negative control (observed RED): `tile.expansions.retain_for(&model)` in
+/// `diff_apply` replaced by clearing every expansion ⇒ no Ctx rows after `r`.
+#[gpui::test]
+fn diff_expand_survives_refresh_when_file_unchanged(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_expand_fixture();
+    let wt = temp.path().to_path_buf();
+    let (view, vcx, id) = boot_with_diff(cx, wt.clone());
+    vcx.simulate_keystrokes(&vec!["j"; 12].join(" "));
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    assert_eq!(ctx_new_numbers(&diff_rows(&view, vcx, id)), (45..=64).collect::<Vec<_>>());
+    let gen0 = view.read_with(vcx, |v, _| v.diff_tile_ref(id).unwrap().model_gen);
+
+    vcx.simulate_keystrokes("r");
+    vcx.run_until_parked();
+    assert!(view.read_with(vcx, |v, _| v.diff_tile_ref(id).unwrap().model_gen) > gen0, "re-derived");
+    assert_eq!(
+        ctx_new_numbers(&diff_rows(&view, vcx, id)),
+        (45..=64).collect::<Vec<_>>(),
+        "same file_hash ⇒ the expansion survives the refresh"
+    );
+    assert_eq!(
+        painted_code_row(&view, vcx, id, 12).map(|r| r.2),
+        Some("line 44".to_string()),
+        "and still paints its text"
+    );
+
+    std::fs::write(wt.join("code.txt"), expand_fixture_feature_text("line 130 changed again")).unwrap();
+    vcx.simulate_keystrokes("r");
+    vcx.run_until_parked();
+    assert!(ctx_new_numbers(&diff_rows(&view, vcx, id)).is_empty(), "a changed file resets its expansion");
+}
+
+/// UXI-Diff-18 `+`: on a line of the second hunk, `+` reveals 20 lines
+/// above it (new 108..=127) and 20 below it (135..=154) in one keystroke.
+#[gpui::test]
+fn diff_expand_plus_key_expands_around_the_cursor_hunk(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_expand_fixture();
+    let (view, vcx, id) = boot_with_diff(cx, temp.path().to_path_buf());
+    vcx.simulate_keystrokes(&vec!["j"; 17].join(" "));
+    vcx.run_until_parked();
+    assert!(matches!(diff_rows(&view, vcx, id)[17], crate::RowRef::Line { hunk: 1, .. }));
+    vcx.simulate_keystrokes("+");
+    vcx.run_until_parked();
+    let rows = diff_rows(&view, vcx, id);
+    let revealed = ctx_new_numbers(&rows);
+    let want: Vec<u32> = (108..=127).chain(135..=154).collect();
+    assert_eq!(revealed, want, "20 above + 20 below hunk 2");
+    let cur = rows[diff_cursor(&view, vcx, id)];
+    assert!(matches!(cur, crate::RowRef::Line { hunk: 1, .. }), "the cursor stays on its line: {cur:?}");
+}
+
+/// UXI-Diff-12 / yux rule 2 for expansion: an expand busts the cached body
+/// (rows rebuilt ⇒ `rows_gen`), and an unrelated root notify afterwards
+/// leaves its render count flat.
+#[gpui::test]
+fn diff_expand_rerenders_body_and_unrelated_notify_is_flat(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_expand_fixture();
+    let (view, vcx, _id) = boot_with_diff(cx, temp.path().to_path_buf());
+    vcx.simulate_keystrokes(&vec!["j"; 12].join(" "));
+    vcx.run_until_parked();
+    crate::perf_reset("diff");
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    let after = crate::perf_render_count("diff");
+    assert!(after >= 1, "an expand must re-render the cached body");
+    for _ in 0..5 {
+        view.update(vcx, |v, cx| {
+            v.transient_status = Some("unrelated".into());
+            cx.notify();
+        });
+        vcx.run_until_parked();
+    }
+    assert_eq!(crate::perf_render_count("diff"), after, "an unrelated root notify must stay render-flat");
+}
+
 // ── Cog graph 8g7 node `send-picker`: spec B6, UXI-Diff-16 ────────────────
 //
 // Sessions are FREE sessions in the store (the focused tile is the Diff tile,

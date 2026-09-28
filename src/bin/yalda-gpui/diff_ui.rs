@@ -298,10 +298,24 @@ impl YaldaGpuiView {
                     let model =
                         parse_diff(&raw.diff_text, wt.clone(), &raw.branch, &raw.base, &raw.merge_base);
                     let review_path = review_path_for(&wt, Some(&raw.branch));
+                    // Comments anchored on revealed context lines (spec B2a)
+                    // are live while their snippet is in the file's new-side
+                    // text: read each such file once (only for comments that
+                    // missed the hunks) and hand the texts to the cache.
+                    let mut texts: Vec<(PathBuf, u64, std::sync::Arc<str>)> = Vec::new();
+                    let mut new_text = |p: &std::path::Path| -> Option<std::sync::Arc<str>> {
+                        if let Some((_, _, t)) = texts.iter().find(|(q, _, _)| q == p) {
+                            return Some(t.clone());
+                        }
+                        let f = model.files.iter().find(|f| f.path == p).filter(|f| expandable(f))?;
+                        let t: std::sync::Arc<str> = read_file_side(&wt, &model.merge_base, p, false).ok()?.into();
+                        texts.push((p.to_path_buf(), f.file_hash, t.clone()));
+                        Some(t)
+                    };
                     let review = review_path.as_ref().map(|path| {
                         let mut review = load_review(path);
                         let stale_viewed = review.viewed.len();
-                        let outdated_moved = review.recompute_outdated(&model);
+                        let outdated_moved = review.recompute_outdated_with(&model, &mut new_text);
                         review.prune_viewed(&model);
                         if outdated_moved || review.viewed.len() != stale_viewed {
                             if let Err(e) = save_review_latest(path, &mut review, Some(&model), review_gen, &saved) {
@@ -319,6 +333,7 @@ impl YaldaGpuiView {
                         model,
                         review,
                         review_path,
+                        texts,
                     })
                 })
                 .await;
@@ -361,12 +376,21 @@ impl YaldaGpuiView {
                 let anchor = tile.cursor_anchor();
                 let old_cursor = tile.cursor;
                 let model = Rc::new(derived.model);
+                // spec B2a: file texts + context expansion survive for files
+                // whose `file_hash` is unchanged; the derive's reads seed the
+                // cache.
+                tile.texts.invalidate(&model);
+                tile.expansions.retain_for(&model);
+                for (path, hash, text) in derived.texts {
+                    tile.texts.insert_ready(&path, CommentSide::New, hash, text);
+                }
                 let edited_meanwhile = tile.review_gen != review_gen_at_start
                     && tile.review.is_some()
                     && tile.review_path == derived.review_path;
                 if edited_meanwhile {
+                    let texts = &tile.texts;
                     if let Some(r) = tile.review.as_mut() {
-                        r.recompute_outdated(&model);
+                        r.recompute_outdated_with(&model, &mut |p| texts.file_text(p, CommentSide::New));
                         r.prune_viewed(&model);
                     }
                     persist = true;
@@ -378,6 +402,7 @@ impl YaldaGpuiView {
                 tile.model = Some(model.clone());
                 tile.error = None;
                 tile.model_gen = tile.model_gen.wrapping_add(1);
+                tile.reveal_comment_lines();
                 tile.rebuild_rows();
                 tile.cursor = anchor
                     .map(|a| resolve_anchor(&model, &tile.rows, &a, old_cursor))
@@ -387,10 +412,166 @@ impl YaldaGpuiView {
                 tile.error = Some(e.to_string());
             }
         }
+        let missing = self.diff_tile_ref(id).map(DiffTile::expansions_missing_text).unwrap_or_default();
+        for path in missing {
+            self.diff_load_file_text(id, path, CommentSide::New, cx);
+        }
         if persist {
             self.diff_persist_review(id, cx);
         }
         cx.notify();
+    }
+
+    // ── Graph kfa node `context-expand`: spec B2a, UXI-Diff-18 ─────────────
+
+    /// Load `path`'s `side` text into tile `id`'s [`FileTexts`] cache on the
+    /// background executor (spec C2 — never on the paint path): the new side
+    /// from the worktree file, the old side via `git show <merge-base>:<path>`
+    /// (a rename's FROM path). No-op when already loading / loaded. On
+    /// landing, queued expands for the file run and rows rebuild. The shared
+    /// entry point for every consumer of the cache (context expander, syntax
+    /// highlighting).
+    pub(crate) fn diff_load_file_text(
+        &mut self,
+        id: workspace::WindowId,
+        path: PathBuf,
+        side: CommentSide,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tile) = self.diff_tile_mut(id) else {
+            return;
+        };
+        let (Some(worktree), Some(model)) = (tile.worktree.clone(), tile.model.clone()) else {
+            return;
+        };
+        let Some(f) = model.files.iter().find(|f| f.path == path) else {
+            return;
+        };
+        let hash = f.file_hash;
+        let rel = match (&f.status, side) {
+            (FileStatus::Renamed { from }, CommentSide::Old) => from.clone(),
+            _ => f.path.clone(),
+        };
+        if !tile.texts.begin_load(&path, side, hash) {
+            return;
+        }
+        let merge_base = model.merge_base.clone();
+        cx.spawn(async move |this, cx| {
+            let mb = merge_base.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    read_file_side(&worktree, &mb, &rel, side == CommentSide::Old)
+                        .map(std::sync::Arc::<str>::from)
+                        .map_err(|e| e.to_string())
+                })
+                .await;
+            let _ = this.update(cx, |v, cx| v.diff_file_text_apply(id, path, side, hash, &merge_base, result, cx));
+        })
+        .detach();
+    }
+
+    /// Land a [`diff_load_file_text`](Self::diff_load_file_text) result:
+    /// store it (dropped if stale), run the file's queued expands, rebuild
+    /// rows keeping the cursor. A failed read drops the queue with a hint.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn diff_file_text_apply(
+        &mut self,
+        id: workspace::WindowId,
+        path: PathBuf,
+        side: CommentSide,
+        hash: u64,
+        merge_base: &str,
+        result: Result<std::sync::Arc<str>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tile) = self.diff_tile_mut(id) else {
+            return;
+        };
+        let failed = result.as_ref().err().cloned();
+        if !tile.texts.finish_load(&path, side, hash, merge_base, result) {
+            return;
+        }
+        if side == CommentSide::New {
+            let queued = tile.apply_pending_expansions(&path);
+            tile.reveal_comment_lines();
+            tile.rebuild_rows_keeping_cursor();
+            if queued && let Some(e) = failed {
+                self.diff_hint(format!("Couldn't read {}: {e}", path.display()), cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Expand gap `gap` of file `file` of tile `id` in `dir` (spec B2a) —
+    /// the one path Enter, a segment click and `+` share. Loads the file's
+    /// text first when needed (the expander shows "Loading…" meanwhile).
+    pub(crate) fn diff_expand(
+        &mut self,
+        id: workspace::WindowId,
+        file: usize,
+        gap: usize,
+        dir: ExpandDir,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tile) = self.diff_tile_mut(id) else {
+            return;
+        };
+        let outcome = tile.expand_gap(file, gap, dir);
+        if outcome != ExpandOutcome::Nothing {
+            tile.rebuild_rows_keeping_cursor();
+        }
+        if let ExpandOutcome::NeedsText(path) = outcome {
+            self.diff_load_file_text(id, path, CommentSide::New, cx);
+        }
+        cx.notify();
+    }
+
+    /// Enter on a bound tile: on a context expander, expand it in its
+    /// default direction ([`default_expand_dir`]); elsewhere a hint.
+    pub(crate) fn diff_enter(&mut self, id: workspace::WindowId, cx: &mut Context<Self>) {
+        let Some(tile) = self.diff_tile_ref(id) else {
+            return;
+        };
+        match tile.cursor_row() {
+            Some(RowRef::Expander { file, gap, hidden, kind, .. }) => {
+                let dir = default_expand_dir(kind, hidden, tile.moving_down);
+                self.diff_expand(id, file, gap as usize, dir, cx);
+            }
+            _ => self.diff_hint("Enter expands a hidden-lines row · + expands around this hunk", cx),
+        }
+    }
+
+    /// `+` (spec B2a): reveal [`EXPAND_STEP`] more lines above AND below the
+    /// cursor's hunk.
+    pub(crate) fn diff_expand_around_cursor(&mut self, id: workspace::WindowId, cx: &mut Context<Self>) {
+        let Some((file, hunk)) = self.diff_tile_ref(id).and_then(DiffTile::cursor_hunk) else {
+            self.diff_hint("+ expands context around a hunk — move into one first", cx);
+            return;
+        };
+        self.diff_expand(id, file, hunk, ExpandDir::Up, cx);
+        self.diff_expand(id, file, hunk + 1, ExpandDir::Down, cx);
+    }
+
+    /// A click on segment `dir` of the expander at body row `index`: cursor
+    /// to that row, then expand. Resolved against the CURRENT rows at event
+    /// time (yux rule 4) — a stale index that no longer holds an expander is
+    /// a no-op.
+    pub(crate) fn diff_click_expander(
+        &mut self,
+        id: workspace::WindowId,
+        index: usize,
+        dir: ExpandDir,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tile) = self.diff_tile_mut(id) else {
+            return;
+        };
+        let Some(RowRef::Expander { file, gap, .. }) = tile.rows.get(index).copied() else {
+            return;
+        };
+        tile.set_cursor(index);
+        self.diff_expand(id, file, gap as usize, dir, cx);
     }
 
     /// Write the tile's review on the background executor (spec C2 / UXI-Diff-17
@@ -594,6 +775,8 @@ impl YaldaGpuiView {
             Key::Char('x') => self.delete_comment_at_cursor(id, cx),
             Key::Char('s') => self.open_send_picker(id, false, cx),
             Key::Char('S') => self.open_send_picker(id, true, cx),
+            Key::Enter => self.diff_enter(id, cx),
+            Key::Char('+') | Key::Char('=') => self.diff_expand_around_cursor(id, cx),
             Key::Esc => {
                 if let Some(tile) = self.diff_tile_mut(id) {
                     tile.range_anchor = None;

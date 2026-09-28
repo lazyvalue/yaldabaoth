@@ -19,14 +19,18 @@ Primary code homes:
   lines}`; `DiffLine{Context|Added|Removed}`. `file_hash` = hash(path + content
   lines, no `@@` positions) — a file's review identity.
 - **`diff_git.rs`** — async git boundary: `collect_raw_diff(worktree, base)`,
-  `list_worktrees(repo_dir)`. Errors are values.
+  `list_worktrees(repo_dir)`, `read_file_side(worktree, merge_base, path,
+  old_side)` (a file's full new text from disk / old text via `git show`).
+  Errors are values.
 - **`review_state.rs`** — the `Review` JSON (`viewed`, `comments`,
   `last_sent_session`) at `<primary-checkout-root>/.yaldabaoth/reviews/<branch>.json`,
   `info/exclude` upkeep, pure ops (toggle viewed, add/edit/delete comment,
   `recompute_outdated`, `unsent_ids`, `record_sent`, `build_send_prompt`),
   `*_PATH_OVERRIDE` test seam.
 - **`diff.rs`** — `DiffTile` (worktree, picker, model, review, cursor, range,
-  collapse, compose, send picker) + pure nav helpers + `zed_open_arg`.
+  collapse, compose, send picker, file-text cache `FileTexts`, context
+  `Expansions`) + pure nav helpers + gap geometry (`file_gaps`,
+  `apply_expand`) + `zed_open_arg`.
 - **`diff_view.rs`** — the yux cached child `DiffView` (picker, header, file rows,
   diff lines, inline comment cards, hint footer); self-notifies on `DiffSeqs`.
 - **`diff_ui.rs`** — view methods: open/bind/unbind, refresh + apply, viewed,
@@ -39,7 +43,9 @@ text-input surfaces).
 **Keys (bound).** `j`/`k` (and ↓/↑) line · `}`/`{` hunk · `]`/`[` file · `G` last
 row · `z` fold · `v` Viewed · `o` Zed · `r` refresh · `V` range (j/k extend
 within the file, `Esc` clears) · `c` comment · `e` edit · `x` `x` delete
-(implemented) · `s` send unsent · `S` send all (send node). **Compose keys:**
+(implemented) · `s` send unsent · `S` send all (send node) · `Enter` on a
+hidden-lines row expands it · `+` (or `=`) expands 20 lines above and below
+the cursor's hunk. **Compose keys:**
 typing, `Enter` newline, `Ctrl-Enter`/`Cmd-Enter` save, `Esc` closes an empty
 draft; on a non-empty one the first `Esc` warns and the second discards;
 leaders are suppressed while composing. Space = tile verbs, `.` = shell verbs. The footer lists the live
@@ -47,9 +53,14 @@ keys (`DIFF_KEY_HINTS`).
 
 **Row model.** The bound body is a virtualized `gpui::list` over the tile's
 cached `rows: Rc<Vec<RowRef>>` (`RowRef::{File, Hunk, Line{old,new},
-Comment{comment,part,parts}, ComposeSlot{part,parts}}`, from the pure
-`visible_rows(model, review, folds)` plus the compose slots spliced in by
-`DiffTile::rebuild_rows`); the cursor is a flat index into it. A comment card is
+Comment{comment,part,parts}, ComposeSlot{part,parts}, Ctx{old,new},
+Expander{gap,first_hidden,hidden,kind,loading}}`, from the pure
+`visible_rows_ex(model, review, folds, expansions, texts)` plus the compose
+slots spliced in by `DiffTile::rebuild_rows`); the cursor is a flat index into
+it. `Ctx` = an unchanged line revealed by expanding context (text from the
+`FileTexts` cache); `Expander` = the one-row stand-in for a gap's still-hidden
+lines. Both are ordinary diff-structure rows (NOT `is_inline_insert`), one row
+tall like every row; `is_line()` covers `Line` + `Ctx`. A comment card is
 `parts` fixed-height `Comment` rows forming ONE bordered box (`CardLine::Header`
 — id pill + status pill; then the body wrapped at `COMMENT_WRAP_COLS`
 characters, capped at `COMMENT_MAX_BODY_ROWS`; an outdated card appends its
@@ -129,7 +140,8 @@ path.
 
 **Status.** `implemented` — the body is a cached child whose `DiffSeqs` covers
 `model_gen`, `rows_gen`, `cursor`, `review_gen`, `range_anchor`, `compose_gen`
-(open/close only), refreshing/error, picker, zoom; rows are virtualized
+(open/close only), refreshing/error, picker, zoom (context expands and file-text
+loads rebuild rows ⇒ `rows_gen`); rows are virtualized
 (O(visible)). The inline comment compose is painted by the root OVER its slot
 rows (`yux::list_rows_overlay`), outside the cached body, so typing in it
 leaves the body's render count flat; only a change in the draft's visual line
@@ -137,7 +149,7 @@ count (a slot-row rebuild, `rows_gen`) re-renders the body.
 
 **Enforcement.** `verify_harness.rs::{diff_view_unrelated_root_notify_is_render_flat,
 diff_view_v_and_j_rerender_the_cached_body, diff_view_v_range_rerenders_the_cached_body,
-diff_compose_typing_is_render_flat}`.
+diff_compose_typing_is_render_flat, diff_expand_rerenders_body_and_unrelated_notify_is_flat}`.
 
 ### UXI-Diff-13 — Refresh on focus and `r`; cursor survives
 
@@ -267,6 +279,54 @@ only inside their tempdir fixture (the fixture IS the primary checkout).
 exclude idempotence, override root, stale-save skip);
 `verify_harness.rs::diff_v_marks_file_viewed_persists_folds_and_advances`
 (the review file never shows up as an untracked change after a re-derive).
+
+### UXI-Diff-18 — Expand hidden context above, between and below hunks
+
+**Statement.** Every changed file shows a slim, full-width, subdued
+**hidden-lines row** wherever unchanged lines are hidden: above its first hunk,
+between two hunks, and below its last hunk (unless that hunk visibly reaches
+the end of the file). The row reads `↑ 20 more lines` / `↓ 20 more lines` /
+`Show all N hidden lines` (plain arrows, no emoji) — top gap: ↑ + all;
+between: ↓ ↑ + all; bottom: ↓ (+ all once the file's length is known); fewer
+than 30 hidden ⇒ just "Show all". Each segment is clickable. `Enter` on the row
+expands toward the hunk for the top/bottom rows; between hunks it shows all
+when fewer than 30 hide, else 20 lines from the edge the cursor is travelling
+away from (moving down ⇒ the lines right under the hunk above). `+` expands 20
+lines above AND below the cursor's hunk. Revealed lines are ordinary context
+lines with correct old/new numbers — cursor-able, commentable (`c`, `V`),
+openable in Zed at their line. A fully revealed gap merges its two hunks (the
+row and the lower hunk's header disappear). The file's text is read off the
+paint path on first expand (the row says "Loading…" meanwhile) and cached per
+file; expansion survives a refresh while the file's `file_hash` is unchanged
+and resets when its diff changes. A comment on a revealed line stays live and
+anchored across re-derives (its line is re-revealed).
+
+**Status.** `implemented` (graph kfa node context-expand). Decisions: the
+cursor stays on the hidden-lines row after an expand that leaves lines hidden
+(so `Enter` repeats), else lands on the first revealed line; the bottom row of a
+file whose last hunk ends in 3 context lines shows `↓ 20 more lines` before the
+length is known (it vanishes on load if the file ended there); deleted files and
+hunk-less changes have no context; the text source is the new side (the
+worktree file) — the old side (`git show <merge-base>:<path>`) is loadable
+through the same cache for other consumers; comments on context lines are kept
+live by checking their snippet against the file's full new text in the derive
+(`Review::recompute_outdated_with`).
+
+**Enforcement.** `verify_harness.rs::{diff_expand_between_hunks_reveals_20_numbered_lines,
+diff_expand_top_and_bottom_expanders, diff_expand_click_show_all_merges_hunks,
+diff_expand_revealed_line_is_commentable, diff_expand_survives_refresh_when_file_unchanged,
+diff_expand_plus_key_expands_around_the_cursor_hunk,
+diff_expand_rerenders_body_and_unrelated_notify_is_flat}`;
+`diff.rs::row_model_tests::{file_gaps_span_and_offset, apply_expand_steps_and_defaults,
+visible_rows_reveal_context_and_merge_hunks, file_content_lines_and_snippet_location}`;
+`review_state.rs::review_v2_tests::recompute_outdated_with_full_text_keeps_context_comments_live`.
+The numbering/text guards read the SHAPED gutter + code text through
+`probe_text` (`diff-row-<ix>-old|new|text`). Negative controls observed RED
+(graph kfa): the gap's old-side offset forced to 0 (row 12 old 45 ≠ 44); the
+renderer reading a revealed line's text by its old number (painted "line 62"
+under new 64); `apply_expand` changing nothing (no revealed rows, 6 guards);
+the segment's mouse handler removed (click reveals nothing); expansions cleared
+on every derive (nothing revealed after `r`).
 
 ### UXI-Diff-8 — Open in Zed; open an unbound Diff tile
 

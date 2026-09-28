@@ -99,6 +99,46 @@ impl Hunk {
         (operand(" -").unwrap_or(0), operand(" +").unwrap_or(0))
     }
 
+    /// The `(start, count)` of each side from the `-a,b +c,d` header —
+    /// `((old_start, old_count), (new_start, new_count))`; an omitted count
+    /// is 1 (unified-diff convention). `((0,0),(0,0))` when unparseable.
+    pub fn ranges(&self) -> ((usize, usize), (usize, usize)) {
+        let operand = |sigil: &str| -> Option<(usize, usize)> {
+            let op = self.header.split(sigil).nth(1)?.split(' ').next()?;
+            let mut parts = op.splitn(2, ',');
+            let start = parts.next()?.parse().ok()?;
+            let count = match parts.next() {
+                Some(c) => c.parse().ok()?,
+                None => 1,
+            };
+            Some((start, count))
+        };
+        (operand(" -").unwrap_or((0, 0)), operand(" +").unwrap_or((0, 0)))
+    }
+
+    /// The `(old, new)` line numbers of this hunk's FIRST line on each side.
+    /// A zero-count side's `start` names the line BEFORE the (empty) span, so
+    /// its first line is `start + 1`.
+    pub fn first_lines(&self) -> (usize, usize) {
+        let ((os, oc), (ns, nc)) = self.ranges();
+        let first = |s: usize, c: usize| if c == 0 { s + 1 } else { s };
+        (first(os, oc), first(ns, nc))
+    }
+
+    /// The `(old, new)` line numbers of the first line AFTER this hunk on
+    /// each side — where the unchanged gap below it starts.
+    pub fn next_lines(&self) -> (usize, usize) {
+        let ((os, oc), (ns, nc)) = self.ranges();
+        let next = |s: usize, c: usize| if c == 0 { s + 1 } else { s + c };
+        (next(os, oc), next(ns, nc))
+    }
+
+    /// Unchanged context lines at the END of this hunk. With git's default
+    /// 3 lines of context, fewer than 3 means the hunk reaches end-of-file.
+    pub fn trailing_context(&self) -> usize {
+        self.lines.iter().rev().take_while(|l| matches!(l, DiffLine::Context(_))).count()
+    }
+
     /// Per content line, its `(old, new)` line numbers — `None` on the side
     /// the line doesn't exist on (an added line has no old number, a removed
     /// line no new number). Context lines carry both.

@@ -82,6 +82,26 @@ pub(crate) enum RowRef {
     /// draft's visual line count ([`compose_slot_rows`]) — only a line-count
     /// change rebuilds rows.
     ComposeSlot { file: usize, part: u8, parts: u8 },
+    /// One unchanged line REVEALED by expanding context (spec B2a,
+    /// UXI-Diff-18): not part of any hunk, its text comes from the file's
+    /// new-side content ([`FileTexts`]). A normal context line otherwise —
+    /// cursor-able, commentable, openable in Zed.
+    Ctx { file: usize, old: u32, new: u32 },
+    /// A context expander (spec B2a, UXI-Diff-18): the slim row standing for
+    /// the still-hidden unchanged lines of gap `gap` of `file` (gap 0 = above
+    /// the first hunk, `hunks.len()` = below the last, else between hunks
+    /// `gap-1` and `gap`). `first_hidden` = the new-side number of its first
+    /// hidden line; `hidden` = how many (`None` = unknown: below the last
+    /// hunk before the file's text is loaded); `loading` = an expand is
+    /// waiting on the file's text. One row tall like every row.
+    Expander {
+        file: usize,
+        gap: u32,
+        first_hidden: u32,
+        hidden: Option<u32>,
+        kind: GapKind,
+        loading: bool,
+    },
 }
 
 impl RowRef {
@@ -92,9 +112,22 @@ impl RowRef {
             | RowRef::Hunk { file, .. }
             | RowRef::Line { file, .. }
             | RowRef::Comment { file, .. }
-            | RowRef::ComposeSlot { file, .. } => file,
+            | RowRef::ComposeSlot { file, .. }
+            | RowRef::Ctx { file, .. }
+            | RowRef::Expander { file, .. } => file,
         }
     }
+
+    /// `(old, new)` line numbers of a code row (a diff `Line` or a revealed
+    /// `Ctx` line); `None` for every other row.
+    pub(crate) fn line_numbers(&self) -> Option<(Option<u32>, Option<u32>)> {
+        match *self {
+            RowRef::Line { old, new, .. } => Some((old, new)),
+            RowRef::Ctx { old, new, .. } => Some((Some(old), Some(new))),
+            _ => None,
+        }
+    }
+
 
     /// A row INSERTED under a diff line (a comment-card row or a compose
     /// slot) rather than a row of the diff itself.
@@ -106,8 +139,10 @@ impl RowRef {
         matches!(self, RowRef::ComposeSlot { .. })
     }
 
+    /// A code line — a diff `Line` or a revealed context `Ctx` line (both
+    /// are cursor/comment/range targets).
     pub(crate) fn is_line(&self) -> bool {
-        matches!(self, RowRef::Line { .. })
+        matches!(self, RowRef::Line { .. } | RowRef::Ctx { .. })
     }
 
     /// The `Review::comments` index of a comment-card row.
@@ -173,7 +208,26 @@ impl Folds {
 /// match nearest its stored line numbers), an outdated / unplaceable one right
 /// after its file header. Folded files show no cards. Pure; O(visible lines ×
 /// comments of that file).
+#[allow(dead_code)] // the no-expansion shorthand the unit tests use.
 pub(crate) fn visible_rows(model: &DiffModel, review: Option<&Review>, folds: &Folds) -> Vec<RowRef> {
+    visible_rows_ex(model, review, folds, &Expansions::default(), &FileTexts::default())
+}
+
+/// [`visible_rows`] with context expansion (spec B2a): each file's gaps of
+/// unchanged lines (above the first hunk, between hunks, below the last) get
+/// their revealed [`RowRef::Ctx`] lines and — while lines stay hidden — one
+/// [`RowRef::Expander`] row, in file order: the lines revealed downward from
+/// the gap's top edge, the expander, the lines revealed upward from its
+/// bottom edge, then the next hunk's header — dropped once its gap is fully
+/// revealed, so the two hunks read as one. Revealed lines need the file's
+/// new-side text in `texts`; until it is loaded the gap renders unexpanded.
+pub(crate) fn visible_rows_ex(
+    model: &DiffModel,
+    review: Option<&Review>,
+    folds: &Folds,
+    expansions: &Expansions,
+    texts: &FileTexts,
+) -> Vec<RowRef> {
     let mut rows = Vec::new();
     for (fi, f) in model.files.iter().enumerate() {
         let viewed = review.is_some_and(|r| r.is_viewed(f));
@@ -186,9 +240,48 @@ pub(crate) fn visible_rows(model: &DiffModel, review: Option<&Review>, folds: &F
         if collapsed {
             continue;
         }
+        let content = texts.content(&f.path, CommentSide::New);
+        let gaps = file_gaps(f, content.map(|c| c.line_count()));
+        let fexp = expansions.by_path.get(&f.path).filter(|e| e.file_hash == f.file_hash);
+        let loading = fexp.is_some_and(|e| !e.pending.is_empty());
+        // Push gap `g`'s rows; `true` when the gap is non-empty and fully
+        // revealed (the following hunk header is then dropped).
+        let push_gap = |body: &mut Vec<RowRef>, g: usize| -> bool {
+            let Some(gap) = gaps.get(g) else {
+                return false;
+            };
+            let reveal = match (content, fexp) {
+                (Some(_), Some(e)) => e.gaps.get(&g).copied().unwrap_or_default(),
+                _ => GapReveal::default(),
+            };
+            let (top, bottom, hidden) = gap.effective(reveal);
+            let ctx = |n: u32| RowRef::Ctx {
+                file: fi,
+                old: (n as i64 + gap.old_delta).max(0) as u32,
+                new: n,
+            };
+            body.extend((gap.lo..gap.lo + top).map(ctx));
+            if hidden != Some(0) {
+                body.push(RowRef::Expander {
+                    file: fi,
+                    gap: g as u32,
+                    first_hidden: gap.lo + top,
+                    hidden,
+                    kind: gap.kind,
+                    loading,
+                });
+            }
+            if let Some(hi) = gap.hi {
+                body.extend((hi + 1 - bottom..=hi).map(ctx));
+            }
+            hidden == Some(0) && gap.len().is_some_and(|l| l > 0)
+        };
         let mut body = Vec::new();
         for (hi, h) in f.hunks.iter().enumerate() {
-            body.push(RowRef::Hunk { file: fi, hunk: hi });
+            let merged = push_gap(&mut body, hi);
+            if !merged {
+                body.push(RowRef::Hunk { file: fi, hunk: hi });
+            }
             for (li, (old, new)) in h.line_numbers().into_iter().enumerate() {
                 body.push(RowRef::Line {
                     file: fi,
@@ -199,13 +292,14 @@ pub(crate) fn visible_rows(model: &DiffModel, review: Option<&Review>, folds: &F
                 });
             }
         }
+        push_gap(&mut body, f.hunks.len());
         // Place this file's comments: `top` right after the header, `after[k]`
         // right after body row k.
         let mut top: Vec<usize> = Vec::new();
         let mut after: HashMap<usize, Vec<usize>> = HashMap::new();
         if let Some(r) = review {
             for (ci, c) in r.comments.iter().enumerate().filter(|(_, c)| c.path == f.path) {
-                match (!c.outdated).then(|| place_comment(f, &body, c)).flatten() {
+                match (!c.outdated).then(|| place_comment(f, texts, &body, c)).flatten() {
                     Some(k) => after.entry(k).or_default().push(ci),
                     None => top.push(ci),
                 }
@@ -240,23 +334,403 @@ pub(crate) fn visible_rows(model: &DiffModel, review: Option<&Review>, folds: &F
     rows
 }
 
-/// The text of diff line `row` (a `Line` row) in `file`.
-fn line_text(file: &FileDiff, row: RowRef) -> Option<&str> {
-    let RowRef::Line { hunk, line, .. } = row else {
-        return None;
-    };
-    match file.hunks.get(hunk)?.lines.get(line)? {
-        DiffLine::Added(t) | DiffLine::Removed(t) | DiffLine::Context(t) => Some(t.as_str()),
+/// The text of code row `row` in `file`: a diff `Line`'s hunk text, or a
+/// revealed `Ctx` line's text from the file's new-side content.
+fn line_text<'a>(file: &'a FileDiff, texts: &'a FileTexts, row: RowRef) -> Option<&'a str> {
+    match row {
+        RowRef::Line { hunk, line, .. } => match file.hunks.get(hunk)?.lines.get(line)? {
+            DiffLine::Added(t) | DiffLine::Removed(t) | DiffLine::Context(t) => Some(t.as_str()),
+        },
+        RowRef::Ctx { new, .. } => texts.line(&file.path, CommentSide::New, new),
+        _ => None,
     }
 }
 
 /// `row`'s line number on `side` (`None` when the line isn't on that side).
 fn side_number(row: RowRef, side: CommentSide) -> Option<u32> {
-    match (row, side) {
-        (RowRef::Line { new, .. }, CommentSide::New) => new,
-        (RowRef::Line { old, .. }, CommentSide::Old) => old,
-        _ => None,
+    let (old, new) = row.line_numbers()?;
+    match side {
+        CommentSide::New => new,
+        CommentSide::Old => old,
     }
+}
+
+// ── Context expansion (spec B2a, UXI-Diff-18; graph kfa node context-expand) ─
+
+/// Lines one `↑`/`↓` expand reveals …
+pub(crate) const EXPAND_STEP: u32 = 20;
+/// … unless fewer than this many are hidden, when any expand shows them all.
+pub(crate) const EXPAND_ALL_UNDER: u32 = 30;
+/// git's default unified-diff context. A last hunk ending in fewer trailing
+/// context lines reaches end-of-file, so it gets no bottom expander before
+/// the file's text is known.
+pub(crate) const DIFF_CONTEXT_LINES: usize = 3;
+/// Context lines revealed around a comment that anchors in a hidden gap.
+const COMMENT_REVEAL_CONTEXT: u32 = 3;
+
+/// One side of a file's full text, split into lines once (1-based lookup).
+#[derive(Debug)]
+pub(crate) struct FileContent {
+    text: Arc<str>,
+    /// Byte offset of each line's start.
+    starts: Vec<usize>,
+}
+
+impl FileContent {
+    pub(crate) fn new(text: Arc<str>) -> Self {
+        let mut starts = Vec::new();
+        if !text.is_empty() {
+            starts.push(0);
+            let len = text.len();
+            starts.extend(text.bytes().enumerate().filter(|&(i, b)| b == b'\n' && i + 1 < len).map(|(i, _)| i + 1));
+        }
+        FileContent { text, starts }
+    }
+
+    /// Number of lines (a trailing newline does not start another line).
+    pub(crate) fn line_count(&self) -> u32 {
+        self.starts.len() as u32
+    }
+
+    /// Line `n` (1-based) without its line terminator.
+    pub(crate) fn line(&self, n: u32) -> Option<&str> {
+        let i = (n as usize).checked_sub(1)?;
+        let start = *self.starts.get(i)?;
+        let end = self.starts.get(i + 1).copied().unwrap_or(self.text.len());
+        let l = &self.text[start..end];
+        let l = l.strip_suffix('\n').unwrap_or(l);
+        Some(l.strip_suffix('\r').unwrap_or(l))
+    }
+
+    pub(crate) fn text(&self) -> &Arc<str> {
+        &self.text
+    }
+}
+
+/// A cache slot's state.
+#[derive(Clone, Debug)]
+pub(crate) enum TextSlot {
+    Loading,
+    Ready(Arc<FileContent>),
+    /// The read failed (the caller surfaced why); a later request retries.
+    Failed,
+}
+
+/// The Diff tile's per-file full-text cache (spec B2a): `(path, side)` →
+/// the text, stamped with the `file_hash` it was read under. Filled async
+/// on first need (the context expander; the syntax highlighter reuses it)
+/// and by the derive (files whose comments anchor outside the hunks);
+/// [`invalidate`](Self::invalidate)d on every derive — a slot whose file's
+/// hash changed (or every slot, when the merge-base moved) is dropped.
+///
+/// API: [`file_text`](Self::file_text) (whole text) /
+/// [`content`](Self::content) (line-indexed) / [`line`](Self::line); a
+/// missing entry is requested with `YaldaGpuiView::diff_load_file_text`.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FileTexts {
+    slots: HashMap<(PathBuf, CommentSide), (u64, TextSlot)>,
+    merge_base: String,
+}
+
+impl FileTexts {
+    /// The loaded content of `path`'s `side`, if ready.
+    pub(crate) fn content(&self, path: &std::path::Path, side: CommentSide) -> Option<&Arc<FileContent>> {
+        match self.slots.get(&(path.to_path_buf(), side)) {
+            Some((_, TextSlot::Ready(c))) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// The whole text of `path`'s `side`, if loaded.
+    pub(crate) fn file_text(&self, path: &std::path::Path, side: CommentSide) -> Option<Arc<str>> {
+        self.content(path, side).map(|c| c.text().clone())
+    }
+
+    /// Line `n` (1-based) of `path`'s `side`, if loaded.
+    pub(crate) fn line(&self, path: &std::path::Path, side: CommentSide, n: u32) -> Option<&str> {
+        self.content(path, side)?.line(n)
+    }
+
+    #[allow(dead_code)] // cache API (syntax-highlight node).
+    pub(crate) fn is_loading(&self, path: &std::path::Path, side: CommentSide) -> bool {
+        matches!(self.slots.get(&(path.to_path_buf(), side)), Some((_, TextSlot::Loading)))
+    }
+
+    /// Start a load of `path`'s `side` at `hash`: `false` when one is already
+    /// loading or loaded (a failed slot may retry).
+    pub(crate) fn begin_load(&mut self, path: &std::path::Path, side: CommentSide, hash: u64) -> bool {
+        let key = (path.to_path_buf(), side);
+        if let Some((h, slot)) = self.slots.get(&key)
+            && *h == hash
+            && !matches!(slot, TextSlot::Failed)
+        {
+            return false;
+        }
+        self.slots.insert(key, (hash, TextSlot::Loading));
+        true
+    }
+
+    /// Land a load started by [`begin_load`](Self::begin_load); `false` (and
+    /// nothing stored) when it is stale — the slot was invalidated or
+    /// re-requested at another hash / merge-base meanwhile.
+    pub(crate) fn finish_load(
+        &mut self,
+        path: &std::path::Path,
+        side: CommentSide,
+        hash: u64,
+        merge_base: &str,
+        result: Result<Arc<str>, String>,
+    ) -> bool {
+        if merge_base != self.merge_base {
+            return false;
+        }
+        let key = (path.to_path_buf(), side);
+        match self.slots.get(&key) {
+            Some((h, TextSlot::Loading)) if *h == hash => {}
+            _ => return false,
+        }
+        let slot = match result {
+            Ok(t) => TextSlot::Ready(Arc::new(FileContent::new(t))),
+            Err(_) => TextSlot::Failed,
+        };
+        self.slots.insert(key, (hash, slot));
+        true
+    }
+
+    /// Store an already-read text (the derive's reads).
+    pub(crate) fn insert_ready(&mut self, path: &std::path::Path, side: CommentSide, hash: u64, text: Arc<str>) {
+        self.slots
+            .insert((path.to_path_buf(), side), (hash, TextSlot::Ready(Arc::new(FileContent::new(text)))));
+    }
+
+    /// Reconcile against a freshly derived `model`: a moved merge-base drops
+    /// everything; otherwise a slot survives only while its file is still in
+    /// the diff with the SAME `file_hash`.
+    pub(crate) fn invalidate(&mut self, model: &DiffModel) {
+        if self.merge_base != model.merge_base {
+            self.slots.clear();
+            self.merge_base = model.merge_base.clone();
+            return;
+        }
+        self.slots.retain(|(path, _), (hash, _)| {
+            model.files.iter().any(|f| &f.path == path && f.file_hash == *hash)
+        });
+    }
+
+}
+
+/// Where a gap sits in its file (spec B2a).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GapKind {
+    /// Above the first hunk.
+    Top,
+    /// Between two hunks.
+    Between,
+    /// Below the last hunk.
+    Bottom,
+}
+
+/// Which lines an expand reveals: `Down` continues downward from the gap's
+/// TOP edge (the lines right below the previous hunk), `Up` continues upward
+/// from its BOTTOM edge (right above the next hunk), `All` the whole gap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum ExpandDir {
+    Down,
+    Up,
+    All,
+}
+
+impl ExpandDir {
+    pub(crate) fn slug(self) -> &'static str {
+        match self {
+            ExpandDir::Down => "down",
+            ExpandDir::Up => "up",
+            ExpandDir::All => "all",
+        }
+    }
+}
+
+/// A run of unchanged new-side lines no hunk shows: `lo..=hi` (`hi: None` =
+/// the file's end is not known yet — only below the last hunk), with
+/// `old = new + old_delta` throughout (the offset right after the preceding
+/// hunk / before the first one).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Gap {
+    pub(crate) lo: u32,
+    pub(crate) hi: Option<u32>,
+    pub(crate) old_delta: i64,
+    pub(crate) kind: GapKind,
+}
+
+/// How much of one gap is revealed: `top` lines down from its top edge and
+/// `bottom` lines up from its bottom edge (requested counts; clamped to the
+/// gap's length by [`Gap::effective`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GapReveal {
+    pub(crate) top: u32,
+    pub(crate) bottom: u32,
+}
+
+impl Gap {
+    /// Line count (`None` = unknown end).
+    pub(crate) fn len(&self) -> Option<u32> {
+        self.hi.map(|hi| (hi + 1).saturating_sub(self.lo))
+    }
+
+    /// `(top, bottom, hidden)` actually revealed under `r`, clamped so the two
+    /// never overlap. An unknown-length gap reveals nothing yet.
+    pub(crate) fn effective(&self, r: GapReveal) -> (u32, u32, Option<u32>) {
+        match self.len() {
+            Some(len) => {
+                let top = r.top.min(len);
+                let bottom = r.bottom.min(len - top);
+                (top, bottom, Some(len - top - bottom))
+            }
+            None => (0, 0, None),
+        }
+    }
+}
+
+/// Can `f` show unchanged context at all? (A deleted file's single hunk IS
+/// the whole file; a hunk-less rename/binary change has no lines.)
+pub(crate) fn expandable(f: &FileDiff) -> bool {
+    !f.hunks.is_empty() && f.status != FileStatus::Deleted
+}
+
+/// `f`'s gaps (`hunks.len() + 1` of them, some empty; none when not
+/// [`expandable`]), on the new side. `total` = the new-side line count when
+/// the text is loaded; without it the bottom gap's end is unknown unless the
+/// last hunk visibly reaches end-of-file (fewer than [`DIFF_CONTEXT_LINES`]
+/// trailing context lines).
+pub(crate) fn file_gaps(f: &FileDiff, total: Option<u32>) -> Vec<Gap> {
+    if !expandable(f) {
+        return Vec::new();
+    }
+    let n = f.hunks.len();
+    (0..=n)
+        .map(|g| {
+            let (old_at, new_at) = if g == 0 {
+                let (o, nw) = f.hunks[0].first_lines();
+                (o, nw.max(1))
+            } else {
+                f.hunks[g - 1].next_lines()
+            };
+            let lo = if g == 0 { 1 } else { new_at as u32 };
+            let hi = if g < n {
+                Some((f.hunks[g].first_lines().1 as u32).saturating_sub(1))
+            } else if let Some(t) = total {
+                Some(t)
+            } else if f.hunks[n - 1].trailing_context() < DIFF_CONTEXT_LINES {
+                Some(lo - 1)
+            } else {
+                None
+            };
+            let kind = match g {
+                0 => GapKind::Top,
+                _ if g == n => GapKind::Bottom,
+                _ => GapKind::Between,
+            };
+            Gap {
+                lo,
+                hi,
+                old_delta: old_at as i64 - new_at as i64,
+                kind,
+            }
+        })
+        .collect()
+}
+
+/// Apply one expand to `r` (spec B2a): `Down`/`Up` reveal [`EXPAND_STEP`]
+/// more lines from that edge — or the whole remainder when fewer than
+/// [`EXPAND_ALL_UNDER`] are hidden — and `All` the whole gap. `false` when
+/// nothing changed (fully revealed, or the gap's end is still unknown).
+pub(crate) fn apply_expand(gap: &Gap, r: &mut GapReveal, dir: ExpandDir) -> bool {
+    let (top, bottom, Some(hidden)) = gap.effective(*r) else {
+        return false;
+    };
+    if hidden == 0 {
+        return false;
+    }
+    let step = if hidden < EXPAND_ALL_UNDER { hidden } else { EXPAND_STEP.min(hidden) };
+    *r = match dir {
+        ExpandDir::Down => GapReveal { top: top + step, bottom },
+        ExpandDir::Up => GapReveal { top, bottom: bottom + step },
+        ExpandDir::All => GapReveal { top: top + hidden, bottom },
+    };
+    true
+}
+
+/// Enter on an expander (spec B2a): toward the hunk for the top/bottom gaps;
+/// between hunks, everything when under [`EXPAND_ALL_UNDER`] lines hide,
+/// else from the edge the cursor is travelling away from (moving down ⇒
+/// continue below the hunk above).
+pub(crate) fn default_expand_dir(kind: GapKind, hidden: Option<u32>, moving_down: bool) -> ExpandDir {
+    match kind {
+        GapKind::Top => ExpandDir::Up,
+        GapKind::Bottom => ExpandDir::Down,
+        GapKind::Between if hidden.is_some_and(|h| h < EXPAND_ALL_UNDER) => ExpandDir::All,
+        GapKind::Between if moving_down => ExpandDir::Down,
+        GapKind::Between => ExpandDir::Up,
+    }
+}
+
+/// One file's expansion state: per gap index its [`GapReveal`], plus the
+/// expands queued while its text loads. Valid only for `file_hash`.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FileExpansion {
+    pub(crate) file_hash: u64,
+    pub(crate) gaps: HashMap<usize, GapReveal>,
+    pub(crate) pending: Vec<(usize, ExpandDir)>,
+}
+
+/// Every file's context expansion, by path. Survives a re-derive for a file
+/// whose `file_hash` is unchanged ([`retain_for`](Self::retain_for)).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Expansions {
+    pub(crate) by_path: HashMap<PathBuf, FileExpansion>,
+}
+
+impl Expansions {
+    /// Keep only entries whose file is still in `model` with the same hash.
+    pub(crate) fn retain_for(&mut self, model: &DiffModel) {
+        self.by_path
+            .retain(|path, e| model.files.iter().any(|f| &f.path == path && f.file_hash == e.file_hash));
+    }
+
+    /// The (hash-checked) entry for `f`, created empty.
+    pub(crate) fn entry(&mut self, f: &FileDiff) -> &mut FileExpansion {
+        let e = self.by_path.entry(f.path.clone()).or_default();
+        if e.file_hash != f.file_hash {
+            *e = FileExpansion {
+                file_hash: f.file_hash,
+                ..FileExpansion::default()
+            };
+        }
+        e
+    }
+}
+
+/// The 1-based `(first, last)` line span of `text` where `snippet` occurs,
+/// choosing the occurrence whose last line is nearest `target` (trailing
+/// whitespace ignored, like comment placement). An empty snippet is
+/// `target` itself when in range.
+fn locate_snippet(text: &FileContent, snippet: &str, target: u32) -> Option<(u32, u32)> {
+    let total = text.line_count();
+    if snippet.is_empty() {
+        return (1..=total).contains(&target).then_some((target, target));
+    }
+    let mut needle: Vec<&str> = snippet.split('\n').map(str::trim_end).collect();
+    if needle.len() > 1 && needle.last() == Some(&"") {
+        needle.pop();
+    }
+    let k = needle.len() as u32;
+    if k == 0 || k > total {
+        return None;
+    }
+    (1..=total + 1 - k)
+        .filter(|&s| (0..k).all(|i| text.line(s + i).map(str::trim_end) == Some(needle[i as usize])))
+        .map(|s| (s, s + k - 1))
+        .min_by_key(|&(_, e)| e.abs_diff(target))
 }
 
 /// Where comment `c`'s card goes among one file's `body` rows (hunk + line
@@ -265,11 +739,11 @@ fn side_number(row: RowRef, side: CommentSide) -> Option<u32> {
 /// `Review::recompute_outdated`), choosing the match whose last line number
 /// is nearest `c.lines[1]` so a comment follows its code when lines drift.
 /// An empty snippet falls back to the exact line number. `None` ⇒ unplaceable.
-pub(crate) fn place_comment(file: &FileDiff, body: &[RowRef], c: &ReviewComment) -> Option<usize> {
+pub(crate) fn place_comment(file: &FileDiff, texts: &FileTexts, body: &[RowRef], c: &ReviewComment) -> Option<usize> {
     let side: Vec<(usize, u32, &str)> = body
         .iter()
         .enumerate()
-        .filter_map(|(k, r)| Some((k, side_number(*r, c.side)?, line_text(file, *r)?.trim_end())))
+        .filter_map(|(k, r)| Some((k, side_number(*r, c.side)?, line_text(file, texts, *r)?.trim_end())))
         .collect();
     let mut needle: Vec<&str> = c.snippet.split('\n').map(str::trim_end).collect();
     if needle.len() > 1 && needle.last() == Some(&"") {
@@ -410,9 +884,15 @@ impl CommentAnchor {
 /// New side if any of them has a new-side number (restricted to those
 /// lines), Old only when every line is a removed line. `None` when the span
 /// holds no line row.
-pub(crate) fn comment_anchor_for_range(model: &DiffModel, rows: &[RowRef], lo: usize, hi: usize) -> Option<CommentAnchor> {
+pub(crate) fn comment_anchor_for_range(
+    model: &DiffModel,
+    texts: &FileTexts,
+    rows: &[RowRef],
+    lo: usize,
+    hi: usize,
+) -> Option<CommentAnchor> {
     let hi = hi.min(rows.len().checked_sub(1)?);
-    let lines: Vec<LineAnchor> = rows.get(lo..=hi)?.iter().filter_map(|r| line_anchor(model, *r)).collect();
+    let lines: Vec<LineAnchor> = rows.get(lo..=hi)?.iter().filter_map(|r| line_anchor(model, texts, *r)).collect();
     let any_new = lines.iter().any(|l| l.side == CommentSide::New);
     let side = if any_new { CommentSide::New } else { CommentSide::Old };
     let picked: Vec<&LineAnchor> = lines.iter().filter(|l| l.side == side).collect();
@@ -622,6 +1102,10 @@ pub(crate) enum AnchorKind {
     File,
     Hunk { new_start: usize },
     Line { old: Option<u32>, new: Option<u32> },
+    /// On a context expander: the same gap's expander if it still exists,
+    /// else the code row nearest the first line it hid (a fully revealed gap
+    /// lands on its first revealed line).
+    Expander { gap: u32, first_hidden: u32 },
 }
 
 /// The anchor of row `cursor` (None for an out-of-range cursor / no rows).
@@ -635,6 +1119,11 @@ pub(crate) fn cursor_anchor(model: &DiffModel, rows: &[RowRef], cursor: usize) -
             new_start: file.hunks.get(hunk).map(|h| h.starts().1).unwrap_or(0),
         },
         RowRef::Line { old, new, .. } => AnchorKind::Line { old, new },
+        RowRef::Ctx { old, new, .. } => AnchorKind::Line {
+            old: Some(old),
+            new: Some(new),
+        },
+        RowRef::Expander { gap, first_hidden, .. } => AnchorKind::Expander { gap, first_hidden },
     };
     Some(CursorAnchor {
         path: file.path.clone(),
@@ -673,21 +1162,13 @@ pub(crate) fn resolve_anchor(model: &DiffModel, rows: &[RowRef], anchor: &Cursor
             },
             new_start as u32,
         ),
-        AnchorKind::Line { new: Some(n), .. } => nearest(
-            &|r: &RowRef| match *r {
-                RowRef::Line { new, .. } => new,
-                _ => None,
-            },
-            n,
-        ),
-        AnchorKind::Line { old: Some(o), .. } => nearest(
-            &|r: &RowRef| match *r {
-                RowRef::Line { old, .. } => old,
-                _ => None,
-            },
-            o,
-        ),
+        AnchorKind::Line { new: Some(n), .. } => nearest(&|r: &RowRef| r.line_numbers()?.1, n),
+        AnchorKind::Line { old: Some(o), .. } => nearest(&|r: &RowRef| r.line_numbers()?.0, o),
         AnchorKind::Line { .. } => None,
+        AnchorKind::Expander { gap, first_hidden } => body
+            .clone()
+            .find(|&i| matches!(rows[i], RowRef::Expander { gap: g, .. } if g == gap))
+            .or_else(|| nearest(&|r: &RowRef| r.line_numbers()?.1, first_hidden)),
     };
     found.unwrap_or(header)
 }
@@ -705,7 +1186,16 @@ pub(crate) struct LineAnchor {
 }
 
 /// The [`LineAnchor`] of `row` — `None` unless it is a `Line` row.
-pub(crate) fn line_anchor(model: &DiffModel, row: RowRef) -> Option<LineAnchor> {
+pub(crate) fn line_anchor(model: &DiffModel, texts: &FileTexts, row: RowRef) -> Option<LineAnchor> {
+    if let RowRef::Ctx { file, new, .. } = row {
+        let f = model.files.get(file)?;
+        return Some(LineAnchor {
+            path: f.path.clone(),
+            side: CommentSide::New,
+            line: new as usize,
+            text: texts.line(&f.path, CommentSide::New, new)?.to_string(),
+        });
+    }
     let RowRef::Line {
         file,
         hunk,
@@ -745,6 +1235,8 @@ pub(crate) fn zed_target(model: &DiffModel, rows: &[RowRef], cursor: usize) -> O
             f.hunks.first().map(|h| h.starts().1).unwrap_or(1)
         }
         RowRef::Hunk { hunk, .. } => hunk_start(hunk),
+        RowRef::Ctx { new, .. } => new as usize,
+        RowRef::Expander { first_hidden, .. } => first_hidden as usize,
         RowRef::Line { new: Some(n), .. } => n as usize,
         RowRef::Line { hunk, .. } => rows[..cursor]
             .iter()
@@ -767,6 +1259,10 @@ pub(crate) struct DiffDerived {
     pub(crate) model: DiffModel,
     pub(crate) review: Option<Review>,
     pub(crate) review_path: Option<PathBuf>,
+    /// New-side file texts the derive read to keep comments on revealed
+    /// context lines live (`(path, file_hash, text)`) — seeded into the
+    /// tile's [`FileTexts`] cache (spec B2a).
+    pub(crate) texts: Vec<(PathBuf, u64, Arc<str>)>,
 }
 
 /// The unbound tile's worktree picker (spec rev 2 B1, UXI-Diff-10): every
@@ -887,6 +1383,25 @@ pub(crate) struct DiffTile {
     /// The cached body view — lazily created at first render (mirrors
     /// `LinearTile::view` / `CogTile::view`).
     pub(crate) view: Option<Entity<DiffView>>,
+    /// Per-file full-text cache (spec B2a) — see [`FileTexts`]; read through
+    /// [`file_text`](Self::file_text).
+    pub(crate) texts: FileTexts,
+    /// Per-file context expansion (spec B2a) — an input of `rows`.
+    pub(crate) expansions: Expansions,
+    /// The cursor's last vertical travel was downward (`j`, `}`, `]`) —
+    /// picks the default side Enter expands a between-hunks gap from.
+    pub(crate) moving_down: bool,
+}
+
+/// What an expand request did (see [`DiffTile::expand_gap`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ExpandOutcome {
+    /// Applied now (the file's text was loaded).
+    Applied,
+    /// Queued: the caller must load this file's new-side text.
+    NeedsText(PathBuf),
+    /// Nothing to expand.
+    Nothing,
 }
 
 /// Where a send-picker row delivers (spec B6): a session loaded in this GUI's
@@ -1009,7 +1524,176 @@ impl DiffTile {
             error: None,
             needs_load: false,
             view: None,
+            texts: FileTexts::default(),
+            expansions: Expansions::default(),
+            moving_down: true,
         }
+    }
+
+    /// The full text of `path`'s `side` if cached (spec B2a) — `None` while
+    /// unloaded; request it with `YaldaGpuiView::diff_load_file_text`. The
+    /// context expander and the syntax highlighter share this cache.
+    #[allow(dead_code)] // public cache API (syntax-highlight node).
+    pub(crate) fn file_text(&self, path: &std::path::Path, side: CommentSide) -> Option<Arc<str>> {
+        self.texts.file_text(path, side)
+    }
+
+    /// Rebuild rows keeping the cursor on the same thing (file + nearest
+    /// line / the same expander) — used by expands, whose row inserts shift
+    /// indices.
+    pub(crate) fn rebuild_rows_keeping_cursor(&mut self) {
+        let anchor = self.cursor_anchor();
+        let old = self.cursor;
+        self.rebuild_rows();
+        if let (Some(a), Some(m)) = (anchor, self.model.clone()) {
+            self.cursor = resolve_anchor(&m, &self.rows, &a, old);
+        }
+    }
+
+    /// Expand gap `gap` of file `file` in `dir` (spec B2a). With the file's
+    /// new-side text loaded the reveal applies now; otherwise it is queued
+    /// (the expander shows "Loading…") and the caller loads the text, after
+    /// which [`apply_pending_expansions`](Self::apply_pending_expansions)
+    /// runs it. Rows are NOT rebuilt here.
+    pub(crate) fn expand_gap(&mut self, file: usize, gap: usize, dir: ExpandDir) -> ExpandOutcome {
+        let Some(model) = self.model.clone() else {
+            return ExpandOutcome::Nothing;
+        };
+        let Some(f) = model.files.get(file).filter(|f| expandable(f)) else {
+            return ExpandOutcome::Nothing;
+        };
+        if gap > f.hunks.len() {
+            return ExpandOutcome::Nothing;
+        }
+        match self.texts.content(&f.path, CommentSide::New).map(|c| c.line_count()) {
+            Some(total) => {
+                let gaps = file_gaps(f, Some(total));
+                let e = self.expansions.entry(f);
+                if apply_expand(&gaps[gap], e.gaps.entry(gap).or_default(), dir) {
+                    ExpandOutcome::Applied
+                } else {
+                    ExpandOutcome::Nothing
+                }
+            }
+            None => {
+                self.expansions.entry(f).pending.push((gap, dir));
+                ExpandOutcome::NeedsText(f.path.clone())
+            }
+        }
+    }
+
+    /// The file's text just landed (or failed): run its queued expands.
+    /// Returns whether anything was queued.
+    pub(crate) fn apply_pending_expansions(&mut self, path: &std::path::Path) -> bool {
+        let Some(model) = self.model.clone() else {
+            return false;
+        };
+        let Some(f) = model.files.iter().find(|f| f.path == path) else {
+            return false;
+        };
+        let total = self.texts.content(path, CommentSide::New).map(|c| c.line_count());
+        let e = self.expansions.entry(f);
+        let pending = std::mem::take(&mut e.pending);
+        if let Some(total) = total {
+            let gaps = file_gaps(f, Some(total));
+            for (g, dir) in &pending {
+                if let Some(gap) = gaps.get(*g) {
+                    apply_expand(gap, e.gaps.entry(*g).or_default(), *dir);
+                }
+            }
+        }
+        !pending.is_empty()
+    }
+
+    /// The `(file, hunk)` the cursor is in or next to (for `+`): a diff line
+    /// / hunk header's own hunk; a revealed line / expander → the hunk whose
+    /// new-side span is nearest. `None` on a file header or a file without
+    /// hunks.
+    pub(crate) fn cursor_hunk(&self) -> Option<(usize, usize)> {
+        let model = self.model.as_ref()?;
+        let row = *self.rows.get(host_row(&self.rows, self.cursor))?;
+        let f = model.files.get(row.file())?;
+        let near = |n: u32| -> Option<usize> {
+            f.hunks
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, h)| {
+                    let (first, next) = (h.first_lines().1 as u32, h.next_lines().1 as u32);
+                    if n < first { first - n } else { n.saturating_sub(next.saturating_sub(1)) }
+                })
+                .map(|(i, _)| i)
+        };
+        let hunk = match row {
+            RowRef::Line { hunk, .. } | RowRef::Hunk { hunk, .. } => Some(hunk),
+            RowRef::Ctx { new, .. } => near(new),
+            RowRef::Expander { first_hidden, .. } => near(first_hidden),
+            _ => None,
+        }?;
+        Some((row.file(), hunk))
+    }
+
+    /// Reveal the hidden lines comments anchor on (spec B2a): a live
+    /// new-side comment whose snippet sits in a hidden part of a gap (its
+    /// file's text loaded) gets that part revealed, plus
+    /// [`COMMENT_REVEAL_CONTEXT`] lines, from the nearer gap edge — so a
+    /// comment written on a revealed line keeps its place after a re-derive.
+    pub(crate) fn reveal_comment_lines(&mut self) {
+        let (Some(model), Some(review)) = (self.model.clone(), self.review.as_ref()) else {
+            return;
+        };
+        let wants: Vec<(usize, u32, u32)> = review
+            .comments
+            .iter()
+            .filter(|c| !c.outdated && c.side == CommentSide::New)
+            .filter_map(|c| {
+                let fi = model.files.iter().position(|f| f.path == c.path)?;
+                let content = self.texts.content(&c.path, CommentSide::New)?;
+                let (a, b) = locate_snippet(content, &c.snippet, c.lines[1] as u32)?;
+                Some((fi, a, b))
+            })
+            .collect();
+        for (fi, a, b) in wants {
+            let f = &model.files[fi];
+            let Some(total) = self.texts.content(&f.path, CommentSide::New).map(|c| c.line_count()) else {
+                continue;
+            };
+            let gaps = file_gaps(f, Some(total));
+            let e = self.expansions.entry(f);
+            for (g, gap) in gaps.iter().enumerate() {
+                let (Some(hi), Some(len)) = (gap.hi, gap.len()) else {
+                    continue;
+                };
+                let (a, b) = (a.max(gap.lo), b.min(hi));
+                if a > b {
+                    continue;
+                }
+                let r = e.gaps.entry(g).or_default();
+                let (top, bottom, _) = gap.effective(*r);
+                if b < gap.lo + top || a > hi - bottom {
+                    continue; // already revealed
+                }
+                if a - gap.lo <= hi - b {
+                    let want = (b + COMMENT_REVEAL_CONTEXT + 1).saturating_sub(gap.lo).min(len);
+                    *r = GapReveal { top: top.max(want), bottom };
+                } else {
+                    let want = (hi + 1).saturating_sub(a.saturating_sub(COMMENT_REVEAL_CONTEXT).max(gap.lo)).min(len);
+                    *r = GapReveal { top, bottom: bottom.max(want) };
+                }
+            }
+        }
+    }
+
+    /// Paths with a context expansion whose new-side text is not cached (a
+    /// merge-base move dropped it) — the view re-requests them after a derive.
+    pub(crate) fn expansions_missing_text(&self) -> Vec<PathBuf> {
+        self.expansions
+            .by_path
+            .iter()
+            .filter(|(p, e)| {
+                (!e.gaps.is_empty() || !e.pending.is_empty()) && self.texts.content(p, CommentSide::New).is_none()
+            })
+            .map(|(p, _)| p.clone())
+            .collect()
     }
 
     /// A tile bound to `path` whose first derive is still pending (restore).
@@ -1036,6 +1720,8 @@ impl DiffTile {
         self.review_path = None;
         self.review_gen = self.review_gen.wrapping_add(1);
         self.folds = Folds::default();
+        self.texts = FileTexts::default();
+        self.expansions = Expansions::default();
         self.cursor = 0;
         self.send_picker = None;
         self.rebuild_rows();
@@ -1046,7 +1732,7 @@ impl DiffTile {
     pub(crate) fn rebuild_rows(&mut self) {
         let rows = match &self.model {
             Some(m) => {
-                let mut rows = visible_rows(m, self.review.as_ref(), &self.folds);
+                let mut rows = visible_rows_ex(m, self.review.as_ref(), &self.folds, &self.expansions, &self.texts);
                 if let Some(c) = &self.compose {
                     let (at, remove, file) = compose_slot_place(m, self.review.as_ref(), &rows, c);
                     let parts = c.slot_rows.clamp(1, u8::MAX as usize) as u8;
@@ -1076,7 +1762,7 @@ impl DiffTile {
     /// The commentable line under the cursor (spec B5; `None` on a header).
     #[allow(dead_code)] // unit-tested helper; the tile uses `comment_anchor_at_cursor`.
     pub(crate) fn cursor_line_anchor(&self) -> Option<LineAnchor> {
-        line_anchor(self.model.as_ref()?, self.cursor_row()?)
+        line_anchor(self.model.as_ref()?, &self.texts, self.cursor_row()?)
     }
 
     /// `(viewed, total)` files (spec B2 `N/M files viewed`).
@@ -1098,6 +1784,9 @@ impl DiffTile {
             if !ok {
                 return;
             }
+        }
+        if delta != 0 {
+            self.moving_down = delta > 0;
         }
         self.cursor = next;
     }
@@ -1127,7 +1816,7 @@ impl DiffTile {
     pub(crate) fn comment_anchor_at_cursor(&self) -> Option<CommentAnchor> {
         let model = self.model.as_ref()?;
         let (lo, hi) = self.selection().unwrap_or((self.cursor, self.cursor));
-        comment_anchor_for_range(model, &self.rows, lo, hi)
+        comment_anchor_for_range(model, &self.texts, &self.rows, lo, hi)
     }
 
     /// The stored comment whose card the cursor is on.
@@ -1267,6 +1956,7 @@ impl DiffTile {
     pub(crate) fn jump_hunk(&mut self, forward: bool) {
         if let Some(i) = next_hunk_row(&self.rows, self.cursor, forward) {
             self.cursor = i;
+            self.moving_down = forward;
         }
     }
 
@@ -1274,6 +1964,7 @@ impl DiffTile {
     pub(crate) fn jump_file(&mut self, forward: bool) {
         if let Some(i) = next_file_row(&self.rows, self.cursor, forward) {
             self.cursor = i;
+            self.moving_down = forward;
         }
     }
 
@@ -1412,9 +2103,23 @@ index 3..4 100644
     fn visible_rows_lists_headers_hunks_and_numbered_lines() {
         let m = model();
         let rows = visible_rows(&m, None, &Folds::default());
-        // a.rs: header + (hunk + 4) + (hunk + 3); b.rs: header + (hunk + 2).
-        assert_eq!(rows.len(), 1 + 5 + 4 + 1 + 3);
-        assert_eq!(file_rows(&rows), vec![0, 10]);
+        // a.rs: header + (hunk + 4) + expander (new 4..=19 hidden) + (hunk +
+        // 3); b.rs: header + (hunk + 2). Neither file gets a top expander
+        // (both start at line 1) nor a bottom one (their last hunks end in
+        // < 3 context lines ⇒ end-of-file).
+        assert_eq!(rows.len(), 1 + 5 + 1 + 4 + 1 + 3);
+        assert_eq!(file_rows(&rows), vec![0, 11]);
+        assert_eq!(
+            rows[6],
+            RowRef::Expander {
+                file: 0,
+                gap: 1,
+                first_hidden: 4,
+                hidden: Some(16),
+                kind: GapKind::Between,
+                loading: false
+            }
+        );
         assert_eq!(rows[1], RowRef::Hunk { file: 0, hunk: 0 });
         assert_eq!(
             rows[3],
@@ -1426,7 +2131,7 @@ index 3..4 100644
             RowRef::Line { file: 0, hunk: 0, line: 2, old: None, new: Some(2) }
         );
         assert_eq!(
-            rows[8],
+            rows[9],
             RowRef::Line { file: 0, hunk: 1, line: 1, old: None, new: Some(21) }
         );
     }
@@ -1442,7 +2147,7 @@ index 3..4 100644
         assert_eq!(rows[1], RowRef::File { file: 1, viewed: false, collapsed: false });
         // z on the viewed file expands it; z again folds it.
         folds.toggle(&m.files[0].path, true);
-        assert_eq!(visible_rows(&m, Some(&review), &folds).len(), 14);
+        assert_eq!(visible_rows(&m, Some(&review), &folds).len(), 15);
         folds.toggle(&m.files[0].path, true);
         assert_eq!(visible_rows(&m, Some(&review), &folds).len(), 1 + 1 + 3);
         // z on an unviewed file folds it.
@@ -1457,19 +2162,19 @@ index 3..4 100644
         let rows = visible_rows(&model(), None, &Folds::default());
         assert_eq!(step_row(&rows, 0, -1), 0);
         assert_eq!(step_row(&rows, 0, 1), 1);
-        assert_eq!(step_row(&rows, 13, 1), 13);
+        assert_eq!(step_row(&rows, 14, 1), 14);
         assert_eq!(step_row(&[], 5, 1), 0);
-        // Hunks at 1, 6, 11.
+        // Hunks at 1, 7, 12 (the expander at 6 is not a hunk stop).
         assert_eq!(next_hunk_row(&rows, 0, true), Some(1));
-        assert_eq!(next_hunk_row(&rows, 1, true), Some(6));
-        assert_eq!(next_hunk_row(&rows, 6, true), Some(11));
-        assert_eq!(next_hunk_row(&rows, 11, true), None);
-        assert_eq!(next_hunk_row(&rows, 8, false), Some(6));
+        assert_eq!(next_hunk_row(&rows, 1, true), Some(7));
+        assert_eq!(next_hunk_row(&rows, 7, true), Some(12));
+        assert_eq!(next_hunk_row(&rows, 12, true), None);
+        assert_eq!(next_hunk_row(&rows, 9, false), Some(7));
         assert_eq!(next_hunk_row(&rows, 1, false), None);
-        // Files at 0, 10.
-        assert_eq!(next_file_row(&rows, 3, true), Some(10));
-        assert_eq!(next_file_row(&rows, 10, true), None);
-        assert_eq!(next_file_row(&rows, 12, false), Some(10));
+        // Files at 0, 11.
+        assert_eq!(next_file_row(&rows, 3, true), Some(11));
+        assert_eq!(next_file_row(&rows, 11, true), None);
+        assert_eq!(next_file_row(&rows, 13, false), Some(11));
         assert_eq!(next_file_row(&rows, 3, false), Some(0));
     }
 
@@ -1485,7 +2190,7 @@ index 3..4 100644
         let rows = visible_rows(&m, Some(&review), &Folds::default());
         assert_eq!(next_unviewed_file_row(&rows, 0), None);
         let rows = visible_rows(&m, None, &Folds::default());
-        assert_eq!(next_unviewed_file_row(&rows, 0), Some(10));
+        assert_eq!(next_unviewed_file_row(&rows, 0), Some(11));
     }
 
     /// UXI-Diff-13: a Line anchor re-resolves to the nearest new-side line in
@@ -1494,7 +2199,7 @@ index 3..4 100644
     fn anchor_survives_a_shift_and_falls_back_when_file_gone() {
         let m = model();
         let rows = visible_rows(&m, None, &Folds::default());
-        let anchor = cursor_anchor(&m, &rows, 8).expect("anchor");
+        let anchor = cursor_anchor(&m, &rows, 9).expect("anchor");
         assert_eq!(anchor.kind, AnchorKind::Line { old: None, new: Some(21) });
         // Fold nothing but add a leading file: indices shift, anchor holds.
         let raw2 = "\
@@ -1523,25 +2228,26 @@ index 1..2 100644
         let gone = CursorAnchor { path: PathBuf::from("zzz.rs"), kind: AnchorKind::File };
         assert_eq!(resolve_anchor(&m2, &rows2, &gone, 99), rows2.len() - 1);
         // Header anchor ⇒ header.
-        let hdr = cursor_anchor(&m, &rows, 10).unwrap();
-        assert_eq!(resolve_anchor(&m, &rows, &hdr, 0), 10);
+        let hdr = cursor_anchor(&m, &rows, 11).unwrap();
+        assert_eq!(resolve_anchor(&m, &rows, &hdr, 0), 11);
     }
 
     #[test]
     fn line_anchor_and_zed_target_pick_the_right_side() {
         let m = model();
         let rows = visible_rows(&m, None, &Folds::default());
-        let removed = line_anchor(&m, rows[3]).unwrap();
+        let removed = line_anchor(&m, &FileTexts::default(), rows[3]).unwrap();
         assert_eq!((removed.side, removed.line, removed.text.as_str()), (CommentSide::Old, 2, "two"));
-        let added = line_anchor(&m, rows[4]).unwrap();
+        let added = line_anchor(&m, &FileTexts::default(), rows[4]).unwrap();
         assert_eq!((added.side, added.line, added.text.as_str()), (CommentSide::New, 2, "TWO"));
-        assert!(line_anchor(&m, rows[0]).is_none() && line_anchor(&m, rows[1]).is_none());
+        assert!(line_anchor(&m, &FileTexts::default(), rows[0]).is_none() && line_anchor(&m, &FileTexts::default(), rows[1]).is_none());
         assert_eq!(zed_target(&m, &rows, 4), Some((PathBuf::from("a.rs"), 2)));
         // Removed line "two" sits after new line 1 ⇒ 2.
         assert_eq!(zed_target(&m, &rows, 3), Some((PathBuf::from("a.rs"), 2)));
-        assert_eq!(zed_target(&m, &rows, 6), Some((PathBuf::from("a.rs"), 20)));
+        assert_eq!(zed_target(&m, &rows, 7), Some((PathBuf::from("a.rs"), 20)));
+        assert_eq!(zed_target(&m, &rows, 6), Some((PathBuf::from("a.rs"), 4)), "expander ⇒ its first hidden line");
         assert_eq!(zed_target(&m, &rows, 0), Some((PathBuf::from("a.rs"), 1)));
-        assert_eq!(zed_target(&m, &rows, 10), Some((PathBuf::from("b.rs"), 1)));
+        assert_eq!(zed_target(&m, &rows, 11), Some((PathBuf::from("b.rs"), 1)));
     }
 
     fn comment(path: &str, side: CommentSide, lines: [usize; 2], snippet: &str, body: &str) -> ReviewComment {
@@ -1585,11 +2291,11 @@ index 1..2 100644
 
         // Mixed removed/added span ⇒ new side, new-side lines only.
         let plain = visible_rows(&m, None, &Folds::default());
-        let a = comment_anchor_for_range(&m, &plain, 2, 5).unwrap();
+        let a = comment_anchor_for_range(&m, &FileTexts::default(), &plain, 2, 5).unwrap();
         assert_eq!((a.side, a.lines, a.snippet.as_str()), (CommentSide::New, [1, 3], "one\nTWO\nthree"));
-        let removed = comment_anchor_for_range(&m, &plain, 3, 3).unwrap();
+        let removed = comment_anchor_for_range(&m, &FileTexts::default(), &plain, 3, 3).unwrap();
         assert_eq!((removed.side, removed.lines), (CommentSide::Old, [2, 2]));
-        assert!(comment_anchor_for_range(&m, &plain, 0, 1).is_none(), "headers only");
+        assert!(comment_anchor_for_range(&m, &FileTexts::default(), &plain, 0, 1).is_none(), "headers only");
         assert_eq!(a.label(), "a.rs:1–3");
 
         assert_eq!(wrap_cols("ab cd ef", 5), vec!["ab cd", "ef"]);
@@ -1623,6 +2329,124 @@ index 1..2 100644
         assert_eq!(compose_window_top(0, 40), 0);
     }
 
+    /// spec B2a: gap geometry (new-side span + old offset), including a
+    /// pure-deletion hunk's zero-count side and the end-of-file heuristic.
+    #[test]
+    fn file_gaps_span_and_offset() {
+        let m = model();
+        let gaps = file_gaps(&m.files[0], None);
+        assert_eq!(gaps.len(), 3);
+        assert_eq!((gaps[0].lo, gaps[0].len()), (1, Some(0)), "hunk at line 1 ⇒ empty top gap");
+        assert_eq!(gaps[1], Gap { lo: 4, hi: Some(19), old_delta: 0, kind: GapKind::Between });
+        // Last hunk -20,2 +20,3 ends in 1 context line ⇒ end-of-file known.
+        assert_eq!(gaps[2], Gap { lo: 23, hi: Some(22), old_delta: -1, kind: GapKind::Bottom });
+        let loaded = file_gaps(&m.files[0], Some(30));
+        assert_eq!(loaded[2].len(), Some(8), "a loaded text gives the real end");
+        assert!(file_gaps(&m.files[1], None).iter().all(|g| g.len() == Some(0)), "an added file hides nothing");
+
+        let h = Hunk { header: "@@ -5,2 +4,0 @@".into(), lines: vec![] };
+        assert_eq!((h.first_lines(), h.next_lines()), ((5, 5), (7, 5)), "zero-count side starts after `start`");
+        let h = Hunk { header: "@@ -9 +9 @@".into(), lines: vec![] };
+        assert_eq!(h.ranges(), ((9, 1), (9, 1)), "omitted count is 1");
+    }
+
+    /// spec B2a: an expand reveals 20 from an edge (all when < 30 hide),
+    /// `All` the rest; Enter's default direction; the expander segments.
+    #[test]
+    fn apply_expand_steps_and_defaults() {
+        let gap = Gap { lo: 45, hi: Some(127), old_delta: -1, kind: GapKind::Between };
+        let mut r = GapReveal::default();
+        assert!(apply_expand(&gap, &mut r, ExpandDir::Down));
+        assert_eq!(r, GapReveal { top: 20, bottom: 0 });
+        assert!(apply_expand(&gap, &mut r, ExpandDir::Up));
+        assert_eq!(r, GapReveal { top: 20, bottom: 20 });
+        assert_eq!(gap.effective(r), (20, 20, Some(43)));
+        assert!(apply_expand(&gap, &mut r, ExpandDir::Down));
+        assert_eq!(gap.effective(r).2, Some(23));
+        assert!(apply_expand(&gap, &mut r, ExpandDir::Up), "23 < 30 hidden ⇒ one step shows them all");
+        assert_eq!(gap.effective(r).2, Some(0));
+        assert!(!apply_expand(&gap, &mut r, ExpandDir::All), "nothing left");
+        let unknown = Gap { hi: None, ..gap };
+        assert!(!apply_expand(&unknown, &mut GapReveal::default(), ExpandDir::Down));
+
+        assert_eq!(default_expand_dir(GapKind::Top, Some(90), true), ExpandDir::Up);
+        assert_eq!(default_expand_dir(GapKind::Bottom, None, false), ExpandDir::Down);
+        assert_eq!(default_expand_dir(GapKind::Between, Some(12), false), ExpandDir::All);
+        assert_eq!(default_expand_dir(GapKind::Between, Some(83), true), ExpandDir::Down);
+        assert_eq!(default_expand_dir(GapKind::Between, Some(83), false), ExpandDir::Up);
+
+        let labels = |k, h| expander_segments(k, h).into_iter().map(|(_, l)| l).collect::<Vec<_>>();
+        assert_eq!(labels(GapKind::Between, Some(83)), ["↓ 20 more lines", "↑ 20 more lines", "Show all 83 hidden lines"]);
+        assert_eq!(labels(GapKind::Top, Some(36)), ["↑ 20 more lines", "Show all 36 hidden lines"]);
+        assert_eq!(labels(GapKind::Bottom, None), ["↓ 20 more lines"]);
+        assert_eq!(labels(GapKind::Between, Some(1)), ["Show all 1 hidden line"]);
+    }
+
+    /// spec B2a: with the text loaded, a reveal emits numbered `Ctx` rows
+    /// around the expander; a fully revealed gap drops the expander AND the
+    /// next hunk's header; a comment on a revealed line anchors to it.
+    #[test]
+    fn visible_rows_reveal_context_and_merge_hunks() {
+        let m = model();
+        let f = &m.files[0];
+        let text: String = (1..=22).map(|i| format!("a{i}\n")).collect();
+        let mut texts = FileTexts::default();
+        texts.invalidate(&m);
+        texts.insert_ready(&f.path, CommentSide::New, f.file_hash, text.into());
+        let mut exp = Expansions::default();
+        exp.entry(f).gaps.insert(1, GapReveal { top: 2, bottom: 3 });
+        let rows = visible_rows_ex(&m, None, &Folds::default(), &exp, &texts);
+        let ctx = |n: u32| RowRef::Ctx { file: 0, old: n, new: n };
+        assert_eq!(&rows[6..13], &[
+            ctx(4),
+            ctx(5),
+            RowRef::Expander { file: 0, gap: 1, first_hidden: 6, hidden: Some(11), kind: GapKind::Between, loading: false },
+            ctx(17),
+            ctx(18),
+            ctx(19),
+            RowRef::Hunk { file: 0, hunk: 1 },
+        ]);
+        let anchor = line_anchor(&m, &texts, rows[7]).unwrap();
+        assert_eq!((anchor.side, anchor.line, anchor.text.as_str()), (CommentSide::New, 5, "a5"));
+        assert_eq!(zed_target(&m, &rows, 7), Some((PathBuf::from("a.rs"), 5)));
+
+        let mut review = Review::new("feature", "main", std::path::Path::new("/wt"));
+        review.comments.push(comment("a.rs", CommentSide::New, [18, 18], "a18", "ctx"));
+        let rows_c = visible_rows_ex(&m, Some(&review), &Folds::default(), &exp, &texts);
+        let at = rows_c.iter().position(|r| r.comment_index() == Some(0)).unwrap();
+        assert_eq!(rows_c[at - 1], ctx(18), "a comment on a revealed line sits under it");
+
+        exp.entry(f).gaps.insert(1, GapReveal { top: 16, bottom: 0 });
+        let rows = visible_rows_ex(&m, None, &Folds::default(), &exp, &texts);
+        assert!(!rows.iter().any(|r| matches!(r, RowRef::Expander { gap: 1, .. })), "fully revealed ⇒ no expander");
+        assert!(!rows.contains(&RowRef::Hunk { file: 0, hunk: 1 }), "…and the hunks merge (header dropped)");
+        assert_eq!(rows[21], ctx(19));
+        assert!(matches!(rows[22], RowRef::Line { hunk: 1, line: 0, new: Some(20), .. }));
+
+        // Without the text the reveal waits (no Ctx rows), and a changed
+        // file_hash invalidates both the text and the expansion.
+        let rows = visible_rows_ex(&m, None, &Folds::default(), &exp, &FileTexts::default());
+        assert!(!rows.iter().any(|r| matches!(r, RowRef::Ctx { .. })));
+        let mut m2 = m.clone();
+        m2.files[0].file_hash ^= 1;
+        texts.invalidate(&m2);
+        exp.retain_for(&m2);
+        assert!(texts.content(&f.path, CommentSide::New).is_none() && exp.by_path.is_empty());
+    }
+
+    #[test]
+    fn file_content_lines_and_snippet_location() {
+        let c = FileContent::new("one\r\ntwo\nthree".into());
+        assert_eq!(c.line_count(), 3);
+        assert_eq!((c.line(1), c.line(2), c.line(3), c.line(4), c.line(0)), (Some("one"), Some("two"), Some("three"), None, None));
+        assert_eq!(FileContent::new("x\n".into()).line_count(), 1, "a trailing newline is not a line");
+        assert_eq!(FileContent::new("".into()).line_count(), 0);
+        let c = FileContent::new("a\nb\na\nb\n".into());
+        assert_eq!(locate_snippet(&c, "a\nb", 4), Some((3, 4)), "nearest occurrence wins");
+        assert_eq!(locate_snippet(&c, "a\nb\n", 1), Some((1, 2)));
+        assert_eq!(locate_snippet(&c, "zz", 1), None);
+    }
+
     #[test]
     fn range_selection_is_clamped_to_one_file() {
         let mut t = DiffTile::bound_to(PathBuf::from("/wt"));
@@ -1630,15 +2454,15 @@ index 1..2 100644
         t.rebuild_rows();
         t.cursor = 0;
         assert!(!t.toggle_range(), "V on a header refuses");
-        t.cursor = 9; // a.rs's last line
+        t.cursor = 10; // a.rs's last line
         assert!(t.toggle_range());
         t.move_cursor(1);
-        assert_eq!(t.cursor, 9, "can't extend into b.rs");
+        assert_eq!(t.cursor, 10, "can't extend into b.rs");
         for _ in 0..20 {
             t.move_cursor(-1);
         }
         assert_eq!(t.cursor, 1, "stops at a.rs's first hunk row, not its header");
-        assert_eq!(t.selection(), Some((1, 9)));
+        assert_eq!(t.selection(), Some((1, 10)));
         assert!(t.toggle_range() && t.selection().is_none(), "V again clears");
     }
 
@@ -1659,6 +2483,6 @@ index 1..2 100644
         t.cursor = 0;
         assert_eq!(t.toggle_viewed_at_cursor(), Some(false));
         assert_eq!(t.cursor, 0);
-        assert_eq!(t.rows.len(), 1 + 9 + 1, "unmarking re-expands a.rs");
+        assert_eq!(t.rows.len(), 1 + 10 + 1, "unmarking re-expands a.rs");
     }
 }

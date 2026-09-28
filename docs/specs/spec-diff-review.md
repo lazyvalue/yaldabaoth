@@ -80,6 +80,29 @@ uncommitted + untracked), base = the repo's default branch.
   `git add -N`). Text zoom scales the diff body; chrome stays fixed. Empty diff
   ⇒ "No changes on <branch> vs <base>."
 
+- **B2a. Expand context. [ACTIVE]** Wherever a file's diff hides unchanged
+  lines — above its first hunk, between two hunks, below its last hunk (unless
+  that hunk visibly ends the file: fewer than 3 trailing context lines) — a
+  slim, full-width, subdued **hidden-lines row** stands in for them, GitHub-
+  style: `↑ 20 more lines` (reveal upward from the hunk below), `↓ 20 more
+  lines` (continue downward from the hunk above), `Show all N hidden lines`;
+  the top row offers ↑ + all, a between row ↓ ↑ + all, the bottom row ↓ (+ all
+  once the length is known); fewer than 30 hidden ⇒ just "Show all". Every
+  segment is clickable; `Enter` on the row expands toward the hunk (top/
+  bottom), or between hunks shows all when under 30 hide, else 20 lines from
+  the edge the cursor travels away from; `+` reveals 20 lines above and below
+  the cursor's hunk. Each step reveals 20 lines (all when fewer than 30
+  remain). Revealed lines are normal context rows with correct old/new numbers
+  (old = new + the offset after the hunk above) — selectable, commentable,
+  openable in Zed. A fully revealed gap merges the two hunks (row + lower hunk
+  header vanish). The text comes from the new side (the worktree file) read on
+  the background executor on first expand ("Loading…" meanwhile) into a
+  per-file cache keyed by `file_hash`; the same cache serves the old side
+  (`git show <merge-base>:<path>`) to other consumers. Expansion is kept per
+  file and survives a re-derive while its `file_hash` is unchanged. A comment
+  on a revealed line stays live (its snippet is checked against the file's full
+  new text) and its line is re-revealed after a re-derive.
+
 - **B3. Refresh. [ACTIVE]** The diff re-derives by re-running git (async, off
   the paint path) when the tile **gains focus** and on `r`. The previous model
   stays on screen until the new one lands (a quiet "refreshing" indicator in
@@ -158,6 +181,8 @@ struct DiffTile {
     folds: Folds,                    // user collapse / expand (viewed ⇒ folded unless expanded)
     compose: Option<CommentCompose>, // new or editing comment
     send_picker: Option<SendPicker>,
+    texts: FileTexts,                // (path, side) → full text @ file_hash (B2a)
+    expansions: Expansions,          // path → per-gap revealed {top, bottom} (B2a)
     refreshing: bool, error: Option<String>,
 }
 
@@ -211,9 +236,14 @@ View methods on `YaldaGpuiView` (module-internal):
 - `open_comment_compose` / `submit_comment` / `edit_comment` / `delete_comment` — B5.
 - `open_send_picker(id, include_sent, cx)` / `send_review_comments(id, sid, cx)` — B6.
 - `open_in_zed(id, cx)` — B7.
+- `diff_expand(id, file, gap, dir, cx)` (Enter / segment click / `+`) and
+  `diff_load_file_text(id, path, side, cx)` (the async cache fill shared with
+  other consumers; `DiffTile::file_text(path, side) -> Option<Arc<str>>` reads
+  it) — B2a.
 
-Subprocess boundary (`diff_git.rs`): `collect_raw_diff(worktree, base)` and
-`list_worktrees(repo_dir)`; errors are values. Pure core: `diff_model.rs`
+Subprocess boundary (`diff_git.rs`): `collect_raw_diff(worktree, base)`,
+`list_worktrees(repo_dir)` and `read_file_side(worktree, merge_base, path,
+old_side)`; errors are values. Pure core: `diff_model.rs`
 (parser, `file_hash`) and `review_state.rs` (schema, viewed/comment ops,
 `recompute_outdated`, `build_send_prompt`).
 
@@ -286,6 +316,10 @@ are **removed** (ADR-0040).
   compose moved from a bottom-pinned panel to an inline GitHub-style box under
   the commented line (`e` edits in place of the card); cards became bordered
   boxes with status pills; the 💬 emoji was removed.
+- 2026-09-27 — B2a added (graph `kfa` node context-expand, Scott: "expand the
+  view of the code above and below the visible hunk"): GitHub-style
+  hidden-lines rows, Enter / click / `+`, per-file text cache, comments on
+  revealed lines. UXI-Diff-18.
 - 2026-09-27 — rev 2 implemented (graph `8g7`), DRAFT → ACTIVE. Deviations are
   recorded per-UXI in `docs/components/diff.md` (bottom-pinned compose — since
   replaced by the inline compose, graph `kfa`,

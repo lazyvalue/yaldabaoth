@@ -71,7 +71,7 @@ pub const REVIEW_VERSION: u32 = 2;
 /// Which side of the diff a comment anchors to (spec B5): `New` = context +
 /// added lines (new-file line numbers), `Old` = context + removed lines.
 /// Serialized lowercase (`"new"` / `"old"`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CommentSide {
     #[default]
@@ -262,11 +262,29 @@ impl Review {
     /// the file's hunks (New = Context+Added, Old = Context+Removed; trailing
     /// whitespace trimmed per line). Returns `true` if any flag changed.
     pub fn recompute_outdated(&mut self, model: &DiffModel) -> bool {
+        self.recompute_outdated_with(model, &mut |_| None)
+    }
+
+    /// [`recompute_outdated`](Self::recompute_outdated) aware of revealed
+    /// context (spec B2a): a NEW-side comment whose snippet is not in the
+    /// file's hunks is still live when it appears in the file's full new-side
+    /// text (`new_text(path)`, `None` = unknown ⇒ outdated) — a comment on a
+    /// line revealed by expanding context stays anchored. `new_text` is only
+    /// asked for files still in the diff whose comment missed the hunks.
+    pub fn recompute_outdated_with(
+        &mut self,
+        model: &DiffModel,
+        new_text: &mut dyn FnMut(&Path) -> Option<std::sync::Arc<str>>,
+    ) -> bool {
         let mut changed = false;
         for c in &mut self.comments {
             let outdated = match model.files.iter().find(|f| f.path == c.path) {
                 None => true,
-                Some(file) => !snippet_present(file, c.side, &c.snippet),
+                Some(file) if snippet_present(file, c.side, &c.snippet) => false,
+                Some(_) if c.side == CommentSide::New => {
+                    !new_text(&c.path).is_some_and(|t| snippet_in_text(&t, &c.snippet))
+                }
+                Some(_) => true,
             };
             if c.outdated != outdated {
                 c.outdated = outdated;
@@ -329,13 +347,23 @@ fn side_lines(file: &FileDiff, side: CommentSide) -> Vec<&str> {
 /// `true` iff `snippet` appears as a contiguous run of `side`'s lines in
 /// `file`. An empty snippet trivially matches.
 fn snippet_present(file: &FileDiff, side: CommentSide, snippet: &str) -> bool {
+    run_present(&side_lines(file, side), snippet)
+}
+
+/// `true` iff `snippet` appears as a contiguous run of `text`'s lines
+/// (trailing whitespace ignored per line, like [`snippet_present`]).
+pub fn snippet_in_text(text: &str, snippet: &str) -> bool {
+    let hay: Vec<&str> = text.lines().map(str::trim_end).collect();
+    run_present(&hay, snippet)
+}
+
+fn run_present(hay: &[&str], snippet: &str) -> bool {
     let needle: Vec<&str> = snippet.split('\n').map(str::trim_end).collect();
     let needle: &[&str] = match needle.as_slice() {
         // A single trailing `\n` in the snippet is not a line of its own.
         [head @ .., ""] if !head.is_empty() => head,
         n => n,
     };
-    let hay = side_lines(file, side);
     if needle.len() > hay.len() {
         return false;
     }
@@ -700,6 +728,24 @@ mod review_v2_tests {
         assert!(r.edit_comment(&a, "edited".into()));
         assert_eq!(r.comment(&a).unwrap().body, "edited");
         assert!(!r.edit_comment("c99", "x".into()));
+    }
+
+    /// spec B2a: a new-side comment on a revealed context line (snippet not
+    /// in any hunk) stays live while the snippet is in the file's full text,
+    /// and is outdated when it is not (or the text is unknown).
+    #[test]
+    fn recompute_outdated_with_full_text_keeps_context_comments_live() {
+        let m = diff_model(&foo_diff("@@ -1,3 +1,3 @@", &["    new();"]));
+        let mut r = Review::default();
+        let id = r.add_comment("src/foo.rs".into(), CommentSide::New, [40, 40], "far away".into(), "b".into(), t(1));
+        let full: std::sync::Arc<str> = "fn foo() {\nfar away  \n}\n".into();
+        r.recompute_outdated_with(&m, &mut |_| Some(full.clone()));
+        assert!(!r.comment(&id).unwrap().outdated, "found in the full text");
+        assert!(r.recompute_outdated_with(&m, &mut |_| Some("nope\n".into())));
+        assert!(r.comment(&id).unwrap().outdated, "gone from the full text");
+        r.recompute_outdated_with(&m, &mut |_| Some(full.clone()));
+        assert!(!r.comment(&id).unwrap().outdated);
+        assert!(r.recompute_outdated(&m), "no text ⇒ outdated");
     }
 
     /// New side: snippet present ⇒ not outdated; the added line changes ⇒
