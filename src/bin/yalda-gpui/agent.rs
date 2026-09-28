@@ -1767,6 +1767,24 @@ pub(crate) fn compose_visual_metrics(
     (caret_vrow, total.max(1), per_line)
 }
 
+/// The caret's absolute visual row given each line's precomputed row count
+/// (`per_line`, from [`Compose::render_snapshot`]) — only the caret's own line
+/// is wrapped here. Equals `compose_visual_metrics(..).0` (D6).
+pub(crate) fn compose_caret_visual_row(
+    lines: &[String],
+    per_line: &[usize],
+    caret_line: usize,
+    caret_col: usize,
+    wrap_cols: usize,
+) -> usize {
+    let above: usize = per_line.iter().take(caret_line).sum();
+    let within = lines
+        .get(caret_line)
+        .map(|l| caret_visual_row(&wrap_line_cols(&l.chars().collect::<Vec<_>>(), wrap_cols), caret_col))
+        .unwrap_or(0);
+    above + within
+}
+
 /// Map an absolute VISUAL-row index to `(logical-line list-item index, visual-row
 /// offset within that item)` for the compose list scroll. The compose list's
 /// items are logical lines (each a wrapped column of visual rows), so the
@@ -2587,6 +2605,30 @@ pub(crate) struct Compose {
     /// as chips above the compose box; drained into the outgoing prompt on
     /// submit and cleared. Ephemeral — never persisted with the draft.
     pub(crate) pending_images: Vec<PendingImage>,
+    /// D6: the render-side snapshot of the draft (display lines + per-line
+    /// wrapped row counts), keyed by `(edit_seq, visible_cols)`. An idle frame
+    /// (caret blink, cross-tile notify, sibling keystroke) reuses the SAME
+    /// `Rc` — so `list.reconcile`'s `ptr_eq` fast path fires and nothing is
+    /// re-extracted or re-wrapped. Invalidated wherever `editor` is REPLACED
+    /// (a fresh `Editor` restarts `edit_seq`, so the key alone can't see it).
+    pub(crate) render_cache: std::cell::RefCell<Option<ComposeRenderSnap>>,
+    /// How many times `render_snapshot` rebuilt the display lines (perf
+    /// observable for the D6 no-rebuild-on-idle guard).
+    pub(crate) render_line_builds: std::cell::Cell<u64>,
+}
+
+/// D6: one cached render snapshot of a [`Compose`] draft — see
+/// [`Compose::render_snapshot`].
+#[derive(Clone)]
+pub(crate) struct ComposeRenderSnap {
+    pub(crate) edit_seq: u64,
+    pub(crate) visible_cols: usize,
+    /// Display lines (newline-trimmed, tab-expanded) — the list's items.
+    pub(crate) lines: std::rc::Rc<Vec<String>>,
+    /// Wrapped visual-row count of each line at `visible_cols`.
+    pub(crate) per_line_rows: std::rc::Rc<Vec<usize>>,
+    /// `per_line_rows` summed (≥ 1).
+    pub(crate) total_rows: usize,
 }
 
 /// One clipboard-pasted image staged on the compose box. `data` is standard
@@ -2633,7 +2675,48 @@ impl Compose {
             window: std::cell::Cell::new(ComposeWindow::default()),
             bounds: std::rc::Rc::new(std::cell::Cell::new((0.0, 0.0, 0.0, 0.0))),
             pending_images: Vec::new(),
+            render_cache: std::cell::RefCell::new(None),
+            render_line_builds: std::cell::Cell::new(0),
         }
+    }
+
+    /// D6: the draft's display lines + per-line wrapped row counts at
+    /// `visible_cols`, cached on `(edit_seq, visible_cols)`. Lines are rebuilt
+    /// only when the text changed; a width change alone re-wraps but keeps the
+    /// lines `Rc` (so the list splice still sees identical items). Each line is
+    /// wrapped ONCE here — the render path reads the counts instead of
+    /// re-wrapping every line for the small/virtualized decision and again for
+    /// the caret's visual row.
+    pub(crate) fn render_snapshot(&self, visible_cols: usize) -> ComposeRenderSnap {
+        let edit_seq = self.editor.document().edit_seq();
+        let mut cache = self.render_cache.borrow_mut();
+        if let Some(c) = cache.as_ref()
+            && c.edit_seq == edit_seq
+            && c.visible_cols == visible_cols
+        {
+            return c.clone();
+        }
+        let lines = match cache.as_ref() {
+            Some(c) if c.edit_seq == edit_seq => c.lines.clone(),
+            _ => {
+                self.render_line_builds.set(self.render_line_builds.get() + 1);
+                std::rc::Rc::new(display_lines(self.editor.document()))
+            }
+        };
+        let per_line_rows: Vec<usize> = lines
+            .iter()
+            .map(|l| wrap_line_cols(&l.chars().collect::<Vec<_>>(), visible_cols).len())
+            .collect();
+        let total_rows = per_line_rows.iter().sum::<usize>().max(1);
+        let snap = ComposeRenderSnap {
+            edit_seq,
+            visible_cols,
+            lines,
+            per_line_rows: std::rc::Rc::new(per_line_rows),
+            total_rows,
+        };
+        *cache = Some(snap.clone());
+        snap
     }
 
     pub(crate) fn text(&self) -> String {
@@ -2688,6 +2771,7 @@ impl Compose {
     pub(crate) fn seeded_committed(text: &str) -> Self {
         let mut c = Self::new();
         c.editor = Editor::new(text.to_string(), std::path::PathBuf::from("*compose*"));
+        c.render_cache.replace(None);
         let last = c.editor.document().line_count().saturating_sub(1);
         let col = c.editor.document().line_len_chars(last);
         c.editor.cursor_mut().line = last;
@@ -2702,6 +2786,9 @@ impl Compose {
     /// pasted image.
     pub(crate) fn set_recalled(&mut self, text: &str) {
         self.editor = Editor::new(text.to_string(), std::path::PathBuf::from("*compose*"));
+        // D6: a fresh Editor restarts `edit_seq`; drop the render snapshot so
+        // it can't be served for the replaced text.
+        self.render_cache.replace(None);
         let last = self.editor.document().line_count().saturating_sub(1);
         let col = self.editor.document().line_len_chars(last);
         self.editor.cursor_mut().line = last;

@@ -37,15 +37,6 @@ pub struct LineHl {
     pub stripped: Vec<Segment>,
 }
 
-impl LineHl {
-    fn empty() -> Self {
-        LineHl {
-            raw: Vec::new(),
-            stripped: Vec::new(),
-        }
-    }
-}
-
 /// Fingerprint of the theme fields the highlighter reads. Cheap to compare
 /// (`Style` is `Copy + Eq`); a change forces a full re-highlight, which is
 /// fine — theme switches are rare.

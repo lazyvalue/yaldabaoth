@@ -31113,3 +31113,68 @@ fn compose_long_single_line_caret_paints_inside_box(cx: &mut TestAppContext) {
     assert!(ry >= by - 1.0 && ry < by + bh, "caret row y={ry} outside box [{by}, {}]", by + bh);
     assert!(cx_ >= bx - 1.0 && cx_ < bx + bw, "caret x={cx_} outside box [{bx}, {}]", bx + bw);
 }
+
+/// D6 (text-editing review): the compose render used to rebuild every display
+/// line, wrap every line twice, and hand `list.reconcile` a FRESH `Rc` on every
+/// root render — even when nothing about the draft changed. Now the snapshot is
+/// cached on `(edit_seq, visible_cols)`: idle root renders (the cross-tile
+/// notify / caret-blink case) must rebuild NOTHING, and a real edit rebuilds
+/// exactly once. Drives the real `render_agent` compose path (virtualized: the
+/// draft exceeds the 8-row cap).
+///
+/// Negative control (observed RED): make `Compose::render_snapshot` ignore its
+/// cache (always rebuild) → the build count climbs on idle frames.
+#[gpui::test]
+fn compose_idle_render_does_not_rebuild_lines(cx: &mut TestAppContext) {
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
+    let text: String = (0..20).map(|i| format!("draft line {i}\n")).collect();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        *c.input_surface.compose_mut() = crate::Compose::seeded(&text);
+    });
+    // Settle (width measurement converges over the first frames).
+    for _ in 0..4 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+    let builds = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.update(vcx, |v, cx| {
+            v.agent_read(cx, |c| c.input_surface.compose().render_line_builds.get())
+                .expect("agent")
+        })
+    };
+    let before = builds(&view, vcx);
+    assert!(before >= 1, "non-vacuous: the compose render path ran ({before})");
+    for _ in 0..5 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+    assert_eq!(
+        builds(&view, vcx),
+        before,
+        "idle root renders must not rebuild the compose display lines"
+    );
+    // A real edit rebuilds (the cache is keyed on edit_seq, not stale).
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        c.input_surface.compose_mut().editor.insert_char('x');
+    });
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    assert_eq!(builds(&view, vcx), before + 1, "an edit rebuilds exactly once");
+    // A replaced editor (history recall) must not be served the stale snapshot.
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        c.input_surface.compose_mut().set_recalled("recalled");
+    });
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let lines = view.update(vcx, |v, cx| {
+        v.agent_read(cx, |c| {
+            c.input_surface.compose().render_cache.borrow().as_ref().map(|s| s.lines.clone())
+        })
+        .expect("agent")
+    });
+    assert_eq!(lines.as_deref().map(|l| l.as_slice()), Some(&["recalled".to_string()][..]));
+}

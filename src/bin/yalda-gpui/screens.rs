@@ -1477,13 +1477,11 @@ impl YaldaGpuiView {
             // virtualized decision is on TOTAL VISUAL rows so one long wrapped
             // line can't overflow the un-scrolled small box and hide the caret
             // (UXI-TextEditing-1).
-            let compose_lines: std::rc::Rc<Vec<String>> = {
-                std::rc::Rc::new(display_lines(tb.editor.document()))
-            };
-            let visual_rows_total: usize = compose_lines
-                .iter()
-                .map(|l| wrap_line_cols(&l.chars().collect::<Vec<_>>(), visible_cols).len())
-                .sum();
+            // D6: cached on (edit_seq, visible_cols) — an idle frame reuses the
+            // same `Rc` (list reconcile's ptr_eq fast path) and wraps nothing.
+            let compose_snap = tb.render_snapshot(visible_cols);
+            let compose_lines: std::rc::Rc<Vec<String>> = compose_snap.lines.clone();
+            let visual_rows_total: usize = compose_snap.total_rows;
 
             let compose_body: AnyElement = if visual_rows_total <= COMPOSE_MAX_VISIBLE_LINES {
                 // ── Small draft: render every (wrapped) line directly. Total
@@ -1567,8 +1565,11 @@ impl YaldaGpuiView {
                 // Anchored on the prior window (`tb.window`) so the box only moves
                 // when the caret would leave it; never read back from the list's
                 // own anchor (mis-fires on freshly-spliced unmeasured rows).
-                let (caret_vrow, total_vrows, per_line) = compose_visual_metrics(
+                let per_line = compose_snap.per_line_rows.clone();
+                let total_vrows = compose_snap.total_rows;
+                let caret_vrow = compose_caret_visual_row(
                     &lines_snap,
+                    &per_line,
                     compose_cursor_line,
                     compose_cursor_col,
                     visible_cols,
