@@ -43,13 +43,7 @@ impl CursorPos {
     }
 
     pub fn move_right(&mut self, doc: &Document, insert_mode: bool) {
-        let line_len = doc.line_len_chars(self.line);
-        let max_col = if insert_mode {
-            line_len
-        } else {
-            line_len.saturating_sub(1)
-        };
-        if self.col < max_col {
+        if self.col < max_col(doc, self.line, insert_mode) {
             self.col += 1;
         }
         self.desired_col = None;
@@ -76,14 +70,8 @@ impl CursorPos {
 
     /// Clamp column to valid range for current line. Call after vertical movement.
     pub fn clamp_col(&mut self, doc: &Document, insert_mode: bool) {
-        let line_len = doc.line_len_chars(self.line);
-        let max_col = if insert_mode {
-            line_len
-        } else {
-            line_len.saturating_sub(1)
-        };
         let target = self.desired_col.unwrap_or(self.col);
-        self.col = target.min(max_col);
+        self.col = target.min(max_col(doc, self.line, insert_mode));
     }
 
     pub fn move_line_start(&mut self) {
@@ -103,53 +91,42 @@ impl CursorPos {
     }
 
     pub fn move_line_end(&mut self, doc: &Document, insert_mode: bool) {
-        let line_len = doc.line_len_chars(self.line);
-        self.col = if insert_mode {
-            line_len
-        } else {
-            line_len.saturating_sub(1)
-        };
+        self.col = max_col(doc, self.line, insert_mode);
         self.desired_col = None;
     }
 
     pub fn move_word_forward(&mut self, doc: &Document) {
-        let text = doc.line_text(self.line);
-        let chars: Vec<char> = text.chars().collect();
-        let len = chars.len();
-        let mut i = self.col;
+        let line = doc.rope().line(self.line.min(doc.line_count().saturating_sub(1)));
+        let len = line.len_chars();
+        let mut i = self.col.min(len);
+        let mut chars = line.chars_at(i).peekable();
 
-        // Skip current word
-        if i < len && is_word_char(chars[i]) {
-            while i < len && is_word_char(chars[i]) {
-                i += 1;
-            }
-        } else if i < len && !chars[i].is_whitespace() {
-            while i < len && !chars[i].is_whitespace() && !is_word_char(chars[i]) {
-                i += 1;
+        // Skip the current word / punctuation run.
+        if let Some(&c) = chars.peek() {
+            let cls = char_class(c);
+            if cls != CharClass::Space {
+                while chars.peek().is_some_and(|&c| char_class(c) == cls) {
+                    chars.next();
+                    i += 1;
+                }
             }
         }
-        // Skip whitespace
-        while i < len && chars[i].is_whitespace() {
-            if chars[i] == '\n' {
-                break;
-            }
+        // Skip whitespace up to (not across) the line break.
+        while chars.peek().is_some_and(|&c| c.is_whitespace() && c != '\n') {
+            chars.next();
             i += 1;
         }
 
-        if i >= len || chars[i] == '\n' {
-            // Move to next line
+        if chars.peek().is_none_or(|&c| c == '\n') {
+            // Move to next line, onto its first non-blank.
             if self.line + 1 < doc.line_count() {
                 self.line += 1;
-                self.col = 0;
-                // Skip leading whitespace on next line
-                let next_text = doc.line_text(self.line);
-                let next_chars: Vec<char> = next_text.chars().collect();
-                let mut j = 0;
-                while j < next_chars.len() && next_chars[j].is_whitespace() && next_chars[j] != '\n'
-                {
-                    j += 1;
-                }
-                self.col = j;
+                self.col = doc
+                    .rope()
+                    .line(self.line)
+                    .chars()
+                    .take_while(|&c| c.is_whitespace() && c != '\n')
+                    .count();
             }
         } else {
             self.col = i;
@@ -157,137 +134,131 @@ impl CursorPos {
         self.desired_col = None;
     }
 
+    /// Vim `b`: back to the start of the previous word, crossing line breaks.
+    /// Whitespace (including newlines) before the caret is skipped, except that
+    /// an empty line counts as a word and stops the motion; then the caret
+    /// walks back over one same-class run (B7: at col 0 this lands on the start
+    /// of the previous line's last word, not its last char).
     pub fn move_word_backward(&mut self, doc: &Document) {
-        let text = doc.line_text(self.line);
-        let chars: Vec<char> = text.chars().collect();
-
-        if self.col == 0 {
-            // Move to end of previous line
-            if self.line > 0 {
-                self.line -= 1;
-                let prev_len = doc.line_len_chars(self.line);
-                self.col = prev_len.saturating_sub(1);
+        let rope = doc.rope();
+        let start = doc.line_col_to_char(self.line, self.col);
+        let mut i = start;
+        let mut back = rope.chars_at(i);
+        let mut prev = |i: usize| -> Option<char> { if i == 0 { None } else { back.prev() } };
+        // `pending` holds the char at i-1 once read.
+        let mut pending = prev(i);
+        while let Some(c) = pending {
+            if char_class(c) != CharClass::Space {
+                break;
             }
-            self.desired_col = None;
-            return;
-        }
-
-        let mut i = self.col;
-        // Skip whitespace backwards
-        while i > 0 && chars[i - 1].is_whitespace() {
             i -= 1;
-        }
-        // Skip word backwards
-        if i > 0 && is_word_char(chars[i - 1]) {
-            while i > 0 && is_word_char(chars[i - 1]) {
-                i -= 1;
+            pending = prev(i);
+            // Empty line: the char just stepped over is a '\n' that starts its
+            // line (the one before it is also a '\n', or it is the doc start).
+            if c == '\n' && i < start && (pending.is_none() || pending == Some('\n')) {
+                let (l, col) = doc.line_col_of_char(i);
+                self.line = l;
+                self.col = col;
+                self.desired_col = None;
+                return;
             }
-        } else if i > 0 {
-            while i > 0 && !chars[i - 1].is_whitespace() && !is_word_char(chars[i - 1]) {
+        }
+        if let Some(c) = pending {
+            let cls = char_class(c);
+            while pending.is_some_and(|c| char_class(c) == cls) {
                 i -= 1;
+                pending = prev(i);
             }
         }
-
-        self.col = i;
+        let (l, col) = doc.line_col_of_char(i);
+        self.line = l;
+        self.col = col;
         self.desired_col = None;
     }
 
+    /// Vim `e`: forward to the end of the next word, crossing line breaks
+    /// (B7: from a line's last word it continues to the next line's first word
+    /// end instead of resting on the '\n' column). With nothing ahead the caret
+    /// stays put.
     pub fn move_word_end(&mut self, doc: &Document) {
-        let text = doc.line_text(self.line);
-        let chars: Vec<char> = text.chars().collect();
-        let len = chars.len();
-        let mut i = self.col + 1;
-
-        // Skip whitespace
-        while i < len && chars[i].is_whitespace() && chars[i] != '\n' {
+        let rope = doc.rope();
+        let len = rope.len_chars();
+        let mut i = doc.line_col_to_char(self.line, self.col) + 1;
+        if i >= len {
+            return;
+        }
+        let mut chars = rope.chars_at(i).peekable();
+        while chars.peek().is_some_and(|&c| char_class(c) == CharClass::Space) {
+            chars.next();
             i += 1;
         }
-        // Move to end of word
-        if i < len && is_word_char(chars[i]) {
-            while i + 1 < len && is_word_char(chars[i + 1]) {
-                i += 1;
-            }
-        } else if i < len && !chars[i].is_whitespace() {
-            while i + 1 < len && !chars[i + 1].is_whitespace() && !is_word_char(chars[i + 1]) {
-                i += 1;
-            }
+        let Some(first) = chars.next() else {
+            return;
+        };
+        let cls = char_class(first);
+        while chars.peek().is_some_and(|&c| char_class(c) == cls) {
+            chars.next();
+            i += 1;
         }
-
-        self.col = i.min(len.saturating_sub(1));
+        let (l, col) = doc.line_col_of_char(i);
+        self.line = l;
+        self.col = col;
         self.desired_col = None;
+    }
+
+    /// Column of the nearest `ch` on the current line strictly after the caret
+    /// (`forward`) or strictly before it, without leaving the line.
+    fn find_on_line(&self, doc: &Document, ch: char, forward: bool) -> Option<usize> {
+        if self.line >= doc.line_count() {
+            return None;
+        }
+        let line = doc.rope().line(self.line);
+        let col = self.col.min(line.len_chars());
+        if forward {
+            line.chars_at(col)
+                .enumerate()
+                .skip(1)
+                .take_while(|&(_, c)| c != '\n')
+                .find(|&(_, c)| c == ch)
+                .map(|(k, _)| col + k)
+        } else {
+            let mut it = line.chars_at(col);
+            (0..col).rev().find(|_| it.prev() == Some(ch))
+        }
     }
 
     /// Find next occurrence of `ch` on the current line after the cursor.
     /// Returns true if found and cursor moved.
     pub fn find_char_forward(&mut self, doc: &Document, ch: char) -> bool {
-        let text = doc.line_text(self.line);
-        let chars: Vec<char> = text.chars().collect();
-        let start = self.col + 1;
-        for (offset, &c) in chars.iter().enumerate().skip(start) {
-            if c == '\n' {
-                break;
-            }
-            if c == ch {
-                self.col = offset;
-                self.desired_col = None;
-                return true;
-            }
-        }
-        false
+        self.jump_col(self.find_on_line(doc, ch, true))
     }
 
     /// Find previous occurrence of `ch` on the current line before the cursor.
     pub fn find_char_backward(&mut self, doc: &Document, ch: char) -> bool {
-        if self.col == 0 {
-            return false;
-        }
-        let text = doc.line_text(self.line);
-        let chars: Vec<char> = text.chars().collect();
-        for i in (0..self.col).rev() {
-            if chars[i] == ch {
-                self.col = i;
-                self.desired_col = None;
-                return true;
-            }
-        }
-        false
+        self.jump_col(self.find_on_line(doc, ch, false))
     }
 
     /// Move forward to the position just before the next occurrence of `ch`
     /// on the current line. No movement if the immediately-next char is `ch`.
     pub fn till_char_forward(&mut self, doc: &Document, ch: char) -> bool {
-        let text = doc.line_text(self.line);
-        let chars: Vec<char> = text.chars().collect();
-        let start = self.col + 1;
-        for (offset, &c) in chars.iter().enumerate().skip(start) {
-            if c == '\n' {
-                break;
-            }
-            if c == ch {
-                self.col = offset.saturating_sub(1);
-                self.desired_col = None;
-                return true;
-            }
-        }
-        false
+        self.jump_col(self.find_on_line(doc, ch, true).map(|c| c.saturating_sub(1)))
     }
 
     /// Move backward to the position just after the previous occurrence of
     /// `ch` on the current line.
     pub fn till_char_backward(&mut self, doc: &Document, ch: char) -> bool {
-        if self.col == 0 {
-            return false;
-        }
-        let text = doc.line_text(self.line);
-        let chars: Vec<char> = text.chars().collect();
-        for i in (0..self.col).rev() {
-            if chars[i] == ch {
-                self.col = i + 1;
+        self.jump_col(self.find_on_line(doc, ch, false).map(|c| c + 1))
+    }
+
+    fn jump_col(&mut self, col: Option<usize>) -> bool {
+        match col {
+            Some(c) => {
+                self.col = c;
                 self.desired_col = None;
-                return true;
+                true
             }
+            None => false,
         }
-        false
     }
 
     pub fn jump_top(&mut self) {
@@ -318,8 +289,35 @@ impl Default for CursorPos {
     }
 }
 
-fn is_word_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
+/// B15: the one character classification every word motion (`w` / `b` / `e`)
+/// uses — whitespace (incl. '\n'), word chars (alphanumeric + `_`), and
+/// everything else (punctuation runs are their own words, like vim).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CharClass {
+    Space,
+    Word,
+    Punct,
+}
+
+pub fn char_class(c: char) -> CharClass {
+    if c.is_whitespace() {
+        CharClass::Space
+    } else if c.is_alphanumeric() || c == '_' {
+        CharClass::Word
+    } else {
+        CharClass::Punct
+    }
+}
+
+/// B15: the one "furthest caret column" rule — Insert may rest one past the
+/// last char (at EOL); Normal sits ON the last char.
+fn max_col(doc: &Document, line: usize, insert_mode: bool) -> usize {
+    let line_len = doc.line_len_chars(line);
+    if insert_mode {
+        line_len
+    } else {
+        line_len.saturating_sub(1)
+    }
 }
 
 #[cfg(test)]
