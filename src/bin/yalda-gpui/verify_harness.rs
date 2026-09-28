@@ -30553,6 +30553,73 @@ fn diff_compose_typing_is_render_flat(cx: &mut TestAppContext) {
     );
 }
 
+/// E1 + E2 (text-editing review): the Diff body shares ONE comment-card
+/// snapshot (comments + their wrapped card lines) per `review_gen` — `j`/`k`
+/// (which re-render the body because `cursor` is in `DiffSeqs`) neither
+/// deep-clone the comments nor re-wrap any card body; a review mutation
+/// (editing the comment) rebuilds it and the card PAINTS the new text.
+/// NEGATIVE CONTROL (observed RED): build the snapshot unconditionally every
+/// render (drop the `review_gen` key check) → `comment_card_lines` runs on
+/// every j/k.
+#[gpui::test]
+fn diff_card_snapshot_is_shared_across_cursor_moves(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let (view, vcx, id) = boot_with_diff(cx, temp.path().to_path_buf());
+    diff_add_comment(vcx, "j j j", "first body");
+    // Settle a paint with the card on screen.
+    let p = paint_diff_probes(&view, vcx, id, &["diff-comment-c1"]);
+    assert!(p[0].is_some(), "card painted");
+
+    crate::card_lines_calls_reset();
+    crate::perf_reset("diff");
+    for k in ["j", "k", "j", "k", "j"] {
+        vcx.simulate_keystrokes(k);
+        vcx.run_until_parked();
+    }
+    let p = paint_diff_probes(&view, vcx, id, &["diff-comment-c1"]);
+    assert!(p[0].is_some(), "card still painted after cursor moves");
+    assert!(crate::perf_render_count("diff") >= 5, "j/k DO re-render the body (non-vacuous)");
+    assert_eq!(
+        crate::card_lines_calls(),
+        0,
+        "cursor moves must not re-wrap / re-snapshot comment cards"
+    );
+
+    // A review mutation (edit the comment) rebuilds the snapshot: the card
+    // shows the new body, not a stale cached one.
+    let card_row = diff_rows(&view, vcx, id)
+        .iter()
+        .position(|r| matches!(r, crate::RowRef::Comment { part: 0, .. }))
+        .expect("card row");
+    let cur = diff_cursor(&view, vcx, id);
+    let nav = if card_row > cur { vec!["j"; card_row - cur] } else { vec!["k"; cur - card_row] };
+    if !nav.is_empty() {
+        vcx.simulate_keystrokes(&nav.join(" "));
+    }
+    vcx.simulate_keystrokes("e");
+    vcx.run_until_parked();
+    diff_type(vcx, " edited");
+    vcx.simulate_keystrokes("ctrl-enter");
+    vcx.run_until_parked();
+    assert!(crate::card_lines_calls() > 0, "a review mutation rebuilds the card snapshot");
+    let body = view.read_with(vcx, |v, _| {
+        v.diff_tile_ref(id).unwrap().review.as_ref().unwrap().comments[0].body.clone()
+    });
+    assert_eq!(body, "first body edited");
+    let p = paint_diff_probes(&view, vcx, id, &["diff-comment-c1"]);
+    assert!(p[0].is_some(), "edited card painted");
+    let dv = view
+        .read_with(vcx, |v, _| v.diff_tile_ref(id).and_then(|t| t.view.clone()))
+        .expect("DiffView");
+    let painted = dv.read_with(vcx, |d, _| d.cached_card_line(0, 0));
+    assert_eq!(
+        painted,
+        Some(crate::CardLine::Body("first body edited".into())),
+        "the painted card row comes from a snapshot rebuilt at the new review_gen"
+    );
+}
+
 /// yux rule 2: the `V` selection (`DiffSeqs::range_anchor`) busts the cached
 /// body — the tint must repaint when the range starts and when it clears.
 #[gpui::test]

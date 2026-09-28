@@ -103,7 +103,30 @@ pub(crate) struct DiffView {
     /// reveal — the reveal runs only when one moves, so a wheel-scroll isn't
     /// undone by an unrelated re-render.
     revealed: Option<(usize, u64, u64)>,
+    /// The comment-card snapshot shared by every row closure, keyed on the
+    /// `review_gen` it was built at (E1/E2): `j`/`k` re-render the body
+    /// (`cursor` is in `DiffSeqs`) but reuse this `Rc` — no deep clone of the
+    /// review's comments, no re-wrap of any card body. Rebuilt only when
+    /// `review_gen` moves (every review mutation bumps it).
+    cards: Option<(u64, Rc<CommentCards>)>,
     perf_label: &'static str,
+}
+
+/// The review's comments plus each one's wrapped card rows
+/// ([`comment_card_lines`]), computed once per `review_gen` (see
+/// `DiffView::cards`). Indexed like `Review::comments` / `RowRef::Comment`.
+#[derive(Default)]
+pub(crate) struct CommentCards {
+    comments: Vec<ReviewComment>,
+    lines: Vec<Vec<CardLine>>,
+}
+
+impl CommentCards {
+    fn build(review: Option<&Review>) -> Self {
+        let comments = review.map(|r| r.comments.clone()).unwrap_or_default();
+        let lines = comments.iter().map(comment_card_lines).collect();
+        CommentCards { comments, lines }
+    }
 }
 
 impl DiffView {
@@ -134,12 +157,33 @@ impl DiffView {
             scroll: ScrollHandle::new(),
             list: ScrollAnchoredList::new(gpui::ListAlignment::Top, px(DIFF_ROW_BASE_H * 20.0)),
             revealed: None,
+            cards: None,
             perf_label: "diff",
         }
     }
 
     pub(crate) fn perf_label(&self) -> &'static str {
         self.perf_label
+    }
+
+    /// The shared card snapshot for `tile`'s current `review_gen`, rebuilt
+    /// only when the generation moved (see [`DiffView::cards`]).
+    fn cards_for(&mut self, tile: &DiffTile) -> Rc<CommentCards> {
+        match &self.cards {
+            Some((g, c)) if *g == tile.review_gen => c.clone(),
+            _ => {
+                let c = Rc::new(CommentCards::build(tile.review.as_ref()));
+                self.cards = Some((tile.review_gen, c.clone()));
+                c
+            }
+        }
+    }
+
+    /// Test seam: row `part` of comment `ci`'s card in the CACHED snapshot —
+    /// exactly what the row closure paints.
+    #[cfg(test)]
+    pub(crate) fn cached_card_line(&self, ci: usize, part: usize) -> Option<CardLine> {
+        self.cards.as_ref()?.1.lines.get(ci)?.get(part).cloned()
     }
 
     /// Keep the cursor row fully inside the list viewport with minimal
@@ -276,7 +320,7 @@ impl Render for DiffView {
                     let fi = model.files.iter().position(|f| f.path == c.anchor.path)?;
                     Some((fi, c.anchor.side, c.anchor.lines))
                 }),
-                comments: Rc::new(t.review.as_ref().map(|r| r.comments.clone()).unwrap_or_default()),
+                cards: self.cards_for(t),
                 now: chrono::Utc::now(),
             };
             let compose = (t.compose_gen, t.compose.is_some());
@@ -936,7 +980,7 @@ fn diff_line_row(
 struct RowMarks {
     selection: Option<(usize, usize)>,
     anchor: Option<(usize, CommentSide, [usize; 2])>,
-    comments: Rc<Vec<ReviewComment>>,
+    cards: Rc<CommentCards>,
     now: chrono::DateTime<chrono::Utc>,
 }
 
@@ -967,11 +1011,16 @@ impl RowMarks {
 /// <time>` / `outdated`) · the first body line; later rows = the rest of
 /// [`comment_card_lines`] (an outdated card ends with its snippet, dimmed).
 fn diff_comment_row(marks: &RowMarks, ci: usize, part: u8, parts: u8, rs: &DiffRowStyle) -> AnyElement {
-    let Some(c) = marks.comments.get(ci) else {
+    let Some(c) = marks.cards.comments.get(ci) else {
         return div().into_any_element();
     };
-    let lines = comment_card_lines(c);
-    let line = lines.get(part as usize).cloned().unwrap_or(CardLine::More);
+    let line = marks
+        .cards
+        .lines
+        .get(ci)
+        .and_then(|l| l.get(part as usize))
+        .cloned()
+        .unwrap_or(CardLine::More);
     let (first, last) = (part == 0, part + 1 >= parts);
     let border = if c.outdated { rs.remove } else { rs.accent };
     let radius = px(5.0);
