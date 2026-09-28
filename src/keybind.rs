@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::keys::{Key, KeyPress, Modifiers};
@@ -120,6 +120,20 @@ pub enum Action {
     None,
 }
 
+/// Outcome of [`KeySequenceMatcher::feed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Feed {
+    /// A bound sequence (single key or complete multi-key) matched.
+    Matched(Vec<KeyPress>),
+    /// Still a prefix of some multi-key sequence — wait for more keys.
+    Pending,
+    /// B17: a multi-key prefix was broken by the last key. Holds every key of
+    /// the abandoned sequence (≥ 2, the breaking key last).
+    Broken(Vec<KeyPress>),
+    /// A single unbound key.
+    Unbound,
+}
+
 pub struct KeySequenceMatcher {
     pending: Vec<KeyPress>,
     pending_since: Option<Instant>,
@@ -139,14 +153,13 @@ impl KeySequenceMatcher {
         }
     }
 
-    /// Feed a key press. Returns Some(matched_sequence) if a match was found,
-    /// None if still accumulating or no match.
+    /// Feed a key press. See [`Feed`] for the outcomes.
     pub fn feed<V>(
         &mut self,
         press: KeyPress,
         single: &HashMap<KeyPress, V>,
         multi: &HashMap<Vec<KeyPress>, V>,
-    ) -> Option<Vec<KeyPress>> {
+    ) -> Feed {
         // Check timeout, clear if expired
         if let Some(since) = self.pending_since
             && since.elapsed() > MULTI_KEY_TIMEOUT
@@ -155,33 +168,35 @@ impl KeySequenceMatcher {
             self.pending_since = None;
         }
 
-        self.pending.push(press.clone());
+        self.pending.push(press);
         self.pending_since = Some(Instant::now());
 
         // Check multi-key match
         if multi.contains_key(&self.pending) {
-            let matched = self.pending.clone();
-            self.pending.clear();
             self.pending_since = None;
-            return Some(matched);
+            return Feed::Matched(std::mem::take(&mut self.pending));
         }
 
         // Check if prefix of any multi-key sequence
         let is_prefix = multi
             .keys()
             .any(|seq| seq.len() > self.pending.len() && seq.starts_with(&self.pending));
-
         if is_prefix {
-            return Option::None;
+            return Feed::Pending;
         }
 
-        // No multi-key match or prefix — check single
-        self.pending.clear();
+        // No multi-key match or prefix.
         self.pending_since = None;
-        if single.contains_key(&press) {
-            Some(vec![press])
+        let keys = std::mem::take(&mut self.pending);
+        if keys.len() > 1 {
+            // B17: a started sequence that can no longer complete. The caller
+            // resolves `keys[0]` on its own and re-feeds the rest (the old code
+            // dropped every key but the last).
+            Feed::Broken(keys)
+        } else if single.contains_key(&keys[0]) {
+            Feed::Matched(keys)
         } else {
-            Option::None
+            Feed::Unbound
         }
     }
 
@@ -204,6 +219,14 @@ pub struct KeybindManager {
     /// Read-and-cleared by [`take_count`](Self::take_count) once an action
     /// resolves.
     pending_count: Option<usize>,
+    /// B17: actions resolved but not yet handed out, each with its count. One
+    /// keystroke can resolve two (a broken prefix's own single binding, then
+    /// the re-fed key); `process_key` returns the first and the caller drains
+    /// the rest via [`next_queued_action`](Self::next_queued_action).
+    queued: VecDeque<(String, Option<usize>)>,
+    /// Count of the action most recently handed out (`Some(count)`), read by
+    /// [`take_count`](Self::take_count). `None` = no action handed out since.
+    resolved_count: Option<Option<usize>>,
 }
 
 impl KeybindManager {
@@ -213,14 +236,37 @@ impl KeybindManager {
             multi,
             matcher: KeySequenceMatcher::new(),
             pending_count: None,
+            queued: VecDeque::new(),
+            resolved_count: None,
         }
     }
 
+    /// Feed one keystroke; returns the first action it resolved, if any.
+    /// B17: a keystroke that breaks a multi-key prefix can resolve more than
+    /// one action — drain the rest with [`next_queued_action`](Self::next_queued_action).
     pub fn process_key(&mut self, press: KeyPress) -> Option<String> {
+        self.resolved_count = None;
+        self.feed_key(press);
+        self.next_queued_action()
+    }
+
+    /// B17: the next action resolved by the last `process_key` beyond the one
+    /// it returned (a broken prefix re-feeds its remaining keys). Sets the
+    /// count [`take_count`](Self::take_count) reports.
+    pub fn next_queued_action(&mut self) -> Option<String> {
+        let (name, count) = self.queued.pop_front()?;
+        self.resolved_count = Some(count);
+        Some(name)
+    }
+
+    fn feed_key(&mut self, press: KeyPress) {
         // Count-prefix accumulation: a bare digit extends the pending count.
         // `0` only counts as a digit once a count is already in progress —
         // a leading `0` stays bound to `move-line-start` (vim semantics).
-        if press.modifiers.is_empty()
+        // B17: while a multi-key prefix is pending the digit is a KEY (it
+        // breaks the prefix), not more count.
+        if !self.matcher.has_pending()
+            && press.modifiers.is_empty()
             && let Key::Char(c) = press.key
             && let Some(d) = c.to_digit(10)
             && !(d == 0 && self.pending_count.is_none())
@@ -228,30 +274,58 @@ impl KeybindManager {
             let acc = self.pending_count.unwrap_or(0);
             // Saturate rather than overflow on absurd counts.
             self.pending_count = Some(acc.saturating_mul(10).saturating_add(d as usize));
-            return None;
+            return;
         }
 
-        let matched = self.matcher.feed(press, &self.single, &self.multi);
-        let matched = match matched {
-            Some(m) => m,
-            None => return None,
-        };
-        if matched.len() == 1 {
-            self.single.get(&matched[0]).cloned()
-        } else {
-            self.multi.get(&matched).cloned()
+        match self.matcher.feed(press, &self.single, &self.multi) {
+            Feed::Matched(seq) => {
+                let name = if seq.len() == 1 {
+                    self.single.get(&seq[0]).cloned()
+                } else {
+                    self.multi.get(&seq).cloned()
+                };
+                if let Some(name) = name {
+                    let count = self.pending_count.take();
+                    self.queued.push_back((name, count));
+                }
+            }
+            Feed::Pending => {}
+            Feed::Unbound => {}
+            Feed::Broken(keys) => {
+                // B17: the abandoned prefix's first key resolves on its own
+                // (with the count typed before it); an unbound first key is an
+                // aborted command and discards that count. Then every later key
+                // is re-fed from scratch — digits start a fresh count.
+                match self.single.get(&keys[0]).cloned() {
+                    Some(name) => {
+                        let count = self.pending_count.take();
+                        self.queued.push_back((name, count));
+                    }
+                    None => self.pending_count = None,
+                }
+                for k in keys.into_iter().skip(1) {
+                    self.feed_key(k);
+                }
+            }
         }
     }
 
-    /// Take the accumulated numeric count prefix, clearing it. Returns `None`
-    /// if no digits were typed before the resolved action.
+    /// Take the numeric count prefix of the action just handed out, clearing
+    /// it. With no action handed out since (a caller intercepting a key
+    /// before `process_key`, e.g. the agent tile's `[N]r`), takes the count
+    /// still accumulating. `None` if no digits were typed.
     pub fn take_count(&mut self) -> Option<usize> {
-        self.pending_count.take()
+        match self.resolved_count.take() {
+            Some(count) => count,
+            None => self.pending_count.take(),
+        }
     }
 
     pub fn reset_pending(&mut self) {
         self.matcher.reset();
         self.pending_count = None;
+        self.queued.clear();
+        self.resolved_count = None;
     }
 
     pub fn has_pending(&self) -> bool {

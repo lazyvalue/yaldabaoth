@@ -653,13 +653,42 @@ impl YaldaGpuiView {
             return NormalOutcome::Skipped;
         }
 
-        let action_name = match keybinds.process_key(press) {
-            Some(name) => name,
-            None => return NormalOutcome::Skipped,
+        let Some(mut action_name) = keybinds.process_key(press) else {
+            return NormalOutcome::Skipped;
         };
-        // Numeric count prefix typed ahead of this action (e.g. `42` in
-        // `42G`). Taken-and-cleared here; arms that don't use it ignore it.
-        let count = keybinds.take_count();
+        // B17: a key that breaks a multi-key prefix can resolve two actions
+        // (the prefix key's own binding, then the re-fed key). Run them in
+        // order; an outcome the caller must act on (paste, quit, menu, yank)
+        // ends the run and drops the rest.
+        let mut result = NormalOutcome::Skipped;
+        loop {
+            let count = keybinds.take_count();
+            match Self::run_normal_action(editor, mode, action_name, count, register) {
+                NormalOutcome::Skipped => {}
+                NormalOutcome::Handled => result = NormalOutcome::Handled,
+                other => {
+                    while keybinds.next_queued_action().is_some() {
+                        keybinds.take_count();
+                    }
+                    return other;
+                }
+            }
+            match keybinds.next_queued_action() {
+                Some(next) => action_name = next,
+                None => return result,
+            }
+        }
+    }
+
+    /// Run one resolved Normal-mode action (`action_name`, with the numeric
+    /// count prefix typed ahead of it, e.g. `42` in `42G`).
+    fn run_normal_action<E: EditOps>(
+        editor: &mut E,
+        mode: &mut EditMode,
+        action_name: String,
+        count: Option<usize>,
+        register: &mut Option<String>,
+    ) -> NormalOutcome {
         // Repeat count for motions: `10j` moves ten lines, `3w` three words.
         // Capped so a pathological `999999999j` can't spin. pre_move runs once
         // (it collapses/extends the selection); only the inner step repeats.

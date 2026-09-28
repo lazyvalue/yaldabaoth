@@ -15672,6 +15672,44 @@ fn count_prefix_repeats_normal_motion(cx: &mut TestAppContext) {
     assert_eq!(line, 10, "`10j` moves the caret ten lines down");
 }
 
+/// B17 (text-editing review, graph ls2 node q1-engine): when a key breaks a
+/// multi-key prefix whose first key ALSO has its own single binding, both
+/// actions run — the prefix key's binding, then the breaking key. Here `]`
+/// (prefix of `]]`) is bound to `move-down`, so `] j` moves two lines. Drives
+/// the REAL `handle_edit_key` → `dispatch_normal_core` path. NEGATIVE CONTROL
+/// (observed RED): drop the `next_queued_action` drain in
+/// `dispatch_normal_core` → the caret moves one line.
+#[gpui::test]
+fn broken_prefix_runs_prefix_binding_then_breaking_key(cx: &mut TestAppContext) {
+    use crate::EditOps;
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let fh = cx.focus_handle();
+        fh.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            fh,
+        )
+    });
+    vcx.run_until_parked();
+    let text = (0..10).map(|i| format!("line {i}\n")).collect::<String>();
+    view.update(vcx, |v, _| v.test_open_edit(&text));
+    view.update(vcx, |v, _| {
+        let e = v.edit_mut().unwrap();
+        e.mode = crate::EditMode::Normal;
+        e.editor.cursor_set(0, 0);
+        e.keybinds.apply_bindings(&[(
+            vec![yalda::keys::KeyPress::new(yalda::keys::Key::Char(']'), yalda::keys::Modifiers::NONE)],
+            "move-down".into(),
+        )]);
+    });
+    for k in ["]", "j"] {
+        view.update_in(vcx, |v, w, cx| v.handle_edit_key(&ws_bare_key(k), w, cx));
+    }
+    let line = view.update(vcx, |v, _| v.edit_mut().unwrap().editor.cursor().line);
+    assert_eq!(line, 2, "`]` (its own binding) then `j`: two lines down");
+}
+
 /// C6 (text-editing review): a counted `delete-char` (`5x` under a vim-style
 /// config binding `x` → `delete-char`) is ONE range delete — one undo step
 /// restores all five chars — and yanks the WHOLE deleted text to the GPUI
