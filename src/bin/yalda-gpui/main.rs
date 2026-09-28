@@ -2077,8 +2077,10 @@ struct YaldaGpuiView {
     transcript_views: HashMap<SessionId, Entity<TranscriptView>>,
     /// Installation-wide Cog Topic address catalog for Agent compose
     /// autocomplete (UXI-AgentTile-43). Refreshed off the paint thread for every
-    /// newly opened percent query and shared by every Agent session.
-    topic_completions: Vec<CogTopicBinding>,
+    /// newly opened percent query and shared by every Agent session. An `Rc`
+    /// slice so the compose key path shares it per keystroke instead of deep-
+    /// cloning the catalog (D8).
+    topic_completions: std::rc::Rc<[CogTopicBinding]>,
     topic_completions_generation: u64,
     /// Scroll state for the root-level jump panel (jump-panel;
     /// spec-jump-panel.md). The panel itself is rendered inline (it's cheap —
@@ -2225,7 +2227,7 @@ impl YaldaGpuiView {
             sessions: AgentSessions::new(),
             agent_roster: AgentRoster::default(),
             transcript_views: HashMap::new(),
-            topic_completions: Vec::new(),
+            topic_completions: std::rc::Rc::from([]),
             topic_completions_generation: 0,
             jump_panel_scroll: ScrollHandle::new(),
             jump_panel_visible: true,
@@ -2298,7 +2300,7 @@ impl YaldaGpuiView {
             sessions: AgentSessions::new(),
             agent_roster: AgentRoster::default(),
             transcript_views: HashMap::new(),
-            topic_completions: Vec::new(),
+            topic_completions: std::rc::Rc::from([]),
             topic_completions_generation: 0,
             jump_panel_scroll: ScrollHandle::new(),
             jump_panel_visible: true,
@@ -3119,7 +3121,7 @@ impl YaldaGpuiView {
         if let Some(tile) = self.agent_tile_mut() {
             tile.bind(id);
         }
-        crate::clear_log(&format!("show_local_session: new_id={id:?} bound to tile"));
+        crate::clear_log!("show_local_session: new_id={id:?} bound to tile");
         id
     }
 
@@ -5654,7 +5656,7 @@ impl YaldaGpuiView {
                         // leaders are suppressed. Pinned by
                         // `real_midturn_worksheet_empty_draft_space_opens_menu` /
                         // `real_midturn_worksheet_typed_draft_space_is_suppressed`.
-                        let draft_empty = c.input_surface.compose().text().trim().is_empty();
+                        let draft_empty = c.input_surface.compose().is_blank();
                         // Focused compose in Insert is text entry — EXCEPT an empty
                         // WORKSHEET block: a fresh/cleared worksheet rests focused +
                         // Insert (so typing lands immediately, no `i`), but while its

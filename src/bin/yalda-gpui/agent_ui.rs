@@ -838,13 +838,13 @@ impl YaldaGpuiView {
                             // state (settle is idempotent + stale-safe). `scx.notify()`
                             // repaints the (possibly freshly-created) TranscriptView.
                             session.state.settle_input_focus();
-                            crate::clear_log(&format!(
+                            crate::clear_log!(
                                 "apply_open_agent_resolution Created: settled id={id:?} \
                                  focus_compose={} you_block_open={} awaiting={}",
                                 session.state.focus == AgentFocus::Compose,
                                 session.state.you_block_open,
                                 session.state.turn_phase.is_awaiting(),
-                            ));
+                            );
                             scx.notify();
                         });
                     }
@@ -1879,7 +1879,7 @@ impl YaldaGpuiView {
             // (UXI-AgentTile-22 rule 1 still governs that case): typing after a draft
             // would not trim to exactly `yes` and would silently cancel, and clearing
             // it to make room would destroy the user's work.
-            if claude.input_surface.compose().text().trim().is_empty() {
+            if claude.input_surface.compose().is_blank() {
                 if claude.input_surface.is_chatbox() {
                     claude.input_surface.compose_mut().mode = EditMode::Insert;
                     claude.focus = AgentFocus::Compose;
@@ -3107,7 +3107,7 @@ impl YaldaGpuiView {
                         // flight until that retry succeeds.
                         slot.state.turn_phase = TurnPhase::Idle;
                         if let Some(cb) = slot.state.input_surface.chatbox_mut()
-                            && cb.text().trim().is_empty()
+                            && cb.is_blank()
                         {
                             let mut fresh = Compose::new();
                             for ch in text.chars() {
@@ -3941,10 +3941,10 @@ impl YaldaGpuiView {
         if let Some(tile) = self.agent_tile_mut() {
             tile.show_picker();
         }
-        crate::clear_log(&format!(
+        crate::clear_log!(
             "clear_agent_session: closed old_id={id:?} server_is_some={}",
             self.session_server.is_some()
-        ));
+        );
 
         // Re-create in place on the now-unbound focused tile, reusing the
         // snapshotted label + cwd and forcing the preserved permission mode.
@@ -4628,7 +4628,7 @@ impl YaldaGpuiView {
                     // A block exists only while IDLE (rule 7); mid-turn the draft is
                     // the chatbox. Reopen a block (at a fresh legal anchor) only when
                     // idle with a non-empty draft (bug-hunt 3). Otherwise rest in nav.
-                    let has_draft = !claude.input_surface.compose().text().trim().is_empty();
+                    let has_draft = !claude.input_surface.compose().is_blank();
                     let idle = !claude.turn_phase.is_awaiting();
                     if has_draft && idle {
                         claude.you_block_open = true;
@@ -4668,7 +4668,7 @@ impl YaldaGpuiView {
                     // discarded (no phantom); a non-empty one persists (rule 4).
                     claude.mode = EditMode::Normal;
                     if !claude.input_surface.is_chatbox()
-                        && claude.input_surface.compose().text().trim().is_empty()
+                        && claude.input_surface.compose().is_blank()
                     {
                         claude.close_you_block();
                     }
@@ -5933,7 +5933,7 @@ impl YaldaGpuiView {
     /// runs on GPUI's background executor and carries a generation fence so a
     /// slower prior response can never overwrite a newer query's result.
     pub(crate) fn refresh_topic_completion_catalog(&mut self, cx: &mut Context<Self>) {
-        self.topic_completions.clear();
+        self.topic_completions = std::rc::Rc::from([]);
         self.topic_completions_generation = self.topic_completions_generation.wrapping_add(1);
         let generation = self.topic_completions_generation;
         if cfg!(test) {
@@ -5951,7 +5951,7 @@ impl YaldaGpuiView {
                     return;
                 }
                 if let Ok(bindings) = result {
-                    this.topic_completions = bindings;
+                    this.topic_completions = bindings.into();
                 }
                 cx.notify();
             });
@@ -6293,7 +6293,7 @@ impl YaldaGpuiView {
                     c.input_surface.compose_mut().mode = EditMode::Normal;
                 } else {
                     // 2nd Esc: leave the block to navigation.
-                    if c.input_surface.compose().text().trim().is_empty() {
+                    if c.input_surface.compose().is_blank() {
                         c.input_surface = InputSurface::new(InputModeKind::Worksheet);
                         c.you_block_open = false;
                         c.you_block_anchor = None;
@@ -6356,7 +6356,8 @@ impl YaldaGpuiView {
         // in place. `compose_mut()` is total, so there is no per-placement branch.
         // (Compose has its own scroll/list_state, so no `pending_reveal_cursor`
         // transcript-reveal is needed for typing.)
-        let topic_catalog = self.topic_completions.clone();
+        // D8: an `Rc` share, not a deep clone of the catalog per keystroke.
+        let topic_catalog = std::rc::Rc::clone(&self.topic_completions);
         let Some(outcome) = self.with_session_silent(focused_id, cx, |claude| {
             claude.status = None;
 
@@ -6459,7 +6460,9 @@ impl YaldaGpuiView {
             // (the recalled text then becomes the working line; a later Up
             // re-stashes it).
             let browsing = claude.history_nav.is_some();
-            let text_before = claude.input_surface.compose().text();
+            // D7: detect an edit by the draft's edit generation, not by copying
+            // the whole draft before and after (equal seq ⇒ identical text).
+            let seq_before = claude.input_surface.compose().edit_seq();
             let cb = claude.input_surface.compose_mut();
             let outcome = match cb.mode {
                 EditMode::Insert => {
@@ -6473,8 +6476,7 @@ impl YaldaGpuiView {
                     press,
                 ),
             };
-            let text_after = claude.input_surface.compose().text();
-            let edited = text_after != text_before;
+            let edited = claude.input_surface.compose().edit_seq() != seq_before;
             if browsing && (edited || claude.input_surface.compose().mode != EditMode::Insert) {
                 claude.history_reset();
             }
@@ -6519,14 +6521,16 @@ impl YaldaGpuiView {
         // focused session id being EDITED, whether a TranscriptView is observing
         // THAT id (a mismatch ⇒ keystroke edits one session, the displayed
         // transcript observes another), and the compose length.
-        {
+        // D9: gated BEFORE building the args — the compose-length count copies
+        // the whole draft and the id list walks every transcript view.
+        if crate::clear_log_enabled() {
             let g = self.agent_read(cx, |c| {
                 (
                     c.you_block_open,
                     c.turn_phase.is_awaiting(),
                     c.input_surface.is_chatbox(),
                     c.focus,
-                    c.input_surface.compose().text().chars().count(),
+                    c.input_surface.compose().editor.document().rope().len_chars(),
                 )
             });
             let tv_exists = self.transcript_views.contains_key(&focused_id);

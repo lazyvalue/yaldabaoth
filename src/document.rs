@@ -281,6 +281,14 @@ impl Document {
         self.rope.len_chars() == 0
     }
 
+    /// True if the document holds only whitespace (or nothing) — the same
+    /// answer as `full_text().trim().is_empty()` without copying the rope.
+    /// Walks chunks and stops at the first non-whitespace one, so a typical
+    /// non-blank draft answers after its first chunk.
+    pub fn is_blank(&self) -> bool {
+        self.rope.chunks().all(|chunk| chunk.trim().is_empty())
+    }
+
     pub fn is_modified(&self) -> bool {
         self.modified
     }
@@ -677,6 +685,27 @@ mod tests {
 
     fn doc(text: &str) -> Document {
         Document::from_text(text.to_string(), PathBuf::from("test.md"))
+    }
+
+    /// D7: `is_blank` must agree with `full_text().trim().is_empty()` for every
+    /// shape, including a whitespace run long enough to span many rope chunks.
+    #[test]
+    fn is_blank_matches_trimmed_full_text() {
+        let long_ws = " \n\t".repeat(4000);
+        let long_ws_then_x = format!("{long_ws}x");
+        for text in ["", " ", "\n\n", " \t\n ", "a", "  a  ", "\u{00a0}", "\u{2003}b"]
+            .into_iter()
+            .map(str::to_string)
+            .chain([long_ws, long_ws_then_x])
+        {
+            let d = doc(&text);
+            assert_eq!(
+                d.is_blank(),
+                d.full_text().trim().is_empty(),
+                "is_blank disagrees for {:?}",
+                text.chars().take(20).collect::<String>()
+            );
+        }
     }
 
     /// Finding #4: the undo record for a single-char insert into a large

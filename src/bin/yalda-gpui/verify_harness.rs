@@ -18645,6 +18645,47 @@ fn slash_popup_filters_navigates_and_accepts(cx: &mut TestAppContext) {
     assert!(rows(&view, vcx).is_empty(), "popup closes after accept");
 }
 
+/// D7 (text-editing review): `handle_claude_key` detects "this keystroke edited
+/// the draft" by the compose's edit generation instead of copying the draft
+/// before + after. Pins the behavior that detection drives: after an Esc-dismiss,
+/// a caret-only key keeps the popup dismissed, while a real edit un-dismisses
+/// and re-filters it (UXI-AgentTile-42). Drives the REAL `handle_claude_key`.
+///
+/// Negative control: force `edited = false` → the edit no longer un-dismisses →
+/// the final assert fails RED.
+#[gpui::test]
+fn slash_popup_undismisses_only_on_a_real_edit(cx: &mut TestAppContext) {
+    use crate::agent::{AgentFocus, InputSurface};
+
+    let (view, vcx, id, _s) = boot_with_transcript(cx);
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| {
+            c.input_surface = InputSurface::with_draft(crate::InputModeKind::Chatbox, "");
+            c.focus = AgentFocus::Compose;
+        });
+    });
+    let key = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext, k: &str| {
+        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(k), w, cx));
+    };
+    let open = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.read_with(vcx, |v, cx| {
+            v.read_session(id, cx, |c| !c.slash_popup_rows().is_empty())
+                .unwrap()
+        })
+    };
+
+    key(&view, vcx, "/");
+    key(&view, vcx, "c");
+    assert!(open(&view, vcx), "`/c` opens the popup");
+    key(&view, vcx, "escape");
+    assert!(!open(&view, vcx), "Esc dismisses it");
+    key(&view, vcx, "left");
+    assert!(!open(&view, vcx), "a caret-only key is not an edit — stays dismissed");
+    key(&view, vcx, "right");
+    key(&view, vcx, "l");
+    assert!(open(&view, vcx), "a real edit un-dismisses and re-filters (`/cl`)");
+}
+
 /// UXI-AgentTile-42 (n3b, PAINT): the slash popup paints ABOVE the compose box when
 /// the draft is a bare slash token, and is absent when it isn't. Layout probe.
 ///
@@ -18735,7 +18776,7 @@ fn topic_popup_message_box_navigates_and_accepts_without_submit(cx: &mut TestApp
     use crate::agent::{AgentFocus, InputSurface};
     let (view, vcx, id, _s) = boot_with_transcript(cx);
     view.update(vcx, |v, cx| {
-        v.topic_completions = test_topic_bindings();
+        v.topic_completions = test_topic_bindings().into();
         v.with_session(id, cx, |c| {
             c.sent_history = vec!["old message".into()];
             c.input_surface =
@@ -18819,7 +18860,7 @@ fn topic_popup_worksheet_accepts_and_paints(cx: &mut TestAppContext) {
     use crate::agent::{AgentFocus, InputSurface};
     let (view, vcx, id, _s) = boot_with_transcript(cx);
     view.update(vcx, |v, cx| {
-        v.topic_completions = test_topic_bindings();
+        v.topic_completions = test_topic_bindings().into();
         v.with_session(id, cx, |c| {
             c.input_surface =
                 InputSurface::with_draft(crate::InputModeKind::Worksheet, "route %projects/cog/m");
@@ -18861,7 +18902,7 @@ fn topic_popup_percent_opening_refreshes_stale_catalog(cx: &mut TestAppContext) 
     use crate::agent::{AgentFocus, InputSurface};
     let (view, vcx, id, _s) = boot_with_transcript(cx);
     view.update(vcx, |v, cx| {
-        v.topic_completions = test_topic_bindings();
+        v.topic_completions = test_topic_bindings().into();
         v.with_session(id, cx, |c| {
             c.input_surface = InputSurface::with_draft(crate::InputModeKind::Chatbox, "");
             c.focus = AgentFocus::Compose;
@@ -18878,7 +18919,7 @@ fn topic_popup_percent_opening_refreshes_stale_catalog(cx: &mut TestAppContext) 
     );
 
     key(&view, vcx, "backspace");
-    view.update(vcx, |v, _cx| v.topic_completions = test_topic_bindings());
+    view.update(vcx, |v, _cx| v.topic_completions = test_topic_bindings().into());
     key(&view, vcx, "%");
     assert!(
         view.read_with(vcx, |v, _cx| v.topic_completions.is_empty()),

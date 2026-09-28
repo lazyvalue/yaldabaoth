@@ -1388,14 +1388,23 @@ impl YaldaGpuiView {
         // `main_col`, so it works in BOTH placements — the inline worksheet
         // You-block (focus==Compose) and the bottom box (show_compose) — but never
         // during read-only transcript navigation.
-        let slash_rows = c.slash_popup_rows();
+        // D10: check the visibility gate FIRST so a tile in transcript nav (or
+        // any tile whose popups can't show) never computes/clones popup rows.
+        let popup_gate = c.focus == AgentFocus::Compose || show_compose;
+        let slash_rows = if popup_gate {
+            c.slash_popup_rows()
+        } else {
+            Vec::new()
+        };
         let slash_sel = c.slash_popup_sel.min(slash_rows.len().saturating_sub(1));
-        let show_slash_popup =
-            !slash_rows.is_empty() && (c.focus == AgentFocus::Compose || show_compose);
-        let topic_rows = c.topic_popup_rows(&self.topic_completions);
+        let show_slash_popup = !slash_rows.is_empty();
+        let topic_rows = if popup_gate {
+            c.topic_popup_rows(&self.topic_completions)
+        } else {
+            Vec::new()
+        };
         let topic_sel = c.topic_popup_sel.min(topic_rows.len().saturating_sub(1));
-        let show_topic_popup =
-            !topic_rows.is_empty() && (c.focus == AgentFocus::Compose || show_compose);
+        let show_topic_popup = !topic_rows.is_empty();
         let compose_panel = if !show_compose {
             None
         } else {
