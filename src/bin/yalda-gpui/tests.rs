@@ -706,11 +706,13 @@ fn preferences_round_trip_with_text_scale() {
             "Yaldabaoth\u{1f}workspace-1".into(),
         ]),
         jump_tile_order: Some(vec![30, 10, 20]),
+        code_font: Some("Iosevka".into()),
     };
     let json = serde_json::to_string(&prefs).unwrap();
     let back: Preferences = serde_json::from_str(&json).unwrap();
     assert_eq!(back.theme.as_deref(), Some("dracula"));
     assert_eq!(back.text_scale, Some(1.21));
+    assert_eq!(back.code_font.as_deref(), Some("Iosevka"));
     assert_eq!(back.window_width_px, Some(1110.0));
     assert_eq!(back.window_height_px, Some(770.0));
     assert_eq!(back.jump_panel_visible, Some(false));
@@ -6606,4 +6608,73 @@ fn topic_query_refreshes_once_per_opening() {
         s.begin_topic_query_refresh(),
         "a later percent query starts a fresh catalog request",
     );
+}
+
+// ── choose_code_font (graph kfa node iv6o) ───────────────────────────────────
+
+/// With no user preference and multiple candidates installed, the fallback
+/// chain always prefers JetBrains Mono first (Scott's pick on Linux/niri,
+/// where neither macOS-only name exists).
+///
+/// Negative control: swap the chain order in `choose_code_font` so "SF Mono"
+/// is checked before "JetBrains Mono" — this fails (`"SF Mono" != "JetBrains
+/// Mono"`), observed RED, then restored.
+#[test]
+fn choose_code_font_prefers_jetbrains_mono_first() {
+    let available: Vec<String> = ["Noto Mono", "SF Mono", "JetBrains Mono", "Ubuntu Mono"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(choose_code_font(&available, None).as_ref(), "JetBrains Mono");
+}
+
+/// An installed user preference wins over the fallback chain entirely, even
+/// when it isn't in the chain at all (an arbitrary installed font name).
+#[test]
+fn choose_code_font_honors_installed_preferred_override() {
+    let available: Vec<String> = ["JetBrains Mono", "Iosevka Term"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(
+        choose_code_font(&available, Some("Iosevka Term")).as_ref(),
+        "Iosevka Term",
+        "an installed preference overrides the chain even outside it"
+    );
+}
+
+/// An uninstalled preference is ignored — it falls through to the normal
+/// fallback chain rather than being honored blindly (which would silently
+/// hand GPUI an unregistered name and collapse to a proportional face).
+#[test]
+fn choose_code_font_ignores_uninstalled_preferred() {
+    let available: Vec<String> = ["DejaVu Sans Mono", "Ubuntu Mono"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(
+        choose_code_font(&available, Some("Comic Sans MS")).as_ref(),
+        "DejaVu Sans Mono",
+        "an uninstalled preference must not be returned verbatim"
+    );
+}
+
+/// With no preference and only a late-chain candidate installed, the chooser
+/// walks the whole chain rather than stopping at the first (uninstalled)
+/// entry.
+#[test]
+fn choose_code_font_falls_through_the_chain() {
+    let available: Vec<String> = vec!["DejaVu Sans Mono".to_string()];
+    assert_eq!(choose_code_font(&available, None).as_ref(), "DejaVu Sans Mono");
+}
+
+/// Total fallback: nothing in the chain is installed ⇒ the generic
+/// "monospace" family name (which every platform text system resolves to
+/// *some* monospace face), never a silently-proportional unregistered name.
+#[test]
+fn choose_code_font_falls_back_to_generic_monospace() {
+    let available: Vec<String> = vec!["Comic Sans MS".to_string(), "Papyrus".to_string()];
+    assert_eq!(choose_code_font(&available, None).as_ref(), "monospace");
+    // Also total when nothing at all is registered.
+    assert_eq!(choose_code_font(&[], None).as_ref(), "monospace");
 }
