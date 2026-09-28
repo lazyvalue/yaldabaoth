@@ -29,7 +29,7 @@ Primary code homes:
   `*_PATH_OVERRIDE` test seam.
 - **`diff.rs`** — `DiffTile` (worktree, picker, model, review, cursor, range,
   collapse, compose, send picker, file-text cache `FileTexts`, context
-  `Expansions`) + pure nav helpers + gap geometry (`file_gaps`,
+  `Expansions`, syntax-span cache `Highlights` + `highlight_file`) + pure nav helpers + gap geometry (`file_gaps`,
   `apply_expand`) + `zed_open_arg`.
 - **`diff_view.rs`** — the yux cached child `DiffView` (picker, header, file rows,
   diff lines, inline comment cards, hint footer); self-notifies on `DiffSeqs`.
@@ -140,7 +140,8 @@ path.
 
 **Status.** `implemented` — the body is a cached child whose `DiffSeqs` covers
 `model_gen`, `rows_gen`, `cursor`, `review_gen`, `range_anchor`, `compose_gen`
-(open/close only), refreshing/error, picker, zoom (context expands and file-text
+(open/close only), refreshing/error, picker, zoom, theme, `hl_gen` (a syntax
+highlight pass landing — UXI-Diff-19) (context expands and file-text
 loads rebuild rows ⇒ `rows_gen`); rows are virtualized
 (O(visible)). The inline comment compose is painted by the root OVER its slot
 rows (`yux::list_rows_overlay`), outside the cached body, so typing in it
@@ -149,7 +150,8 @@ count (a slot-row rebuild, `rows_gen`) re-renders the body.
 
 **Enforcement.** `verify_harness.rs::{diff_view_unrelated_root_notify_is_render_flat,
 diff_view_v_and_j_rerender_the_cached_body, diff_view_v_range_rerenders_the_cached_body,
-diff_compose_typing_is_render_flat, diff_expand_rerenders_body_and_unrelated_notify_is_flat}`.
+diff_compose_typing_is_render_flat, diff_expand_rerenders_body_and_unrelated_notify_is_flat,
+diff_hl_landing_rerenders_body_and_unrelated_notify_is_flat}`.
 
 ### UXI-Diff-13 — Refresh on focus and `r`; cursor survives
 
@@ -327,6 +329,45 @@ renderer reading a revealed line's text by its old number (painted "line 62"
 under new 64); `apply_expand` changing nothing (no revealed rows, 6 guards);
 the segment's mouse handler removed (click reveals nothing); expansions cleared
 on every derive (nothing revealed after `r`).
+
+### UXI-Diff-19 — Code is syntax-highlighted (Rust, TypeScript, Markdown)
+
+**Statement.** Diff code lines (added, removed, context, revealed) of a file
+whose language is known — at least Rust (`.rs`), TypeScript (`.ts`/`.mts`/
+`.cts`), TSX (`.tsx`) and Markdown (`.md`/`.markdown`) — paint with syntax
+token colors over the unchanged add/remove row tints (gutters, tints and the
+colored `+`/`−` sign stay; plain tokens take the editor fg). Highlighting is
+computed over each side's WHOLE file (new = worktree, old = merge-base), so
+multi-line constructs are right; removed lines use the old side, the rest the
+new side. It is computed off the paint path, once per (path, side,
+`file_hash`, theme); until it lands the line renders plain. Unknown extensions,
+and files over 20,000 lines / 2 MB / any 10,000-byte line, stay plain. A theme
+switch re-highlights under the new theme. Rows stay one fixed height and long
+lines still clip at the row width (nowrap, no wrap-induced height change).
+
+**Status.** `implemented` (graph kfa node syntax-highlight). TS/TSX come from
+the `two-face` crate's extra syntax set (bat's grammars, MIT/Apache-2.0) merged
+with syntect's defaults as a lazy process-global `SyntaxSet`
+(`yalda::highlight::syntax_set`, warmed on the background executor at startup
+and before the first diff highlight); the resolver is
+`yalda::highlight::syntax_for_path`. The transcript / editor highlighters share
+the same set (so fenced `ts` blocks now highlight too). Spans are applied only
+when the diff line equals the file's line (a mismatched read ⇒ plain). The
+actual on-screen colors are `NEEDS-RUNTIME` (gap 1: pixels/colors beyond
+layout bounds) — headless guards prove the spans reach the painted text leaf,
+not how they look.
+
+**Enforcement.** `verify_harness.rs::{diff_hl_rust_keyword_line_paints_colored_runs,
+diff_hl_ts_tsx_md_highlight_and_unknown_stays_plain, diff_hl_theme_switch_rehighlights,
+diff_hl_landing_rerenders_body_and_unrelated_notify_is_flat}` (tempdir fixture with
+`.rs`/`.ts`/`.tsx`/`.md`/`.xyz` changes; painted runs read through the
+`probe_styled_text` → `layout_probe_runs` seam); `highlight.rs::tests::{syntax_for_path_resolves_rust_ts_tsx_md,
+highlight_file_spans_carries_state_and_skips_default_fg}`. Negative controls
+observed RED (graph kfa): syntax set built from syntect defaults only (`a.ts` ⇒
+`None`); the row renderer painting the plain leaf (no colored runs, 3 guards);
+the Diff re-highlight walk removed from `set_theme` (row paints plain after the
+switch); `hl_gen` dropped from `DiffSeqs` (a landing leaves the body
+render count at 0).
 
 ### UXI-Diff-8 — Open in Zed; open an unbound Diff tile
 

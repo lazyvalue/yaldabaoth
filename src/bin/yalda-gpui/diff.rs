@@ -451,9 +451,13 @@ impl FileTexts {
         self.content(path, side)?.line(n)
     }
 
-    #[allow(dead_code)] // cache API (syntax-highlight node).
     pub(crate) fn is_loading(&self, path: &std::path::Path, side: CommentSide) -> bool {
         matches!(self.slots.get(&(path.to_path_buf(), side)), Some((_, TextSlot::Loading)))
+    }
+
+    /// The last read of `path`'s `side` failed.
+    pub(crate) fn is_failed(&self, path: &std::path::Path, side: CommentSide) -> bool {
+        matches!(self.slots.get(&(path.to_path_buf(), side)), Some((_, TextSlot::Failed)))
     }
 
     /// Start a load of `path`'s `side` at `hash`: `false` when one is already
@@ -517,6 +521,173 @@ impl FileTexts {
         });
     }
 
+}
+
+/// Syntax highlighting (spec B2b, UXI-Diff-19) is skipped — the file renders
+/// plain — above this many lines …
+pub(crate) const HL_MAX_LINES: u32 = 20_000;
+/// … or this many bytes …
+pub(crate) const HL_MAX_BYTES: usize = 2 * 1024 * 1024;
+/// … or when any one line is longer than this (minified bundles: syntect's
+/// per-line regex cost is superlinear there).
+pub(crate) const HL_MAX_LINE_BYTES: usize = 10_000;
+
+/// One highlighted token: a byte range of its line and its foreground.
+pub(crate) type HlSpan = (std::ops::Range<usize>, Hsla);
+
+/// One side of one file, highlighted as a WHOLE (spec B2b): per-line spans
+/// plus the content they were computed over, so a diff row whose text does
+/// not match the file line (a stale / mismatched read) renders plain instead
+/// of mis-colored.
+#[derive(Debug)]
+pub(crate) struct FileSpans {
+    pub(crate) content: Arc<FileContent>,
+    /// `lines[n - 1]` = line `n`'s non-default-colored spans.
+    pub(crate) lines: Vec<Vec<HlSpan>>,
+}
+
+impl FileSpans {
+    /// Line `n`'s (1-based) spans, iff the file's line `n` IS `text`.
+    pub(crate) fn line(&self, n: u32, text: &str) -> Option<&[HlSpan]> {
+        if self.content.line(n)? != text {
+            return None;
+        }
+        self.lines.get(n.checked_sub(1)? as usize).map(Vec::as_slice)
+    }
+}
+
+/// Highlight `content` as `path`'s language under the syntect theme `theme`
+/// (background executor only — this is the whole-file syntect pass). `None`
+/// ⇒ plain: unknown language, over a size cap, or a syntect failure.
+pub(crate) fn highlight_file(path: &std::path::Path, theme: &str, content: Arc<FileContent>) -> Option<FileSpans> {
+    let text = content.text();
+    if content.line_count() > HL_MAX_LINES
+        || text.len() > HL_MAX_BYTES
+        || text.split('\n').any(|l| l.len() > HL_MAX_LINE_BYTES)
+    {
+        return None;
+    }
+    let syntax = yalda::highlight::syntax_for_path(path)?;
+    let hl = yalda::highlight::Highlighter::with_syntect_theme(theme);
+    let lines = hl
+        .highlight_file_spans(syntax, text)?
+        .into_iter()
+        .map(|spans| spans.into_iter().map(|(r, c)| (r, nc(c))).collect())
+        .collect();
+    Some(FileSpans { content, lines })
+}
+
+/// A highlight cache slot's state.
+#[derive(Debug)]
+pub(crate) enum HlSlot {
+    /// The syntect pass is running on the background executor.
+    Pending,
+    Ready(Arc<FileSpans>),
+    /// Unknown language / over a cap / read failed ⇒ plain, don't retry.
+    Plain,
+}
+
+/// The Diff tile's syntax-highlight cache (spec B2b): `(path, side)` → the
+/// spans, stamped with the `file_hash` + syntect theme they were computed
+/// under — i.e. keyed by (path, side, file_hash, theme). A derive drops slots
+/// whose hash changed ([`invalidate`](Self::invalidate)); a theme switch
+/// drops everything ([`set_theme`](Self::set_theme)).
+#[derive(Debug, Default)]
+pub(crate) struct Highlights {
+    slots: HashMap<(PathBuf, CommentSide), (u64, HlSlot)>,
+    theme: &'static str,
+    merge_base: String,
+    /// A background `warm_syntax_set` for this tile is in flight.
+    pub(crate) warming: bool,
+}
+
+impl Highlights {
+    /// The ready spans of `path`'s `side`.
+    pub(crate) fn spans(&self, path: &std::path::Path, side: CommentSide) -> Option<&Arc<FileSpans>> {
+        match self.slots.get(&(path.to_path_buf(), side)) {
+            Some((_, HlSlot::Ready(s))) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// The syntect theme the cache is keyed on.
+    pub(crate) fn theme(&self) -> &'static str {
+        self.theme
+    }
+
+    /// Switch the keyed theme: `true` (and every slot dropped) when it moved.
+    pub(crate) fn set_theme(&mut self, theme: &'static str) -> bool {
+        if self.theme == theme {
+            return false;
+        }
+        self.theme = theme;
+        self.slots.clear();
+        true
+    }
+
+    /// Whether `path`'s `side` at `hash` still needs a highlight pass.
+    pub(crate) fn wants(&self, path: &std::path::Path, side: CommentSide, hash: u64) -> bool {
+        !matches!(self.slots.get(&(path.to_path_buf(), side)), Some((h, _)) if *h == hash)
+    }
+
+    /// Mark a pass as started (or resolved-plain without one).
+    pub(crate) fn begin(&mut self, path: &std::path::Path, side: CommentSide, hash: u64, slot: HlSlot) {
+        self.slots.insert((path.to_path_buf(), side), (hash, slot));
+    }
+
+    /// Land a pass: `false` (nothing stored) when stale — the slot was
+    /// invalidated / re-keyed, or the theme moved, meanwhile.
+    pub(crate) fn finish(
+        &mut self,
+        path: &std::path::Path,
+        side: CommentSide,
+        hash: u64,
+        theme: &str,
+        spans: Option<FileSpans>,
+    ) -> bool {
+        if theme != self.theme {
+            return false;
+        }
+        let key = (path.to_path_buf(), side);
+        match self.slots.get(&key) {
+            Some((h, HlSlot::Pending)) if *h == hash => {}
+            _ => return false,
+        }
+        let slot = spans.map_or(HlSlot::Plain, |s| HlSlot::Ready(Arc::new(s)));
+        self.slots.insert(key, (hash, slot));
+        true
+    }
+
+    /// Reconcile against a fresh derive: a moved merge-base (the old side's
+    /// text) drops everything; otherwise a slot survives only while its file
+    /// is still in the diff with the SAME `file_hash`.
+    pub(crate) fn invalidate(&mut self, model: &DiffModel) {
+        if self.merge_base != model.merge_base {
+            self.slots.clear();
+            self.merge_base = model.merge_base.clone();
+            return;
+        }
+        self.slots.retain(|(path, _), (hash, _)| {
+            model.files.iter().any(|f| &f.path == path && f.file_hash == *hash)
+        });
+    }
+}
+
+/// The sides of `f` that have text to highlight: new unless deleted, old
+/// unless added; nothing for a hunk-less (binary / mode-only) file or an
+/// unknown language.
+pub(crate) fn highlight_sides(f: &FileDiff) -> Vec<CommentSide> {
+    if f.hunks.is_empty() || yalda::highlight::syntax_for_path(&f.path).is_none() {
+        return Vec::new();
+    }
+    let mut sides = Vec::new();
+    if f.status != FileStatus::Deleted {
+        sides.push(CommentSide::New);
+    }
+    if f.status != FileStatus::Added {
+        sides.push(CommentSide::Old);
+    }
+    sides
 }
 
 /// Where a gap sits in its file (spec B2a).
@@ -1410,6 +1581,11 @@ pub(crate) struct DiffTile {
     /// The cursor's last vertical travel was downward (`j`, `}`, `]`) —
     /// picks the default side Enter expands a between-hunks gap from.
     pub(crate) moving_down: bool,
+    /// Syntax-highlight spans per (path, side) — spec B2b, [`Highlights`].
+    pub(crate) highlights: Highlights,
+    /// Bumped whenever a highlight pass lands (or the cache is dropped) —
+    /// `DiffView`'s fingerprint for the painted token colors.
+    pub(crate) hl_gen: u64,
 }
 
 /// What an expand request did (see [`DiffTile::expand_gap`]).
@@ -1558,6 +1734,8 @@ impl DiffTile {
             texts: FileTexts::default(),
             expansions: Expansions::default(),
             moving_down: true,
+            highlights: Highlights::default(),
+            hl_gen: 0,
         }
     }
 
@@ -1753,6 +1931,11 @@ impl DiffTile {
         self.folds = Folds::default();
         self.texts = FileTexts::default();
         self.expansions = Expansions::default();
+        self.highlights = Highlights {
+            theme: self.highlights.theme,
+            ..Highlights::default()
+        };
+        self.hl_gen = self.hl_gen.wrapping_add(1);
         self.cursor = 0;
         self.send_picker = None;
         self.rebuild_rows();

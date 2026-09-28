@@ -69,10 +69,16 @@ pub(crate) struct DiffSeqs {
     /// `text_scale.to_bits()` — global zoom input (UXI-TextZoom-1 pattern),
     /// falls out of the same root-observe fingerprint (see module docs).
     text_scale_bits: u32,
+    /// `DiffTile::hl_gen` — bumped when a syntax-highlight pass lands or the
+    /// span cache is dropped (spec B2b): the painted token colors.
+    hl_gen: u64,
+    /// The app theme — a global input like zoom, read off the same root: the
+    /// row tints/fg AND (via the re-highlight it triggers) the token colors.
+    theme: ThemeName,
 }
 
 impl DiffSeqs {
-    pub(crate) fn of(tile: &DiffTile, text_scale: f32) -> Self {
+    pub(crate) fn of(tile: &DiffTile, text_scale: f32, theme: ThemeName) -> Self {
         DiffSeqs {
             bound: tile.worktree.is_some(),
             model_gen: tile.model_gen,
@@ -85,6 +91,8 @@ impl DiffSeqs {
             has_error: tile.error.is_some(),
             picker_gen: tile.picker.gen_,
             text_scale_bits: text_scale.to_bits(),
+            hl_gen: tile.hl_gen,
+            theme,
         }
     }
 }
@@ -357,7 +365,7 @@ impl Render for DiffView {
             gutter_w: diff_gutter_w(scale),
         };
         let tile = r.diff_tile_ref(self.window_id);
-        self.last_rendered = tile.map(|t| DiffSeqs::of(t, scale)).unwrap_or_default();
+        self.last_rendered = tile.map(|t| DiffSeqs::of(t, scale, r.theme.name)).unwrap_or_default();
 
         // The bound, derived body: header + virtualized rows + footer.
         if let Some(t) = tile
@@ -390,6 +398,23 @@ impl Render for DiffView {
                     .filter_map(|(i, f)| Some((i, t.texts.content(&f.path, CommentSide::New)?.clone())))
                     .collect(),
             );
+            // Syntax-highlight spans (spec B2b) by (file index, side), ready
+            // ones computed under the CURRENT theme only — covered by
+            // `DiffSeqs::{hl_gen, theme}`.
+            let hl_current = t.highlights.theme() == r.theme.name.syntect_theme();
+            let spans: Rc<HashMap<(usize, CommentSide), Arc<FileSpans>>> = Rc::new(
+                model
+                    .files
+                    .iter()
+                    .enumerate()
+                    .filter(|_| hl_current)
+                    .flat_map(|(i, f)| {
+                        [CommentSide::New, CommentSide::Old]
+                            .into_iter()
+                            .filter_map(move |side| Some(((i, side), t.highlights.spans(&f.path, side)?.clone())))
+                    })
+                    .collect(),
+            );
             let body: AnyElement = if model.files.is_empty() {
                 diff_empty_body(&model, &st).into_any_element()
             } else {
@@ -405,6 +430,7 @@ impl Render for DiffView {
                 let render_fn = diff_row_renderer(
                     model,
                     ctx_texts,
+                    spans,
                     rows,
                     cursor,
                     marks,
@@ -808,6 +834,7 @@ fn diff_empty_body(model: &DiffModel, st: &DetailStyle) -> gpui::Div {
 fn diff_row_renderer(
     model: Rc<DiffModel>,
     ctx_texts: Rc<HashMap<usize, Arc<FileContent>>>,
+    spans: Rc<HashMap<(usize, CommentSide), Arc<FileSpans>>>,
     rows: Rc<Vec<RowRef>>,
     cursor: usize,
     marks: RowMarks,
@@ -873,11 +900,16 @@ fn diff_row_renderer(
                     Some(DiffLine::Context(t)) => (" ", t.as_str(), rs.fg, None),
                     None => (" ", "", rs.fg, None),
                 };
-                (diff_line_row(ix, old, new, sign, text, color, &rs), bg)
+                // A removed line is colored from the OLD side's spans (by its
+                // old number); added + context lines from the NEW side.
+                let (side, n) = if sign == "−" { (CommentSide::Old, old) } else { (CommentSide::New, new) };
+                let hl = n.and_then(|n| spans.get(&(file, side))?.line(n, text));
+                (diff_line_row(ix, old, new, sign, text, color, hl, &rs), bg)
             }
             RowRef::Ctx { file, old, new } => {
                 let text = ctx_texts.get(&file).and_then(|c| c.line(new)).unwrap_or("");
-                (diff_line_row(ix, Some(old), Some(new), " ", text, rs.fg, &rs), None)
+                let hl = spans.get(&(file, CommentSide::New)).and_then(|s| s.line(new, text));
+                (diff_line_row(ix, Some(old), Some(new), " ", text, rs.fg, hl, &rs), None)
             }
             RowRef::Expander {
                 gap,
@@ -1060,6 +1092,13 @@ fn diff_hunk_row(header: String, rs: &DiffRowStyle) -> AnyElement {
 /// `+`/`−` sign, then the text (no wrap — every row is one fixed height).
 /// The gutters and text are `probe_text` leaves (`diff-row-<ix>-old` /
 /// `-new` / `-text`) so a test reads the SHAPED numbers and code.
+///
+/// `hl` = the line's syntax spans (spec B2b): when present the code paints
+/// in the editor fg with each span's color over it (the add/remove tint +
+/// the colored sign still mark the change); absent ⇒ the plain look (the
+/// whole line in the add/remove color). A styled leaf keeps the same
+/// nowrap + clip, so a long line still truncates at the row width.
+#[allow(clippy::too_many_arguments)]
 fn diff_line_row(
     ix: usize,
     old: Option<u32>,
@@ -1067,6 +1106,7 @@ fn diff_line_row(
     sign: &'static str,
     text: &str,
     color: Hsla,
+    hl: Option<&[HlSpan]>,
     rs: &DiffRowStyle,
 ) -> AnyElement {
     let gutter = |n: Option<u32>, side: &'static str| {
@@ -1105,8 +1145,15 @@ fn diff_line_row(
                 .min_w_0()
                 .overflow_hidden()
                 .whitespace_nowrap()
-                .text_color(if sign == " " { rs.fg } else { color })
-                .child(probe_text(|| format!("diff-row-{ix}-text"), SharedString::from(text.to_string()))),
+                .text_color(if sign == " " || hl.is_some() { rs.fg } else { color })
+                .child(match hl {
+                    Some(spans) => probe_styled_text(
+                        || format!("diff-row-{ix}-text"),
+                        SharedString::from(text.to_string()),
+                        spans.to_vec(),
+                    ),
+                    None => probe_text(|| format!("diff-row-{ix}-text"), SharedString::from(text.to_string())),
+                }),
         )
         .into_any_element()
 }
