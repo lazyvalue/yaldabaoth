@@ -193,6 +193,47 @@ pub(crate) async fn collect_raw_diff(
     })
 }
 
+/// The full text of one side of a changed file (spec B2a — the context
+/// expander's source, and the syntax highlighter's): the NEW side is the
+/// working-tree file on disk (`<worktree>/<rel_path>`); the OLD side is
+/// `git show <merge_base>:<rel_path>` (for a rename, pass the FROM path).
+/// Blocking — run on the background executor. Non-UTF-8 bytes are replaced
+/// (lossy), never an error; a missing file / failed `git show` is a value.
+pub(crate) fn read_file_side(
+    worktree: &Path,
+    merge_base: &str,
+    rel_path: &Path,
+    old_side: bool,
+) -> Result<String, GitDiffError> {
+    if !old_side {
+        let abs = worktree.join(rel_path);
+        return std::fs::read(&abs)
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .map_err(|e| GitDiffError::Spawn {
+                command: format!("read {}", abs.display()),
+                reason: e.to_string(),
+            });
+    }
+    let spec = format!("{merge_base}:{}", rel_path.display());
+    let label = format!("git show {spec}");
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["show", &spec])
+        .output()
+        .map_err(|e| GitDiffError::Spawn {
+            command: label.clone(),
+            reason: e.to_string(),
+        })?;
+    if !out.status.success() {
+        return Err(GitDiffError::CommandFailed {
+            command: label,
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// One entry of `git worktree list --porcelain` (spec rev 2 B1 — the rows of
 /// the unbound Diff tile's worktree picker).
 #[derive(Debug, Clone, PartialEq, Eq)]

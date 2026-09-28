@@ -35,6 +35,8 @@
 
 use super::*;
 
+use std::sync::Arc;
+
 /// The slice-version watermark the observe filter compares across renders.
 /// Mirrors `TranscriptSeqs` / the `RootSnapshot` fingerprint idea, but over
 /// `DiffTile` fields read off the root. Cheap: every field is a `Copy` read
@@ -295,6 +297,9 @@ struct DiffRowStyle {
     /// outdated one `card_outdated_border`.
     card_border: Hsla,
     card_outdated_border: Hsla,
+    /// Context expander row tint (subdued) + its segment hover.
+    expander_bg: Hsla,
+    expander_hover_bg: Hsla,
     prose: SharedString,
     mono: SharedString,
     text: Pixels,
@@ -342,6 +347,8 @@ impl Render for DiffView {
             card_header_bg: editor_bg.blend(tint(selected_bg, 0.65)),
             card_border: editor_bg.blend(tint(st.dim, 0.55)),
             card_outdated_border: editor_bg.blend(tint(nc(at.diff_remove), 0.60)),
+            expander_bg: tint(nc(at.diff_header), 0.08),
+            expander_hover_bg: tint(nc(at.diff_header), 0.20),
             prose: st.prose.clone(),
             mono: st.mono.clone(),
             text: px(13.0 * scale),
@@ -372,6 +379,17 @@ impl Render for DiffView {
                 now: chrono::Utc::now(),
             };
             let (compose_gen, compose_span) = (t.compose_gen, t.compose_slot_span());
+            // Revealed context lines' text (spec B2a): the loaded new-side
+            // contents, by file index. Loads rebuild rows (`rows_gen`), so
+            // this snapshot is covered by `DiffSeqs`.
+            let ctx_texts: Rc<HashMap<usize, Arc<FileContent>>> = Rc::new(
+                model
+                    .files
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, f)| Some((i, t.texts.content(&f.path, CommentSide::New)?.clone())))
+                    .collect(),
+            );
             let body: AnyElement = if model.files.is_empty() {
                 diff_empty_body(&model, &st).into_any_element()
             } else {
@@ -386,6 +404,7 @@ impl Render for DiffView {
                 );
                 let render_fn = diff_row_renderer(
                     model,
+                    ctx_texts,
                     rows,
                     cursor,
                     marks,
@@ -448,8 +467,8 @@ impl Render for DiffView {
 }
 
 /// The bound body's always-visible key hints (spec C6 idiot-proof).
-pub(crate) const DIFF_KEY_HINTS: &str = "j/k line · {/} hunk · [/] file · v viewed · z fold · c comment · V range · \
-     e edit · x delete · s send · r refresh · o zed · space menu";
+pub(crate) const DIFF_KEY_HINTS: &str = "j/k line · {/} hunk · [/] file · enter/+ expand · v viewed · z fold · \
+     c comment · V range · e edit · x delete · s send · r refresh · o zed · space menu";
 
 /// The header's unsent-comment count label (spec B2; shown only when > 0).
 pub(crate) fn diff_unsent_label(unsent: usize) -> String {
@@ -785,8 +804,10 @@ fn diff_empty_body(model: &DiffModel, st: &DetailStyle) -> gpui::Div {
 /// same fixed height (module docs); the cursor row gets the left accent bar +
 /// a tint. Clicks carry only the row INDEX and resolve it through the root at
 /// event time (yux rule 4).
+#[allow(clippy::too_many_arguments)]
 fn diff_row_renderer(
     model: Rc<DiffModel>,
+    ctx_texts: Rc<HashMap<usize, Arc<FileContent>>>,
     rows: Rc<Vec<RowRef>>,
     cursor: usize,
     marks: RowMarks,
@@ -852,8 +873,22 @@ fn diff_row_renderer(
                     Some(DiffLine::Context(t)) => (" ", t.as_str(), rs.fg, None),
                     None => (" ", "", rs.fg, None),
                 };
-                (diff_line_row(old, new, sign, text, color, &rs), bg)
+                (diff_line_row(ix, old, new, sign, text, color, &rs), bg)
             }
+            RowRef::Ctx { file, old, new } => {
+                let text = ctx_texts.get(&file).and_then(|c| c.line(new)).unwrap_or("");
+                (diff_line_row(ix, Some(old), Some(new), " ", text, rs.fg, &rs), None)
+            }
+            RowRef::Expander {
+                gap,
+                hidden,
+                kind,
+                loading,
+                ..
+            } => (
+                diff_expander_row(ix, gap, hidden, kind, loading, &rs, root.clone(), wid),
+                Some(rs.expander_bg),
+            ),
         };
         let bg = if marked { Some(rs.sel_bg) } else { bg };
         let transparent: Hsla = rgba(0x00000000).into();
@@ -1023,7 +1058,10 @@ fn diff_hunk_row(header: String, rs: &DiffRowStyle) -> AnyElement {
 
 /// One diff line: old / new line-number gutters (dimmed, fixed width), the
 /// `+`/`−` sign, then the text (no wrap — every row is one fixed height).
+/// The gutters and text are `probe_text` leaves (`diff-row-<ix>-old` /
+/// `-new` / `-text`) so a test reads the SHAPED numbers and code.
 fn diff_line_row(
+    ix: usize,
     old: Option<u32>,
     new: Option<u32>,
     sign: &'static str,
@@ -1031,7 +1069,7 @@ fn diff_line_row(
     color: Hsla,
     rs: &DiffRowStyle,
 ) -> AnyElement {
-    let gutter = |n: Option<u32>| {
+    let gutter = |n: Option<u32>, side: &'static str| {
         div()
             .flex_none()
             .w(rs.gutter_w)
@@ -1039,7 +1077,10 @@ fn diff_line_row(
             .text_right()
             .text_size(rs.small)
             .text_color(rs.dim.opacity(0.7))
-            .child(SharedString::from(n.map(|n| n.to_string()).unwrap_or_default()))
+            .child(probe_text(
+                || format!("diff-row-{ix}-{side}"),
+                SharedString::from(n.map(|n| n.to_string()).unwrap_or_default()),
+            ))
     };
     div()
         .flex()
@@ -1048,8 +1089,8 @@ fn diff_line_row(
         .size_full()
         .font_family(rs.mono.clone())
         .text_size(rs.text)
-        .child(gutter(old))
-        .child(gutter(new))
+        .child(gutter(old, "old"))
+        .child(gutter(new, "new"))
         .child(
             div()
                 .flex_none()
@@ -1065,9 +1106,101 @@ fn diff_line_row(
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .text_color(if sign == " " { rs.fg } else { color })
-                .child(SharedString::from(text.to_string())),
+                .child(probe_text(|| format!("diff-row-{ix}-text"), SharedString::from(text.to_string()))),
         )
         .into_any_element()
+}
+
+/// "↑ 20 more lines" / "↓ 20 more lines" / "Show all 37 hidden lines" —
+/// an expander's clickable segments (spec B2a): top gap ↑ + all; between
+/// ↓ ↑ + all; bottom ↓ (+ all once the count is known); fewer than
+/// [`EXPAND_ALL_UNDER`] hidden ⇒ just "Show all". Pure.
+pub(crate) fn expander_segments(kind: GapKind, hidden: Option<u32>) -> Vec<(ExpandDir, String)> {
+    let all = |h: u32| {
+        let s = if h == 1 { "" } else { "s" };
+        (ExpandDir::All, format!("Show all {h} hidden line{s}"))
+    };
+    let step = |dir: ExpandDir| {
+        let arrow = if dir == ExpandDir::Up { "↑" } else { "↓" };
+        (dir, format!("{arrow} {EXPAND_STEP} more lines"))
+    };
+    match (kind, hidden) {
+        (_, Some(h)) if h < EXPAND_ALL_UNDER => vec![all(h)],
+        (GapKind::Top, Some(h)) => vec![step(ExpandDir::Up), all(h)],
+        (GapKind::Between, Some(h)) => vec![step(ExpandDir::Down), step(ExpandDir::Up), all(h)],
+        (GapKind::Bottom, Some(h)) => vec![step(ExpandDir::Down), all(h)],
+        (_, None) => vec![step(ExpandDir::Down)],
+    }
+}
+
+/// A context expander row (spec B2a, UXI-Diff-18): slim, full width, a
+/// subdued tint (set by the caller), a dotted gutter, then its segments —
+/// each one clickable (the handler carries only the row index + direction,
+/// resolved at event time via `diff_click_expander`, yux rule 4). While the
+/// file's text loads it reads "Loading…". Probes: `diff-expander-<ix>-<dir>`
+/// (segment box) and `diff-expander-text-<ix>-<dir>` (shaped label).
+#[allow(clippy::too_many_arguments)]
+fn diff_expander_row(
+    ix: usize,
+    gap: u32,
+    hidden: Option<u32>,
+    kind: GapKind,
+    loading: bool,
+    rs: &DiffRowStyle,
+    root: WeakEntity<YaldaGpuiView>,
+    wid: workspace::WindowId,
+) -> AnyElement {
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(14.0))
+        .size_full()
+        .overflow_hidden()
+        .font_family(rs.mono.clone())
+        .text_size(rs.small)
+        .text_color(rs.header)
+        .child(
+            div()
+                .flex_none()
+                .w(rs.gutter_w * 2.0 + px(16.0))
+                .text_center()
+                .text_color(rs.dim)
+                .child(SharedString::from("⋯")),
+        );
+    if loading {
+        return row
+            .child(div().text_color(rs.dim).child(SharedString::from("Loading…")))
+            .into_any_element();
+    }
+    let probing = layout_probe_active();
+    for (dir, label) in expander_segments(kind, hidden) {
+        let click_root = root.clone();
+        let seg = div()
+            .id(SharedString::from(format!("diff-expander-{gap}-{}", dir.slug())))
+            .flex_none()
+            .px(px(6.0))
+            .rounded(px(3.0))
+            .cursor_pointer()
+            .hover(|s| s.bg(rs.expander_hover_bg))
+            .child(probe_text(
+                || format!("diff-expander-text-{ix}-{}", dir.slug()),
+                SharedString::from(label),
+            ))
+            .on_mouse_down(MouseButton::Left, move |_ev, _w, cx| {
+                cx.stop_propagation();
+                if let Some(r) = click_root.upgrade() {
+                    r.update(cx, |r, cx| r.diff_click_expander(wid, ix, dir, cx));
+                }
+            })
+            .into_any_element();
+        row = row.child(if probing {
+            probe_bounds_dyn(format!("diff-expander-{ix}-{}", dir.slug()), seg)
+        } else {
+            seg
+        });
+    }
+    row.into_any_element()
 }
 
 /// Per-render row decorations beyond the cursor (snapshotted into the
@@ -1084,9 +1217,10 @@ struct RowMarks {
 impl RowMarks {
     /// A `Line` row inside the `V` selection or the compose's anchor span.
     fn is_marked(&self, ix: usize, row: RowRef) -> bool {
-        let RowRef::Line { file, old, new, .. } = row else {
+        let Some((old, new)) = row.line_numbers() else {
             return false;
         };
+        let file = row.file();
         if self.selection.is_some_and(|(lo, hi)| (lo..=hi).contains(&ix)) {
             return true;
         }
