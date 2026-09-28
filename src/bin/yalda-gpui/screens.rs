@@ -525,12 +525,12 @@ impl YaldaGpuiView {
     /// with the incremental highlight cache this makes a keystroke O(changed),
     /// not O(document).
     pub(crate) fn build_edit_body_code(&self, e: &mut EditState) -> impl IntoElement {
-        let cursor = e.editor.cursor();
+        // C4: caret + selection in DISPLAY columns (rows are tab-expanded).
+        let (cursor, sel) = e.editor.display_caret_and_selection();
         let cursor_line = cursor.line;
         let cursor_col = cursor.col;
         let cursor_color: Hsla = rgb(CURSOR_BAR_COLOR).into();
         let dim_fg: Hsla = rgb(0x6272a4).into();
-        let sel = e.editor.selection_range();
         let mode = e.mode;
         let edit_seq = e.editor.edit_seq();
 
@@ -638,11 +638,11 @@ impl YaldaGpuiView {
     /// modifiers, which `font_for` maps to FontWeight/FontStyle on render.
     /// No gutter — word processors don't show line numbers.
     pub(crate) fn build_edit_body_wp(&self, e: &mut EditState) -> impl IntoElement {
-        let cursor = e.editor.cursor();
+        // C4: caret + selection in DISPLAY columns (rows are tab-expanded).
+        let (cursor, sel) = e.editor.display_caret_and_selection();
         let cursor_line = cursor.line;
         let cursor_col = cursor.col;
         let cursor_color: Hsla = rgb(CURSOR_BAR_COLOR).into();
-        let sel = e.editor.selection_range();
         let mode = e.mode;
         let edit_seq = e.editor.edit_seq();
 
@@ -731,7 +731,10 @@ impl YaldaGpuiView {
                 DEFAULT_FG,
                 line_font,
                 &code_font,
-                None,
+                // C5: the selection bg painted onto `segs` above must be
+                // excluded from the inline-code font proxy, or selected prose
+                // reflows into the monospace code font.
+                sel.map(|_| selection_bg),
                 None,
                 line_idx,
                 None,
@@ -1425,11 +1428,17 @@ impl YaldaGpuiView {
             let line_h = 18.0f32;
             let max_visible_h = COMPOSE_MAX_VISIBLE_LINES as f32 * line_h;
 
-            let line_count = tb.editor.document().line_count().max(1);
             let compose_cursor_line = tb.editor.cursor().line;
-            let compose_cursor_col = tb.editor.cursor().col;
+            // C4: caret + selection in DISPLAY columns — the rows (and their
+            // word-wrap) are tab-expanded, the editor's columns are raw.
+            let compose_cursor_col = display_col(
+                tb.editor.document(),
+                compose_cursor_line,
+                tb.editor.cursor().col,
+            );
             let compose_mode = tb.mode;
-            let compose_sel = tb.editor.selection_range();
+            let compose_sel =
+                display_selection(tb.editor.document(), tb.editor.selection_range());
             let sep_color: Hsla = nc(at.compose_separator);
             let compose_cursor_color: Hsla = nc(at.cursor);
             // Worksheet accent = teal (the app accent), used for the left `›`
@@ -1477,20 +1486,11 @@ impl YaldaGpuiView {
             // virtualized decision is on TOTAL VISUAL rows so one long wrapped
             // line can't overflow the un-scrolled small box and hide the caret
             // (UXI-TextEditing-1).
-            let compose_lines: std::rc::Rc<Vec<String>> = {
-                let doc = tb.editor.document();
-                std::rc::Rc::new(
-                    (0..line_count)
-                        .map(|i| {
-                            doc.line_text(i).trim_end_matches('\n').replace('\t', "    ")
-                        })
-                        .collect(),
-                )
-            };
-            let visual_rows_total: usize = compose_lines
-                .iter()
-                .map(|l| wrap_line_cols(&l.chars().collect::<Vec<_>>(), visible_cols).len())
-                .sum();
+            // D6: cached on (edit_seq, visible_cols) — an idle frame reuses the
+            // same `Rc` (list reconcile's ptr_eq fast path) and wraps nothing.
+            let compose_snap = tb.render_snapshot(visible_cols);
+            let compose_lines: std::rc::Rc<Vec<String>> = compose_snap.lines.clone();
+            let visual_rows_total: usize = compose_snap.total_rows;
 
             let compose_body: AnyElement = if visual_rows_total <= COMPOSE_MAX_VISIBLE_LINES {
                 // ── Small draft: render every (wrapped) line directly. Total
@@ -1574,8 +1574,11 @@ impl YaldaGpuiView {
                 // Anchored on the prior window (`tb.window`) so the box only moves
                 // when the caret would leave it; never read back from the list's
                 // own anchor (mis-fires on freshly-spliced unmeasured rows).
-                let (caret_vrow, total_vrows, per_line) = compose_visual_metrics(
+                let per_line = compose_snap.per_line_rows.clone();
+                let total_vrows = compose_snap.total_rows;
+                let caret_vrow = compose_caret_visual_row(
                     &lines_snap,
+                    &per_line,
                     compose_cursor_line,
                     compose_cursor_col,
                     visible_cols,

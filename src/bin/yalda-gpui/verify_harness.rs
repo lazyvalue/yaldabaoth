@@ -31361,3 +31361,332 @@ fn paste_into_compose_in_insert_pastes_at_caret(cx: &mut TestAppContext) {
     view.update(vcx, |v, cx| v.paste_into_compose(cx));
     assert_eq!(compose_text_and_col(&view, vcx, id), ("helXYlo".into(), 5));
 }
+
+
+/// Measure the PAINTED caret x of an Edit view (`view_kind`) showing `text`
+/// with the caret at RAW `(0, col)`. Drives the real render path (highlight
+/// snapshot → build_edit_body_* → build_wrapped_line → make_caret).
+fn edit_caret_painted_x(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+    text: &str,
+    col: usize,
+    view_kind: crate::EditView,
+) -> f32 {
+    view.update(vcx, |v, _| {
+        v.test_open_edit(text);
+        let e = v.edit_mut().expect("edit view");
+        e.view = view_kind;
+        e.editor.set_cursor(0, col);
+    });
+    view.update(vcx, |v, cx| v.set_text_scale(1.0, cx));
+    for _ in 0..3 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let caret = crate::layout_probe_get("caret");
+    crate::layout_probe_end();
+    caret.expect("the edit caret must paint").0
+}
+
+/// C4 (text-editing review): tabs are expanded to 4 spaces for display, but the
+/// editor's caret column is RAW (a tab = 1 column). The caret on `f` of
+/// `"\tfoo"` (raw col 1) must paint exactly where the caret on `f` of
+/// `"    foo"` (col 4) paints — in BOTH the Code and WP Edit views. Asserted on
+/// PAINTED geometry (layout probe on `make_caret`).
+///
+/// Negative control (observed RED): feed the raw `e.editor.cursor()` column to
+/// `build_wrapped_line` (drop `display_caret_and_selection`) → the tab caret
+/// paints 3 columns left of the space caret.
+#[gpui::test]
+fn edit_caret_after_tab_paints_at_expanded_column(cx: &mut TestAppContext) {
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let fh = cx.focus_handle();
+        fh.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            fh,
+        )
+    });
+    vcx.run_until_parked();
+    for kind in [crate::EditView::Code, crate::EditView::WordProcessor] {
+        let spaces_x = edit_caret_painted_x(&view, vcx, "    foo\n", 4, kind);
+        let tab_x = edit_caret_painted_x(&view, vcx, "\tfoo\n", 1, kind);
+        let start_x = edit_caret_painted_x(&view, vcx, "    foo\n", 0, kind);
+        assert!(
+            spaces_x - start_x > 8.0,
+            "non-vacuous: col 4 must paint right of col 0 ({kind:?}: {start_x} vs {spaces_x})"
+        );
+        assert!(
+            (tab_x - spaces_x).abs() < 0.5,
+            "{kind:?}: caret after a TAB painted at x={tab_x}, but the same display \
+             column after 4 spaces paints at x={spaces_x} — raw/display column drift"
+        );
+    }
+}
+
+/// C4 in the agent compose (chatbox box): the caret after a TAB paints at the
+/// expanded column. Negative control (observed RED): pass the raw
+/// `tb.editor.cursor().col` as `compose_cursor_col` in `render_agent`.
+#[gpui::test]
+fn compose_caret_after_tab_paints_at_expanded_column(cx: &mut TestAppContext) {
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
+    let mut measure = |text: &str, col: usize| -> f32 {
+        view.update(vcx, |v, cx| {
+            let mut c = v.agent_mut(cx).expect("agent");
+            let tb = c.input_surface.compose_mut();
+            *tb = crate::Compose::seeded(text);
+            tb.editor.cursor_mut().line = 0;
+            tb.editor.cursor_mut().col = col;
+        });
+        for _ in 0..3 {
+            view.update(vcx, |_, cx| cx.notify());
+            vcx.run_until_parked();
+        }
+        crate::layout_probe_begin();
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+        let caret = crate::layout_probe_get("caret");
+        crate::layout_probe_end();
+        caret.expect("compose caret must paint").0
+    };
+    let start_x = measure("    foo", 0);
+    let spaces_x = measure("    foo", 4);
+    let tab_x = measure("\tfoo", 1);
+    assert!(spaces_x - start_x > 8.0, "non-vacuous: {start_x} vs {spaces_x}");
+    assert!(
+        (tab_x - spaces_x).abs() < 0.5,
+        "compose caret after a TAB painted at x={tab_x}; after 4 spaces x={spaces_x}"
+    );
+}
+
+/// C5 (text-editing review): the WP Edit view paints selected prose with the
+/// selection bg; `styled_line_element` must not mistake that bg for the
+/// inline-code proxy and reflow the selection into the monospace code font.
+/// Drives the real WP render (build_edit_body_wp → build_wrapped_line →
+/// styled_line_element) and reads the font actually chosen for each run.
+///
+/// Negative control (observed RED): pass `None` as `selection_bg` to
+/// `build_wrapped_line` in `build_edit_body_wp` (the pre-C5 code) → the
+/// selected "hello" run is laid out in the code font.
+#[gpui::test]
+fn wp_selected_prose_stays_in_body_font(cx: &mut TestAppContext) {
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let fh = cx.focus_handle();
+        fh.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            fh,
+        )
+    });
+    vcx.run_until_parked();
+    let (body, code) = view.update(vcx, |v, _| {
+        v.test_open_edit("plain hello world\nsecond line\n");
+        let e = v.edit_mut().expect("edit view");
+        e.view = crate::EditView::WordProcessor;
+        e.mode = crate::EditMode::Normal;
+        // Select "hello": anchor at (0,6), caret at (0,11).
+        e.editor.set_cursor(0, 6);
+        e.editor.view.anchor_at_cursor();
+        e.editor.set_cursor(0, 11);
+        (v.body_font.clone(), v.code_font.clone())
+    });
+    assert_ne!(body, code, "non-vacuous: body and code fonts differ");
+    for _ in 0..2 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+    crate::font_run_tap_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let runs = crate::font_run_tap_end();
+    let selected: Vec<_> = runs.iter().filter(|(t, _)| t.contains("hello")).collect();
+    assert!(!selected.is_empty(), "the selected run must render: {runs:?}");
+    for (t, fam) in selected {
+        assert_eq!(
+            fam, &body,
+            "selected WP prose {t:?} reflowed into font {fam:?} (code font {code:?})"
+        );
+    }
+}
+
+/// D2 (text-editing review): a FROZEN transcript line renders markdown-STRIPPED
+/// segments, but the transcript caret column is RAW. The caret on `t` of
+/// `"[bold](x) tail"` (raw col 10) must paint where the caret on `t` of the
+/// already-plain `"bold tail"` (col 5) paints — asserted on PAINTED geometry.
+///
+/// Negative control (observed RED): drop the raw→stripped `raw_cols` mapping of
+/// `cursor_col` in `build_wrapped_line` → the caret lands 5 columns right (at
+/// EOL of the stripped text).
+#[gpui::test]
+fn frozen_line_caret_maps_raw_col_through_stripped_markdown(cx: &mut TestAppContext) {
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+    install_agent_slot(&view, vcx, None);
+    view.update(vcx, |v, cx| {
+        v.splash_until = None;
+        let id = v.agent_tile().unwrap().session().unwrap();
+        let session = v.session_entity(id).unwrap();
+        session.update(cx, |session, cx| {
+            session
+                .state
+                .editor
+                .programmatic_insert(0, "[bold](x) tail\nbold tail\n");
+            session.state.editor.add_frozen_lines(0, 2);
+            session.state.focus = crate::AgentFocus::Transcript;
+            session.state.mode = crate::EditMode::Normal;
+            cx.notify();
+        });
+        cx.notify();
+    });
+    let session = view
+        .update(vcx, |v, _| {
+            let id = v.agent_tile().unwrap().session().unwrap();
+            v.session_entity(id)
+        })
+        .expect("agent session");
+    let mut caret_x = |line: usize, col: usize| -> f32 {
+        session.update(vcx, |s, cx| {
+            let c = s.state.editor.cursor_mut();
+            c.line = line;
+            c.col = col;
+            cx.notify();
+        });
+        for _ in 0..2 {
+            view.update(vcx, |_, cx| cx.notify());
+            vcx.run_until_parked();
+        }
+        // Bust the cached TranscriptView so the probed frame really paints it
+        // (a cache hit replays the old scene without running paint).
+        crate::layout_probe_begin();
+        session.update(vcx, |s, cx| {
+            s.state.pending_reveal_cursor = true;
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        let caret = crate::layout_probe_get("caret");
+        crate::layout_probe_end();
+        caret.expect("transcript caret must paint").0
+    };
+    let plain_start = caret_x(1, 0);
+    let plain_t = caret_x(1, 5);
+    let link_t = caret_x(0, 10);
+    assert!(plain_t - plain_start > 8.0, "non-vacuous: {plain_start} vs {plain_t}");
+    assert!(
+        (link_t - plain_t).abs() < 0.5,
+        "frozen-line caret at raw col 10 of '[bold](x) tail' painted at x={link_t}; \
+         the same rendered char on 'bold tail' paints at x={plain_t}"
+    );
+}
+
+/// D5 (text-editing review): a very long single compose line (a pasted blob)
+/// wraps into hundreds of visual rows; each row is now sliced from ONE shared
+/// `&[char]` of the line instead of re-collecting the whole line per row
+/// (O(L) instead of O(L²/cols)). Pins the behavior across that refactor: the
+/// caret deep inside the long line still paints on its row, inside the box.
+/// (Perf-only change — behavior was already correct, so there is no RED; the
+/// O(L) bound holds by construction of `build_chatbox_line(chars: &[char], …)`.)
+#[gpui::test]
+fn compose_long_single_line_caret_paints_inside_box(cx: &mut TestAppContext) {
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
+    let text: String = (0..3000).map(|i| format!("w{i} ")).collect();
+    let n = text.chars().count();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        let tb = c.input_surface.compose_mut();
+        *tb = crate::Compose::seeded(&text);
+        tb.editor.cursor_mut().line = 0;
+        tb.editor.cursor_mut().col = n / 2;
+    });
+    for _ in 0..4 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let row = crate::layout_probe_get("compose-cursor-row");
+    let caret = crate::layout_probe_get("caret");
+    let box_bounds = view.update(vcx, |v, cx| {
+        v.agent_read(cx, |c| c.input_surface.compose().bounds.get())
+    });
+    crate::layout_probe_end();
+    let (bx, by, bw, bh) = box_bounds.expect("compose box painted");
+    let (_, ry, _, _) = row.expect("caret row must paint (not below the fold)");
+    let (cx_, _, _, _) = caret.expect("caret must paint");
+    // Non-vacuous: the line is far taller than the box when wrapped.
+    assert!(n as f32 / (bw / crate::CHATBOX_CHAR_W).max(1.0) * 18.0 > bh * 4.0);
+    assert!(ry >= by - 1.0 && ry < by + bh, "caret row y={ry} outside box [{by}, {}]", by + bh);
+    assert!(cx_ >= bx - 1.0 && cx_ < bx + bw, "caret x={cx_} outside box [{bx}, {}]", bx + bw);
+}
+
+/// D6 (text-editing review): the compose render used to rebuild every display
+/// line, wrap every line twice, and hand `list.reconcile` a FRESH `Rc` on every
+/// root render — even when nothing about the draft changed. Now the snapshot is
+/// cached on `(edit_seq, visible_cols)`: idle root renders (the cross-tile
+/// notify / caret-blink case) must rebuild NOTHING, and a real edit rebuilds
+/// exactly once. Drives the real `render_agent` compose path (virtualized: the
+/// draft exceeds the 8-row cap).
+///
+/// Negative control (observed RED): make `Compose::render_snapshot` ignore its
+/// cache (always rebuild) → the build count climbs on idle frames.
+#[gpui::test]
+fn compose_idle_render_does_not_rebuild_lines(cx: &mut TestAppContext) {
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
+    let text: String = (0..20).map(|i| format!("draft line {i}\n")).collect();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        *c.input_surface.compose_mut() = crate::Compose::seeded(&text);
+    });
+    // Settle (width measurement converges over the first frames).
+    for _ in 0..4 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+    let builds = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.update(vcx, |v, cx| {
+            v.agent_read(cx, |c| c.input_surface.compose().render_line_builds.get())
+                .expect("agent")
+        })
+    };
+    let before = builds(&view, vcx);
+    assert!(before >= 1, "non-vacuous: the compose render path ran ({before})");
+    for _ in 0..5 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+    assert_eq!(
+        builds(&view, vcx),
+        before,
+        "idle root renders must not rebuild the compose display lines"
+    );
+    // A real edit rebuilds (the cache is keyed on edit_seq, not stale).
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        c.input_surface.compose_mut().editor.insert_char('x');
+    });
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    assert_eq!(builds(&view, vcx), before + 1, "an edit rebuilds exactly once");
+    // A replaced editor (history recall) must not be served the stale snapshot.
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        c.input_surface.compose_mut().set_recalled("recalled");
+    });
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let lines = view.update(vcx, |v, cx| {
+        v.agent_read(cx, |c| {
+            c.input_surface.compose().render_cache.borrow().as_ref().map(|s| s.lines.clone())
+        })
+        .expect("agent")
+    });
+    assert_eq!(lines.as_deref().map(|l| l.as_slice()), Some(&["recalled".to_string()][..]));
+}

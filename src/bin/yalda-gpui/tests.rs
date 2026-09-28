@@ -6694,3 +6694,51 @@ fn slash_and_topic_queries_are_draft_copy_free_but_equivalent() {
     assert_ne!(rows[0].description, "agent clear", "local /clear wins");
     assert_eq!(rows[1].description, "first", "first duplicate wins");
 }
+
+
+/// C2: the incremental WP kind derivation must equal a from-scratch fold for
+/// any edit — including fence openers/closers inserted, deleted, or edited —
+/// across a deterministic stream of random edits (seeded LCG).
+#[test]
+fn wp_kinds_incremental_matches_full_fold() {
+    fn full(lines: &[String]) -> Vec<WpLineKind> {
+        let mut in_fence = false;
+        lines
+            .iter()
+            .map(|l| {
+                let k = classify_wp_line(l, in_fence);
+                if matches!(k, WpLineKind::CodeFence) {
+                    in_fence = !in_fence;
+                }
+                k
+            })
+            .collect()
+    }
+    let pool = ["# head", "- item", "1. one", "> quote", "```", "```rust", "plain", "", "| a | b |"];
+    let mut seed: u64 = 0x5eed;
+    let mut next = |m: usize| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((seed >> 33) as usize) % m
+    };
+    let mut lines: Vec<String> = (0..30).map(|i| pool[i % pool.len()].to_string()).collect();
+    let mut kinds = full(&lines);
+    for step in 0..400 {
+        let old = lines.clone();
+        match next(3) {
+            0 => {
+                let at = next(lines.len() + 1);
+                lines.insert(at, pool[next(pool.len())].to_string());
+            }
+            1 if lines.len() > 1 => {
+                let at = next(lines.len());
+                lines.remove(at);
+            }
+            _ => {
+                let at = next(lines.len());
+                lines[at] = pool[next(pool.len())].to_string();
+            }
+        }
+        kinds = wp_kinds_incremental(&old, &kinds, &lines);
+        assert_eq!(kinds, full(&lines), "diverged at step {step}");
+    }
+}

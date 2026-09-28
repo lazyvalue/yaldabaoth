@@ -190,6 +190,34 @@ pub(crate) fn style_uses_code_font(style: NStyle, selection_bg: Option<NColor>) 
         || span_uses_code_font(style.bg, style.fg, selection_bg)
 }
 
+// Headless harness tap: `(span text, chosen font family)` for every run
+// `styled_line_element` builds, so a test can assert the REAL font decision
+// (e.g. C5: selected WP prose must stay in the body font). Inactive (`None`)
+// unless a test calls `font_run_tap_begin`.
+#[cfg(test)]
+thread_local! {
+    static FONT_RUN_TAP: RefCell<Option<Vec<(String, SharedString)>>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn font_run_tap_push(text: &str, family: &SharedString) {
+    FONT_RUN_TAP.with(|t| {
+        if let Some(v) = t.borrow_mut().as_mut() {
+            v.push((text.to_string(), family.clone()));
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn font_run_tap_begin() {
+    FONT_RUN_TAP.with(|t| *t.borrow_mut() = Some(Vec::new()));
+}
+
+#[cfg(test)]
+pub(crate) fn font_run_tap_end() -> Vec<(String, SharedString)> {
+    FONT_RUN_TAP.with(|t| t.borrow_mut().take().unwrap_or_default())
+}
+
 pub(crate) fn styled_line_element(
     line: &StyledLine,
     base_style: NStyle,
@@ -253,6 +281,9 @@ pub(crate) fn styled_line_element(
             };
 
             let bg = combined.bg.map(|c| ncolor_to_hsla(c, BG));
+
+            #[cfg(test)]
+            font_run_tap_push(&span.text, &font.family);
 
             runs.push(TextRun {
                 len,

@@ -16,8 +16,10 @@
 //! 3. **Virtualized scroll surfaces** (`list`) — `ScrollAnchoredList`, the one
 //!    place the "splice the changed range, never `reset()`" reconcile lives, so
 //!    no scroll surface re-derives it (or re-introduces the jump-to-top bug).
-//!
-//! 4. **Single-line text input** (`line_input`) — `LineInput` (the lib-crate
+//! 4. **Display text** (`display_text`) — the one document-line → rendered
+//!    string projection (newline-trimmed, tab-expanded) and the raw→display
+//!    column mapper every caret/selection painter must go through.
+//! 5. **Single-line text input** (`line_input`) — `LineInput` (the lib-crate
 //!    model: text + caret + one key policy) and `LINE_INPUT_CARET`. Every
 //!    query / filter / rename field is one; never hand-roll `push`/`pop`.
 //!
@@ -27,10 +29,12 @@
 
 mod cached;
 mod detail;
+mod display_text;
 mod line_input;
 mod list;
 
 pub(crate) use cached::*;
 pub(crate) use detail::*;
+pub(crate) use display_text::*;
 pub(crate) use line_input::*;
 pub(crate) use list::*;

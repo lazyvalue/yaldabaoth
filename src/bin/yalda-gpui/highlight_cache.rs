@@ -37,15 +37,6 @@ pub struct LineHl {
     pub stripped: Vec<Segment>,
 }
 
-impl LineHl {
-    fn empty() -> Self {
-        LineHl {
-            raw: Vec::new(),
-            stripped: Vec::new(),
-        }
-    }
-}
-
 /// Fingerprint of the theme fields the highlighter reads. Cheap to compare
 /// (`Style` is `Copy + Eq`); a change forces a full re-highlight, which is
 /// fine — theme switches are rare.
@@ -217,18 +208,34 @@ impl HighlightCache {
         }
 
         let n = lines.len();
-        let no_fence = FenceFp {
-            in_fence: false,
-            lang_hash: 0,
-        };
-        if self.lines.len() != n {
-            self.lines.resize_with(n, || Rc::new(LineHl::empty()));
-            // `u64::MAX` is the "no cached hash" sentinel: a freshly grown slot
-            // never matches a real line hash, so it is always recomputed.
-            self.hashes.resize(n, u64::MAX);
-            self.fence_before.resize(n, no_fence.clone());
-        }
 
+        // C1 (text-editing review): align old ↔ new lines by their common
+        // content-hash PREFIX + SUFFIX (the `splice_list_to_items` pattern),
+        // not by index. An inserted/deleted line near the top shifts every line
+        // below it by one index; index matching saw every one of them as
+        // "changed" and re-highlighted (twice: raw + stripped) the whole tail.
+        // Aligned, the unchanged tail maps to its old slot and is reused — only
+        // the spliced middle (plus any line whose inbound fence state moved) is
+        // re-highlighted.
+        let new_hashes: Vec<u64> = lines.iter().map(|l| hash_line(l)).collect();
+        let old_lines = std::mem::take(&mut self.lines);
+        let old_hashes = std::mem::take(&mut self.hashes);
+        let old_fence = std::mem::take(&mut self.fence_before);
+        let old_n = old_hashes.len();
+        let (pre, suf) = crate::common_prefix_suffix(&old_hashes, &new_hashes);
+        // New index → the old slot holding the same line content, if any.
+        let old_slot = |i: usize| -> Option<usize> {
+            if i < pre {
+                Some(i)
+            } else if i >= n - suf {
+                Some(i + old_n - n)
+            } else {
+                None
+            }
+        };
+
+        let mut new_lines: Vec<Rc<LineHl>> = Vec::with_capacity(n);
+        let mut new_fence: Vec<FenceFp> = Vec::with_capacity(n);
         let mut fence = FenceState::new();
         let mut recomputed = 0;
         // bug-0033: track which frozen span each line belongs to so the fence can
@@ -238,9 +245,7 @@ impl HighlightCache {
         // live draft, where an open fence from the previous span must not leak.
         let mut ri = 0usize;
         let mut prev_region: i64 = i64::MIN;
-        // index drives parallel collections (lines + self.{hashes,fence_before,lines})
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..n {
+        for (i, line) in lines.iter().enumerate() {
             while ri < frozen_ranges.len() && frozen_ranges[ri].1 <= i {
                 ri += 1;
             }
@@ -257,17 +262,21 @@ impl HighlightCache {
             }
             prev_region = region;
 
-            let h = hash_line(&lines[i]);
             let entry_fp = FenceFp::of(&fence);
-            let reuse = self.hashes[i] == h && self.fence_before[i] == entry_fp;
-            if !reuse {
-                let (raw, _) = highlight_one_line(&lines[i], &fence, theme, false, hl);
-                let (stripped, _) = highlight_one_line(&lines[i], &fence, theme, true, hl);
-                self.lines[i] = Rc::new(LineHl { raw, stripped });
-                self.hashes[i] = h;
-                self.fence_before[i] = entry_fp;
-                recomputed += 1;
+            // Reusable iff the aligned old slot holds the same content (hash
+            // equal by construction of the prefix/suffix) AND was highlighted
+            // under the same inbound fence state. A fence toggle therefore still
+            // re-derives exactly the lines whose context changed.
+            match old_slot(i).filter(|&j| old_fence[j] == entry_fp) {
+                Some(j) => new_lines.push(old_lines[j].clone()),
+                None => {
+                    let (raw, _) = highlight_one_line(line, &fence, theme, false, hl);
+                    let (stripped, _) = highlight_one_line(line, &fence, theme, true, hl);
+                    new_lines.push(Rc::new(LineHl { raw, stripped }));
+                    recomputed += 1;
+                }
             }
+            new_fence.push(entry_fp);
             // Advance fence state regardless of reuse. Use the cheap byte-scan
             // `advance_fence` rather than a full `highlight_one_line`: during
             // live streaming `edit_seq` bumps every chunk so the fast-skip path
@@ -275,8 +284,11 @@ impl HighlightCache {
             // highlighter here would re-tokenize + re-allocate every non-fence
             // line each frame, making the reconcile O(transcript) instead of
             // O(changed). `advance_fence` mirrors the fence branches exactly.
-            fence = advance_fence(&lines[i], &fence);
+            fence = advance_fence(line, &fence);
         }
+        self.lines = new_lines;
+        self.hashes = new_hashes;
+        self.fence_before = new_fence;
 
         // Cloning `Vec<Rc<LineHl>>` is N pointer copies (refcount bumps), no
         // string allocation. The closure owns this snapshot for the frame.
@@ -407,6 +419,57 @@ mod tests {
         let snap = cache.snapshot(&edited, &theme, 2);
         assert_matches_batch(&snap, &edited, &theme);
         assert_eq!(cache.last_recomputed, 1);
+    }
+
+    /// C1 (text-editing review): inserting ONE line near the top of a long
+    /// document shifts every line below by one index. The cache must align the
+    /// unchanged tail by content (prefix + suffix), so exactly the inserted line
+    /// is re-highlighted — O(changed), not O(lines below the edit).
+    ///
+    /// Negative control (observed RED): index-matched reconcile (the pre-C1
+    /// code) recomputes 1000 of 1001 lines here (`left: 1000, right: 1`).
+    #[test]
+    fn insert_near_top_rehighlights_only_the_new_line() {
+        let theme = Theme::default();
+        let mut cache = HighlightCache::new();
+        let ls: Vec<String> = (0..1000).map(|i| format!("line {i} **x**")).collect();
+        cache.snapshot(&ls, &theme, 1);
+        let mut grown = ls.clone();
+        grown.insert(1, "a freshly typed line".into());
+        let snap = cache.snapshot(&grown, &theme, 2);
+        assert_eq!(
+            cache.last_recomputed, 1,
+            "a one-line insert must re-highlight one line, not the shifted tail"
+        );
+        assert_matches_batch(&snap, &grown, &theme);
+
+        // Deleting a line near the top: nothing needs re-highlighting at all.
+        let mut shrunk = grown.clone();
+        shrunk.remove(3);
+        let snap = cache.snapshot(&shrunk, &theme, 3);
+        assert_eq!(cache.last_recomputed, 0);
+        assert_matches_batch(&snap, &shrunk, &theme);
+    }
+
+    /// C1 companion: an inserted fence OPENER near the top genuinely changes the
+    /// context of every line below, so the aligned reconcile must still
+    /// re-derive them (it continues past the splice while fence state differs)
+    /// and stay byte-identical to a batch highlight.
+    #[test]
+    fn inserted_fence_opener_still_invalidates_shifted_tail() {
+        let theme = Theme::default();
+        let mut cache = HighlightCache::new();
+        let ls = lines("intro\nalpha\nbravo\ncharlie\ndelta");
+        cache.snapshot(&ls, &theme, 1);
+        let mut edited = ls.clone();
+        edited.insert(1, "```".into());
+        let snap = cache.snapshot(&edited, &theme, 2);
+        assert_matches_batch(&snap, &edited, &theme);
+        // The opener + the 4 lines now inside the fence.
+        assert_eq!(cache.last_recomputed, 5);
+        // Removing it again restores the old context below.
+        let snap = cache.snapshot(&ls, &theme, 3);
+        assert_matches_batch(&snap, &ls, &theme);
     }
 
     /// Build a representative agent transcript: headings, prose with inline

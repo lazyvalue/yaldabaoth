@@ -653,8 +653,9 @@ impl TranscriptView {
             } else {
                 usize::MAX
             };
+            // C4: DISPLAY column (transcript rows are tab-expanded).
             let cursor_col = if transcript_focused && !dragging {
-                cursor.col
+                crate::display_col(c.editor.document(), cursor.line, cursor.col)
             } else {
                 0
             };
@@ -666,15 +667,7 @@ impl TranscriptView {
             let lines_rc: std::rc::Rc<Vec<String>> = if c.lines_cache_seq == edit_seq {
                 c.lines_cache.clone()
             } else {
-                let built: Vec<String> = (0..line_count.max(1))
-                    .map(|i| {
-                        c.editor
-                            .document()
-                            .line_text(i)
-                            .trim_end_matches('\n')
-                            .replace('\t', "    ")
-                    })
-                    .collect();
+                let built: Vec<String> = crate::display_lines(c.editor.document());
                 let rc = std::rc::Rc::new(built);
                 c.lines_cache = rc.clone();
                 c.lines_cache_seq = edit_seq;
@@ -775,7 +768,7 @@ impl TranscriptView {
             let lockable_through_snap = c.editor.lockable_through_line();
             // Selection band renders only when the transcript is focused (§4.5).
             let sel_snap = if transcript_focused {
-                c.editor.selection_range()
+                crate::display_selection(c.editor.document(), c.editor.selection_range())
             } else {
                 None
             };
@@ -796,24 +789,18 @@ impl TranscriptView {
             let you_block_snap = if c.inline_you_block_active() {
                 let compose = c.input_surface.compose();
                 let cc = compose.editor.cursor();
-                let n = compose.editor.document().line_count().max(1);
                 Some(YouBlockSnap {
-                    lines: (0..n)
-                        .map(|i| {
-                            compose
-                                .editor
-                                .document()
-                                .line_text(i)
-                                .trim_end_matches('\n')
-                                .replace('\t', "    ")
-                        })
-                        .collect(),
+                    lines: crate::display_lines(compose.editor.document()),
                     cursor_line: cc.line,
-                    cursor_col: cc.col,
+                    // C4: DISPLAY columns (the block's rows are tab-expanded).
+                    cursor_col: crate::display_col(compose.editor.document(), cc.line, cc.col),
                     mode: compose.mode,
                     anchor_line: c.effective_you_block_anchor().unwrap_or(last_line),
                     focused: c.focus == AgentFocus::Compose,
-                    selection: compose.editor.selection_range(),
+                    selection: crate::display_selection(
+                        compose.editor.document(),
+                        compose.editor.selection_range(),
+                    ),
                     bounds: compose.bounds.clone(),
                 })
             } else {
@@ -853,7 +840,7 @@ impl TranscriptView {
                                 .unwrap_or(last_line);
                             let lines = text
                                 .split('\n')
-                                .map(|l| l.replace('\t', "    "))
+                                .map(crate::display_text_of)
                                 .collect();
                             (al, lines)
                         })

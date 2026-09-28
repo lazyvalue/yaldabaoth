@@ -21,13 +21,11 @@ use std::rc::Rc;
 
 use gpui::{ListAlignment, ListState, Pixels};
 
-/// Splice a `gpui::ListState` from `old` items to `new` items by replacing only
-/// the minimal changed range (shared prefix + shared suffix trimmed), rather
-/// than `reset()`-ing the whole list. Preserving the unchanged head/tail keeps
-/// their height measurements and lets gpui re-anchor `logical_scroll_top` across
-/// the edit, so the viewport doesn't jump. Free function (not a method) so it
-/// stays unit-testable against a bare `ListState`.
-pub(crate) fn splice_list_to_items<T: PartialEq>(list: &ListState, old: &[T], new: &[T]) {
+/// Length of the shared PREFIX and the (non-overlapping) shared SUFFIX of two
+/// sequences — the minimal-changed-range alignment every incremental surface
+/// reconciles through (list splice, highlight cache, WP line kinds). The
+/// changed range is `old[pre..old.len()-suf]` → `new[pre..new.len()-suf]`.
+pub(crate) fn common_prefix_suffix<T: PartialEq>(old: &[T], new: &[T]) -> (usize, usize) {
     let max_pre = old.len().min(new.len());
     let mut pre = 0;
     while pre < max_pre && old[pre] == new[pre] {
@@ -38,6 +36,17 @@ pub(crate) fn splice_list_to_items<T: PartialEq>(list: &ListState, old: &[T], ne
     while suf < max_suf && old[old.len() - 1 - suf] == new[new.len() - 1 - suf] {
         suf += 1;
     }
+    (pre, suf)
+}
+
+/// Splice a `gpui::ListState` from `old` items to `new` items by replacing only
+/// the minimal changed range (shared prefix + shared suffix trimmed), rather
+/// than `reset()`-ing the whole list. Preserving the unchanged head/tail keeps
+/// their height measurements and lets gpui re-anchor `logical_scroll_top` across
+/// the edit, so the viewport doesn't jump. Free function (not a method) so it
+/// stays unit-testable against a bare `ListState`.
+pub(crate) fn splice_list_to_items<T: PartialEq>(list: &ListState, old: &[T], new: &[T]) {
+    let (pre, suf) = common_prefix_suffix(old, new);
     let old_changed = pre..(old.len() - suf);
     let new_len = new.len() - suf - pre;
     // Nothing structurally changed (identical content) ⇒ leave the list alone.
