@@ -178,3 +178,39 @@ cached body `DocView`), `edit_ui.rs` / `edit_view.rs`, `browser_ui.rs`,
   `md_harness.rs` `x_toggles_the_focused_blocks_first_open_task`,
   `clicking_a_checkbox_toggles_that_item`; `task_list.rs` tests;
   `editor.rs` `replace_char_undoable_is_one_undo_step`.
+- **`UXI-Buffer-13` (heading jumps).** In `Viewing`, `]]` puts the Doc cursor
+  on the next painted heading block (any level) and `[[` on the previous one —
+  from inside a section, `[[` goes to that section's own heading. The target
+  heading is scrolled to the **top** of the view (the outline rail's jump,
+  UXI-Rail-4), not merely revealed. No wrap: past the last / before the first
+  heading the cursor stays and the status line says "no next / previous
+  heading". Headings inside a folded section are skipped (UXI-Buffer-14).
+  Headings nested in a container block (e.g. a blockquote) are not jump
+  targets — the Doc cursor addresses top-level blocks. Keys are keymap-registry
+  entries (`NextHeading` / `PrevHeading`, YaldaView), listed + rebindable in the
+  keybindings tile. Status: implemented (graph 4f1 `heading-nav`). Guard:
+  `md_harness.rs` `heading_jumps_move_cursor_and_scroll_heading_to_top`.
+- **`UXI-Buffer-14` (heading folds).** In `Viewing`, vim-style folding by
+  heading: `za` toggles the fold of the section under the cursor (the cursor's
+  heading block, or the nearest heading above it); `zM` folds every heading that
+  has a section; `zR` unfolds everything. A heading's section is every block
+  after it up to the next heading of the same or a higher level, so a folded
+  `#` hides its `##` subsections. A folded section paints **only its heading**,
+  followed by a muted `… N hidden blocks` marker; the hidden blocks are not
+  painted (zero-height rows) and are not copied by a selection that spans them.
+  `j`/`k`/page/`G` and `]]`/`[[` skip hidden blocks; folding from inside a
+  section lands the cursor on its heading (it stays visible, UXP-1); a jump that
+  targets a hidden block (outline rail, local-menu goto, Edit→Doc landing) opens
+  the folds hiding it. Fold state is **per Doc tile** (`DocState::folds`), keyed
+  by the heading's first source line and re-keyed on every re-parse by heading
+  identity (level + text, nearest line) — so folds survive edits (in this or a
+  sibling Edit tile of the same file), theme re-renders and a Doc → Edit → Doc
+  round trip; a fold whose heading vanished is dropped. The outline rail marks
+  a folded heading with `▸`. Fold changes are a `DocSeqs` input (`fold_seq`) of
+  the cached `DocView`. Status: implemented (graph 4f1 `heading-nav`). Guards:
+  `md_harness.rs` `za_folds_the_section_out_of_paint_and_j_skips_it`,
+  `zm_folds_all_and_zr_unfolds_all`,
+  `fold_survives_an_edit_that_moves_its_heading`,
+  `fold_toggle_rerenders_the_cached_doc_body`,
+  `outline_row_label_marks_folded_headings`. Glyph/colour of the marker is a
+  human check (genuine gap 1).

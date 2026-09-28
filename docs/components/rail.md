@@ -15,6 +15,8 @@ the `RailView` key context). Primary code home: `chrome.rs`.
 ## References
 
 - `docs/specs/spec-rail.md` — the rail's design and behavior.
+- `docs/components/buffer.md` `UXI-Buffer-14` — the outline marks a heading folded in
+  the focused Doc with `▸`.
 
 ## UX invariants
 

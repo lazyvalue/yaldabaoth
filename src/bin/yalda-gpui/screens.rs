@@ -255,7 +255,7 @@ impl YaldaGpuiView {
                     .children(doc_conflict.then(disk_conflict_badge)),
             )
             .child(SharedString::new_static(
-                "j/k scroll · h/l block · g/G top/bot · Ctrl-O browse · Space tile menu · . workspace menu",
+                "j/k scroll · h/l block · g/G top/bot · ]] [[ heading · za fold · Ctrl-O browse · Space tile menu · . workspace menu",
             ));
 
         root.key_context("YaldaView")
@@ -269,6 +269,11 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::cursor_top))
             .on_action(cx.listener(Self::cursor_bottom))
             .on_action(cx.listener(Self::doc_toggle_task))
+            .on_action(cx.listener(Self::next_heading))
+            .on_action(cx.listener(Self::prev_heading))
+            .on_action(cx.listener(Self::toggle_fold))
+            .on_action(cx.listener(Self::fold_all))
+            .on_action(cx.listener(Self::unfold_all))
             .on_action(cx.listener(Self::open_browser))
             .on_action(cx.listener(Self::enter_edit))
             .on_action(cx.listener(Self::enter_wp))

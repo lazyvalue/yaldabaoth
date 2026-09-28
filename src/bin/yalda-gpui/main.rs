@@ -86,6 +86,7 @@ mod diff_model;
 mod diff_ui;
 mod diff_view;
 mod doc;
+mod doc_fold;
 mod doc_ui;
 mod doc_view;
 mod edit_ui;
@@ -134,6 +135,7 @@ pub(crate) use diff_git::*;
 pub(crate) use diff_model::*;
 pub(crate) use diff_view::*;
 pub(crate) use doc::*;
+pub(crate) use doc_fold::*;
 pub(crate) use doc_view::*;
 pub(crate) use edit_view::*;
 pub(crate) use file_sync::*;
@@ -243,6 +245,11 @@ actions!(
         CursorBottom,
         // Toggle a task checkbox of the focused Doc block (UXI-Buffer-12).
         ToggleTask,
+        NextHeading,
+        PrevHeading,
+        ToggleFold,
+        FoldAll,
+        UnfoldAll,
         OpenBrowser,
         EnterEdit,
         EnterWp,
@@ -1176,6 +1183,9 @@ struct EditState {
     /// created body entity: `render_edit` hands it to the body's list the
     /// first time it has one (UXI-Buffer-8).
     pending_land: Option<(gpui::ListOffset, usize)>,
+    /// The folds of the Doc this Edit was entered from (UXI-Buffer-14),
+    /// re-keyed onto the rebuilt Doc by `back_to_doc`.
+    doc_folds: DocFolds,
 }
 
 /// The Doc position a fresh Edit view was entered from (see
@@ -1202,6 +1212,7 @@ impl EditState {
             pending_replace: false,
             doc_return: None,
             pending_land: None,
+            doc_folds: DocFolds::new(),
         }
     }
 }
