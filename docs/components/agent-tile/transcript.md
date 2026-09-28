@@ -17,8 +17,6 @@ highlight, and a thinking indicator while awaiting. Append-only / ordered
 
 ## References
 
-- INV-UX-3, INV-UX-4, INV-UX-15, INV-UX-19, INV-UX-23 in
-  `docs/ux-invariants.md` → migrated here.
 - `docs/components/agent-tile/README.md` — parent component.
 - `docs/components/common/paragraph-spacing.md` — the transcript's markdown
   blocks + list items obey `ParagraphSpacing` (`UXI-ParagraphSpacing-1`).
@@ -114,7 +112,7 @@ the test fails.
 ### UXI-AgentTile-6 — Focusing a subagent swaps the main agent view to its context
 
 **Statement.** When a subagent is **focused** (`focused_subagent = Some(key)` — set
-by clicking its row, or highlighting it in the Subagents panel per INV-UX-12), the
+by clicking its row, or highlighting it in the Subagents panel per UXI-AgentTile-3), the
 agent tile's **main area is replaced** by that subagent's **context**: a `← Back`
 header (label of the subagent) over a scrollable view of its prompt + content +
 output. A Claude child renders its rich parent Task call (`append_tool_body_rich`,

@@ -2,7 +2,7 @@
 
 > **PARTIALLY SUPERSEDED (2026-06-28).** The **worksheet/chatbox behavioral model**
 > here (§4–§20: two co-equal user-toggled input modes) is superseded by
-> **`spec-worksheet.md`** + **`docs/ux-invariants.md` INV-UX-9**: the worksheet is
+> **`spec-worksheet.md`** + **UXI-AgentTile-11**: the worksheet is
 > the inline-editable buffer (You-block on Insert), and the chatbox is the
 > **mid-turn-only** input surface — there is no user-selected mode toggle. The
 > §9–§15 *inline-edit mechanics* (turn gutter, frozen-line invariants, submit

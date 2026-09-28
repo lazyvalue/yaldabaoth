@@ -966,7 +966,7 @@ impl YaldaGpuiView {
         Some(probe_bounds("recap-panel", panel.into_any_element()))
     }
 
-    /// The staged-image chip strip (INV-UX-21 property 2): one `🖼 label` chip
+    /// The staged-image chip strip (UXI-AgentTile-14 property 2): one `🖼 label` chip
     /// per pending attachment, tinted with the accent so they read as pending
     /// payload. Rendered inside the compose panel in chatbox/mid-turn mode AND as
     /// a standalone strip in worksheet-idle mode (where there is no compose panel)
@@ -1373,7 +1373,7 @@ impl YaldaGpuiView {
         // Staged image attachments (pasted via Cmd+V) → chip labels. Computed at
         // the outer scope so the strip renders in BOTH the compose panel
         // (chatbox/mid-turn) and standalone in worksheet-idle where no compose
-        // panel shows — a paste must be visible before send (INV-UX-21 prop 2).
+        // panel shows — a paste must be visible before send (UXI-AgentTile-14 prop 2).
         let pending_image_labels: Vec<SharedString> = c
             .input_surface
             .compose()
@@ -2303,7 +2303,7 @@ impl YaldaGpuiView {
             self.code_font.clone(),
         ) {
             // Worksheet-idle: no compose panel, but a pasted image must still show
-            // its chip before send (INV-UX-21 prop 2; bug-0039 follow-up). Pin the
+            // its chip before send (UXI-AgentTile-14 prop 2; bug-0039 follow-up). Pin the
             // strip to the bottom of the main column.
             main_col = main_col.child(
                 div().flex().flex_col().flex_none().pb_1().child(strip),
@@ -2693,7 +2693,7 @@ impl YaldaGpuiView {
     /// anchor ("commenting on a.txt:2–4" / "editing c3 on …"), the draft with
     /// a caret marker, and its keys. Chrome — fixed sizes (it doesn't zoom,
     /// like the agent compose). Every line renders unclipped and wraps in its
-    /// own `w_full` block (INV-UX-1/2 for a short comment: no scrolled region
+    /// own `w_full` block (UXI-TextEditing-1 / UXI-AgentTile-9 for a short comment: no scrolled region
     /// to strand the caret in); a 4-line minimum height keeps the tile's body
     /// bounds stable while a short draft is typed.
     fn render_diff_comment_compose(

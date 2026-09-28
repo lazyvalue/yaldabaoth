@@ -5,7 +5,7 @@ description: Review a section of the codebase and produce a ranked, implementati
 
 # Refactor
 
-You review **existing** code — a section the user names — and produce one ranked report of refactor proposals. You do not edit code in this skill. The user reads the report and then tells you which findings to implement; that implementation is separate, tracked work (`/plan` or `/implement`).
+You review **existing** code — a section the user names — and produce one ranked report of refactor proposals. You do not edit code in this skill. The user reads the report and then tells you which findings to implement; that implementation is separate, tracked work (a Cog graph via `/cog-plan`).
 
 This is design-level review, not diff review. It is distinct from `/code-review` (diff-scoped, bug-focused) and `/simplify` (mechanical cleanup of changed code).
 

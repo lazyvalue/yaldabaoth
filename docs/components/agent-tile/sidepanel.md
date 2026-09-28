@@ -21,8 +21,6 @@ summon-only semantics of `UXI-AgentTile-20` below.
 
 ## References
 
-- Migrated from `docs/ux-invariants.md` INV-UX-12 (panel focus) + INV-UX-5
-  (subagents one-per-line). Those entries are now `→ migrated here`.
 - `docs/components/agent-tile/README.md` — parent component.
 
 ## UX invariants
@@ -57,7 +55,7 @@ uses a `Task`/Think tool call carrying a spawn prompt (`TodoWrite`/`Read` exclud
 Codex uses `_meta.codex.subagent`: its separate start/interact/interrupt activity
 calls are folded by child `threadId`, so one child never becomes duplicate rows.
 Clicking a subagent row focuses its output (swaps the main view — see the transcript
-facet / INV-UX-15).
+facet / UXI-AgentTile-6).
 
 **Applies to.** `agent.rs::classify_subagent` / `AgentState::subagents`; the
 `subagent-panes` rows in `screens.rs::render_agent`.

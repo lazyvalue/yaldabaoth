@@ -1,18 +1,17 @@
 # yalda-gpui — UX architecture (read before adding/altering any view)
 
-> **Behavioral contract: `docs/ux-invariants.md` is authoritative and
-> mandatory.** Before adding/altering any view, check the change against the UX
-> invariants (cursor always visible + tracks text; agent compose word-wraps; …).
-> A change MUST NOT violate one; if it seems to need to, reconcile the spec first.
-> Designing new UX ⇒ add/extend an `INV-UX-N` there. The rules below are the
-> *performance* contract; ux-invariants is the *behavior* contract.
+> **Behavioral contract: `docs/ux-patterns/` (universal `UXP-N` laws) + the owning
+> component's `UXI-<Component>-N` list in `docs/components/` are authoritative and
+> mandatory.** A change MUST NOT violate one; if it seems to need to, reconcile the
+> spec first. New UX ⇒ `/new-ux`. The rules below are the *performance* contract;
+> the specs are the *behavior* contract.
 
 This module is the GPUI surface. GPUI re-renders the **root every frame**
 (`window.rs draw_roots`), and its *only* render-skip lever is
 `AnyView::cached`. So the cost of an indelicately-built view is **O(whole tree)
 per keystroke** — that is the performance trap this module is organized to make
 hard to fall into. Background + the six verified GPUI 0.2.2 facts:
-`docs/projects/gpui-responsiveness/project.md`.
+`docs/reference/gpui-render-model.md`.
 
 ## The one pattern: expensive surfaces are cached child entities
 
@@ -85,3 +84,89 @@ read in tests via `perf_render_count` / `perf_last_notify`. Run the live app
 with `YALDA_PERF=1` to watch counts. Render *count* is a proxy, not frame time —
 GPUI can't be driven headlessly for paint, so a real perf read is still a human
 `sample` under `--release` (debug masks all wins).
+
+## Module layout
+
+`src/bin/yalda-gpui/` is a module-per-concern split (modules glob-import the
+root via `use super::*;` and the root re-exports them with `pub(crate) use`,
+so items stay crate-visible regardless of file):
+
+- `main.rs` (~6.5k) — `YaldaGpuiView` struct, the `Render` impl, app/tab/
+  split/doc methods, marks/layout-modes/tags, menus + overlays + pickers,
+  key bindings + `main()`. A Tile (`Window<App>`) holds one `App`
+  (`spec-tiles-and-apps.md`, ADR-0019): `App::Buffer(BufferApp)` —
+  `BufferApp::{Picking(file browser), Viewing(rendered doc), Editing(raw)}`
+  — or `App::Agent(AgentTile)` (a viewport bound to one session in the
+  `AgentSessions` store; see `spec-agent-session-ownership.md`). The render path
+  branches on that, each screen with its own `key_context` (`YaldaView`,
+  `EditView`, `BrowserView`, `AgentView`) and its own `on_action` wiring.
+- `screens.rs` — the screen render bodies: `render_doc`, `render_edit`
+  (Code + WP), `render_agent`, `render_browser`.
+- `agent.rs` — agent-tile data layer: tool-call model, `FlatItem` view model
+  + S1 cache + `rebuild_agent_view_model`, `TurnPhase`, `AgentState`,
+  `AgentSession`, `AgentTile`.
+- `agent_sessions.rs` — the `SessionStore`/`AgentSessions` owner: the private
+  `SessionId → AgentSession` registry that enforces the 1:1 binding invariant
+  (`open_or_focus`, `bind_sid`, `locate`, `close`).
+- `agent_ui.rs` — agent/session methods on the view: open/attach/create/
+  close flows, server pump + reducers (`apply_server_batch`
+  / `apply_reply_events` / `apply_agent_event`), submit paths, Claude key
+  handler.
+- `chrome.rs` — focused-window/layout render, tab strip, tag bar, rails.
+- `edit_ui.rs` / `browser_ui.rs` — per-screen methods (edit entry/exit + key
+  dispatch; browser nav + rail).
+- `render_blocks.rs` — free render helpers for the markdown doc/transcript
+  path: colors/fonts, styled-line/block/table elements, wiki links.
+- `linear.rs` / `linear_ui.rs` / `linear_view.rs` — `App::Linear`: the Linear
+  GraphQL client + data model, the view-layer methods, and the cached body
+  component (built on **yux**).
+- `diff.rs` / `diff_ui.rs` / `diff_view.rs` + `diff_model.rs` / `diff_git.rs` /
+  `review_state.rs` — `App::Diff`: the read-only, worktree-bound review tile
+  (`docs/specs/spec-diff-review.md` rev 2, `docs/components/diff.md`, ADR-0040).
+  `diff.rs` = tile data model + pure nav helpers; `diff_ui.rs` = view methods
+  (worktree bind/refresh/apply, Viewed, comments, send picker, open);
+  `diff_view.rs` = the yux cached body (`DiffView`, root-observed).
+  `diff_model.rs` = the pure unified-diff parser + `file_hash`; `diff_git.rs` =
+  the async `git` subprocess boundary (diff, worktree list); `review_state.rs` =
+  the per-branch review JSON (viewed files + comments) at
+  `<primary-checkout-root>/.yaldabaoth/reviews/<branch>.json`.
+- `yux/` — the reusable UX component layer (cached-view infra + view
+  primitives). See **"yux" below** and `yux/CLAUDE.md`.
+- `persist.rs` — paths, preferences, workspace + ACP-session persistence,
+  server launch helpers.
+- `workspace.rs` — tab strip + n-ary split tree (`Workspace<C>`,
+  `FocusedWindow`, etc.). See `docs/specs/spec-tabs-and-splits.md`.
+- `tests.rs` / `verify_harness.rs` — unit tests + headless render harness.
+
+Keep the split honest: new agent-tile logic goes in `agent.rs`/`agent_ui.rs`,
+markdown-block render helpers in `render_blocks.rs`, **all reusable UX in
+`yux/`** — don't let `main.rs` re-accrete.
+
+## Key conventions
+
+Per-screen vim-style bindings live with `Some("YaldaView")` etc. contexts.
+Global Cmd shortcuts (Quit, OpenBrowser, OpenClaude, tab/split management,
+zoom) are registered with `None` context and **must** have a matching
+`on_action(Self::handler)` on every screen's root so the dispatch lands.
+
+## Document text zoom (extending it)
+
+`Cmd-=` / `Cmd-+` zoom in, `Cmd--` zooms out, `Cmd-0` resets. Implementation
+is a `text_scale: f32` on `YaldaGpuiView` (clamped `[MIN_TEXT_SCALE, MAX_TEXT_SCALE]`,
+step `TEXT_SCALE_STEP = 1.1`) that multiplies the body `text_size(px(14.0))`
+and every heading size. Threaded into `RenderCtx::text_scale` for block
+rendering — for the buffer doc/edit views AND the **agent transcript**
+(conversation prose + markdown blocks scale; UXI-TextZoom-1). **Chrome stays fixed** —
+status bars, tab strip, browser rows, the agent gutter/labels + bottom panels,
+and the pixel-pinned compose input all render at their native sizes. To extend
+the zoom to a new surface, multiply that surface's base `text_size` by
+`self.text_scale` and add `on_action(Self::zoom_in/out/reset)` to its root; for a
+cached surface (the transcript) read `text_scale` off the root and invalidate via
+`notify_transcript_views`.
+
+## Tests never touch `~/.yalda`
+
+`acp_session_persist_path` / `preferences_path` / `workspace_persist_path` return
+`None` (or a tempdir override) under `cfg(test)`. A test that triggers `set_theme`,
+`set_text_scale`, or `save_workspace_state` must NOT write the user's real state —
+a new persisted path gets the same `*_PATH_OVERRIDE` seam (bug-0016).

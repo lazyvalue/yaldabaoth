@@ -4172,7 +4172,7 @@ impl YaldaGpuiView {
         cx: &mut Context<Self>,
     ) {
         // Agent tile: an image on the clipboard stages as a pending attachment
-        // (INV-UX-21) rather than pasting text. Cmd+V dispatches THIS action
+        // (UXI-AgentTile-14) rather than pasting text. Cmd+V dispatches THIS action
         // (bound globally to `PasteFromClipboard`, keymap_registry.rs), and GPUI
         // dispatches bound actions BEFORE `on_key_down` — so the image path must
         // live here, not in `handle_claude_key` (whose Cmd+V branch never runs;

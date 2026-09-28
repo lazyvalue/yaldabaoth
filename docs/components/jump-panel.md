@@ -37,11 +37,11 @@ Sections:
 - **Workspaces** — one collapsible folder per durable workspace, containing one
   row per attached tile, including hidden tiles (`UXI-JumpPanel-25`).
   - The folder badge shows the **1-based workspace number** — the digit
-    `ctrl-<n>` jumps to (INV-UX-11).
+    `ctrl-<n>` jumps to (UXI-Workspace-1).
   - Folder click folds/unfolds. A visible-tile click selects its workspace and
     focuses that tile; a hidden-tile click presents it alone without unhiding it.
   - Agent tile rows carry the activity status, provider, and archive signals.
-    **Status dot** = what the AGENT is doing (INV-UX-10, UXI-JumpPanel-6) — the
+    **Status dot** = what the AGENT is doing (UXI-JumpPanel-1, UXI-JumpPanel-6) — the
     shape + color are one signal, not binding:
     - **● orange** — working (a reply is in flight).
     - **● green** — connected and idle → **ready for input / your turn**.
@@ -66,8 +66,6 @@ as a tile in its project's workspace (`UXI-Workspace-30`).
   and typed solo presentation. Its Detached state is superseded by ADR-0039.
 - ADR-0039 — every tile belongs to a workspace; the Detached section, its tag
   folders, and its ordering preference are removed (`UXI-Workspace-30`).
-- Migrated from `docs/ux-invariants.md` INV-UX-10, INV-UX-18. Those entries are
-  now `→ migrated here`.
 
 **Terminology migration.** Older implemented-invariant evidence below may name
 “free sessions,” “bare views,” or ephemeral workspaces. Those are historical

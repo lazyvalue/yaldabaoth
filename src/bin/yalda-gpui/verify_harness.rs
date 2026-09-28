@@ -14039,7 +14039,7 @@ fn image_paste_direct_read_stages_even_with_text_on_clipboard(cx: &mut TestAppCo
     );
 }
 
-/// PROBE: a pasted-image chip PAINTS above the chatbox before send (INV-UX-21
+/// PROBE: a pasted-image chip PAINTS above the chatbox before send (UXI-AgentTile-14
 /// property 2). A state-only assert can't catch a repaint miss (the reported
 /// symptom: "indication only appears after sent"). Boots chatbox mode, pastes an
 /// image via the real cmd-v action, and asserts the `compose-image-chips` element
@@ -14085,7 +14085,7 @@ fn image_paste_chip_paints_before_send_chatbox(cx: &mut TestAppContext) {
 /// PROBE: the reported bug — in WORKSHEET-IDLE mode there is no compose panel
 /// (`show_compose` is false), so before this fix a pasted image had NO on-screen
 /// indication until send. The standalone chip strip must paint here too
-/// (INV-UX-21 property 2; bug-0039 follow-up). Negative control: delete the
+/// (UXI-AgentTile-14 property 2; bug-0039 follow-up). Negative control: delete the
 /// `else if let Some(strip) = …` standalone-strip arm in `render_agent` and this
 /// goes RED (the chatbox test stays green — it uses the in-panel strip).
 #[gpui::test]
@@ -14940,7 +14940,7 @@ fn worksheet_typing_after_clear_is_visible_without_pressing_i(cx: &mut TestAppCo
 }
 
 // ============================================================================
-// /clear worksheet-invisible reproduction (docs/projects/clear-worksheet-invisible)
+// /clear worksheet-invisible reproduction (docs/bugs/saga-clear-worksheet-invisible/)
 //
 // The recurring bug: after `/clear` in worksheet mode, typed text is INVISIBLE
 // until a chatbox toggle. The text IS in the buffer — it just doesn't REPAINT.

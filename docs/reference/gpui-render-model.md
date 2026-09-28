@@ -1,4 +1,12 @@
-# Project: GPUI responsiveness — "super fast GUI"
+# Reference: GPUI render model (from the GPUI responsiveness project)
+
+> **Reference, not a plan.** Relocated from the retired
+> `docs/projects/gpui-responsiveness/project.md` (2026-09-27, graph `od4`) because
+> the verified GPUI 0.2.2 facts and the cached-component model below are load-bearing
+> for `src/bin/yalda-gpui/CLAUDE.md` and `docs/ux-patterns/` UXP-3/UXP-4. Ticket
+> references and the audit files are historical — recover them with
+> `git log --all -- docs/projects/gpui-responsiveness/`. Open tickets were moved to
+> Cog bulletin `yaldabaoth/docs::open-project-threads`.
 
 Umbrella project to make `yalda-gpui` consistently fast on the hot path
 (typing, scrolling, dragging). Born from a whole-surface multi-agent audit

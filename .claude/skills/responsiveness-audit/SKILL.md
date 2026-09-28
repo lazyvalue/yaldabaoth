@@ -43,7 +43,7 @@ with no prior about where the problem is. Breadth of *surface* is the whole poin
    (extend it): Doc view, Edit (code+WP), Browser file list, rail/outline,
    overlays, tab/workspace strip, status bars, multi-home dot, mouse/selection/
    scroll handlers, persistence, file-open/reload paths.
-2. **Gather "already handled"** from `docs/backlog.md` + recent branches, and pass
+2. **Gather "already handled"** from `cog graph list` (recent graphs), the `yaldabaoth/*` Cog bulletins, `docs/bugs/bug-manifest.md` + recent branches, and pass
    it to the reviewers so they hunt the *others*, not known-fixed paths.
 3. **Pick run mode — prefer surface fan-out.** For true surface diversity, dispatch
    **one agent per surface (or surface group)** so each gets independent deep

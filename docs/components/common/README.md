@@ -1,7 +1,9 @@
 # Common components
 
 Shared elements and bodies of behavior that **more than one** component depends on.
-A component spec `References` these instead of duplicating their invariants.
+A component spec `References` these instead of duplicating their invariants. (Laws
+that bind *every* surface without being referenced are not common components —
+they are `UXP-N` in `docs/ux-patterns/`.)
 
 A "common" entry is anything cross-cutting: a reusable **behavior** (text editing,
 caret containment, copy-on-select), a reusable **visual element** (a segmented
