@@ -942,6 +942,18 @@ enum EditMode {
     Insert,
 }
 
+/// The focused editable text surface a clipboard action targets — resolved
+/// once by `YaldaGpuiView::focused_text_input` (C7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextInputTarget {
+    /// The bound agent session's compose (worksheet You-block or chatbox).
+    AgentCompose(SessionId),
+    /// The focused `App::Buffer` Edit tile.
+    Edit,
+    /// The open review-comment compose of the Diff tile at this id.
+    DiffCompose(workspace::WindowId),
+}
+
 /// Result of `dispatch_normal_core` so the calling screen (Edit / Claude)
 /// can decide how to surface it (status message, quit, plain re-render).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4149,9 +4161,26 @@ impl YaldaGpuiView {
         Some(out)
     }
 
-    /// Paste system clipboard contents into the active editor at the cursor.
-    /// Works in Edit, Agent (worksheet + chatbox) screens — anywhere there's
-    /// an editor in Insert mode.
+    /// The ONE resolver for "which editable text surface does a clipboard
+    /// action (Cmd-V paste / Cmd-C copy) act on" (C7). A new text-input
+    /// surface adds its arm here, so paste + copy can't silently skip it (the
+    /// Diff comment compose was missed when paste routed per-screen inline).
+    fn focused_text_input(&self) -> Option<TextInputTarget> {
+        if let Some(id) = self.focused_bound_session() {
+            return Some(TextInputTarget::AgentCompose(id));
+        }
+        let wid = self.workspace.focused_window_id()?;
+        match self.workspace.focused_content()? {
+            App::Buffer(BufferApp::Editing(_)) => Some(TextInputTarget::Edit),
+            App::Diff(t) if t.compose.is_some() => Some(TextInputTarget::DiffCompose(wid)),
+            _ => None,
+        }
+    }
+
+    /// Paste system clipboard contents into the focused text input
+    /// ([`Self::focused_text_input`]) at the cursor: the Edit buffer or agent
+    /// compose (worksheet + chatbox) in Insert mode, or an open Diff review
+    /// comment compose.
     fn paste_from_clipboard(
         &mut self,
         _: &PasteFromClipboard,
@@ -4165,7 +4194,8 @@ impl YaldaGpuiView {
         // live here, not in `handle_claude_key` (whose Cmd+V branch never runs;
         // bug-0039). mac reads the pasteboard directly to dodge GPUI's string
         // short-circuit.
-        if self.focused_bound_session().is_some()
+        let target = self.focused_text_input();
+        if matches!(target, Some(TextInputTarget::AgentCompose(_)))
             && self.stage_clipboard_images_onto_compose(cx) > 0
         {
             cx.notify();
@@ -4178,12 +4208,10 @@ impl YaldaGpuiView {
         if text.is_empty() {
             return;
         }
-        // Find the active editor + mode. Chatbox takes priority in chatbox mode.
-        // Agent tiles route through `self.sessions`, so read the bound id first
-        // and drop the workspace borrow before touching the store.
-        let agent_bound = self.focused_bound_session();
-        let pasted = if let Some(id) = agent_bound {
-            self.with_session(id, cx, |c| {
+        // Agent tiles route through `self.sessions`, so the resolver hands back
+        // the bound id and the workspace borrow is dropped before the store.
+        let pasted = match target {
+            Some(TextInputTarget::AgentCompose(id)) => self.with_session(id, cx, |c| {
                 // Model C: paste always targets the compose buffer (the transcript
                 // is read-only in both placements — INV-1).
                 let cb = c.input_surface.compose_mut();
@@ -4196,9 +4224,8 @@ impl YaldaGpuiView {
                     false
                 }
             })
-            .unwrap_or(false)
-        } else {
-            match self.workspace.focused_content_mut() {
+            .unwrap_or(false),
+            Some(TextInputTarget::Edit) => match self.workspace.focused_content_mut() {
                 Some(App::Buffer(BufferApp::Editing(e))) => {
                     if e.mode == EditMode::Insert {
                         for ch in text.chars() {
@@ -4210,7 +4237,23 @@ impl YaldaGpuiView {
                     }
                 }
                 _ => false,
+            },
+            // Screen-level compose: the root notify below repaints it; the
+            // cached Diff body is untouched (`compose_gen` moves on
+            // open/close only), exactly like typing.
+            Some(TextInputTarget::DiffCompose(wid)) => {
+                match self.diff_tile_mut(wid).and_then(|t| t.compose.as_mut()) {
+                    Some(c) => {
+                        c.esc_armed = false;
+                        for ch in text.chars() {
+                            c.input.editor.insert_char(ch);
+                        }
+                        true
+                    }
+                    None => false,
+                }
             }
+            None => false,
         };
         if pasted {
             cx.notify();
@@ -4229,10 +4272,11 @@ impl YaldaGpuiView {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
             return;
         }
-        // Edit / Agent views: copy editor selection. Agent sessions live in
-        // the store, so resolve the bound id first.
-        let text = if let Some(id) = self.focused_bound_session() {
-            self.read_session(id, cx, |c| {
+        // Text inputs: copy the focused input's selection (one resolver, the
+        // same one paste uses). Agent sessions live in the store, so the
+        // resolver hands back the bound id.
+        let text = match self.focused_text_input() {
+            Some(TextInputTarget::AgentCompose(id)) => self.read_session(id, cx, |c| {
                 // Prefer the compose selection (the editable surface); fall back to
                 // a transcript selection (read-only copy is fine — INV-1 forbids
                 // writes, not reads).
@@ -4242,12 +4286,16 @@ impl YaldaGpuiView {
                     .selection_text()
                     .or_else(|| c.editor.selection_text())
             })
-            .flatten()
-        } else {
-            match self.workspace.focused_content() {
+            .flatten(),
+            Some(TextInputTarget::Edit) => match self.workspace.focused_content() {
                 Some(App::Buffer(BufferApp::Editing(e))) => e.editor.selection_text(),
                 _ => None,
-            }
+            },
+            Some(TextInputTarget::DiffCompose(wid)) => self
+                .diff_tile_ref(wid)
+                .and_then(|t| t.compose.as_ref())
+                .and_then(|c| c.input.editor.selection_text()),
+            None => None,
         };
         if let Some(t) = text
             && !t.is_empty()

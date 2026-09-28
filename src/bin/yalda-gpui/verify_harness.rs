@@ -30611,6 +30611,40 @@ fn diff_compose_typing_is_render_flat(cx: &mut TestAppContext) {
     );
 }
 
+/// C7 (text-editing review): Cmd-V pastes into an open Diff review-comment
+/// compose through the REAL keymap (`cmd-v` → `PasteFromClipboard` →
+/// `paste_from_clipboard`), routed by the single `focused_text_input`
+/// resolver (which Cmd-C's `copy_selection` shares). Paste stays render-flat for the
+/// cached body, like typing.
+/// NEGATIVE CONTROL (observed RED): drop the `TextInputTarget::DiffCompose`
+/// arm from `focused_text_input` → the compose stays "note: ".
+#[gpui::test]
+fn diff_compose_cmd_v_pastes_clipboard(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let (view, vcx, id) = boot_with_diff(cx, temp.path().to_path_buf());
+    vcx.simulate_keystrokes("j j j c");
+    vcx.run_until_parked();
+    diff_type(vcx, "note: ");
+    view.update(vcx, |_, cx| {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("pasted text".into()))
+    });
+    crate::perf_reset("diff");
+    vcx.simulate_keystrokes("cmd-v");
+    vcx.run_until_parked();
+    assert_eq!(
+        diff_compose_text(&view, vcx, id).as_deref(),
+        Some("note: pasted text"),
+        "Cmd-V must paste into the open comment compose"
+    );
+    assert_eq!(crate::perf_render_count("diff"), 0, "paste must not re-render the cached Diff body");
+    // Save still works on the pasted draft.
+    vcx.simulate_keystrokes("ctrl-enter");
+    vcx.run_until_parked();
+    let (_, json) = fixture_review_json(temp.path());
+    assert_eq!(json["comments"][0]["body"], "note: pasted text", "{json}");
+}
+
 /// E1 + E2 (text-editing review): the Diff body shares ONE comment-card
 /// snapshot (comments + their wrapped card lines) per `review_gen` — `j`/`k`
 /// (which re-render the body because `cursor` is in `DiffSeqs`) neither
