@@ -224,17 +224,15 @@ so items stay crate-visible regardless of file):
   GraphQL client + data model, the view-layer methods, and the cached body
   component (built on **yux**).
 - `diff.rs` / `diff_ui.rs` / `diff_view.rs` + `diff_model.rs` / `diff_git.rs` /
-  `review_state.rs` — `App::Diff`: the read-only diff-review tile
-  (`docs/specs/spec-diff-review.md`, `docs/components/diff.md`). `diff.rs` = tile
-  data model + pure helpers (`merge_gate_decision`, `zed_open_arg`,
-  `build_hunk_comment_prompt`, `DiffProjections`); `diff_ui.rs` = view methods
-  (bind/refresh/apply derive pipeline, review marks, comment→steering, merge
-  gate, open); `diff_view.rs` = the yux cached body (`DiffView`, root-observed).
-  `diff_model.rs` = the pure unified-diff parser + `hunk_hash` (the shared
-  normalization; also drives the hidden `--hash-diff` subcommand, C6);
-  `diff_git.rs` = the async `git` subprocess boundary; `review_state.rs` =
-  per-branch reviewed-hash persistence in the git common dir. Merge hook:
-  `scripts/yalda-pre-merge-hook`.
+  `review_state.rs` — `App::Diff`: the read-only, worktree-bound review tile
+  (`docs/specs/spec-diff-review.md` rev 2, `docs/components/diff.md`, ADR-0039).
+  `diff.rs` = tile data model + pure nav helpers; `diff_ui.rs` = view methods
+  (worktree bind/refresh/apply, Viewed, comments, send picker, open);
+  `diff_view.rs` = the yux cached body (`DiffView`, root-observed).
+  `diff_model.rs` = the pure unified-diff parser + `file_hash`; `diff_git.rs` =
+  the async `git` subprocess boundary (diff, worktree list); `review_state.rs` =
+  the per-branch review JSON (viewed files + comments) at
+  `<primary-checkout-root>/.yaldabaoth/reviews/<branch>.json`.
 - `yux/` — the reusable UX component layer (cached-view infra + view
   primitives). See **"yux" below** and `yux/CLAUDE.md`.
 - `persist.rs` — paths, preferences, workspace + ACP-session persistence,
