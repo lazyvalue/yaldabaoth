@@ -70,7 +70,8 @@ extending an existing graph.
 ## 5. Validate and hand off
 
 - Bind the graph to a Topic so it is discoverable in the Cog tile, using the
-  project's prefix (Yaldabaoth: `yaldabaoth/<graph-name>::plan`):
+  project's prefix (Yaldabaoth: `yaldabaoth/<area>/<graph-name>::plan`, areas
+  listed in CLAUDE.md § Mandatory Cog orchestration):
   `cog topic bind <prefix>/<graph-name>::plan --graph <graph-id> --actor <actor>`.
   Topic addresses are immutable; bind exactly once.
 - Run `cog graph islands <graph-id>`; it must return an empty list.
