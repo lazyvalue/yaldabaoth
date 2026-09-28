@@ -107,7 +107,14 @@ style bundle so a caller themes once:
 1. **O(changed), never O(whole tree).** An expensive surface that is usually
    stable while you interact elsewhere is its own cached view entity embedded
    with `cached_child`. The reference consumers are `transcript_view.rs`
-   (`TranscriptView`) and `linear_view.rs` (`LinearView`).
+   (`TranscriptView`, observes its session entity) and `linear_view.rs`
+   (`LinearView`); the ROOT-observed shape — for state that lives in the
+   workspace tree, not an entity — is `diff_view.rs` (`DiffView`),
+   `edit_view.rs` (`EditBodyView`, fingerprint `EditSeqs`) and `doc_view.rs`
+   (`DocView`, fingerprint `DocSeqs`). The Edit/Doc bodies are lazily created
+   by their screen render, touched every frame (`let _ = body.read(cx)`, so
+   their self-notifies reach a redraw), and their derived state (Doc blocks,
+   list reconcile) is updated on the mutation/effect path, never in render.
 2. **Never call `cx.notify()` inside a `render()`/build path.** A notify issued
    mid-draw is *parked* — no effect that frame, no scheduled redraw. Notify only
    from event handlers, `cx.observe` callbacks, timers, or `cx.defer`.

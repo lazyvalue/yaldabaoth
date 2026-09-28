@@ -470,7 +470,7 @@ fn local_markdown_link_opens_new_buffer_tile(cx: &mut TestAppContext) {
     });
 
     crate::layout_probe_begin();
-    view.update(vcx, |_, cx| cx.notify());
+    view.update(vcx, |v, cx| v.test_notify_doc_bodies(cx));
     vcx.run_until_parked();
     let (_, _, w, h) =
         crate::layout_probe_get("doc-link-0-0").expect("Markdown link did not paint");
@@ -482,7 +482,7 @@ fn local_markdown_link_opens_new_buffer_tile(cx: &mut TestAppContext) {
 
     let at = view.read_with(vcx, |v, _| {
         let bounds = v
-            .line_layouts
+            .focused_doc_line_layouts()
             .borrow()
             .get(&(0, 0))
             .expect("link text layout")
@@ -865,7 +865,7 @@ fn doc_view_render_is_o_visible(cx: &mut TestAppContext) {
     //     drives exactly one virtualized render. Virtualization must build only
     //     the visible window, not all N blocks. ---
     YaldaGpuiView::test_reset_doc_block_builds();
-    view.update(vcx, |_v, cx| cx.notify());
+    view.update(vcx, |v, cx| v.test_notify_doc_bodies(cx));
     vcx.run_until_parked();
     let cold = YaldaGpuiView::test_doc_block_builds();
     assert!(
@@ -931,7 +931,7 @@ fn paragraph_gap_between_doc_blocks_exceeds_within_paragraph_leading(cx: &mut Te
     }
 
     crate::layout_probe_begin();
-    view.update(vcx, |_, cx| cx.notify());
+    view.update(vcx, |v, cx| v.test_notify_doc_bodies(cx));
     vcx.run_until_parked();
     let slot = crate::layout_probe_get("doc-block-0");
     let content = crate::layout_probe_get("doc-block-inner-0");
@@ -1058,7 +1058,7 @@ fn doc_hit_test_never_touches_unpainted_layout(cx: &mut TestAppContext) {
     // Sanity: the virtualized list actually rendered lines (not a collapsed,
     // zero-height body — which removing `Auto` could cause if the parent didn't
     // bound the height). Otherwise the hit-test below would be vacuous.
-    let registered = view.update(vcx, |v, cx| v.line_layouts.borrow().len());
+    let registered = view.update(vcx, |v, cx| v.focused_doc_line_layouts().borrow().len());
     assert!(
         registered > 0,
         "doc body rendered no lines (list collapsed?)"
@@ -1077,7 +1077,8 @@ fn doc_hit_test_never_touches_unpainted_layout(cx: &mut TestAppContext) {
 
     // And hit-testing still resolves: a point inside a painted line yields a pos.
     let p = view.update(vcx, |v, cx| {
-        let ll = v.line_layouts.borrow();
+        let lls = v.focused_doc_line_layouts();
+        let ll = lls.borrow();
         let b = ll.values().next().expect("a painted line").bounds();
         point(b.left() + px(2.0), b.top() + px(2.0))
     });
@@ -1130,7 +1131,8 @@ fn doc_selection_drag_highlights_dragged_lines(cx: &mut TestAppContext) {
     // Pick drag endpoints from the REAL painted bounds: top-most painted line →
     // bottom-most painted line (both guaranteed prepainted, so bounds() is safe).
     let (start, end, start_block, end_block) = view.update(vcx, |v, cx| {
-        let ll = v.line_layouts.borrow();
+        let lls = v.focused_doc_line_layouts();
+        let ll = lls.borrow();
         let mut keys: Vec<(usize, usize)> = ll.keys().copied().collect();
         keys.sort();
         assert!(
@@ -1164,7 +1166,7 @@ fn doc_selection_drag_highlights_dragged_lines(cx: &mut TestAppContext) {
 
     // Decision tap: render one clean frame and inspect what was highlighted.
     YaldaGpuiView::test_reset_doc_render_tap();
-    view.update(vcx, |_v, cx| cx.notify());
+    view.update(vcx, |v, cx| v.test_notify_doc_bodies(cx));
     vcx.run_until_parked();
     let tap = YaldaGpuiView::test_doc_render_tap();
 
@@ -1242,7 +1244,8 @@ fn doc_drag_autocopies_selection_to_clipboard(cx: &mut TestAppContext) {
     // Drag across the first painted line (left edge → right edge) so the whole
     // line's text is selected.
     let (start, end) = view.update(vcx, |v, cx| {
-        let ll = v.line_layouts.borrow();
+        let lls = v.focused_doc_line_layouts();
+        let ll = lls.borrow();
         let mut keys: Vec<(usize, usize)> = ll.keys().copied().collect();
         keys.sort();
         let b = ll.get(&keys[0]).unwrap().bounds();
@@ -27752,7 +27755,7 @@ fn diagram_002_render_failure_falls_back_to_source(cx: &mut TestAppContext) {
 
     // Non-vacuous: the mermaid block still paints its raw-source fallback.
     crate::layout_probe_begin();
-    view.update(vcx, |_, cx| cx.notify());
+    view.update(vcx, |v, cx| v.test_notify_doc_bodies(cx));
     vcx.run_until_parked();
     let painted = crate::layout_probe_get("doc-block-0");
     crate::layout_probe_end();

@@ -74,11 +74,7 @@ impl YaldaGpuiView {
         };
         let inner: AnyElement = match content {
             App::Buffer(BufferApp::Viewing(d)) => {
-                // C3: the painted set is exactly the tiles reaching here, so a
-                // Doc that `refresh_painted_docs` didn't cover still never
-                // paints stale. O(1) when already current (the common case).
-                d.refresh_blocks(&self.theme);
-                self.render_doc(leaf_root, d, cx).into_any_element()
+                self.render_doc(leaf_root, id, d, cx).into_any_element()
             }
             App::Buffer(BufferApp::Editing(e)) => {
                 self.render_edit(leaf_root, id, e, cx).into_any_element()

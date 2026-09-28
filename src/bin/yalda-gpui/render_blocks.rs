@@ -618,9 +618,7 @@ pub(crate) struct RenderCtx<'a> {
     /// `None` outside the view-mode render path (e.g. edit-mode rendering
     /// and nested ctxes inside blockquotes/lists where v1 doesn't yet
     /// support selection).
-    // type alias would hurt readability here more than help
-    #[allow(clippy::type_complexity)]
-    pub(crate) line_layouts: Option<std::rc::Rc<RefCell<HashMap<(usize, usize), TextLayout>>>>,
+    pub(crate) line_layouts: Option<DocLineLayouts>,
     /// The top-level block index currently being rendered. Set by
     /// `block_element` and cleared (set to `None`) when `block_inner`
     /// recurses into nested blocks (blockquote/list content), so the v1
@@ -670,6 +668,39 @@ pub(crate) struct RenderCtx<'a> {
     pub(crate) path: Option<Vec<usize>>,
 }
 
+impl<'a> RenderCtx<'a> {
+    /// The ONE constructor: a plain context (theme, fonts, zoom) with every
+    /// surface-specific channel off — no cursor, selection, hit sinks, wiki
+    /// navigation, diagrams or structural path. Surfaces switch on what they
+    /// use with struct-update syntax: `RenderCtx { cursor_block: …,
+    /// ..RenderCtx::new(…) }`, so a new field is added here once instead of at
+    /// every literal.
+    pub(crate) fn new(
+        theme: &'a Theme,
+        body_font: SharedString,
+        code_font: SharedString,
+        text_scale: f32,
+    ) -> Self {
+        RenderCtx {
+            theme,
+            body_font,
+            code_font,
+            text_scale,
+            cursor_block: None,
+            doc_selection: None,
+            line_layouts: None,
+            current_block: None,
+            weak_view: None,
+            doc_dir: None,
+            block_count: 0,
+            show_heading_markers: false,
+            block_hits: None,
+            diagrams: None,
+            path: None,
+        }
+    }
+}
+
 impl RenderCtx<'_> {
     /// Context for a nested block at child offset `extra` below this one:
     /// selection / cursor / line-layout plumbing is top-level only, while
@@ -677,28 +708,23 @@ impl RenderCtx<'_> {
     /// through.
     pub(crate) fn nested(&self, extra: &[usize]) -> RenderCtx<'_> {
         RenderCtx {
-            theme: self.theme,
-            body_font: self.body_font.clone(),
-            code_font: self.code_font.clone(),
-            text_scale: self.text_scale,
-            cursor_block: None,
-            doc_selection: None,
-            line_layouts: None,
-            current_block: None,
             // Wiki links stay clickable inside nested blocks (blockquotes,
             // list items) — only selection is scoped top-level.
             weak_view: self.weak_view.clone(),
             doc_dir: self.doc_dir.clone(),
-            block_count: 0,
             show_heading_markers: self.show_heading_markers,
-            // Nested blocks don't use the transcript code-block hit path.
-            block_hits: None,
             diagrams: self.diagrams.clone(),
             path: self.path.as_ref().map(|p| {
                 let mut p = p.clone();
                 p.extend_from_slice(extra);
                 p
             }),
+            ..RenderCtx::new(
+                self.theme,
+                self.body_font.clone(),
+                self.code_font.clone(),
+                self.text_scale,
+            )
         }
     }
 
@@ -1656,10 +1682,6 @@ pub(crate) fn block_element(ctx: &RenderCtx<'_>, idx: usize, block: &RenderedBlo
         DOC_RENDER_TAP.with(|t| t.borrow_mut().cursor_bar_block = Some(idx));
     }
     let inner_ctx = RenderCtx {
-        theme: ctx.theme,
-        body_font: ctx.body_font.clone(),
-        code_font: ctx.code_font.clone(),
-        text_scale: ctx.text_scale,
         cursor_block: ctx.cursor_block,
         doc_selection: ctx.doc_selection,
         line_layouts: ctx.line_layouts.clone(),
@@ -1672,6 +1694,12 @@ pub(crate) fn block_element(ctx: &RenderCtx<'_>, idx: usize, block: &RenderedBlo
         block_hits: None,
         diagrams: ctx.diagrams.clone(),
         path: Some(vec![idx]),
+        ..RenderCtx::new(
+            ctx.theme,
+            ctx.body_font.clone(),
+            ctx.code_font.clone(),
+            ctx.text_scale,
+        )
     };
     let base = block_inner(&inner_ctx, block);
 
@@ -2317,7 +2345,7 @@ pub(crate) fn split_segments_at_col(
 /// is true between MouseDown and MouseUp on the doc body — during that
 /// window every MouseMove updates `head`. Once `dragging` is false the
 /// range is frozen and Cmd-C reads from it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DocSelection {
     pub(crate) anchor: DocPos,
     pub(crate) head: DocPos,
@@ -2530,21 +2558,8 @@ pub(crate) fn render_markdown_column(
     text_scale: f32,
 ) -> AnyElement {
     let ctx = RenderCtx {
-        theme,
-        body_font: body_font.clone(),
-        code_font: code_font.clone(),
-        text_scale,
-        cursor_block: None,
-        doc_selection: None,
-        line_layouts: None,
-        current_block: None,
-        weak_view: None,
-        doc_dir: None,
         block_count: blocks.len(),
-        show_heading_markers: false,
-        block_hits: None,
-        diagrams: None,
-        path: None,
+        ..RenderCtx::new(theme, body_font.clone(), code_font.clone(), text_scale)
     };
     let cap = max_blocks.unwrap_or(blocks.len());
     let gap = paragraph_gap(text_scale);

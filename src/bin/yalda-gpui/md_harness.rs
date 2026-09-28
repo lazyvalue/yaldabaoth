@@ -253,15 +253,15 @@ fn edit_pos(
 /// Paint one frame with the layout probe on and return `tag`'s painted rect.
 fn probe(view: &Entity<YaldaGpuiView>, vcx: &mut VisualTestContext, tag: &str) -> Option<(f32, f32, f32, f32)> {
     crate::layout_probe_begin();
-    // The Edit body is a cached child: a root notify alone replays its last
-    // paint (no probes recorded), so invalidate it too.
+    // The Edit and Doc bodies are cached children: a root notify alone
+    // replays their last paint (no probes recorded), so invalidate them too.
     view.update(vcx, |v, cx| {
         if let Some(App::Buffer(BufferApp::Editing(e))) = v.workspace.focused_content()
             && let Some(body) = &e.body
         {
             body.update(cx, |_, bcx| bcx.notify());
         }
-        cx.notify();
+        v.test_notify_doc_bodies(cx);
     });
     vcx.run_until_parked();
     let r = crate::layout_probe_get(tag);
@@ -405,10 +405,15 @@ fn doc_edit_doc_round_trip_keeps_place(cx: &mut TestAppContext) {
 // render-fixes (graph 4f1): GFM constructs painted in the Doc view.
 // ---------------------------------------------------------------------------
 
-/// Force `n` frames (the real render + paint path).
+/// Force `n` frames (the real render + paint path), re-running the cached Doc
+/// body too. The body re-renders on its own inputs; one input the headless
+/// harness can't deliver is an image finishing its decode — gpui re-notifies
+/// the painting view via `on_next_frame`, which the test platform never fires
+/// (`TestWindow::on_request_frame` is a no-op). Invalidating the body here
+/// stands in for that frame callback.
 fn frames_n(view: &Entity<YaldaGpuiView>, vcx: &mut VisualTestContext, n: usize) {
     for _ in 0..n {
-        view.update(vcx, |_, cx| cx.notify());
+        view.update(vcx, |v, cx| v.test_notify_doc_bodies(cx));
         vcx.run_until_parked();
     }
 }
@@ -542,7 +547,8 @@ fn hard_breaks_paint_separate_lines(cx: &mut TestAppContext) {
     let md = "first  \nsecond\\\nthird\nsame line\n";
     let (view, vcx, _file) = boot_doc(cx, "hardbreak", md);
     let ys: Vec<Option<f32>> = view.read_with(vcx, |v, _| {
-        let layouts = v.line_layouts.borrow();
+        let lls = v.focused_doc_line_layouts();
+        let layouts = lls.borrow();
         (0..4)
             .map(|li| {
                 layouts
@@ -598,4 +604,141 @@ fn footnote_definitions_paint_as_blocks(cx: &mut TestAppContext) {
     let (_, _, w, h) = probe_get("md-footnote-1").expect("footnote block painted");
     assert!(w > 0.0 && h > 0.0);
     crate::layout_probe_end();
+}
+
+// ---------------------------------------------------------------------------
+// doc-view (graph 4f1): the Doc body is a cached yux component (`DocView`).
+// ---------------------------------------------------------------------------
+
+/// Boot `(Doc of left, Edit of right)` side by side in one workspace through
+/// the real paths: `open_file` (Doc in place of the browser), then
+/// `make_doc_content` and `split_focused` (a pooled tile of `right`, focused),
+/// then `enter_edit_with` (toggled into Edit, Insert). `same_file` makes
+/// `right` the SAME file as `left` (one pooled core).
+fn boot_doc_beside_edit<'a>(
+    cx: &'a mut TestAppContext,
+    tag: &str,
+    left_md: &str,
+    right_md: &str,
+    same_file: bool,
+) -> (Entity<YaldaGpuiView>, &'a mut VisualTestContext) {
+    cx.update(crate::register_keymap);
+    let dir = temp_dir(tag);
+    let left = dir.join("left.md");
+    let right = if same_file { left.clone() } else { dir.join("right.md") };
+    std::fs::write(&left, left_md).expect("write left");
+    if !same_file {
+        std::fs::write(&right, right_md).expect("write right");
+    }
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+    view.update(vcx, |v, cx| {
+        v.splash_until = None;
+        assert!(v.open_file(left.clone()), "open the Doc");
+        let content = v.make_doc_content(&right).expect("doc content");
+        v.workspace
+            .split_focused(crate::workspace::SplitDir::V, content)
+            .expect("split");
+        v.enter_edit_with(crate::EditView::Code, cx);
+        v.edit_mut().expect("edit tile").mode = crate::EditMode::Insert;
+        cx.notify();
+    });
+    for _ in 0..3 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+    (view, vcx)
+}
+
+/// The painted text of every line the unfocused Doc tile's body registered in
+/// its hit-test sink — filled at PAINT time, so this is what the user sees.
+fn painted_doc_text(view: &Entity<YaldaGpuiView>, vcx: &mut VisualTestContext) -> String {
+    view.read_with(vcx, |v, _| {
+        let mut out = Vec::new();
+        v.workspace.workspaces[v.workspace.active_workspace].for_each_attached_window(
+            &mut |w| {
+                if let App::Buffer(BufferApp::Viewing(d)) = &w.content {
+                    let ll = d.line_layouts.borrow();
+                    let mut keys: Vec<_> = ll.keys().copied().collect();
+                    keys.sort();
+                    for k in keys {
+                        out.push(ll[&k].text().to_string());
+                    }
+                }
+            },
+        );
+        out.join("\n")
+    })
+}
+
+/// yux rule 5 render-count guard for the cached Doc body. A Doc of file A
+/// beside an Edit of file B: typing in B (real keystrokes through the keymap
+/// and `handle_edit_key`, each a root notify) must leave the Doc body's render
+/// count FLAT; the global inputs — zoom (`cmd-=`) and theme (`ToggleTheme`) —
+/// must each re-render it.
+///
+/// Negative controls (observed RED): make the root-observe filter in
+/// `DocView::new` notify unconditionally → the flat assert fails; drop
+/// `text_scale_bits` / `theme` from `DocSeqs::of` (default them) → the zoom /
+/// theme bust asserts fail.
+#[gpui::test]
+fn doc_body_is_render_flat_while_another_file_is_edited(cx: &mut TestAppContext) {
+    let left: String = (0..30).map(|i| format!("Left paragraph {i}.\n\n")).collect();
+    let (view, vcx) = boot_doc_beside_edit(cx, "docview-flat", &left, "right side\n", false);
+    let base = crate::perf_render_count("doc-body");
+    assert!(base >= 1, "the Doc body must have rendered (live beside the Edit)");
+    assert!(painted_doc_text(&view, vcx).contains("Left paragraph 0."), "the Doc painted");
+
+    for key in ["q", "u", "x"] {
+        vcx.simulate_keystrokes(key);
+        vcx.run_until_parked();
+    }
+    let typed = view.update(vcx, |v, _| v.edit_mut().expect("edit").editor.full_text());
+    assert!(typed.contains("qux"), "non-vacuous: the keystrokes landed in B: {typed:?}");
+    let after = crate::perf_render_count("doc-body");
+    assert_eq!(
+        after, base,
+        "typing in another file's Edit tile must not re-render the cached Doc body ({base} → {after})"
+    );
+
+    vcx.simulate_keystrokes("cmd-=");
+    vcx.run_until_parked();
+    let zoomed = crate::perf_render_count("doc-body");
+    assert!(zoomed > after, "zoom must re-render the Doc body ({after} → {zoomed})");
+
+    vcx.dispatch_action(crate::ToggleTheme);
+    vcx.run_until_parked();
+    let themed = crate::perf_render_count("doc-body");
+    assert!(themed > zoomed, "a theme change must re-render the Doc body ({zoomed} → {themed})");
+}
+
+/// A Doc and an Edit tile of the SAME pooled file: typing in the Edit tile
+/// (real keystrokes) re-derives the Doc's blocks on the effect path (the
+/// root's self-observe → `refresh_painted_docs`) and the cached Doc body
+/// repaints them — asserted on the text the Doc's body actually PAINTED (its
+/// paint-time hit-test sink), not on the model.
+///
+/// Negative controls (observed RED): make `ensure_doc_refresh_hook` a no-op →
+/// the Doc keeps painting the old text; drop `blocks_ptr`/`blocks_seq`/
+/// `source_seq` from `DocSeqs::of` → the body never re-renders, same failure.
+#[gpui::test]
+fn doc_body_repaints_a_same_file_sibling_edit(cx: &mut TestAppContext) {
+    let (view, vcx) =
+        boot_doc_beside_edit(cx, "docview-same", "alpha paragraph\n", "", true);
+    assert!(painted_doc_text(&view, vcx).contains("alpha paragraph"), "the Doc painted");
+    let before = crate::perf_render_count("doc-body");
+    for key in ["q", "u", "x"] {
+        vcx.simulate_keystrokes(key);
+        vcx.run_until_parked();
+    }
+    let typed = view.update(vcx, |v, _| v.edit_mut().expect("edit").editor.full_text());
+    assert!(typed.contains("qux"), "non-vacuous: the keystrokes landed: {typed:?}");
+    assert!(
+        crate::perf_render_count("doc-body") > before,
+        "the sibling edit must re-render the Doc body"
+    );
+    let painted = painted_doc_text(&view, vcx);
+    assert!(
+        painted.contains("qux"),
+        "the Doc must PAINT the sibling Edit tile's text, not stale content: {painted:?}"
+    );
 }

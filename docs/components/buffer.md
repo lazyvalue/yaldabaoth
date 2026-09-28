@@ -23,7 +23,9 @@ three modes:
 
 Buffer and Agent are orthogonal — a Buffer tile never nests an agent, and vice
 versa. Primary code home: `screens.rs::render_doc` / `render_edit` /
-`render_browser`, `edit_ui.rs`, `browser_ui.rs`, `render_blocks.rs`.
+`render_browser`, `doc.rs` / `doc_ui.rs` / `doc_view.rs` (Doc state, methods,
+cached body `DocView`), `edit_ui.rs` / `edit_view.rs`, `browser_ui.rs`,
+`render_blocks.rs`.
 
 ## References
 

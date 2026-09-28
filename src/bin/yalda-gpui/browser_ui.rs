@@ -706,14 +706,14 @@ impl YaldaGpuiView {
                 let Some(block) = entry.block else { return };
                 let block = block.min(d.blocks.len().saturating_sub(1));
                 d.cursor_block = block;
+                // The list is reconciled at every block mutation, so `block`
+                // is a real item; the body repaints off `DocSeqs` (cursor +
+                // scroll top).
                 if block < d.list.len() {
                     d.list.state().scroll_to(gpui::ListOffset {
                         item_ix: block,
                         offset_in_item: gpui::px(0.0),
                     });
-                    d.last_cursor_block.set(Some(block));
-                } else {
-                    d.reveal_block(block);
                 }
             }
             Some(App::Buffer(BufferApp::Editing(e))) => {
