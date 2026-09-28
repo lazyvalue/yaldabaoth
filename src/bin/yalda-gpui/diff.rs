@@ -483,9 +483,10 @@ pub(crate) enum ComposeTarget {
     Edit(String),
 }
 
-/// Mono columns a draft line hard-wraps at in the inline compose (the editor
-/// is monospace, so a character count IS the visual width; same budget as a
-/// card body).
+/// Mono columns (cells) a draft line word-wraps at in the inline compose — the
+/// same budget as a card body. Wrapping is the shared chatbox wrap
+/// ([`wrap_line_cols`]: word breaks, terminal cells, a reserved EOL-caret
+/// column; D14).
 pub(crate) const COMPOSE_WRAP_COLS: usize = COMMENT_WRAP_COLS;
 /// Editor lines the inline compose always shows (an empty draft still gets a
 /// comfortable box) …
@@ -496,35 +497,34 @@ pub(crate) const COMPOSE_MAX_LINES: usize = 12;
 /// key-hint footer, and one row of vertical room for margins + borders.
 pub(crate) const COMPOSE_CHROME_ROWS: usize = 3;
 
-/// A draft laid out for the inline compose: its visual lines (each doc line
-/// hard-wrapped at [`COMPOSE_WRAP_COLS`] chars; an empty line is one empty
-/// visual line) and the caret as `(visual line, char column)`.
+/// A draft laid out for the inline compose by the SHARED chatbox layout (D14):
+/// the tab-expanded display `lines` (one per doc line), their visual `rows`
+/// (`(line, start, end)` char ranges from [`wrap_line_cols`] at
+/// [`COMPOSE_WRAP_COLS`]), and the caret as `(visual row, display column
+/// within its line)`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ComposeLines {
     pub(crate) lines: Vec<String>,
+    pub(crate) rows: Vec<(usize, usize, usize)>,
     pub(crate) caret: (usize, usize),
 }
 
-/// Lay `text` out for the inline compose (see [`ComposeLines`]); the caret is
-/// the editor's `(line, col)` in chars.
-pub(crate) fn compose_visual_lines(text: &str, caret_line: usize, caret_col: usize) -> ComposeLines {
-    let mut lines = Vec::new();
+/// Lay display `lines` out for the inline compose (see [`ComposeLines`]);
+/// `caret_line` / `caret_col` are the editor caret in DISPLAY columns (the col
+/// is clamped to its line).
+pub(crate) fn compose_visual_lines(lines: Vec<String>, caret_line: usize, caret_col: usize) -> ComposeLines {
+    let mut rows = Vec::new();
     let mut caret = (0, 0);
-    for (li, doc_line) in text.split('\n').enumerate() {
-        let chars: Vec<char> = doc_line.chars().collect();
-        let chunks: Vec<String> = if chars.is_empty() {
-            vec![String::new()]
-        } else {
-            chars.chunks(COMPOSE_WRAP_COLS).map(|c| c.iter().collect()).collect()
-        };
+    for (li, line) in lines.iter().enumerate() {
+        let chars: Vec<char> = line.chars().collect();
+        let wrapped = wrap_line_cols(&chars, COMPOSE_WRAP_COLS);
         if li == caret_line {
             let col = caret_col.min(chars.len());
-            let k = (col / COMPOSE_WRAP_COLS).min(chunks.len() - 1);
-            caret = (lines.len() + k, col - k * COMPOSE_WRAP_COLS);
+            caret = (rows.len() + caret_visual_row(&wrapped, col), col);
         }
-        lines.extend(chunks);
+        rows.extend(wrapped.into_iter().map(|(a, b)| (li, a, b)));
     }
-    ComposeLines { lines, caret }
+    ComposeLines { lines, rows, caret }
 }
 
 /// How many [`RowRef::ComposeSlot`] rows a draft of `visual_lines` reserves:
@@ -545,13 +545,14 @@ pub(crate) fn compose_window_top(caret_line: usize, line_count: usize) -> usize 
 impl CommentCompose {
     /// The draft laid out for the inline editor.
     pub(crate) fn visual_lines(&self) -> ComposeLines {
+        let doc = self.input.editor.document();
         let c = self.input.editor.cursor();
-        compose_visual_lines(&self.input.text(), c.line, c.col)
+        compose_visual_lines(display_lines(doc), c.line, display_col(doc, c.line, c.col))
     }
 
     /// The slot rows this draft needs right now.
     pub(crate) fn wanted_slot_rows(&self) -> usize {
-        compose_slot_rows(compose_visual_lines(&self.input.text(), 0, 0).lines.len())
+        compose_slot_rows(compose_visual_lines(display_lines(self.input.editor.document()), 0, 0).rows.len())
     }
 }
 
@@ -1637,12 +1638,22 @@ index 1..2 100644
     fn compose_layout_wraps_places_caret_and_sizes_slots() {
         let w = COMPOSE_WRAP_COLS;
         let long: String = "x".repeat(w + 5);
-        let l = compose_visual_lines(&format!("ab\n{long}\n"), 1, w + 2);
-        assert_eq!(l.lines.len(), 4, "ab · x*w · xxxxx · empty last line");
-        assert_eq!(l.lines[1].chars().count(), w);
-        assert_eq!(l.caret, (2, 2), "caret past the wrap lands on the continuation");
-        assert_eq!(compose_visual_lines("", 0, 0), ComposeLines { lines: vec![String::new()], caret: (0, 0) });
-        assert_eq!(compose_visual_lines("abc", 0, 99).caret, (0, 3), "col clamped to the line");
+        let ls = |t: &str| t.split('\n').map(display_text_of).collect::<Vec<_>>();
+        let l = compose_visual_lines(ls(&format!("ab\n{long}\n")), 1, w + 2);
+        assert_eq!(l.rows.len(), 4, "ab · x*w · xxxxx · empty last line");
+        assert_eq!(l.rows[1], (1, 0, w), "a full row holds the whole budget");
+        assert_eq!(l.caret, (2, w + 2), "caret past the wrap lands on the continuation");
+        // Shared chatbox wrap (D14): word breaks, not char chunks …
+        let words = format!("{} tail", "y".repeat(w - 3));
+        let l = compose_visual_lines(ls(&words), 0, 0);
+        assert_eq!(l.rows, vec![(0, 0, w - 2), (0, w - 2, w + 2)], "breaks after the space");
+        // … and tabs expand like every other compose.
+        assert_eq!(compose_visual_lines(ls("\tz"), 0, 5).caret, (0, 5));
+        assert_eq!(
+            compose_visual_lines(ls(""), 0, 0),
+            ComposeLines { lines: vec![String::new()], rows: vec![(0, 0, 0)], caret: (0, 0) }
+        );
+        assert_eq!(compose_visual_lines(ls("abc"), 0, 99).caret, (0, 3), "col clamped to the line");
         assert_eq!(compose_slot_rows(1), COMPOSE_MIN_LINES + COMPOSE_CHROME_ROWS);
         assert_eq!(compose_slot_rows(5), 5 + COMPOSE_CHROME_ROWS);
         assert_eq!(compose_slot_rows(500), COMPOSE_MAX_LINES + COMPOSE_CHROME_ROWS);

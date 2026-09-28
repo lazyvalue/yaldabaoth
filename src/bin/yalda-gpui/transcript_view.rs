@@ -1696,19 +1696,18 @@ impl TranscriptView {
                         // is now upheld by revealing the caret's row within the block, not
                         // by truncating the block.)
                         let mut inner = div().flex().flex_col().w_full().min_w_0();
+                        let row_style =
+                            crate::ChatboxRowStyle::compose(code_font_snap.clone(), fg, accent, sel_bg);
                         for (i, line) in lines.iter().enumerate() {
                             inner = inner.child(crate::build_chatbox_wrapped_line(
                                 line,
                                 focused && i == caret_line,
                                 caret_col,
                                 mode,
-                                accent,
                                 selection,
                                 i,
-                                &code_font_snap,
-                                fg,
-                                sel_bg,
                                 wrap_cols,
+                                &row_style,
                             ));
                         }
                         // Nav-focus highlight: while navigating the transcript, the

@@ -32128,3 +32128,116 @@ fn compose_cmd_v_normalizes_crlf(cx: &mut TestAppContext) {
     let text = view.update(vcx, |v, cx| v.read_session(id, cx, |c| c.input_surface.compose().text()).expect("session"));
     assert_eq!(text, "hela\nblo", "CRLF normalized on paste");
 }
+
+/// Seed the open Diff comment compose with `text`, caret at `(line, col)`
+/// (raw), resync its slot rows, and paint `tags`.
+fn q4_diff_compose_paint(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+    id: crate::workspace::WindowId,
+    text: &str,
+    line: usize,
+    col: usize,
+    tags: &[&str],
+) -> Vec<Option<(f32, f32, f32, f32)>> {
+    view.update(vcx, |v, cx| {
+        let t = v.diff_tile_mut(id).expect("diff tile");
+        let c = t.compose.as_mut().expect("compose open");
+        c.input.reset_to(text);
+        c.input.editor.cursor_mut().line = line;
+        c.input.editor.cursor_mut().col = col;
+        t.sync_compose_slots();
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    paint_diff_probes(view, vcx, id, tags)
+}
+
+/// D14 (text-editing review): the Diff comment compose renders through the
+/// SHARED chatbox layout + row renderer (`compose_visual_lines` →
+/// `wrap_line_cols` → `build_chatbox_line`), not its own char-chunk caret
+/// model — so it WORD-wraps (a word never splits at the budget) and a TAB
+/// expands like every other compose. Real keys open the compose; the painted
+/// beam caret is read back.
+///
+/// Negative control (observed RED): lay the compose out with the old
+/// `chars.chunks(COMPOSE_WRAP_COLS)` hard-chunking in `compose_visual_lines`
+/// → the caret after "tail" paints 2 columns in (the word split as "ta|il").
+#[gpui::test]
+fn diff_compose_uses_shared_chatbox_wrap_and_tabs(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let (view, vcx, id) = boot_with_diff(cx, temp.path().to_path_buf());
+    vcx.simulate_keystrokes("j j j c");
+    vcx.run_until_parked();
+    let tags = ["diff-compose-caret", "diff-compose-editor"];
+    let p = q4_diff_compose_paint(&view, vcx, id, "", 0, 0, &tags);
+    let (x0, y0, _, _) = p[0].expect("caret paints");
+    let adv = {
+        let p = q4_diff_compose_paint(&view, vcx, id, "abcd", 0, 4, &tags);
+        (p[0].expect("caret").0 - x0) / 4.0
+    };
+    assert!(adv > 4.0, "non-vacuous advance {adv}");
+    // Word wrap: "y…y tail" one column over the budget breaks AFTER the space,
+    // so the EOL caret sits 4 columns into the second row.
+    let w = crate::COMPOSE_WRAP_COLS;
+    let text = format!("{} tail", "y".repeat(w - 3));
+    let p = q4_diff_compose_paint(&view, vcx, id, &text, 0, w + 2, &tags);
+    let (x, y, _, _) = p[0].expect("caret paints on the wrapped row");
+    assert!(y > y0 + 5.0, "caret moved to the second row: y {y0} -> {y}");
+    assert!(
+        (x - (x0 + 4.0 * adv)).abs() < adv * 0.5,
+        "caret after the wrapped word 'tail' paints 4 cols in (x={x}, want {})",
+        x0 + 4.0 * adv
+    );
+    // Tab expansion: the caret after a TAB lands where it does after 4 spaces.
+    let spaces = q4_diff_compose_paint(&view, vcx, id, "    z", 0, 4, &tags)[0].expect("caret").0;
+    let tab = q4_diff_compose_paint(&view, vcx, id, "\tz", 0, 1, &tags)[0].expect("caret").0;
+    assert!((tab - spaces).abs() < 0.5, "caret after TAB x={tab}; after 4 spaces x={spaces}");
+}
+
+/// E4 (text-editing review): a LONG Diff comment can't squeeze the diff — the
+/// inline compose (kfa, GitHub-style) caps its editor at `COMPOSE_MAX_LINES`
+/// rows and scrolls its own window to the caret. Types a 31-line draft through
+/// the REAL keymap and proves from paint: the box's height is capped at 15 rows
+/// (12 editor + 3 chrome) though the draft is 31 lines, the diff list keeps its
+/// height, and the caret on the last line paints INSIDE the editor. (kfa
+/// already bounded it; this pins it — raising `COMPOSE_MAX_LINES` to 100 turns
+/// it RED: the box grows to 34 rows.)
+#[gpui::test]
+fn diff_compose_long_comment_is_height_capped_with_caret_inside(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let (view, vcx, id) = boot_with_diff(cx, temp.path().to_path_buf());
+    vcx.simulate_keystrokes("j j j c");
+    vcx.run_until_parked();
+    let tags = ["diff-comment-compose", "diff-compose-editor", "diff-compose-caret", "diff-list"];
+    let before = paint_diff_probes(&view, vcx, id, &tags);
+    let list0 = before[3].expect("diff list paints");
+    let mut keys = Vec::new();
+    for i in 0..30 {
+        keys.push(format!("{}", i % 10));
+        keys.push("enter".to_string());
+    }
+    keys.push("z".to_string());
+    vcx.simulate_keystrokes(&keys.join(" "));
+    vcx.run_until_parked();
+    let lines = diff_compose_text(&view, vcx, id).expect("compose open").lines().count();
+    assert_eq!(lines, 31, "the draft is 31 lines (far past the cap)");
+    let p = paint_diff_probes(&view, vcx, id, &tags);
+    let boxed = p[0].expect("compose paints");
+    let editor = p[1].expect("editor paints");
+    let caret = p[2].expect("caret on the last line paints");
+    let list = p[3].expect("diff list paints");
+    let row_h = f32::from(crate::diff_row_h(view.read_with(vcx, |v, _| v.text_scale)));
+    // The cap, spelled out (12 editor rows + 3 chrome rows) so a raised
+    // `COMPOSE_MAX_LINES` can't silently move the goalposts.
+    let cap = 15.0 * row_h;
+    assert!(boxed.3 <= cap + 1.0, "compose box {} tall exceeds the {cap}px cap", boxed.3);
+    assert!(boxed.3 >= cap - 2.0 * row_h, "non-vacuous: the box grew to (about) the cap: {}", boxed.3);
+    assert!((list.3 - list0.3).abs() < 1.0, "the diff list keeps its height: {list0:?} -> {list:?}");
+    assert!(
+        caret.1 >= editor.1 - 0.5 && caret.1 + caret.3 <= editor.1 + editor.3 + 0.5,
+        "caret {caret:?} inside the editor {editor:?}"
+    );
+}

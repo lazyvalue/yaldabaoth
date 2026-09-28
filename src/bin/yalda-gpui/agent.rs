@@ -1474,6 +1474,55 @@ pub(crate) fn build_wrapped_line(
     row.into_any_element()
 }
 
+/// How a chatbox row draws its caret (D14 — the one shared text-input
+/// renderer serves every compose surface).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CaretShape {
+    /// The app's block caret ([`make_caret_cells`]): a solid block in Insert,
+    /// the char drawn inside it in Normal. The agent compose / You-block.
+    Block,
+    /// A thin `w`-wide beam, `h` tall, tagged with layout probe `probe` (the
+    /// Diff tile's GitHub-style comment compose, zoom-scaled).
+    Beam { w: Pixels, h: Pixels, probe: &'static str },
+}
+
+/// Paint parameters for the shared chatbox row renderer
+/// ([`build_chatbox_line`] / [`build_chatbox_wrapped_line`]). The agent
+/// compose uses fixed chrome ([`ChatboxRowStyle::compose`]: 18px rows, 13px
+/// mono, block caret); the Diff comment compose passes zoom-scaled metrics
+/// and a beam caret.
+#[derive(Clone, Debug)]
+pub(crate) struct ChatboxRowStyle {
+    pub(crate) font: SharedString,
+    pub(crate) text_color: Hsla,
+    pub(crate) cursor_color: Hsla,
+    /// Theme-driven selection background — the same color the edit view
+    /// (`build_edit_body_*`) paints, so the highlight contrast tracks the theme.
+    pub(crate) selection_bg: Hsla,
+    pub(crate) line_h: Pixels,
+    pub(crate) text_size: Pixels,
+    pub(crate) caret: CaretShape,
+    /// Layout-probe tag for the caret's visual row (headless harness), if any.
+    pub(crate) row_probe: Option<&'static str>,
+}
+
+impl ChatboxRowStyle {
+    /// The agent compose / inline You-block style: 18px rows, 13px mono, block
+    /// caret, rows probed as `compose-cursor-row`.
+    pub(crate) fn compose(font: SharedString, text_color: Hsla, cursor_color: Hsla, selection_bg: Hsla) -> Self {
+        Self {
+            font,
+            text_color,
+            cursor_color,
+            selection_bg,
+            line_h: px(18.0),
+            text_size: px(13.0),
+            caret: CaretShape::Block,
+            row_probe: Some("compose-cursor-row"),
+        }
+    }
+}
+
 /// Render ONE visual row of a wrapped chatbox line: the char range
 /// `[row_start, row_start + row_len)` of the logical line (a [`wrap_line_cols`]
 /// row), drawn from the row's left edge. Slicing on the string boundary (not a
@@ -1492,22 +1541,15 @@ pub(crate) fn build_chatbox_line(
     is_cursor_line: bool,
     cursor_col: usize,
     mode: EditMode,
-    cursor_color: Hsla,
     sel: Option<((usize, usize), (usize, usize))>,
     line_idx: usize,
-    code_font: &SharedString,
-    text_color: Hsla,
-    selection_bg: Hsla,
     row_start: usize,
     row_len: usize,
+    style: &ChatboxRowStyle,
 ) -> AnyElement {
-    let line_h = px(18.0);
-    let fg: Hsla = text_color;
-    // Theme-driven selection background — the same color the edit view
-    // (`build_edit_body_*`) paints, so the chatbox highlight contrast tracks
-    // the active theme instead of a hardcoded Dracula swath that clashes on
-    // light/non-Dracula themes.
-    let sel_bg: Hsla = selection_bg;
+    let line_h = style.line_h;
+    let fg: Hsla = style.text_color;
+    let sel_bg: Hsla = style.selection_bg;
 
     let char_count = chars.len();
     let total_line_chars = char_count;
@@ -1541,15 +1583,15 @@ pub(crate) fn build_chatbox_line(
         .min_w_0()
         .w_full()
         .min_h(line_h)
-        // Pin the text line-box to the caret height (18px) so a line carrying
-        // a glyph is exactly as tall as the empty/placeholder line (which only
-        // holds the fixed-height caret).
+        // Pin the text line-box to the row height so a line carrying a glyph
+        // is exactly as tall as the empty/placeholder line (which only holds
+        // the fixed-height caret).
         .line_height(line_h)
         // Belt-and-suspenders clip: the slice is sized to fit by construction,
         // but a fractional last column never spills past the box edge.
         .overflow_hidden()
-        .font_family(code_font.clone())
-        .text_size(px(13.0))
+        .font_family(style.font.clone())
+        .text_size(style.text_size)
         .text_color(fg);
 
     // Emit a chunk of the SLICE with the selection highlight painted through any
@@ -1608,18 +1650,27 @@ pub(crate) fn build_chatbox_line(
                 row = emit_chunk(row, before, 0);
             }
             let cursor_char = slice.get(rel).copied().unwrap_or(' ');
-            // D15: in Normal mode the block covers the char's cells (a wide
-            // char is 2 columns); the Insert beam is always one column.
-            let caret_cells = match mode {
-                EditMode::Normal => char_cells(cursor_char).max(1),
-                EditMode::Insert => 1,
-            };
-            row = row.child(make_caret_cells(mode, cursor_char, cursor_color, caret_cells));
-            // Normal mode consumes the char under the caret; Insert is a
-            // zero-width beam so that char stays in the after-stream.
-            let after_start = match mode {
-                EditMode::Normal => rel + 1,
-                EditMode::Insert => rel,
+            row = row.child(match style.caret {
+                CaretShape::Block => {
+                    // D15: in Normal mode the block covers the char's cells (a
+                    // wide char is 2 columns); the Insert block is one column.
+                    let caret_cells = match mode {
+                        EditMode::Normal => char_cells(cursor_char).max(1),
+                        EditMode::Insert => 1,
+                    };
+                    make_caret_cells(mode, cursor_char, style.cursor_color, caret_cells)
+                }
+                CaretShape::Beam { w, h, probe } => probe_bounds(
+                    probe,
+                    div().flex_none().w(w).h(h).bg(style.cursor_color).into_any_element(),
+                ),
+            });
+            // A Normal-mode BLOCK consumes the char under the caret (drawn
+            // inside it); Insert — and any beam caret — leaves that char in
+            // the after-stream.
+            let after_start = match (mode, style.caret) {
+                (EditMode::Normal, CaretShape::Block) => rel + 1,
+                _ => rel,
             };
             if after_start < slice_len {
                 let after: String = slice[after_start..].iter().collect();
@@ -1633,10 +1684,9 @@ pub(crate) fn build_chatbox_line(
     // can read its PAINTED bounds and prove it's inside the compose box — the
     // virtualized list never paints an off-screen row, so a missing probe means
     // the caret fell below the fold. No-op in production. Pins UXI-TextEditing-1 at paint.
-    if is_cursor_line {
-        probe_bounds("compose-cursor-row", el)
-    } else {
-        el
+    match style.row_probe {
+        Some(tag) if is_cursor_line => probe_bounds(tag, el),
+        _ => el,
     }
 }
 
@@ -1724,11 +1774,6 @@ pub(crate) fn caret_visual_row(rows: &[(usize, usize)], cursor_col: usize) -> us
     rows.len().saturating_sub(1)
 }
 
-/// Render one LOGICAL compose line as a column of wrapped visual rows (UXI-AgentTile-9).
-/// Each visual row is drawn by [`build_chatbox_line`] over exactly its own char
-/// range, so nothing is clipped and no horizontal scroll is needed; the caret is
-/// placed on the single visual row that holds `cursor_col`.
-#[allow(clippy::too_many_arguments)]
 /// UXI-Blockquote-1: is `line` a markdown blockquote line — a `>` marker after
 /// at most leading whitespace? The classification seam behind the italic styling
 /// of `>`-quoted text on the compose / You-block surfaces (the paint itself is a
@@ -1739,18 +1784,19 @@ pub(crate) fn is_blockquote_line(line: &str) -> bool {
     line.trim_start().starts_with('>')
 }
 
+/// Render one LOGICAL compose line as a column of wrapped visual rows (UXI-AgentTile-9).
+/// Each visual row is drawn by [`build_chatbox_line`] over exactly its own char
+/// range, so nothing is clipped and no horizontal scroll is needed; the caret is
+/// placed on the single visual row that holds `cursor_col`.
 pub(crate) fn build_chatbox_wrapped_line(
     full_text: &str,
     is_cursor_line: bool,
     cursor_col: usize,
     mode: EditMode,
-    cursor_color: Hsla,
     sel: Option<((usize, usize), (usize, usize))>,
     line_idx: usize,
-    code_font: &SharedString,
-    text_color: Hsla,
-    selection_bg: Hsla,
     wrap_cols: usize,
+    style: &ChatboxRowStyle,
 ) -> AnyElement {
     let chars: Vec<char> = full_text.chars().collect();
     let rows = wrap_line_cols(&chars, wrap_cols);
@@ -1774,14 +1820,11 @@ pub(crate) fn build_chatbox_wrapped_line(
             caret_row == Some(r),
             cursor_col,
             mode,
-            cursor_color,
             sel,
             line_idx,
-            code_font,
-            text_color,
-            selection_bg,
             rs,
             re - rs,
+            style,
         ));
     }
     col.into_any_element()

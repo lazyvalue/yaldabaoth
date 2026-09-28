@@ -1439,6 +1439,12 @@ impl YaldaGpuiView {
             // chatbox highlight contrast matches the rest of the app.
             let compose_selection_bg: Hsla = nc(at.selection_bg);
             let compose_code_font = self.code_font.clone();
+            let row_style = ChatboxRowStyle::compose(
+                compose_code_font.clone(),
+                compose_fg,
+                compose_cursor_color,
+                compose_selection_bg,
+            );
             let separator = div().w_full().h(px(1.0)).bg(dim_fg);
 
             // ── Caret-containment window (spec-chatbox-caret-containment.md). ──
@@ -1478,13 +1484,10 @@ impl YaldaGpuiView {
                         i == compose_cursor_line,
                         compose_cursor_col,
                         compose_mode,
-                        compose_cursor_color,
                         compose_sel,
                         i,
-                        &compose_code_font,
-                        compose_fg,
-                        compose_selection_bg,
                         visible_cols,
+                        &row_style,
                     ));
                 }
                 div()
@@ -1558,10 +1561,7 @@ impl YaldaGpuiView {
                     item_ix,
                     offset_in_item: gpui::px(offset_rows as f32 * line_h),
                 });
-                let font = compose_code_font.clone();
-                let cur_color = compose_cursor_color;
-                let fg = compose_fg;
-                let sel_bg = compose_selection_bg;
+                let row_style = row_style.clone();
                 let render_fn =
                     move |idx: usize, _w: &mut Window, _a: &mut GpuiApp| -> AnyElement {
                         let Some(line_text) = lines_snap.get(idx) else {
@@ -1572,13 +1572,10 @@ impl YaldaGpuiView {
                             idx == compose_cursor_line,
                             compose_cursor_col,
                             compose_mode,
-                            cur_color,
                             compose_sel,
                             idx,
-                            &font,
-                            fg,
-                            sel_bg,
                             visible_cols,
+                            &row_style,
                         )
                     };
                 div()
@@ -2659,9 +2656,24 @@ impl YaldaGpuiView {
         let header_bg = bg.blend(Hsla { a: 0.65, ..selected_bg });
         let hairline = bg.blend(Hsla { a: 0.55, ..dim });
 
+        // D14: the SHARED chatbox layout + row renderer (word wrap in cells,
+        // reserved EOL-caret column, tab expansion, selection) — only the
+        // metrics (zoom-scaled rows) and the thin beam caret are Diff's own.
         let laid = compose.visual_lines();
-        let top = compose_window_top(laid.caret.0, laid.lines.len());
+        let top = compose_window_top(laid.caret.0, laid.rows.len());
         let shown = slots.saturating_sub(COMPOSE_CHROME_ROWS).max(1);
+        let doc = compose.input.editor.document();
+        let sel = display_selection(doc, compose.input.editor.selection_range());
+        let row_style = ChatboxRowStyle {
+            font: self.code_font.clone(),
+            text_color: fg,
+            cursor_color: accent,
+            selection_bg: nc(self.theme.agent.selection_bg),
+            line_h: row_h,
+            text_size: text_px,
+            caret: CaretShape::Beam { w: px(2.0), h: row_h * 0.7, probe: "diff-compose-caret" },
+            row_probe: None,
+        };
         let mut editor = div()
             .flex()
             .flex_col()
@@ -2675,24 +2687,25 @@ impl YaldaGpuiView {
             .font_family(self.code_font.clone())
             .text_size(text_px)
             .text_color(fg);
-        for (i, line) in laid.lines.iter().enumerate().skip(top).take(shown) {
-            let mut row = div().flex().flex_row().items_center().flex_none().h(row_h).whitespace_nowrap();
-            if i == laid.caret.0 {
-                let split = line.char_indices().nth(laid.caret.1).map_or(line.len(), |(b, _)| b);
-                let (before, after) = line.split_at(split);
-                row = row
-                    .child(SharedString::from(before.to_string()))
-                    .child(
-                        probe_bounds(
-                            "diff-compose-caret",
-                            div().flex_none().w(px(2.0)).h(row_h * 0.7).bg(accent).into_any_element(),
-                        ),
-                    )
-                    .child(SharedString::from(after.to_string()));
-            } else {
-                row = row.child(SharedString::from(line.clone()));
+        let mut line_chars: Option<(usize, Vec<char>)> = None;
+        for (i, &(li, rs, re)) in laid.rows.iter().enumerate().skip(top).take(shown) {
+            if line_chars.as_ref().is_none_or(|(l, _)| *l != li) {
+                line_chars = Some((li, laid.lines[li].chars().collect()));
             }
-            editor = editor.child(row);
+            let chars = &line_chars.as_ref().expect("set above").1;
+            editor = editor.child(
+                div().flex_none().h(row_h).child(build_chatbox_line(
+                    chars,
+                    i == laid.caret.0,
+                    laid.caret.1,
+                    compose.input.mode,
+                    sel,
+                    li,
+                    rs,
+                    re - rs,
+                    &row_style,
+                )),
+            );
         }
 
         let caption = match &compose.target {
