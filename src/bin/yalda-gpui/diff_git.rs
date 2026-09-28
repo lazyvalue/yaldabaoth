@@ -193,6 +193,104 @@ pub(crate) async fn collect_raw_diff(
     })
 }
 
+/// One entry of `git worktree list --porcelain` (spec rev 2 B1 — the rows of
+/// the unbound Diff tile's worktree picker).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorktreeEntry {
+    /// Absolute worktree root.
+    pub(crate) path: PathBuf,
+    /// `HEAD` commit SHA (empty for a fresh repo with no commits).
+    pub(crate) head: String,
+    /// Checked-out branch with `refs/heads/` stripped; `None` when detached.
+    pub(crate) branch: Option<String>,
+    pub(crate) detached: bool,
+    /// The first entry git lists — the primary checkout.
+    pub(crate) is_primary: bool,
+}
+
+impl WorktreeEntry {
+    /// The picker's prominent label: the branch, else `detached @ <sha8>`.
+    pub(crate) fn label(&self) -> String {
+        match &self.branch {
+            Some(b) => b.clone(),
+            None => format!("detached @ {}", &self.head[..self.head.len().min(8)]),
+        }
+    }
+}
+
+/// Parse `git worktree list --porcelain` output. Pure (unit-tested without
+/// git). Bare entries and entries whose path no longer exists (prunable /
+/// deleted out from under git) are skipped; `is_primary` marks the FIRST
+/// entry git reports (git always lists the primary checkout first).
+pub(crate) fn parse_worktree_porcelain(text: &str) -> Vec<WorktreeEntry> {
+    struct Raw {
+        path: PathBuf,
+        head: String,
+        branch: Option<String>,
+        detached: bool,
+        bare: bool,
+    }
+    let mut raws: Vec<Raw> = Vec::new();
+    for line in text.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            raws.push(Raw {
+                path: PathBuf::from(p),
+                head: String::new(),
+                branch: None,
+                detached: false,
+                bare: false,
+            });
+            continue;
+        }
+        let Some(cur) = raws.last_mut() else { continue };
+        if let Some(h) = line.strip_prefix("HEAD ") {
+            cur.head = h.to_string();
+        } else if let Some(b) = line.strip_prefix("branch ") {
+            cur.branch = Some(b.strip_prefix("refs/heads/").unwrap_or(b).to_string());
+        } else if line == "detached" {
+            cur.detached = true;
+        } else if line == "bare" {
+            cur.bare = true;
+        }
+    }
+    raws.into_iter()
+        .enumerate()
+        .filter(|(_, r)| !r.bare && r.path.is_dir())
+        .map(|(i, r)| WorktreeEntry {
+            path: r.path,
+            head: r.head,
+            branch: r.branch,
+            detached: r.detached,
+            is_primary: i == 0,
+        })
+        .collect()
+}
+
+/// List every worktree of the repo containing `repo_dir` (spec rev 2 B1,
+/// § Interfaces). Blocking — run on the background executor, never the paint
+/// path (C2). A non-repo / missing dir is an `Err` value, never a panic.
+pub(crate) fn list_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeEntry>, GitDiffError> {
+    if !repo_dir.is_dir() {
+        return Err(GitDiffError::InvalidWorktree(repo_dir.to_path_buf()));
+    }
+    let out = run_git(repo_dir, &["worktree", "list", "--porcelain"])?;
+    Ok(parse_worktree_porcelain(&out))
+}
+
+impl GitDiffError {
+    /// `true` when git refused because `dir` is not inside any repository —
+    /// the picker renders that as the plain "Not inside a git repository."
+    /// state rather than an error (spec B1).
+    pub(crate) fn is_not_a_repo(&self) -> bool {
+        match self {
+            GitDiffError::CommandFailed { stderr, .. } => {
+                stderr.to_ascii_lowercase().contains("not a git repository")
+            }
+            _ => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,4 +453,86 @@ mod tests {
         );
     }
 
+    /// Spec rev 2 B1: a repo with a linked worktree lists both — primary
+    /// first (flagged), branch names with `refs/heads/` stripped, real paths.
+    #[test]
+    fn list_worktrees_lists_primary_and_linked_worktree() {
+        let temp = build_fixture();
+        let primary = temp.path().to_path_buf();
+        let linked_parent = tempfile::tempdir().expect("tempdir");
+        let linked = linked_parent.path().join("wt-topic");
+        git_ok(
+            &primary,
+            &["worktree", "add", "--quiet", "-b", "topic", linked.to_str().unwrap()],
+        );
+
+        let rows = list_worktrees(&primary).expect("list_worktrees on a real repo");
+        assert_eq!(rows.len(), 2, "primary + linked worktree: {rows:?}");
+        assert!(rows[0].is_primary && !rows[1].is_primary);
+        assert_eq!(rows[0].branch.as_deref(), Some("feature"));
+        assert_eq!(rows[1].branch.as_deref(), Some("topic"));
+        assert_eq!(
+            rows[1].path.canonicalize().unwrap(),
+            linked.canonicalize().unwrap()
+        );
+        assert!(!rows[1].head.is_empty());
+
+        // Listing from INSIDE the linked worktree finds the same set.
+        let from_linked = list_worktrees(&linked).expect("list from linked");
+        assert_eq!(from_linked.len(), 2);
+        assert!(from_linked[0].is_primary);
+    }
+
+    /// A worktree whose directory was deleted (prunable) is skipped, not
+    /// listed as a dead row.
+    #[test]
+    fn list_worktrees_skips_deleted_worktree() {
+        let temp = build_fixture();
+        let primary = temp.path().to_path_buf();
+        let linked_parent = tempfile::tempdir().expect("tempdir");
+        let linked = linked_parent.path().join("wt-gone");
+        git_ok(
+            &primary,
+            &["worktree", "add", "--quiet", "-b", "gone", linked.to_str().unwrap()],
+        );
+        std::fs::remove_dir_all(&linked).unwrap();
+        let rows = list_worktrees(&primary).expect("list");
+        assert_eq!(rows.len(), 1, "deleted worktree must be skipped: {rows:?}");
+        assert!(rows[0].is_primary);
+    }
+
+    /// Non-repo dir ⇒ an `Err` value flagged not-a-repo; missing dir ⇒
+    /// `InvalidWorktree`. Never a panic.
+    #[test]
+    fn list_worktrees_non_repo_is_error_value() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let err = list_worktrees(temp.path()).expect_err("non-repo must error");
+        assert!(err.is_not_a_repo(), "expected not-a-repo, got {err:?}");
+        let bogus = PathBuf::from("/nonexistent/definitely-not-a-repo-wt-list");
+        assert_eq!(
+            list_worktrees(&bogus),
+            Err(GitDiffError::InvalidWorktree(bogus))
+        );
+    }
+
+    #[test]
+    fn parse_worktree_porcelain_handles_detached_and_bare() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let text = format!(
+            "worktree {}\nbare\n\nworktree {}\nHEAD 0123456789abcdef\ndetached\n\nworktree {}\nHEAD fff\nbranch refs/heads/x/y\n\n",
+            dir.path().display(),
+            a.display(),
+            b.display()
+        );
+        let rows = parse_worktree_porcelain(&text);
+        assert_eq!(rows.len(), 2, "bare entry skipped: {rows:?}");
+        assert!(rows[0].detached && rows[0].branch.is_none());
+        assert_eq!(rows[0].label(), "detached @ 01234567");
+        assert_eq!(rows[1].branch.as_deref(), Some("x/y"));
+        assert!(!rows[0].is_primary && !rows[1].is_primary, "primary was the bare entry");
+    }
 }

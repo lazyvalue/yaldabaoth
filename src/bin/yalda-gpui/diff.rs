@@ -17,26 +17,6 @@
 
 use super::*;
 
-/// Cog node `badge-projection` (1cxd), spec B6 / § Data Model: a root-owned,
-/// worktree-keyed projection of the unreviewed-hunk count, updated ONLY at
-/// `DiffModel` derive time (`diff_apply`, `diff_ui.rs`) — never by a
-/// background scan. Lives on `YaldaGpuiView` (not on any `DiffTile`), so it
-/// survives a tile close and is shared by every tile watching one worktree
-/// (last derive wins). Not persisted: a worktree never opened in a Diff tile
-/// this session has no entry, and a count goes stale-frozen once nothing
-/// refreshes that worktree — both per spec B6.
-pub(crate) type DiffProjections = HashMap<PathBuf, usize>;
-
-/// What a Diff tile shows the cumulative diff for (spec § Data Model).
-#[derive(Clone, PartialEq, Eq)]
-pub(crate) enum DiffSource {
-    /// Worktree derived from a session's `cwd` at bind time (spec B1).
-    Session(SessionId),
-    /// An explicit worktree, no session — e.g. restored from disk (spec
-    /// "Persistence": a session-bound tile always restores `Path`-bound).
-    Path(PathBuf),
-}
-
 /// The focused hunk, addressed by (file index, hunk index within that
 /// file's `Vec<Hunk>`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -45,65 +25,72 @@ pub(crate) struct DiffFocus {
     pub(crate) hunk: usize,
 }
 
-/// Snapshot of the hunk a comment compose is anchored to (spec B4), captured
-/// at OPEN time (`open_hunk_comment`, `diff_ui.rs`) rather than read live off
-/// `DiffTile.model` at submit time — a background refresh (spec B3) can land
-/// mid-compose and the tile's `focus`/`model` can move on, but the comment
-/// compose is a short-lived side conversation about the hunk as it looked
-/// when `c` was pressed, not a live view that would need to track a refresh.
-#[derive(Clone)]
-pub(crate) struct CommentTarget {
-    /// Repo-relative path of the file the commented hunk belongs to.
-    pub(crate) path: PathBuf,
-    /// Inclusive new-file line range (`Hunk::new_line_range`).
-    pub(crate) line_range: (usize, usize),
-    /// Verbatim hunk patch text (`Hunk::patch_text`) — header + prefixed lines.
-    pub(crate) patch: String,
+/// The unbound tile's worktree picker (spec rev 2 B1, UXI-Diff-10): every
+/// `git worktree list` entry of the repo containing the active workspace's
+/// cwd, plus a trailing "Pick a folder…" row. `selected` ranges over
+/// `0..=rows.len()` — index `rows.len()` IS the folder row, so the folder row
+/// is always selectable (the only row when outside a git repo).
+#[derive(Default)]
+pub(crate) struct WorktreePicker {
+    pub(crate) rows: Vec<WorktreeEntry>,
+    pub(crate) selected: usize,
+    /// A `list_worktrees` load is in flight.
+    pub(crate) loading: bool,
+    /// The last load found no git repository at the resolved directory.
+    pub(crate) not_a_repo: bool,
+    /// Any other load failure (git missing, …) — shown inline; the folder
+    /// row stays available.
+    pub(crate) error: Option<String>,
+    /// `true` until a load has been kicked for this picker showing — the
+    /// per-frame reconcile (`diff_reconcile`, `diff_ui.rs`) kicks it off the
+    /// render path (a tile restored unbound never ran `open_diff_inner`).
+    pub(crate) needs_load: bool,
+    /// Stale-load guard (mirrors `DiffTile::req`).
+    pub(crate) req: u64,
+    /// Bumped on EVERY picker mutation — `DiffView`'s cheap fingerprint for
+    /// the whole picker (`DiffSeqs::picker_gen`).
+    pub(crate) gen_: u64,
 }
 
-/// Build the outgoing prompt for a hunk comment (spec B4): a machine-readable
-/// prefix — repo-relative path, new-line range, and the hunk's verbatim patch
-/// text, fenced so the agent can cleanly separate it from the human comment
-/// that follows — then the user's typed comment. Pure and unit-tested
-/// independent of the send path; `submit_hunk_comment` (`diff_ui.rs`) is the
-/// only caller.
-pub(crate) fn build_hunk_comment_prompt(
-    path: &std::path::Path,
-    line_range: (usize, usize),
-    patch: &str,
-    comment: &str,
-) -> String {
-    format!(
-        "Review comment on a diff hunk:\n```\npath: {}\nlines {}-{}\n{}\n```\n{}",
-        path.display(),
-        line_range.0,
-        line_range.1,
-        patch.trim_end_matches('\n'),
-        comment.trim()
-    )
+impl WorktreePicker {
+    /// Number of selectable rows: every worktree + the folder row.
+    pub(crate) fn row_count(&self) -> usize {
+        self.rows.len() + 1
+    }
+
+    /// Index of the trailing "Pick a folder…" row.
+    pub(crate) fn folder_index(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Move the selection by `delta`, clamped (no wrap) to the row range.
+    pub(crate) fn move_selection(&mut self, delta: i32) {
+        let max = self.row_count() as i32 - 1;
+        let next = (self.selected as i32 + delta).clamp(0, max) as usize;
+        if next != self.selected {
+            self.selected = next;
+            self.gen_ = self.gen_.wrapping_add(1);
+        }
+    }
+
+    pub(crate) fn bump(&mut self) {
+        self.gen_ = self.gen_.wrapping_add(1);
+    }
 }
 
-/// A Diff tile's payload (spec § Data Model). `compose` is the hunk-comment
-/// surface (spec B4, "comment → steering") — opened by `open_hunk_comment`,
-/// paired with `comment_target` (the hunk it's anchored to); `None` when no
-/// comment is being composed (the tile's default, and its only insert-mode
-/// surface — spec B9).
+/// A Diff tile's payload (spec rev 2 § Data Model). `worktree: None` ⇒ the
+/// tile renders the worktree picker; `Some` ⇒ it derives and shows that
+/// worktree's diff. No session binding (ADR-0039).
 pub(crate) struct DiffTile {
-    pub(crate) source: Option<DiffSource>,
+    /// The bound worktree root (`None` ⇒ picker).
+    pub(crate) worktree: Option<PathBuf>,
+    /// Picker state — meaningful only while `worktree` is `None`.
+    pub(crate) picker: WorktreePicker,
     /// Last successfully derived diff (kept during a refresh — spec B3:
     /// "the tile shows the previous model until the new one lands").
     pub(crate) model: Option<DiffModel>,
     pub(crate) focus: DiffFocus,
     pub(crate) collapsed: HashSet<PathBuf>,
-    /// The open hunk-comment compose (spec B4) — the tile's only insert-mode
-    /// surface (`focused_in_insert_mode`, `main.rs`, keys off `.is_some()`).
-    /// Opened by `open_hunk_comment`, cleared by `cancel_hunk_comment` (Esc)
-    /// or on a successful `submit_hunk_comment` (left intact on send failure
-    /// so the draft is never dropped).
-    pub(crate) compose: Option<Compose>,
-    /// The hunk `compose` is anchored to, snapshotted at open time (see
-    /// [`CommentTarget`]). Always `Some` exactly when `compose` is.
-    pub(crate) comment_target: Option<CommentTarget>,
     pub(crate) refreshing: bool,
     /// Monotonic guard so a stale in-flight refresh can't clobber a newer
     /// one (mirrors `LinearTile::req` / `CogTile::req`).
@@ -120,10 +107,9 @@ pub(crate) struct DiffTile {
     /// Error from the last failed derive (spec B1: a deleted worktree
     /// renders inline, never panics). Cleared on a new bind / success.
     pub(crate) error: Option<String>,
-    /// `true` until the first refresh has been kicked — a tile restored from
-    /// disk (or freshly bound) never ran an explicit "open" flow, so
-    /// `render_diff` kicks the derive once on first paint (mirrors
-    /// `CogTile::needs_load`).
+    /// `true` until the first derive has been kicked for the bound worktree —
+    /// a tile restored from disk never ran a bind flow, so the per-frame
+    /// reconcile (`diff_reconcile`) kicks it once (mirrors `CogTile::needs_load`).
     pub(crate) needs_load: bool,
     /// The cached body view — lazily created at first render (mirrors
     /// `LinearTile::view` / `CogTile::view`).
@@ -131,57 +117,43 @@ pub(crate) struct DiffTile {
 }
 
 impl DiffTile {
+    /// A fresh, UNBOUND tile — renders the worktree picker, whose list load
+    /// is kicked by the reconcile (or directly by `open_diff_inner`).
     pub(crate) fn new() -> Self {
         DiffTile {
-            source: None,
+            worktree: None,
+            picker: WorktreePicker {
+                needs_load: true,
+                ..WorktreePicker::default()
+            },
             model: None,
             focus: DiffFocus::default(),
             collapsed: HashSet::new(),
-            compose: None,
-            comment_target: None,
             refreshing: false,
             req: 0,
             model_gen: 0,
             collapsed_gen: 0,
             error: None,
-            needs_load: true,
+            needs_load: false,
             view: None,
         }
     }
 
-    pub(crate) fn bound_to_path(path: PathBuf) -> Self {
+    /// A tile bound to `path` whose first derive is still pending (restore).
+    pub(crate) fn bound_to(path: PathBuf) -> Self {
         let mut t = Self::new();
-        t.source = Some(DiffSource::Path(path));
+        t.worktree = Some(path);
+        t.picker.needs_load = false;
+        t.needs_load = true;
         t
     }
 
-    pub(crate) fn bound_to_session(id: SessionId) -> Self {
-        let mut t = Self::new();
-        t.source = Some(DiffSource::Session(id));
-        t
-    }
-
-    /// Tab / window title: the worktree dir name once known, else a generic
-    /// placeholder (mirrors `LinearTile::title`).
+    /// Tab / window title: the bound worktree's dir name, else "diff".
     pub(crate) fn title(&self) -> String {
-        self.worktree()
+        self.worktree
+            .as_ref()
             .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
             .unwrap_or_else(|| "diff".to_string())
-    }
-
-    /// The worktree path this tile is (or was last) deriving for. Used to
-    /// persist a session-bound tile as `Path`-bound (spec "Persistence") and
-    /// to fall back to `Path` binding when the bound session closes (spec
-    /// B1). Prefers the last-derived model's worktree (authoritative once
-    /// known) over the raw source.
-    pub(crate) fn worktree(&self) -> Option<PathBuf> {
-        self.model
-            .as_ref()
-            .map(|m| m.worktree.clone())
-            .or_else(|| match &self.source {
-                Some(DiffSource::Path(p)) => Some(p.clone()),
-                _ => None,
-            })
     }
 
     /// The currently-focused hunk's content hash, if any — used to preserve
@@ -292,63 +264,6 @@ impl DiffTile {
 /// actual `zed` launch (`diff_ui.rs::open_hunk_in_zed` is the only caller).
 pub(crate) fn zed_open_arg(worktree: &std::path::Path, rel_path: &std::path::Path, first_new_line: usize) -> String {
     format!("{}:{}", worktree.join(rel_path).display(), first_new_line)
-}
-
-#[cfg(test)]
-mod comment_prompt_tests {
-    use super::*;
-
-    /// Cog node `comment-steering` (hk81), spec B4: the built prompt must
-    /// carry the repo-relative path, the new-line range, the verbatim patch
-    /// text, and the user's comment — in that order, fenced so the agent can
-    /// tell the machine-readable context apart from the human text. This is
-    /// the pure-fn half of DONE_WHEN #1 (see `diff_ui.rs::submit_hunk_comment`
-    /// for the send-path half).
-    #[test]
-    fn build_hunk_comment_prompt_includes_path_range_patch_and_comment() {
-        let patch = "@@ -1,3 +1,3 @@\n fn foo() {\n-    old_line();\n+    new_line();\n }\n";
-        let prompt = build_hunk_comment_prompt(
-            std::path::Path::new("src/foo.rs"),
-            (10, 12),
-            patch,
-            "please rename this",
-        );
-        assert!(
-            prompt.contains("src/foo.rs"),
-            "prompt must carry the repo-relative path: {prompt:?}"
-        );
-        assert!(
-            prompt.contains("10-12") || prompt.contains("10") && prompt.contains("12"),
-            "prompt must carry the new-line range: {prompt:?}"
-        );
-        assert!(
-            prompt.contains("@@ -1,3 +1,3 @@"),
-            "prompt must carry the hunk header: {prompt:?}"
-        );
-        assert!(
-            prompt.contains("-    old_line();") && prompt.contains("+    new_line();"),
-            "prompt must carry the verbatim patch lines: {prompt:?}"
-        );
-        assert!(
-            prompt.contains("please rename this"),
-            "prompt must carry the user's comment: {prompt:?}"
-        );
-        // Order: path/range/patch (the machine-readable prefix) before the
-        // human comment, per spec B4 ("prefixed by machine-readable context").
-        let patch_pos = prompt.find("@@ -1,3").unwrap();
-        let comment_pos = prompt.find("please rename this").unwrap();
-        assert!(
-            patch_pos < comment_pos,
-            "the patch context must precede the comment text"
-        );
-    }
-
-    #[test]
-    fn build_hunk_comment_prompt_trims_comment_whitespace() {
-        let prompt =
-            build_hunk_comment_prompt(std::path::Path::new("a.rs"), (1, 1), "@@ -1 +1 @@\n", "  hi  \n");
-        assert!(prompt.trim_end().ends_with("hi"), "got {prompt:?}");
-    }
 }
 
 // ── Cog node `open-in-zed` (oc72): spec B8 ──────────────────────────────────

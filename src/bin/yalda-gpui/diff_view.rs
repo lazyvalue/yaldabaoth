@@ -36,31 +36,31 @@ use super::*;
 /// proxy for "did the derived diff change").
 #[derive(Clone, Copy, PartialEq, Default)]
 pub(crate) struct DiffSeqs {
-    has_source: bool,
+    bound: bool,
     model_gen: u64,
     focus: DiffFocus,
     collapsed_gen: u64,
     refreshing: bool,
     has_error: bool,
-    /// Number of sessions live in the store — so the unbound selector
-    /// re-renders when a session is created/closed elsewhere. Cheap (a
-    /// `BTreeMap::len()`).
-    session_count: usize,
+    /// `WorktreePicker::gen_` — bumped by every picker mutation (rows loaded,
+    /// selection moved, loading/not-a-repo/error flips), so the unbound
+    /// picker re-renders exactly when its own state moves.
+    picker_gen: u64,
     /// `text_scale.to_bits()` — global zoom input (UXI-TextZoom-1 pattern),
     /// falls out of the same root-observe fingerprint (see module docs).
     text_scale_bits: u32,
 }
 
 impl DiffSeqs {
-    pub(crate) fn of(tile: &DiffTile, session_count: usize, text_scale: f32) -> Self {
+    pub(crate) fn of(tile: &DiffTile, text_scale: f32) -> Self {
         DiffSeqs {
-            has_source: tile.source.is_some(),
+            bound: tile.worktree.is_some(),
             model_gen: tile.model_gen,
             focus: tile.focus,
             collapsed_gen: tile.collapsed_gen,
             refreshing: tile.refreshing,
             has_error: tile.error.is_some(),
-            session_count,
+            picker_gen: tile.picker.gen_,
             text_scale_bits: text_scale.to_bits(),
         }
     }
@@ -132,16 +132,17 @@ impl Render for DiffView {
             pt: 14.0 * scale,
         };
         let editor_bg = r.editor_bg();
+        let selected_bg: Hsla = nc(r.theme.overlay.selected_bg);
         let tile = r.diff_tile_ref(self.window_id);
 
         let body: AnyElement = match tile {
             None => div().size_full().into_any_element(),
             Some(t) => {
-                if let Some(err) = &t.error {
+                if t.worktree.is_none() {
+                    diff_picker_body(&t.picker, self.window_id, selected_bg, &st, cx)
+                        .into_any_element()
+                } else if let Some(err) = &t.error {
                     diff_error_body(err, &st).into_any_element()
-                } else if t.source.is_none() {
-                    let candidates = diff_eligible_sessions(r, cx);
-                    diff_selector_body(&candidates, &st).into_any_element()
                 } else if let Some(model) = &t.model {
                     diff_model_body(model, t.focus, &t.collapsed, &st).into_any_element()
                 } else {
@@ -150,10 +151,7 @@ impl Render for DiffView {
             }
         };
 
-        let session_count = r.sessions.ids().count();
-        self.last_rendered = tile
-            .map(|t| DiffSeqs::of(t, session_count, scale))
-            .unwrap_or_default();
+        self.last_rendered = tile.map(|t| DiffSeqs::of(t, scale)).unwrap_or_default();
 
         let scroll = self.scroll.clone();
         div()
@@ -171,45 +169,6 @@ impl Render for DiffView {
             .child(body)
             .into_any_element()
     }
-}
-
-/// Sessions eligible for the unbound-tile selector (spec B1): those whose
-/// `cwd` looks like a git worktree. A cheap bounded filesystem walk (stat
-/// calls for a `.git` entry, dir-or-file to cover linked worktrees) — NOT a
-/// git subprocess, so this stays inside the paint-path-purity budget (spec
-/// C2 bans git subprocesses / `ReviewState` I/O on render, not a handful of
-/// `Path::exists` stats already common elsewhere in this file's render paths).
-fn diff_eligible_sessions(
-    r: &YaldaGpuiView,
-    cx: &GpuiApp,
-) -> Vec<(SessionId, String, PathBuf)> {
-    r.sessions
-        .iter()
-        .map(|(id, s)| {
-            let s = s.read(cx);
-            (id, s.label.clone(), s.cwd.clone())
-        })
-        .filter(|(_, _, cwd)| looks_like_git_repo(cwd))
-        .collect()
-}
-
-/// Cheap, bounded upward walk for a `.git` entry (dir for a primary checkout,
-/// file for a linked worktree). No subprocess. `pub(crate)` — also used by
-/// `diff_ui.rs`'s selector digit-key binder (both must agree on eligibility).
-pub(crate) fn looks_like_git_repo(path: &std::path::Path) -> bool {
-    let mut cur = Some(path);
-    let mut hops = 0;
-    while let Some(p) = cur {
-        if p.join(".git").exists() {
-            return true;
-        }
-        cur = p.parent();
-        hops += 1;
-        if hops > 32 {
-            break;
-        }
-    }
-    false
 }
 
 // ── Domain body builders (Diff-specific; composed from yux primitives) ──────
@@ -248,62 +207,124 @@ fn diff_loading_body(refreshing: bool, st: &DetailStyle) -> gpui::Div {
         .child(SharedString::from(msg))
 }
 
-fn diff_selector_body(candidates: &[(SessionId, String, PathBuf)], st: &DetailStyle) -> gpui::Div {
-    let mut col = div().flex().flex_col().w_full().gap_2();
-    col = col.child(
-        div()
-            .text_color(st.dim)
-            .font_family(st.mono.clone())
-            .text_size(px(st.pt * 0.9))
-            .child(SharedString::from(
-                "No diff bound yet. Press a number to diff that session's worktree, \
-                 or `p` to diff the current workspace directory.",
-            )),
-    );
-    if candidates.is_empty() {
-        col = col.child(
-            div()
-                .text_color(st.dim)
-                .font_family(st.mono.clone())
-                .text_size(st.base)
-                .child(SharedString::from("No open sessions look like git worktrees.")),
-        );
-    } else {
-        for (i, (_, label, cwd)) in candidates.iter().enumerate().take(9) {
-            col = col.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap_2()
-                    .items_center()
-                    .w_full()
-                    .px_1()
-                    .font_family(st.mono.clone())
-                    .text_size(st.base)
-                    .child(
-                        div()
-                            .w(px(24.0))
-                            .flex_none()
-                            .text_color(st.accent)
-                            .child(SharedString::from(format!("{}.", i + 1))),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_color(st.fg)
-                            .child(SharedString::from(label.clone())),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_color(st.dim)
-                            .child(SharedString::from(cwd.display().to_string())),
-                    ),
-            );
+/// `$HOME/…` → `~/…` for the picker's dimmed path line.
+fn home_relative(path: &std::path::Path) -> String {
+    let raw = path.display().to_string();
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home).display().to_string();
+        if let Some(rest) = raw.strip_prefix(&home)
+            && (rest.is_empty() || rest.starts_with('/'))
+        {
+            return format!("~{rest}");
         }
     }
-    col
+    raw
+}
+
+/// The worktree picker (spec rev 2 B1, UXI-Diff-10): a title, one
+/// `picker_option_row_detailed` per worktree (branch prominent, home-relative
+/// path dimmed, a "primary" badge on the primary checkout), then the "Pick a
+/// folder…" row and the key-hint footer. Rows are clickable; the handler
+/// carries only the ROW INDEX and resolves the row at event time through the
+/// root (`diff_picker_activate`) — yux rule 4, since a cache hit replays this
+/// render's listeners.
+fn diff_picker_body(
+    picker: &WorktreePicker,
+    window_id: workspace::WindowId,
+    selected_bg: Hsla,
+    st: &DetailStyle,
+    cx: &Context<DiffView>,
+) -> gpui::Div {
+    let mut col = div().flex().flex_col().w_full().gap(px(2.0));
+    col = col.child(
+        div()
+            .pb_2()
+            .text_color(st.fg)
+            .font_family(st.prose.clone())
+            .font_weight(FontWeight::BOLD)
+            .text_size(px(st.pt * 1.2))
+            .child(SharedString::from("Review a worktree")),
+    );
+
+    let status: Option<(&str, Hsla)> = if picker.loading && picker.rows.is_empty() {
+        Some(("Finding worktrees…", st.dim))
+    } else if picker.not_a_repo {
+        Some(("Not inside a git repository.", st.dim))
+    } else {
+        picker.error.as_deref().map(|e| (e, st.err))
+    };
+    if let Some((text, color)) = status {
+        col = col.child(probe_bounds(
+            "diff-picker-status",
+            div()
+                .py_1()
+                .px(px(10.0))
+                .text_color(color)
+                .font_family(st.mono.clone())
+                .text_size(st.base)
+                .child(SharedString::from(text.to_string()))
+                .into_any_element(),
+        ));
+    }
+
+    let root_listener = |index: usize| {
+        cx.listener(move |this: &mut DiffView, _ev: &MouseDownEvent, _w, cx| {
+            let Some(root) = this.root.upgrade() else {
+                return;
+            };
+            let wid = this.window_id;
+            root.update(cx, |r, cx| r.diff_picker_activate(wid, index, cx));
+        })
+    };
+
+    for (i, row) in picker.rows.iter().enumerate() {
+        let label = row.label();
+        let path = home_relative(&row.path);
+        let el = picker_option_row_detailed(
+            SharedString::from(format!("diff-picker-row-{window_id}-{i}")),
+            "⎇",
+            &label,
+            Some((&path, st.dim)),
+            row.is_primary.then_some(("primary", st.dim)),
+            picker.selected == i,
+            st.accent,
+            st.fg,
+            selected_bg,
+            &st.prose,
+            &st.mono,
+        )
+        .on_mouse_down(MouseButton::Left, root_listener(i));
+        col = col.child(probe_bounds_dyn(
+            format!("diff-picker-row-{i}"),
+            el.into_any_element(),
+        ));
+    }
+
+    let folder = picker.folder_index();
+    let folder_row = picker_option_row(
+        SharedString::from(format!("diff-picker-folder-{window_id}")),
+        "…",
+        "Pick a folder…",
+        None,
+        picker.selected == folder,
+        st.accent,
+        st.accent,
+        selected_bg,
+        &st.prose,
+        &st.mono,
+    )
+    .on_mouse_down(MouseButton::Left, root_listener(folder));
+    col = col.child(probe_bounds("diff-picker-folder-row", folder_row.into_any_element()));
+
+    col.child(
+        div()
+            .pt_3()
+            .px(px(10.0))
+            .text_color(st.dim)
+            .font_family(st.mono.clone())
+            .text_size(px(12.0))
+            .child(SharedString::from("j/k move · enter review · p pick folder")),
+    )
 }
 
 /// First 8 hex chars of a SHA (ASCII, safe to byte-slice).

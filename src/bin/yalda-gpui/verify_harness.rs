@@ -1995,7 +1995,6 @@ fn agent_dot_status_mapping() {
         connected,
         awaiting,
         unread,
-        unreviewed_hunks: 0,
         tags: Vec::new(),
     };
     // Reply in flight → working (unread irrelevant while working).
@@ -8383,22 +8382,26 @@ fn focused_in_insert_mode_tracks_compose_not_transcript(cx: &mut TestAppContext)
 /// spec-diff-review.md B1) opens a fresh, UNBOUND `App::Diff` tile, which
 /// renders the selector. Drives the REAL entry point `open_diff_inner` — the
 /// same method the `OpenDiff` action / menu item calls — not a hand-built
-/// `App::Diff(DiffTile::bound_to_path(...))` the way `boot_with_diff`
+/// `App::Diff(DiffTile::bound_to(...))` the way `boot_with_diff`
 /// constructs its OWN fixture further down in this file.
 #[gpui::test]
 fn open_diff_inner_opens_unbound_diff_tile(cx: &mut TestAppContext) {
     let (view, vcx) = boot_browser(cx);
+    // The picker lists the active workspace's repo — point it at a non-repo
+    // tempdir so the test never reads a real repository (spec C5).
+    let scratch = tempfile::tempdir().expect("tempdir");
     view.update(vcx, |v, cx| {
+        v.test_set_active_workspace_cwd(scratch.path().to_path_buf());
         v.open_diff_inner(cx);
     });
     vcx.run_until_parked();
     view.update(vcx, |v, _cx| match v.workspace.focused_content() {
         Some(crate::App::Diff(tile)) => {
             assert!(
-                tile.source.is_none(),
+                tile.worktree.is_none(),
                 "a freshly opened Diff tile must be UNBOUND so it renders the \
-                 selector (spec B1), got source = {:?}",
-                tile.source.is_some()
+                 worktree picker (spec B1), got worktree = {:?}",
+                tile.worktree
             );
         }
         other => panic!(
@@ -10559,7 +10562,6 @@ fn session_tags_partition_folders_and_untagged() {
         connected: true,
         awaiting: Some(false),
         unread: false,
-        unreviewed_hunks: 0,
         order_sid: Some(label.into()),
         state_entered_at: None,
         tags: tags.iter().map(|s| s.to_string()).collect(),
@@ -11841,7 +11843,6 @@ fn jump_reorder_ordering_applies_and_defaults_to_alpha() {
         connected: true,
         awaiting: None,
         unread: false,
-        unreviewed_hunks: 0,
         order_sid: Some(sid.into()),
         state_entered_at: None,
         tags: Vec::new(),
@@ -11915,7 +11916,6 @@ fn jump_agent_state_tabs_filter_and_sort_without_moving_all() {
             connected: true,
             awaiting,
             unread,
-            unreviewed_hunks: 0,
             order_sid: Some(sid.into()),
             state_entered_at: Some(base - std::time::Duration::from_secs(age_secs)),
             tags: Vec::new(),
@@ -13855,7 +13855,6 @@ fn jump_panel_groups_agent_rows_by_cwd() {
         connected: true,
         awaiting: None,
         unread: false,
-        unreviewed_hunks: 0,
         tags: Vec::new(),
     };
     // Two projects, one with two sessions; input order is by-label (a,b,c).
@@ -29742,9 +29741,9 @@ fn diff_fixture_repo() -> tempfile::TempDir {
 }
 
 /// Boot a hermetic browser view, replace the focused tile with a `Diff` tile
-/// `Path`-bound to `worktree`, and kick its first derive via the REAL
-/// first-render path (`render_diff`'s `needs_load` check) by forcing a
-/// paint. Returns once the derive has settled.
+/// bound to `worktree` (the restore shape), and kick its first derive via
+/// the REAL per-frame reconcile (`diff_reconcile`'s `needs_load` kick) by
+/// forcing a paint. Returns once the derive has settled.
 fn boot_with_diff<'a>(
     cx: &'a mut TestAppContext,
     worktree: PathBuf,
@@ -29755,7 +29754,7 @@ fn boot_with_diff<'a>(
 ) {
     let (view, vcx) = boot_browser(cx);
     let id = view.update(vcx, |v, cx| {
-        v.set_screen(crate::App::Diff(crate::DiffTile::bound_to_path(worktree)));
+        v.set_screen(crate::App::Diff(crate::DiffTile::bound_to(worktree)));
         let id = v.workspace.focused_window_id().expect("focused Diff tile");
         cx.notify();
         id
@@ -29906,177 +29905,16 @@ fn diff_view_unrelated_root_notify_is_render_flat(cx: &mut TestAppContext) {
     );
 }
 
-// ── Cog node `refresh-triggers` (7ods): spec B3(a)/(b) automatic re-derive ──
-
-/// Boot a real session-bound Agent tile (`boot_with_transcript`, sid `S1`),
-/// point its `cwd` at `worktree`, then open a SEPARATE Diff tile
-/// `Session`-bound to the same session id alongside it (`split_focused`, not
-/// `set_screen` — this must NOT disturb the Agent tile, mirroring a real
-/// workspace where an agent session and its Diff review sit in two tiles at
-/// once). Returns once the Diff tile's first on-paint derive has settled.
-fn boot_diff_bound_to_session<'a>(
-    cx: &'a mut TestAppContext,
-    worktree: PathBuf,
-) -> (
-    gpui::Entity<YaldaGpuiView>,
-    &'a mut gpui::VisualTestContext,
-    crate::SessionId,
-    crate::workspace::WindowId,
-) {
-    let (view, vcx, id, session) = boot_with_transcript(cx);
-    session.update(vcx, |s, _cx| s.cwd = worktree);
-    let diff_id = view.update(vcx, |v, cx| {
-        let wid = v
-            .workspace
-            .split_focused(
-                crate::workspace::SplitDir::V,
-                crate::App::Diff(crate::DiffTile::bound_to_session(id)),
-            )
-            .expect("split for a second (Diff) tile");
-        cx.notify();
-        wid
-    });
-    vcx.run_until_parked();
-    (view, vcx, id, diff_id)
-}
-
-/// Cog node `refresh-triggers` (7ods), spec B3(a): "when a bound session's
-/// turn completes" re-derives any Diff tile sourced from it — through the
-/// REAL entry point (`apply_server_batch` folding a `TurnEnded` notification
-/// exactly as the live server pump would), not a hand-called `refresh_diff`.
-///
-/// Negative control (observed RED — see report): commenting out the
-/// `self.drain_diff_refresh_requests(cx);` call in `apply_server_batch`
-/// leaves `model_gen` unchanged after the `TurnEnded` batch.
+/// spec B3 "the cursor stays on the same file after a refresh": an `r`
+/// re-derive that changes a DIFFERENT file's hunk must leave the focused
+/// hunk's identity untouched. Paired with the "must re-derive" assert on
+/// `model_gen` so it can't pass vacuously.
 #[gpui::test]
-fn diff_tile_rederives_on_bound_session_turn_completion(cx: &mut TestAppContext) {
-    use yalda::session_proto::Notification as ServerNotification;
-
+fn diff_tile_refresh_preserves_focus_when_hunk_unchanged(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
     let temp = diff_fixture_repo();
     let worktree = temp.path().to_path_buf();
-    let (view, vcx, _id, diff_id) = boot_diff_bound_to_session(cx, worktree.clone());
-
-    let gen0 = view.read_with(vcx, |v, _| {
-        let tile = v.diff_tile_ref(diff_id).expect("Diff tile");
-        assert!(tile.model.is_some(), "first on-paint derive must have landed");
-        tile.model_gen
-    });
-
-    // Change the worktree so a genuine second derive would see something new
-    // (not asserted on directly — `model_gen` moving is the re-derive proof).
-    std::fs::write(worktree.join("a.txt"), "line1\nchanged a\nturn-triggered\n").unwrap();
-
-    view.update(vcx, |v, cx| {
-        v.apply_server_batch(
-            vec![ServerNotification::TurnEnded {
-                session_id: "S1".into(),
-                turn_count: 1,
-                generation: 0,
-            }],
-            cx,
-        );
-    });
-    vcx.run_until_parked();
-
-    let gen1 = view.read_with(vcx, |v, _| v.diff_tile_ref(diff_id).unwrap().model_gen);
-    assert!(
-        gen1 > gen0,
-        "a bound session's TurnEnded must re-derive its Diff tile (gen0={gen0}, gen1={gen1})"
-    );
-}
-
-/// Cog node `refresh-triggers` (7ods), spec B3(b): "debounced after any
-/// tool-call completion... that reports file changes". Two file-editing tool
-/// calls complete back-to-back (well inside the debounce window) — this must
-/// coalesce to exactly ONE re-derive, not two, and NONE before the window
-/// elapses. Drives the real `apply_server_batch` → reducer → drain → spawned
-/// debounce task path; the test controls time via the deterministic test
-/// executor (`advance_clock`), never a wall-clock sleep.
-///
-/// Negative control (observed RED — see report): commenting out the
-/// `self.drain_diff_file_change_requests(cx);` call leaves `model_gen`
-/// unchanged even after the debounce window elapses.
-#[gpui::test]
-fn diff_tile_rederives_debounced_after_file_changing_tool_call(cx: &mut TestAppContext) {
-    use yalda::acp_channel::{ReplyEvent, ToolCall, ToolCallStatus, ToolKind};
-    use yalda::session_proto::Notification as ServerNotification;
-
-    let temp = diff_fixture_repo();
-    let worktree = temp.path().to_path_buf();
-    let (view, vcx, _id, diff_id) = boot_diff_bound_to_session(cx, worktree.clone());
-    let gen0 = view.read_with(vcx, |v, _| v.diff_tile_ref(diff_id).unwrap().model_gen);
-
-    let ev = |e: ReplyEvent| ServerNotification::ReplyEvent {
-        session_id: "S1".into(),
-        event: e,
-    };
-    let edit_call = |tool_id: &str, path: &std::path::Path| {
-        let mut tc = ToolCall::new(tool_id.to_string(), format!("Edit {}", path.display()));
-        tc.kind = ToolKind::Edit;
-        tc.status = ToolCallStatus::Completed;
-        tc.raw_input = Some(serde_json::json!({ "file_path": path.to_string_lossy() }));
-        tc
-    };
-
-    // First completed file edit.
-    view.update(vcx, |v, cx| {
-        v.apply_server_batch(
-            vec![ev(ReplyEvent::ToolCallStarted(edit_call(
-                "tool-edit-1",
-                &worktree.join("a.txt"),
-            )))],
-            cx,
-        );
-    });
-    vcx.run_until_parked();
-
-    // A second completed file edit arrives immediately (same tick), well
-    // inside the debounce window — must coalesce with the first.
-    view.update(vcx, |v, cx| {
-        v.apply_server_batch(
-            vec![ev(ReplyEvent::ToolCallStarted(edit_call(
-                "tool-edit-2",
-                &worktree.join("b.txt"),
-            )))],
-            cx,
-        );
-    });
-    vcx.run_until_parked();
-
-    let gen_before_window = view.read_with(vcx, |v, _| v.diff_tile_ref(diff_id).unwrap().model_gen);
-    assert_eq!(
-        gen_before_window, gen0,
-        "must NOT re-derive before the debounce window elapses"
-    );
-
-    vcx.executor()
-        .advance_clock(crate::YaldaGpuiView::DIFF_FILE_CHANGE_DEBOUNCE);
-    vcx.run_until_parked();
-
-    let gen_after = view.read_with(vcx, |v, _| v.diff_tile_ref(diff_id).unwrap().model_gen);
-    assert_eq!(
-        gen_after,
-        gen0 + 1,
-        "two completions inside one debounce window must coalesce to exactly \
-         ONE re-derive (gen0={gen0}, got {gen_after})"
-    );
-}
-
-/// spec B3 "Hunk focus survives refresh when the focused hunk's hash still
-/// exists": a triggered (not manual) re-derive that changes a DIFFERENT
-/// file's hunk must leave the focused hunk's identity untouched.
-///
-/// Negative control (observed RED — see report): commenting out the trigger
-/// wiring leaves this test vacuously passing for the wrong reason (no
-/// re-derive at all) — paired with the "must re-derive" assert on `model_gen`
-/// above, which fails RED in that state, so the pairing is meaningful.
-#[gpui::test]
-fn diff_tile_triggered_refresh_preserves_focus_when_hunk_unchanged(cx: &mut TestAppContext) {
-    use yalda::session_proto::Notification as ServerNotification;
-
-    let temp = diff_fixture_repo();
-    let worktree = temp.path().to_path_buf();
-    let (view, vcx, _id, diff_id) = boot_diff_bound_to_session(cx, worktree.clone());
+    let (view, vcx, diff_id) = boot_with_diff(cx, worktree.clone());
 
     let (gen0, file0_name, prev_hash) = view.read_with(vcx, |v, _| {
         let tile = v.diff_tile_ref(diff_id).expect("Diff tile");
@@ -30098,16 +29936,7 @@ fn diff_tile_triggered_refresh_preserves_focus_when_hunk_unchanged(cx: &mut Test
     // hash must be identical after the re-derive.
     std::fs::write(worktree.join("b.txt"), "line1\nchanged b\nmore\n").unwrap();
 
-    view.update(vcx, |v, cx| {
-        v.apply_server_batch(
-            vec![ServerNotification::TurnEnded {
-                session_id: "S1".into(),
-                turn_count: 1,
-                generation: 0,
-            }],
-            cx,
-        );
-    });
+    vcx.simulate_keystrokes("r");
     vcx.run_until_parked();
 
     view.read_with(vcx, |v, _| {
@@ -30126,26 +29955,20 @@ fn diff_tile_triggered_refresh_preserves_focus_when_hunk_unchanged(cx: &mut Test
             tile.focused_hunk_hash(),
             Some(prev_hash),
             "an unchanged hunk's hash (and thus focus identity) must survive a \
-             triggered refresh"
+             refresh"
         );
     });
 }
 
-/// spec B3 "otherwise focus moves to the nearest hunk": a triggered re-derive
-/// that removes the CURRENTLY FOCUSED hunk (its content changed back to
-/// match the merge-base, so the hunk disappears from the model entirely)
-/// must move focus to the nearest surviving hunk — not panic, not point at a
-/// stale/out-of-range index. Drives spec B3(b) (the debounced tool-call
-/// trigger) for this assertion, so both triggers get focus-survival coverage
-/// across the two tests.
+/// spec B3 "nearest line" fallback: a re-derive that removes the CURRENTLY
+/// FOCUSED hunk (its content changed back to match the merge-base, so the
+/// hunk disappears from the model entirely) must move focus to the nearest
+/// surviving hunk — not panic, not point at a stale/out-of-range index.
 #[gpui::test]
-fn diff_tile_triggered_refresh_moves_focus_to_nearest_when_hunk_hash_gone(cx: &mut TestAppContext) {
-    use yalda::acp_channel::{ReplyEvent, ToolCall, ToolCallStatus, ToolKind};
-    use yalda::session_proto::Notification as ServerNotification;
-
+fn diff_tile_refresh_moves_focus_to_nearest_when_hunk_hash_gone(cx: &mut TestAppContext) {
     let temp = diff_fixture_repo();
     let worktree = temp.path().to_path_buf();
-    let (view, vcx, _id, diff_id) = boot_diff_bound_to_session(cx, worktree.clone());
+    let (view, vcx, diff_id) = boot_with_diff(cx, worktree.clone());
 
     // Focus b.txt's hunk (file index 1) — the one about to disappear.
     let (gen0, prev_hash) = view.update(vcx, |v, cx| {
@@ -30171,30 +29994,14 @@ fn diff_tile_triggered_refresh_moves_focus_to_nearest_when_hunk_hash_gone(cx: &m
     // of the diff, since it now matches merge-base exactly).
     std::fs::write(worktree.join("b.txt"), "line1\n").unwrap();
 
-    let ev = ServerNotification::ReplyEvent {
-        session_id: "S1".into(),
-        event: {
-            let mut tc = ToolCall::new("tool-edit-revert-b", "Edit b.txt");
-            tc.kind = ToolKind::Edit;
-            tc.status = ToolCallStatus::Completed;
-            tc.raw_input =
-                Some(serde_json::json!({ "file_path": worktree.join("b.txt").to_string_lossy() }));
-            ReplyEvent::ToolCallStarted(tc)
-        },
-    };
-    view.update(vcx, |v, cx| {
-        v.apply_server_batch(vec![ev], cx);
-    });
-    vcx.run_until_parked();
-    vcx.executor()
-        .advance_clock(crate::YaldaGpuiView::DIFF_FILE_CHANGE_DEBOUNCE);
+    view.update(vcx, |v, cx| v.refresh_diff(diff_id, cx));
     vcx.run_until_parked();
 
     view.read_with(vcx, |v, _| {
         let tile = v.diff_tile_ref(diff_id).expect("Diff tile");
         assert!(
             tile.model_gen > gen0,
-            "the debounced tool-call trigger must have re-derived (gen0={gen0}, got {})",
+            "the refresh must have re-derived (gen0={gen0}, got {})",
             tile.model_gen
         );
         let model = tile.model.as_ref().expect("re-derive settled");
@@ -30384,90 +30191,321 @@ fn diff_tile_shift_v_marks_whole_file_reviewed(cx: &mut TestAppContext) {
     });
 }
 
-// ── Cog node `diff-persistence` (w5a4): spec § Persistence ──────────────────
+// ── Cog node `worktree-picker` (j73t): spec rev 2 B1/B3, UXI-Diff-9/10/13 ────
 
-/// spec-diff-review.md § Persistence: a Diff tile bound to a SESSION persists
-/// as `Path`-bound to that session's DERIVED worktree — `SessionId` is
-/// runtime-local and must not survive a restart (a session-bound tile always
-/// restores `Path`-bound, per the doc comment on `PersistedKind::Diff`) — and
-/// restores holding the SAME worktree path, `DiffSource::Path`-bound, never
-/// re-attached to a session id.
-///
-/// Drives the REAL entry points: `boot_diff_bound_to_session` binds a Diff
-/// tile to a real session (sid "S1") whose `cwd` is a tempdir git fixture and
-/// runs the real on-paint derive (`render_diff`'s `needs_load` kick), so
-/// `tile.worktree()` resolves through the derived model exactly as it would
-/// live — NOT a hand-built `DiffTile` with `model` poked in directly. Then
-/// `crate::snapshot_content` / `crate::restore_content` (the same functions
-/// `save_workspace_state` / restore call) do the round trip.
-///
-/// Negative control (observed RED — see report): reverting
-/// `PersistedKind::Diff { worktree: tile.worktree() }` to `worktree: None`
-/// makes the restored tile unbound (`source: None`) instead of `Path`-bound —
-/// the second assertion block fails for the right reason.
+/// Fixture for the worktree picker: `diff_fixture_repo` (primary checkout on
+/// `feature`) plus a LINKED worktree on a new `topic` branch (from `main`)
+/// carrying an untracked `topic.txt`. Returns (primary tempdir, linked
+/// parent tempdir, linked worktree path). Entirely tempdir — spec C5.
+fn diff_worktree_fixture() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
+    let primary = diff_fixture_repo();
+    let linked_parent = tempfile::tempdir().expect("tempdir");
+    let linked = linked_parent.path().join("wt-topic");
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(primary.path())
+        .args(["worktree", "add", "--quiet", "-b", "topic"])
+        .arg(&linked)
+        .arg("main")
+        .status()
+        .expect("git worktree add");
+    assert!(status.success(), "git worktree add failed");
+    std::fs::write(linked.join("topic.txt"), "topic work\n").unwrap();
+    (primary, linked_parent, linked)
+}
+
+/// Boot a hermetic view with the active workspace's cwd at `cwd`, open a Diff
+/// tile through the REAL entry point (`open_diff_inner` — what `OpenDiff`
+/// calls), and let the async worktree-list load settle.
+fn boot_diff_picker<'a>(
+    cx: &'a mut TestAppContext,
+    cwd: PathBuf,
+) -> (
+    gpui::Entity<YaldaGpuiView>,
+    &'a mut gpui::VisualTestContext,
+    crate::workspace::WindowId,
+) {
+    let (view, vcx) = boot_browser(cx);
+    let id = view.update(vcx, |v, cx| {
+        v.test_set_active_workspace_cwd(cwd);
+        v.open_diff_inner(cx);
+        v.workspace.focused_window_id().expect("focused Diff tile")
+    });
+    vcx.run_until_parked();
+    (view, vcx, id)
+}
+
+/// Force the cached `DiffView` of tile `id` to repaint with the layout probe
+/// on, returning the painted rect of each `tags` entry. (A cache hit replays
+/// the previous paint without re-running `probe_bounds`, so the body's own
+/// entity is notified — an explicit repaint, not a state change.)
+fn paint_diff_probes(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+    id: crate::workspace::WindowId,
+    tags: &[&str],
+) -> Vec<Option<(f32, f32, f32, f32)>> {
+    let dv = view.read_with(vcx, |v, _| v.diff_tile_ref(id).and_then(|t| t.view.clone()));
+    crate::layout_probe_begin();
+    match dv {
+        Some(dv) => dv.update(vcx, |_, cx| cx.notify()),
+        None => view.update(vcx, |_, cx| cx.notify()),
+    }
+    vcx.run_until_parked();
+    let out = tags.iter().map(|t| crate::layout_probe_get(t)).collect();
+    crate::layout_probe_end();
+    out
+}
+
+fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
+    a.canonicalize().ok() == b.canonicalize().ok()
+}
+
+/// UXI-Diff-10: an unbound tile opened in a repo lists EVERY worktree (the
+/// real async `list_worktrees` load, kicked by `open_diff_inner`) — primary
+/// first and flagged, branch names — and PAINTS one row per worktree plus the
+/// folder row (layout probe, non-empty rects, stacked top-to-bottom). `j`
+/// moves the selection and busts the cached body (`DiffSeqs::picker_gen`).
 #[gpui::test]
-fn diff_tile_session_bound_persists_and_restores_as_path_bound(cx: &mut TestAppContext) {
+fn diff_picker_lists_and_paints_worktrees(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (primary, _lp, linked) = diff_worktree_fixture();
+    let (view, vcx, id) = boot_diff_picker(cx, primary.path().to_path_buf());
+
+    view.read_with(vcx, |v, _| {
+        let p = &v.diff_tile_ref(id).expect("Diff tile").picker;
+        assert!(!p.loading, "the worktree load must have settled");
+        assert!(!p.not_a_repo && p.error.is_none());
+        let branches: Vec<_> = p.rows.iter().map(|r| r.branch.clone()).collect();
+        assert_eq!(
+            branches,
+            vec![Some("feature".to_string()), Some("topic".to_string())],
+            "both fixture worktrees, primary first"
+        );
+        assert!(p.rows[0].is_primary && !p.rows[1].is_primary);
+        assert!(same_dir(&p.rows[1].path, &linked));
+        assert_eq!(p.selected, 0);
+    });
+
+    let rects = paint_diff_probes(
+        &view,
+        vcx,
+        id,
+        &["diff-picker-row-0", "diff-picker-row-1", "diff-picker-folder-row"],
+    );
+    let r0 = rects[0].expect("worktree row 0 did not paint");
+    let r1 = rects[1].expect("worktree row 1 did not paint");
+    let rf = rects[2].expect("folder row did not paint");
+    for (x, y, w, h) in [r0, r1, rf] {
+        assert!(w > 20.0 && h > 20.0, "row painted too small: {x},{y},{w},{h}");
+    }
+    assert!(r0.1 < r1.1 && r1.1 < rf.1, "rows stack: {r0:?} {r1:?} {rf:?}");
+
+    crate::perf_reset("diff");
+    vcx.simulate_keystrokes("j");
+    vcx.run_until_parked();
+    assert_eq!(view.read_with(vcx, |v, _| v.diff_tile_ref(id).unwrap().picker.selected), 1);
+    assert!(
+        crate::perf_render_count("diff") >= 1,
+        "moving the picker selection must re-render the cached body"
+    );
+    // Clamped, not wrapped: j past the folder row stays on it; k back to 0.
+    vcx.simulate_keystrokes("j j j");
+    vcx.run_until_parked();
+    assert_eq!(view.read_with(vcx, |v, _| v.diff_tile_ref(id).unwrap().picker.selected), 2);
+    vcx.simulate_keystrokes("k k k k");
+    vcx.run_until_parked();
+    assert_eq!(view.read_with(vcx, |v, _| v.diff_tile_ref(id).unwrap().picker.selected), 0);
+}
+
+/// UXI-Diff-10: `j` then `Enter` (REAL keystrokes through the keymap →
+/// `handle_diff_key`) binds the tile to the SECOND worktree and derives its
+/// diff — the linked worktree's untracked `topic.txt` is in the model.
+///
+/// Negative control (observed RED): with the `Key::Enter` arm's
+/// `diff_picker_activate` call commented out, `tile.worktree` stays `None`.
+#[gpui::test]
+fn diff_picker_j_enter_binds_second_worktree_and_derives(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (primary, _lp, linked) = diff_worktree_fixture();
+    let (view, vcx, id) = boot_diff_picker(cx, primary.path().to_path_buf());
+
+    vcx.simulate_keystrokes("j enter");
+    vcx.run_until_parked();
+
+    view.read_with(vcx, |v, _| {
+        let tile = v.diff_tile_ref(id).expect("Diff tile");
+        let wt = tile.worktree.as_ref().expect("Enter must bind the selected worktree");
+        assert!(same_dir(wt, &linked), "bound {wt:?}, expected {linked:?}");
+        let model = tile.model.as_ref().expect("the bound worktree's diff must derive");
+        assert!(same_dir(&model.worktree, &linked));
+        assert_eq!(model.branch, "topic");
+        assert!(
+            model.files.iter().any(|f| f.path.ends_with("topic.txt")),
+            "the linked worktree's topic.txt must be in the diff: {:?}",
+            model.files.iter().map(|f| f.path.clone()).collect::<Vec<_>>()
+        );
+    });
+}
+
+/// UXI-Diff-10: a mouse click on a PAINTED picker row binds the tile to that
+/// worktree — the click lands at the row's real painted center (layout
+/// probe), through gpui's hit-testing to the row's `on_mouse_down` listener,
+/// which resolves the row index at event time (`diff_picker_activate`).
+///
+/// Negative control (observed RED): with the worktree rows'
+/// `.on_mouse_down(…)` removed in `diff_picker_body`, the click binds nothing.
+#[gpui::test]
+fn diff_picker_click_row_binds_worktree(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (primary, _lp, linked) = diff_worktree_fixture();
+    let (view, vcx, id) = boot_diff_picker(cx, primary.path().to_path_buf());
+
+    let rect = paint_diff_probes(&view, vcx, id, &["diff-picker-row-1"])[0]
+        .expect("worktree row 1 did not paint");
+    let at = point(px(rect.0 + rect.2 / 2.0), px(rect.1 + rect.3 / 2.0));
+    vcx.simulate_mouse_move(at, None, gpui::Modifiers::default());
+    vcx.simulate_click(at, gpui::Modifiers::default());
+    vcx.run_until_parked();
+
+    view.read_with(vcx, |v, _| {
+        let tile = v.diff_tile_ref(id).expect("Diff tile");
+        let wt = tile.worktree.as_ref().expect("clicking a row must bind it");
+        assert!(same_dir(wt, &linked), "bound {wt:?}, expected {linked:?}");
+        assert!(tile.model.is_some(), "the clicked worktree's diff must derive");
+    });
+}
+
+/// UXI-Diff-13: a bound Diff tile re-derives when it GAINS focus. Focus moves
+/// away (split → the new tile is focused), the worktree changes on disk (no
+/// re-derive while unfocused), then focus returns through the REAL
+/// `ctrl-w w` (FocusNext) binding — the new model contains the change.
+///
+/// Negative control (observed RED): with `|| focus_gained` removed from
+/// `diff_reconcile`, `model_gen` does not move and the change is absent.
+#[gpui::test]
+fn diff_tile_rederives_on_focus_gain(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
     let temp = diff_fixture_repo();
     let worktree = temp.path().to_path_buf();
-    let (view, vcx, _sid, diff_id) = boot_diff_bound_to_session(cx, worktree.clone());
+    let (view, vcx, diff_id) = boot_with_diff(cx, worktree.clone());
 
-    // Precondition: the first on-paint derive landed, so `tile.worktree()`
-    // resolves via the derived model's worktree (spec deviation noted on
-    // `snapshot_content`'s `App::Diff` arm) rather than falling back to
-    // `None` the way an un-derived session-bound tile would.
-    view.read_with(vcx, |v, _| {
-        let tile = v.diff_tile_ref(diff_id).expect("Diff tile");
-        assert!(
-            matches!(tile.source, Some(crate::DiffSource::Session(_))),
-            "fixture must still be session-bound before the snapshot"
-        );
-        assert!(tile.model.is_some(), "first on-paint derive must have landed");
+    let other = view.update(vcx, |v, cx| {
+        let wid = v
+            .workspace
+            .split_focused(crate::workspace::SplitDir::V, crate::App::AgentStats)
+            .expect("split for a second tile");
+        cx.notify();
+        wid
     });
+    vcx.run_until_parked();
+    assert_eq!(view.read_with(vcx, |v, _| v.workspace.focused_window_id()), Some(other));
+    let gen0 = view.read_with(vcx, |v, _| {
+        let t = v.diff_tile_ref(diff_id).expect("Diff tile");
+        assert!(t.model.is_some(), "first derive landed");
+        t.model_gen
+    });
+
+    std::fs::write(worktree.join("a.txt"), "line1\nchanged a\nfocus-gain edit\n").unwrap();
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(vcx, |v, _| v.diff_tile_ref(diff_id).unwrap().model_gen),
+        gen0,
+        "no re-derive while the Diff tile is unfocused"
+    );
+
+    vcx.simulate_keystrokes("ctrl-w w");
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(vcx, |v, _| v.workspace.focused_window_id()),
+        Some(diff_id),
+        "ctrl-w w must return focus to the Diff tile"
+    );
+    view.read_with(vcx, |v, _| {
+        let t = v.diff_tile_ref(diff_id).unwrap();
+        assert!(t.model_gen > gen0, "focus gain must re-derive (gen0={gen0}, now {})", t.model_gen);
+        let model = t.model.as_ref().unwrap();
+        let has_edit = model.files.iter().flat_map(|f| f.hunks.iter()).any(|h| {
+            h.lines
+                .iter()
+                .any(|l| matches!(l, crate::DiffLine::Added(t) if t.contains("focus-gain edit")))
+        });
+        assert!(has_edit, "the re-derived model must contain the on-disk change");
+    });
+}
+
+/// UXI-Diff-10: outside a git repo the picker says so plainly (painted) and
+/// offers only the folder row; Enter on it binds the folder, whose derive is
+/// an inline error — never a panic.
+#[gpui::test]
+fn diff_picker_not_a_repo_offers_only_folder_row(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let (view, vcx, id) = boot_diff_picker(cx, scratch.path().to_path_buf());
+
+    view.read_with(vcx, |v, _| {
+        let p = &v.diff_tile_ref(id).expect("Diff tile").picker;
+        assert!(p.not_a_repo, "a non-repo cwd must read as not-a-repo");
+        assert!(p.rows.is_empty() && p.error.is_none());
+        assert_eq!(p.row_count(), 1, "only the folder row");
+    });
+    let rects = paint_diff_probes(
+        &view,
+        vcx,
+        id,
+        &["diff-picker-status", "diff-picker-folder-row", "diff-picker-row-0"],
+    );
+    assert!(rects[0].is_some_and(|r| r.2 > 0.0), "the not-a-repo text must paint");
+    assert!(rects[1].is_some_and(|r| r.2 > 0.0), "the folder row must paint");
+    assert!(rects[2].is_none(), "no worktree rows outside a repo");
+
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        let tile = v.diff_tile_ref(id).expect("Diff tile");
+        assert!(tile.worktree.as_ref().is_some_and(|w| same_dir(w, scratch.path())));
+        assert!(tile.model.is_none() && tile.error.is_some(), "inline error, no panic");
+    });
+}
+
+/// UXI-Diff-9: a tile bound through the real picker path persists its
+/// worktree and restores BOUND to the same worktree (first derive pending);
+/// `space → switch worktree` returns it to the picker and reloads the list.
+#[gpui::test]
+fn diff_tile_bound_persists_and_restores_bound(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (primary, _lp, linked) = diff_worktree_fixture();
+    let (view, vcx, id) = boot_diff_picker(cx, primary.path().to_path_buf());
+    vcx.simulate_keystrokes("j enter");
+    vcx.run_until_parked();
 
     let persisted = view.read_with(vcx, |v, _| {
-        let content = &v
-            .workspace
-            .tile(diff_id)
-            .expect("Diff tile window")
-            .content;
-        crate::snapshot_content(content, &|_| None)
+        crate::snapshot_content(&v.workspace.tile(id).expect("Diff tile").content, &|_| None)
     });
-
-    match &persisted {
-        crate::PersistedKind::Diff { worktree: w } => {
-            assert_eq!(
-                w.as_deref(),
-                Some(worktree.as_path()),
-                "must persist the session's DERIVED worktree, not None"
-            );
-        }
-        other => panic!("expected PersistedKind::Diff, got {other:?}"),
-    }
+    let crate::PersistedKind::Diff { worktree: Some(w) } = &persisted else {
+        panic!("a bound Diff tile must persist its worktree, got {persisted:?}");
+    };
+    assert!(same_dir(w, &linked));
 
     let restored = view.update(vcx, |v, _cx| {
         let theme = v.theme.clone();
         crate::restore_content(&mut v.workspace, &theme, persisted)
     });
-
     match restored {
-        crate::App::Diff(tile) => match &tile.source {
-            Some(crate::DiffSource::Path(p)) => {
-                assert_eq!(
-                    p, &worktree,
-                    "restored tile must be Path-bound to the SAME worktree"
-                );
-            }
-            Some(crate::DiffSource::Session(_)) => panic!(
-                "restored tile must NOT still be Session-bound — SessionId is \
-                 runtime-local and must not survive a restart (spec Persistence)"
-            ),
-            None => panic!(
-                "restored session-bound tile must restore Path-bound per spec, \
-                 got unbound instead"
-            ),
-        },
+        crate::App::Diff(tile) => {
+            assert!(tile.worktree.as_ref().is_some_and(|w| same_dir(w, &linked)));
+            assert!(tile.needs_load, "a restored bound tile derives on first frame");
+        }
         _ => panic!("expected the restored content to be App::Diff"),
     }
+
+    view.update(vcx, |v, cx| v.diff_switch_worktree_focused(cx));
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        let t = v.diff_tile_ref(id).expect("Diff tile");
+        assert!(t.worktree.is_none() && t.model.is_none(), "back to the picker");
+        assert_eq!(t.picker.rows.len(), 2, "the worktree list reloaded");
+    });
 }
 
 /// spec § Persistence, unbound case: a Diff tile with no binding at all
@@ -30476,7 +30514,9 @@ fn diff_tile_session_bound_persists_and_restores_as_path_bound(cx: &mut TestAppC
 #[gpui::test]
 fn diff_tile_unbound_persists_and_restores_unbound(cx: &mut TestAppContext) {
     let (view, vcx) = boot_browser(cx);
+    let scratch = tempfile::tempdir().expect("tempdir");
     let diff_id = view.update(vcx, |v, cx| {
+        v.test_set_active_workspace_cwd(scratch.path().to_path_buf());
         v.set_screen(crate::App::Diff(crate::DiffTile::new()));
         let id = v.workspace.focused_window_id().expect("focused Diff tile");
         cx.notify();
@@ -30504,359 +30544,13 @@ fn diff_tile_unbound_persists_and_restores_unbound(cx: &mut TestAppContext) {
     match restored {
         crate::App::Diff(tile) => {
             assert!(
-                tile.source.is_none(),
-                "restoring worktree: None must yield an unbound (selector) Diff tile"
+                tile.worktree.is_none() && tile.picker.needs_load,
+                "restoring worktree: None must yield an unbound (picker) Diff tile \
+                 whose list load is pending"
             );
         }
         _ => panic!("expected the restored content to be App::Diff"),
     }
-}
-
-// ── Cog node `comment-steering` (hk81): spec B4 comment → steering ──────────
-
-/// `c` on a focused hunk of a `Path`-bound Diff tile (no session — spec C4)
-/// must NOT open the comment compose: there is nothing to steer a comment
-/// INTO. The affordance is absent, not merely inert-with-an-error (spec B4:
-/// "the affordance is absent, not erroring").
-///
-/// Negative control (observed RED — see report): dropping the
-/// `matches!(t.source, Some(DiffSource::Session(_)))` guard in
-/// `open_hunk_comment` makes this test fail (the compose opens anyway).
-#[gpui::test]
-fn diff_tile_path_bound_c_opens_no_comment_compose(cx: &mut TestAppContext) {
-    cx.update(crate::register_keymap);
-    let temp = diff_fixture_repo();
-    let worktree = temp.path().to_path_buf();
-    let (view, vcx, id) = boot_with_diff(cx, worktree);
-
-    view.read_with(vcx, |v, _| {
-        let tile = v.diff_tile_ref(id).expect("Diff tile");
-        assert!(tile.model.is_some(), "derive must have settled");
-        assert!(tile.compose.is_none(), "no compose before the keystroke");
-    });
-
-    vcx.simulate_keystrokes("c");
-    vcx.run_until_parked();
-
-    view.read_with(vcx, |v, _| {
-        let tile = v.diff_tile_ref(id).expect("Diff tile");
-        assert!(
-            tile.compose.is_none(),
-            "a Path-bound tile has no comment affordance — `c` must be a no-op"
-        );
-        assert!(tile.comment_target.is_none());
-    });
-
-    // The hint line must not advertise `c comment` either (spec B4: the
-    // affordance is absent, not just inert) — read back through the real
-    // render path.
-    crate::layout_probe_begin();
-    view.update(vcx, |_, cx| cx.notify());
-    vcx.run_until_parked();
-    crate::layout_probe_end();
-}
-
-/// `c` on a focused hunk of a SESSION-bound Diff tile opens the comment
-/// compose (spec B4) through the REAL keystroke path — and it is the tile's
-/// only insert-mode surface: `focused_in_insert_mode` must flip to `true`
-/// while it's open (main.rs's `App::Diff(tile) => tile.compose.is_some()`
-/// arm), so the universal `space`/`.` leaders are suppressed exactly like
-/// every other compose in the app.
-///
-/// Negative control (observed RED — see report): commenting out the
-/// `Key::Char('c') => self.open_hunk_comment(id, cx),` arm in
-/// `handle_diff_key` leaves `tile.compose` `None` after the keystroke.
-#[gpui::test]
-fn diff_tile_c_opens_comment_compose_on_session_bound_tile(cx: &mut TestAppContext) {
-    cx.update(crate::register_keymap);
-    let temp = diff_fixture_repo();
-    let worktree = temp.path().to_path_buf();
-    let (view, vcx, _id, diff_id) = boot_diff_bound_to_session(cx, worktree);
-
-    view.read_with(vcx, |v, cx| {
-        assert!(
-            !v.focused_in_insert_mode(cx),
-            "hunk-nav (no compose yet) is NOT insert mode"
-        );
-    });
-
-    vcx.simulate_keystrokes("c");
-    vcx.run_until_parked();
-
-    view.read_with(vcx, |v, cx| {
-        let tile = v.diff_tile_ref(diff_id).expect("Diff tile");
-        assert!(tile.compose.is_some(), "`c` must open the comment compose");
-        assert!(
-            tile.comment_target.is_some(),
-            "the focused hunk must be snapshotted as the comment target"
-        );
-        assert!(
-            v.focused_in_insert_mode(cx),
-            "an open comment compose is the tile's only insert-mode surface"
-        );
-    });
-}
-
-/// Esc while composing (spec B4/B9) cancels: drops BOTH the compose and its
-/// target, back to plain hunk-nav (`focused_in_insert_mode` flips back to
-/// `false`) — through the real keystroke path.
-///
-/// Negative control (observed RED — see report): commenting out the
-/// `Key::Esc => self.cancel_hunk_comment(...)` branch in
-/// `handle_diff_comment_key` leaves `tile.compose` `Some` after Esc.
-#[gpui::test]
-fn diff_tile_esc_cancels_comment_compose(cx: &mut TestAppContext) {
-    cx.update(crate::register_keymap);
-    let temp = diff_fixture_repo();
-    let worktree = temp.path().to_path_buf();
-    let (view, vcx, _id, diff_id) = boot_diff_bound_to_session(cx, worktree);
-
-    vcx.simulate_keystrokes("c");
-    vcx.run_until_parked();
-    view.read_with(vcx, |v, _| {
-        assert!(v.diff_tile_ref(diff_id).unwrap().compose.is_some());
-    });
-
-    vcx.simulate_keystrokes("escape");
-    vcx.run_until_parked();
-
-    view.read_with(vcx, |v, cx| {
-        let tile = v.diff_tile_ref(diff_id).expect("Diff tile");
-        assert!(tile.compose.is_none(), "Esc must drop the compose");
-        assert!(tile.comment_target.is_none(), "Esc must drop the anchor too");
-        assert!(
-            !v.focused_in_insert_mode(cx),
-            "back to hunk-nav after cancel"
-        );
-    });
-
-    // The tile must still be perfectly usable for ordinary hunk-nav after the
-    // cancel — `j` still moves focus.
-    let before = view.read_with(vcx, |v, _| v.diff_tile_ref(diff_id).unwrap().focus);
-    vcx.simulate_keystrokes("j");
-    vcx.run_until_parked();
-    let after = view.read_with(vcx, |v, _| v.diff_tile_ref(diff_id).unwrap().focus);
-    assert_ne!(before, after, "hunk-nav must work again after Esc cancels the compose");
-}
-
-/// Like `boot_diff_bound_to_session`, but the underlying agent slot is bound
-/// to NEITHER a server sid NOR a channel, and the view is built through the
-/// hermetic `boot_browser` (which forces `session_server` off via
-/// `with_no_session_server` — `persist.rs`'s documented test-hygiene seam).
-/// `boot_diff_bound_to_session`'s `Some("S1")` sid takes the SERVER path in
-/// `send_prompt_to_session`, which a stray REAL `yalda-session-server`
-/// reachable on the machine running the test would fire-and-forget ACCEPT
-/// (its `prompt()` doesn't validate the sid exists) — flaky-green depending on
-/// what else is running on the box. No sid + no channel + no server takes
-/// NEITHER path, so `sent` is deterministically `false` regardless of the
-/// environment — the fixture for asserting a genuinely failed send.
-fn boot_diff_bound_to_disconnected_session<'a>(
-    cx: &'a mut TestAppContext,
-    worktree: PathBuf,
-) -> (
-    gpui::Entity<YaldaGpuiView>,
-    &'a mut gpui::VisualTestContext,
-    crate::workspace::WindowId,
-) {
-    let (view, vcx) = boot_browser(cx);
-    install_agent_slot(&view, &mut *vcx, None);
-    let diff_id = view.update(vcx, |v, cx| {
-        let id = v.focused_bound_session().expect("bound session");
-        if let Some(ent) = v.session_entity(id) {
-            ent.update(cx, |s, _| s.cwd = worktree.clone());
-        }
-        let diff_id = v
-            .workspace
-            .split_focused(
-                crate::workspace::SplitDir::V,
-                crate::App::Diff(crate::DiffTile::bound_to_session(id)),
-            )
-            .expect("split for a second (Diff) tile");
-        cx.notify();
-        diff_id
-    });
-    vcx.run_until_parked();
-    (view, vcx, diff_id)
-}
-
-/// DONE_WHEN (failure path): with the agent slot connected to NEITHER a
-/// session-server sid NOR a channel (`boot_diff_bound_to_disconnected_session`
-/// — deterministic regardless of what else is running on the test machine), a
-/// submit through the REAL `c` → type → Ctrl-Enter path fails, and the draft
-/// (+ its anchor) is LEFT INTACT in `tile.compose`/`tile.comment_target` —
-/// spec B4: "On send failure the draft stays in the compose (no silent
-/// drop)".
-///
-/// Negative control (observed RED — see report): in `submit_hunk_comment`,
-/// unconditionally clearing `tile.compose`/`comment_target` (instead of only
-/// on `sent == true`) makes this test fail (the compose is gone after the
-/// failed submit).
-#[gpui::test]
-fn diff_tile_comment_submit_failure_keeps_draft(cx: &mut TestAppContext) {
-    cx.update(crate::register_keymap);
-    let temp = diff_fixture_repo();
-    let worktree = temp.path().to_path_buf();
-    let (view, vcx, diff_id) = boot_diff_bound_to_disconnected_session(cx, worktree);
-
-    vcx.simulate_keystrokes("c");
-    vcx.run_until_parked();
-    view.read_with(vcx, |v, _| {
-        assert!(v.diff_tile_ref(diff_id).unwrap().compose.is_some());
-    });
-
-    view.update(vcx, |v, cx| {
-        let window = v.workspace.tile_mut(diff_id).expect("Diff tile window");
-        let crate::App::Diff(tile) = &mut window.content else {
-            panic!("not a Diff tile");
-        };
-        let compose = tile.compose.as_mut().expect("compose open");
-        for ch in "needs work".chars() {
-            compose.editor.insert_char(ch);
-        }
-        cx.notify();
-    });
-    vcx.run_until_parked();
-
-    vcx.simulate_keystrokes("ctrl-enter");
-    vcx.run_until_parked();
-
-    view.read_with(vcx, |v, _| {
-        let tile = v.diff_tile_ref(diff_id).expect("Diff tile");
-        assert!(
-            tile.compose.is_some(),
-            "a failed send (no daemon in this harness) must leave the draft in place"
-        );
-        assert_eq!(
-            tile.compose.as_ref().unwrap().text(),
-            "needs work",
-            "the exact typed draft must survive a failed send"
-        );
-        assert!(
-            tile.comment_target.is_some(),
-            "the hunk anchor must survive too, so a retry still has full context"
-        );
-    });
-}
-
-/// Behind `test-support` (the in-process transport feature, mirrors
-/// `boot_worksheet_channel`): boot a browser with a channel-connected agent
-/// session, point its `cwd` at a real git fixture, and open a SEPARATE Diff
-/// tile `Session`-bound to it (mirrors `boot_diff_bound_to_session`, minus the
-/// server-sid binding so `send_prompt_to_session` takes the in-process
-/// `channel.send_payload` path instead of the absent session-server path).
-#[cfg(feature = "test-support")]
-fn boot_diff_comment_channel(
-    cx: &mut TestAppContext,
-    worktree: PathBuf,
-) -> (
-    gpui::Entity<YaldaGpuiView>,
-    &mut gpui::VisualTestContext,
-    crate::workspace::WindowId,
-    yalda::acp_channel::TestChannelControls,
-) {
-    let (view, vcx) = cx.add_window_view(|window, cx| {
-        let focus_handle = cx.focus_handle();
-        focus_handle.focus(window);
-        YaldaGpuiView::new_browser(
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            Theme::default(),
-            focus_handle,
-        )
-    });
-    vcx.run_until_parked();
-    install_agent_slot(&view, &mut *vcx, None); // None sid ⇒ channel.send() path
-    let (client, controls) = yalda::acp_channel::AcpChannelClient::test_connected();
-    let diff_id = view.update(vcx, |v, cx| {
-        v.splash_until = None;
-        let id = v.focused_bound_session().expect("bound session");
-        v.with_session(id, cx, |c| c.channel = Some(client));
-        if let Some(ent) = v.session_entity(id) {
-            ent.update(cx, |s, _| s.cwd = worktree.clone());
-        }
-        let diff_id = v
-            .workspace
-            .split_focused(
-                crate::workspace::SplitDir::V,
-                crate::App::Diff(crate::DiffTile::bound_to_session(id)),
-            )
-            .expect("split for a second (Diff) tile");
-        cx.notify();
-        diff_id
-    });
-    vcx.run_until_parked();
-    (view, vcx, diff_id, controls)
-}
-
-/// DONE_WHEN #1 (comment-steering, hk81): `c` on a focused hunk of a
-/// session-bound Diff tile opens the compose; a typed comment submitted with
-/// Ctrl-Enter reaches the bound session's REAL channel
-/// (`send_prompt_to_session` → `channel.send_payload`) carrying the exact
-/// prompt `build_hunk_comment_prompt` would build from the SAME path/range/
-/// patch the tile actually derived — i.e. this proves both that
-/// `submit_hunk_comment` calls that builder AND that real data (not a stub)
-/// flows from the derived `DiffModel` through to the wire.
-///
-/// Negative control (observed RED — see report): in `submit_hunk_comment`,
-/// replace the `build_hunk_comment_prompt(...)` call with the raw `comment`
-/// text — the `assert_eq!(payload.text, expected, ...)` fails (the delivered
-/// text is missing the path/range/patch prefix).
-#[cfg(feature = "test-support")]
-#[gpui::test]
-fn diff_hunk_comment_open_type_submit_delivers_prefixed_prompt(cx: &mut TestAppContext) {
-    cx.update(crate::register_keymap);
-    let temp = diff_fixture_repo();
-    let worktree = temp.path().to_path_buf();
-    let (view, vcx, diff_id, controls) = boot_diff_comment_channel(cx, worktree.clone());
-
-    let (path, line_range, patch) = view.read_with(vcx, |v, _| {
-        let tile = v.diff_tile_ref(diff_id).expect("Diff tile");
-        let model = tile.model.as_ref().expect("first on-paint derive must have landed");
-        let file = &model.files[0];
-        let hunk = &file.hunks[0];
-        (file.path.clone(), hunk.new_line_range(), hunk.patch_text())
-    });
-
-    vcx.simulate_keystrokes("c");
-    vcx.run_until_parked();
-    view.read_with(vcx, |v, _| {
-        assert!(
-            v.diff_tile_ref(diff_id).unwrap().compose.is_some(),
-            "c must open the comment compose"
-        );
-    });
-
-    let comment = "please rename this";
-    view.update(vcx, |v, cx| {
-        let window = v.workspace.tile_mut(diff_id).expect("Diff tile window");
-        let crate::App::Diff(tile) = &mut window.content else {
-            panic!("not a Diff tile");
-        };
-        let compose = tile.compose.as_mut().expect("compose open");
-        for ch in comment.chars() {
-            compose.editor.insert_char(ch);
-        }
-        cx.notify();
-    });
-    vcx.run_until_parked();
-
-    vcx.simulate_keystrokes("ctrl-enter");
-    vcx.run_until_parked();
-
-    let payload = controls
-        .prompt_rx
-        .try_recv()
-        .expect("a prompt reached the channel");
-    let expected = crate::build_hunk_comment_prompt(&path, line_range, &patch, comment);
-    assert_eq!(
-        payload.text, expected,
-        "the delivered prompt must be exactly the built hunk-comment prompt"
-    );
-
-    view.read_with(vcx, |v, _| {
-        let tile = v.diff_tile_ref(diff_id).expect("Diff tile");
-        assert!(tile.compose.is_none(), "compose clears on a successful send");
-        assert!(tile.comment_target.is_none());
-    });
 }
 
 // ── Cog node `open-in-zed` (oc72): spec B8 "Open in Zed" ────────────────────
@@ -30930,168 +30624,6 @@ fn diff_tile_o_key_with_no_model_is_noop_no_panic(cx: &mut TestAppContext) {
     assert!(
         status.is_none(),
         "o with no model must be a silent no-op, got {status:?}"
-    );
-}
-
-// ── Cog node `badge-projection` (1cxd): spec B6 unreviewed-hunk badge ──────
-
-/// Cog node `badge-projection` (1cxd), spec B6: deriving a Diff tile
-/// (`boot_diff_bound_to_session`'s real first-paint derive → `diff_apply`)
-/// writes the unreviewed-hunk count into the root-owned `DiffProjections`,
-/// keyed by worktree; the jump panel's REAL row-build path
-/// (`jump_panel_agent_rows`) carries it as `AgentRow::unreviewed_hunks` for
-/// the session sharing that worktree as its `cwd`, and the REAL paint
-/// (`render_jump_panel` → `jump_session_row_el`'s unreviewed-badge chip)
-/// shows it — not a hand-built row or a bare state assert.
-///
-/// Negative control (observed RED — see report): commenting out the
-/// `self.diff_projections.insert(worktree, count);` line in `diff_apply`
-/// (`diff_ui.rs`) leaves `diff_projections` empty and the badge probe misses.
-#[gpui::test]
-fn jump_panel_paints_unreviewed_badge_after_diff_derive(cx: &mut TestAppContext) {
-    let temp = diff_fixture_repo();
-    let worktree = temp.path().to_path_buf();
-    let (view, vcx, _sid, diff_id) = boot_diff_bound_to_session(cx, worktree.clone());
-
-    let expected = view.read_with(vcx, |v, _| {
-        let tile = v.diff_tile_ref(diff_id).expect("Diff tile");
-        let model = tile.model.as_ref().expect("first on-paint derive must have landed");
-        model.unreviewed_hunk_count()
-    });
-    assert!(
-        expected > 0,
-        "fixture must produce at least one unreviewed hunk to show a badge"
-    );
-
-    let projected = view.read_with(vcx, |v, _| v.diff_projections.get(&worktree).copied());
-    assert_eq!(
-        projected,
-        Some(expected),
-        "the derive must write the unreviewed count into DiffProjections keyed by worktree"
-    );
-
-    let row_count = view.read_with(vcx, |v, cx| {
-        v.jump_panel_agent_rows(cx)
-            .into_iter()
-            .find(|r| r.cwd == worktree)
-            .map(|r| r.unreviewed_hunks)
-    });
-    assert_eq!(
-        row_count,
-        Some(expected),
-        "the jump-panel row's view-model field must carry the projected count"
-    );
-
-    // PAINT: force a fresh frame and probe the badge chip on the session's
-    // row (flat index 0 — the only session in this fixture).
-    crate::layout_probe_begin();
-    view.update(vcx, |_, cx| cx.notify());
-    vcx.run_until_parked();
-    let badge = crate::layout_probe_get("jump-session-unreviewed-0");
-    crate::layout_probe_end();
-    let (_, _, w, h) = badge.expect("unreviewed badge did not paint");
-    assert!(w > 0.0 && h > 0.0, "unreviewed badge has no painted area");
-}
-
-/// Cog node `badge-projection` (1cxd), spec B6: "rendered alongside (not
-/// replacing) the unread badge when both are present". A session that is
-/// BOTH unread (the real `AgentState.unread`, set via `with_session` — the
-/// same field the jump-panel unread accounting reads) AND has unreviewed
-/// hunks keeps both facts live on the same row: `unread` stays `true` and
-/// the unreviewed badge still paints. Neither write clobbers the other.
-#[gpui::test]
-fn jump_panel_unread_and_unreviewed_badge_coexist(cx: &mut TestAppContext) {
-    let temp = diff_fixture_repo();
-    let worktree = temp.path().to_path_buf();
-    let (view, vcx, sid, diff_id) = boot_diff_bound_to_session(cx, worktree.clone());
-
-    let expected = view.read_with(vcx, |v, _| {
-        v.diff_tile_ref(diff_id)
-            .unwrap()
-            .model
-            .as_ref()
-            .unwrap()
-            .unreviewed_hunk_count()
-    });
-    assert!(expected > 0, "fixture must produce unreviewed hunks");
-
-    view.update(vcx, |v, cx| v.with_session(sid, cx, |c| c.unread = true));
-    vcx.run_until_parked();
-
-    let row = view.read_with(vcx, |v, cx| {
-        v.jump_panel_agent_rows(cx)
-            .into_iter()
-            .find(|r| r.cwd == worktree)
-            .expect("session row present")
-    });
-    assert!(
-        row.unread,
-        "unread must stay true alongside a nonzero unreviewed count"
-    );
-    assert_eq!(
-        row.unreviewed_hunks, expected,
-        "the unreviewed count must be unaffected by unread"
-    );
-
-    crate::layout_probe_begin();
-    view.update(vcx, |_, cx| cx.notify());
-    vcx.run_until_parked();
-    let badge = crate::layout_probe_get("jump-session-unreviewed-0");
-    crate::layout_probe_end();
-    assert!(
-        badge.is_some(),
-        "the unreviewed badge must still paint on a row that is also unread"
-    );
-}
-
-/// Cog node `badge-projection` (1cxd), spec B6: "survives tile close" — the
-/// projection is root-owned, not tile-owned. Close the Diff tile through the
-/// REAL close path (`cmd-w` → the real `CloseWindow` binding →
-/// `close_window` → `close_focused_tile` → `workspace.close_focused()`, the
-/// sole semantic close-tile boundary), not a hand-called teardown, then
-/// assert the projection — and the jump-panel badge it drives — are still
-/// present via the session's Agent tile (which remains open).
-#[gpui::test]
-fn diff_projection_survives_diff_tile_close(cx: &mut TestAppContext) {
-    cx.update(crate::register_keymap);
-    let temp = diff_fixture_repo();
-    let worktree = temp.path().to_path_buf();
-    let (view, vcx, _sid, diff_id) = boot_diff_bound_to_session(cx, worktree.clone());
-
-    let expected = view.read_with(vcx, |v, _| v.diff_projections.get(&worktree).copied());
-    assert!(matches!(expected, Some(n) if n > 0), "fixture must derive unreviewed hunks");
-
-    // The Diff tile is focused (split_focused focuses the new leaf) — `ctrl-w c`
-    // closes exactly it via the real binding, not `diff_unbind`/a hand teardown.
-    // (`cmd-w` was retired for Linux/niri, where the compositor reserves Super;
-    // `ctrl-w c` is the surviving CloseWindow chord — see `keymap_registry.rs`.)
-    assert_eq!(
-        view.read_with(vcx, |v, _| v.workspace.focused_window_id()),
-        Some(diff_id),
-        "the split Diff tile must be the focused window before closing it"
-    );
-    vcx.simulate_keystrokes("ctrl-w c");
-    vcx.run_until_parked();
-    assert!(
-        view.read_with(vcx, |v, _| v.diff_tile_ref(diff_id).is_none()),
-        "the Diff tile must actually be gone after the real close path"
-    );
-
-    let after = view.read_with(vcx, |v, _| v.diff_projections.get(&worktree).copied());
-    assert_eq!(
-        after, expected,
-        "DiffProjections is root-owned and must survive the Diff tile's close"
-    );
-
-    let row_count = view.read_with(vcx, |v, cx| {
-        v.jump_panel_agent_rows(cx)
-            .into_iter()
-            .find(|r| r.cwd == worktree)
-            .map(|r| r.unreviewed_hunks)
-    });
-    assert_eq!(
-        row_count, expected,
-        "the jump-panel badge must still show via the session's remaining Agent tile"
     );
 }
 

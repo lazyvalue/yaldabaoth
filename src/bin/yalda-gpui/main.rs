@@ -1915,7 +1915,7 @@ fn cog_local_menu() -> Vec<MenuNode> {
 fn diff_local_menu() -> Vec<MenuNode> {
     with_tile_commands(vec![
         MenuNode::entry("r", "refresh", "diff-refresh"),
-        MenuNode::entry("b", "bind (choose session/path)", "diff-bind"),
+        MenuNode::entry("w", "switch worktree", "diff-switch-worktree"),
     ])
 }
 
@@ -2158,15 +2158,10 @@ struct YaldaGpuiView {
     /// sid is unranked and drops to the bottom of its cwd group — bug-0007's
     /// recurrence. Entries are consumed at bind and dropped on close.
     jump_order_succession: HashMap<SessionId, String>,
-    /// Cog node `badge-projection` (1cxd), spec B6 / § Data Model: root-owned
-    /// worktree → unreviewed-hunk-count projection, updated ONLY at
-    /// `DiffModel` derive time (`diff_apply`, `diff_ui.rs`). Read by the jump
-    /// panel (`AgentRow::unreviewed_hunks`, `jump_panel_view.rs`) to render
-    /// the unreviewed badge alongside the unread mark. Survives Diff tile
-    /// close (it's on root, not the tile); shared across every tile watching
-    /// one worktree (last derive wins); NOT persisted — a worktree never
-    /// opened in a Diff tile this session has no entry.
-    diff_projections: DiffProjections,
+    /// The focused window id as of the last root render — the edge detector
+    /// behind the Diff tile's focus-gain refresh (spec B3, `diff_reconcile`,
+    /// `diff_ui.rs`).
+    diff_last_focused: Option<workspace::WindowId>,
     /// Pinned session recaps (recap-panel), keyed by the session they summarize —
     /// one per session, so a recap is SPECIFIC to its agent tile (UXI-AgentTile-15). An
     /// entry appears when summoned (`recap-session`), is re-runnable and dismissed
@@ -2271,7 +2266,7 @@ impl YaldaGpuiView {
             jump_tile_order: Vec::new(),
             jump_detached_tile_order: Vec::new(),
             jump_order_succession: HashMap::new(),
-            diff_projections: HashMap::new(),
+            diff_last_focused: None,
             recaps: HashMap::new(),
             roster_unread: HashMap::new(),
             // bug-0020: id-keyed autoname summaries, durable across restarts.
@@ -2347,7 +2342,7 @@ impl YaldaGpuiView {
             jump_tile_order: Vec::new(),
             jump_detached_tile_order: Vec::new(),
             jump_order_succession: HashMap::new(),
-            diff_projections: HashMap::new(),
+            diff_last_focused: None,
             recaps: HashMap::new(),
             roster_unread: HashMap::new(),
             // bug-0020: id-keyed autoname summaries, durable across restarts.
@@ -5837,10 +5832,9 @@ impl YaldaGpuiView {
             // leaders must be suppressed then so keys reach the box.
             Some(App::Keymap(_)) => self.keymap_captures_text(cx),
             Some(App::AgentStats) => false,
-            // The hunk-comment compose (spec B4) is the tile's only insert
-            // surface; this node always leaves it `None`, so a Diff tile is
-            // navigation-only for now.
-            Some(App::Diff(tile)) => tile.compose.is_some(),
+            // The Diff tile has no text-input surface yet (the comment compose
+            // returns with spec rev 2 B5) — navigation-only.
+            Some(App::Diff(_)) => false,
             Some(App::Buffer(BufferApp::Viewing(_))) | None => false,
         }
     }
@@ -6010,7 +6004,7 @@ impl YaldaGpuiView {
             "cog-refresh" => self.cog_refresh_focused(cx),
             "cog-toggle-events" => self.cog_toggle_events(cx),
             "diff-refresh" => self.diff_refresh_focused(cx),
-            "diff-bind" => self.diff_bind_focused(cx),
+            "diff-switch-worktree" => self.diff_switch_worktree_focused(cx),
             "keymap-filter" => self.keymap_menu_filter(cx),
             "keymap-rebind" => self.keymap_menu_rebind(cx),
             "keymap-reset" => self.keymap_menu_reset(cx),
@@ -9498,6 +9492,11 @@ impl Render for YaldaGpuiView {
         // discipline as diagrams: mutation-only, dedup by `needs_load`, spawns
         // off-thread — safe to run every frame.
         self.cog_reconcile_loads(cx);
+
+        // Diff tiles (spec rev 2 B1/B3): kick a restored picker's worktree-list
+        // load / a restored bound tile's first derive, and re-derive a bound
+        // Diff tile that just GAINED focus. Mutation-only; spawns off the draw.
+        self.diff_reconcile(cx);
 
         // Behavior 9 (spec-menu-scopes.md): if the focused window changed
         // while a menu was open, dismiss it — stale entries must not

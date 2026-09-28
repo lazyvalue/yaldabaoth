@@ -19,6 +19,9 @@ impl YaldaGpuiView {
             return;
         }
         self.set_screen(App::Diff(DiffTile::new()));
+        if let Some(id) = self.workspace.focused_window_id() {
+            self.diff_load_worktrees(id, cx);
+        }
         cx.notify();
     }
 
@@ -36,23 +39,13 @@ impl YaldaGpuiView {
         }
     }
 
-    /// Cog node `badge-projection` (1cxd), spec B6: the current unreviewed-
-    /// hunk count for `worktree`, or `0` when this worktree has never had a
-    /// `DiffModel` derive land in `self.diff_projections` (spec: "a worktree
-    /// never opened in a Diff tile shows no count"). Read by the jump panel
-    /// (`jump_panel_view.rs`) keyed on a session's `cwd` — the same worktree
-    /// key `refresh_diff` resolves a `Session`-sourced tile to.
-    pub(crate) fn unreviewed_hunks_for(&self, worktree: &std::path::Path) -> usize {
-        self.diff_projections.get(worktree).copied().unwrap_or(0)
-    }
-
     /// The live render-input fingerprint for the Diff tile at `id` (used by
     /// `DiffView`'s root-observe filter — see `diff_view.rs` module docs).
     /// `DiffSeqs::default()` for a tile that's gone / not a Diff tile — a
     /// transient state a torn-down view's next (and last) render tolerates.
     pub(crate) fn diff_seqs_for(&self, id: workspace::WindowId) -> DiffSeqs {
         match self.diff_tile_ref(id) {
-            Some(tile) => DiffSeqs::of(tile, self.sessions.ids().count(), self.text_scale),
+            Some(tile) => DiffSeqs::of(tile, self.text_scale),
             None => DiffSeqs::default(),
         }
     }
@@ -78,71 +71,207 @@ impl YaldaGpuiView {
         view
     }
 
-    /// Bind (or rebind) a Diff tile's source and kick a refresh (spec B1).
-    pub(crate) fn bind_diff_source(
+    /// Bind a Diff tile to `worktree` and kick its first derive (spec rev 2
+    /// B1). The single bind path — picker Enter, row click, and `p` all land
+    /// here via [`diff_picker_activate`](Self::diff_picker_activate).
+    pub(crate) fn bind_diff_worktree(
         &mut self,
         id: workspace::WindowId,
-        source: DiffSource,
+        worktree: PathBuf,
         cx: &mut Context<Self>,
     ) {
-        if let Some(tile) = self.diff_tile_mut(id) {
-            tile.source = Some(source);
-            tile.model = None;
-            tile.error = None;
-            tile.needs_load = false;
-        }
+        let Some(tile) = self.diff_tile_mut(id) else {
+            return;
+        };
+        tile.worktree = Some(worktree);
+        tile.model = None;
+        tile.error = None;
+        tile.needs_load = false;
+        tile.focus = DiffFocus::default();
+        tile.picker = WorktreePicker::default();
         self.refresh_diff(id, cx);
         self.save_workspace_state();
         cx.notify();
     }
 
-    /// Return a bound tile to the selector (spec B9 "bind" verb — pick a
-    /// different session/path).
+    /// Return a bound tile to the worktree picker and reload the list (spec
+    /// B1 `space → Switch worktree`). Bumps `req` so an in-flight derive for
+    /// the old worktree is discarded when it lands.
     pub(crate) fn diff_unbind(&mut self, id: workspace::WindowId, cx: &mut Context<Self>) {
-        if let Some(tile) = self.diff_tile_mut(id) {
-            tile.source = None;
-            tile.model = None;
-            tile.error = None;
-            tile.needs_load = false;
-        }
+        let Some(tile) = self.diff_tile_mut(id) else {
+            return;
+        };
+        tile.worktree = None;
+        tile.model = None;
+        tile.error = None;
+        tile.refreshing = false;
+        tile.needs_load = false;
+        tile.req = tile.req.wrapping_add(1);
+        tile.picker = WorktreePicker::default();
+        self.diff_load_worktrees(id, cx);
+        self.save_workspace_state();
         cx.notify();
     }
 
-    /// Re-derive the diff for the tile at `id`: resolve the worktree (from
-    /// the bound session's `cwd`, cheap and `cx`-only, or the explicit
-    /// `Path`), then run `collect_raw_diff` → `parse_diff` →
-    /// `resolve_git_common_dir`/`load_review_state` → `join_reviewed_flags`
-    /// entirely on the background executor (spec C2 — no git subprocess or
-    /// `ReviewState` I/O on the foreground thread, let alone the render
-    /// path), swapping the result in via `diff_apply` (spec § Interfaces).
-    pub(crate) fn refresh_diff(&mut self, id: workspace::WindowId, cx: &mut Context<Self>) {
-        let Some(source) = self.diff_tile_mut(id).and_then(|t| t.source.clone()) else {
+    /// The directory whose repo the picker lists: the active workspace's cwd,
+    /// falling back to the process cwd (spec B1). Also what "Pick a folder…"
+    /// binds.
+    fn diff_picker_dir(&self) -> PathBuf {
+        self.active_workspace_cwd().unwrap_or_else(process_cwd)
+    }
+
+    /// Load the worktree list for the picker of tile `id` on the background
+    /// executor (spec C2 — `git worktree list` never runs on the paint path),
+    /// folding the result in via [`diff_worktrees_apply`](Self::diff_worktrees_apply).
+    /// Event-handler / spawned-task only: it notifies.
+    pub(crate) fn diff_load_worktrees(&mut self, id: workspace::WindowId, cx: &mut Context<Self>) {
+        let dir = self.diff_picker_dir();
+        let req = {
+            let Some(tile) = self.diff_tile_mut(id) else {
+                return;
+            };
+            let p = &mut tile.picker;
+            p.needs_load = false;
+            p.req = p.req.wrapping_add(1);
+            p.loading = true;
+            p.bump();
+            p.req
+        };
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { list_worktrees(&dir) })
+                .await;
+            let _ = this.update(cx, |this, cx| this.diff_worktrees_apply(id, req, result, cx));
+        })
+        .detach();
+    }
+
+    /// Fold a finished worktree-list load into the picker (discarding a stale
+    /// one). Not-a-repo is a plain state, not an error (spec B1); any other
+    /// failure shows inline. The folder row is always offered.
+    pub(crate) fn diff_worktrees_apply(
+        &mut self,
+        id: workspace::WindowId,
+        req: u64,
+        result: Result<Vec<WorktreeEntry>, GitDiffError>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tile) = self.diff_tile_mut(id) else {
             return;
         };
-        let worktree = match &source {
-            DiffSource::Path(p) => Some(p.clone()),
-            DiffSource::Session(sid) => match self.sessions.get(*sid) {
-                Some(ent) => Some(ent.read(cx).cwd.clone()),
-                None => {
-                    // Spec B1: the session closed — fall back to Path binding
-                    // on the last-known worktree rather than closing the tile.
-                    let fallback = self.diff_tile_mut(id).and_then(|t| t.worktree());
-                    if let Some(wt) = fallback.clone()
-                        && let Some(tile) = self.diff_tile_mut(id)
-                    {
-                        tile.source = Some(DiffSource::Path(wt));
-                    }
-                    fallback
-                }
-            },
-        };
-        let Some(worktree) = worktree else {
-            if let Some(tile) = self.diff_tile_mut(id) {
-                tile.error = Some(
-                    "no worktree to diff (session closed with no prior binding)".to_string(),
-                );
+        let p = &mut tile.picker;
+        if p.req != req {
+            return;
+        }
+        p.loading = false;
+        match result {
+            Ok(rows) => {
+                p.rows = rows;
+                p.not_a_repo = false;
+                p.error = None;
             }
-            cx.notify();
+            Err(e) => {
+                p.rows.clear();
+                p.not_a_repo = e.is_not_a_repo();
+                p.error = (!p.not_a_repo).then(|| e.to_string());
+            }
+        }
+        p.selected = p.selected.min(p.folder_index());
+        p.bump();
+        cx.notify();
+    }
+
+    /// Activate picker row `index` of tile `id` (Enter on the selection, a row
+    /// click, or `p` for the folder row). Resolves the row AT EVENT TIME from
+    /// the tile's current picker (yux rule 4 — a click handler captured by a
+    /// cached render carries only the index): a worktree row binds its path;
+    /// the trailing folder row binds the picker directory.
+    pub(crate) fn diff_picker_activate(
+        &mut self,
+        id: workspace::WindowId,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let target = match self.diff_tile_ref(id) {
+            Some(t) if t.worktree.is_none() => {
+                if let Some(row) = t.picker.rows.get(index) {
+                    Some(row.path.clone())
+                } else if index == t.picker.folder_index() {
+                    Some(self.diff_picker_dir())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(path) = target {
+            self.bind_diff_worktree(id, path, cx);
+        }
+    }
+
+    /// Per-frame Diff reconcile, run from the ROOT render (like
+    /// `cog_reconcile_loads`): mutation-only, every load/derive is SPAWNED so
+    /// its notifies land outside the draw (yux rule 1).
+    ///
+    /// Three duties:
+    /// 1. an unbound tile whose picker list was never loaded (restored from
+    ///    disk unbound) gets its `list_worktrees` load kicked;
+    /// 2. a bound tile whose first derive was never kicked (restored bound)
+    ///    gets its derive kicked;
+    /// 3. **focus-gain refresh (spec B3, UXI-Diff-13)** — this is THE
+    ///    chokepoint for "the focused tile changed": focus moves through ~20
+    ///    `Workspace` mutators (motion, cycle, tab/workspace switch, click,
+    ///    jump palette, …), but every one of them is followed by a root
+    ///    render, so an edge detector on `focused_window_id()` here catches
+    ///    all of them by construction. When the newly focused window is a
+    ///    bound Diff tile, it re-derives.
+    pub(crate) fn diff_reconcile(&mut self, cx: &mut Context<Self>) {
+        let focused = self.workspace.focused_window_id();
+        let gained = focused != self.diff_last_focused;
+        self.diff_last_focused = focused;
+        let mut derives: Vec<workspace::WindowId> = Vec::new();
+        let mut loads: Vec<workspace::WindowId> = Vec::new();
+        for wsp in self.workspace.workspaces.iter_mut() {
+            wsp.for_each_attached_window_mut(&mut |w| {
+                let wid = w.id();
+                let App::Diff(tile) = &mut w.content else {
+                    return;
+                };
+                if tile.worktree.is_some() {
+                    let focus_gained = gained && focused == Some(wid);
+                    if tile.needs_load || focus_gained {
+                        tile.needs_load = false;
+                        derives.push(wid);
+                    }
+                } else if tile.picker.needs_load {
+                    tile.picker.needs_load = false;
+                    loads.push(wid);
+                }
+            });
+        }
+        for wid in derives {
+            cx.spawn(async move |this, cx| {
+                let _ = this.update(cx, |v, cx| v.refresh_diff(wid, cx));
+            })
+            .detach();
+        }
+        for wid in loads {
+            cx.spawn(async move |this, cx| {
+                let _ = this.update(cx, |v, cx| v.diff_load_worktrees(wid, cx));
+            })
+            .detach();
+        }
+    }
+
+    /// Re-derive the diff for the bound tile at `id`: run `collect_raw_diff`
+    /// → `parse_diff` → `resolve_git_common_dir`/`load_review_state` →
+    /// `join_reviewed_flags` entirely on the background executor (spec C2 —
+    /// no git subprocess or review I/O on the foreground thread), swapping the
+    /// result in via `diff_apply`. No-op on an unbound tile.
+    pub(crate) fn refresh_diff(&mut self, id: workspace::WindowId, cx: &mut Context<Self>) {
+        let Some(worktree) = self.diff_tile_ref(id).and_then(|t| t.worktree.clone()) else {
             return;
         };
 
@@ -183,10 +312,8 @@ impl YaldaGpuiView {
     /// `WindowId`), discarding a superseded (stale) request (spec §
     /// Interfaces). Never panics on failure (spec B1) — an error just
     /// replaces the inline error state; the previous model (if any) is
-    /// dropped only on success, per spec B3 "the tile shows the previous
-    /// model until the new one lands" (a failed refresh still surfaces the
-    /// error rather than silently keeping stale content, since the worktree
-    /// itself may be gone).
+    /// dropped only on success, per spec B3 "the previous model stays on
+    /// screen until the new one lands".
     pub(crate) fn diff_apply(
         &mut self,
         id: workspace::WindowId,
@@ -201,17 +328,9 @@ impl YaldaGpuiView {
             return;
         }
         tile.refreshing = false;
-        // Cog node `badge-projection` (1cxd), spec B6: captured alongside the
-        // successful derive (never on error — a failed refresh leaves the
-        // previous projection stale-frozen, same as it leaves `tile.model`
-        // untouched-by-clearing) and written to `self.diff_projections`
-        // AFTER `tile`'s borrow ends below, since the projection lives on
-        // root, not the tile.
-        let mut projection: Option<(PathBuf, usize)> = None;
         match result {
             Ok(model) => {
                 let prev_hash = tile.focused_hunk_hash();
-                projection = Some((model.worktree.clone(), model.unreviewed_hunk_count()));
                 tile.model = Some(model);
                 tile.error = None;
                 tile.model_gen = tile.model_gen.wrapping_add(1);
@@ -221,130 +340,7 @@ impl YaldaGpuiView {
                 tile.error = Some(e.to_string());
             }
         }
-        if let Some((worktree, count)) = projection {
-            self.diff_projections.insert(worktree, count);
-        }
         cx.notify();
-    }
-
-    /// Every window id holding a Diff tile whose `DiffSource` is
-    /// `Session(id)` — spec B3 triggers (a)/(b) fan out a re-derive to
-    /// however many tiles (across however many workspaces) are watching one
-    /// session's worktree. Mirrors the `for_each_attached_window` walk
-    /// `reconcile_session_closed` uses to find a session's `App::Agent` tile,
-    /// generalized to `App::Diff` and to "however many", not "at most one" —
-    /// unlike an agent tile's 1:1 binding, several Diff tiles may legitimately
-    /// watch the same session's worktree at once.
-    fn diff_windows_bound_to_session(&self, id: SessionId) -> Vec<workspace::WindowId> {
-        let mut out = Vec::new();
-        for wsp in self.workspace.workspaces.iter() {
-            wsp.for_each_attached_window(&mut |window| {
-                if let App::Diff(tile) = &window.content
-                    && tile.source == Some(DiffSource::Session(id))
-                {
-                    out.push(window.id());
-                }
-            });
-        }
-        out
-    }
-
-    /// Re-derive every Diff tile bound to session `id` (spec B3 triggers
-    /// (a)/(b)). A no-op when nothing is watching this session — the common
-    /// case, since most sessions never have a Diff tile open on them.
-    pub(crate) fn refresh_diff_tiles_for_session(&mut self, id: SessionId, cx: &mut Context<Self>) {
-        for wid in self.diff_windows_bound_to_session(id) {
-            self.refresh_diff(wid, cx);
-        }
-    }
-
-    /// Cog node `refresh-triggers` (7ods), spec B3(a): "when a bound session's
-    /// turn completes". `finalize_agent_turn_idem` is the one chokepoint every
-    /// turn-completion path (forwarded `AgentEvent`, legacy inference, the
-    /// direct-channel path) funnels through, so arming `diff_turn_completed_due`
-    /// there and draining it HERE — exactly where `drain_autoname_requests`
-    /// already runs, for the same "no `cx` at the finalize site" reason —
-    /// covers every completion path by construction. Not debounced: a turn
-    /// completion is a single, infrequent event (unlike a burst of tool
-    /// calls), so an immediate re-derive is correct as-is.
-    pub(crate) fn drain_diff_refresh_requests(&mut self, cx: &mut Context<Self>) {
-        let due: Vec<SessionId> = self
-            .sessions
-            .iter()
-            .filter(|(_, ent)| ent.read(cx).state.diff_turn_completed_due)
-            .map(|(id, _)| id)
-            .collect();
-        for id in due {
-            if let Some(ent) = self.sessions.get(id) {
-                ent.update(cx, |s, _| s.state.diff_turn_completed_due = false);
-            }
-            self.refresh_diff_tiles_for_session(id, cx);
-        }
-    }
-
-    /// Debounce window for spec B3(b) — long enough to coalesce a multi-file
-    /// edit turn's tool-call completions (which land back-to-back) into one
-    /// re-derive, short enough that the diff still feels live.
-    pub(crate) const DIFF_FILE_CHANGE_DEBOUNCE: std::time::Duration =
-        std::time::Duration::from_millis(600);
-
-    /// Cog node `refresh-triggers` (7ods), spec B3(b): "debounced after any
-    /// tool-call completion... that reports file changes". The reducer arms
-    /// (`apply_reply_events` / `apply_agent_event`) bump
-    /// `diff_file_change_gen` on every completed file-mutating tool call —
-    /// cheap, `cx`-free bookkeeping at the point of detection. This drain
-    /// (called from the same two pump chokepoints as
-    /// `drain_diff_refresh_requests`) notices a session whose generation has
-    /// moved since the last schedule, marks it seen, and schedules ONE
-    /// debounce task carrying that generation.
-    pub(crate) fn drain_diff_file_change_requests(&mut self, cx: &mut Context<Self>) {
-        let due: Vec<(SessionId, u64)> = self
-            .sessions
-            .iter()
-            .filter_map(|(id, ent)| {
-                let s = ent.read(cx);
-                let gen_ = s.state.diff_file_change_gen;
-                if gen_ != s.state.diff_file_change_seen_gen {
-                    Some((id, gen_))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        for (id, gen_) in due {
-            if let Some(ent) = self.sessions.get(id) {
-                ent.update(cx, |s, _| s.state.diff_file_change_seen_gen = gen_);
-            }
-            self.schedule_debounced_diff_refresh(id, gen_, cx);
-        }
-    }
-
-    /// Wait out the debounce window, then re-derive ONLY if `gen_` is still
-    /// the LATEST generation for this session — a later bump during the
-    /// window means a newer scheduled task (carrying that later `gen_`) owns
-    /// the eventual refresh instead, so this stale one no-ops. This trailing-
-    /// edge pattern collapses a whole burst of file-touching tool calls to
-    /// exactly one re-derive: the caller marks each generation "seen" at
-    /// SCHEDULE time (`drain_diff_file_change_requests`), so a burst inside
-    /// one window spawns several of these tasks, but every task except the
-    /// one whose `gen_` survives untouched through its own wait exits without
-    /// deriving.
-    fn schedule_debounced_diff_refresh(&mut self, id: SessionId, gen_: u64, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Self::DIFF_FILE_CHANGE_DEBOUNCE)
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                let current = this
-                    .sessions
-                    .get(id)
-                    .map(|ent| ent.read(cx).state.diff_file_change_gen);
-                if current == Some(gen_) {
-                    this.refresh_diff_tiles_for_session(id, cx);
-                }
-            });
-        })
-        .detach();
     }
 
     /// `r` / the tile-menu "refresh" verb (spec B3 manual refresh) for the
@@ -359,9 +355,9 @@ impl YaldaGpuiView {
         self.refresh_diff(id, cx);
     }
 
-    /// Tile-menu "bind" verb (spec B9) — return the focused Diff tile to its
-    /// selector so a different session/path can be chosen.
-    pub(crate) fn diff_bind_focused(&mut self, cx: &mut Context<Self>) {
+    /// Tile-menu "Switch worktree" verb (spec B1/B8) — return the focused Diff
+    /// tile to the worktree picker and reload the list.
+    pub(crate) fn diff_switch_worktree_focused(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.workspace.focused_window_id() else {
             return;
         };
@@ -471,14 +467,9 @@ impl YaldaGpuiView {
             .detach();
     }
 
-    /// Key handler for a focused Diff tile (spec B9): navigation by default —
-    /// the hunk-comment compose (spec B4) is the tile's only insert-mode
-    /// surface, checked FIRST (before the platform/control bail and
-    /// `leader_intercept`) so Ctrl-Enter can reach `submit_hunk_comment` while
-    /// composing. `focused_in_insert_mode` (`main.rs`) already keys off
-    /// `tile.compose.is_some()`, so leaders are suppressed correctly while
-    /// composing regardless — this early branch is what makes the compose's
-    /// OWN keys (Esc/Ctrl-Enter/typing) actually reach it.
+    /// Key handler for a focused Diff tile. Unbound ⇒ the worktree picker
+    /// (spec B1: `j`/`k`/arrows move, Enter binds the selection, `p` binds
+    /// the folder row); bound ⇒ diff navigation.
     pub(crate) fn handle_diff_key(
         &mut self,
         ev: &KeyDownEvent,
@@ -489,34 +480,35 @@ impl YaldaGpuiView {
         let Some(id) = self.workspace.focused_window_id() else {
             return;
         };
-        if self.diff_tile_ref(id).is_some_and(|t| t.compose.is_some()) {
-            self.handle_diff_comment_key(id, press, cx);
-            return;
-        }
-
         if ev.keystroke.modifiers.platform || ev.keystroke.modifiers.control {
             return;
         }
         if self.leader_intercept(&press, cx) {
             return;
         }
-        let unbound = matches!(self.diff_tile_ref(id), Some(t) if t.source.is_none());
+        let unbound = matches!(self.diff_tile_ref(id), Some(t) if t.worktree.is_none());
         if unbound {
             match press.key {
-                Key::Char('p') => {
-                    let dir = self.active_workspace_cwd().unwrap_or_else(process_cwd);
-                    self.bind_diff_source(id, DiffSource::Path(dir), cx);
+                Key::Char('j') | Key::Down => {
+                    if let Some(tile) = self.diff_tile_mut(id) {
+                        tile.picker.move_selection(1);
+                    }
+                    cx.notify();
                 }
-                Key::Char(d) if d.is_ascii_digit() && d != '0' => {
-                    let idx = (d as u8 - b'1') as usize;
-                    let candidate = self
-                        .sessions
-                        .iter()
-                        .map(|(sid, s)| (sid, s.read(cx).cwd.clone()))
-                        .filter(|(_, cwd)| looks_like_git_repo(cwd))
-                        .nth(idx);
-                    if let Some((sid, _)) = candidate {
-                        self.bind_diff_source(id, DiffSource::Session(sid), cx);
+                Key::Char('k') | Key::Up => {
+                    if let Some(tile) = self.diff_tile_mut(id) {
+                        tile.picker.move_selection(-1);
+                    }
+                    cx.notify();
+                }
+                Key::Enter => {
+                    if let Some(sel) = self.diff_tile_ref(id).map(|t| t.picker.selected) {
+                        self.diff_picker_activate(id, sel, cx);
+                    }
+                }
+                Key::Char('p') => {
+                    if let Some(folder) = self.diff_tile_ref(id).map(|t| t.picker.folder_index()) {
+                        self.diff_picker_activate(id, folder, cx);
                     }
                 }
                 _ => {}
@@ -563,126 +555,9 @@ impl YaldaGpuiView {
             Key::Char('r') => self.refresh_diff(id, cx),
             Key::Char('v') => self.toggle_hunk_reviewed(id, cx),
             Key::Char('V') => self.mark_file_reviewed(id, cx),
-            Key::Char('c') => self.open_hunk_comment(id, cx),
             Key::Char('o') => self.open_hunk_in_zed(id, cx),
             _ => {}
         }
-    }
-
-    // ── Cog node `comment-steering` (hk81): spec B4 comment → steering ──────
-
-    /// `c` on a focused hunk (spec B4): open the hunk-comment compose,
-    /// snapshotting the focused hunk's path/line-range/patch into
-    /// `comment_target` so a later background refresh (spec B3) can't move
-    /// the ground the comment was written against out from under it. A
-    /// `Path`-bound tile has NO comment affordance (spec B4/C4: comment→
-    /// steering needs a session to steer) — `c` is a silent no-op there, and
-    /// likewise a no-op with no model/no hunks to anchor to.
-    pub(crate) fn open_hunk_comment(&mut self, id: workspace::WindowId, cx: &mut Context<Self>) {
-        let target = self.diff_tile_ref(id).and_then(|t| {
-            if !matches!(t.source, Some(DiffSource::Session(_))) {
-                return None;
-            }
-            let model = t.model.as_ref()?;
-            let file = model.files.get(t.focus.file)?;
-            let hunk = file.hunks.get(t.focus.hunk)?;
-            Some(CommentTarget {
-                path: file.path.clone(),
-                line_range: hunk.new_line_range(),
-                patch: hunk.patch_text(),
-            })
-        });
-        let Some(target) = target else {
-            return;
-        };
-        if let Some(tile) = self.diff_tile_mut(id) {
-            tile.comment_target = Some(target);
-            tile.compose = Some(Compose::new());
-        }
-        cx.notify();
-    }
-
-    /// Esc while composing (spec B4/B9): cancel — drop the compose AND its
-    /// target, back to hunk-nav. Unlike the worksheet's layered Esc
-    /// (Insert→Normal, then leave), this compose has exactly one level: it is
-    /// a short-lived, single-purpose surface, not an editable transcript
-    /// block.
-    pub(crate) fn cancel_hunk_comment(&mut self, id: workspace::WindowId, cx: &mut Context<Self>) {
-        if let Some(tile) = self.diff_tile_mut(id) {
-            tile.compose = None;
-            tile.comment_target = None;
-        }
-        cx.notify();
-    }
-
-    /// Ctrl-Enter while composing (spec B4): build the prefixed prompt
-    /// (`build_hunk_comment_prompt`, `diff.rs`) and send it to the bound
-    /// session via the SAME `send_prompt_to_session` core the agent compose
-    /// uses (`agent_ui.rs`) — mid-turn it steers, idle it prompts, no new
-    /// transport. `steer_codex` is computed exactly like `submit_compose`'s:
-    /// Claude keeps its unconditional promptQueueing path; only a
-    /// cleanly-awaiting Codex session asks the transport to steer. On success
-    /// the compose clears; on FAILURE it is left intact (spec B4: "the draft
-    /// stays in the compose") with a status hint so the user can retry.
-    pub(crate) fn submit_hunk_comment(&mut self, id: workspace::WindowId, cx: &mut Context<Self>) {
-        let target_and_session = self.diff_tile_ref(id).and_then(|t| {
-            let Some(DiffSource::Session(sid)) = t.source else {
-                return None;
-            };
-            let target = t.comment_target.clone()?;
-            let comment = t.compose.as_ref()?.text();
-            Some((sid, target, comment))
-        });
-        let Some((sid, target, comment)) = target_and_session else {
-            return;
-        };
-        let prompt =
-            build_hunk_comment_prompt(&target.path, target.line_range, &target.patch, &comment);
-        let steer_codex = self
-            .read_session(sid, cx, |c| {
-                c.provider == AgentProvider::Codex && matches!(c.turn_phase, TurnPhase::Awaiting { .. })
-            })
-            .unwrap_or(false);
-        let sent = self.send_prompt_to_session(sid, &prompt, &[], None, steer_codex, cx);
-        if sent {
-            if let Some(tile) = self.diff_tile_mut(id) {
-                tile.compose = None;
-                tile.comment_target = None;
-            }
-            self.transient_status = Some("comment sent".into());
-        } else {
-            // Spec B4: on send FAILURE the draft stays in `tile.compose` — no
-            // silent drop. Nothing else to undo: we never touched it.
-            self.transient_status =
-                Some("send failed — reconnecting; press ctrl-enter to retry".into());
-        }
-        cx.notify();
-    }
-
-    /// Key dispatch while the hunk-comment compose is open (spec B4/B9). Esc
-    /// cancels; Ctrl-Enter submits (mirrors the agent compose's Ctrl-Enter
-    /// submit key — `handle_claude_key`, `agent_ui.rs` — so the same chord
-    /// submits every compose in the app); everything else is ordinary typing,
-    /// dispatched through the SAME insert-mode core the agent compose and the
-    /// Edit view share (`dispatch_insert_core`). The compose never leaves
-    /// Insert mode on its own — `dispatch_insert_core`'s internal Esc arm
-    /// (which would drop to Normal) never fires because Esc is handled here
-    /// first, so there is no Normal-mode dispatch to wire.
-    fn handle_diff_comment_key(&mut self, id: workspace::WindowId, press: KeyPress, cx: &mut Context<Self>) {
-        if press.key == Key::Esc && press.modifiers.is_empty() {
-            self.cancel_hunk_comment(id, cx);
-            return;
-        }
-        if press.key == Key::Enter && press.modifiers.contains(KMods::CONTROL) {
-            self.submit_hunk_comment(id, cx);
-            return;
-        }
-        if let Some(tile) = self.diff_tile_mut(id)
-            && let Some(compose) = tile.compose.as_mut()
-        {
-            Self::dispatch_insert_core(&mut compose.editor, &mut compose.mode, press);
-        }
-        cx.notify();
     }
 
     // ── Cog node `open-in-zed` (oc72): spec B8 ──────────────────────────────
@@ -702,7 +577,7 @@ impl YaldaGpuiView {
     /// installed on the machine running the test.
     pub(crate) fn open_hunk_in_zed(&mut self, id: workspace::WindowId, cx: &mut Context<Self>) {
         let target = self.diff_tile_ref(id).and_then(|t| {
-            let worktree = t.worktree()?;
+            let worktree = t.worktree.clone()?;
             let model = t.model.as_ref()?;
             let file = model.files.get(t.focus.file)?;
             let hunk = file.hunks.get(t.focus.hunk)?;

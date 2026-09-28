@@ -57,7 +57,12 @@ repo (branch prominent, path dimmed, primary labelled) plus "Pick a folder…";
 diff. Outside a git repo the picker says so and offers only the folder row.
 `space → Switch worktree` returns to the picker.
 
-**Status.** `target`
+**Status.** `implemented` (graph 8g7 node worktree-picker)
+
+**Enforcement.** `verify_harness.rs::{diff_picker_lists_and_paints_worktrees,
+diff_picker_j_enter_binds_second_worktree_and_derives,
+diff_picker_click_row_binds_worktree, diff_picker_not_a_repo_offers_only_folder_row,
+diff_tile_bound_persists_and_restores_bound}`; `diff_git.rs::list_worktrees_*`.
 
 ### UXI-Diff-11 — Diff paints with a line cursor; nav never strands it
 
@@ -86,7 +91,14 @@ keeping the old model painted until the new one lands. The cursor stays on the
 same file (nearest line) when that file still exists. No session activity
 triggers a refresh.
 
-**Status.** `target`
+**Status.** `partial` — focus-gain + `r` refresh implemented (focus edge detected
+in the per-frame `diff_reconcile`, the one point every focus mutator funnels
+through); cursor survival is still hunk-grain until the line cursor lands
+(UXI-Diff-11).
+
+**Enforcement.** `verify_harness.rs::{diff_tile_rederives_on_focus_gain,
+diff_tile_refresh_preserves_focus_when_hunk_unchanged,
+diff_tile_refresh_moves_focus_to_nearest_when_hunk_hash_gone}`.
 
 ### UXI-Diff-14 — Viewed is per file, persisted, and self-clearing
 
@@ -148,8 +160,8 @@ worktree; an unbound tile restores unbound.
 
 **Status.** `implemented`
 
-**Enforcement.** `verify_harness.rs::diff_tile_unbound_persists_and_restores_unbound`
-+ a bound round-trip (rewritten with UXI-Diff-10).
+**Enforcement.** `verify_harness.rs::{diff_tile_unbound_persists_and_restores_unbound,
+diff_tile_bound_persists_and_restores_bound}`.
 
 ## Retired (rev 1, ADR-0039)
 
