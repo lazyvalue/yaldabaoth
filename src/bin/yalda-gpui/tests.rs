@@ -4208,7 +4208,7 @@ fn doc_list_splice_preserves_scroll_anchor() {
     });
 
     // Remove a block BELOW the viewport top (an edit-flush re-parse).
-    let mut new_blocks = doc.blocks.clone();
+    let mut new_blocks = doc.blocks.to_vec();
     new_blocks.remove(30);
     doc.set_blocks(new_blocks);
     doc.reconcile_list();

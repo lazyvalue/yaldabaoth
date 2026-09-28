@@ -740,7 +740,10 @@ pub(crate) fn menu_trail_crumbs(
 
 /// State held while the user is viewing a rendered markdown document.
 struct DocState {
-    blocks: Vec<RenderedBlock>,
+    /// The rendered blocks, shared by pointer with the `'static` list render
+    /// closure (`blocks_rc`) — a re-parse swaps the `Rc`, never deep-clones
+    /// (C3). Replaced only via `set_blocks`.
+    blocks: Rc<Vec<RenderedBlock>>,
     file_label: SharedString,
     cursor_block: usize,
     /// Variable-height virtualized list driving the doc body. Only the visible
@@ -755,13 +758,6 @@ struct DocState {
     /// `EditState.lines_cache` — the key the render snapshot is memoized on,
     /// so no caller has to remember a manual invalidation step.
     blocks_seq: u64,
-    /// O(1)-cloneable snapshot of `blocks` handed to the `'static` list
-    /// render closure. Rebuilt lazily (a single full clone) only when
-    /// `blocks_seq` advanced past the stamp it was built at, mirroring
-    /// `EditState.lines_cache` keyed on `edit_seq`. Steady-state frames pay
-    /// only a pointer clone, matching the agent transcript's `lines_rc`
-    /// pattern. Stores the `blocks_seq` it was built at.
-    blocks_snapshot: RefCell<Option<(u64, Rc<Vec<RenderedBlock>>)>>,
     /// `cursor_block` value last revealed during render. When the focused
     /// block changes, render re-issues `scroll_to_reveal_item` with the
     /// freshly-spliced item count — catching nav actions that fired before
@@ -828,32 +824,36 @@ impl DocState {
         source: Option<DocSource>,
     ) -> Self {
         DocState {
-            blocks,
+            blocks: Rc::new(blocks),
             file_label,
             cursor_block: 0,
             // Top-aligned: a doc reads from its first block (the agent transcript
             // tails the bottom). 512px default item-height estimate as before.
             list: ScrollAnchoredList::new(gpui::ListAlignment::Top, gpui::px(512.0)),
             blocks_seq: 0,
-            blocks_snapshot: RefCell::new(None),
             last_cursor_block: std::cell::Cell::new(None),
             source,
         }
     }
 
-    /// Replace `blocks` and bump `blocks_seq`. The render snapshot is keyed on
-    /// `blocks_seq` (see `blocks_rc`), so the next render rebuilds it lazily —
-    /// no separate invalidation call to remember. This is the only path that
-    /// mutates `blocks` in place after construction.
+    /// Replace `blocks` and bump `blocks_seq`. The list reconcile is keyed on
+    /// `blocks_seq`, so the next render re-splices lazily — no separate
+    /// invalidation call to remember. This is the only path that mutates
+    /// `blocks` after construction.
     fn set_blocks(&mut self, blocks: Vec<RenderedBlock>) {
-        self.blocks = blocks;
+        self.blocks = Rc::new(blocks);
         self.blocks_seq = self.blocks_seq.wrapping_add(1);
     }
 
     /// Re-derive `blocks` from the shared core if it has advanced since the
     /// last derivation (5c live path: an Edit view's keystroke bumps the
     /// shared `edit_seq`, and the next frame re-renders this Doc). O(1) when
-    /// idle; one markdown parse per change. Uses a READ-ONLY borrow of the
+    /// idle; at most one markdown parse per frame however many edits landed
+    /// since the last one (keyed on `edit_seq`, so rapid edits coalesce).
+    /// C3: called ONLY for Docs that are about to be painted
+    /// (`refresh_painted_docs` + `render_tile_content`) — a hidden /
+    /// background-workspace Doc stays stale and catches up lazily the frame it
+    /// becomes visible, before anything paints it. Uses a READ-ONLY borrow of the
     /// core — never `borrow_mut` here — so a concurrent Edit mutation on the
     /// same core cannot trigger a `RefCell` double-borrow panic. No-op for
     /// string-backed Docs (`source == None`).
@@ -868,6 +868,12 @@ impl DocState {
             }
             None => return,
         };
+        #[cfg(test)]
+        DOC_REFRESH_PARSES.with(|m| {
+            *m.borrow_mut()
+                .entry(self.file_label.to_string())
+                .or_insert(0) += 1
+        });
         let path = PathBuf::from(self.file_label.as_ref());
         let blocks = render_with_wiki(&text, theme, Some(&path));
         self.set_blocks(blocks);
@@ -876,20 +882,11 @@ impl DocState {
         }
     }
 
-    /// O(1) pointer clone of the blocks snapshot, rebuilding it (one full
-    /// clone) only when `blocks_seq` has advanced past the version the cached
-    /// snapshot was built at. Mirrors `EditState.lines_cache` keyed on
-    /// `edit_seq`.
+    /// O(1) pointer clone of the blocks for the `'static` list render closure.
+    /// `blocks` is itself an `Rc`, so there is no snapshot to rebuild and no
+    /// deep clone per re-parse (C3).
     fn blocks_rc(&self) -> Rc<Vec<RenderedBlock>> {
-        let mut slot = self.blocks_snapshot.borrow_mut();
-        if let Some((seq, rc)) = slot.as_ref()
-            && *seq == self.blocks_seq
-        {
-            return rc.clone();
-        }
-        let rc = Rc::new(self.blocks.clone());
-        *slot = Some((self.blocks_seq, rc.clone()));
-        rc
+        self.blocks.clone()
     }
 
     /// Scroll the virtualized list so `idx` is on-screen. Guarded against a
@@ -9361,6 +9358,33 @@ impl Focusable for YaldaGpuiView {
     }
 }
 
+impl YaldaGpuiView {
+    /// C3: re-derive (`DocState::refresh_blocks`) only the Doc tiles that can be
+    /// painted this frame — the solo-presented tile if any, else the ACTIVE
+    /// workspace's layout leaves. Never hidden tiles or other workspaces: a
+    /// sibling Edit keystroke must not re-parse a Doc nobody can see. A skipped
+    /// Doc is stale only while invisible; the frame that shows it lands here
+    /// (or in `render_tile_content`'s refresh) before it paints. O(1) per Doc
+    /// when its core is unchanged. Mutation-only, never notifies.
+    pub(crate) fn refresh_painted_docs(&mut self) {
+        let theme = &self.theme;
+        let mut refresh = |content: &mut App| {
+            if let App::Buffer(BufferApp::Viewing(d)) = content {
+                d.refresh_blocks(theme);
+            }
+        };
+        if let Some(presentation) = self.workspace.presented_tile() {
+            if let Some(tile) = self.workspace.tile_mut(presentation.window_id()) {
+                refresh(&mut tile.content);
+            }
+            return;
+        }
+        if let Some(wsp) = self.workspace.active_workspace_mut() {
+            wsp.layout.for_each_leaf_content_mut(&mut refresh);
+        }
+    }
+}
+
 impl Render for YaldaGpuiView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.viewport_width_px = f32::from(_window.viewport_size().width);
@@ -9380,20 +9404,12 @@ impl Render for YaldaGpuiView {
             return self.render_splash(cx);
         }
 
-        // 5c: re-derive each Doc tile's blocks from its shared core when the
-        // rope has advanced (e.g. an Edit tile of the same file took a
-        // keystroke). `refresh_blocks` is O(1) per Doc when the core is
-        // unchanged and read-only on the core, so this is cheap and panic-safe.
-        {
-            let theme = &self.theme;
-            for wsp in self.workspace.workspaces.iter_mut() {
-                wsp.for_each_attached_window_mut(&mut |window| {
-                    if let App::Buffer(BufferApp::Viewing(d)) = &mut window.content {
-                        d.refresh_blocks(theme);
-                    }
-                });
-            }
-        }
+        // 5c / C3: re-derive the blocks of each Doc tile that can paint this
+        // frame from its shared core when the rope has advanced (e.g. an Edit
+        // tile of the same file took a keystroke). Hidden / background-workspace
+        // Docs are skipped — they refresh lazily when they become visible. Runs
+        // before the diagram / outline passes below so they read fresh blocks.
+        self.refresh_painted_docs();
 
         // UXI-Diagram-1: ensure every mermaid Diagram block visible on either
         // markdown surface has a render in flight. Idempotent (dedups by cache
@@ -9818,6 +9834,24 @@ impl Render for YaldaGpuiView {
 #[cfg(test)]
 thread_local! {
     static DOC_BLOCK_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// C3: per-`file_label` count of `DocState::refresh_blocks` re-parses (the
+    /// full_text copy + markdown parse). The hidden-Doc guard asserts a Doc
+    /// that isn't painted does ZERO of these while a sibling Edit tile types.
+    static DOC_REFRESH_PARSES: std::cell::RefCell<HashMap<String, usize>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Test-only: C3 re-parse count for the Doc labelled `label` since the last
+/// [`test_reset_doc_refresh_parses`].
+#[cfg(test)]
+pub(crate) fn test_doc_refresh_parses(label: &str) -> usize {
+    DOC_REFRESH_PARSES.with(|m| m.borrow().get(label).copied().unwrap_or(0))
+}
+
+/// Test-only: zero every C3 re-parse counter.
+#[cfg(test)]
+pub(crate) fn test_reset_doc_refresh_parses() {
+    DOC_REFRESH_PARSES.with(|m| m.borrow_mut().clear());
 }
 
 /// Test-only render-decision tap (the substitute for pixel inspection — GPUI's
