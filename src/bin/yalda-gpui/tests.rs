@@ -3402,11 +3402,10 @@ fn gpui_menu_has_required_entries() {
         // direct workspace commands
         "new-workspace",
         "rename-workspace",
-        // workspace submenu
         "close-workspace",
         "new-project",
         "workspace-back-and-forth",
-        // Workspace → System submenu
+        // System submenu
         "dev-restart-gui",
         "dev-restart-all",
         "open-system-console",
@@ -3463,36 +3462,39 @@ fn shell_menu_root_is_the_approved_items() {
             ("l".into(), "layout"),
             ("N".into(), "new workspace"),
             ("r".into(), "rename workspace"),
-            ("w".into(), "workspace"),
+            ("x".into(), "close workspace"),
+            ("b".into(), "back and forth"),
+            ("p".into(), "new project"),
+            ("S".into(), "system"),
             ("`".into(), "system console"),
         ],
-        "the shell root is an exact contract; tile verbs belong on the tile menu"
+        "the shell root is an exact contract; `.` is the workspace menu, so \
+         workspace ops sit at the root with no `workspace` submenu"
+    );
+    assert!(
+        menu.iter().all(|node| node.label != "workspace"),
+        "no redundant `workspace` submenu"
     );
 
-    let workspace = menu
+    let system = menu
         .iter()
-        .find(|node| node.label == "workspace")
+        .find(|node| node.label == "system")
         .and_then(|node| match &node.action {
             yalda::menu::MenuAction::Submenu(children) => Some(children),
             _ => None,
         })
-        .expect("Workspace submenu");
-    let workspace_items: Vec<(String, &str)> = workspace
+        .expect("System submenu");
+    let system_items: Vec<(String, &str)> = system
         .iter()
-        .filter(|node| {
-            matches!(node.kind(), MenuNodeKind::Command | MenuNodeKind::Submenu)
-        })
+        .filter(|node| matches!(node.kind(), MenuNodeKind::Command))
         .map(|node| (format_menu_key(&node.key), node.label.as_str()))
         .collect();
     assert_eq!(
-        workspace_items,
+        system_items,
         vec![
-            ("x".into(), "close workspace"),
-            ("p".into(), "new project"),
-            ("b".into(), "back and forth"),
-            ("s".into(), "system"),
-        ],
-        "New/Rename belong at shell root; Workspace retains lifecycle/project ops and System"
+            ("r".into(), "rebuild and restart gui"),
+            ("R".into(), "rebuild and restart all"),
+        ]
     );
 
     // New/Rename dispatch straight from the root. `n` remains the New Tile
@@ -3507,24 +3509,33 @@ fn shell_menu_root_is_the_approved_items() {
         );
     }
 
-    // Rebuild commands are nested at Workspace → System.
+    // Workspace ops dispatch straight from the root (no `workspace` submenu);
+    // rebuild commands are one level down at `S` System.
+    for (key, expected) in [
+        ('x', "close-workspace"),
+        ('b', "workspace-back-and-forth"),
+        ('p', "new-project"),
+    ] {
+        let mut state = MenuState::new();
+        state.open();
+        assert_eq!(
+            state.process_key(KeyPress::new(Key::Char(key), KMods::NONE), &menu),
+            Some(expected.to_string()),
+            "root {key} must dispatch {expected}"
+        );
+    }
     for (key, expected) in [('r', "dev-restart-gui"), ('R', "dev-restart-all")] {
         let mut state = MenuState::new();
         state.open();
         assert_eq!(
-            state.process_key(KeyPress::new(Key::Char('w'), KMods::NONE), &menu),
+            state.process_key(KeyPress::new(Key::Char('S'), KMods::NONE), &menu),
             None,
-            "w opens Workspace"
-        );
-        assert_eq!(
-            state.process_key(KeyPress::new(Key::Char('s'), KMods::NONE), &menu),
-            None,
-            "w s opens System"
+            "S opens System"
         );
         assert_eq!(
             state.process_key(KeyPress::new(Key::Char(key), KMods::NONE), &menu),
             Some(expected.to_string()),
-            "w s {key} must dispatch {expected}"
+            "S {key} must dispatch {expected}"
         );
     }
 }
@@ -3691,7 +3702,7 @@ fn shell_layout_submenu_selects_modes() {
 }
 
 #[test]
-fn shell_menu_close_tile_at_root_close_workspace_under_w() {
+fn shell_menu_close_workspace_at_root_close_tile_on_tile_menu() {
     // UXI-Menu-8/9: tile close moved to the `<space>` tile menu, so the shell
     // root no longer binds `X`; workspace close remains lowercase `w x`.
     let menu = gpui_menu();
@@ -3708,22 +3719,8 @@ fn shell_menu_close_tile_at_root_close_workspace_under_w() {
     lower.open();
     assert_eq!(
         lower.process_key(KeyPress::new(Key::Char('x'), KMods::NONE), &menu),
-        None,
-        "lowercase x is intentionally unbound at root"
-    );
-
-    // Descend into the workspace submenu, then `x` closes the workspace.
-    let mut ws = MenuState::new();
-    ws.open();
-    assert_eq!(
-        ws.process_key(KeyPress::new(Key::Char('w'), KMods::NONE), &menu),
-        None,
-        "w opens the workspace submenu"
-    );
-    assert_eq!(
-        ws.process_key(KeyPress::new(Key::Char('x'), KMods::NONE), &menu),
         Some("close-workspace".to_string()),
-        "w x closes the workspace"
+        "lowercase x closes the workspace from the root (no `workspace` submenu)"
     );
 
     let mut show = MenuState::new();
