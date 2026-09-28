@@ -150,24 +150,12 @@ pub(crate) struct CwdDrag {
     pub(crate) cwd_key: String,
 }
 
-/// Drag payload for a tag folder header being reordered (UXI-JumpPanel-21).
-/// Carries the owning `project` name (tags are project-scoped, so a folder drag
-/// never crosses projects) plus the `tag`. Typed distinctly so tag- and cwd-level
-/// drags never cross-fire.
-#[derive(Clone)]
-pub(crate) struct TagDrag {
-    pub(crate) project: String,
-    pub(crate) tag: String,
-}
-
 /// The exact visible group in which a tile row may reorder (UXI-JumpPanel-28).
 /// Encoding workspace, project, tag, and untagged membership as a closed enum
 /// makes every drop boundary explicit and exhaustively gateable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TileDragGroup {
     Workspace(usize),
-    DetachedTag { project: ProjectId, tag: String },
-    DetachedUntagged(ProjectId),
 }
 
 /// Drag payload for a tile row being reordered within its visible group
@@ -388,70 +376,6 @@ impl AgentRow {
 }
 
 impl YaldaGpuiView {
-    /// Reorder a Detached tile within its exact project/tag (or untagged) group
-    /// (UXI-JumpPanel-28). The typed drag predicate rejects invalid gestures;
-    /// this state boundary independently derives live tile membership and is a
-    /// no-op unless both identities still belong to the supplied group.
-    pub(crate) fn reorder_detached_tile(
-        &mut self,
-        dragged: workspace::WindowId,
-        target: workspace::WindowId,
-        group: &TileDragGroup,
-        cx: &mut Context<Self>,
-    ) {
-        let belongs_to_group = |id: workspace::WindowId| {
-            self.workspace
-                .detached_tiles
-                .iter()
-                .find(|tile| tile.window.id() == id)
-                .is_some_and(|tile| match group {
-                    TileDragGroup::Workspace(_) => false,
-                    TileDragGroup::DetachedTag { project, tag } => {
-                        tile.project() == *project && tile.window.tags.contains(tag)
-                    }
-                    TileDragGroup::DetachedUntagged(project) => {
-                        tile.project() == *project && tile.window.tags.is_empty()
-                    }
-                })
-        };
-        if !belongs_to_group(dragged) || !belongs_to_group(target) {
-            return;
-        }
-
-        // Rebuild a total order over ALL Detached tiles, not merely the current
-        // Waiting/Working/Archived filter. That keeps switching tabs from
-        // silently dropping identities out of the durable preference.
-        let agent_rows = self.jump_panel_agent_rows(cx);
-        let mut ids = Vec::with_capacity(self.workspace.detached_tiles.len());
-        for (project, _) in self.projects.iter() {
-            let mut rows: Vec<_> = self
-                .workspace
-                .detached_tiles
-                .iter()
-                .filter(|tile| tile.project() == project)
-                .map(|tile| {
-                    self.jump_tile_row(&tile.window, &agent_rows, JumpTilePlacement::Detached, cx)
-                })
-                .collect();
-            rows.sort_by(|a, b| a.label.cmp(&b.label));
-            let rank = |id: workspace::WindowId| {
-                self.jump_detached_tile_order
-                    .iter()
-                    .position(|ordered| *ordered == id)
-                    .unwrap_or(usize::MAX)
-            };
-            rows.sort_by_key(|row| rank(row.id));
-            ids.extend(rows.into_iter().map(|row| row.id));
-        }
-        reorder_move_win(&mut ids, dragged, target);
-        if ids == self.jump_detached_tile_order {
-            return;
-        }
-        self.jump_detached_tile_order = ids;
-        self.save_settings();
-        cx.notify();
-    }
-
     /// Build the deduped agent-session rows for the jump panel: the universal
     /// roster (every server session) unioned with local-only sessions not yet
     /// represented in the roster (mid-create placeholders). Sessions opened here
@@ -674,6 +598,9 @@ fn jump_target_key(t: &JumpTarget) -> String {
 /// catches up it can be a `Local` row — so match BOTH so the box never blinks
 /// off across that window. Pure so the "which row is active" derivation is
 /// headlessly testable in isolation.
+// Legacy session-row projection: production paint moved to tile rows; the
+// pure projection tests still exercise it.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn jump_target_is_active(
     target: &JumpTarget,
     active_local: Option<SessionId>,
@@ -688,7 +615,7 @@ pub(crate) fn jump_target_is_active(
 impl YaldaGpuiView {
     /// The identity of the active agent session for the jump-panel active box
     /// (UXI-JumpPanel-5): the session bound to the FOCUSED tile, as `(local id,
-    /// server sid)`. `(None, _)` when the focused tile is a buffer or an detached
+    /// server sid)`. `(None, _)` when the focused tile is a buffer or an unbound
     /// agent tile. `render_jump_panel` consumes this; exposed for headless
     /// assertion so the test drives the same derivation the paint does.
     pub(crate) fn jump_active_session(&self) -> (Option<SessionId>, Option<String>) {
@@ -713,20 +640,16 @@ pub(crate) struct JumpTileRow {
     pub(crate) id: workspace::WindowId,
     pub(crate) render_index: usize,
     pub(crate) label: String,
-    pub(crate) tags: Vec<String>,
     pub(crate) active: bool,
     pub(crate) placement: JumpTilePlacement,
     pub(crate) agent: Option<AgentRow>,
 }
 
-/// Ownership and visibility reach the renderer as one closed state. In
-/// particular, a Detached tile cannot also be Hidden; that invalid combination
-/// is unrepresentable in the jump-panel projection.
+/// A tile's visibility in its owning workspace, as the renderer sees it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum JumpTilePlacement {
     AttachedVisible,
     AttachedHidden,
-    Detached,
 }
 
 impl JumpTilePlacement {
@@ -757,9 +680,9 @@ pub(crate) struct JumpWorkspaceFolder {
 }
 
 /// One rendered project section in the jump panel (UXI-Project-3): a project's
-/// name + cwd, collapsible workspace folders, and its Detached tile collection.
-/// The legacy flat fields remain during the compatibility transition for pure
-/// ordering tests; production paint consumes `workspace_folders` / `detached`.
+/// name + cwd and its collapsible workspace folders (ADR-0039: there is no
+/// tile outside a workspace). The legacy flat fields remain for pure ordering
+/// tests; production paint consumes `workspace_folders`.
 pub(crate) struct JumpProjectSection {
     pub(crate) id: ProjectId,
     pub(crate) name: String,
@@ -773,7 +696,6 @@ pub(crate) struct JumpProjectSection {
     /// `(flat row index, row)` — the flat index is the stable listener key.
     pub(crate) sessions: Vec<(usize, AgentRow)>,
     pub(crate) workspace_folders: Vec<JumpWorkspaceFolder>,
-    pub(crate) detached: Vec<JumpTileRow>,
 }
 
 impl YaldaGpuiView {
@@ -931,54 +853,20 @@ impl YaldaGpuiView {
                     .unwrap_or(usize::MAX)
             };
             workspace_folders.sort_by_key(|folder| workspace_rank(&folder.key));
-            let mut detached: Vec<JumpTileRow> = self
-                .workspace
-                .detached_tiles
-                .iter()
-                .filter(|tile| {
-                    tile.project() == id && !matches!(&tile.window.content, App::AgentStats)
-                })
-                .map(|tile| {
-                    self.jump_tile_row(
-                        &tile.window,
-                        &tile_agent_rows,
-                        JumpTilePlacement::Detached,
-                        cx,
-                    )
-                })
-                .filter(|tile| match (&tile.agent, agent_tab) {
-                    (None, JumpAgentTab::All) => true,
-                    (None, _) => false,
-                    (Some(row), JumpAgentTab::Waiting) => {
-                        !row.archived && row.activity() == AgentActivity::Waiting
-                    }
-                    (Some(row), JumpAgentTab::Working) => {
-                        !row.archived && row.activity() == AgentActivity::Working
-                    }
-                    (Some(row), JumpAgentTab::All) => !row.archived,
-                    (Some(row), JumpAgentTab::Archived) => row.archived,
-                })
-                .collect();
-            detached.sort_by(|a, b| a.label.cmp(&b.label));
-            // Detached order is independent from attached workspace tile order.
-            // This stable rank sort preserves the alphabetical default for an
-            // absent preference and for newly discovered, unlisted tiles.
-            let detached_rank = |tile_id: workspace::WindowId| {
-                self.jump_detached_tile_order
+            // Live non-archived totals over every agent tile the project's
+            // workspaces own, visible or hidden.
+            let project_agents = || {
+                workspace_folders
                     .iter()
-                    .position(|ordered| *ordered == tile_id)
-                    .unwrap_or(usize::MAX)
+                    .flat_map(|folder| folder.tiles.iter())
+                    .filter_map(|tile| tile.agent.as_ref())
+                    .filter(|row| !row.archived)
             };
-            detached.sort_by_key(|tile| detached_rank(tile.id));
-            let waiting_count = detached
-                .iter()
-                .filter_map(|tile| tile.agent.as_ref())
-                .filter(|row| !row.archived && row.activity() == AgentActivity::Waiting)
+            let waiting_count = project_agents()
+                .filter(|row| row.activity() == AgentActivity::Waiting)
                 .count();
-            let working_count = detached
-                .iter()
-                .filter_map(|tile| tile.agent.as_ref())
-                .filter(|row| !row.archived && row.activity() == AgentActivity::Working)
+            let working_count = project_agents()
+                .filter(|row| row.activity() == AgentActivity::Working)
                 .count();
             sections.push(JumpProjectSection {
                 id,
@@ -990,7 +878,6 @@ impl YaldaGpuiView {
                 workspaces,
                 sessions,
                 workspace_folders,
-                detached,
             });
         }
         let cwd_rank = |key: &str| {
@@ -1034,7 +921,7 @@ impl YaldaGpuiView {
             .unwrap_or(window.id() as usize);
         let mut agent = agent_match.take().map(|(_, row)| row);
         if let Some(row) = &mut agent {
-            row.tags = tags.clone();
+            row.tags = tags;
         }
         let label = agent
             .as_ref()
@@ -1044,7 +931,6 @@ impl YaldaGpuiView {
             id: window.id(),
             render_index,
             label,
-            tags,
             active: self.workspace.focused_window_id() == Some(window.id()),
             placement,
             agent,
@@ -1115,6 +1001,7 @@ pub(crate) fn agent_row_groups_for_tab(
 /// WITHIN each folder and within untagged, so the caller's sort carries through
 /// (chronological for Waiting/Working, by-label for All). Pure so the grouping is
 /// headlessly testable in isolation.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn partition_rows_by_tag(
     rows: Vec<(usize, AgentRow)>,
     tag_order: &[String],
@@ -1144,35 +1031,6 @@ pub(crate) fn partition_rows_by_tag(
     // BTreeMap yields alpha order (the default); a stable sort by manual rank
     // floats the user's ordered tags to the top, unlisted ones keep alpha after.
     let mut folders: Vec<(String, Vec<(usize, AgentRow)>)> = folders.into_iter().collect();
-    let rank = |tag: &str| {
-        tag_order
-            .iter()
-            .position(|t| t == tag)
-            .unwrap_or(usize::MAX)
-    };
-    folders.sort_by_key(|(tag, _)| rank(tag));
-    (folders, untagged)
-}
-
-/// Tile-native twin of `partition_rows_by_tag`. Tags live on the stable tile,
-/// so the same grouping works for Agent and non-Agent detached rows.
-pub(crate) fn partition_tiles_by_tag(
-    rows: Vec<JumpTileRow>,
-    tag_order: &[String],
-) -> (Vec<(String, Vec<JumpTileRow>)>, Vec<JumpTileRow>) {
-    let mut folders: std::collections::BTreeMap<String, Vec<JumpTileRow>> =
-        std::collections::BTreeMap::new();
-    let mut untagged = Vec::new();
-    for row in rows {
-        if row.tags.is_empty() {
-            untagged.push(row);
-            continue;
-        }
-        for tag in &row.tags {
-            folders.entry(tag.clone()).or_default().push(row.clone());
-        }
-    }
-    let mut folders: Vec<_> = folders.into_iter().collect();
     let rank = |tag: &str| {
         tag_order
             .iter()
@@ -1534,14 +1392,12 @@ impl YaldaGpuiView {
             return;
         }
         self.announce_session_archived(sid, archived, cx);
-        // Archiving detaches the complete Agent tile so its transcript and tags
-        // remain reachable from Archived. Empty workspaces are valid.
+        // Archiving returns every tile showing the session to its session
+        // picker (ADR-0039); the tile keeps its workspace and place.
         if archived
             && let Some(local) = self.sessions.locate(&ServerSid::new(sid.to_string()))
-            && let Some(tile) = self.agent_tile_id_for_session(local)
-            && self.workspace.detach_window(tile).is_ok()
+            && self.show_pickers_for_session(local)
         {
-            self.workspace.clear_solo_presentation();
             self.save_agent_ring(cx);
         }
         self.save_settings();
@@ -1632,84 +1488,6 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
-    /// The composite key a tag folder folds by (`"{project}\u{1f}{tag}"`,
-    /// UXI-JumpPanel-21) — `\u{1f}` (unit separator) can't appear in a project
-    /// name or tag, so the join is unambiguous.
-    pub(crate) fn tag_fold_key(project: &str, tag: &str) -> String {
-        format!("{project}\u{1f}{tag}")
-    }
-
-    /// Is this project's tag folder folded (UXI-JumpPanel-21)?
-    pub(crate) fn tag_folder_folded(&self, project: &str, tag: &str) -> bool {
-        self.jump_folded_tags
-            .contains(&Self::tag_fold_key(project, tag))
-    }
-
-    /// Fold or unfold one project's tag folder (UXI-JumpPanel-21). Keyed by
-    /// durable project name + tag, persisted like `jump_folded_projects`.
-    pub(crate) fn toggle_tag_fold(&mut self, project: &str, tag: &str, cx: &mut Context<Self>) {
-        let key = Self::tag_fold_key(project, tag);
-        if !self.jump_folded_tags.remove(&key) {
-            self.jump_folded_tags.insert(key);
-        }
-        self.save_settings();
-        cx.notify();
-    }
-
-    /// The tags currently present across a project's detached tiles, in the
-    /// user's manual order (`jump_tag_order[project]`, then alphabetical for
-    /// unlisted tags). Used by the reorder to rebuild a total order over the tags
-    /// actually shown. Pure read.
-    pub(crate) fn ordered_project_tags(&self, project: &str, cx: &gpui::App) -> Vec<String> {
-        let _ = cx;
-        let mut present: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for tile in &self.workspace.detached_tiles {
-            if self.projects.name_of(tile.project()) == project {
-                present.extend(tile.window.tags.iter().cloned());
-            }
-        }
-        let order = self
-            .jump_tag_order
-            .get(project)
-            .cloned()
-            .unwrap_or_default();
-        let mut tags: Vec<String> = present.into_iter().collect();
-        let rank = |t: &str| order.iter().position(|x| x == t).unwrap_or(usize::MAX);
-        tags.sort_by_key(|t| rank(t));
-        tags
-    }
-
-    /// Reorder tag folder `dragged` to `target`'s slot within `project`
-    /// (UXI-JumpPanel-21). Tags are project-scoped, so the reorder is confined to
-    /// one project: both tags must be present in it or the drag is refused (the
-    /// cross-project guard, mirroring `reorder_session`'s cwd gate). Rebuilds that
-    /// project's `jump_tag_order` entry over the tags currently shown, in present
-    /// display order, then persists + notifies.
-    pub(crate) fn reorder_tag(
-        &mut self,
-        project: &str,
-        dragged: &str,
-        target: &str,
-        cx: &mut Context<Self>,
-    ) {
-        if dragged == target {
-            return;
-        }
-        let mut tags = self.ordered_project_tags(project, cx);
-        // Cross-project guard: a tag not present in this project can't be moved here.
-        if !tags.iter().any(|t| t == dragged) || !tags.iter().any(|t| t == target) {
-            return;
-        }
-        reorder_move(&mut tags, dragged, target);
-        let entry = self.jump_tag_order.entry(project.to_string()).or_default();
-        if *entry == tags {
-            return;
-        }
-        *entry = tags;
-        self.save_settings();
-        cx.notify();
-    }
-
     /// Build the jump-panel sidebar element (inline; see the module note).
     /// Reads workspaces + agent sessions + theme directly off `self`; row clicks
     /// re-enter through `cx.listener` and resolve their target id/index in the
@@ -1765,10 +1543,6 @@ impl YaldaGpuiView {
             &self.theme.agent,
             AgentDotStatus::Working,
         ));
-
-        // The active screen element for the neutral selected treatment
-        // (UXI-JumpPanel-5): the session bound to the focused tile.
-        let (active_local, active_sid) = self.jump_active_session();
 
         let mut col = div()
             .id("jump-panel")
@@ -1851,17 +1625,16 @@ impl YaldaGpuiView {
         // session / Delete project; UXI-JumpPanel-8). Each section owns its
         // WORKSPACES sublist (workspaces whose `wsp.project()` is it; the ctrl-<n>
         // number moves to a dim right-edge hint) and its UNBOUND tiles. Bound
-        // tiles are children of workspace folders; detached tiles live below the
-        // optional tag folders. The panel always paints the ordinary All
+        // tiles are children of workspace folders (ADR-0039: nothing lives outside
+        // one). The panel always paints the ordinary All
         // projection; activity-specific projections remain available to Cmd-P
         // and compatibility callers (UXI-JumpPanel-32).
-        let (sections, unfiled) = self.jump_panel_sections_with_tab(cx, Some(JumpAgentTab::All));
+        let (sections, _unfiled) = self.jump_panel_sections_with_tab(cx, Some(JumpAgentTab::All));
         let drag_fg = st.fg;
         let drag_font = st.mono.clone();
 
         for section in sections {
             let pid = section.id;
-            let agent_tab = section.agent_tab;
             let cwd_key = section.cwd_display.clone();
             let project_name = section.name.clone();
             let folded = self.jump_folded_projects.contains(&project_name);
@@ -2108,392 +1881,6 @@ impl YaldaGpuiView {
                     group.into_any_element(),
                 ));
             }
-
-            // DETACHED is tile-native: attached tiles cannot enter it,
-            // non-Agent tiles participate, and tag
-            // folders read the tags carried by each stable tile.
-            let proj_name = section.name.clone();
-            col = col.child(
-                div()
-                    .w_full()
-                    .px_3()
-                    .pt_2()
-                    .pb_1()
-                    .text_color(electric)
-                    .font_family(st.mono.clone())
-                    .font_weight(FontWeight::BOLD)
-                    .text_size(px(st.pt * 0.82))
-                    .child(SharedString::new_static("DETACHED")),
-            );
-            let tag_order = self
-                .jump_tag_order
-                .get(&proj_name)
-                .cloned()
-                .unwrap_or_default();
-            let (folders, untagged) = partition_tiles_by_tag(section.detached, &tag_order);
-            let had_folders = !folders.is_empty();
-            for (folder_idx, (tag, rows)) in folders.into_iter().enumerate() {
-                let folder_folded = self.tag_folder_folded(&proj_name, &tag);
-                let project_for_fold = proj_name.clone();
-                let tag_for_fold = tag.clone();
-                let header = div()
-                    .id(SharedString::from(format!(
-                        "jump-detached-tag-folder-{}-{folder_idx}",
-                        pid.0
-                    )))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .w_full()
-                    .pl(px(20.0))
-                    .pr_3()
-                    .py_1()
-                    .cursor_pointer()
-                    .text_color(electric)
-                    .font_family(st.mono.clone())
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_size(px(st.pt * 0.82))
-                    .child(SharedString::from(format!(
-                        "{} 🏷 {}  {}",
-                        if folder_folded { "▸" } else { "▾" },
-                        tag,
-                        rows.len()
-                    )))
-                    .on_click(cx.listener(move |this, _ev, _window, cx| {
-                        this.toggle_tag_fold(&project_for_fold, &tag_for_fold, cx)
-                    }));
-                col = col.child(probe_bounds_dyn(
-                    format!("jump-tag-folder-{}-{folder_idx}", pid.0),
-                    header.into_any_element(),
-                ));
-                if !folder_folded {
-                    let mut body = div()
-                        .flex()
-                        .flex_col()
-                        .w_full()
-                        .ml(px(26.0))
-                        .border_l_1()
-                        .border_color(divider_color)
-                        .pl(px(2.0));
-                    for tile in &rows {
-                        body = body.child(jump_tile_row_el(
-                            tile,
-                            &format!("-tg{folder_idx}"),
-                            &st,
-                            sel_bg,
-                            selection_mark,
-                            ready,
-                            working_orange,
-                            drag_fg,
-                            drag_font.clone(),
-                            supporting_text,
-                            Some(TileDragGroup::DetachedTag {
-                                project: pid,
-                                tag: tag.clone(),
-                            }),
-                            cx,
-                        ));
-                    }
-                    col = col.child(body);
-                }
-            }
-            if had_folders && !untagged.is_empty() {
-                col = col.child(probe_bounds_dyn(
-                    format!("jump-untagged-sep-{}", pid.0),
-                    div()
-                        .w_full()
-                        .pl(px(20.0))
-                        .pr_3()
-                        .py_1()
-                        .text_color(st.dim)
-                        .font_family(st.mono.clone())
-                        .text_size(px(st.pt * 0.72))
-                        .child(SharedString::new_static("untagged"))
-                        .into_any_element(),
-                ));
-            }
-            for tile in &untagged {
-                col = col.child(jump_tile_row_el(
-                    tile,
-                    "",
-                    &st,
-                    sel_bg,
-                    selection_mark,
-                    ready,
-                    working_orange,
-                    drag_fg,
-                    drag_font.clone(),
-                    supporting_text,
-                    Some(TileDragGroup::DetachedUntagged(pid)),
-                    cx,
-                ));
-            }
-
-            // Compatibility-only legacy session renderer. Kept typechecked
-            // while older pure tests are migrated, but never enters production
-            // paint: every session is represented by its stable tile above.
-            if false {
-                let render_flat_row =
-                    |col: gpui::Stateful<gpui::Div>,
-                     i: usize,
-                     row: &AgentRow,
-                     suffix: &str,
-                     allow_drag: bool,
-                     cx: &mut Context<Self>| {
-                        let active =
-                            jump_target_is_active(&row.target, active_local, active_sid.as_deref());
-                        col.child(jump_session_row_el(
-                            i,
-                            row,
-                            suffix,
-                            &st,
-                            sel_bg,
-                            selection_mark,
-                            ready,
-                            working_orange,
-                            active,
-                            drag_fg,
-                            drag_font.clone(),
-                            allow_drag,
-                            supporting_text,
-                            None,
-                            None,
-                            cx,
-                        ))
-                    };
-                if agent_tab == JumpAgentTab::Archived {
-                    for (i, row) in section.sessions {
-                        col = render_flat_row(col, i, &row, "", false, cx);
-                    }
-                } else {
-                    let mut rows = section.sessions;
-                    // All drops the activity sub-headers and SORTS by label
-                    // (UXI-JumpPanel-20 clause 5); Waiting/Working keep chronology.
-                    if agent_tab == JumpAgentTab::All {
-                        rows.sort_by(|(_, a), (_, b)| a.label.cmp(&b.label));
-                    }
-                    let tag_order = self
-                        .jump_tag_order
-                        .get(&proj_name)
-                        .cloned()
-                        .unwrap_or_default();
-                    let (folders, untagged) = partition_rows_by_tag(rows, &tag_order);
-                    let had_folders = !folders.is_empty();
-                    for (folder_idx, (tag, folder_rows)) in folders.into_iter().enumerate() {
-                        let folded = self.tag_folder_folded(&proj_name, &tag);
-                        let folder_count = folder_rows.len();
-                        let probe = format!("jump-tag-folder-{}-{folder_idx}", pid.0);
-                        // Folder header: chevron (folds) + tag name + count. The label
-                        // is the drag source + drop target for reorder (UXI-JumpPanel-21).
-                        let tag_for_fold = tag.clone();
-                        let tag_for_drag = tag.clone();
-                        let proj_for_fold = proj_name.clone();
-                        let proj_for_drag = proj_name.clone();
-                        let proj_for_drop = proj_name.clone();
-                        let drag_label: SharedString = tag.clone().into();
-                        let header = div()
-                            .id(SharedString::from(format!(
-                                "jump-tagfold-{}-{folder_idx}",
-                                pid.0
-                            )))
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .w_full()
-                            .pl(px(20.0))
-                            .pr_3()
-                            .pt_1()
-                            .child(
-                                div()
-                                    .id(SharedString::from(format!(
-                                        "jump-tagchev-{}-{folder_idx}",
-                                        pid.0
-                                    )))
-                                    .w(px(16.0))
-                                    .flex_none()
-                                    .cursor_pointer()
-                                    .text_color(st.dim)
-                                    .child(SharedString::new_static(if folded {
-                                        "▸"
-                                    } else {
-                                        "▾"
-                                    }))
-                                    .on_click(cx.listener(move |this, _ev, _window, cx| {
-                                        this.toggle_tag_fold(&proj_for_fold, &tag_for_fold, cx);
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .id(SharedString::from(format!(
-                                        "jump-tagname-{}-{folder_idx}",
-                                        pid.0
-                                    )))
-                                    .flex_1()
-                                    .min_w_0()
-                                    .cursor_pointer()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_2()
-                                    // Tag name in the grouping/subheader blue so a
-                                    // folder reads as a header, not a session row.
-                                    .child(
-                                        div()
-                                            .flex_none()
-                                            .text_color(electric)
-                                            .font_family(st.mono.clone())
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_size(px(st.pt * 0.82))
-                                            .child(SharedString::from(format!("🏷 {tag}"))),
-                                    )
-                                    // The count, quiet.
-                                    .child(
-                                        div()
-                                            .flex_none()
-                                            .text_color(st.dim)
-                                            .font_family(st.mono.clone())
-                                            .text_size(px(st.pt * 0.72))
-                                            .child(SharedString::from(folder_count.to_string())),
-                                    )
-                                    // A trailing hairline rule fills the row so the
-                                    // header spans the panel and separates cleanly.
-                                    .child(div().flex_1().h(px(1.0)).bg(divider_color))
-                                    .on_drag(
-                                        TagDrag {
-                                            project: proj_for_drag.clone(),
-                                            tag: tag_for_drag.clone(),
-                                        },
-                                        {
-                                            let (fg, bg, font) =
-                                                (drag_fg, sel_bg, drag_font.clone());
-                                            move |_p, _pos, _window, cx| {
-                                                cx.new(|_| JumpDragPreview {
-                                                    label: drag_label.clone(),
-                                                    fg,
-                                                    bg,
-                                                    font: font.clone(),
-                                                })
-                                            }
-                                        },
-                                    )
-                                    .can_drop({
-                                        let proj = proj_for_drag.clone();
-                                        move |dragged, _window, _cx| {
-                                            dragged
-                                                .downcast_ref::<TagDrag>()
-                                                .is_some_and(|d| d.project == proj)
-                                        }
-                                    })
-                                    .drag_over::<TagDrag>(move |s, _, _, _| s.bg(sel_bg))
-                                    .on_drop(cx.listener({
-                                        let target_tag = tag.clone();
-                                        move |this, dragged: &TagDrag, _window, cx| {
-                                            this.reorder_tag(
-                                                &proj_for_drop,
-                                                &dragged.tag,
-                                                &target_tag,
-                                                cx,
-                                            )
-                                        }
-                                    })),
-                            );
-                        col = col.child(probe_bounds_dyn(probe, header.into_any_element()));
-                        if !folded {
-                            let suffix = format!("-tg{folder_idx}");
-                            // Wrap the folder's rows in an indented container with a
-                            // left guide line, so they clearly read as children OF the
-                            // tag header above them (UXI-JumpPanel-20).
-                            let mut body = div()
-                                .id(SharedString::from(format!(
-                                    "jump-tagbody-{}-{folder_idx}",
-                                    pid.0
-                                )))
-                                .flex()
-                                .flex_col()
-                                .w_full()
-                                .ml(px(26.0))
-                                .border_l_1()
-                                .border_color(divider_color)
-                                .pl(px(2.0));
-                            for (i, row) in folder_rows {
-                                body = render_flat_row(body, i, &row, &suffix, false, cx);
-                            }
-                            col = col.child(body);
-                        }
-                    }
-                    // A labeled hairline separates the tagged folders from the loose
-                    // untagged sessions below — only when both are present.
-                    if had_folders && !untagged.is_empty() {
-                        let sep = div()
-                            .w_full()
-                            .pl(px(20.0))
-                            .pr_3()
-                            .pt_2()
-                            .pb_1()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .text_color(st.dim)
-                                    .font_family(st.mono.clone())
-                                    .text_size(px(st.pt * 0.72))
-                                    .child(SharedString::new_static("untagged")),
-                            )
-                            .child(div().flex_1().h(px(1.0)).bg(divider_color));
-                        col = col.child(probe_bounds_dyn(
-                            format!("jump-untagged-sep-{}", pid.0),
-                            sep.into_any_element(),
-                        ));
-                    }
-                    // Untagged residual, flat, below the folders.
-                    for (i, row) in untagged {
-                        col = render_flat_row(col, i, &row, "", false, cx);
-                    }
-                }
-            }
-        }
-
-        // ── Unfiled sessions (no project roots their cwd) ─ path headers.
-        if false && !unfiled.is_empty() {
-            col = col.child(section_heading("Unfiled", &st).px_3().text_color(st.err));
-            for (cwd_label, group) in unfiled {
-                let header = div()
-                    .w_full()
-                    .pt_2()
-                    .pb_1()
-                    .pl(px(20.0))
-                    .pr_3()
-                    .text_color(electric)
-                    .font_family(st.mono.clone())
-                    .text_size(px(st.pt * 0.85))
-                    .child(SharedString::from(cwd_label.clone()));
-                col = col.child(header);
-                for (i, row) in group {
-                    let active =
-                        jump_target_is_active(&row.target, active_local, active_sid.as_deref());
-                    col = col.child(jump_session_row_el(
-                        i,
-                        &row,
-                        "",
-                        &st,
-                        sel_bg,
-                        selection_mark,
-                        ready,
-                        working_orange,
-                        active,
-                        drag_fg,
-                        drag_font.clone(),
-                        true,
-                        supporting_text,
-                        None,
-                        None,
-                        cx,
-                    ));
-                }
-            }
         }
 
         col.into_any_element()
@@ -2540,9 +1927,6 @@ fn attach_tile_drag(
     .on_drop(cx.listener(
         move |this, dragged: &TileDrag, _window, cx| match &drop_group {
             TileDragGroup::Workspace(_) => this.reorder_tile(dragged.id, id, cx),
-            TileDragGroup::DetachedTag { .. } | TileDragGroup::DetachedUntagged(_) => {
-                this.reorder_detached_tile(dragged.id, id, &drop_group, cx)
-            }
         },
     ))
 }
@@ -2560,7 +1944,7 @@ fn jump_tile_row_el(
     drag_font: SharedString,
     supporting_text: Hsla,
     // `Some(group)` makes this tile row drag-reorderable only within that exact
-    // workspace or Detached project/tag/untagged group (UXI-JumpPanel-28).
+    // workspace group (UXI-JumpPanel-28).
     tile_drag: Option<TileDragGroup>,
     cx: &mut Context<YaldaGpuiView>,
 ) -> AnyElement {
@@ -2667,7 +2051,7 @@ fn jump_session_row_el(
     supporting_text: Hsla,
     hidden_indicator: Option<AnyElement>,
     // `Some((tile WindowId, exact group))` makes this agent-backed tile row
-    // drag-reorderable within its workspace or Detached group
+    // drag-reorderable within its workspace group
     // (UXI-JumpPanel-28). Mutually exclusive with `allow_drag` (session-level
     // reorder), which is `false` in the tile context.
     tile_drag: Option<(workspace::WindowId, TileDragGroup)>,

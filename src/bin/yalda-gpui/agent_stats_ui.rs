@@ -132,8 +132,8 @@ impl YaldaGpuiView {
         if let Some(id) = self.agent_stats_tile_id() {
             self.workspace.focus_tile(id);
         } else {
-            let id = self.workspace.push_detached(App::AgentStats, project);
-            self.workspace.present_solo(id);
+            self.workspace.open_tile_in_project(App::AgentStats, project);
+            self.save_workspace_state();
         }
 
         match selected_root {

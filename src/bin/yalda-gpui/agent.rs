@@ -5638,7 +5638,7 @@ pub(crate) enum AgentTile {
         session: SessionId,
         reopening: Option<u64>,
     },
-    /// A roster-known session materialized as an unbound tile but not yet
+    /// A tile remembering a roster-known session that is not yet
     /// attached in this GUI. Activating it replaces this state with `Bound`
     /// through the ordinary attach choke.
     Dormant { remembered: ServerSid },

@@ -67,6 +67,16 @@ refreshed selector back, which updates the badge. Three properties:
    which routes through `session_server.set_model` (server-backed) or the local
    channel's `set_model` (direct-spawn).
 
+**Fresh Claude sessions default to Opus 5.5.** Right after a `session/new` (never a
+`session/load`), if the advertised selector's current value is not
+`YALDA_DEFAULT_CLAUDE_MODEL` (`claude-opus-5-5`) and that id is an advertised
+option, the worker issues `session/set_config_option model=claude-opus-5-5`
+*before* emitting the selector, so the first model the UI shows is the default.
+This overrides the adapter's own pick (`ANTHROPIC_MODEL` / `~/.claude/settings.json`
+`model` / first entry) for Yalda sessions only. A resumed session keeps whatever
+model it was running; a failed pin leaves the adapter's choice; Codex is never
+pinned.
+
 **Applies to.** `acp_channel.rs` — `YALDA_CLAUDE_AVAILABLE_MODELS` (compiled
 defaults), `claude_models_config_path` (path resolver + `cfg(test)`
 `CLAUDE_MODELS_PATH_OVERRIDE` / `with_claude_models_path` seam),
@@ -92,7 +102,13 @@ menu, and the channel-dispatch; the live ACP `session/set_config_option`
 round-trip is the sole `NEEDS-RUNTIME` gap — dev-system § Verification harness
 gap 2 — covered by the `#[ignore]` `tests/model_switch_live.rs`).
 
-**Enforcement.** `acp_channel.rs`: `model_state_parses_select_current_and_options`
+**Enforcement.** `acp_channel.rs`: `fresh_claude_session_defaults_to_opus_5_5`
+(pin decision: Claude-only, only when advertised and not already current) and
+`fresh_session_worker_pins_default_model_before_emitting_selector` (real worker
+against a fake adapter starting on `claude-opus-4-8`: the pin reaches the wire and
+the first `ModelChanged` is `claude-opus-5-5`; negative control with the pin
+disabled observed RED — first model `claude-opus-4-8`);
+`model_state_parses_select_current_and_options`
 (config parse + `model_reply_events`);
 `session_meta_advertises_latest_claude_models_only_to_claude` (Opus 5.5 + Fable
 5.1 reach the `session/new` wire payload with no file present, no duplicates, none

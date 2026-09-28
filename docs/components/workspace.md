@@ -21,8 +21,7 @@ directory is the project's, resolved at the point of use (`projects.cwd_of(
 workspace.project())`) and **never cached** (`UXI-Project-2`, ADR-0028 §3). A new
 workspace inherits the active one's project.
 
-The container that owns the list of workspaces and the **Detached tile**
-collection (one per OS-level **Frame**) is
+The container that owns the list of workspaces (one per OS-level **Frame**) is
 **`Frame<App>`** (formerly the code's `Workspace<App>` — renamed in T007 so the
 type name matches the user-facing "workspace" = the plane). The frame carries the
 workspace strip (per-workspace label, active marker, click-to-select, rename,
@@ -30,10 +29,13 @@ next/prev, new/close, `ctrl-<n>` jump by number) and the buffer pool; the tag ba
 drives tile tags. Durable workspaces are numbered `1..N` in the jump panel
 (globally, across all projects), and those numbers are the jump targets.
 
-The full hierarchy is **`Frame` → `Project` → (`Workspace` → attached tiles) +
-Detached tiles**. An attached tile is either visible or hidden. Every stable
-tile has exactly one owner; solo presentation is not a third owner (ADR-0034,
-`UXI-Workspace-24`).
+The full hierarchy is **`Frame` → `Project` → `Workspace` → attached tiles**.
+There is no frame-level tile collection: every stable tile is owned by exactly
+one workspace and is either visible or hidden there. A hidden tile may be
+solo-presented, but solo presentation is not an owner (ADR-0034,
+`UXI-Workspace-24`). A server session that no tile shows gets **no** tile; it
+is reached through Cmd-P or an Agent tile's session selector, which open it as a
+new tile in its project's workspace (ADR-0039, `UXI-Workspace-30`).
 
 ## References
 
@@ -45,7 +47,9 @@ tile has exactly one owner; solo presentation is not a third owner (ADR-0034,
   focus, and removal of ephemeral virtual workspaces.
 - ADR-0034 — attachment independent of visibility; Attached/Detached
   terminology, hidden workspace ownership, typed solo presentation, and Close
-  as an independent operation.
+  as an independent operation. Its Detached state is superseded by ADR-0039.
+- ADR-0039 — every tile belongs to a workspace; Detached tiles, roster
+  materialization, and Attach/Detach are removed (`UXI-Workspace-30`).
 - `docs/specs/spec-workspaces-and-splits.md` — the n-ary split/layout tree +
   persistence (retroactive spec of shipped behavior; workspace/frame vocabulary).
 - `docs/specs/spec-layout-patterns.md` — tile tags + automatic layout modes.
@@ -700,6 +704,11 @@ the production startup-size helper.
 tile owned by the closing workspace into Unbound instead of deleting it. The
 historical behavior and guards remain below until implementation is replaced.
 
+> **Superseded again by `UXI-Workspace-30` / ADR-0039.** There is no Unbound or
+> Detached collection: closing a workspace retires its tiles (sessions keep
+> running; the one-workspace floor stays) — which is again this entry's
+> tile-removal behavior.
+
 **Statement.** The workspace `.` menu exposes uppercase `X` as **close
 workspace**; lowercase `x` remains **close tile**. Closing the active workspace
 removes that workspace and every tile it owns only when another workspace
@@ -883,6 +892,9 @@ command-specific assertion before the production implementation was restored.
 > **Superseded by `UXI-Workspace-24` / ADR-0034.** Exclusive ownership remains,
 > but Attached-visible, Attached-hidden, and Detached replace this two-state
 > Bound/Unbound model.
+>
+> **Detached state superseded by `UXI-Workspace-30` / ADR-0039.** Every tile is
+> owned by exactly one workspace; there is no frame-level tile collection.
 
 **Statement.** A stable tile has exactly one optional workspace owner:
 
@@ -923,6 +935,10 @@ targeted ownership mutants are caught (Cog graph `9k2`).
 > **Terminology amended by `UXI-Workspace-24` / ADR-0034.** The same destination
 > picker attaches a Detached tile or moves an already Attached tile. Hidden
 > attachment is not a separate destination.
+>
+> **Detached clauses superseded by `UXI-Workspace-30` / ADR-0039.** There are no
+> Detached tiles and no `Ctrl-W b` Attach; the picker only moves a tile between
+> same-project workspaces.
 
 **Statement.** A bound tile can move to another workspace in the same project
 through the existing workspace picker:
@@ -1074,6 +1090,9 @@ hard-coding either the rendered ratio or count made the geometry guard RED.
 
 ### UXI-Workspace-21 — Close Tile closes a directly focused Unbound tile
 
+> **Superseded by `UXI-Workspace-30` / ADR-0039.** Unbound/Detached tiles no
+> longer exist; Close Tile retires a workspace-owned tile (`UXI-Workspace-24`).
+
 **Statement.** The shell's **Close Tile** command has the same object regardless
 of placement: it removes the focused stable tile when that tile is bound or
 Unbound. For a directly focused Unbound tile, closing removes it from Unbound,
@@ -1152,6 +1171,9 @@ pins the common raw-key interceptor that prevents App reinterpretation.
 
 > **Superseded by `UXI-Workspace-24` / ADR-0034.** Close is independent from
 > Hide and Detach; Scratchpad is removed.
+>
+> **Detach removed by `UXI-Workspace-30` / ADR-0039.** No Unbound/Detached
+> destination exists for any tile.
 
 **Statement.** **Close Tile** on a bound Agent tile is a placement transition,
 not destruction. It performs the same ownership move as **Stash**: the complete
@@ -1188,19 +1210,21 @@ callers to rewrite either identity field.
 
 ### UXI-Workspace-24 — Attachment, visibility, presentation, and close are independent
 
-**Statement.** Every stable tile has exactly one of three placement states:
+> **Amended by `UXI-Workspace-30` / ADR-0039.** The third placement state
+> (**Detached**, frame-owned) and the Attach/Detach transitions are removed; the
+> statement below is the amended two-state form. Historical enforcement names
+> that mention detaching are listed as they shipped.
+
+**Statement.** Every stable tile has exactly one of two placement states:
 
 1. **Attached + visible** — owned by one workspace and present in its layout.
 2. **Attached + hidden** — owned by one workspace and absent from its layout.
-3. **Detached** — owned by the frame and associated with no workspace.
 
-There is no Detached + hidden state. Attach accepts a Detached tile and makes it
-visible in a same-project workspace. Detach accepts either attached state,
-clears hidden state, and places the unchanged tile in Detached. Hide accepts
-only Attached + visible and leaves the tile owned by that workspace. Unhide
-accepts only Attached + hidden, restores it through the current layout manager,
-selects its workspace, and focuses it. Close retires the tile shell and never
-dispatches any of those four placement transitions.
+Hide accepts only Attached + visible and leaves the tile owned by that
+workspace. Unhide accepts only Attached + hidden, restores it through the
+current layout manager, selects its workspace, and focuses it. Send-to-workspace
+moves a tile between same-project workspaces. Close retires the tile shell and
+never dispatches any placement transition.
 
 Hiding records the tile's last plane footprint as a best-effort restoration
 preference. Other visible tiles may invalidate it. Unhide restores the footprint
@@ -1209,7 +1233,7 @@ arrangement inserts the tile by the same neighbor-seeding rules as a new tile.
 
 A workspace may have all of its tiles hidden. It remains durable and renders an
 explicit all-tiles-hidden empty state without creating a replacement. A hidden
-attached or Detached tile may be presented alone through a typed solo target;
+tile may be presented alone through a typed solo target;
 leaving that presentation changes neither ownership nor visibility. A visible
 attached tile cannot be a solo target.
 
@@ -1220,7 +1244,7 @@ all-hidden canvas, and solo presentation; `persist.rs`: visibility and migration
 
 **Why.** Workspace association, layout visibility, temporary navigation, and
 tile lifetime are independent facts. Encoding them as separate legal states
-prevents Hide from silently detaching, Close from silently hiding, and a solo
+prevents Hide from silently removing ownership, Close from silently hiding, and a solo
 visit from silently changing ownership.
 
 **Status.** `implemented (headless)`.
@@ -1345,15 +1369,18 @@ membership change).
 
 ### UXI-Workspace-27 — Show unhides a chosen tile in the active workspace
 
+> **Amended by `UXI-Workspace-30` / ADR-0039.** The Detached case is gone: Show
+> is dimmed only while a hidden tile is solo-presented.
+
 **Statement.** The shell command panel's top-level **`.` → Show** command
 opens a compact picker over exactly the hidden tiles owned by the active
 workspace. The command is available only while an ordinary visible tile in that
-workspace is focused; a solo-presented hidden or Detached tile is not “focused
-on a workspace,” so Show remains present but dimmed and cannot dispatch.
+workspace is focused; a solo-presented hidden tile is not “focused on a
+workspace,” so Show remains present but dimmed and cannot dispatch.
 
 Opening Show is valid when the active workspace has no hidden tiles. The same
 picker card still opens with an explicit empty message; it never substitutes
-Detached tiles, hidden tiles from another workspace, or a newly-created tile.
+hidden tiles from another workspace or a newly-created tile.
 Rows use the tile's normal desktop title and stable `WindowId`, follow the
 Cmd-P palette's compact centered overlay language, and support `j`/`k`, arrow
 keys, Enter/`l`, Esc/`q`, hover selection, and click activation.
@@ -1380,36 +1407,32 @@ preserving the distinction between navigation and visibility.
 top-level Show, proves the empty state paints, then hides tiles in two
 workspaces and proves only the active workspace's stable tile is offered and
 unhidden/focused by the real picker key handler. The same guard presents a
-Detached tile and proves Show is dimmed and does not replace the menu overlay.
+solo tile and proves Show is dimmed and does not replace the menu overlay
+(originally a Detached tile; after ADR-0039 a solo-presented hidden tile).
 
-### UXI-Workspace-28 — Boot restores durable tile membership before roster reconciliation
+### UXI-Workspace-28 — Boot restores durable tile membership before roster refresh
+
+> **Amended by `UXI-Workspace-30` / ADR-0039.** Roster refresh no longer
+> materializes tiles, and there is no Detached state. The ordering still matters
+> because a roster refresh may save `workspace.json`.
 
 **Statement.** On every ordinary launch, restart, and self-rebuild, Yalda must
-restore the persisted `Frame` ownership graph before the universal Agent roster
-may materialize roster-only sessions. A persisted tile keeps its exact stable
-`WindowId` and membership state—Attached + visible in its named workspace,
-Attached + hidden in that workspace, or Detached—across the process boundary.
-Roster reconciliation may synthesize a Detached tile only for a session absent
-from the fully restored ownership graph; it must never persist a pre-restore
-default frame over durable workspace membership.
-
-The restore prerequisite applies even though roster loading is asynchronous.
-Starting the request is observable work: a fast result can call
-`materialize_roster_detached_tiles` and `save_workspace_state`, so the request
-itself cannot be launched until restore has completed (or definitively found no
-snapshot). Session cwd identifies a Project, not one of its possibly many named
-workspaces, and therefore cannot reconstruct lost attachment after the fact.
+restore the persisted `Frame` ownership graph before the Agent roster refresh
+starts. A persisted tile keeps its exact stable `WindowId` and membership
+state—Attached + visible or Attached + hidden in its named workspace—across the
+process boundary. A roster refresh must never persist a pre-restore default
+frame over durable workspace membership; since a fast result may call
+`save_workspace_state`, the request itself is not launched until restore has
+completed (or definitively found no snapshot).
 
 **Applies to.** `main.rs`: the production GUI initialization entry point and
-`restore_workspace_from_disk`; `agent_ui.rs`: `refresh_roster` and
-`materialize_roster_detached_tiles`; `persist.rs`: `workspace.json` snapshot and
-restore of visible, hidden-attached, and Detached tiles.
+`restore_workspace_from_disk`; `agent_ui.rs`: `refresh_roster`; `persist.rs`:
+`workspace.json` snapshot and restore of visible and hidden attached tiles.
 
 **Why.** Named-workspace membership is user-authored durable state. The server
-roster is authoritative for which sessions exist, but it has no workspace
-identity and cannot safely run as an ownership migration before the saved frame
-is present. If it does, a reboot can intermittently empty a workspace and file
-its Agent tile under Detached.
+roster has no workspace identity (a session cwd names a Project, not one of its
+workspaces), so a save that races ahead of restore would lose membership that
+cannot be reconstructed.
 
 **Status.** `implemented (headless)` (bug-0059).
 
@@ -1417,10 +1440,10 @@ its Agent tile under Detached.
 `boot_restores_attached_agent_before_fast_roster_save` drives the production boot
 initializer with a persisted named workspace containing one Agent tile and an
 immediately available matching roster entry. After initialization, the same
-stable tile must be Attached to that workspace, no Detached duplicate may
-exist, and the on-disk snapshot must retain the attached leaf. The negative
-control reverses the restore/roster order and reproduces the empty-workspace
-plus Detached result. The full `yalda-gpui` suite and changed-helper mutation
+stable tile must be Attached to that workspace and the on-disk snapshot must
+retain the attached leaf. (As originally shipped it also asserted no Detached
+duplicate; the negative control reversed the restore/roster order and
+reproduced the empty-workspace plus Detached result.) The full `yalda-gpui` suite and changed-helper mutation
 gate also pass. Native process restart timing remains a runtime observation,
 not a correctness gap in the deterministically exercised ordering boundary.
 
@@ -1459,3 +1482,63 @@ the message does not paint. Negative control observed RED with
 `client_connect_never_launches_a_server`
 (`tests/session_resilience_test.rs`), observed RED with the launch code
 reintroduced.
+
+### UXI-Workspace-30 — Every tile belongs to a workspace; tile-less sessions open into their project's workspace
+
+**Statement.** Every stable tile is owned by exactly one workspace, visible or
+hidden (`UXI-Workspace-24`). There is no frame-level tile collection (no
+Detached/Unbound tiles) and no Attach/Detach command (`ctrl-w shift-b` /
+`ctrl-w b` and the tile-menu “detach tile” are removed).
+
+1. **The roster is not a tile source.** A server session that no tile shows
+   gets no tile. Roster refresh creates, heals, or deduplicates no tiles.
+2. **Opening a tile-less session.** Cmd-P and an Agent tile's session selector
+   reach such sessions. Opening one places a **new visible tile** in a workspace
+   of the session's project — the active workspace when it belongs to that
+   project, else that project's first workspace, else a new workspace for the
+   project — and focuses it.
+3. **Close workspace retires its tiles**, visible and hidden. Agent sessions
+   keep running on the server; the one-workspace floor stays.
+4. **Archive** returns every tile showing the session to its session picker; it
+   never moves the tile.
+5. **New tile while a hidden tile is solo-presented** lands in that tile's
+   owning workspace.
+6. **Migration.** `workspace.json` `detached_tiles`, legacy `unbound_tiles` /
+   `direct_unbound`, and any Detached solo presentation are ignored on load and
+   never written.
+
+“Exactly one workspace” is the current rule, not a structural promise; nothing
+here should make a later multi-membership model harder (ADR-0039 §5).
+
+**Applies to.** `workspace.rs`: `Frame` ownership (no detached collection),
+`TileMembership` / `SoloPresentation`, `close_workspace`, the ownership
+validator; `agent_ui.rs`: roster refresh, session-open placement, archive;
+`main.rs`: Cmd-P palette and shell/tile menus; `jump_panel_view.rs`: workspace
+folders only; `persist.rs`: snapshot/restore and legacy-field migration.
+
+**Why.** Materializing a Detached tile per server session produced a second,
+parallel navigator (56 mostly archived, invisible Detached tiles for 57
+sessions on 2026-09-27) plus the attach/detach, dedup-repair, and tag-folder
+machinery to support it. Workspaces are the one navigation model; sessions
+without a tile stay sessions (ADR-0039).
+
+**Status.** `implemented (headless)`.
+
+**Enforcement.**
+`workspace::tests::closing_workspace_retires_its_tiles_and_keeps_the_workspace_floor`
+(close retires visible + hidden tiles, floor holds);
+`verify_harness.rs::roster_refresh_creates_no_tiles` (the real roster refresh
+leaves the ownership graph unchanged);
+`verify_harness.rs::jump_palette_opens_tileless_session_into_project_workspace`
+(the real Cmd-P path opens a tile-less session as a focused visible tile in the
+project's workspace); `tests.rs::legacy_detached_tiles_are_dropped_on_restore`
+(legacy `detached_tiles` are ignored on load and not re-written; negative
+control: dropping the read-only legacy `Detached` solo variant fails the whole
+snapshot parse with “unknown variant `detached`”);
+`workspace::tests::open_tile_in_project_prefers_active_then_project_workspace_then_new`
+(placement order incl. the hidden-solo owner);
+`verify_harness.rs::project_menu_new_agent_session_opens_visible_tile_in_project_workspace`
+(project-menu New agent session opens a focused visible tile, creating a
+workspace for a project with none). Negative controls for the three harness
+guards were observed RED (tile placed hidden; Session rows skipped; roster
+adoption minting tiles; wrong project for a new workspace).

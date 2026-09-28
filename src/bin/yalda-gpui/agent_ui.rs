@@ -52,14 +52,6 @@ enum BindOutcome {
     Focused(SessionId),
 }
 
-/// Result of enforcing the durable-session → stable-tile uniqueness rule.
-/// A duplicate roster tile is stale ownership state, not a second view.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AgentIdentityRepair {
-    Unique,
-    RetiredDetachedDuplicates(usize),
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AgentIdentityViolation {
     DuplicateLocalSession {
@@ -115,9 +107,6 @@ impl YaldaGpuiView {
             if let Some(violation) = violation {
                 return Err(violation);
             }
-        }
-        for tile in &self.workspace.detached_tiles {
-            visit(&tile.window)?;
         }
         Ok(())
     }
@@ -313,20 +302,15 @@ impl YaldaGpuiView {
                     // momentarily-stale roster.
                     let recovered_labels = this.recover_labels_from_roster(cx);
                     let recovered_providers = this.recover_providers_from_roster(cx);
-                    let materialized = this.materialize_roster_detached_tiles();
                     // The successful server roster is authoritative even when
                     // Agent Stats has never been opened. Persist this lifecycle
                     // boundary so a GUI restart does not erase fleet history.
                     this.refresh_agent_stats_agents(cx);
-                    if materialized {
-                        this.save_workspace_state();
-                    }
                     if changed
                         || recovered_labels
                         || recovered_providers
                         || order_changed
                         || archive_changed
-                        || materialized
                     {
                         cx.notify();
                     }
@@ -708,45 +692,6 @@ impl YaldaGpuiView {
             return;
         }
 
-        // The roster owns one stable tile for this session even while that tile
-        // is Detached. Selecting it from a temporary Agent picker inside a
-        // workspace is a placement operation, not a request to mint a second
-        // tile. Move the stable tile into the picker's exact layout slot before
-        // attaching so mouse and keyboard activation share the same identity-
-        // preserving result.
-        let current = self.workspace.focused_window_id();
-        let stable = self.agent_tile_id_for_server_sid(&sid);
-        if let (Some(current), Some(stable)) = (current, stable)
-            && current != stable
-            && matches!(
-                self.workspace.tile_membership(current),
-                Some(workspace::TileMembership::Attached {
-                    visibility: workspace::AttachedVisibility::Visible,
-                    ..
-                })
-            )
-            && self.workspace.tile_membership(stable) == Some(workspace::TileMembership::Detached)
-            && self
-                .workspace
-                .replace_attached_with_detached(current, stable)
-                .is_ok()
-        {
-            self.save_workspace_state();
-
-            // A session may already be attached locally while its stable tile
-            // is Detached. In that case placement is complete: attach/focus that
-            // existing owner and do not create a duplicate placeholder.
-            if let Some(owner) = self.sessions.locate(&ServerSid::new(sid.clone())) {
-                if let Some(tile) = self.agent_tile_mut() {
-                    tile.bind(owner);
-                    tile.set_pending(None);
-                }
-                self.mark_session_read(owner, cx);
-                self.save_agent_ring(cx);
-                cx.notify();
-                return;
-            }
-        }
         let open_token = alloc_open_token();
         if self.agent_tile_mut().is_none() {
             return;
@@ -974,13 +919,6 @@ impl YaldaGpuiView {
                 return found;
             }
         }
-        for tile in &self.workspace.detached_tiles {
-            if let App::Agent(agent) = &tile.window.content
-                && agent.pending_token() == Some(token)
-            {
-                return agent.session();
-            }
-        }
         None
     }
 
@@ -1012,21 +950,13 @@ impl YaldaGpuiView {
         None
     }
 
-    /// Stable tile showing `sid` in either placement domain.
+    /// Stable tile showing `sid`, visible or hidden, in any workspace.
     pub(crate) fn agent_tile_id_for_session(&self, sid: SessionId) -> Option<workspace::WindowId> {
-        self.agent_tile_id_bound_to(sid).or_else(|| {
-            self.workspace.detached_tiles.iter().find_map(|tile| {
-                matches!(
-                    &tile.window.content,
-                    App::Agent(agent) if agent.session() == Some(sid)
-                )
-                .then_some(tile.window.id())
-            })
-        })
+        self.agent_tile_id_bound_to(sid)
     }
 
     /// Find the stable Agent tile remembering a durable server sid, whether
-    /// locally attached, dormant, unavailable, session-bound, or Detached.
+    /// locally attached, dormant, unavailable, or session-bound.
     pub(crate) fn agent_tile_id_for_server_sid(&self, sid: &str) -> Option<workspace::WindowId> {
         let remembers = |tile: &AgentTile| {
             tile.remembered_sid(|id| self.sessions.sid_of(id).cloned())
@@ -1045,127 +975,7 @@ impl YaldaGpuiView {
                 return found;
             }
         }
-        self.workspace.detached_tiles.iter().find_map(|tile| {
-            matches!(&tile.window.content, App::Agent(agent) if remembers(agent))
-                .then_some(tile.window.id())
-        })
-    }
-
-    fn agent_tile_ids_for_server_sid(&self, sid: &str) -> Vec<workspace::WindowId> {
-        let remembers = |tile: &AgentTile| {
-            tile.remembered_sid(|id| self.sessions.sid_of(id).cloned())
-                .is_some_and(|remembered| remembered.as_str() == sid)
-        };
-        let mut ids = Vec::new();
-        for workspace in &self.workspace.workspaces {
-            workspace.for_each_attached_window(&mut |window| {
-                if matches!(&window.content, App::Agent(tile) if remembers(tile)) {
-                    ids.push(window.id());
-                }
-            });
-        }
-        ids.extend(self.workspace.detached_tiles.iter().filter_map(|tile| {
-            matches!(&tile.window.content, App::Agent(agent) if remembers(agent))
-                .then_some(tile.window.id())
-        }));
-        ids
-    }
-
-    fn retire_detached_agent_identity_duplicates(
-        &mut self,
-        canonical: workspace::WindowId,
-        sid: &str,
-    ) -> usize {
-        let duplicates: Vec<_> = self
-            .agent_tile_ids_for_server_sid(sid)
-            .into_iter()
-            .filter(|id| *id != canonical)
-            .filter(|id| {
-                self.workspace.tile_membership(*id) == Some(workspace::TileMembership::Detached)
-            })
-            .collect();
-        for duplicate in &duplicates {
-            let tags = self
-                .workspace
-                .tile(*duplicate)
-                .map(|tile| tile.tags.clone())
-                .unwrap_or_default();
-            if let Some(tile) = self.workspace.tile_mut(canonical) {
-                tile.tags.extend(tags);
-            }
-            self.workspace.remove_detached_window(*duplicate);
-        }
-        duplicates.len()
-    }
-
-    /// Heal stale roster ownership before it reaches the jump-panel projection.
-    /// Attached owners are visited first and therefore win over Detached copies;
-    /// when every owner is Detached, the oldest stable tile wins. We only retire
-    /// Detached duplicates because deleting a second Attached tile would also
-    /// mutate a workspace layout and needs the restore-time ownership repair's
-    /// stronger placement policy.
-    fn reconcile_roster_agent_identity(&mut self, sid: &str) -> usize {
-        let Some(canonical) = self.agent_tile_ids_for_server_sid(sid).first().copied() else {
-            return 0;
-        };
-        self.retire_detached_agent_identity_duplicates(canonical, sid)
-    }
-
-    /// Enforce one stable tile for a newly bound durable session. The tile
-    /// that owns the live local session is canonical; roster-created dormant
-    /// Detached duplicates are retired and their tags are merged into it.
-    fn reconcile_bound_agent_identity(
-        &mut self,
-        owner: SessionId,
-        sid: &str,
-    ) -> AgentIdentityRepair {
-        let Some(canonical) = self.agent_tile_id_for_session(owner) else {
-            return AgentIdentityRepair::Unique;
-        };
-        let retired = self.retire_detached_agent_identity_duplicates(canonical, sid);
-        if retired == 0 {
-            AgentIdentityRepair::Unique
-        } else {
-            self.save_workspace_state();
-            AgentIdentityRepair::RetiredDetachedDuplicates(retired)
-        }
-    }
-
-    /// Migrate every roster-only session into exactly one dormant Detached Agent
-    /// tile. Idempotent: existing Attached/Detached tiles win by durable sid.
-    pub(crate) fn materialize_roster_detached_tiles(&mut self) -> bool {
-        let entries: Vec<_> = self
-            .agent_roster
-            .entries_by_label()
-            .into_iter()
-            .cloned()
-            .collect();
-        let mut changed = false;
-        for info in entries {
-            if self.reconcile_roster_agent_identity(&info.session_id) > 0 {
-                changed = true;
-            }
-            if self
-                .agent_tile_id_for_server_sid(&info.session_id)
-                .is_some()
-            {
-                continue;
-            }
-            let project = self
-                .projects
-                .ensure_at_cwd(info.cwd.clone(), &project_name_for_cwd(&info.cwd));
-            let id = self.workspace.push_detached(
-                App::Agent(AgentTile::dormant(ServerSid::new(info.session_id.clone()))),
-                project,
-            );
-            if let Some(tags) = self.session_tags.get(&info.session_id)
-                && let Some(tile) = self.workspace.tile_mut(id)
-            {
-                tile.tags.extend(tags.iter().cloned());
-            }
-            changed = true;
-        }
-        changed
+        None
     }
 
     /// Clear the selected session from every Agent tile showing `sid`, leaving
@@ -1186,21 +996,13 @@ impl YaldaGpuiView {
                 }
             });
         }
-        for tile in &mut self.workspace.detached_tiles {
-            if let App::Agent(agent) = &mut tile.window.content
-                && agent.session() == Some(sid)
-            {
-                agent.show_picker();
-                changed = true;
-            }
-        }
         changed
     }
 
-    /// Jump-panel / Cmd-P activation (ADR-0034): focus the one stable Agent tile
-    /// showing this session. Attached tiles reveal their workspace; Detached tiles
-    /// open solo without changing membership. A session with no tile is
-    /// materialized once as a Detached Agent tile.
+    /// Jump-panel / Cmd-P activation: focus the one stable Agent tile showing
+    /// this session (visible tiles reveal their workspace; hidden tiles open
+    /// solo). A session with no tile gets a new visible tile in a workspace of
+    /// its project (ADR-0039, `Frame::open_tile_in_project`).
     pub(crate) fn jump_to_session(&mut self, sid: SessionId, cx: &mut Context<Self>) {
         if !self.sessions.contains(sid) {
             return;
@@ -1217,8 +1019,8 @@ impl YaldaGpuiView {
                 .and_then(|cwd| self.projects.membership_for_cwd(&cwd).project())
                 .or_else(|| self.active_project(cx))
                 .unwrap_or_else(|| self.workspace.inherited_project());
-            let id = self.workspace.push_detached(App::Agent(tile), project);
-            self.workspace.present_solo(id);
+            self.workspace.open_tile_in_project(App::Agent(tile), project);
+            self.save_workspace_state();
         }
         // You're now looking at this session — clear its "waiting on you" mark
         // eagerly (the pump also clears it, but this makes the dot update on the
@@ -1291,8 +1093,9 @@ impl YaldaGpuiView {
         }
     }
 
-    /// Open a roster session (one not yet in this GUI's store) by materializing
-    /// one Detached Agent tile, presenting it solo, and reusing the picker's
+    /// Open a roster session (one not yet in this GUI's store): focus the tile
+    /// that still remembers its sid, else open a new tile for it in a
+    /// workspace of its project (ADR-0039), then reuse the picker's
     /// bind+attach path.
     pub(crate) fn jump_to_roster_session(&mut self, sid: String, cx: &mut Context<Self>) {
         // Wire boundary: the roster/jump-target sid is a raw String; type it for
@@ -1307,22 +1110,23 @@ impl YaldaGpuiView {
         if self.session_server.is_none() && !crate::force_server_roster_jump_branch() {
             return;
         }
-        // Reuse the roster-materialized dormant tile when present; otherwise
-        // create it defensively (e.g. an activation racing the first roster
-        // reconciliation). Direct focus is non-owning.
         let proj = self
             .projects
             .membership_for_cwd(&info.cwd)
             .project()
             .or_else(|| self.active_project(cx))
             .unwrap_or_else(|| self.workspace.inherited_project());
-        let id = self.agent_tile_id_for_server_sid(&sid).unwrap_or_else(|| {
-            self.workspace.push_detached(
-                App::Agent(AgentTile::dormant(ServerSid::new(sid.clone()))),
-                proj,
-            )
-        });
-        self.workspace.focus_tile(id);
+        match self.agent_tile_id_for_server_sid(&sid) {
+            Some(id) => {
+                self.workspace.focus_tile(id);
+            }
+            None => {
+                self.workspace.open_tile_in_project(
+                    App::Agent(AgentTile::dormant(ServerSid::new(sid.clone()))),
+                    proj,
+                );
+            }
+        }
         self.picker_attach_existing(
             info.cwd,
             info.session_id,
@@ -1402,7 +1206,6 @@ impl YaldaGpuiView {
         // resolution; type it for the store bind.
         match self.sessions.bind_sid(id, ServerSid::new(sid)) {
             Ok(()) => {
-                let _ = self.reconcile_bound_agent_identity(id, sid);
                 self.inherit_order_slot(id, sid);
                 BindOutcome::Bound
             }
@@ -1749,7 +1552,7 @@ impl YaldaGpuiView {
     ///
     /// The session the tile was showing is NOT killed — dropping the tile's binding
     /// returns it to *free* in the store (the tile holds only a `SessionId` key), so
-    /// it stays running as a Detached row in the jump panel and is re-pickable from
+    /// it stays running on the server (reachable from Cmd-P) and is re-pickable from
     /// the very picker this opens (clause 3). Only `claude-close` kills a session.
     pub(crate) fn open_new_agent_selector_in_place(&mut self, cx: &mut Context<Self>) {
         // A fresh `AgentTile::new()` is already `Selecting`, so replacing the
@@ -1907,78 +1710,6 @@ impl YaldaGpuiView {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.apply_open_agent_resolution(open_token, resolution, cx);
-            });
-        })
-        .detach();
-    }
-
-    /// Spawn a brand-new agent session that is bound to NO tile and NO
-    /// workspace — a *free* session (spec-agent-session-ownership.md). Used by
-    /// the global (`?`) menu's "new agent session" command.
-    ///
-    /// Unlike `new_agent_session` / `bootstrap_fresh_agent_session` (which place
-    /// a tile and bind the new sid to it), this only issues the server
-    /// `create_session` round-trip. The resulting session lands in the universal
-    /// roster via the `SessionCreated` broadcast (and an explicit
-    /// `refresh_roster` to make it appear immediately), so it shows up in the
-    /// jump panel as a Detached, attachable row — never auto-attached here. A user can
-    /// later attach it by selecting it (jump panel → `jump_to_roster_session`, or a
-    /// tile selector). It is server-only: with no session server there is no
-    /// roster to host a free session, so this no-ops with a status note.
-    pub(crate) fn spawn_free_agent_session(&mut self, cx: &mut Context<Self>) {
-        // Default entry: root the free session at the shared default cwd (the
-        // active workspace's, else the process cwd). The cwd-choosing entry
-        // points (UXI-JumpPanel-4) call `spawn_free_agent_session_at` directly.
-        let cwd = self.agent_base_cwd();
-        self.spawn_free_agent_session_at(cwd, cx);
-    }
-
-    /// As `spawn_free_agent_session`, but roots the new free session at an
-    /// explicit `cwd` (UXI-JumpPanel-4). The cwd-input overlay's commit calls this
-    /// with the resolved path so a free agent — which has no workspace cwd to
-    /// inherit — runs where the user chose.
-    pub(crate) fn spawn_free_agent_session_at(&mut self, cwd: PathBuf, cx: &mut Context<Self>) {
-        let Some(handle) = self.session_server.as_ref().map(|s| s.handle()) else {
-            self.transient_status = Some("no session server — free agent sessions need one".into());
-            cx.notify();
-            return;
-        };
-        // Reuse the same label allocator as the tile-bound create paths so a free
-        // session is named identically; the cwd is the caller's choice.
-        let label = self.next_agent_label(cx);
-        self.transient_status = Some(
-            format!(
-                "creating free agent session {label} at {}…",
-                shorten_cwd_for_display(&cwd)
-            )
-            .into(),
-        );
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result: Result<String, String> = cx
-                .background_executor()
-                .spawn(async move {
-                    handle
-                        .create_session(cwd, label, None)
-                        .map(|info| info.label)
-                        .map_err(|e| e.to_string())
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                match result {
-                    Ok(label) => {
-                        this.transient_status =
-                            Some(format!("free agent session {label} created").into());
-                        // Pull it into the roster now so the jump panel lists it
-                        // without waiting on the (also-arriving) broadcast.
-                        this.refresh_roster(cx);
-                    }
-                    Err(e) => {
-                        this.transient_status =
-                            Some(format!("free agent session create failed: {e}").into());
-                    }
-                }
-                cx.notify();
             });
         })
         .detach();
@@ -2247,7 +1978,7 @@ impl YaldaGpuiView {
         }
         self.save_agent_ring(cx);
         cx.notify();
-        // No early `back_to_doc` — the tile stays Agent (Detached → selector).
+        // No early `back_to_doc` — the tile stays Agent (→ selector).
     }
 
     /// Another agent session belonging to `project` to land on when a bare agent
@@ -2317,8 +2048,8 @@ impl YaldaGpuiView {
             .detach();
     }
 
-    /// Snapshot every materialized agent session to disk. Walks both workspace
-    /// leaves and the Detached collection so it is symmetric with
+    /// Snapshot every materialized agent session to disk. Walks every
+    /// workspace's visible and hidden tiles so it is symmetric with
     /// `restore_agent_leaves`: ownership changes must not decide whether a live
     /// session's draft and presentation state survive restart. The first live
     /// session is marked active. Best-effort.
@@ -2372,9 +2103,6 @@ impl YaldaGpuiView {
         };
         for wsp in &self.workspace.workspaces {
             wsp.for_each_attached_window(&mut snapshot_window);
-        }
-        for tile in &self.workspace.detached_tiles {
-            snapshot_window(&tile.window);
         }
         save_persisted_acp_sessions(&cwd, &snaps);
         // CRITICAL (bug-0001): the per-tile session id that RESTORE reads lives in
@@ -2957,7 +2685,7 @@ impl YaldaGpuiView {
         }
         self.transcript_views.remove(&id);
         self.sessions.close(id);
-        // The now-Detached tile's selector projects from the roster (the closed
+        // The now-unbound tile's selector projects from the roster (the closed
         // session was already removed from it by the SessionClosed handler / is
         // gone after this). Refresh to be safe on non-broadcast close paths.
         let _ = tile_found;
@@ -4262,7 +3990,7 @@ impl YaldaGpuiView {
             self.session_server.is_some()
         ));
 
-        // Re-create in place on the now-Detached focused tile, reusing the
+        // Re-create in place on the now-unbound focused tile, reusing the
         // snapshotted label + cwd and forcing the preserved permission mode.
         if self.session_server.is_some() || crate::force_server_clear_branch() {
             let open_token = alloc_open_token();

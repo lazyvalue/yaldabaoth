@@ -152,8 +152,6 @@ const DEFAULT_BINDINGS: &[DefaultBinding] = &[
     b!("ctrl-w t",          "TagViewChord",    GLOBAL, "Layout", "Tag: view by tag"),
     b!("ctrl-w ctrl-t",     "TagToggleChord",  GLOBAL, "Layout", "Tag: toggle tag on tile"),
     b!("ctrl-w shift-t",    "ClearTagView",    GLOBAL, "Layout", "Tag: clear tag view"),
-    b!("ctrl-w b",          "AttachFocusedTile", GLOBAL, "Workspaces", "Attach tile to active workspace"),
-    b!("ctrl-w shift-b",    "DetachFocusedTile", GLOBAL, "Workspaces", "Detach tile from workspace"),
     b!("ctrl-w d",          "HideFocusedTile", GLOBAL, "Workspaces", "Hide tile in its workspace"),
     b!("ctrl-w shift-d",    "UnhideFocusedTile", GLOBAL, "Workspaces", "Unhide focused hidden tile"),
     b!("ctrl-w backspace",  "WorkspaceBackAndForth", GLOBAL, "Workspaces", "Toggle previous workspace"),

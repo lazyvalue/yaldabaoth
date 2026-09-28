@@ -1,7 +1,7 @@
 //! The **jump palette** (`UXI-JumpPanel-9`) — `Cmd-P`'s type-to-filter dialog
 //! over the jump panel's navigable set: permanent system destinations, durable
-//! workspaces and the stable tiles they own, followed by the **Detached** tile
-//! collection.
+//! workspaces and the stable tiles they own, followed by every live server
+//! session no tile shows (ADR-0039) — the palette is how you reach those.
 //!
 //! The palette is a pure alternate *input* onto that list. It builds its
 //! candidates directly from the ownership model, independent of which filtered
@@ -24,6 +24,9 @@ pub(crate) enum PaletteTarget {
     /// `select_workspace` takes). Only non-ephemeral workspaces become items.
     Workspace(usize),
     Tile(workspace::WindowId),
+    /// A live, non-archived server session no tile shows. Activating it opens
+    /// a tile for it in a workspace of its project (ADR-0039).
+    Session(String),
 }
 
 /// One palette candidate: what it points at, what you read, and what you type
@@ -198,8 +201,8 @@ impl YaldaGpuiView {
     }
 
     /// Every ordinary-navigation candidate in ownership order: each workspace
-    /// folder followed by its visible and hidden tiles, then every Detached tile. A selected jump
-    /// panel activity tab never changes `Cmd-P` candidates.
+    /// folder followed by its visible and hidden tiles, then every live,
+    /// non-archived server session that no tile shows (ADR-0039).
     pub(crate) fn jump_palette_items(&self, cx: &gpui::App) -> Vec<PaletteItem> {
         let mut items = vec![PaletteItem {
             target: PaletteTarget::AgentStats,
@@ -238,13 +241,32 @@ impl YaldaGpuiView {
                 }
             }
         }
-        for tile in &self.workspace.detached_tiles {
-            let project = self.projects.name_of(tile.project());
-            if let Some(item) =
-                self.palette_tile_item(&tile.window, format!("{project} · Detached"), cx)
+        for info in self.agent_roster.entries_by_label() {
+            if self.jump_archived_sessions.contains(&info.session_id)
+                || self.agent_tile_id_for_server_sid(&info.session_id).is_some()
             {
-                items.push(item);
+                continue;
             }
+            let detail = self
+                .projects
+                .by_cwd(&info.cwd)
+                .map(|pid| self.projects.name_of(pid).to_string())
+                .unwrap_or_else(|| shorten_cwd_for_display(&info.cwd));
+            let status = if !info.connected {
+                AgentDotStatus::Neutral
+            } else if info.busy {
+                AgentDotStatus::Working
+            } else {
+                AgentDotStatus::WaitingForYou
+            };
+            items.push(PaletteItem {
+                target: PaletteTarget::Session(info.session_id.clone()),
+                label: info.label.clone(),
+                detail: format!("{detail} · no tile"),
+                is_agent: true,
+                status: Some(status),
+                active: false,
+            });
         }
         items
     }
@@ -398,8 +420,16 @@ impl YaldaGpuiView {
             PaletteTarget::AgentStats => self.open_agent_stats(cx),
             PaletteTarget::Workspace(i) => self.select_workspace(i, cx),
             PaletteTarget::Tile(id) => self.jump_to_tile(id, cx),
+            PaletteTarget::Session(sid) => self.open_tileless_session(sid, cx),
         }
         cx.notify();
+    }
+
+    /// Open a server session no tile shows: a new tile in a workspace of its
+    /// project (ADR-0039), via the jump panel's roster dispatcher.
+    pub(crate) fn open_tileless_session(&mut self, sid: String, cx: &mut Context<Self>) {
+        self.jump_to_agent(JumpTarget::Roster(sid), cx);
+        self.save_workspace_state();
     }
 
     pub(crate) fn render_jump_palette(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -534,6 +564,9 @@ impl YaldaGpuiView {
                                 PaletteTarget::AgentStats => this.open_agent_stats(cx),
                                 PaletteTarget::Workspace(i) => this.select_workspace(i, cx),
                                 PaletteTarget::Tile(id) => this.jump_to_tile(id, cx),
+                                PaletteTarget::Session(sid) => {
+                                    this.open_tileless_session(sid, cx)
+                                }
                             }
                             cx.notify();
                         }

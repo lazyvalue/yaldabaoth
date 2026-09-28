@@ -275,7 +275,7 @@ level's keys are unique.
 root entries, in this order: `w` switch worksheet/chatbox, `m` switch model, `s`
 select session, `c` clear, `v` view — followed by the shared tile-menu tail
 (`UXI-Menu-9`): `p` Send to Workspace, `X` Close, `t` Tag, then `h` Hide, `u`
-Unhide, `f` Detach, and finally the Agent-only `r` Rename Session and `a`
+Unhide, and finally the Agent-only `r` Rename Session and `a`
 Archive. The View submenu
 contains only `a` Agents and `t` Tasks; choosing one shows that sidepanel view
 and marks the currently visible choice. Advertised model choices use `1..9,0` so
@@ -290,7 +290,7 @@ monocle) plus the primary-area adjustments. The Workspace submenu holds close
 workspace, new project, back-and-forth, and `s` System; System contains `r`
 Rebuild and Restart GUI and `R` Rebuild and Restart All. Top-level Show
 (`UXI-Workspace-27`) stays present but is contextually dimmed when focus is on a
-solo-presented hidden or Detached tile rather than inside a workspace.
+solo-presented hidden tile rather than inside a workspace.
 Commands removed from these roots are not deleted; tile verbs live on the tile
 menu, and retired ones (plane view, set cwd, also-show) are simply gone.
 
@@ -326,11 +326,11 @@ menu** commands, appended after a separator, in three groups:
 - **Always present + enabled:** `p` Send to Workspace (`send-tile-follow`), `X`
   Close (`close-window`), `t` Tag (`tile-tag` — the session tag editor on an
   Agent tile, the buffer tag input elsewhere).
-- **In-a-workspace (attached):** `h` Hide, `u` Unhide, `f` Detach. Always present
-  so the menu stays learnable, but **contextually dimmed** by membership (the
-  established never-a-fake-success pattern): Hide needs attached-visible, Unhide
-  needs attached-hidden, Detach needs any attachment; a Detached/unbound tile
-  dims all three.
+- **Visibility:** `h` Hide, `u` Unhide. Always present so the menu stays
+  learnable, but **contextually dimmed** by membership (the established
+  never-a-fake-success pattern): Hide needs visible, Unhide needs hidden.
+  (`f` Detach was removed by ADR-0039 / `UXI-Workspace-30`; every tile belongs
+  to a workspace.)
 - **Agent-only:** `r` Rename Session (`claude-rename`) and `a` Archive
   (`archive-session`) — appended to the Agent tile menu alone, since they are
   session concepts. Archive is dimmed when the focused session has no stable
@@ -351,11 +351,11 @@ transition masquerade as a successful command.
 **Status.** `implemented`
 
 **Enforcement.** `tests.rs::every_tile_menu_has_shared_tile_commands` asserts the
-shared send/close/tag/hide/unhide/detach commands (and Agent-only archive) for
+shared send/close/tag/hide/unhide commands (and Agent-only archive) for
 every App menu. The real-path GUI guard
 `verify_harness.rs::tile_menu_hide_unhide_enablement_tracks_focused_membership`
-opens the production tile menu, verifies applicability across visible, hidden,
-and Detached membership (including Detach dimming), and proves a disabled key
+opens the production tile menu, verifies applicability across visible and hidden
+membership, and proves a disabled key
 neither dispatches nor closes the menu.
 
 ## Deviations from the design brief (Fable, "The Sigil Card")

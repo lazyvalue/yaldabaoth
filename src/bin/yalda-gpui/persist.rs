@@ -698,16 +698,6 @@ pub(crate) struct Preferences {
     /// project-gated; unlisted workspaces retain frame order after listed ones.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) jump_workspace_order: Option<Vec<String>>,
-    /// User's drag-reordered order of jump-panel tag folders, per project
-    /// (UXI-JumpPanel-21). `project name → [tag]`; folders render in this order,
-    /// any tag not listed sorts after alphabetically. Tags are project-scoped, so
-    /// the order is keyed by durable project name (like `jump_folded_projects`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) jump_tag_order: Option<std::collections::HashMap<String, Vec<String>>>,
-    /// Folded jump-panel tag folders, keyed by `"{project}\u{1f}{tag}"` composite
-    /// (UXI-JumpPanel-21). Absent means every folder starts expanded.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) jump_folded_tags: Option<Vec<String>>,
     /// User's drag-reordered order of jump-panel TILE rows within a workspace
     /// folder (UXI-JumpPanel-28). One global ordered list of durable `WindowId`s;
     /// within each workspace folder tiles sort by their index here, any tile not
@@ -715,13 +705,6 @@ pub(crate) struct Preferences {
     /// so one global list suffices. `None`/absent = layout order (the default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) jump_tile_order: Option<Vec<workspace::WindowId>>,
-    /// User's drag-reordered order of Detached tile rows (UXI-JumpPanel-28).
-    /// Kept separate from `jump_tile_order` so rebuilding the complete attached
-    /// order cannot erase the Detached presentation order (and vice versa).
-    /// Drops are project/tag-group gated; one global durable `WindowId` rank is
-    /// sufficient. `None`/absent = alphabetical order.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) jump_detached_tile_order: Option<Vec<workspace::WindowId>>,
 }
 
 pub(crate) fn load_preferences() -> Preferences {
@@ -989,15 +972,6 @@ pub(crate) struct PersistedLeaf {
     pub(crate) kind: PersistedKind,
 }
 
-/// One tile outside every workspace (ADR-0033). Project is persisted by cwd,
-/// matching workspace membership's self-healing project migration.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct PersistedDetachedTile {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) project_cwd: Option<String>,
-    pub(crate) tile: PersistedLeaf,
-}
-
 /// One tile that remains attached to a workspace but is excluded from its
 /// visible layout (ADR-0034). The footprint is a best-effort restoration hint.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1018,6 +992,8 @@ pub(crate) struct PersistedPlacement {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "tile")]
 pub(crate) enum PersistedSoloPresentation {
+    /// Legacy (ADR-0034) Detached target. Read only so old snapshots still
+    /// parse; it restores as no presentation and is never written (ADR-0039).
     Detached(workspace::WindowId),
     HiddenAttached(workspace::WindowId),
 }
@@ -1213,19 +1189,12 @@ pub(crate) struct PersistedFrame {
     pub(crate) workspaces: Vec<PersistedWorkspace>,
     #[serde(rename = "active_tab")]
     pub(crate) active_workspace: usize,
-    /// Stable tiles outside every workspace. Absent in legacy snapshots.
-    #[serde(
-        default,
-        alias = "unbound_tiles",
-        skip_serializing_if = "Vec::is_empty"
-    )]
-    pub(crate) detached_tiles: Vec<PersistedDetachedTile>,
-    /// Temporary presentation of a tile whose normal owner does not paint it.
+    // Legacy `detached_tiles` / `unbound_tiles` / `direct_unbound` keys
+    // (ADR-0033/0034) are unknown fields now: serde skips them, so an old
+    // snapshot loads without its tiles outside every workspace (ADR-0039).
+    /// Temporary presentation of a hidden tile its workspace does not paint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) solo_presentation: Option<PersistedSoloPresentation>,
-    /// Legacy direct-Unbound focus; restored only when it names a Detached tile.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) direct_unbound: Option<workspace::WindowId>,
     /// Legacy scratchpad MRU, retained only for additive deserialization.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) scratchpad: Vec<workspace::WindowId>,
@@ -1248,12 +1217,11 @@ pub(crate) struct PersistedFrame {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PersistedAgentOwnershipRepair {
     pub(crate) cleared_attached_duplicates: usize,
-    pub(crate) removed_detached_duplicates: usize,
 }
 
 impl PersistedAgentOwnershipRepair {
     pub(crate) fn changed(self) -> bool {
-        self.cleared_attached_duplicates != 0 || self.removed_detached_duplicates != 0
+        self.cleared_attached_duplicates != 0
     }
 }
 
@@ -1262,7 +1230,6 @@ struct PersistedAgentCandidate {
     sid: String,
     id: workspace::WindowId,
     project_cwd: PathBuf,
-    attached: bool,
     order: usize,
 }
 
@@ -1285,7 +1252,6 @@ fn collect_persisted_agent_candidates(
                 sid: sid.to_string(),
                 id: *id,
                 project_cwd: project_cwd.to_path_buf(),
-                attached: true,
                 order: *order,
             });
             *order += 1;
@@ -1349,7 +1315,6 @@ fn collect_hidden_agent_candidate(
             sid: sid.to_string(),
             id: hidden.tile.id,
             project_cwd: project_cwd.to_path_buf(),
-            attached: true,
             order,
         });
     }
@@ -1377,8 +1342,8 @@ fn clear_noncanonical_hidden_agent_sid(
 }
 
 /// Heal duplicate durable Agent identities before constructing live tiles.
-/// Session cwd is authoritative for project membership; within that project a
-/// attached tile wins over a Detached tile, then stable id/order break ties.
+/// Session cwd is authoritative for project membership; within that project
+/// stable id/order break ties.
 pub(crate) fn heal_persisted_agent_ownership(
     frame: &mut PersistedFrame,
     authoritative_cwds: &HashMap<String, PathBuf>,
@@ -1404,39 +1369,14 @@ pub(crate) fn heal_persisted_agent_ownership(
             order += 1;
         }
     }
-    for persisted in &frame.detached_tiles {
-        let PersistedKind::Agent {
-            session_id: Some(sid),
-        } = &persisted.tile.kind
-        else {
-            order += 1;
-            continue;
-        };
-        if !sid.as_str().is_empty() {
-            candidates.push(PersistedAgentCandidate {
-                sid: sid.to_string(),
-                id: persisted.tile.id,
-                project_cwd: persisted
-                    .project_cwd
-                    .as_deref()
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| fallback_cwd.to_path_buf()),
-                attached: false,
-                order,
-            });
-        }
-        order += 1;
-    }
-
     let mut canonical: HashMap<String, usize> = HashMap::new();
-    let mut rank: HashMap<String, (u8, u8, workspace::WindowId, usize)> = HashMap::new();
+    let mut rank: HashMap<String, (u8, workspace::WindowId, usize)> = HashMap::new();
     for candidate in candidates {
         let correct_project = authoritative_cwds
             .get(&candidate.sid)
             .is_some_and(|cwd| cwd_match_key(cwd) == cwd_match_key(&candidate.project_cwd));
         let candidate_rank = (
             u8::from(!correct_project),
-            u8::from(!candidate.attached),
             candidate.id,
             candidate.order,
         );
@@ -1463,22 +1403,6 @@ pub(crate) fn heal_persisted_agent_ownership(
             repair_order += 1;
         }
     }
-    frame.detached_tiles.retain(|persisted| {
-        let candidate_order = repair_order;
-        repair_order += 1;
-        let keep = match &persisted.tile.kind {
-            PersistedKind::Agent {
-                session_id: Some(sid),
-            } if !sid.as_str().is_empty() => canonical
-                .get(sid.as_str())
-                .is_none_or(|canonical_order| *canonical_order == candidate_order),
-            _ => true,
-        };
-        if !keep {
-            repair.removed_detached_duplicates += 1;
-        }
-        keep
-    });
     repair
 }
 
@@ -1664,7 +1588,7 @@ pub(crate) fn restore_layout(
 }
 
 /// Restore one persisted tile while preserving its stable id and tile-local
-/// tags. Shared by workspace layouts and the Detached collection.
+/// tags. Shared by workspace layouts and hidden tiles.
 pub(crate) fn restore_leaf(
     ws: &mut workspace::Frame<App>,
     theme: &Theme,
@@ -1839,27 +1763,11 @@ pub(crate) fn snapshot_workspace(
             })
             .collect(),
         active_workspace: ws.active_workspace.min(non_ephemeral.saturating_sub(1)),
-        detached_tiles: ws
-            .detached_tiles
-            .iter()
-            .map(|tile| PersistedDetachedTile {
-                project_cwd: projects
-                    .cwd_of(tile.project())
-                    .map(|path| path.display().to_string()),
-                tile: PersistedLeaf {
-                    id: tile.window.id(),
-                    tags: tile.window.tags.clone(),
-                    kind: snapshot_content(&tile.window.content, resolve),
-                },
-            })
-            .collect(),
         solo_presentation: ws.presented_tile().map(|presentation| match presentation {
-            workspace::SoloPresentation::Detached(id) => PersistedSoloPresentation::Detached(id),
             workspace::SoloPresentation::HiddenAttached(id) => {
                 PersistedSoloPresentation::HiddenAttached(id)
             }
         }),
-        direct_unbound: ws.presented_detached_tile_id(),
         // ADR-0034 removed scratchpad membership. Keep the legacy field empty
         // for additive snapshot compatibility until the schema version retires it.
         scratchpad: Vec::new(),

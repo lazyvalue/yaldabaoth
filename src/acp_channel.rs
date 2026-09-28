@@ -672,6 +672,28 @@ fn flatten_select_options(
     }
 }
 
+/// The model a FRESH Claude session starts on. The adapter otherwise picks from
+/// `ANTHROPIC_MODEL` / the user's `settings.json` `model` / its own first entry;
+/// Yalda pins its own default right after `session/new` instead. Resumed sessions
+/// are never re-pinned — they keep whatever model they were running.
+pub const YALDA_DEFAULT_CLAUDE_MODEL: &str = "claude-opus-5-5";
+
+/// The model id to switch a freshly created session to, if any: `None` for
+/// non-Claude providers, when there is no model selector, when the selector is
+/// already on the default, or when the adapter does not advertise the default
+/// (never ask for a model the picker can't show).
+fn default_model_switch(
+    provider: AgentProvider,
+    opts: &[SessionConfigOption],
+) -> Option<&'static str> {
+    if provider != AgentProvider::Claude {
+        return None;
+    }
+    let (current, options) = model_state_from_config_options(opts)?;
+    let advertised = options.iter().any(|o| o.id == YALDA_DEFAULT_CLAUDE_MODEL);
+    (advertised && current != YALDA_DEFAULT_CLAUDE_MODEL).then_some(YALDA_DEFAULT_CLAUDE_MODEL)
+}
+
 /// Build the `(ModelChanged, ModelsAvailable)` reply-event pair from a set of
 /// config options, if a model selector is present. Emitting BOTH keeps the
 /// existing status-strip `ModelChanged` path untouched while adding the
@@ -3011,6 +3033,9 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                     // resumed sessions). We emit it AFTER the marker below so it
                     // is always a live, post-fence event.
                     let mut model_events: Vec<ReplyEvent> = Vec::new();
+                    // Set only by the two `session/new` paths (never a load):
+                    // the Yalda default to pin before the selector is emitted.
+                    let mut fresh_default_model: Option<&'static str> = None;
                     if resume_only && resume_session_id.is_some() && !supports_load {
                         let _ = ready_tx.send(Err(io::Error::new(
                             io::ErrorKind::Unsupported,
@@ -3100,6 +3125,8 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                                 Ok(r) => {
                                     if let Some(opts) = &r.config_options {
                                         model_events = model_reply_events(opts);
+                                        fresh_default_model =
+                                            default_model_switch(provider, opts);
                                     }
                                     r.session_id
                                 }
@@ -3124,6 +3151,7 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                             Ok(r) => {
                                 if let Some(opts) = &r.config_options {
                                     model_events = model_reply_events(opts);
+                                    fresh_default_model = default_model_switch(provider, opts);
                                 }
                                 r.session_id
                             }
@@ -3135,6 +3163,25 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                             }
                         }
                     };
+                    // === Pin the Yalda default model on a fresh session, before
+                    //     the selector is emitted, so the first model the UI sees
+                    //     is the default (no flicker through the adapter's pick).
+                    //     A failed switch leaves the adapter's choice in place.
+                    if let Some(model_id) = fresh_default_model {
+                        let req = agent_client_protocol::schema::SetSessionConfigOptionRequest::new(
+                            session_id.clone(),
+                            "model",
+                            model_id,
+                        );
+                        match connection.send_request(req).block_task().await {
+                            Ok(resp) => {
+                                model_events = model_reply_events(&resp.config_options);
+                            }
+                            Err(e) => {
+                                acp_debug!("default model pin {model_id:?} failed: {e}");
+                            }
+                        }
+                    }
                     // === End-of-replay marker — emitted on EVERY spawn that
                     //     ATTEMPTED a resume, regardless of outcome.
                     //
@@ -3972,6 +4019,38 @@ mod tests {
         );
     }
 
+    /// A fresh Claude session is pinned to `claude-opus-5-5` only when the
+    /// adapter advertises it and is not already on it; Codex is never pinned.
+    #[test]
+    fn fresh_claude_session_defaults_to_opus_5_5() {
+        use agent_client_protocol::schema::{
+            SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+        };
+        let selector = |current: &str, ids: &[&str]| {
+            let mut o = SessionConfigOption::select(
+                "model",
+                "Model",
+                current.to_string(),
+                ids.iter()
+                    .map(|id| SessionConfigSelectOption::new(id.to_string(), id.to_string()))
+                    .collect::<Vec<_>>(),
+            );
+            o.category = Some(SessionConfigOptionCategory::Model);
+            vec![o]
+        };
+        let with_opus = selector("claude-opus-4-8[1m]", &["claude-opus-4-8[1m]", "claude-opus-5-5"]);
+        assert_eq!(
+            default_model_switch(AgentProvider::Claude, &with_opus),
+            Some("claude-opus-5-5")
+        );
+        assert_eq!(default_model_switch(AgentProvider::Codex, &with_opus), None);
+        let already = selector("claude-opus-5-5", &["claude-opus-5-5", "sonnet"]);
+        assert_eq!(default_model_switch(AgentProvider::Claude, &already), None);
+        let absent = selector("sonnet", &["sonnet"]);
+        assert_eq!(default_model_switch(AgentProvider::Claude, &absent), None);
+        assert_eq!(default_model_switch(AgentProvider::Claude, &[]), None);
+    }
+
     /// The model `Select` (id `"model"`, category `Model`) is parsed into
     /// `(current, [ModelOption])` preserving advertised order + labels; a
     /// non-model option alongside it is ignored. Mirrors the real
@@ -4568,6 +4647,102 @@ while True:
             got.contains("hello world"),
             "expected streamed reply 'hello world', got {got:?}"
         );
+    }
+
+    /// Real worker path: a fake Claude adapter whose `session/new` starts on
+    /// `claude-opus-4-8` must receive `session/set_config_option model=
+    /// claude-opus-5-5`, and the FIRST `ModelChanged` the client sees is the
+    /// default (the pin lands before the selector is emitted).
+    #[test]
+    fn fresh_session_worker_pins_default_model_before_emitting_selector() {
+        use agent_client_protocol::schema::{
+            SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+        };
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            eprintln!("python3 not available — skipping default-model pin test");
+            return;
+        }
+        let selector = |current: &str| {
+            let mut o = SessionConfigOption::select(
+                "model",
+                "Model",
+                current.to_string(),
+                vec![
+                    SessionConfigSelectOption::new("claude-opus-4-8", "Opus 4.8"),
+                    SessionConfigSelectOption::new("claude-opus-5-5", "Opus 5.5"),
+                ],
+            );
+            o.category = Some(SessionConfigOptionCategory::Model);
+            serde_json::to_string(&vec![o]).unwrap()
+        };
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let log = tmp.path().join("set_config.log");
+        let script = tmp.path().join("fake_model_agent.py");
+        let body = format!(
+            r#"#!/usr/bin/env python3
+import sys, json
+initial = json.loads({initial:?})
+pinned = json.loads({pinned:?})
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    try:
+        msg = json.loads(line)
+    except Exception:
+        continue
+    method = msg.get("method", "")
+    msg_id = msg.get("id")
+    if method == "initialize":
+        emit({{"jsonrpc": "2.0", "id": msg_id,
+              "result": {{"protocolVersion": 1, "agentCapabilities": {{}}}}}})
+    elif method == "session/new":
+        emit({{"jsonrpc": "2.0", "id": msg_id,
+              "result": {{"sessionId": "sess-1", "configOptions": initial}}}})
+    elif method == "session/set_config_option":
+        with open({log:?}, "a") as f:
+            f.write(json.dumps(msg.get("params")) + "\n")
+        emit({{"jsonrpc": "2.0", "id": msg_id,
+              "result": {{"configOptions": pinned}}}})
+"#,
+            initial = selector("claude-opus-4-8"),
+            pinned = selector("claude-opus-5-5"),
+            log = log.to_str().unwrap(),
+        );
+        std::fs::write(&script, body).expect("write script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let client = AcpChannelClient::spawn(script.to_str().unwrap(), Some(tmp.path().into()))
+            .expect("spawn ACP agent");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut first_model = None;
+        while first_model.is_none() && std::time::Instant::now() < deadline {
+            match client.try_recv() {
+                Some(ReplyEvent::ModelChanged(m)) => first_model = Some(m),
+                Some(_) => {}
+                None => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        assert_eq!(first_model.as_deref(), Some(YALDA_DEFAULT_CLAUDE_MODEL));
+        let sent = std::fs::read_to_string(&log).expect("set_config_option reached the agent");
+        let params: serde_json::Value =
+            serde_json::from_str(sent.lines().next().unwrap()).unwrap();
+        assert_eq!(params["configId"], "model");
+        assert_eq!(params["value"], YALDA_DEFAULT_CLAUDE_MODEL);
     }
 
     /// INV-1 / INV-6 (Finding 1, defect B): a `UserMessageChunk` replayed on

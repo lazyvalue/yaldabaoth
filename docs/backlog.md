@@ -13,6 +13,17 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Remove ephemeral virtual workspaces (dead code?)** — `READY` (noted
+  2026-09-27 during ADR-0039, single-owner workspaces). With Detached tiles gone
+  and tile-less sessions opening into their project's workspace
+  (`UXI-Workspace-30`), `Frame::open_ephemeral_workspace`,
+  `Frame::open_ephemeral_workspace_in`, `Frame::dismiss_ephemeral_workspace`
+  (and the `Workspace::ephemeral` flag they manage) appear to be exercised only
+  by tests. ADR-0033 already retired ephemeral views as a product concept.
+  Follow-up simplification: confirm no production caller remains, then delete
+  them along with their tests and any `ephemeral` filtering in the jump panel,
+  Cmd-P, persistence, and `ctrl-<n>` numbering.
+
 - **Config-file-driven Claude model list** — `NEEDS-RUNTIME` (built 2026-09-24,
   Cog graph `2qm`, branch `config-driven-claude-models` → `main`; see
   [worklog](worklog/2026-09-24-config-driven-claude-models.md), UXI-AgentTile-16).

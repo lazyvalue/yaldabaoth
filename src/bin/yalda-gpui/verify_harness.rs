@@ -1261,6 +1261,36 @@ fn add_free_session(
     })
 }
 
+/// Every live tile across every workspace, visible or hidden (ADR-0039: there is
+/// no tile outside a workspace).
+#[cfg(test)]
+fn total_tile_count(v: &YaldaGpuiView) -> usize {
+    let mut n = 0;
+    for workspace in &v.workspace.workspaces {
+        workspace.for_each_attached_window(&mut |_| n += 1);
+    }
+    n
+}
+
+/// Give each roster sid a dormant Agent tile in `project`'s workspace (the
+/// roster creates no tiles — ADR-0039 — and the jump panel paints session rows
+/// only through the workspace tiles that show them). Returns the tile ids.
+#[cfg(test)]
+fn open_dormant_agent_tiles(
+    v: &mut YaldaGpuiView,
+    project: crate::project::ProjectId,
+    sids: &[&str],
+) -> Vec<crate::workspace::WindowId> {
+    sids.iter()
+        .map(|sid| {
+            v.workspace.open_tile_in_project(
+                crate::App::Agent(crate::AgentTile::dormant(crate::ServerSid::new(*sid))),
+                project,
+            )
+        })
+        .collect()
+}
+
 /// The inline jump panel renders without disturbing the cached transcript: a
 /// chatbox keystroke (compose-only session mutation) must still leave the
 /// TRANSCRIPT render-flat even though the panel shares the root render. (The
@@ -1899,8 +1929,9 @@ fn empty_workspace_after_close_last_tile_keeps_menu_leaders(cx: &mut TestAppCont
     });
 }
 
-/// Direct unbound focus does not enter workspace numbering; `ctrl-<n>` still
-/// addresses the durable workspace folders shown by the jump panel.
+/// A solo-presented hidden tile does not enter workspace numbering; `ctrl-<n>`
+/// still addresses the durable workspace folders shown by the jump panel and
+/// leaves the solo presentation.
 #[gpui::test]
 fn workspace_number_ignores_direct_unbound_focus(cx: &mut TestAppContext) {
     let (view, vcx) = boot_browser(cx);
@@ -1908,18 +1939,26 @@ fn workspace_number_ignores_direct_unbound_focus(cx: &mut TestAppContext) {
     view.update(vcx, |v, _| {
         let project = v.workspace.inherited_project();
         v.push_empty_workspace(project);
-    }); // workspaces 1 and 2 are real
-    // Open the free session → an ephemeral workspace is appended (sorts last).
+        v.workspace.set_active_workspace(0);
+    }); // workspaces 1 and 2 are real; the first is active
+    // Open the tile-less session → a visible tile in the active workspace;
+    // then hide it and present it solo.
     view.update(vcx, |v, cx| v.jump_to_session(sid, cx));
+    view.update(vcx, |v, _| {
+        let id = v.agent_tile_id_bound_to(sid).expect("jump opened a tile");
+        assert_eq!(v.workspace.workspace_index_of_window(id), Some(0));
+        v.workspace.hide_window(id).expect("hide the tile");
+        assert!(v.workspace.present_solo(id));
+    });
     view.update(vcx, |v, _| {
         assert_eq!(
             v.workspace.workspaces.len(),
             2,
-            "direct focus adds no workspace"
+            "solo presentation adds no workspace"
         );
-        assert!(v.workspace.presented_detached_tile_id().is_some());
+        assert!(v.workspace.presented_tile().is_some());
     });
-    // ctrl-2 must land on the 2nd REAL workspace (index 1), not the ephemeral.
+    // ctrl-2 must land on the 2nd REAL workspace (index 1).
     view.update(vcx, |v, cx| v.goto_workspace_number(2, cx));
     view.update(vcx, |v, _| {
         assert_eq!(
@@ -1927,6 +1966,11 @@ fn workspace_number_ignores_direct_unbound_focus(cx: &mut TestAppContext) {
             "number 2 = 2nd non-ephemeral workspace"
         );
         assert!(!v.workspace.active_is_ephemeral());
+        assert_eq!(
+            v.workspace.presented_tile(),
+            None,
+            "workspace numbering leaves the solo presentation"
+        );
     });
 }
 
@@ -2328,7 +2372,9 @@ fn jump_active_box_marks_focused_workspace_and_session(cx: &mut TestAppContext) 
     });
 }
 
-/// Jump-panel selection materializes one unbound tile and directly focuses it.
+/// Jumping to a session no tile shows opens ONE visible tile in the active
+/// workspace of its project and focuses it (ADR-0039); switching workspaces
+/// away and back keeps that tile and its session.
 #[gpui::test]
 fn jump_to_unbound_session_preserves_tile_after_workspace_focus(cx: &mut TestAppContext) {
     let (view, vcx) = boot_browser(cx);
@@ -2343,56 +2389,50 @@ fn jump_to_unbound_session_preserves_tile_after_workspace_focus(cx: &mut TestApp
         );
     });
 
-    // Jump to the free session → one directly focused unbound tile.
+    // Jump to the free session → one visible, focused tile in workspace 0.
     view.update(vcx, |v, cx| v.jump_to_session(sid, cx));
-    view.update(vcx, |v, _| {
+    let id = view.update(vcx, |v, _| {
         assert_eq!(
             v.workspace.workspaces.len(),
             1,
             "no workspace is manufactured"
         );
         let id = v
-            .workspace
-            .presented_detached_tile_id()
-            .expect("direct unbound focus");
+            .agent_tile_id_bound_to(sid)
+            .expect("the jump opened a workspace tile");
         assert_eq!(
-            v.workspace
-                .tile(id)
-                .and_then(|window| match &window.content {
-                    crate::App::Agent(tile) => tile.session(),
-                    _ => None,
-                }),
-            Some(sid),
-            "the unbound tile retains the session"
+            v.workspace.tile_membership(id),
+            Some(crate::workspace::TileMembership::Attached {
+                workspace: 0,
+                visibility: crate::workspace::AttachedVisibility::Visible,
+            }),
+            "the new tile is visible in the project's workspace"
         );
-        assert!(
-            v.agent_tile_id_bound_to(sid).is_none(),
-            "an ephemeral reference is not durable workspace placement"
-        );
-        assert!(
-            v.bound_sid_set().is_empty(),
-            "free/bound projection also ignores ephemeral references"
-        );
+        assert_eq!(v.workspace.focused_window_id(), Some(id));
+        assert_eq!(v.workspace.presented_tile(), None);
+        assert!(v.workspace.validate_ownership().is_ok());
+        id
     });
 
-    // Jump away clears direct focus but keeps the unbound tile and its state.
+    // Switch to another workspace and back: the tile and session persist.
+    view.update(vcx, |v, cx| {
+        let project = v.workspace.inherited_project();
+        v.push_empty_workspace(project);
+        v.select_workspace(1, cx);
+    });
     view.update(vcx, |v, cx| v.select_workspace(0, cx));
     view.update(vcx, |v, _| {
-        assert_eq!(v.workspace.workspaces.len(), 1);
-        assert_eq!(v.workspace.presented_detached_tile_id(), None);
-        assert!(
-            v.agent_tile_id_bound_to(sid).is_none(),
-            "session returned to free"
-        );
+        assert_eq!(v.workspace.workspace_index_of_window(id), Some(0));
+        assert_eq!(v.agent_tile_id_bound_to(sid), Some(id));
         assert!(
             v.sessions.contains(sid),
-            "session itself survives the teardown"
+            "session itself survives the workspace switch"
         );
     });
 }
 
-/// Selecting a second free session directly focuses its own stable unbound tile;
-/// the first remains in Unbound with its state intact.
+/// Jumping to a second tile-less session opens its own tile; both tiles stay
+/// in the workspace with their sessions and survive switching workspaces.
 #[gpui::test]
 fn jump_to_second_unbound_session_preserves_both_tiles(cx: &mut TestAppContext) {
     let (view, vcx) = boot_browser(cx);
@@ -2401,11 +2441,11 @@ fn jump_to_second_unbound_session_preserves_both_tiles(cx: &mut TestAppContext) 
 
     view.update(vcx, |v, cx| v.jump_to_session(a, cx));
     view.update(vcx, |v, cx| v.jump_to_session(b, cx));
-    view.update(vcx, |v, _| {
+    let (ta, tb) = view.update(vcx, |v, _| {
         assert_eq!(
             v.workspace.workspaces.len(),
             1,
-            "direct views add no workspaces"
+            "jumps add no workspaces"
         );
         assert_eq!(
             v.workspace
@@ -2417,16 +2457,339 @@ fn jump_to_second_unbound_session_preserves_both_tiles(cx: &mut TestAppContext) 
             Some(b),
             "the second session is now shown"
         );
-        assert!(
-            v.agent_tile_id_bound_to(b).is_none(),
-            "the second session still has no durable placement"
-        );
-        assert!(
-            v.agent_tile_id_bound_to(a).is_none(),
-            "the first session returned to free"
-        );
+        let ta = v.agent_tile_id_bound_to(a).expect("first tile persists");
+        let tb = v.agent_tile_id_bound_to(b).expect("second tile exists");
+        assert_ne!(ta, tb, "each session has its own tile");
+        assert_eq!(v.workspace.visible_workspace_index_of_window(ta), Some(0));
+        assert_eq!(v.workspace.visible_workspace_index_of_window(tb), Some(0));
         assert!(v.sessions.contains(a) && v.sessions.contains(b));
-        assert_eq!(v.workspace.detached_tiles.len(), 2);
+        (ta, tb)
+    });
+    view.update(vcx, |v, cx| {
+        let project = v.workspace.inherited_project();
+        v.push_empty_workspace(project);
+        v.select_workspace(1, cx);
+    });
+    view.update(vcx, |v, cx| v.select_workspace(0, cx));
+    view.update(vcx, |v, _| {
+        assert_eq!(v.agent_tile_id_bound_to(a), Some(ta));
+        assert_eq!(v.agent_tile_id_bound_to(b), Some(tb));
+        assert!(v.workspace.validate_ownership().is_ok());
+    });
+}
+
+/// A roster `SessionInfo` rooted at `cwd` (connected, idle, Claude).
+#[cfg(test)]
+fn roster_info(sid: &str, label: &str, cwd: PathBuf, archived: bool) -> yalda::session_proto::SessionInfo {
+    yalda::session_proto::SessionInfo {
+        session_id: sid.into(),
+        acp_session_id: None,
+        label: label.into(),
+        cwd,
+        provider: yalda::acp_channel::AgentProvider::Claude,
+        turns: 0,
+        connected: true,
+        permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+        busy: false,
+        archived,
+    }
+}
+
+/// ADR-0039 §2: the server roster is not a tile source. Sessions no tile
+/// shows arrive through both real roster-adoption paths — the
+/// `SessionCreated` broadcast reducer (`apply_server_batch`) and the adoption
+/// tail `refresh_roster`'s callback runs on a `list_sessions` result
+/// (`replace_all` → `append_new_jump_sessions` → label/provider recovery) —
+/// and neither may create, move, or duplicate a tile.
+///
+/// NEGATIVE CONTROL (observed RED): re-introduce roster materialization by
+/// making `recover_providers_from_roster` open a dormant tile (via
+/// `open_tile_in_project`) for every roster session no tile remembers → the
+/// "roster adoption creates no tiles" assertion fails.
+#[gpui::test]
+fn roster_refresh_creates_no_tiles(cx: &mut TestAppContext) {
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let (view, vcx) = boot_browser(cx);
+    let (cwd, tiles_before, workspaces_before) = view.read_with(vcx, |v, _| {
+        let pid = v.workspace.active_workspace().expect("workspace").project();
+        (
+            v.projects.cwd_of(pid).expect("project cwd").to_path_buf(),
+            total_tile_count(v),
+            v.workspace.workspaces.len(),
+        )
+    });
+    let foreign = std::env::temp_dir().join("yalda-roster-no-tiles-unfiled");
+
+    // Broadcast path: sessions created elsewhere on the server.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                ServerNotification::SessionCreated {
+                    session: roster_info("R-created-a", "created a", cwd.clone(), false),
+                },
+                ServerNotification::SessionCreated {
+                    session: roster_info("R-created-b", "created b", foreign.clone(), false),
+                },
+            ],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    // Refresh path: the synchronous adoption tail of `refresh_roster`.
+    view.update(vcx, |v, cx| {
+        let sessions = vec![
+            roster_info("R-created-a", "created a", cwd.clone(), false),
+            roster_info("R-created-b", "created b", foreign.clone(), false),
+            roster_info("R-listed", "listed", cwd.clone(), false),
+            roster_info("R-archived", "archived", cwd.clone(), true),
+        ];
+        v.agent_roster.replace_all(sessions);
+        let order = v
+            .agent_roster
+            .entries_by_label()
+            .into_iter()
+            .map(|s| s.session_id.clone())
+            .collect::<Vec<_>>();
+        v.append_new_jump_sessions(order);
+        v.recover_labels_from_roster(cx);
+        v.recover_providers_from_roster(cx);
+        cx.notify();
+    });
+    vcx.run_until_parked();
+
+    view.read_with(vcx, |v, _| {
+        assert_eq!(v.agent_roster.entries_by_label().len(), 4, "roster adopted");
+        assert_eq!(
+            total_tile_count(v),
+            tiles_before,
+            "roster adoption creates no tiles"
+        );
+        assert_eq!(v.workspace.workspaces.len(), workspaces_before);
+        for sid in ["R-created-a", "R-created-b", "R-listed", "R-archived"] {
+            assert_eq!(
+                v.agent_tile_id_for_server_sid(sid),
+                None,
+                "{sid} has no tile"
+            );
+        }
+        assert!(v.workspace.validate_ownership().is_ok());
+    });
+}
+
+/// ADR-0039 §2: Cmd-P is a path to a session no tile shows. It lists every
+/// live, non-archived roster session without a tile as a `Session` target
+/// (never an archived one, never one a tile already shows), and activating it
+/// opens a new VISIBLE Agent tile in that session's project's workspace, makes
+/// that workspace active, and focuses the tile. Drives the real palette
+/// open → query → activate path.
+///
+/// NEGATIVE CONTROL (observed RED): skip the `PaletteTarget::Session` rows in
+/// `jump_palette_items` → "the tile-less session is a Session target" fails.
+/// Make `Frame::open_tile_in_project` hide the tile it just placed → "a new
+/// visible Agent tile" fails.
+#[gpui::test]
+fn jump_palette_opens_tileless_session_into_project_workspace(cx: &mut TestAppContext) {
+    use crate::jump_palette::PaletteTarget;
+    use crate::workspace::{AttachedVisibility, TileMembership};
+    use crate::{AgentTile, App, ServerSid};
+
+    let (view, vcx) = boot_browser(cx);
+    let (pid, cwd) = view.read_with(vcx, |v, _| {
+        let pid = v.workspace.workspaces[0].project();
+        (pid, v.projects.cwd_of(pid).expect("project cwd").to_path_buf())
+    });
+    let shown_tile = view.update(vcx, |v, cx| {
+        v.agent_roster
+            .upsert(roster_info("P-tileless", "tileless target", cwd.clone(), false));
+        v.agent_roster
+            .upsert(roster_info("P-archived", "archived target", cwd.clone(), true));
+        v.jump_archived_sessions.insert("P-archived".into());
+        v.agent_roster
+            .upsert(roster_info("P-shown", "shown target", cwd.clone(), false));
+        let shown_tile = v.workspace.open_tile_in_project(
+            App::Agent(AgentTile::dormant(ServerSid::new("P-shown"))),
+            pid,
+        );
+        // Stand in ANOTHER project's workspace, so landing in the session's
+        // project workspace is an observable move.
+        let other = v
+            .projects
+            .create("Other".into(), PathBuf::from("/tmp/yalda-palette-other"))
+            .expect("other project");
+        v.new_workspace_in(other, cx);
+        assert_ne!(v.workspace.active_workspace, 0);
+        shown_tile
+    });
+    let (tiles_before, workspaces_before) = view.read_with(vcx, |v, _| {
+        (total_tile_count(v), v.workspace.workspaces.len())
+    });
+
+    view.update(vcx, |v, cx| v.open_jump_palette_impl(cx));
+    view.read_with(vcx, |v, cx| {
+        let targets: Vec<_> = v
+            .jump_palette_items(cx)
+            .into_iter()
+            .map(|item| item.target)
+            .collect();
+        assert!(
+            targets.contains(&PaletteTarget::Session("P-tileless".into())),
+            "the tile-less session is a Session target: {targets:?}"
+        );
+        assert!(
+            !targets.contains(&PaletteTarget::Session("P-archived".into())),
+            "an archived session is never a Session target"
+        );
+        assert!(
+            !targets.contains(&PaletteTarget::Session("P-shown".into())),
+            "a session a tile already shows is not a Session target"
+        );
+        assert!(
+            targets.contains(&PaletteTarget::Tile(shown_tile)),
+            "the shown session is reachable through its tile"
+        );
+    });
+
+    // Type the label, then activate the top-ranked row.
+    view.update(vcx, |v, cx| {
+        let palette = v.jump_palette_mut().expect("palette open");
+        palette.query = "tileless target".into();
+        palette.selected = 0;
+        cx.notify();
+    });
+    view.read_with(vcx, |v, cx| {
+        let (items, ranked) = v.jump_palette_ranked(cx);
+        assert_eq!(
+            items[ranked[0]].target,
+            PaletteTarget::Session("P-tileless".into()),
+            "the typed label ranks the Session row first"
+        );
+    });
+    view.update(vcx, |v, cx| {
+        crate::with_server_roster_jump_branch(|| v.activate_jump_palette_selection(cx))
+    });
+    vcx.run_until_parked();
+
+    view.read_with(vcx, |v, _| {
+        assert!(!v.has_overlay(), "activation dismisses the palette");
+        let tile = v
+            .agent_tile_id_for_server_sid("P-tileless")
+            .expect("activation opened a tile remembering the session");
+        assert_eq!(
+            v.workspace.tile_membership(tile),
+            Some(TileMembership::Attached {
+                workspace: 0,
+                visibility: AttachedVisibility::Visible,
+            }),
+            "a new visible Agent tile in the session's project workspace"
+        );
+        assert_eq!(v.workspace.active_workspace, 0, "that workspace is active");
+        assert_eq!(v.workspace.focused_window_id(), Some(tile), "and it is focused");
+        assert_eq!(v.workspace.presented_tile(), None);
+        assert_eq!(total_tile_count(v), tiles_before + 1, "exactly one new tile");
+        assert_eq!(v.workspace.workspaces.len(), workspaces_before);
+        assert!(v.workspace.validate_ownership().is_ok());
+    });
+}
+
+/// UXI-Project-4 / ADR-0039: the project menu's New agent session opens a
+/// new VISIBLE, focused Agent tile in a workspace of that project — the
+/// existing workspace when the project has one, else a new workspace for the
+/// project. Drives the real `new_agent_session_in` entry point.
+///
+/// NEGATIVE CONTROL (observed RED): make `Frame::open_tile_in_project` hide
+/// the tile it just placed → "the NEW tile is focused" fails (focus falls back
+/// to the pre-existing tile, which `set_screen` then clobbers). Make its
+/// no-workspace branch create the workspace under `default_project` → the new
+/// workspace's project assertion fails.
+#[gpui::test]
+fn project_menu_new_agent_session_opens_visible_tile_in_project_workspace(
+    cx: &mut TestAppContext,
+) {
+    use crate::App;
+    use crate::workspace::{AttachedVisibility, TileMembership};
+
+    let (view, vcx) = boot_browser(cx);
+    let (pid, tiles_before, workspaces_before, browser) = view.read_with(vcx, |v, _| {
+        (
+            v.workspace.workspaces[0].project(),
+            total_tile_count(v),
+            v.workspace.workspaces.len(),
+            v.workspace.focused_window_id().expect("boot browser tile"),
+        )
+    });
+
+    // A. A project WITH a workspace: the tile lands there.
+    view.update(vcx, |v, cx| v.new_agent_session_in(pid, cx));
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert_eq!(total_tile_count(v), tiles_before + 1, "one new tile");
+        assert_eq!(v.workspace.workspaces.len(), workspaces_before);
+        let tile = v.workspace.focused_window_id().expect("new tile focused");
+        assert_ne!(tile, browser, "the NEW tile is focused");
+        assert!(
+            matches!(
+                v.workspace.tile(browser).map(|w| &w.content),
+                Some(App::Buffer(_))
+            ),
+            "the existing tile keeps its content"
+        );
+        assert_eq!(
+            v.workspace.tile_membership(tile),
+            Some(TileMembership::Attached {
+                workspace: 0,
+                visibility: AttachedVisibility::Visible,
+            }),
+            "the new Agent tile is visible in the project's workspace"
+        );
+        assert!(matches!(
+            v.workspace.tile(tile).map(|w| &w.content),
+            Some(App::Agent(_))
+        ));
+        assert_eq!(v.workspace.active_workspace, 0);
+        assert!(v.workspace.validate_ownership().is_ok());
+    });
+
+    // B. A project with NO workspace: a new workspace for it holds the tile.
+    let other = view.update(vcx, |v, _| {
+        v.projects
+            .create("Fresh".into(), PathBuf::from("/tmp/yalda-new-agent-fresh"))
+            .expect("fresh project")
+    });
+    let (tiles_before, workspaces_before, ids_before) = view.read_with(vcx, |v, _| {
+        (
+            total_tile_count(v),
+            v.workspace.workspaces.len(),
+            v.workspace.all_window_ids(),
+        )
+    });
+    view.update(vcx, |v, cx| v.new_agent_session_in(other, cx));
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert_eq!(
+            v.workspace.workspaces.len(),
+            workspaces_before + 1,
+            "a new workspace for the project"
+        );
+        assert_eq!(total_tile_count(v), tiles_before + 1);
+        let active = v.workspace.active_workspace;
+        assert_eq!(v.workspace.workspaces[active].project(), other);
+        let tile = v.workspace.focused_window_id().expect("new tile focused");
+        assert!(!ids_before.contains(&tile), "the NEW tile is focused");
+        assert_eq!(
+            v.workspace.tile_membership(tile),
+            Some(TileMembership::Attached {
+                workspace: active,
+                visibility: AttachedVisibility::Visible,
+            }),
+            "the new workspace holds the visible Agent tile"
+        );
+        assert!(matches!(
+            v.workspace.tile(tile).map(|w| &w.content),
+            Some(App::Agent(_))
+        ));
+        assert!(v.workspace.validate_ownership().is_ok());
     });
 }
 
@@ -5075,7 +5438,7 @@ fn selector_projection_reflects_binding_across_tiles(cx: &mut TestAppContext) {
     vcx.run_until_parked();
 
     // Two server sessions in the roster (cwd ".").
-    view.update(vcx, |v, cx| {
+    view.update(vcx, |v, _| {
         for (sid, label) in [("S1", "claude-1"), ("S2", "claude-2")] {
             v.agent_roster.upsert(SessionInfo {
                 session_id: sid.into(),
@@ -5090,7 +5453,6 @@ fn selector_projection_reflects_binding_across_tiles(cx: &mut TestAppContext) {
                 archived: false,
             });
         }
-        v.materialize_roster_detached_tiles();
     });
 
     // An unbound selector tile. Both sessions are FREE.
@@ -5305,11 +5667,11 @@ fn workspace_cwd_persists_across_restart(cx: &mut TestAppContext) {
 }
 
 /// bug-0059 / UXI-Workspace-28: GUI boot must restore the durable ownership
-/// graph before a fast universal-roster result may materialize roster-only
-/// sessions and save workspace.json. This drives the production
-/// `initialize_workspace_before_roster` entry point; its injected callback is
-/// the exact mutating tail of `refresh_roster` (materialize, then save when it
-/// changed something).
+/// graph before a fast universal-roster result may save workspace.json. This
+/// drives the production `initialize_workspace_before_roster` entry point; its
+/// injected callback models the fastest roster result (adopt the roster entry,
+/// then save). Since ADR-0039 the roster creates no tiles, so the restored
+/// Attached tile must remain the session's only tile.
 ///
 /// The setup snapshot models the reported state before corruption: stable tile
 /// 1175 is an Agent in the named Outlook workspace. The fresh view marks the
@@ -5319,9 +5681,8 @@ fn workspace_cwd_persists_across_restart(cx: &mut TestAppContext) {
 ///
 /// Negative control (required): move `start_roster(self, cx)` above the restore
 /// block in `initialize_workspace_before_roster`. The callback sees only the
-/// default frame, writes the session as Detached over the prepared snapshot,
-/// then restore reads that corruption; the `Outlook remains present` assertion
-/// fails RED.
+/// default frame and saves it over the prepared snapshot, then restore reads
+/// that corruption; the `Outlook remains present` assertion fails RED.
 #[gpui::test]
 fn boot_restores_attached_agent_before_fast_roster_save(cx: &mut TestAppContext) {
     use crate::persist::{
@@ -5375,9 +5736,9 @@ fn boot_restores_attached_agent_before_fast_roster_save(cx: &mut TestAppContext)
                     busy: false,
                     archived: true,
                 });
-                if v.materialize_roster_detached_tiles() {
-                    v.save_workspace_state();
-                }
+                // A fast roster result may trigger a save; the roster itself
+                // creates no tiles (ADR-0039).
+                v.save_workspace_state();
             });
         });
     });
@@ -5397,13 +5758,18 @@ fn boot_restores_attached_agent_before_fast_roster_save(cx: &mut TestAppContext)
             }),
             "the same stable tile remains Attached to Outlook"
         );
-        assert!(
-            v.workspace.detached_tiles.iter().all(|tile| {
-                !matches!(&tile.window.content, App::Agent(agent)
+        let mut remembering = 0;
+        for workspace in &v.workspace.workspaces {
+            workspace.for_each_attached_window(&mut |tile| {
+                if matches!(&tile.content, App::Agent(agent)
                     if agent.remembered_sid(|_| None).as_ref().is_some_and(|id| id.as_str() == sid))
-            }),
-            "the roster cannot create a Detached duplicate"
-        );
+                {
+                    remembering += 1;
+                }
+            });
+        }
+        assert_eq!(remembering, 1, "the roster cannot create a duplicate tile");
+        assert!(v.workspace.validate_ownership().is_ok());
     });
 
     // The correctness boundary is the file the next reboot reads, not only the
@@ -5424,10 +5790,6 @@ fn boot_restores_attached_agent_before_fast_roster_save(cx: &mut TestAppContext)
                 && matches!(&leaf.kind, PersistedKind::Agent { session_id }
                     if session_id.as_ref().is_some_and(|id| id.as_str() == sid))
     ));
-    assert!(persisted.detached_tiles.iter().all(|tile| {
-        !matches!(&tile.tile.kind, PersistedKind::Agent { session_id }
-            if session_id.as_ref().is_some_and(|id| id.as_str() == sid))
-    }));
 }
 
 /// A new agent inherits the workspace's LIVE cwd at create time — including a
@@ -5681,7 +6043,9 @@ fn session_picker_navigation_wraps(cx: &mut TestAppContext) {
 
 /// Activating a listed row binds the tile to the chosen session and clears the
 /// picker; the bound session SURVIVES the attach round-trip (hermetic — no
-/// server, so the attach early-returns rather than dropping the session).
+/// server, so the attach early-returns rather than dropping the session). The
+/// roster session has no tile (ADR-0039), so the workspace picker tile itself
+/// binds it and stays focused in the workspace.
 fn assert_existing_agent_picker_activation_stays_in_workspace(
     cx: &mut TestAppContext,
     by_mouse: bool,
@@ -5693,7 +6057,7 @@ fn assert_existing_agent_picker_activation_stays_in_workspace(
 
     let (view, vcx) = boot_browser(cx);
     let server_sid = "picker-existing-agent";
-    let (workspace_idx, picker_tile, old_unbound_tile) = view.update(vcx, |v, cx| {
+    let (workspace_idx, picker_tile) = view.update(vcx, |v, cx| {
         let workspace_idx = v.workspace.active_workspace;
         let project = v.workspace.workspaces[workspace_idx].project();
         let cwd = v
@@ -5713,25 +6077,22 @@ fn assert_existing_agent_picker_activation_stays_in_workspace(
             busy: false,
             archived: false,
         });
-        assert!(v.materialize_roster_detached_tiles());
-        let old_unbound_tile = v
-            .agent_tile_id_for_server_sid(server_sid)
-            .expect("roster session materialized as an unbound tile");
+        assert_eq!(
+            v.agent_tile_id_for_server_sid(server_sid),
+            None,
+            "a roster session has no tile"
+        );
         let picker_tile = v
             .workspace
             .split_focused(SplitDir::H, App::Agent(AgentTile::new()))
             .expect("add empty Agent tile to workspace");
         cx.notify();
-        (workspace_idx, picker_tile, old_unbound_tile)
+        (workspace_idx, picker_tile)
     });
     vcx.run_until_parked();
 
     view.read_with(vcx, |v, _| {
         assert_eq!(v.workspace.focused_window_id(), Some(picker_tile));
-        assert_eq!(
-            v.workspace.tile_membership(old_unbound_tile),
-            Some(TileMembership::Detached)
-        );
         let (free, _) = v.picker_projection(&v.agent_base_cwd());
         assert_eq!(free.first().map(|row| row.sid.as_str()), Some(server_sid));
     });
@@ -5765,27 +6126,27 @@ fn assert_existing_agent_picker_activation_stays_in_workspace(
             "activation must stay in the workspace"
         );
         assert_eq!(
-            v.workspace.presented_detached_tile_id(),
+            v.workspace.presented_tile(),
             None,
-            "activation must not bounce to the old unbound Agent tile"
+            "activation must not bounce to a solo presentation"
         );
         assert_eq!(
             v.workspace.focused_window_id(),
-            Some(old_unbound_tile),
-            "the existing stable Agent tile moves into the workspace and stays focused"
+            Some(picker_tile),
+            "the workspace picker tile binds the session and stays focused"
         );
         assert_eq!(
-            v.workspace.tile_membership(old_unbound_tile),
+            v.workspace.tile_membership(picker_tile),
             Some(TileMembership::Attached {
                 workspace: workspace_idx,
                 visibility: crate::workspace::AttachedVisibility::Visible,
             }),
-            "picker activation binds the existing stable Agent tile"
+            "the bound tile stays visible in the workspace"
         );
         assert_eq!(
-            v.workspace.tile_membership(picker_tile),
-            None,
-            "the temporary empty picker tile is retired"
+            v.agent_tile_id_for_server_sid(server_sid),
+            Some(picker_tile),
+            "exactly the picker tile shows the session"
         );
         let session = v
             .agent_tile()
@@ -5822,7 +6183,7 @@ fn session_picker_enter_uses_visually_clamped_row_after_roster_shrink(cx: &mut T
     use yalda::session_proto::SessionInfo;
 
     let (view, vcx) = boot_browser(cx);
-    let (workspace, picker, beta_tile) = view.update(vcx, |v, cx| {
+    let (workspace, picker) = view.update(vcx, |v, cx| {
         let workspace = v.workspace.active_workspace;
         let project = v.workspace.workspaces[workspace].project();
         let cwd = v
@@ -5846,16 +6207,12 @@ fn session_picker_enter_uses_visually_clamped_row_after_roster_shrink(cx: &mut T
         }
         v.session_tags
             .insert("picker-alpha".into(), vec!["first-group".into()]);
-        assert!(v.materialize_roster_detached_tiles());
-        let beta_tile = v
-            .agent_tile_id_for_server_sid("picker-beta")
-            .expect("beta stable tile");
         let picker = v
             .workspace
             .split_focused(SplitDir::H, App::Agent(AgentTile::new()))
             .expect("workspace picker tile");
         cx.notify();
-        (workspace, picker, beta_tile)
+        (workspace, picker)
     });
     vcx.run_until_parked();
 
@@ -5880,10 +6237,9 @@ fn session_picker_enter_uses_visually_clamped_row_after_roster_shrink(cx: &mut T
     vcx.run_until_parked();
 
     view.read_with(vcx, |v, _| {
-        assert_eq!(v.workspace.focused_window_id(), Some(beta_tile));
-        assert_eq!(v.workspace.tile_membership(picker), None);
+        assert_eq!(v.workspace.focused_window_id(), Some(picker));
         assert_eq!(
-            v.workspace.tile_membership(beta_tile),
+            v.workspace.tile_membership(picker),
             Some(TileMembership::Attached {
                 workspace,
                 visibility: crate::workspace::AttachedVisibility::Visible
@@ -5896,136 +6252,6 @@ fn session_picker_enter_uses_visually_clamped_row_after_roster_shrink(cx: &mut T
                 .map(|sid| sid.as_str()),
             Some("picker-beta")
         );
-    });
-}
-
-/// The intermittent variant: the roster session is already attached locally,
-/// but its stable Agent tile is Unbound. Placement must move that tile without
-/// minting a duplicate local session or navigating away.
-#[gpui::test]
-fn session_picker_places_already_local_unbound_agent_without_duplicate(cx: &mut TestAppContext) {
-    use crate::workspace::{SplitDir, TileMembership};
-    use crate::{AgentTile, App};
-    use yalda::session_proto::SessionInfo;
-
-    let (view, vcx) = boot_browser(cx);
-    let server_sid = "picker-local-unbound-agent";
-    let (stable, picker, workspace, session) = view.update(vcx, |v, cx| {
-        let workspace = v.workspace.active_workspace;
-        let project = v.workspace.workspaces[workspace].project();
-        let cwd = v
-            .projects
-            .cwd_of(project)
-            .expect("project cwd")
-            .to_path_buf();
-        let session = v.show_local_session(
-            crate::AgentSession {
-                state: crate::AgentState::new_server_managed(None),
-                label: "local-unbound".into(),
-                cwd: cwd.clone(),
-                resume_id: None,
-            },
-            cx,
-        );
-        v.sessions
-            .bind_sid(session, crate::ServerSid::new(server_sid))
-            .expect("local session gets durable sid");
-        v.agent_roster.upsert(SessionInfo {
-            session_id: server_sid.into(),
-            acp_session_id: None,
-            label: "local-unbound".into(),
-            cwd,
-            provider: yalda::acp_channel::AgentProvider::Claude,
-            turns: 2,
-            connected: true,
-            permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
-            busy: false,
-            archived: false,
-        });
-        let mut tile = AgentTile::new();
-        tile.bind(session);
-        let stable = v.workspace.push_detached(App::Agent(tile), project);
-        let picker = v
-            .workspace
-            .split_focused(SplitDir::H, App::Agent(AgentTile::new()))
-            .expect("workspace picker tile");
-        (stable, picker, workspace, session)
-    });
-
-    view.update(vcx, |v, cx| {
-        v.agent_tile_mut()
-            .and_then(|tile| tile.picker_mut())
-            .expect("focused Agent tile has picker")
-            .selected = 2;
-        cx.notify();
-    });
-    vcx.run_until_parked();
-    vcx.simulate_keystrokes("enter");
-    vcx.run_until_parked();
-    view.read_with(vcx, |v, _| {
-        assert_eq!(v.sessions.len(), 1, "placement must not mint a duplicate");
-        assert_eq!(v.workspace.focused_window_id(), Some(stable));
-        assert_eq!(v.workspace.tile_membership(picker), None);
-        assert_eq!(
-            v.workspace.tile_membership(stable),
-            Some(TileMembership::Attached {
-                workspace,
-                visibility: crate::workspace::AttachedVisibility::Visible
-            })
-        );
-        assert_eq!(v.agent_tile().and_then(AgentTile::session), Some(session));
-    });
-}
-
-/// The shell command is the discoverable placement path for an Agent tile
-/// outside every workspace. It opens the same real workspace picker used for
-/// bound tiles and moves the same stable tile into the chosen workspace.
-#[gpui::test]
-fn shell_send_to_workspace_command_binds_an_unbound_agent(cx: &mut TestAppContext) {
-    use crate::workspace::TileMembership;
-    use crate::{AgentTile, App, LinearTile};
-
-    let (view, vcx) = boot_browser(cx);
-    let (agent, target) = view.update(vcx, |v, _| {
-        let project = v.workspace.inherited_project();
-        v.workspace
-            .push_workspace_inheriting(App::Linear(LinearTile::new()));
-        let target = v.workspace.active_workspace;
-        v.workspace.set_active_workspace(0);
-        let agent = v.workspace.push_detached(
-            App::Agent(AgentTile::dormant(crate::ServerSid::new(
-                "send-agent-to-workspace",
-            ))),
-            project,
-        );
-        assert!(v.workspace.present_solo(agent));
-        (agent, target)
-    });
-
-    view.update(vcx, |v, cx| v.dispatch_menu_command("send-tile-follow", cx));
-    view.read_with(vcx, |v, _| {
-        let picker = v
-            .workspace_picker_ref()
-            .expect("shell command opens workspace picker");
-        assert_eq!(
-            picker.mode,
-            crate::WorkspacePickerMode::Move { follow: true }
-        );
-        assert_eq!(picker.targets, vec![0, target]);
-        assert_eq!(picker.selected, 1);
-    });
-    vcx.simulate_keystrokes("enter");
-    vcx.run_until_parked();
-    view.read_with(vcx, |v, _| {
-        assert_eq!(
-            v.workspace.tile_membership(agent),
-            Some(TileMembership::Attached {
-                workspace: target,
-                visibility: crate::workspace::AttachedVisibility::Visible,
-            })
-        );
-        assert_eq!(v.workspace.active_workspace, target);
-        assert_eq!(v.workspace.focused_window_id(), Some(agent));
     });
 }
 
@@ -8584,40 +8810,6 @@ fn roster_surfaces_unopened_session_and_tracks_rename_close(cx: &mut TestAppCont
     assert!(rows.is_empty(), "closed session is gone from the roster");
 }
 
-/// UXI-JumpPanel-3, clause 3: the jump-panel "＋ New agent session" action drives
-/// the REAL `spawn_free_agent_session`. With no session server there is no roster
-/// to host a free session, so it is a graceful no-op — a transient status note is
-/// set, and it creates NOTHING (no store session, no tile binding). It must never
-/// panic and never auto-bind a phantom.
-///
-/// Negative control: `spawn_free_agent_session`'s no-server guard
-/// (`let Some(handle) … else { note; return }`). Remove it and the method
-/// unwraps a `None` handle → panic instead of this clean note.
-#[gpui::test]
-fn free_agent_session_no_server_is_graceful_noop(cx: &mut TestAppContext) {
-    let (view, vcx) = boot_browser(cx); // hermetic → session_server is None
-    view.update(vcx, |v, cx| {
-        assert!(v.sessions.is_empty(), "precondition: no sessions yet");
-        v.spawn_free_agent_session(cx);
-    });
-    vcx.run_until_parked();
-    view.update(vcx, |v, _| {
-        assert!(
-            v.sessions.is_empty(),
-            "no session server ⇒ create NOTHING locally (no phantom session)"
-        );
-        let note = v
-            .transient_status
-            .as_ref()
-            .map(|s| s.to_string())
-            .unwrap_or_default();
-        assert!(
-            note.contains("no session server"),
-            "the action explains why it did nothing, got: {note:?}"
-        );
-    });
-}
-
 /// UXI-Project-7 (removal half): the retired global "new agent session" cwd flow
 /// is gone. The `?` menu no longer offers `new-free-agent-session`, and
 /// dispatching that command (the exact call a menu key-selection made) opens NO
@@ -8768,15 +8960,16 @@ fn jump_panel_project_fold_hides_and_restores_children(cx: &mut TestAppContext) 
     crate::layout_probe_end();
 }
 
-/// ADR-0033: the painted tree has exclusive workspace children and an Unbound
-/// collection. Both row kinds dispatch by stable tile id, and workspace folds
-/// hide only that folder's children.
+/// ADR-0039: the painted tree lists workspaces and their tiles only. Tile rows
+/// (including an Agent tile's status row) sit under their exclusive workspace
+/// folder, dispatch by stable tile id, and workspace folds hide only that
+/// folder's children.
 #[gpui::test]
-fn jump_panel_workspace_folders_and_unbound_rows_are_tile_native(cx: &mut TestAppContext) {
+fn jump_panel_workspace_folders_are_tile_native(cx: &mut TestAppContext) {
     use crate::{App, LinearTile};
     use gpui::Modifiers;
     let (view, vcx) = boot_browser(cx);
-    let (pid, workspace_idx, bound, unbound, agent, fold_key) = view.update(vcx, |v, _| {
+    let (pid, workspace_idx, bound, sibling, agent, fold_key) = view.update(vcx, |v, _| {
         let pid = v.workspace.active_workspace().expect("workspace").project();
         let cwd = v.projects.cwd_of(pid).unwrap().to_path_buf();
         let mut bound_tile = LinearTile::new();
@@ -8785,16 +8978,14 @@ fn jump_panel_workspace_folders_and_unbound_rows_are_tile_native(cx: &mut TestAp
             .workspace
             .push_workspace_inheriting(App::Linear(bound_tile));
         let workspace_idx = v.workspace.active_workspace;
-        let mut unbound_tile = LinearTile::new();
-        unbound_tile.title = "unbound-linear".into();
-        let unbound = v.workspace.push_detached(App::Linear(unbound_tile), pid);
-        v.workspace
-            .tile_mut(unbound)
-            .unwrap()
-            .tags
-            .insert("frontend".into());
+        let mut sibling_tile = LinearTile::new();
+        sibling_tile.title = "sibling-linear".into();
+        let sibling = v
+            .workspace
+            .split_focused(crate::workspace::SplitDir::V, App::Linear(sibling_tile))
+            .expect("sibling joins the workspace");
         v.agent_roster.upsert(yalda::session_proto::SessionInfo {
-            session_id: "S-unbound-status".into(),
+            session_id: "S-workspace-status".into(),
             acp_session_id: None,
             label: "working-codex".into(),
             cwd,
@@ -8805,25 +8996,19 @@ fn jump_panel_workspace_folders_and_unbound_rows_are_tile_native(cx: &mut TestAp
             busy: true,
             archived: false,
         });
-        let agent = v.workspace.push_detached(
-            App::Agent(crate::AgentTile::dormant(crate::ServerSid::new(
-                "S-unbound-status",
-            ))),
-            pid,
-        );
-        v.workspace
-            .tile_mut(agent)
-            .unwrap()
-            .tags
-            .insert("backend".into());
-        v.jump_tag_order.insert(
-            v.projects.name_of(pid).to_string(),
-            vec!["frontend".into(), "backend".into()],
-        );
+        let agent = v
+            .workspace
+            .split_focused(
+                crate::workspace::SplitDir::V,
+                App::Agent(crate::AgentTile::dormant(crate::ServerSid::new(
+                    "S-workspace-status",
+                ))),
+            )
+            .expect("Agent tile joins the workspace");
         v.workspace.set_active_workspace(0);
         let wsp = &v.workspace.workspaces[workspace_idx];
         let fold_key = YaldaGpuiView::workspace_fold_key(v.projects.name_of(pid), &wsp.auto_name);
-        (pid, workspace_idx, bound, unbound, agent, fold_key)
+        (pid, workspace_idx, bound, sibling, agent, fold_key)
     });
 
     view.update(vcx, |v, cx| {
@@ -8839,30 +9024,35 @@ fn jump_panel_workspace_folders_and_unbound_rows_are_tile_native(cx: &mut TestAp
             .find(|folder| folder.index == workspace_idx)
             .expect("workspace folder");
         assert!(folder.tiles.iter().any(|tile| tile.id == bound));
-        assert!(folder.tiles.iter().all(|tile| tile.id != unbound));
-        let loose = section
-            .detached
-            .iter()
-            .find(|tile| tile.id == unbound)
-            .expect("unbound projection");
-        assert_eq!(loose.tags, vec!["frontend"]);
-        let agent_row = section
-            .detached
+        assert!(folder.tiles.iter().any(|tile| tile.id == sibling));
+        let agent_row = folder
+            .tiles
             .iter()
             .find(|tile| tile.id == agent)
             .and_then(|tile| tile.agent.as_ref())
-            .expect("unbound Agent retains its status row");
+            .expect("workspace Agent tile carries its status row");
         assert_eq!(agent_row.provider, yalda::acp_channel::AgentProvider::Codex);
         assert_eq!(agent_row.dot_status(), crate::AgentDotStatus::Working);
-        assert_eq!(agent_row.tags, vec!["backend"]);
-        assert!(section.detached.iter().all(|tile| tile.id != bound));
+        for other in section
+            .workspace_folders
+            .iter()
+            .filter(|folder| folder.index != workspace_idx)
+        {
+            assert!(
+                other
+                    .tiles
+                    .iter()
+                    .all(|tile| tile.id != bound && tile.id != sibling && tile.id != agent),
+                "a tile is listed only under its owning workspace"
+            );
+        }
     });
 
     crate::layout_probe_begin();
     view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
     let bound_probe = format!("jump-tile-row-{bound}-ws{workspace_idx}");
-    let unbound_probe = format!("jump-tile-row-{unbound}-tg0");
+    let sibling_probe = format!("jump-tile-row-{sibling}-ws{workspace_idx}");
     assert!(crate::layout_probe_get(&bound_probe).is_some());
     let (_, _, _, workspace_row_h) =
         crate::layout_probe_get(&format!("jump-workspace-row-{workspace_idx}"))
@@ -8874,8 +9064,8 @@ fn jump_panel_workspace_folders_and_unbound_rows_are_tile_native(cx: &mut TestAp
         "workspace folder header must use the standard jump-row font size: \
          folder={workspace_row_h}px standard={standard_row_h}px"
     );
-    let (x, y, w, h) = crate::layout_probe_get(&unbound_probe)
-        .expect("tagged unbound row paints under its folder");
+    let (x, y, w, h) =
+        crate::layout_probe_get(&sibling_probe).expect("sibling row paints under its folder");
     crate::layout_probe_end();
 
     let at = point(px(x + w / 2.0), px(y + h / 2.0));
@@ -8883,7 +9073,9 @@ fn jump_panel_workspace_folders_and_unbound_rows_are_tile_native(cx: &mut TestAp
     vcx.simulate_click(at, Modifiers::default());
     vcx.run_until_parked();
     view.update(vcx, |v, _| {
-        assert_eq!(v.workspace.presented_detached_tile_id(), Some(unbound));
+        assert_eq!(v.workspace.active_workspace, workspace_idx);
+        assert_eq!(v.workspace.focused_window_id(), Some(sibling));
+        assert_eq!(v.workspace.presented_tile(), None);
     });
 
     view.update(vcx, |v, cx| v.toggle_workspace_fold(&fold_key, cx));
@@ -8900,18 +9092,22 @@ fn jump_panel_workspace_folders_and_unbound_rows_are_tile_native(cx: &mut TestAp
     crate::layout_probe_end();
 }
 
-/// UXI-JumpPanel-24: tag-folder chrome is compact and fixed, while a tile row
-/// keeps exactly the standard navigation-row height whether it is tagged or
-/// loose. Document zoom must not affect any of these jump-panel measurements.
+/// UXI-JumpPanel-24: a tile row keeps exactly the standard navigation-row
+/// height whether it carries tags or not (tags are tile metadata and no longer
+/// drive a folder view — ADR-0039). Document zoom must not affect any of these
+/// jump-panel measurements.
 #[gpui::test]
 fn jump_panel_tagged_items_keep_fixed_chrome_size(cx: &mut TestAppContext) {
     use crate::{App, LinearTile};
     let (view, vcx) = boot_browser(cx);
-    let (pid, tagged, loose) = view.update(vcx, |v, _| {
-        let pid = v.workspace.active_workspace().expect("workspace").project();
+    let (workspace, tagged, loose) = view.update(vcx, |v, _| {
+        let workspace = v.workspace.active_workspace;
         let mut tagged_tile = LinearTile::new();
         tagged_tile.title = "tagged-linear".into();
-        let tagged = v.workspace.push_detached(App::Linear(tagged_tile), pid);
+        let tagged = v
+            .workspace
+            .split_focused(crate::workspace::SplitDir::V, App::Linear(tagged_tile))
+            .expect("tagged tile joins the workspace");
         v.workspace
             .tile_mut(tagged)
             .unwrap()
@@ -8920,52 +9116,45 @@ fn jump_panel_tagged_items_keep_fixed_chrome_size(cx: &mut TestAppContext) {
 
         let mut loose_tile = LinearTile::new();
         loose_tile.title = "loose-linear".into();
-        let loose = v.workspace.push_detached(App::Linear(loose_tile), pid);
-        (pid, tagged, loose)
+        let loose = v
+            .workspace
+            .split_focused(crate::workspace::SplitDir::V, App::Linear(loose_tile))
+            .expect("loose tile joins the workspace");
+        (workspace, tagged, loose)
     });
 
     let measure = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
         crate::layout_probe_begin();
         view.update(vcx, |_, cx| cx.notify());
         vcx.run_until_parked();
-        let folder = crate::layout_probe_get(&format!("jump-tag-folder-{}-0", pid.0))
-            .expect("tag folder paints")
-            .3;
-        let tagged_row = crate::layout_probe_get(&format!("jump-tile-row-{tagged}-tg0"))
+        let tagged_row = crate::layout_probe_get(&format!("jump-tile-row-{tagged}-ws{workspace}"))
             .expect("tagged tile row paints")
             .3;
-        let loose_row = crate::layout_probe_get(&format!("jump-tile-row-{loose}"))
+        let loose_row = crate::layout_probe_get(&format!("jump-tile-row-{loose}-ws{workspace}"))
             .expect("untagged tile row paints")
             .3;
         let standard = crate::layout_probe_get("jump-system-console")
             .expect("standard jump navigation row paints")
             .3;
         crate::layout_probe_end();
-        (folder, tagged_row, loose_row, standard)
+        (tagged_row, loose_row, standard)
     };
 
     let initial = measure(&view, &mut *vcx);
     assert!(
-        initial.0 <= initial.3,
-        "tag folder must stay compact, never taller than a normal jump row: folder={}px standard={}px",
-        initial.0,
-        initial.3
-    );
-    assert!(
-        (initial.1 - initial.3).abs() < 0.5 && (initial.2 - initial.3).abs() < 0.5,
+        (initial.0 - initial.2).abs() < 0.5 && (initial.1 - initial.2).abs() < 0.5,
         "tagged and untagged tiles must share standard row height: tagged={}px loose={}px standard={}px",
+        initial.0,
         initial.1,
-        initial.2,
-        initial.3
+        initial.2
     );
 
     view.update(vcx, |v, cx| v.set_text_scale(2.0, cx));
     let zoomed = measure(&view, &mut *vcx);
     for (before, after, label) in [
-        (initial.0, zoomed.0, "tag folder"),
-        (initial.1, zoomed.1, "tagged tile"),
-        (initial.2, zoomed.2, "untagged tile"),
-        (initial.3, zoomed.3, "standard row"),
+        (initial.0, zoomed.0, "tagged tile"),
+        (initial.1, zoomed.1, "untagged tile"),
+        (initial.2, zoomed.2, "standard row"),
     ] {
         assert!(
             (before - after).abs() < 0.5,
@@ -9036,27 +9225,33 @@ fn jump_panel_long_tile_names_stay_single_line(cx: &mut TestAppContext) {
     use crate::{App, LinearTile};
 
     let (view, vcx) = boot_browser(cx);
-    let (tile, short_tile) = view.update(vcx, |v, _| {
-        let project = v.workspace.active_workspace().expect("workspace").project();
+    let (tile, short_tile, workspace) = view.update(vcx, |v, _| {
+        let workspace = v.workspace.active_workspace;
         let mut linear = LinearTile::new();
-        linear.title = "a very long detached tile title that must end in an ellipsis rather than wrapping onto a second or third navigation line".into();
-        let tile = v.workspace.push_detached(App::Linear(linear), project);
+        linear.title = "a very long workspace tile title that must end in an ellipsis rather than wrapping onto a second or third navigation line".into();
+        let tile = v
+            .workspace
+            .split_focused(crate::workspace::SplitDir::V, App::Linear(linear))
+            .expect("long tile joins the workspace");
         let mut short = LinearTile::new();
         short.title = "short".into();
-        let short_tile = v.workspace.push_detached(App::Linear(short), project);
-        (tile, short_tile)
+        let short_tile = v
+            .workspace
+            .split_focused(crate::workspace::SplitDir::V, App::Linear(short))
+            .expect("short tile joins the workspace");
+        (tile, short_tile, workspace)
     });
 
     crate::layout_probe_begin();
     view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
-    let long = crate::layout_probe_get(&format!("jump-tile-row-{tile}"))
-        .expect("long detached tile row paints")
+    let long = crate::layout_probe_get(&format!("jump-tile-row-{tile}-ws{workspace}"))
+        .expect("long workspace tile row paints")
         .3;
-    let long_label = crate::layout_probe_get(&format!("jump-tile-label-{tile}"))
+    let long_label = crate::layout_probe_get(&format!("jump-tile-label-{tile}-ws{workspace}"))
         .expect("long tile identity label paints");
-    let short = crate::layout_probe_get(&format!("jump-tile-row-{short_tile}"))
-        .expect("short detached tile row paints")
+    let short = crate::layout_probe_get(&format!("jump-tile-row-{short_tile}-ws{workspace}"))
+        .expect("short workspace tile row paints")
         .3;
     let standard = crate::layout_probe_get("jump-system-console")
         .expect("standard jump navigation row paints")
@@ -9081,7 +9276,7 @@ fn jump_panel_hidden_tiles_paint_indicator(cx: &mut TestAppContext) {
     use crate::{AgentTile, App, LinearTile, ServerSid};
 
     let (view, vcx) = boot_browser(cx);
-    let (tile, workspace, agent, detached) = view.update(vcx, |v, _| {
+    let (tile, workspace, agent, visible) = view.update(vcx, |v, _| {
         let mut linear = LinearTile::new();
         linear.title = "hidden-linear".into();
         let tile = v.workspace.push_workspace_inheriting(App::Linear(linear));
@@ -9120,37 +9315,34 @@ fn jump_panel_hidden_tiles_paint_indicator(cx: &mut TestAppContext) {
             Some(workspace),
             "hidden Agent retains workspace ownership"
         );
-        let mut detached_linear = LinearTile::new();
-        detached_linear.title = "detached-visible".into();
-        let detached = v
+        let mut visible_linear = LinearTile::new();
+        visible_linear.title = "visible-linear".into();
+        let visible = v
             .workspace
-            .push_detached(App::Linear(detached_linear), project);
-        (tile, workspace, agent, detached)
+            .open_tile_in_project(App::Linear(visible_linear), project);
+        (tile, workspace, agent, visible)
     });
 
     view.read_with(vcx, |v, cx| {
-        let placements: Vec<_> = v
+        let mut placements: Vec<_> = v
             .jump_panel_sections(cx)
             .0
             .into_iter()
             .flat_map(|section| section.workspace_folders)
             .flat_map(|folder| folder.tiles)
-            .chain(
-                v.jump_panel_sections(cx)
-                    .0
-                    .into_iter()
-                    .flat_map(|section| section.detached),
-            )
-            .filter(|row| row.id == tile || row.id == agent || row.id == detached)
+            .filter(|row| row.id == tile || row.id == agent || row.id == visible)
             .map(|row| (row.id, row.placement, row.agent.is_some()))
             .collect();
+        placements.sort_by_key(|(id, _, _)| *id);
+        let mut expected = vec![
+            (tile, crate::JumpTilePlacement::AttachedHidden, false),
+            (agent, crate::JumpTilePlacement::AttachedHidden, true),
+            (visible, crate::JumpTilePlacement::AttachedVisible, false),
+        ];
+        expected.sort_by_key(|(id, _, _)| *id);
         assert_eq!(
             placements,
-            vec![
-                (tile, crate::JumpTilePlacement::AttachedHidden, false),
-                (agent, crate::JumpTilePlacement::AttachedHidden, true),
-                (detached, crate::JumpTilePlacement::Detached, false),
-            ],
+            expected,
             "hidden attachment state survives the typed row projection"
         );
     });
@@ -9172,9 +9364,10 @@ fn jump_panel_hidden_tiles_paint_indicator(cx: &mut TestAppContext) {
         "hidden Agent row keeps its provider/status marks and also paints the hidden indicator"
     );
     assert!(
-        crate::layout_probe_get(&format!("jump-tile-row-{detached}")).is_some()
-            && crate::layout_probe_get(&format!("jump-tile-hidden-{detached}")).is_none(),
-        "Detached is a distinct placement and must never inherit the hidden marker"
+        crate::layout_probe_get(&format!("jump-tile-row-{visible}-ws{workspace}")).is_some()
+            && crate::layout_probe_get(&format!("jump-tile-hidden-{visible}-ws{workspace}"))
+                .is_none(),
+        "a visible workspace tile must never inherit the hidden marker"
     );
     let (_, _, mark_w, mark_h) = hidden_mark.unwrap();
     // UXI-JumpPanel-28: the hidden mark is now a single fixed-width icon glyph
@@ -9376,7 +9569,6 @@ fn hidden_tile_navigation_is_solo_until_explicit_unhide(cx: &mut TestAppContext)
             .find(|folder| folder.index == workspace_index)
             .unwrap();
         assert!(folder.tiles.iter().any(|row| row.id == tile));
-        assert!(section.detached.iter().all(|row| row.id != tile));
         assert!(
             v.jump_palette_items(cx)
                 .iter()
@@ -9419,7 +9611,7 @@ fn hidden_tile_navigation_is_solo_until_explicit_unhide(cx: &mut TestAppContext)
 /// UXI-Workspace-27: `.` → Show is a real active-workspace
 /// operation. It opens even when empty, projects only that workspace's hidden
 /// stable ids, unhides/follows through both keyboard and click activation, and
-/// remains dimmed while focus is on a solo Detached tile.
+/// remains dimmed while a hidden tile of another workspace is solo-presented.
 #[gpui::test]
 fn workspace_show_picker_unhides_active_hidden_tile_and_disables_outside_workspace(
     cx: &mut TestAppContext,
@@ -9481,11 +9673,17 @@ fn workspace_show_picker_unhides_active_hidden_tile_and_disables_outside_workspa
         foreign_visible.title = "Other visible".into();
         v.workspace
             .push_workspace_inheriting(App::Linear(foreign_visible));
-        let mut foreign_hidden = LinearTile::new();
-        foreign_hidden.title = "Other hidden".into();
+        // A Buffer browser (not a Linear tile) so the root keeps key focus
+        // when it is later presented solo.
+        let foreign_cwd = v.active_workspace_cwd().unwrap_or_else(crate::process_cwd);
         let hidden_elsewhere = v
             .workspace
-            .split_focused(SplitDir::V, App::Linear(foreign_hidden))
+            .split_focused(
+                SplitDir::V,
+                App::Buffer(crate::BufferApp::Picking(crate::BrowserWindow::standalone(
+                    foreign_cwd,
+                ))),
+            )
             .unwrap();
         v.workspace.hide_window(hidden_elsewhere).unwrap();
 
@@ -9553,18 +9751,22 @@ fn workspace_show_picker_unhides_active_hidden_tile_and_disables_outside_workspa
         ));
     });
 
-    // Solo Detached focus is explicitly outside a workspace. Show is still
-    // discoverable but dimmed, and pressing `s` cannot replace the menu.
-    view.update(vcx, |v, _| {
+    // A solo-presented hidden tile of ANOTHER workspace is outside the active
+    // workspace's visible layout. Show is still discoverable but dimmed, and
+    // pressing `s` cannot replace the menu.
+    view.update(vcx, |v, cx| {
         assert!(v.workspace.focus_tile(visible_here));
-        v.workspace.detach_window(visible_here).unwrap();
+        assert!(v.workspace.focus_tile(hidden_elsewhere));
+        assert_eq!(v.workspace.active_workspace, 0);
+        cx.notify();
     });
+    vcx.run_until_parked();
     vcx.simulate_keystrokes(".");
     vcx.run_until_parked();
     view.read_with(vcx, |v, _| {
         assert!(
             v.menu_ref()
-                .expect("shell menu over Detached tile")
+                .expect("shell menu over a solo hidden tile")
                 .disabled
                 .contains("show-hidden-tiles")
         );
@@ -9576,12 +9778,15 @@ fn workspace_show_picker_unhides_active_hidden_tile_and_disables_outside_workspa
         assert!(!v.overlay_is_hidden_tile_picker());
         assert_eq!(
             v.workspace.focused_window_id(),
-            Some(visible_here),
-            "disabled Show cannot move focus away from the Detached tile"
+            Some(hidden_elsewhere),
+            "disabled Show cannot move focus away from the solo hidden tile"
         );
         assert_eq!(
-            v.workspace.tile_membership(visible_here),
-            Some(TileMembership::Detached)
+            v.workspace.tile_membership(hidden_elsewhere),
+            Some(TileMembership::Attached {
+                workspace: 1,
+                visibility: AttachedVisibility::Hidden,
+            })
         );
     });
 }
@@ -9590,11 +9795,10 @@ fn workspace_show_picker_unhides_active_hidden_tile_and_disables_outside_workspa
 /// and applicability follows the focused tile's typed membership. A disabled
 /// key is inert: it neither invokes the command nor closes the menu.
 ///
-/// Negative control: remove `tile-unhide` from the visible/Detached arms of
+/// Negative control: remove `tile-unhide` from the visible arm of
 /// `tile_menu_disabled` → the first `u` closes the production menu and this
 /// guard fails RED. Remove the hidden arm's `tile-hide` entry → lowercase `h`
-/// closes the hidden tile menu and also fails RED. (Unhide is now `u`, detach is
-/// `f`; UXI-Menu-9.)
+/// closes the hidden tile menu and also fails RED. (Unhide is `u`; UXI-Menu-9.)
 #[gpui::test]
 fn tile_menu_hide_unhide_enablement_tracks_focused_membership(cx: &mut TestAppContext) {
     use crate::workspace::{AttachedVisibility, TileMembership};
@@ -9665,68 +9869,11 @@ fn tile_menu_hide_unhide_enablement_tracks_focused_membership(cx: &mut TestAppCo
             })
         ));
     });
-
-    // Detached tiles cannot participate in workspace visibility; hide, unhide,
-    // and detach all remain discoverable and dimmed.
-    vcx.simulate_keystrokes("ctrl-w shift-b");
-    vcx.run_until_parked();
-    assert_eq!(
-        view.read_with(vcx, |v, _| v.workspace.tile_membership(tile)),
-        Some(TileMembership::Detached)
-    );
-    vcx.simulate_keystrokes("space");
-    vcx.run_until_parked();
-    view.read_with(vcx, |v, _| {
-        let menu = v.menu_ref().expect("Detached tile menu");
-        assert!(menu.disabled.contains("tile-hide"));
-        assert!(menu.disabled.contains("tile-unhide"));
-        assert!(menu.disabled.contains("tile-detach"));
-    });
-    vcx.simulate_keystrokes("u");
-    vcx.run_until_parked();
-    assert!(view.read_with(vcx, |v, _| v.overlay_is_menu()));
 }
 
-/// The destination picker carries the focused tile's project as typed state.
-/// Creating a destination while viewing another project cannot re-home the tile.
-#[gpui::test]
-fn send_detached_tile_to_new_workspace_preserves_its_project(cx: &mut TestAppContext) {
-    use crate::workspace::{AttachedVisibility, TileMembership};
-    use crate::{App, LinearTile, WorkspacePickerMode};
-
-    let (view, vcx) = boot_browser(cx);
-    let (tile, tile_project) = view.update(vcx, |v, cx| {
-        let cwd = std::env::temp_dir().join("yalda-hidden-send-foreign-project");
-        let tile_project = v.projects.ensure_at_cwd(cwd, "foreign");
-        let tile = v
-            .workspace
-            .push_detached(App::Linear(LinearTile::new()), tile_project);
-        assert!(v.workspace.present_solo(tile));
-        v.open_workspace_picker(WorkspacePickerMode::Move { follow: true }, cx);
-        let picker = v.workspace_picker_ref().unwrap();
-        assert_eq!(picker.project, tile_project);
-        assert!(picker.targets.is_empty());
-        (tile, tile_project)
-    });
-
-    view.update(vcx, |v, cx| v.commit_workspace_picker(0, cx));
-    vcx.run_until_parked();
-    view.read_with(vcx, |v, _| {
-        let owner = v.workspace.workspace_index_of_window(tile).unwrap();
-        assert_eq!(v.workspace.workspaces[owner].project(), tile_project);
-        assert_eq!(
-            v.workspace.tile_membership(tile),
-            Some(TileMembership::Attached {
-                workspace: owner,
-                visibility: AttachedVisibility::Visible,
-            })
-        );
-        assert_eq!(v.workspace.tile(tile).unwrap().project(), tile_project);
-    });
-}
-
-/// A hidden Agent is still a materialized tile and owns its durable session id.
-/// Roster reconciliation must not create a second Detached copy in any project.
+/// A hidden Agent is still a tile and owns its durable session id. A roster
+/// entry for that session (even one whose cwd is another project) must not
+/// produce a second tile anywhere; the roster creates no tiles (ADR-0039).
 #[gpui::test]
 fn hidden_agent_prevents_cross_project_roster_duplicate(cx: &mut TestAppContext) {
     use crate::{AgentTile, App, ServerSid};
@@ -9760,144 +9907,26 @@ fn hidden_agent_prevents_cross_project_roster_duplicate(cx: &mut TestAppContext)
         (tile, sid)
     });
 
-    view.update(vcx, |v, _| {
-        assert!(!v.materialize_roster_detached_tiles());
-        assert_eq!(v.agent_tile_id_for_server_sid(&sid), Some(tile));
-        assert!(v.workspace.detached_tiles.is_empty());
-        assert!(v.validate_agent_tile_identities().is_ok());
-    });
-}
-
-/// bug-0062: stale live ownership can contain two stable Agent tiles remembering
-/// the same server session. The universal-roster reconciliation must heal that
-/// state before the jump panel projects it: an Attached owner wins over a
-/// Detached duplicate, and duplicate Detached owners collapse to one.
-#[gpui::test]
-fn roster_reconciliation_retires_duplicate_detached_session_tiles(cx: &mut TestAppContext) {
-    use crate::{AgentTile, App, ServerSid};
-    use yalda::session_proto::SessionInfo;
-
-    let (view, vcx) = boot_browser(cx);
     view.update(vcx, |v, cx| {
-        let project = v.workspace.inherited_project();
-        let cwd = v
-            .projects
-            .cwd_of(project)
-            .expect("project cwd")
-            .to_path_buf();
-        let attached_sid = "DUPLICATE-ATTACHED";
-        let attached = v
-            .workspace
-            .split_focused(
-                crate::workspace::SplitDir::V,
-                App::Agent(AgentTile::dormant(ServerSid::new(attached_sid))),
-            )
-            .expect("attached Agent tile");
-        let stale_detached = v.workspace.push_detached(
-            App::Agent(AgentTile::dormant(ServerSid::new(attached_sid))),
-            project,
-        );
-        v.workspace
-            .tile_mut(stale_detached)
-            .unwrap()
-            .tags
-            .insert("from-stale-attached-copy".into());
-
-        let detached_sid = "DUPLICATE-DETACHED";
-        let retained_detached = v.workspace.push_detached(
-            App::Agent(AgentTile::dormant(ServerSid::new(detached_sid))),
-            project,
-        );
-        let stale_second_detached = v.workspace.push_detached(
-            App::Agent(AgentTile::dormant(ServerSid::new(detached_sid))),
-            project,
-        );
-        v.workspace
-            .tile_mut(stale_second_detached)
-            .unwrap()
-            .tags
-            .insert("from-stale-detached-copy".into());
-
-        for (sid, label) in [
-            (attached_sid, "attached duplicate"),
-            (detached_sid, "detached duplicate"),
-        ] {
-            v.agent_roster.upsert(SessionInfo {
-                session_id: sid.into(),
-                acp_session_id: None,
-                label: label.into(),
-                cwd: cwd.clone(),
-                provider: yalda::acp_channel::AgentProvider::Codex,
-                turns: 0,
-                connected: true,
-                permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
-                busy: false,
-                archived: false,
-            });
-        }
-
-        assert!(
-            v.materialize_roster_detached_tiles(),
-            "healing duplicate ownership is a material roster change"
-        );
-        assert_eq!(v.agent_tile_id_for_server_sid(attached_sid), Some(attached));
-        assert!(v.workspace.tile(stale_detached).is_none());
-        assert!(
-            v.workspace
-                .tile(attached)
-                .unwrap()
-                .tags
-                .contains("from-stale-attached-copy")
-        );
+        let tiles_before = total_tile_count(v);
+        // The adoption tail of `refresh_roster`'s callback.
+        v.recover_labels_from_roster(cx);
+        v.recover_providers_from_roster(cx);
+        assert_eq!(total_tile_count(v), tiles_before, "the roster adds no tile");
+        assert_eq!(v.agent_tile_id_for_server_sid(&sid), Some(tile));
         assert_eq!(
-            v.agent_tile_id_for_server_sid(detached_sid),
-            Some(retained_detached)
-        );
-        assert!(v.workspace.tile(stale_second_detached).is_none());
-        assert!(
-            v.workspace
-                .tile(retained_detached)
-                .unwrap()
-                .tags
-                .contains("from-stale-detached-copy")
+            v.workspace.hidden_workspace_index_of_window(tile),
+            Some(0),
+            "the hidden Agent keeps its owning workspace"
         );
         assert!(v.validate_agent_tile_identities().is_ok());
-
-        let sections = v.jump_panel_sections(cx).0;
-        let destinations = sections
-            .iter()
-            .flat_map(|section| {
-                section
-                    .workspace_folders
-                    .iter()
-                    .flat_map(|folder| folder.tiles.iter())
-                    .chain(section.detached.iter())
-            })
-            .filter_map(|tile| tile.agent.as_ref())
-            .filter_map(|row| row.order_sid.as_deref())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            destinations
-                .iter()
-                .filter(|sid| **sid == attached_sid)
-                .count(),
-            1,
-            "the Attached session has one jump-panel destination"
-        );
-        assert_eq!(
-            destinations
-                .iter()
-                .filter(|sid| **sid == detached_sid)
-                .count(),
-            1,
-            "the Detached session has one jump-panel destination"
-        );
+        assert!(v.workspace.validate_ownership().is_ok());
     });
 }
 
 /// UXI-Workspace-21: Close Tile acts on the directly focused stable tile even
-/// when it lives in Unbound. Exercise the exact two picker states from the bug
-/// report through the real system-menu command dispatcher.
+/// when it is a solo-presented hidden tile. Exercise the exact two picker states
+/// from the bug report through the real system-menu command dispatcher.
 #[gpui::test]
 fn close_tile_removes_unbound_buffer_and_agent_picker(cx: &mut TestAppContext) {
     use crate::{AgentTile, App, BrowserWindow, BufferApp};
@@ -9905,11 +9934,15 @@ fn close_tile_removes_unbound_buffer_and_agent_picker(cx: &mut TestAppContext) {
     let (buffer, agent, workspace_count) = view.update(vcx, |v, _| {
         let pid = v.workspace.active_workspace().expect("workspace").project();
         let cwd = v.projects.cwd_of(pid).expect("project cwd").to_path_buf();
-        let buffer = v.workspace.push_detached(
+        let buffer = v.workspace.open_tile_in_project(
             App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd))),
             pid,
         );
-        let agent = v.workspace.push_detached(App::Agent(AgentTile::new()), pid);
+        v.workspace.hide_window(buffer).expect("hide Buffer picker");
+        let agent = v
+            .workspace
+            .open_tile_in_project(App::Agent(AgentTile::new()), pid);
+        v.workspace.hide_window(agent).expect("hide Agent picker");
         (buffer, agent, v.workspace.workspaces.len())
     });
 
@@ -9925,7 +9958,7 @@ fn close_tile_removes_unbound_buffer_and_agent_picker(cx: &mut TestAppContext) {
             v.workspace.tile(agent).is_some(),
             "closing Buffer does not remove Agent"
         );
-        assert_eq!(v.workspace.presented_detached_tile_id(), None);
+        assert_eq!(v.workspace.presented_tile(), None);
         assert_eq!(
             v.workspace.workspaces.len(),
             workspace_count,
@@ -9941,7 +9974,7 @@ fn close_tile_removes_unbound_buffer_and_agent_picker(cx: &mut TestAppContext) {
             v.workspace.tile(agent).is_none(),
             "the empty unbound Agent picker closes"
         );
-        assert_eq!(v.workspace.presented_detached_tile_id(), None);
+        assert_eq!(v.workspace.presented_tile(), None);
         assert_eq!(
             v.workspace.workspaces.len(),
             workspace_count,
@@ -10071,8 +10104,9 @@ fn empty_workspace_keeps_both_command_leaders_live(cx: &mut TestAppContext) {
 
 /// bug-0047: the server can publish a newly-created session to the roster
 /// before the create reply binds that server sid to its provisional local
-/// session. Roster materialization must not leave a second stable Agent tile
-/// once the production bind choke resolves the provisional identity.
+/// session. The roster must not create a second stable Agent tile (ADR-0039:
+/// the roster creates no tiles), and once the production bind choke resolves
+/// the provisional identity the provisional tile is the session's only tile.
 #[gpui::test]
 fn provisional_bind_reconciles_racing_roster_tile(cx: &mut TestAppContext) {
     use crate::{AgentSession, AgentState, AgentTile, App, ServerSid};
@@ -10105,7 +10139,11 @@ fn provisional_bind_reconciles_racing_roster_tile(cx: &mut TestAppContext) {
             busy: false,
             archived: false,
         });
-        assert!(v.materialize_roster_detached_tiles(), "roster wins the race");
+        // The roster wins the race: run the adoption tail of `refresh_roster`.
+        let tiles_before = total_tile_count(v);
+        v.recover_labels_from_roster(cx);
+        v.recover_providers_from_roster(cx);
+        assert_eq!(total_tile_count(v), tiles_before, "the roster adds no tile");
         v.apply_open_agent_resolution(
             token,
             crate::OpenResolution::Created {
@@ -10121,20 +10159,13 @@ fn provisional_bind_reconciles_racing_roster_tile(cx: &mut TestAppContext) {
         let sid = ServerSid::new("RACE-SID");
         let mut owners = Vec::new();
         for workspace in &v.workspace.workspaces {
-            workspace.layout.for_each_leaf(&mut |window| {
+            workspace.for_each_attached_window(&mut |window| {
                 if matches!(&window.content, App::Agent(tile)
                     if tile.remembered_sid(|local| v.sessions.sid_of(local).cloned()).as_ref() == Some(&sid))
                 {
                     owners.push((window.id(), workspace.project()));
                 }
             });
-        }
-        for tile in &v.workspace.detached_tiles {
-            if matches!(&tile.window.content, App::Agent(agent)
-                if agent.remembered_sid(|local| v.sessions.sid_of(local).cloned()).as_ref() == Some(&sid))
-            {
-                owners.push((tile.window.id(), tile.project()));
-            }
         }
         assert_eq!(owners.len(), 1, "one server session must have one stable tile: {owners:?}");
     });
@@ -10147,13 +10178,16 @@ fn agent_identity_guard_rejects_duplicate_local_and_durable_owners(cx: &mut Test
     let (view, vcx, session, _) = boot_with_transcript(cx);
     view.update(vcx, |v, _| {
         let project = v.workspace.inherited_project();
-        let duplicate_local = v.workspace.push_detached(
+        let duplicate_local = v.workspace.open_tile_in_project(
             App::Agent(AgentTile::Bound {
                 session,
                 reopening: None,
             }),
             project,
         );
+        v.workspace
+            .hide_window(duplicate_local)
+            .expect("hide the corrupt duplicate");
         assert!(matches!(
             v.validate_agent_tile_identities(),
             Err(AgentIdentityViolation::DuplicateLocalSession {
@@ -10162,9 +10196,13 @@ fn agent_identity_guard_rejects_duplicate_local_and_durable_owners(cx: &mut Test
                 ..
             }) if duplicate == session && second == duplicate_local
         ));
-        v.workspace
-            .remove_detached_window(duplicate_local)
-            .expect("remove corrupt test tile");
+        let owner = v
+            .workspace
+            .hidden_workspace_index_of_window(duplicate_local)
+            .expect("duplicate is hidden in a workspace");
+        v.workspace.workspaces[owner]
+            .hidden_tiles
+            .retain(|tile| tile.window.id() != duplicate_local);
 
         let sid = ServerSid::new("DUPLICATE-DURABLE-SID");
         v.sessions
@@ -10172,7 +10210,10 @@ fn agent_identity_guard_rejects_duplicate_local_and_durable_owners(cx: &mut Test
             .expect("bind durable identity");
         let duplicate_durable = v
             .workspace
-            .push_detached(App::Agent(AgentTile::dormant(sid.clone())), project);
+            .open_tile_in_project(App::Agent(AgentTile::dormant(sid.clone())), project);
+        v.workspace
+            .hide_window(duplicate_durable)
+            .expect("hide the durable duplicate");
         assert!(matches!(
             v.validate_agent_tile_identities(),
             Err(AgentIdentityViolation::DuplicateServerSession {
@@ -10601,232 +10642,6 @@ fn session_tags_partition_folders_and_untagged() {
         vec!["frontend", "urgent"],
         "empty tag_order = alphabetical folders"
     );
-}
-
-/// Seed connected roster sessions rooted in the active project's cwd, returning
-/// its `ProjectId`. Shared by the tag render/fold/reorder tests.
-fn seed_project_sessions(
-    view: &gpui::Entity<YaldaGpuiView>,
-    vcx: &mut gpui::VisualTestContext,
-    sessions: &[(&str, &str)], // (sid, label)
-) -> crate::project::ProjectId {
-    use yalda::session_proto::SessionInfo;
-    let (pid, cwd) = view.read_with(vcx, |v, _| {
-        let pid = v.workspace.active_workspace().expect("workspace").project();
-        (
-            pid,
-            v.projects.cwd_of(pid).expect("project cwd").to_path_buf(),
-        )
-    });
-    view.update(vcx, |v, _| {
-        for (sid, label) in sessions {
-            v.agent_roster.upsert(SessionInfo {
-                session_id: (*sid).into(),
-                acp_session_id: None,
-                label: (*label).into(),
-                cwd: cwd.clone(),
-                provider: yalda::acp_channel::AgentProvider::Claude,
-                turns: 0,
-                connected: true,
-                permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
-                busy: false,
-                archived: false,
-            });
-        }
-        v.materialize_roster_detached_tiles();
-    });
-    pid
-}
-
-fn set_materialized_tile_tags(v: &mut YaldaGpuiView, sid: &str, tags: &[&str]) {
-    let id = v
-        .agent_tile_id_for_server_sid(sid)
-        .unwrap_or_else(|| panic!("materialized tile for {sid}"));
-    v.workspace.tile_mut(id).unwrap().tags = tags.iter().map(|tag| tag.to_string()).collect();
-    v.session_tags.insert(
-        sid.to_string(),
-        tags.iter().map(|tag| tag.to_string()).collect(),
-    );
-}
-
-/// UXI-JumpPanel-20: a tagged session paints under its tag folder header; an
-/// untagged session paints flat below the folders (no folder). Non-vacuous: the
-/// tagged row uses the folder-ordinal id suffix (`-tg0`), the untagged row does
-/// not, and the untagged row paints BELOW the folder.
-#[gpui::test]
-fn jump_panel_groups_sessions_under_tag_folders(cx: &mut TestAppContext) {
-    let (view, vcx) = boot_browser(cx);
-    let pid = seed_project_sessions(
-        &view,
-        &mut *vcx,
-        &[("S-tag", "alpha"), ("S-plain", "plain")],
-    );
-    view.update(vcx, |v, _| {
-        set_materialized_tile_tags(v, "S-tag", &["frontend"]);
-    });
-    let row_ids: std::collections::HashMap<String, usize> = view.update(vcx, |v, cx| {
-        v.jump_panel_sections(cx)
-            .0
-            .into_iter()
-            .find(|s| s.id == pid)
-            .expect("project section")
-            .sessions
-            .into_iter()
-            .map(|(i, r)| (r.label, i))
-            .collect()
-    });
-
-    crate::layout_probe_begin();
-    view.update(vcx, |_, cx| cx.notify());
-    vcx.run_until_parked();
-    let folder_y = crate::layout_probe_get(&format!("jump-tag-folder-{}-0", pid.0))
-        .expect("the tagged session paints a folder header")
-        .1;
-    let tagged_y = crate::layout_probe_get(&format!("jump-session-row-{}-tg0", row_ids["alpha"]))
-        .expect("the tagged row paints under its folder (with the -tg0 id suffix)")
-        .1;
-    let plain_y = crate::layout_probe_get(&format!("jump-session-row-{}", row_ids["plain"]))
-        .expect("the untagged row paints flat (no suffix)")
-        .1;
-    assert!(folder_y < tagged_y, "the folder header sits above its rows");
-    assert!(tagged_y < plain_y, "untagged rows fall below the folders");
-    // The "untagged" separator sits between the last tagged row and the loose ones.
-    let sep_y = crate::layout_probe_get(&format!("jump-untagged-sep-{}", pid.0))
-        .expect("the untagged separator paints when folders AND loose rows coexist")
-        .1;
-    assert!(
-        tagged_y < sep_y && sep_y < plain_y,
-        "the separator divides tagged from untagged"
-    );
-    crate::layout_probe_end();
-
-    // With no tagged sessions (all loose) there are no folders, so the separator
-    // must NOT paint — it only exists to divide the two groups.
-    view.update(vcx, |v, _| {
-        v.session_tags.clear();
-        for tile in &mut v.workspace.detached_tiles {
-            tile.window.tags.clear();
-        }
-    });
-    crate::layout_probe_begin();
-    view.update(vcx, |_, cx| cx.notify());
-    vcx.run_until_parked();
-    assert!(
-        crate::layout_probe_get(&format!("jump-untagged-sep-{}", pid.0)).is_none(),
-        "with no folders there is nothing to separate, so no separator paints"
-    );
-    crate::layout_probe_end();
-}
-
-/// UXI-JumpPanel-21: folding a tag folder hides its session rows; unfolding
-/// restores them. The folder header itself stays painted while folded.
-#[gpui::test]
-fn jump_tag_folder_fold_hides_and_restores(cx: &mut TestAppContext) {
-    let (view, vcx) = boot_browser(cx);
-    let pid = seed_project_sessions(&view, &mut *vcx, &[("S-tag", "alpha")]);
-    let (project_name, i) = view.update(vcx, |v, cx| {
-        set_materialized_tile_tags(v, "S-tag", &["frontend"]);
-        let name = v.projects.name_of(pid).to_string();
-        let i = v
-            .jump_panel_sections(cx)
-            .0
-            .into_iter()
-            .find(|s| s.id == pid)
-            .expect("section")
-            .sessions
-            .into_iter()
-            .find(|(_, r)| r.label == "alpha")
-            .expect("alpha row")
-            .0;
-        (name, i)
-    });
-    let row_probe = format!("jump-session-row-{i}-tg0");
-    let folder_probe = format!("jump-tag-folder-{}-0", pid.0);
-
-    crate::layout_probe_begin();
-    view.update(vcx, |_, cx| cx.notify());
-    vcx.run_until_parked();
-    assert!(
-        crate::layout_probe_get(&row_probe).is_some(),
-        "expanded folder paints its row"
-    );
-    crate::layout_probe_end();
-
-    view.update(vcx, |v, cx| {
-        v.toggle_tag_fold(&project_name, "frontend", cx)
-    });
-    view.read_with(vcx, |v, _| {
-        assert!(
-            v.tag_folder_folded(&project_name, "frontend"),
-            "fold state is set"
-        );
-    });
-    crate::layout_probe_begin();
-    view.update(vcx, |_, cx| cx.notify());
-    vcx.run_until_parked();
-    assert!(
-        crate::layout_probe_get(&row_probe).is_none(),
-        "folded folder hides its row"
-    );
-    assert!(
-        crate::layout_probe_get(&folder_probe).is_some(),
-        "the header stays painted while folded"
-    );
-    crate::layout_probe_end();
-
-    view.update(vcx, |v, cx| {
-        v.toggle_tag_fold(&project_name, "frontend", cx)
-    });
-    crate::layout_probe_begin();
-    view.update(vcx, |_, cx| cx.notify());
-    vcx.run_until_parked();
-    assert!(
-        crate::layout_probe_get(&row_probe).is_some(),
-        "unfolding restores the row"
-    );
-    crate::layout_probe_end();
-}
-
-/// UXI-JumpPanel-21: `reorder_tag` reorders a project's tag folders and persists
-/// the per-project order; a tag not present in the project is refused
-/// (project-scope guard). One session carries both tags so both folders exist.
-#[gpui::test]
-fn jump_reorder_tag_folders_persists(cx: &mut TestAppContext) {
-    let (view, vcx) = boot_browser(cx);
-    let pid = seed_project_sessions(&view, &mut *vcx, &[("S-tag", "alpha")]);
-    let project_name = view.update(vcx, |v, _| {
-        set_materialized_tile_tags(v, "S-tag", &["alpha", "beta"]);
-        v.projects.name_of(pid).to_string()
-    });
-    // Default order is alphabetical: alpha, beta.
-    view.read_with(vcx, |v, cx| {
-        assert_eq!(
-            v.ordered_project_tags(&project_name, cx),
-            vec!["alpha".to_string(), "beta".to_string()]
-        );
-    });
-    // Drop beta onto alpha → order becomes beta, alpha; persisted.
-    view.update(vcx, |v, cx| {
-        v.reorder_tag(&project_name, "beta", "alpha", cx)
-    });
-    view.read_with(vcx, |v, _| {
-        assert_eq!(
-            v.jump_tag_order.get(&project_name).map(|v| v.as_slice()),
-            Some(&["beta".to_string(), "alpha".to_string()][..]),
-            "the manual order is stored per project"
-        );
-    });
-    // Project-scope guard: a tag absent from this project can't be reordered.
-    view.update(vcx, |v, cx| {
-        v.reorder_tag(&project_name, "ghost", "alpha", cx)
-    });
-    view.read_with(vcx, |v, _| {
-        assert_eq!(
-            v.jump_tag_order.get(&project_name).map(|v| v.as_slice()),
-            Some(&["beta".to_string(), "alpha".to_string()][..]),
-            "a ghost tag drag changes nothing"
-        );
-    });
 }
 
 /// UXI-AgentTile-33: the modal tag-editor dialog. `i` enters Insert to
@@ -11747,12 +11562,12 @@ fn free_agent_row_is_unbound_and_bindable(cx: &mut TestAppContext) {
         assert_eq!(
             v.agent_tile().and_then(crate::AgentTile::session),
             Some(id),
-            "selecting the free session opens a viewport reference"
+            "selecting the free session shows it in the focused tile"
         );
-        assert!(
-            v.agent_tile_id_bound_to(id).is_none(),
-            "a bare direct reference does not place the session in a workspace"
-        );
+        let tile = v
+            .agent_tile_id_bound_to(id)
+            .expect("selecting a tile-less session opens a workspace tile (ADR-0039)");
+        assert_eq!(v.workspace.focused_window_id(), Some(tile));
         let _ = &target;
     });
 }
@@ -12240,7 +12055,7 @@ fn jump_session_rows_do_not_paint_redundant_status_words(cx: &mut TestAppContext
         v.agent_roster
             .upsert(info("no-word-work", "working row", true));
         v.jump_session_order = vec!["no-word-wait".into(), "no-word-work".into()];
-        v.materialize_roster_detached_tiles();
+        open_dormant_agent_tiles(v, pid, &["no-word-wait", "no-word-work"]);
     });
     let row_ids: HashMap<String, usize> = view.update(vcx, |v, cx| {
         v.jump_panel_sections(cx)
@@ -12333,7 +12148,7 @@ fn jump_panel_session_rows_paint_provider_ownership_marks(cx: &mut TestAppContex
             },
             cx,
         );
-        v.materialize_roster_detached_tiles();
+        open_dormant_agent_tiles(v, pid, &["provider-claude", "provider-codex"]);
         v.jump_to_session(local, cx);
         v.workspace.set_active_workspace(0);
         cx.notify();
@@ -12420,7 +12235,8 @@ fn jump_agent_state_widget_does_not_paint(cx: &mut TestAppContext) {
 }
 
 /// UXI-JumpPanel-17/32: live totals remain correctly derived for compatibility
-/// consumers even though their retired count badges do not paint.
+/// consumers even though their retired count badges do not paint. Since
+/// ADR-0039 the totals are over the Agent tiles the project's workspaces own.
 #[gpui::test]
 fn jump_waiting_working_tabs_paint_live_counts(cx: &mut TestAppContext) {
     use yalda::session_proto::SessionInfo;
@@ -12464,7 +12280,17 @@ fn jump_waiting_working_tabs_paint_live_counts(cx: &mut TestAppContext) {
             "count-wait-b".into(),
             "count-archived".into(),
         ];
-        v.materialize_roster_detached_tiles();
+        open_dormant_agent_tiles(
+            v,
+            pid,
+            &[
+                "count-wait-a",
+                "count-work",
+                "count-offline",
+                "count-wait-b",
+                "count-archived",
+            ],
+        );
     });
 
     let counts = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
@@ -12544,7 +12370,11 @@ fn jump_all_tab_groups_activity_with_headers(cx: &mut TestAppContext) {
             "S-work-1".into(),
             "S-wait-1".into(),
         ];
-        v.materialize_roster_detached_tiles();
+        open_dormant_agent_tiles(
+            v,
+            pid,
+            &["S-wait-2", "S-work-2", "S-off", "S-work-1", "S-wait-1"],
+        );
     });
 
     let row_ids: HashMap<String, usize> = view.update(vcx, |v, cx| {
@@ -12558,14 +12388,28 @@ fn jump_all_tab_groups_activity_with_headers(cx: &mut TestAppContext) {
             .map(|(i, row)| (row.label, i))
             .collect()
     });
+    // The workspace folder's own (tile-owned) order is what the panel paints.
+    let folder_order: Vec<String> = view.update(vcx, |v, cx| {
+        v.jump_panel_sections(cx)
+            .0
+            .into_iter()
+            .find(|section| section.id == pid)
+            .expect("project section")
+            .workspace_folders
+            .into_iter()
+            .flat_map(|folder| folder.tiles)
+            .filter_map(|tile| tile.agent.map(|row| row.label))
+            .collect()
+    });
+    assert_eq!(folder_order.len(), 5, "every session's tile is listed");
 
     crate::layout_probe_begin();
     view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
     // UXI-JumpPanel-20 clause 5 SUPERSEDES UXI-JumpPanel-14's All activity
-    // partition IN THE PANEL: the Working/Waiting/Unavailable headings are gone,
-    // and untagged rows sort alphabetically by label. Cmd-P uses that same
-    // ownership-and-tag projection rather than a separate session ordering.
+    // partition IN THE PANEL: the Working/Waiting/Unavailable headings are gone.
+    // Since ADR-0039 rows paint in their workspace folder's tile order, and
+    // Cmd-P uses that same ownership projection.
     for name in ["working", "waiting", "unavailable"] {
         assert!(
             crate::layout_probe_get(&format!("jump-agent-group-{}-{name}", pid.0)).is_none(),
@@ -12578,11 +12422,10 @@ fn jump_all_tab_groups_activity_with_headers(cx: &mut TestAppContext) {
             .unwrap_or_else(|| panic!("{label} row must paint"))
             .1
     };
-    // All sorts untagged rows by label: offline, wait-one, wait-two, work-one, work-two.
-    let painted = ["offline", "wait-one", "wait-two", "work-one", "work-two"].map(row_y);
+    let painted: Vec<f32> = folder_order.iter().map(|label| row_y(label)).collect();
     assert!(
         painted.windows(2).all(|pair| pair[0] < pair[1]),
-        "All must paint untagged rows in alphabetical label order"
+        "rows must paint in their workspace folder's tile order: {folder_order:?}"
     );
     crate::layout_probe_end();
 
@@ -12594,9 +12437,8 @@ fn jump_all_tab_groups_activity_with_headers(cx: &mut TestAppContext) {
             .collect::<Vec<_>>()
     });
     assert_eq!(
-        palette_agents,
-        vec!["offline", "wait-one", "wait-two", "work-one", "work-two"],
-        "empty Cmd-P mirrors the Unbound list's tile order"
+        palette_agents, folder_order,
+        "empty Cmd-P mirrors the workspace folder's tile order"
     );
 }
 
@@ -12633,7 +12475,6 @@ fn jump_session_archive_filters_tabs_palette_and_persists(cx: &mut TestAppContex
         v.agent_roster
             .upsert(info("S-arch", "archived-session", true));
         v.jump_session_order = vec!["S-arch".into(), "S-live".into()];
-        v.materialize_roster_detached_tiles();
     });
     let temp = tempfile::tempdir().expect("temp preferences dir");
     let prefs_path = temp.path().join("preferences.json");
@@ -12832,17 +12673,24 @@ fn jump_session_archive_controls_toggle_the_same_durable_flag(cx: &mut TestAppCo
     });
 }
 
-/// UXI-JumpPanel-16 amended by ADR-0034: archiving detaches the complete Agent
-/// tile. The session and transcript stay alive; selecting it presents that exact
-/// tile solo.
+/// UXI-JumpPanel-16 amended by ADR-0039: archiving returns the tile showing
+/// the session to its session picker; the tile stays in its workspace. The
+/// session and transcript stay alive; a direct jump reopens the transcript.
 #[gpui::test]
-fn archive_detaches_tile_and_direct_jump_reopens_the_transcript(cx: &mut TestAppContext) {
+fn archive_returns_tile_to_picker_and_direct_jump_reopens_the_transcript(
+    cx: &mut TestAppContext,
+) {
     use crate::JumpTarget;
+    use crate::workspace::{AttachedVisibility, TileMembership};
 
     let (view, vcx, id, _session) = boot_with_transcript(cx);
     // The real server transition is covered by session_resilience; keep this
     // viewport/projection guard hermetic and synchronous.
     view.update(vcx, |v, _| v.session_server = None);
+    let (tile, workspace) = view.read_with(vcx, |v, _| {
+        let tile = v.agent_tile_id_bound_to(id).expect("bound tile");
+        (tile, v.workspace.workspace_index_of_window(tile).unwrap())
+    });
 
     view.update(vcx, |v, cx| v.set_session_archived("S1", true, cx));
 
@@ -12851,13 +12699,23 @@ fn archive_detaches_tile_and_direct_jump_reopens_the_transcript(cx: &mut TestApp
         assert_eq!(
             v.agent_tile_id_bound_to(id),
             None,
-            "no workspace owns the archived session tile"
+            "no tile shows the archived session"
         );
-        assert!(matches!(
-            v.workspace
-                .tile_membership(v.agent_tile_id_for_session(id).unwrap()),
-            Some(crate::workspace::TileMembership::Detached)
-        ));
+        assert_eq!(
+            v.workspace.tile_membership(tile),
+            Some(TileMembership::Attached {
+                workspace,
+                visibility: AttachedVisibility::Visible,
+            }),
+            "the tile stays in its workspace"
+        );
+        assert!(
+            matches!(
+                &v.workspace.tile(tile).unwrap().content,
+                crate::App::Agent(agent) if agent.picker().is_some()
+            ),
+            "the tile returns to its session picker"
+        );
         assert!(
             v.sessions.contains(id),
             "archive keeps the live session in the store"
@@ -12879,10 +12737,16 @@ fn archive_detaches_tile_and_direct_jump_reopens_the_transcript(cx: &mut TestApp
     view.update(vcx, |v, cx| v.jump_to_agent(JumpTarget::Local(id), cx));
 
     view.read_with(vcx, |v, cx| {
-        assert!(
-            v.workspace.presented_detached_tile_id().is_some(),
-            "a direct visit focuses the preserved session's unbound tile"
+        let shown = v
+            .agent_tile_id_bound_to(id)
+            .expect("a direct visit gives the session a workspace tile");
+        assert_eq!(
+            v.workspace.visible_workspace_index_of_window(shown),
+            Some(workspace),
+            "the reopened tile is visible in the project's workspace"
         );
+        assert_eq!(v.workspace.focused_window_id(), Some(shown));
+        assert!(v.workspace.validate_ownership().is_ok());
         assert_eq!(
             v.agent_tile().and_then(|tile| tile.session()),
             Some(id),
@@ -12998,13 +12862,8 @@ fn archived_waiting_session_is_removed_from_the_painted_waiting_tab(cx: &mut Tes
             busy: false,
             archived: false,
         });
-        let tile = v
-            .agent_tile_id_for_server_sid("S-archived-waiting")
-            .expect("installed Agent tile");
-        v.workspace
-            .detach_window(tile)
-            .expect("the Waiting list is the Detached list");
-        v.workspace.clear_solo_presentation();
+        v.agent_tile_id_for_server_sid("S-archived-waiting")
+            .expect("installed Agent tile in the workspace");
         v.select_jump_agent_tab(pid, JumpAgentTab::Waiting, cx);
         pid
     });
@@ -13357,215 +13216,6 @@ fn jump_tile_reorder_applies_within_folder_and_gates_by_folder(cx: &mut TestAppC
     assert_eq!(
         before, unchanged,
         "a tile cannot be reordered into another workspace folder"
-    );
-}
-
-/// UXI-JumpPanel-28, REAL Detached path: a tile drag changes only the durable
-/// presentation order inside its exact project/tag (or project/untagged) group.
-/// Project ownership, tags, attachment, and tile identity are invariant, while
-/// cross-project, tag-to-untagged, and attached-to-detached drops are refused.
-#[gpui::test]
-fn jump_detached_tile_reorder_is_group_bounded_and_preserves_ownership(cx: &mut TestAppContext) {
-    use crate::{App, LinearTile, TileDragGroup};
-    let (view, vcx) = boot_browser(cx);
-
-    let (project, other_project, alpha, beta, gamma, tagged_a, tagged_b, foreign, attached) = view
-        .update(vcx, |v, _| {
-            let project = v.workspace.active_workspace().expect("workspace").project();
-            let other_project = v
-                .projects
-                .create(
-                    "Detached order B".into(),
-                    PathBuf::from("/tmp/yalda-detached-order-b"),
-                )
-                .expect("second project");
-            let make_detached = |v: &mut YaldaGpuiView, label: &str, pid| {
-                let mut tile = LinearTile::new();
-                tile.title = label.into();
-                v.workspace.push_detached(App::Linear(tile), pid)
-            };
-            let alpha = make_detached(v, "alpha", project);
-            let beta = make_detached(v, "beta", project);
-            let gamma = make_detached(v, "gamma", project);
-            let tagged_a = make_detached(v, "tagged alpha", project);
-            let tagged_b = make_detached(v, "tagged beta", project);
-            v.workspace
-                .tile_mut(tagged_a)
-                .unwrap()
-                .tags
-                .insert("focus".into());
-            v.workspace
-                .tile_mut(tagged_b)
-                .unwrap()
-                .tags
-                .insert("focus".into());
-            let foreign = make_detached(v, "foreign", other_project);
-            v.workspace
-                .tile_mut(foreign)
-                .unwrap()
-                .tags
-                .insert("focus".into());
-            let mut attached_tile = LinearTile::new();
-            attached_tile.title = "attached".into();
-            let attached = v
-                .workspace
-                .push_workspace_inheriting(App::Linear(attached_tile));
-            (
-                project,
-                other_project,
-                alpha,
-                beta,
-                gamma,
-                tagged_a,
-                tagged_b,
-                foreign,
-                attached,
-            )
-        });
-
-    let project_rows = |v: &mut YaldaGpuiView, cx: &mut gpui::Context<YaldaGpuiView>, pid| {
-        v.jump_panel_sections_with_tab(cx, Some(crate::JumpAgentTab::All))
-            .0
-            .into_iter()
-            .find(|section| section.id == pid)
-            .expect("project section")
-            .detached
-    };
-    let untagged_ids = |rows: Vec<crate::JumpTileRow>| {
-        rows.into_iter()
-            .filter(|row| row.tags.is_empty())
-            .map(|row| row.id)
-            .collect::<Vec<_>>()
-    };
-    let ownership_before = view.update(vcx, |v, _| {
-        v.workspace
-            .detached_tiles
-            .iter()
-            .map(|tile| (tile.window.id(), tile.project(), tile.window.tags.clone()))
-            .collect::<Vec<_>>()
-    });
-
-    let initial = view.update(vcx, |v, cx| untagged_ids(project_rows(v, cx, project)));
-    assert_eq!(initial, vec![alpha, beta, gamma]);
-    view.update(vcx, |v, cx| {
-        v.reorder_detached_tile(gamma, alpha, &TileDragGroup::DetachedUntagged(project), cx)
-    });
-    assert_eq!(
-        view.update(vcx, |v, cx| untagged_ids(project_rows(v, cx, project))),
-        vec![gamma, alpha, beta],
-        "same-project untagged drag moves the tile into the target slot"
-    );
-    assert!(
-        view.update(vcx, |v, _| {
-            v.jump_detached_tile_order
-                .windows(3)
-                .any(|ids| ids == [gamma, alpha, beta])
-        }),
-        "the Detached presentation order is retained for preference persistence"
-    );
-    view.update(vcx, |v, cx| {
-        v.reorder_detached_tile(beta, alpha, &TileDragGroup::DetachedUntagged(project), cx)
-    });
-    assert_eq!(
-        view.update(vcx, |v, cx| untagged_ids(project_rows(v, cx, project))),
-        vec![gamma, beta, alpha],
-        "a later reorder starts from the previously persisted rank order"
-    );
-
-    view.update(vcx, |v, cx| {
-        v.reorder_detached_tile(
-            tagged_b,
-            tagged_a,
-            &TileDragGroup::DetachedTag {
-                project,
-                tag: "focus".into(),
-            },
-            cx,
-        )
-    });
-    let tagged_ids = view.update(vcx, |v, cx| {
-        project_rows(v, cx, project)
-            .into_iter()
-            .filter(|row| row.tags.iter().any(|tag| tag == "focus"))
-            .map(|row| row.id)
-            .collect::<Vec<_>>()
-    });
-    assert_eq!(tagged_ids, vec![tagged_b, tagged_a]);
-    view.read_with(vcx, |v, _| {
-        assert_eq!(
-            v.jump_detached_tile_order.last(),
-            Some(&foreign),
-            "the total durable order retains every project in panel order"
-        );
-        assert_eq!(
-            v.jump_detached_tile_order.len(),
-            ownership_before.len(),
-            "the durable order includes every Detached identity exactly once"
-        );
-    });
-
-    let order_after_valid = view.update(vcx, |v, cx| {
-        project_rows(v, cx, project)
-            .into_iter()
-            .map(|row| row.id)
-            .collect::<Vec<_>>()
-    });
-    let durable_after_valid = view.read_with(vcx, |v, _| v.jump_detached_tile_order.clone());
-    for (dragged, target, group) in [
-        (foreign, alpha, TileDragGroup::DetachedUntagged(project)),
-        (tagged_a, alpha, TileDragGroup::DetachedUntagged(project)),
-        (
-            foreign,
-            tagged_a,
-            TileDragGroup::DetachedTag {
-                project,
-                tag: "focus".into(),
-            },
-        ),
-        (
-            alpha,
-            tagged_a,
-            TileDragGroup::DetachedTag {
-                project,
-                tag: "focus".into(),
-            },
-        ),
-        (attached, alpha, TileDragGroup::DetachedUntagged(project)),
-        (
-            alpha,
-            foreign,
-            TileDragGroup::DetachedUntagged(other_project),
-        ),
-    ] {
-        view.update(vcx, |v, cx| {
-            v.reorder_detached_tile(dragged, target, &group, cx)
-        });
-    }
-    assert_eq!(
-        view.update(vcx, |v, cx| {
-            project_rows(v, cx, project)
-                .into_iter()
-                .map(|row| row.id)
-                .collect::<Vec<_>>()
-        }),
-        order_after_valid,
-        "invalid cross-boundary drops are no-ops"
-    );
-    assert_eq!(
-        view.read_with(vcx, |v, _| v.jump_detached_tile_order.clone()),
-        durable_after_valid,
-        "invalid drops cannot mutate the durable order behind the projection"
-    );
-    assert_eq!(
-        view.update(vcx, |v, _| {
-            v.workspace
-                .detached_tiles
-                .iter()
-                .map(|tile| (tile.window.id(), tile.project(), tile.window.tags.clone()))
-                .collect::<Vec<_>>()
-        }),
-        ownership_before,
-        "reordering cannot change identity, project, tags, or attachment"
     );
 }
 
@@ -21097,6 +20747,11 @@ fn agent_stats_content_keeps_a_readable_measure_on_wide_tiles(cx: &mut TestAppCo
 
     let (view, vcx) = boot_browser(cx);
     let cwd = std::env::current_dir().expect("test cwd");
+    // Agent Stats opens as a tile in the active workspace (ADR-0039); close
+    // the boot tile first so it is the workspace's only tile and spans the
+    // ultrawide window.
+    view.update(vcx, |view, cx| view.dispatch_menu_command("close-window", cx));
+    vcx.run_until_parked();
     view.update(vcx, |view, cx| {
         view.open_agent_stats(cx);
         view.apply_server_batch(
@@ -23184,26 +22839,6 @@ fn ctrl_w_hide_unhide_and_workspace_back_and_forth_are_global(cx: &mut TestAppCo
     vcx.simulate_keystrokes("escape");
     vcx.run_until_parked();
 
-    vcx.simulate_keystrokes("ctrl-w shift-b");
-    vcx.run_until_parked();
-    view.read_with(vcx, |v, _| {
-        assert_eq!(
-            v.workspace.tile_membership(hidden),
-            Some(TileMembership::Detached)
-        );
-    });
-    vcx.simulate_keystrokes("ctrl-w b");
-    vcx.run_until_parked();
-    view.read_with(vcx, |v, _| {
-        assert_eq!(
-            v.workspace.tile_membership(hidden),
-            Some(TileMembership::Attached {
-                workspace: 0,
-                visibility: crate::workspace::AttachedVisibility::Visible,
-            })
-        );
-    });
-
     view.update(vcx, |v, cx| v.dispatch_menu_command("tile-hide", cx));
     view.read_with(vcx, |v, _| {
         assert_eq!(
@@ -23212,16 +22847,7 @@ fn ctrl_w_hide_unhide_and_workspace_back_and_forth_are_global(cx: &mut TestAppCo
                 workspace: 0,
                 visibility: crate::workspace::AttachedVisibility::Hidden,
             }),
-            "the system menu's Hide command changes visibility without detaching"
-        );
-    });
-    view.update(vcx, |v, cx| v.jump_to_tile(hidden, cx));
-    view.update(vcx, |v, cx| v.dispatch_menu_command("tile-detach", cx));
-    view.read_with(vcx, |v, _| {
-        assert_eq!(
-            v.workspace.tile_membership(hidden),
-            Some(TileMembership::Detached),
-            "detaching a hidden tile clears hidden state"
+            "the system menu's Hide command changes visibility and keeps the owner"
         );
     });
 
@@ -25333,16 +24959,18 @@ fn active_tile_count(
     })
 }
 
-/// ADR-0033: "new agent" is contextual. In a workspace it adds a bound tile;
-/// while directly viewing Unbound it creates another unbound tile and preserves
-/// the original tile and session. Drives the real menu dispatcher in both modes.
+/// ADR-0039: "new agent" always lands visibly in a workspace. In a workspace
+/// it adds a tile there; while a hidden tile is solo-presented it opens the new
+/// tile visibly in that hidden tile's OWNING workspace, preserving the original
+/// tile and its session. Drives the real menu dispatcher in both modes.
 #[gpui::test]
-fn new_agent_adds_bound_or_unbound_tile_by_focus_domain(cx: &mut TestAppContext) {
+fn new_agent_from_hidden_solo_lands_visible_in_owning_workspace(cx: &mut TestAppContext) {
     use crate::App;
+    use crate::workspace::{AttachedVisibility, TileMembership};
     let (view, vcx) = boot_browser(cx);
     let sid = add_free_session(&view, vcx, "claude-1");
 
-    // ── A. Real workspace: a NEW tile appears, on the picker. ──────────────
+    // ── A. Real workspace: a NEW tile appears. ─────────────────────────────
     let before = active_tile_count(&view, vcx);
     view.update(vcx, |v, cx| v.dispatch_menu_command("new-agent-tile", cx));
     vcx.run_until_parked();
@@ -25352,11 +24980,6 @@ fn new_agent_adds_bound_or_unbound_tile_by_focus_domain(cx: &mut TestAppContext)
         "in a real workspace, new agent ADDS a tile"
     );
     view.update(vcx, |v, _| {
-        // The new tile is an agent tile. (Whether it rests on the picker or is
-        // pre-bound is the server-vs-direct-spawn split inside `open_agent_inner`:
-        // production runs the server path and lands on the picker; this harness has
-        // no daemon, so it takes the legacy direct-spawn branch. The PLACEMENT is
-        // what this guard pins.)
         assert!(
             matches!(v.workspace.focused_content(), Some(App::Agent(_))),
             "the new tile is an agent tile, got {:?}",
@@ -25364,20 +24987,21 @@ fn new_agent_adds_bound_or_unbound_tile_by_focus_domain(cx: &mut TestAppContext)
         );
     });
 
-    // ── B. Direct Unbound view: create another unbound tile. ──────────────
+    // ── B. Hidden tile of workspace 0 solo-presented from workspace 1. ────
     view.update(vcx, |v, cx| v.jump_to_session(sid, cx));
     vcx.run_until_parked();
-    let (workspaces_before, unbound_before, original) = view.update(vcx, |v, _| {
-        let original = v
-            .workspace
-            .presented_detached_tile_id()
-            .expect("the jump directly focuses an unbound tile");
+    let (workspaces_before, original) = view.update(vcx, |v, _| {
+        let original = v.agent_tile_id_bound_to(sid).expect("the jump opened a tile");
+        assert_eq!(v.workspace.workspace_index_of_window(original), Some(0));
+        v.workspace.hide_window(original).expect("hide it");
+        let project = v.workspace.inherited_project();
+        v.workspace
+            .push_workspace_inheriting(App::Agent(crate::AgentTile::new()));
+        assert_eq!(v.workspace.workspaces[1].project(), project);
+        assert!(v.workspace.focus_tile(original), "present the hidden tile solo");
+        assert_eq!(v.workspace.active_workspace, 1);
         assert_eq!(v.focused_bound_session(), Some(sid));
-        (
-            v.workspace.workspaces.len(),
-            v.workspace.detached_tiles.len(),
-            original,
-        )
+        (v.workspace.workspaces.len(), original)
     });
 
     view.update(vcx, |v, cx| v.dispatch_menu_command("new-agent-tile", cx));
@@ -25387,39 +25011,41 @@ fn new_agent_adds_bound_or_unbound_tile_by_focus_domain(cx: &mut TestAppContext)
         assert_eq!(
             v.workspace.workspaces.len(),
             workspaces_before,
-            "direct creation does not manufacture a workspace"
+            "creation does not manufacture a workspace"
         );
-        assert_eq!(
-            v.workspace.detached_tiles.len(),
-            unbound_before + 1,
-            "a second stable unbound tile is created"
-        );
-        let created = v
-            .workspace
-            .presented_detached_tile_id()
-            .expect("the new unbound tile is directly focused");
+        let created = v.workspace.focused_window_id().expect("new tile focused");
         assert_ne!(created, original, "new Agent preserves the original tile");
+        assert_eq!(v.workspace.presented_tile(), None, "solo presentation ends");
+        assert_eq!(
+            v.workspace.tile_membership(created),
+            Some(TileMembership::Attached {
+                workspace: 0,
+                visibility: AttachedVisibility::Visible,
+            }),
+            "the new tile lands visible in the hidden tile's owning workspace"
+        );
+        assert_eq!(v.workspace.active_workspace, 0);
         assert!(
             matches!(v.workspace.focused_content(), Some(App::Agent(t)) if t.session().is_none()),
             "the new tile starts as an empty Agent picker"
         );
         assert_eq!(
-            v.workspace
-                .tile(original)
-                .and_then(|window| match &window.content {
-                    App::Agent(tile) => tile.session(),
-                    _ => None,
-                }),
-            Some(sid),
-            "the original unbound tile retains its session"
+            v.workspace.tile_membership(original),
+            Some(TileMembership::Attached {
+                workspace: 0,
+                visibility: AttachedVisibility::Hidden,
+            }),
+            "the original tile stays hidden in its workspace"
         );
+        assert_eq!(v.agent_tile_id_bound_to(sid), Some(original));
         assert!(v.sessions.contains(sid));
+        assert!(v.workspace.validate_ownership().is_ok());
     });
 }
 
-/// ADR-0033: closing a session in a directly focused unbound Agent tile keeps
-/// that same tile alive and unbound as an empty picker. Session lifecycle does
-/// not change workspace ownership.
+/// Closing a session in a focused workspace Agent tile keeps that same tile
+/// alive in its workspace as an empty picker. Session lifecycle does not
+/// change workspace ownership.
 #[gpui::test]
 fn closing_session_keeps_same_unbound_tile_as_empty_picker(cx: &mut TestAppContext) {
     use crate::App;
@@ -25427,10 +25053,12 @@ fn closing_session_keeps_same_unbound_tile_as_empty_picker(cx: &mut TestAppConte
     let sid = add_free_session(&view, vcx, "claude-1");
     view.update(vcx, |v, cx| v.jump_to_session(sid, cx));
     vcx.run_until_parked();
-    let tile = view.update(vcx, |v, _| {
-        v.workspace
-            .presented_detached_tile_id()
-            .expect("session owns one directly focused unbound tile")
+    let (tile, workspace) = view.update(vcx, |v, _| {
+        let tile = v
+            .agent_tile_id_bound_to(sid)
+            .expect("session owns one workspace tile");
+        assert_eq!(v.workspace.focused_window_id(), Some(tile));
+        (tile, v.workspace.workspace_index_of_window(tile).unwrap())
     });
 
     view.update(vcx, |v, cx| v.dispatch_menu_command("claude-close", cx));
@@ -25447,20 +25075,18 @@ fn closing_session_keeps_same_unbound_tile_as_empty_picker(cx: &mut TestAppConte
 
     view.update(vcx, |v, _| {
         assert_eq!(
-            v.workspace.presented_detached_tile_id(),
+            v.workspace.focused_window_id(),
             Some(tile),
-            "closing the session preserves direct focus on the same tile"
+            "closing the session keeps focus on the same tile"
         );
         assert!(matches!(
             v.workspace.tile(tile).map(|window| &window.content),
             Some(App::Agent(agent)) if agent.session().is_none()
         ));
-        assert!(
-            v.workspace
-                .detached_tiles
-                .iter()
-                .any(|entry| entry.window.id() == tile),
-            "the empty Agent tile remains unbound"
+        assert_eq!(
+            v.workspace.visible_workspace_index_of_window(tile),
+            Some(workspace),
+            "the empty Agent tile remains in its workspace"
         );
         assert!(!v.sessions.contains(sid), "the session itself was closed");
     });
@@ -25635,8 +25261,10 @@ fn real_close_confirmed(view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::Visu
     vcx.run_until_parked();
 }
 
-/// Closing a selected session cannot re-home its unbound tile into whichever
-/// foreign-project workspace happens to be active underneath direct focus.
+/// Closing a selected session cannot re-home its tile into a foreign-project
+/// workspace: jumping to a project-B session from a project-A workspace opens
+/// its tile in a (new) project-B workspace, and closing the session leaves the
+/// tile there.
 #[gpui::test]
 fn closing_session_preserves_unbound_tile_project(cx: &mut TestAppContext) {
     let (view, vcx) = boot_browser(cx);
@@ -25656,10 +25284,12 @@ fn closing_session_preserves_unbound_tile_project(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     let tile = view.update(vcx, |v, _| {
         let tile = v
-            .workspace
-            .presented_detached_tile_id()
-            .expect("project-B session materializes an unbound tile");
+            .agent_tile_id_bound_to(sb)
+            .expect("project-B session opens a workspace tile");
         assert_eq!(v.workspace.tile_project(tile), Some(b_pid));
+        let owner = v.workspace.workspace_index_of_window(tile).unwrap();
+        assert_eq!(v.workspace.workspaces[owner].project(), b_pid);
+        assert_eq!(v.workspace.active_workspace, owner);
         tile
     });
 
@@ -25667,9 +25297,9 @@ fn closing_session_preserves_unbound_tile_project(cx: &mut TestAppContext) {
 
     view.update(vcx, |v, _| {
         assert_eq!(
-            v.workspace.presented_detached_tile_id(),
+            v.workspace.focused_window_id(),
             Some(tile),
-            "session close leaves the same tile directly focused"
+            "session close leaves the same tile focused"
         );
         assert_eq!(
             v.workspace.tile_project(tile),
@@ -26780,63 +26410,6 @@ fn jump_palette_lists_workspaces_and_sessions_in_panel_order(cx: &mut TestAppCon
         agents[..first_agent].iter().all(|a| !*a),
         "panel order puts a section's workspaces before its sessions: {agents:?}"
     );
-}
-
-/// ADR-0034 / UXI-JumpPanel-25: Cmd-P names a Detached *tile*, Enter opens that
-/// exact tile without attaching it, and the explicit workspace command moves the
-/// same id into the active workspace.
-#[gpui::test]
-fn jump_palette_opens_detached_tile_then_attaches_same_identity(cx: &mut TestAppContext) {
-    use crate::workspace::TileMembership;
-    use crate::{App, LinearTile, PaletteTarget};
-    cx.update(crate::register_keymap);
-    let (view, vcx) = boot_browser(cx);
-    let id = view.update(vcx, |v, _| {
-        let project = v.workspace.active_workspace().expect("workspace").project();
-        let mut tile = LinearTile::new();
-        tile.title = "unique-unbound-linear".into();
-        v.workspace.push_detached(App::Linear(tile), project)
-    });
-
-    vcx.simulate_keystrokes("cmd-p");
-    vcx.run_until_parked();
-    vcx.simulate_keystrokes("u n i q u e - u n b o u n d");
-    vcx.run_until_parked();
-    view.update(vcx, |v, cx| {
-        let (items, ranked) = v.jump_palette_ranked(cx);
-        let top = &items[*ranked.first().expect("unbound tile is a Cmd-P candidate")];
-        assert_eq!(top.target, PaletteTarget::Tile(id));
-        assert!(top.detail.ends_with("Detached"));
-    });
-
-    vcx.simulate_keystrokes("enter");
-    vcx.run_until_parked();
-    view.update(vcx, |v, _| {
-        assert_eq!(v.workspace.presented_detached_tile_id(), Some(id));
-        assert_eq!(
-            v.workspace.tile_membership(id),
-            Some(TileMembership::Detached)
-        );
-    });
-
-    vcx.simulate_keystrokes("ctrl-w b");
-    vcx.run_until_parked();
-    view.update(vcx, |v, _| {
-        assert_eq!(
-            v.workspace.tile_membership(id),
-            Some(TileMembership::Attached {
-                workspace: 0,
-                visibility: crate::workspace::AttachedVisibility::Visible
-            })
-        );
-        assert_eq!(v.workspace.focused_window_id(), Some(id));
-        assert!(
-            v.workspace
-                .detached_tiles
-                .iter()
-                .all(|tile| tile.window.id() != id)
-        );
-    });
 }
 
 /// UXI-JumpPanel-9 (2): ranking, not mere filtering. A prefix hit outranks a
@@ -28153,16 +27726,17 @@ fn cog_test_bundle(nodes: Vec<crate::CogNode>) -> crate::CogBundle {
 }
 
 /// UXI-Cog-13 / UXI-Workspace-24: shell New -> Cog adds a split Cog tile in a
-/// workspace, or creates a new detached Cog tile when the current tile is
-/// solo-presented, preserving the tile the user was viewing. This drives the
-/// exact command emitted by `.` -> new -> cog in both focus domains.
+/// workspace, or — when a hidden tile is solo-presented — opens the new Cog
+/// tile visibly in that hidden tile's owning workspace (ADR-0039), preserving
+/// the tile the user was viewing. This drives the exact command emitted by
+/// `.` -> new -> cog in both focus states.
 ///
-/// NEGATIVE CONTROL (observed RED): the pre-fix dispatcher only calls
-/// `split_focused`, which returns `None` while a detached tile is presented;
-/// `presented_tile` remains the original Linear tile and this test fails.
+/// NEGATIVE CONTROL: a dispatcher that only calls `split_focused` returns
+/// `None` while a hidden tile is presented; the presented tile remains the
+/// original Linear tile and this test fails.
 #[gpui::test]
-fn new_cog_tile_from_solo_presentation_creates_and_focuses_detached_cog(cx: &mut TestAppContext) {
-    use crate::workspace::TileMembership;
+fn new_cog_tile_from_hidden_solo_lands_visible_in_owning_workspace(cx: &mut TestAppContext) {
+    use crate::workspace::{AttachedVisibility, TileMembership};
     use crate::{App, LinearTile};
 
     let (view, vcx) = boot_browser(cx);
@@ -28181,12 +27755,17 @@ fn new_cog_tile_from_solo_presentation_creates_and_focuses_detached_cog(cx: &mut
         );
     });
 
+    // A hidden Linear tile of workspace 0, presented solo from workspace 1.
     let original = view.update(vcx, |v, _| {
         let project = v.workspace.inherited_project();
         let original = v
             .workspace
-            .push_detached(App::Linear(LinearTile::new()), project);
+            .open_tile_in_project(App::Linear(LinearTile::new()), project);
+        v.workspace.hide_window(original).expect("hide it");
+        v.workspace
+            .push_workspace_inheriting(App::Linear(LinearTile::new()));
         assert!(v.workspace.present_solo(original));
+        assert_eq!(v.workspace.active_workspace, 1);
         original
     });
 
@@ -28194,23 +27773,35 @@ fn new_cog_tile_from_solo_presentation_creates_and_focuses_detached_cog(cx: &mut
     vcx.run_until_parked();
 
     view.read_with(vcx, |v, _| {
+        assert_eq!(v.workspace.presented_tile(), None, "solo presentation ends");
         let created = v
             .workspace
-            .presented_tile()
-            .expect("New -> Cog presents the created tile")
-            .window_id();
+            .focused_window_id()
+            .expect("New -> Cog focuses the created tile");
         assert_ne!(created, original, "New -> Cog must create a distinct tile");
         assert!(
             matches!(
                 v.workspace.tile(created).map(|tile| &tile.content),
                 Some(App::Cog(_))
             ),
-            "the newly presented tile is a Cog explorer"
+            "the newly focused tile is a Cog explorer"
         );
         assert_eq!(
             v.workspace.tile_membership(created),
-            Some(TileMembership::Detached),
-            "a tile created outside the workspace remains detached"
+            Some(TileMembership::Attached {
+                workspace: 0,
+                visibility: AttachedVisibility::Visible,
+            }),
+            "the new Cog lands visible in the hidden tile's owning workspace"
+        );
+        assert_eq!(v.workspace.active_workspace, 0);
+        assert_eq!(
+            v.workspace.tile_membership(original),
+            Some(TileMembership::Attached {
+                workspace: 0,
+                visibility: AttachedVisibility::Hidden,
+            }),
+            "the previously presented tile stays hidden in its workspace"
         );
         assert!(
             matches!(

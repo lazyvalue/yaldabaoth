@@ -74,9 +74,6 @@ impl YaldaGpuiView {
                 set.extend(window.tags.iter().cloned());
             });
         }
-        for tile in &self.workspace.detached_tiles {
-            set.extend(tile.window.tags.iter().cloned());
-        }
         for tags in self.session_tags.values() {
             for t in tags {
                 set.insert(t.clone());

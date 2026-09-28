@@ -253,11 +253,6 @@ actions!(
         // creates a second view onto the same file there, leaving the
         // original in place. Agent/Browser tiles are single-home (rejected).
         AlsoShowTile,
-        // Move the same tile object across the workspace ownership boundary.
-        // Bind targets the active same-project workspace; unbind leaves the
-        // tile directly focused with all of its state intact.
-        AttachFocusedTile,
-        DetachFocusedTile,
         HideFocusedTile,
         UnhideFocusedTile,
         WorkspaceBackAndForth,
@@ -476,8 +471,6 @@ define_ctrl_w_shell_actions! {
     TagViewChord => tag_view_chord,
     TagToggleChord => tag_toggle_chord,
     ClearTagView => clear_tag_view,
-    AttachFocusedTile => attach_focused_tile,
-    DetachFocusedTile => detach_focused_tile,
     HideFocusedTile => hide_focused_tile,
     UnhideFocusedTile => unhide_focused_tile,
     WorkspaceBackAndForth => workspace_back_and_forth,
@@ -1803,7 +1796,6 @@ fn with_tile_commands(mut menu: Vec<MenuNode>) -> Vec<MenuNode> {
     menu.push(MenuNode::separator());
     menu.push(MenuNode::entry("h", "hide", "tile-hide"));
     menu.push(MenuNode::entry("u", "unhide", "tile-unhide"));
-    menu.push(MenuNode::entry("f", "detach tile", "tile-detach"));
     menu
 }
 
@@ -2128,25 +2120,12 @@ struct YaldaGpuiView {
     /// durable project/immutable auto-name keys; this affects presentation only,
     /// never `Frame::workspaces` identity, numbering, or keyboard shortcuts.
     jump_workspace_order: Vec<String>,
-    /// User's drag-reordered order of jump-panel tag folders, per project
-    /// (`Preferences::jump_tag_order`, UXI-JumpPanel-21). `project name → [tag]`;
-    /// unlisted tags sort after alphabetically. Keyed by durable project name
-    /// because tags are project-scoped.
-    jump_tag_order: HashMap<String, Vec<String>>,
-    /// Folded jump-panel tag folders, keyed by `"{project}\u{1f}{tag}"`
-    /// (`Preferences::jump_folded_tags`, UXI-JumpPanel-21). Absent = expanded.
-    jump_folded_tags: std::collections::HashSet<String>,
     /// User's drag-reordered order of jump-panel TILE rows within a workspace
     /// folder (`Preferences::jump_tile_order`, UXI-JumpPanel-28). One global list
     /// of durable `WindowId`s; within each folder tiles sort by their index here,
     /// unlisted tiles keep layout-traversal order after. Empty = layout order. A
     /// tile drag is folder-gated, so one global list suffices.
     jump_tile_order: Vec<workspace::WindowId>,
-    /// User's drag-reordered Detached tile presentation order
-    /// (`Preferences::jump_detached_tile_order`, UXI-JumpPanel-28). This is
-    /// independent of attached workspace tile order. Empty = alphabetical;
-    /// unlisted tiles retain alphabetical order after ranked tiles.
-    jump_detached_tile_order: Vec<workspace::WindowId>,
     /// Per-session user tags, keyed by SERVER sid (UXI-JumpPanel-20). Loaded once
     /// at construction from the id-keyed sidecar (`session_tags.json`), written on
     /// every tag edit. The jump panel reads this to group sessions into tag
@@ -2269,10 +2248,7 @@ impl YaldaGpuiView {
             jump_folded_projects: std::collections::HashSet::new(),
             jump_folded_workspaces: std::collections::HashSet::new(),
             jump_workspace_order: Vec::new(),
-            jump_tag_order: HashMap::new(),
-            jump_folded_tags: std::collections::HashSet::new(),
             jump_tile_order: Vec::new(),
-            jump_detached_tile_order: Vec::new(),
             jump_order_succession: HashMap::new(),
             diff_projections: HashMap::new(),
             recaps: HashMap::new(),
@@ -2345,10 +2321,7 @@ impl YaldaGpuiView {
             jump_folded_projects: std::collections::HashSet::new(),
             jump_folded_workspaces: std::collections::HashSet::new(),
             jump_workspace_order: Vec::new(),
-            jump_tag_order: HashMap::new(),
-            jump_folded_tags: std::collections::HashSet::new(),
             jump_tile_order: Vec::new(),
-            jump_detached_tile_order: Vec::new(),
             jump_order_succession: HashMap::new(),
             diff_projections: HashMap::new(),
             recaps: HashMap::new(),
@@ -2374,12 +2347,11 @@ impl YaldaGpuiView {
     }
 
     /// Establish durable tile ownership before any universal-roster result can
-    /// synthesize and persist Detached Agent tiles (UXI-Workspace-28).
+    /// save workspace state (UXI-Workspace-28).
     ///
     /// `start_roster` is injected so the production entry point and the
     /// headless fast-result regression exercise this exact ordering seam.  The
-    /// callback may immediately call `materialize_roster_detached_tiles` and
-    /// `save_workspace_state`; by then restore has either completed or
+    /// callback may immediately call `save_workspace_state`; by then restore has either completed or
     /// definitively found no snapshot.
     fn initialize_workspace_before_roster(
         &mut self,
@@ -2447,7 +2419,6 @@ impl YaldaGpuiView {
         let default_project = self.projects.first().unwrap_or(ProjectId(0));
         let requested_solo_presentation = snap.solo_presentation;
         let mut ws: workspace::Frame<App> = workspace::Frame::new(default_project);
-        let requested_direct_unbound = snap.direct_unbound;
         let requested_scratchpad = snap.scratchpad.clone();
         let migrate_legacy_tile_tags = !snap.tile_tags_migrated;
         // Each agent leaf carries its persisted session id (identity), so restore
@@ -2558,39 +2529,14 @@ impl YaldaGpuiView {
                 }
             }
         }
-        // Restore the Detached ownership domain. Duplicate ids and duplicate
-        // Agent session identities are skipped defensively so a corrupt or
-        // transitional snapshot cannot place one tile/session twice.
-        for persisted in snap.detached_tiles {
-            let leaf = persisted.tile;
-            let Some(identity) =
-                reserve_persisted_leaf(&leaf, &mut placed_ids, &mut placed_agent_sids)
-            else {
-                continue;
-            };
-            let project_cwd = persisted
-                .project_cwd
-                .map(PathBuf::from)
-                .unwrap_or_else(process_cwd);
-            let project = self
-                .projects
-                .ensure_at_cwd(project_cwd.clone(), &project_name_for_cwd(&project_cwd));
-            let id = leaf.id;
-            let (window, _) = restore_leaf(&mut ws, &self.theme, leaf, project);
-            ws.insert_restored_detached(window)
-                .expect("restore registry accepted a duplicate tile id");
-            if let PersistedTileIdentity::Agent(sid) = identity {
-                agent_leaf_ids.push((id, Some(sid)));
-            }
-        }
         if !ws.workspaces.is_empty() {
             ws.active_workspace = snap.active_workspace.min(ws.workspaces.len() - 1);
         }
         if ws.workspaces.is_empty() {
             return false;
         }
-        // Legacy scratchpad ids were Detached, so they cannot be migrated to
-        // hidden attachment without inventing a workspace owner (ADR-0034).
+        // Legacy scratchpad ids named tiles outside every workspace, which no
+        // longer exist (ADR-0034, ADR-0039).
         let _ = requested_scratchpad;
         // Restore marks — load from snapshot, then GC stale window ids.
         for (ch, wid) in snap.marks {
@@ -2658,28 +2604,11 @@ impl YaldaGpuiView {
             return false;
         }
         self.workspace = ws;
-        match requested_solo_presentation {
-            Some(presentation) => {
-                let presentation = match presentation {
-                    PersistedSoloPresentation::Detached(id) => {
-                        workspace::SoloPresentation::Detached(id)
-                    }
-                    PersistedSoloPresentation::HiddenAttached(id) => {
-                        workspace::SoloPresentation::HiddenAttached(id)
-                    }
-                };
-                // A typed field is authoritative even when corrupt/stale. Never
-                // let a legacy field override its ownership domain.
-                self.workspace.restore_solo_presentation(presentation);
-            }
-            None => {
-                if let Some(id) = requested_direct_unbound {
-                    // Additive migration: the legacy direct-unbound target can
-                    // only describe a Detached solo presentation.
-                    self.workspace
-                        .restore_solo_presentation(workspace::SoloPresentation::Detached(id));
-                }
-            }
+        // A legacy Detached target (ADR-0034) names a tile that was not
+        // restored, so it restores as no presentation (ADR-0039).
+        if let Some(PersistedSoloPresentation::HiddenAttached(id)) = requested_solo_presentation {
+            self.workspace
+                .restore_solo_presentation(workspace::SoloPresentation::HiddenAttached(id));
         }
 
         // Post-pass: replace Browser stubs with live agent sessions.
@@ -3948,16 +3877,8 @@ impl YaldaGpuiView {
             }),
             jump_workspace_order: (!self.jump_workspace_order.is_empty())
                 .then(|| self.jump_workspace_order.clone()),
-            jump_tag_order: (!self.jump_tag_order.is_empty()).then(|| self.jump_tag_order.clone()),
-            jump_folded_tags: (!self.jump_folded_tags.is_empty()).then(|| {
-                let mut keys: Vec<_> = self.jump_folded_tags.iter().cloned().collect();
-                keys.sort();
-                keys
-            }),
             jump_tile_order: (!self.jump_tile_order.is_empty())
                 .then(|| self.jump_tile_order.clone()),
-            jump_detached_tile_order: (!self.jump_detached_tile_order.is_empty())
-                .then(|| self.jump_detached_tile_order.clone()),
         });
     }
 
@@ -4399,7 +4320,7 @@ impl YaldaGpuiView {
 
     /// Activate the workspace at `idx`. Mouse-click entry point from the workspace
     /// strip — no-ops if the index is out of range or already active, unless
-    /// a solo-presented Detached or hidden tile must be left.
+    /// a solo-presented hidden tile must be left.
     fn select_workspace(&mut self, idx: usize, cx: &mut Context<Self>) {
         if idx >= self.workspace.workspaces.len()
             || (idx == self.workspace.active_workspace && self.workspace.presented_tile().is_none())
@@ -4498,59 +4419,6 @@ impl YaldaGpuiView {
     /// Menu-only legacy command: also show the focused tile in another workspace.
     fn also_show_tile(&mut self, _: &AlsoShowTile, _w: &mut Window, cx: &mut Context<Self>) {
         self.open_workspace_picker(WorkspacePickerMode::AlsoShow, cx);
-    }
-
-    fn attach_focused_tile(
-        &mut self,
-        _: &AttachFocusedTile,
-        _w: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(workspace::SoloPresentation::Detached(id)) = self.workspace.presented_tile()
-        else {
-            self.transient_status = Some("focused tile is already attached".into());
-            cx.notify();
-            return;
-        };
-        let target = self.workspace.active_workspace;
-        if self.workspace.attach_detached(id, target).is_err() {
-            self.transient_status =
-                Some("tile and active workspace belong to different projects".into());
-        } else {
-            self.transient_status = Some("tile attached to active workspace".into());
-            self.save_workspace_state();
-        }
-        cx.notify();
-    }
-
-    fn detach_focused_tile(
-        &mut self,
-        _: &DetachFocusedTile,
-        _w: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.detach_focused_tile_inner(cx);
-    }
-
-    fn detach_focused_tile_inner(&mut self, cx: &mut Context<Self>) {
-        if matches!(
-            self.workspace.presented_tile(),
-            Some(workspace::SoloPresentation::Detached(_))
-        ) {
-            self.transient_status = Some("focused tile is already detached".into());
-            cx.notify();
-            return;
-        }
-        let Some(id) = self.workspace.focused_window_id() else {
-            return;
-        };
-        if self.workspace.detach_window(id).is_err() {
-            self.transient_status = Some("focused tile cannot be detached".into());
-        } else {
-            self.transient_status = Some("tile detached from workspace".into());
-            self.save_workspace_state();
-        }
-        cx.notify();
     }
 
     fn hide_focused_tile(&mut self, _: &HideFocusedTile, _w: &mut Window, cx: &mut Context<Self>) {
@@ -5703,11 +5571,9 @@ impl YaldaGpuiView {
             }) => {
                 disabled.insert("tile-hide".to_string());
             }
-            Some(workspace::TileMembership::Detached) | None => {
+            None => {
                 disabled.insert("tile-hide".to_string());
                 disabled.insert("tile-unhide".to_string());
-                // Detach is meaningless without a workspace attachment.
-                disabled.insert("tile-detach".to_string());
             }
         }
         if self.active_server_session_id().is_none() {
@@ -6133,9 +5999,6 @@ impl YaldaGpuiView {
             }
             "also-show-tile" => self.open_workspace_picker(WorkspacePickerMode::AlsoShow, cx),
             "show-hidden-tiles" => self.open_hidden_tile_picker(cx),
-            "tile-detach" => {
-                self.detach_focused_tile_inner(cx);
-            }
             "tile-hide" => self.hide_focused_tile_inner(cx),
             "tile-unhide" => self.unhide_focused_tile_inner(cx),
             "workspace-back-and-forth" => self.workspace_back_and_forth_inner(cx),
@@ -6254,15 +6117,13 @@ impl YaldaGpuiView {
                 cx.notify();
             }
             "new-agent-tile" => {
-                // Solo-presented content has no visible workspace layout to split.
-                // Make another Detached tile and focus it, leaving the viewed tile and
-                // its state intact.
+                // A solo-presented hidden tile has no visible layout to split.
+                // Open the new tile visibly in its owning workspace (ADR-0039),
+                // leaving the hidden tile and its state intact.
                 if self.workspace.presented_tile().is_some() {
                     let project = self.workspace.inherited_project();
-                    let id = self
-                        .workspace
-                        .push_detached(App::Agent(AgentTile::new()), project);
-                    self.workspace.present_solo(id);
+                    self.workspace
+                        .open_tile_in_project(App::Agent(AgentTile::new()), project);
                     if self.session_server.is_some() {
                         self.start_server_pump(cx);
                         self.refresh_roster(cx);
@@ -6326,17 +6187,14 @@ impl YaldaGpuiView {
                 }
             }
             "new-cog-tile" => {
-                // A solo-presented tile lives outside the visible workspace
-                // layout, so there is nothing for `split_focused` to split.
-                // Create another detached tile and present it, preserving the
-                // tile the user was viewing (the same ownership transition as
-                // `new-agent-tile` above).
+                // A solo-presented hidden tile has no visible layout to split.
+                // Open the Cog tile visibly in its owning workspace (ADR-0039),
+                // as `new-agent-tile` above does.
                 if self.workspace.presented_tile().is_some() {
                     let project = self.workspace.inherited_project();
                     let id = self
                         .workspace
-                        .push_detached(App::Cog(CogTile::new()), project);
-                    self.workspace.present_solo(id);
+                        .open_tile_in_project(App::Cog(CogTile::new()), project);
                     self.cog_load_graphs_into(id, cx);
                     self.save_workspace_state();
                     cx.notify();
@@ -6584,7 +6442,7 @@ impl YaldaGpuiView {
     }
 
     /// `UXI-Workspace-27` availability predicate: ordinary focus inside the
-    /// active workspace, never a solo-presented hidden/Detached tile.
+    /// active workspace, never a solo-presented hidden tile.
     fn focused_on_active_workspace(&self) -> bool {
         if self.workspace.presented_tile().is_some() {
             return false;
@@ -6746,8 +6604,7 @@ impl YaldaGpuiView {
         };
 
         // Selecting the active workspace is a no-op only for a tile already
-        // attached there. For a Detached tile, the active workspace is a valid
-        // destination and must attach it.
+        // visible there; a hidden tile of the active workspace is un-hidden.
         let focused_membership = self
             .workspace
             .focused_window_id()
@@ -6848,7 +6705,7 @@ impl YaldaGpuiView {
         }
         // The free-session listing lists from a cwd: use the current session's,
         // Free the current session (kept running in the store) and land the tile
-        // in the live in-tile selector — the same UI a Detached Agent tile shows
+        // in the live in-tile selector — the same UI an unbound Agent tile shows
         // (free sessions + "start new"). No bespoke overlay.
         self.release_focused_session_for_rebind();
         self.show_selector_on_focused_tile(cx);
@@ -7725,14 +7582,18 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
-    /// Create a new FREE agent session rooted at `pid`'s cwd (UXI-Project-4: the
-    /// per-project ＋ New agent session row). No cwd prompt; it lands Detached in
-    /// the roster under this project's section.
+    /// Create a new agent session rooted at `pid`'s cwd (UXI-Project-4: the
+    /// project menu's New agent session). No cwd prompt; it opens as a new
+    /// visible Agent tile in a workspace of `pid` (ADR-0039,
+    /// `Frame::open_tile_in_project`) and binds a fresh session to it.
     pub(crate) fn new_agent_session_in(&mut self, pid: ProjectId, cx: &mut Context<Self>) {
         let Some(cwd) = self.projects.cwd_of(pid).map(|p| p.to_path_buf()) else {
             return;
         };
-        self.spawn_free_agent_session_at(cwd, cx);
+        self.workspace
+            .open_tile_in_project(App::Agent(AgentTile::new()), pid);
+        self.bootstrap_fresh_agent_session_for(AgentProvider::Claude, Some(cwd), cx);
+        self.save_workspace_state();
     }
 
     /// Request deletion of `pid` (UXI-Project-5). If it still holds workspaces or
@@ -7806,15 +7667,11 @@ impl YaldaGpuiView {
         }
         // 2. Workspaces: close this project's workspaces (descending so indices stay
         // valid), then guarantee ≥1 workspace survives under a surviving project.
-        // Explicit project deletion is the one operation that destroys tiles:
-        // the ordinary workspace-close path moves them to Detached, which would
-        // otherwise leave Detached tiles carrying a now-dead ProjectId here.
+        // Ordinary workspace close keeps the one-workspace floor; project
+        // deletion removes every workspace of the project (and its tiles).
         self.workspace
             .workspaces
             .retain(|workspace| workspace.project() != pid);
-        self.workspace
-            .detached_tiles
-            .retain(|tile| tile.project() != pid);
         if self
             .workspace
             .presented_tile()
@@ -10559,22 +10416,12 @@ fn main() {
                             view.jump_workspace_order = order;
                         }
                         // Per-project tag-folder order + fold state (UXI-JumpPanel-21).
-                        if let Some(o) = prefs.jump_tag_order {
-                            view.jump_tag_order = o;
-                        }
-                        if let Some(keys) = prefs.jump_folded_tags {
-                            view.jump_folded_tags = keys.into_iter().collect();
-                        }
                         if let Some(o) = prefs.jump_tile_order {
                             view.jump_tile_order = o;
                         }
-                        if let Some(o) = prefs.jump_detached_tile_order {
-                            view.jump_detached_tile_order = o;
-                        }
                         // UXI-Workspace-28: restore the durable ownership graph
                         // before starting the universal roster. A fast roster
-                        // result materializes missing sessions as Detached and
-                        // saves workspace.json, so launching it first can
+                        // result saves workspace.json, so launching it first can
                         // overwrite attached membership that is still on disk.
                         view.initialize_workspace_before_roster(
                             initial_doc.is_none(),
