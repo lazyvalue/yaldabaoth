@@ -38,20 +38,14 @@ impl YaldaGpuiView {
     /// filter). Computed from `self.keymap_registry` directly — never a
     /// root-entity read — so it's safe to call from a `&mut self` handler.
     fn keymap_visible_count(&self, view: &Entity<KeymapView>, cx: &GpuiApp) -> usize {
-        let filter = view.read(cx).filter().to_string();
-        keymap_visible_order(&self.keymap_registry, &filter).len()
+        view.read(cx).visible_order(&self.keymap_registry).len()
     }
 
     /// The registry entry the browse cursor is on (same visible order the body
     /// renders), or `None`.
     fn keymap_cursor_entry(&self, view: &Entity<KeymapView>, cx: &GpuiApp) -> Option<usize> {
-        let (filter, cursor) = {
-            let v = view.read(cx);
-            (v.filter().to_string(), v.cursor())
-        };
-        keymap_visible_order(&self.keymap_registry, &filter)
-            .get(cursor)
-            .copied()
+        let v = view.read(cx);
+        v.visible_order(&self.keymap_registry).get(v.cursor()).copied()
     }
 
     /// Rebuild the app keymap from the current registry (also the restore path

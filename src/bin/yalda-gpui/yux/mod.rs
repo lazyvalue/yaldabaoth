@@ -24,6 +24,9 @@
 //! 5. **Single-line text input** (`line_input`) — `LineInput` (the lib-crate
 //!    model: text + caret + one key policy) and `LINE_INPUT_CARET`. Every
 //!    query / filter / rename field is one; never hand-roll `push`/`pop`.
+//! 6. **Keyed memo** (`memo`) — `KeyedMemo` + `fingerprint_strs`: a one-slot
+//!    memo for a derived match list / ranking keyed on (query, source
+//!    generation), so renders reuse it instead of re-filtering every frame.
 //!
 //! Read `yux/CLAUDE.md` before adding to it: it states the rules (state
 //! encapsulation, the never-notify-in-render law, the render-count test) and
@@ -34,9 +37,11 @@ mod detail;
 mod display_text;
 mod line_input;
 mod list;
+mod memo;
 
 pub(crate) use cached::*;
 pub(crate) use detail::*;
 pub(crate) use display_text::*;
 pub(crate) use line_input::*;
 pub(crate) use list::*;
+pub(crate) use memo::*;

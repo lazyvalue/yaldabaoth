@@ -268,6 +268,9 @@ impl BindingEntry {
 /// applies at boot and what the reference tile rebinds at runtime.
 pub(crate) struct KeymapRegistry {
     pub entries: Vec<BindingEntry>,
+    /// Bumped on every binding mutation (rebind / reset / overrides) — the
+    /// source generation the reference tile's filter memo keys on (A9).
+    generation: u64,
 }
 
 /// Persisted override — keyed by (action, context, default) so it survives table
@@ -279,6 +282,13 @@ struct PersistedOverride {
     context: Option<String>,
     default_keystrokes: String,
     keystrokes: String,
+}
+
+/// Process-unique registry generations, so even a freshly constructed
+/// registry never collides with a memo key from a previous one.
+fn next_keymap_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl KeymapRegistry {
@@ -304,10 +314,19 @@ impl KeymapRegistry {
                 desc: d.desc,
             })
             .collect();
-        KeymapRegistry { entries }
+        KeymapRegistry {
+            entries,
+            generation: next_keymap_generation(),
+        }
+    }
+
+    /// Monotonic mutation counter (see the field).
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
     }
 
     fn apply_overrides(&mut self, overrides: Vec<PersistedOverride>) {
+        self.generation = next_keymap_generation();
         for ov in overrides {
             if let Some(e) = self.entries.iter_mut().find(|e| {
                 e.action == ov.action
@@ -366,6 +385,7 @@ impl KeymapRegistry {
         }
         if let Some(e) = self.entries.iter_mut().find(|e| e.idx == idx) {
             e.keystrokes = keystrokes.to_string();
+            self.generation = next_keymap_generation();
             true
         } else {
             false
@@ -376,11 +396,13 @@ impl KeymapRegistry {
     pub(crate) fn reset(&mut self, idx: usize) {
         if let Some(e) = self.entries.iter_mut().find(|e| e.idx == idx) {
             e.keystrokes = e.default_keystrokes.to_string();
+            self.generation = next_keymap_generation();
         }
     }
 
     /// Restore every entry to its default.
     pub(crate) fn reset_all(&mut self) {
+        self.generation = next_keymap_generation();
         for e in self.entries.iter_mut() {
             e.keystrokes = e.default_keystrokes.to_string();
         }
