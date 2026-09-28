@@ -1,7 +1,7 @@
 # Diff Review Tile (`App::Diff`)
 
-**Status:** DRAFT (rev 2 — worktree-bound review with stored comments; supersedes
-the rev-1 session-bound design. See ADR-0039.)
+**Status:** ACTIVE (rev 2 implemented via Cog graph `8g7` — worktree-bound review
+with stored comments; supersedes rev 1. See ADR-0039 and `docs/components/diff.md`.)
 **Last updated:** 2026-09-27
 
 ## Builds On
@@ -55,7 +55,7 @@ uncommitted + untracked), base = the repo's default branch.
 
 ## Behaviors
 
-- **B1. Pick a worktree. [DRAFT]** An unbound tile renders the **worktree
+- **B1. Pick a worktree. [ACTIVE]** An unbound tile renders the **worktree
   picker**: every entry of `git worktree list --porcelain` for the repo
   containing the active workspace's cwd (fallback: process cwd), one row each
   — branch name prominent, path dimmed (home-relative), primary checkout
@@ -65,7 +65,7 @@ uncommitted + untracked), base = the repo's default branch.
   worktree` returns a bound tile to the picker. A deleted/invalid worktree
   renders an inline error with a "Pick another worktree" hint, never a panic.
 
-- **B2. Read the diff. [DRAFT]** A bound tile shows a header (branch, base,
+- **B2. Read the diff. [ACTIVE]** A bound tile shows a header (branch, base,
   `N/M files viewed` progress, `K unsent comments`) and, per file, a file header
   row (status glyph, path, `+a −r`, Viewed checkbox) followed by its diff lines
   in monospace with add/remove backgrounds and old/new line-number gutters. A
@@ -77,13 +77,13 @@ uncommitted + untracked), base = the repo's default branch.
   `git add -N`). Text zoom scales the diff body; chrome stays fixed. Empty diff
   ⇒ "No changes on <branch> vs <base>."
 
-- **B3. Refresh. [DRAFT]** The diff re-derives by re-running git (async, off
+- **B3. Refresh. [ACTIVE]** The diff re-derives by re-running git (async, off
   the paint path) when the tile **gains focus** and on `r`. The previous model
   stays on screen until the new one lands (a quiet "refreshing" indicator in
   the header). The cursor stays on the same file + nearest line after a
   refresh. There are no session-driven triggers.
 
-- **B4. Viewed files. [DRAFT]** `v` (or clicking the checkbox) toggles
+- **B4. Viewed files. [ACTIVE]** `v` (or clicking the checkbox) toggles
   **Viewed** on the file under the cursor. A viewed file collapses to its
   header row, dimmed, with a check. Viewed-ness is keyed by `path + file_hash`
   (hash of the file's diff content lines, position-independent), so **any
@@ -91,7 +91,7 @@ uncommitted + untracked), base = the repo's default branch.
   Marking a file viewed moves the cursor to the next unviewed file. When every
   file is viewed the header reads "All files viewed ✓".
 
-- **B5. Comments. [DRAFT]** `c` on the cursor line opens a comment compose
+- **B5. Comments. [ACTIVE]** `c` on the cursor line opens a comment compose
   pinned at the bottom of the tile, captioned with its anchor
   ("commenting on src/foo.rs:40–46"), while the anchored lines stay highlighted
   in the diff; `V` starts a line-range selection (extend with `j`/`k`, confined
@@ -129,10 +129,10 @@ uncommitted + untracked), base = the repo's default branch.
   comments can be re-sent explicitly (`S` = send all, including sent; with no
   comments at all: "No comments.").
 
-- **B7. Open in Zed. [DRAFT]** `o` spawns `zed <abs-path>:<cursor line>`
+- **B7. Open in Zed. [ACTIVE]** `o` spawns `zed <abs-path>:<cursor line>`
   fire-and-forget; a missing `zed` shows a status hint.
 
-- **B8. Leaders. [DRAFT]** Space = tile verbs (Switch worktree, Refresh, Send
+- **B8. Leaders. [ACTIVE]** Space = tile verbs (Switch worktree, Refresh, Send
   comments…, Open in Zed); `.` = shell verbs (ADR-0032). The comment compose and
   the send picker are the tile's only text-input surfaces.
 
@@ -274,3 +274,6 @@ are **removed** (ADR-0039).
   session via a `cmd-p`-style picker defaulting to the last session sent to,
   pointing the agent at the file + comment ids; refresh on focus + `r`. Merge
   gate, hook, `--hash-diff`, session triggers, and unreviewed badge deleted.
+- 2026-09-27 — rev 2 implemented (graph `8g7`), DRAFT → ACTIVE. Deviations are
+  recorded per-UXI in `docs/components/diff.md` (bottom-pinned compose,
+  uniform-row virtualization ⇒ long lines truncate, send picker session universe).
