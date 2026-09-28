@@ -31197,3 +31197,167 @@ fn diff_send_picker_query_is_render_flat_and_filters(cx: &mut TestAppContext) {
         assert_eq!(v.diff_tile_ref(id).unwrap().unsent_count(), 1, "closing sends nothing");
     });
 }
+
+// =============================================================================
+// Text-editing review P2 (graph exa node p2-engine): B1 + D1 on the REAL paths
+// =============================================================================
+
+/// B1 on the REAL buffer-edit keystroke path (`handle_edit_key` →
+/// `dispatch_insert_core` Key::Delete → `delete_char_at_cursor`): a forward
+/// Delete inside an insert session used to REPLACE the session's open undo
+/// group, so `u` afterwards reverted only the Delete and left the typed text.
+/// With the fix one `u` reverts the whole session.
+///
+/// Negative control (observed RED): make `Document::begin_undo_group` always
+/// open a fresh group (drop the `if self.pending_undo.is_some()` early return)
+/// → the buffer after `u` is "heablclo\n"-shaped, not "hello\n".
+#[gpui::test]
+fn edit_insert_delete_then_undo_reverts_whole_session(cx: &mut TestAppContext) {
+    use yalda::editor::EditAccess;
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let fh = cx.focus_handle();
+        fh.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            fh,
+        )
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |v, _| v.test_open_edit("hello\n"));
+    let key = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext, k: &str| {
+        view.update_in(vcx, |v, w, cx| v.handle_edit_key(&ws_bare_key(k), w, cx));
+    };
+    let text = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.update(vcx, |v, _| {
+            v.edit_mut()
+                .unwrap()
+                .editor
+                .read_core(|c| c.document().full_text())
+        })
+    };
+    // Normal mode, caret to col 2, then a real insert session.
+    key(&view, vcx, "escape");
+    key(&view, vcx, "l");
+    key(&view, vcx, "l");
+    key(&view, vcx, "i");
+    for k in ["a", "b", "delete", "c"] {
+        key(&view, vcx, k);
+    }
+    key(&view, vcx, "escape");
+    assert_eq!(text(&view, vcx), "heabclo\n");
+    key(&view, vcx, "u");
+    assert_eq!(
+        text(&view, vcx),
+        "hello\n",
+        "one `u` must revert the whole insert session including the Delete"
+    );
+}
+
+/// B1 (caret rule) on the REAL buffer-edit path: forward Delete of the last
+/// char in Insert mode leaves the caret AT EOL — the Normal-mode clamp onto
+/// the last char must not apply in Insert.
+///
+/// Negative control (observed RED): route the Insert-mode `Key::Delete` arm
+/// back to the Normal-mode `delete_char_at_cursor` (which clamps onto the last
+/// char) → caret col 1, not 2.
+#[gpui::test]
+fn edit_insert_delete_last_char_keeps_caret_at_eol(cx: &mut TestAppContext) {
+    use crate::EditOps;
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let fh = cx.focus_handle();
+        fh.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            fh,
+        )
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |v, _| v.test_open_edit("abc\nxyz\n"));
+    for k in ["right", "right", "delete"] {
+        view.update_in(vcx, |v, w, cx| v.handle_edit_key(&ws_bare_key(k), w, cx));
+    }
+    let (line, col) = view.update(vcx, |v, _| {
+        let e = v.edit_mut().unwrap();
+        (e.editor.line_text_at_cursor(), e.editor.cursor().col)
+    });
+    assert_eq!(line, "ab\n");
+    assert_eq!(col, 2, "Insert-mode caret stays at EOL after Delete");
+}
+
+/// Type `hello` into the chatbox compose through the REAL `handle_claude_key`
+/// path, step the caret back two columns, and put `XY` on the clipboard.
+fn compose_hello_caret_at_3(
+    cx: &mut TestAppContext,
+) -> (gpui::Entity<YaldaGpuiView>, &mut gpui::VisualTestContext, crate::SessionId) {
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_worksheet_nav(cx);
+    let id = view.update(vcx, |v, _| v.focused_bound_session().expect("bound"));
+    // `i` opens the tail You-block in Insert (no undo group is opened — the
+    // compose Insert session is group-less), then type through the real path.
+    for k in ["i", "h", "e", "l", "l", "o", "left", "left"] {
+        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(k), w, cx));
+    }
+    view.update(vcx, |_, cx| {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("XY".into()))
+    });
+    (view, vcx, id)
+}
+
+fn compose_text_and_col(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+    id: crate::SessionId,
+) -> (String, usize) {
+    view.update(vcx, |v, cx| {
+        v.read_session(id, cx, |c| {
+            let cb = c.input_surface.compose();
+            (cb.text(), cb.editor.cursor().col)
+        })
+        .expect("session")
+    })
+}
+
+/// D1 on the REAL Cmd+V path (`cmd-v` → `PasteFromClipboard` →
+/// `paste_from_clipboard`): an Insert-mode paste lands AT the caret, the caret
+/// ends after the pasted text, and the paste is ONE undo step (the old
+/// char-by-char insert in the group-less chatbox Insert session recorded no
+/// undo at all, so `undo` left the pasted text in place).
+///
+/// Negative control (observed RED): restore the per-char `insert_char` loop in
+/// `paste_from_clipboard` → after undo the compose still reads "helXYlo".
+#[gpui::test]
+fn compose_cmd_v_pastes_at_caret_as_one_undo_step(cx: &mut TestAppContext) {
+    let (view, vcx, id) = compose_hello_caret_at_3(cx);
+    assert_eq!(compose_text_and_col(&view, vcx, id), ("hello".into(), 3));
+    vcx.simulate_keystrokes("cmd-v");
+    vcx.run_until_parked();
+    assert_eq!(
+        compose_text_and_col(&view, vcx, id),
+        ("helXYlo".into(), 5),
+        "paste lands at the caret; caret after the pasted run"
+    );
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| c.input_surface.compose_mut().editor.undo())
+    });
+    assert_eq!(
+        compose_text_and_col(&view, vcx, id).0,
+        "hello",
+        "one undo removes exactly the paste"
+    );
+}
+
+/// D1 on `paste_into_compose` (the agent key-handler's Cmd+V branch): in
+/// Insert mode it used vim `p` rules (`put_text(before=false)`) — the text went
+/// one char RIGHT of the caret. It must paste AT the caret like every other
+/// Insert-mode paste.
+///
+/// Negative control (observed RED): route Insert mode back through
+/// `Self::put_text(&mut cb.editor, &text, false)` → compose reads "hellXYo".
+#[gpui::test]
+fn paste_into_compose_in_insert_pastes_at_caret(cx: &mut TestAppContext) {
+    let (view, vcx, id) = compose_hello_caret_at_3(cx);
+    view.update(vcx, |v, cx| v.paste_into_compose(cx));
+    assert_eq!(compose_text_and_col(&view, vcx, id), ("helXYlo".into(), 5));
+}

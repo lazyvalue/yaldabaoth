@@ -1068,6 +1068,7 @@ impl SharedEditor {
 
     // --- Mutations that EditState drives directly ---
 
+    #[cfg(test)]
     fn insert_char(&mut self, ch: char) {
         self.view.insert_char(&mut self.core.borrow_mut(), ch);
     }
@@ -1218,8 +1219,23 @@ trait EditOps: EditAccess {
     fn backspace(&mut self) {
         self.edit(|v, c| v.backspace(c));
     }
+    /// Bulk typed insert at the caret (B10) — same result as `insert_char`
+    /// per char, one guard / shift / splice.
+    fn insert_str(&mut self, text: &str) {
+        self.edit(|v, c| v.insert_str(c, text));
+    }
+    /// Insert-mode paste at the caret as one undo step (D1).
+    fn paste_str(&mut self, text: &str) {
+        self.edit(|v, c| v.paste_str(c, text));
+    }
+    fn delete_back_in_line(&mut self, n: usize) {
+        self.edit(|v, c| v.delete_back_in_line(c, n));
+    }
     fn delete_char_at_cursor(&mut self) {
         self.edit(|v, c| v.delete_char_at_cursor(c));
+    }
+    fn delete_forward_in_insert(&mut self) {
+        self.edit(|v, c| v.delete_forward_in_insert(c));
     }
     fn delete_current_line(&mut self) {
         self.edit(|v, c| v.delete_current_line(c));
@@ -4224,9 +4240,7 @@ impl YaldaGpuiView {
                 // is read-only in both placements — INV-1).
                 let cb = c.input_surface.compose_mut();
                 if cb.mode == EditMode::Insert {
-                    for ch in text.chars() {
-                        cb.editor.insert_char(ch);
-                    }
+                    cb.editor.paste_str(&text);
                     true
                 } else {
                     false
@@ -4236,9 +4250,7 @@ impl YaldaGpuiView {
             Some(TextInputTarget::Edit) => match self.workspace.focused_content_mut() {
                 Some(App::Buffer(BufferApp::Editing(e))) => {
                     if e.mode == EditMode::Insert {
-                        for ch in text.chars() {
-                            e.editor.insert_char(ch);
-                        }
+                        e.editor.paste_str(&text);
                         true
                     } else {
                         false

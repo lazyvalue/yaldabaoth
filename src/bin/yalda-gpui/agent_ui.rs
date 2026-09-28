@@ -6654,7 +6654,13 @@ impl YaldaGpuiView {
                 && let Some(mut c) = self.agent_mut(cx)
             {
                 let cb = c.input_surface.compose_mut();
-                Self::put_text(&mut cb.editor, &text, false);
+                // D1: Insert mode pastes AT the caret (caret after the text, one
+                // undo step) — only Normal mode uses the vim `p` rules.
+                if cb.mode == EditMode::Insert {
+                    cb.editor.paste_str(&text);
+                } else {
+                    Self::put_text(&mut cb.editor, &text, false);
+                }
             }
         }
         cx.notify();

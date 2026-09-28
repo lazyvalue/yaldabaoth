@@ -105,31 +105,32 @@ impl LineAnchorStore {
         if deleted_nl == 0 {
             return Vec::new();
         }
-        let start_line_consumed = start_col == 0;
+        // B11: like `shift_for_insert`, touch only the affected tail — lines
+        // above `start_line` keep their anchors in place, so a delete near EOF
+        // (the common streaming/compose case) is O(affected) not O(anchors).
+        let first_consumed = if start_col == 0 { start_line } else { start_line + 1 };
+        let last_consumed = start_line + deleted_nl; // inclusive
+        let affected: Vec<(usize, LineAnchor)> = self
+            .by_line
+            .range(first_consumed..)
+            .map(|(&line, &a)| (line, a))
+            .collect();
         let mut dropped = Vec::new();
-        let mut new_by_anchor: BTreeMap<LineAnchor, usize> = BTreeMap::new();
-        let mut new_by_line: BTreeMap<usize, LineAnchor> = BTreeMap::new();
-        for (&a, &line) in self.by_anchor.iter() {
-            if line < start_line {
-                new_by_anchor.insert(a, line);
-                new_by_line.insert(line, a);
-            } else if line == start_line {
-                if start_line_consumed {
-                    dropped.push(a);
-                } else {
-                    new_by_anchor.insert(a, line);
-                    new_by_line.insert(line, a);
-                }
-            } else if line <= start_line + deleted_nl {
+        // Remove every affected entry first, then re-insert the survivors at
+        // their shifted lines — no transient key collisions in `by_line`.
+        for &(line, _) in &affected {
+            self.by_line.remove(&line);
+        }
+        for (line, a) in affected {
+            if line <= last_consumed {
+                self.by_anchor.remove(&a);
                 dropped.push(a);
             } else {
                 let nl = line - deleted_nl;
-                new_by_anchor.insert(a, nl);
-                new_by_line.insert(nl, a);
+                self.by_line.insert(nl, a);
+                self.by_anchor.insert(a, nl);
             }
         }
-        self.by_anchor = new_by_anchor;
-        self.by_line = new_by_line;
         dropped
     }
 }
@@ -563,18 +564,17 @@ impl EditorCore {
         self.last_llm_open = false;
     }
 
-    /// True if `line` is in any frozen range.
+    /// True if `line` is in any frozen range. B13: `frozen_lines` is sorted
+    /// and non-overlapping, so this is a binary search, not a linear scan.
     pub fn is_frozen_line(&self, line: usize) -> bool {
-        self.frozen_lines
-            .iter()
-            .any(|&(s, e)| line >= s && line < e)
+        range_containing(&self.frozen_lines, line).is_some()
     }
 
     /// True if `char_idx` falls within any frozen line. Boundary semantics:
     /// the very first char of a frozen line counts as inside; the trailing
     /// newline of a frozen line is part of that line.
     pub fn is_in_frozen_range(&self, char_idx: usize) -> bool {
-        let (line, _) = char_to_line_col(&self.document, char_idx);
+        let (line, _) = self.document.line_col_of_char(char_idx);
         self.is_frozen_line(line)
     }
 
@@ -600,12 +600,10 @@ impl EditorCore {
         if ch != '\n' {
             return false;
         }
-        let line_len = self.document.line_len_chars(line);
-        let line_end = line_len.saturating_sub(if self.document.line_text(line).ends_with('\n') {
-            1
-        } else {
-            0
-        });
+        // B3: `line_len_chars` already excludes the trailing '\n' — the visible
+        // end IS the line length (subtracting the newline again let Enter split
+        // a frozen line one char before its end).
+        let line_end = self.document.line_len_chars(line);
         let at_line_start = col == 0;
         let at_line_end = col >= line_end;
         if !(at_line_start || at_line_end) {
@@ -613,7 +611,7 @@ impl EditorCore {
         }
         // Atomic-block interior guard: if this line belongs to an atomic block,
         // only its outer boundaries are insertable.
-        if let Some(&(s, e)) = self.atomic_blocks.iter().find(|&&(s, e)| line >= s && line < e) {
+        if let Some((s, e)) = range_containing(&self.atomic_blocks, line) {
             let above_block = at_line_start && line == s;
             let below_block = at_line_end && line + 1 == e;
             return above_block || below_block;
@@ -630,31 +628,27 @@ impl EditorCore {
         if del_s >= del_e {
             return true;
         }
-        let (start_line, _) = char_to_line_col(&self.document, del_s);
+        let (start_line, _) = self.document.line_col_of_char(del_s);
         if start_line < self.lockable_through_line {
             return false;
         }
+        // B13: one range-overlap test instead of a per-char `is_frozen_line`
+        // loop. The deleted chars live on lines `start_line..=last_line`; if the
+        // final deleted char is a '\n' the line after it would be joined in, so
+        // it must be editable too.
         let rope = self.document.rope();
-        let mut line = start_line;
-        let mut idx = del_s;
-        let line_count = self.document.line_count();
-        while idx < del_e {
-            if self.is_frozen_line(line) {
-                return false;
-            }
-            let ch = match rope.get_char(idx) {
-                Some(c) => c,
-                None => break,
-            };
-            if ch == '\n' && line + 1 < line_count {
-                if self.is_frozen_line(line + 1) {
-                    return false;
-                }
-                line += 1;
-            }
-            idx += 1;
+        let end = del_e.min(rope.len_chars());
+        if del_s >= end {
+            // Nothing real to delete (past EOF): only the start line's own
+            // frozen state decides, as before.
+            return !self.is_frozen_line(start_line);
         }
-        true
+        let last = end - 1;
+        let mut hi = rope.char_to_line(last);
+        if rope.char(last) == '\n' && hi + 1 < self.document.line_count() {
+            hi += 1;
+        }
+        !ranges_overlap(&self.frozen_lines, start_line, hi)
     }
 
     /// Recompute frozen line ranges after inserting `text` at `(line, col)`.
@@ -663,17 +657,43 @@ impl EditorCore {
         if inserted_nl == 0 {
             return;
         }
-
         // Normalize: inserting at-or-past the visible end of a line is
         // identical (in the rope) to inserting at the start of the next line.
-        let line_text = self.document.line_text(line);
-        let visible_len = line_text.trim_end_matches('\n').chars().count();
+        let visible_len = self.document.line_len_chars(line);
         let (eff_line, eff_col) = if col >= visible_len {
             (line + 1, 0)
         } else {
             (line, col)
         };
+        self.shift_frozen_at(eff_line, eff_col, inserted_nl);
+    }
 
+    /// B10: the frozen/anchor shift for a TYPED run `text` inserted at
+    /// `(line, col)` — equal to the net effect of inserting it char-by-char
+    /// (which is what paste/put/seed did before the bulk path). The only way a
+    /// typed run differs from a programmatic block insert is where its FIRST
+    /// line break lands: after the chars that precede it, so a run that starts
+    /// with text at col 0 splits the line mid-way (the line keeps its anchor)
+    /// instead of pushing the whole line down.
+    fn shift_frozen_lines_for_typed_insert(&mut self, line: usize, col: usize, text: &str) {
+        let inserted_nl = text.chars().filter(|c| *c == '\n').count();
+        if inserted_nl == 0 {
+            return;
+        }
+        let prefix = text.chars().take_while(|c| *c != '\n').count();
+        let visible_len = self.document.line_len_chars(line);
+        let (eff_line, eff_col) = if col >= visible_len {
+            (line + 1, 0)
+        } else {
+            (line, col + prefix)
+        };
+        self.shift_frozen_at(eff_line, eff_col, inserted_nl);
+    }
+
+    /// Shift frozen ranges, the locked prefix, atomic blocks, anchors and the
+    /// LLM-tail hint for `inserted_nl` line breaks inserted at the normalized
+    /// position `(eff_line, eff_col)`.
+    fn shift_frozen_at(&mut self, eff_line: usize, eff_col: usize, inserted_nl: usize) {
         let mut new_ranges: Vec<(usize, usize)> = Vec::with_capacity(self.frozen_lines.len() + 1);
         for &(s, e) in self.frozen_lines.iter() {
             if e <= eff_line {
@@ -732,22 +752,25 @@ impl EditorCore {
             return;
         }
         let rope = self.document.rope();
-        let mut deleted_nl = 0usize;
-        for i in del_s..del_e {
-            if rope.get_char(i) == Some('\n') {
-                deleted_nl += 1;
-            }
+        let end = del_e.min(rope.len_chars());
+        if del_s >= end {
+            return;
         }
+        let deleted_nl = rope.slice(del_s..end).chars().filter(|c| *c == '\n').count();
         if deleted_nl == 0 {
             return;
         }
-        let (start_line, start_col) = char_to_line_col(&self.document, del_s);
+        let (start_line, start_col) = self.document.line_col_of_char(del_s);
         for (s, e) in self.frozen_lines.iter_mut() {
             if *s > start_line {
                 *s = s.saturating_sub(deleted_nl);
                 *e = e.saturating_sub(deleted_nl);
             }
         }
+        // A programmatic delete (no frozen guard) can collapse or overlap
+        // ranges; keep the sorted/non-overlapping invariant the binary searches
+        // in `is_frozen_line` / `can_delete_range` rely on (B13).
+        normalize_ranges(&mut self.frozen_lines);
         // Atomic blocks mirror the frozen-range shift (a delete can never touch a
         // frozen/atomic line per `can_delete_range`, so a block only moves up
         // when editable lines above it are removed).
@@ -790,7 +813,7 @@ impl EditorCore {
     /// Programmatic insert (bypasses lockable guard). Used by app.rs to push
     /// Claude replies into the *claude* buffer.
     pub fn programmatic_insert(&mut self, char_idx: usize, text: &str) {
-        let (line, col) = char_to_line_col(&self.document, char_idx);
+        let (line, col) = self.document.line_col_of_char(char_idx);
         self.shift_frozen_lines_for_insert(line, col, text);
         // NON-undoable: agent/programmatic content must never be reachable by
         // the user's undo (else a chunk streamed while the user is mid-insert
@@ -1105,6 +1128,7 @@ impl EditorView {
         let Some(((sl, sc), (el, ec))) = self.selection_range() else {
             return false;
         };
+        // The caret lands on the (clamped) selection start = `start` below.
         let start = core.document.line_col_to_char(sl, sc);
         let mut end = core.document.line_col_to_char(el, ec);
         if start == end {
@@ -1117,32 +1141,17 @@ impl EditorView {
             self.selection_anchor = None;
             return false;
         }
+        self.selection_anchor = None;
         if !core.can_delete_range(start, end) {
-            self.selection_anchor = None;
             return false;
         }
-        core.document.begin_undo_group(
-            self.cursor.line,
-            self.cursor.col,
-            &core.frozen_lines,
-            core.lockable_through_line,
-        );
-        core.shift_frozen_lines_for_delete(start, end);
-        core.document.delete_range(start, end);
-        self.cursor.line = sl;
-        self.cursor.col = sc;
-        let line_count = core.document.line_count();
-        if self.cursor.line >= line_count {
-            self.cursor.line = line_count.saturating_sub(1);
-        }
-        let line_len = core.document.line_len_chars(self.cursor.line);
-        if self.cursor.col > line_len {
-            self.cursor.col = line_len;
-        }
-        self.selection_anchor = None;
-        core.document
-            .end_undo_group(self.cursor.line, self.cursor.col);
-        core.reparse();
+        self.grouped(core, |v, core| {
+            core.shift_frozen_lines_for_delete(start, end);
+            core.document.delete_range(start, end);
+            let (l, c) = core.document.line_col_of_char(start);
+            v.cursor.line = l;
+            v.cursor.col = c;
+        });
         true
     }
 
@@ -1164,14 +1173,51 @@ impl EditorView {
 
     // --- Insert / delete mutations ---
 
-    pub fn begin_insert(&mut self, core: &mut EditorCore) {
-        self.in_insert_mode = true;
+    /// Open an undo group at the cursor unless one is already open (B1).
+    /// Returns whether THIS call opened it.
+    fn open_group(&self, core: &mut EditorCore) -> bool {
         core.document.begin_undo_group(
             self.cursor.line,
             self.cursor.col,
             &core.frozen_lines,
             core.lockable_through_line,
-        );
+        )
+    }
+
+    /// Run a discrete edit as one undo step: opens a group if none is open,
+    /// runs `f`, closes the group only if this call opened it, then reparses.
+    /// Inside an insert session (group already open) the edit joins the
+    /// session instead of clobbering it (B1).
+    fn grouped(&mut self, core: &mut EditorCore, f: impl FnOnce(&mut Self, &mut EditorCore)) {
+        let opened = self.open_group(core);
+        f(self, core);
+        if opened {
+            core.document
+                .end_undo_group(self.cursor.line, self.cursor.col);
+        }
+        core.reparse();
+    }
+
+    /// Guarded delete of the char range `[del_s, del_e)`: checks the frozen /
+    /// locked-prefix guard on EXACTLY this range, shifts frozen state for it,
+    /// removes it, and parks the caret at `del_s`. The single primitive behind
+    /// backspace / Delete / `dd`, so the range that is validated is always the
+    /// range that is deleted (B4, B5). Returns false (no-op) if rejected.
+    fn delete_chars(&mut self, core: &mut EditorCore, del_s: usize, del_e: usize) -> bool {
+        if del_s >= del_e || !core.can_delete_range(del_s, del_e) {
+            return false;
+        }
+        core.shift_frozen_lines_for_delete(del_s, del_e);
+        core.document.delete_range(del_s, del_e);
+        let (l, c) = core.document.line_col_of_char(del_s);
+        self.cursor.line = l;
+        self.cursor.col = c;
+        true
+    }
+
+    pub fn begin_insert(&mut self, core: &mut EditorCore) {
+        self.in_insert_mode = true;
+        self.open_group(core);
     }
 
     pub fn end_insert(&mut self, core: &mut EditorCore) {
@@ -1198,6 +1244,52 @@ impl EditorView {
         }
     }
 
+    /// B10: insert a whole run of typed text at the caret — the bulk form of
+    /// calling [`insert_char`](Self::insert_char) once per char. When the caret
+    /// line is editable and past the locked prefix, every char of the run is
+    /// insertable (a split editable line stays editable), so the run is guarded
+    /// ONCE, frozen state is shifted ONCE, and the rope takes ONE insert (one
+    /// undo splice). Otherwise (frozen / locked caret line, where individual
+    /// chars may be rejected) it falls back to the per-char path, which is
+    /// exactly the previous behaviour. Caret lands just after the run.
+    pub fn insert_str(&mut self, core: &mut EditorCore, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let (line, col) = (self.cursor.line, self.cursor.col);
+        if line < core.lockable_through_line || core.is_frozen_line(line) {
+            for ch in text.chars() {
+                self.insert_char(core, ch);
+            }
+            return;
+        }
+        let idx = core.document.line_col_to_char(line, col);
+        core.shift_frozen_lines_for_typed_insert(line, col, text);
+        core.document.insert_str_at_char(idx, text);
+        let (l, c) = core
+            .document
+            .line_col_of_char(idx + text.chars().count());
+        self.cursor.line = l;
+        self.cursor.col = c;
+    }
+
+    /// Insert-mode paste (D1): put `text` AT the caret (no vim `p` step right,
+    /// no step back), caret after the pasted run, as one bulk splice. Joins the
+    /// open insert session's undo group if there is one; otherwise the paste is
+    /// its own undo step.
+    pub fn paste_str(&mut self, core: &mut EditorCore, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let opened = self.open_group(core);
+        self.insert_str(core, text);
+        if opened {
+            core.document
+                .end_undo_group(self.cursor.line, self.cursor.col);
+            core.reparse();
+        }
+    }
+
     pub fn backspace(&mut self, core: &mut EditorCore) {
         let char_idx = core
             .document
@@ -1205,51 +1297,59 @@ impl EditorView {
         if char_idx == 0 {
             return;
         }
-        let del_s = char_idx - 1;
-        let del_e = char_idx;
-        if !core.can_delete_range(del_s, del_e) {
-            return;
-        }
-        core.shift_frozen_lines_for_delete(del_s, del_e);
-        if self.cursor.col > 0 {
-            self.cursor.col -= 1;
-            core.document.delete_char(self.cursor.line, self.cursor.col);
-        } else if self.cursor.line > 0 {
-            let prev_line_len = core.document.line_len_chars(self.cursor.line - 1);
-            self.cursor.line -= 1;
-            self.cursor.col = prev_line_len;
-            core.document.delete_char(self.cursor.line, self.cursor.col);
-        }
+        // B5: delete the SAME clamped range the guard validated (the caret col
+        // may be stale past EOL; the old code validated `[idx-1, idx)` but then
+        // deleted at the unclamped `col - 1`, i.e. the line's '\n').
+        self.delete_chars(core, char_idx - 1, char_idx);
     }
 
+    /// Delete the `n` chars before the caret on its line (e.g. wiping an empty
+    /// list item's marker) as one guarded range — the bulk form of `n`
+    /// backspaces within a line (B10). Clamped to the line start.
+    pub fn delete_back_in_line(&mut self, core: &mut EditorCore, n: usize) {
+        let col = self.cursor.col.min(core.document.line_len_chars(self.cursor.line));
+        let n = n.min(col);
+        if n == 0 {
+            return;
+        }
+        let idx = core.document.line_col_to_char(self.cursor.line, col);
+        self.delete_chars(core, idx - n, idx);
+    }
+
+    /// Normal-mode `x`: delete the char under the caret; the caret then sits
+    /// on the (new) last char if it was at the end of the line.
     pub fn delete_char_at_cursor(&mut self, core: &mut EditorCore) {
+        self.delete_under_caret(core, false);
+    }
+
+    /// Insert-mode forward Delete (B1): same delete, but the caret may rest at
+    /// EOL (Insert rule) and, inside an insert session, the edit joins the
+    /// session's open undo group instead of replacing it.
+    pub fn delete_forward_in_insert(&mut self, core: &mut EditorCore) {
+        self.delete_under_caret(core, true);
+    }
+
+    fn delete_under_caret(&mut self, core: &mut EditorCore, insert_mode: bool) {
         let char_idx = core
             .document
             .line_col_to_char(self.cursor.line, self.cursor.col);
-        let rope_len = core.document.rope().len_chars();
-        if char_idx >= rope_len {
+        if char_idx >= core.document.rope().len_chars()
+            || !core.can_delete_range(char_idx, char_idx + 1)
+        {
             return;
         }
-        let del_s = char_idx;
-        let del_e = char_idx + 1;
-        if !core.can_delete_range(del_s, del_e) {
-            return;
-        }
-        core.document.begin_undo_group(
-            self.cursor.line,
-            self.cursor.col,
-            &core.frozen_lines,
-            core.lockable_through_line,
-        );
-        core.shift_frozen_lines_for_delete(del_s, del_e);
-        core.document.delete_char(self.cursor.line, self.cursor.col);
-        let line_len = core.document.line_len_chars(self.cursor.line);
-        if self.cursor.col >= line_len && line_len > 0 {
-            self.cursor.col = line_len - 1;
-        }
-        core.document
-            .end_undo_group(self.cursor.line, self.cursor.col);
-        core.reparse();
+        self.grouped(core, |v, core| {
+            let (line, col) = (v.cursor.line, v.cursor.col);
+            v.delete_chars(core, char_idx, char_idx + 1);
+            v.cursor.line = line;
+            v.cursor.col = col;
+            if !insert_mode {
+                let line_len = core.document.line_len_chars(line);
+                if col >= line_len && line_len > 0 {
+                    v.cursor.col = line_len - 1;
+                }
+            }
+        });
     }
 
     /// Replace the single character under the cursor with `ch` (vim `r`),
@@ -1268,49 +1368,32 @@ impl EditorView {
         {
             return;
         }
-        core.document.begin_undo_group(
-            line,
-            col,
-            &core.frozen_lines,
-            core.lockable_through_line,
-        );
-        core.shift_frozen_lines_for_delete(char_idx, char_idx + 1);
-        core.document.delete_char(line, col);
-        core.shift_frozen_lines_for_insert(line, col, &ch.to_string());
-        core.document.insert_char(line, col, ch);
-        // Cursor stays on the replaced character (normal-mode position).
-        self.cursor.line = line;
-        self.cursor.col = col;
-        core.document.end_undo_group(line, col);
-        core.reparse();
+        self.grouped(core, |v, core| {
+            core.shift_frozen_lines_for_delete(char_idx, char_idx + 1);
+            core.document.delete_char(line, col);
+            core.shift_frozen_lines_for_insert(line, col, &ch.to_string());
+            core.document.insert_char(line, col, ch);
+            // Cursor stays on the replaced character (normal-mode position).
+            v.cursor.line = line;
+            v.cursor.col = col;
+        });
     }
 
     pub fn delete_current_line(&mut self, core: &mut EditorCore) {
-        let line = self.cursor.line;
-        let line_start = core.document.line_col_to_char(line, 0);
-        let line_end = if line + 1 < core.document.line_count() {
-            core.document.line_col_to_char(line + 1, 0)
-        } else {
-            core.document.rope().len_chars()
+        // B4: compute the range `dd` really removes ONCE (for an empty last
+        // line that is the preceding '\n') and guard + shift + delete exactly it.
+        let Some((s, e)) = core.document.line_delete_range(self.cursor.line) else {
+            return;
         };
-        if !core.can_delete_range(line_start, line_end) {
+        if !core.can_delete_range(s, e) {
             return;
         }
-        core.document.begin_undo_group(
-            self.cursor.line,
-            self.cursor.col,
-            &core.frozen_lines,
-            core.lockable_through_line,
-        );
-        core.shift_frozen_lines_for_delete(line_start, line_end);
-        core.document.delete_line(self.cursor.line);
-        if self.cursor.line >= core.document.line_count() {
-            self.cursor.line = core.document.line_count().saturating_sub(1);
-        }
-        self.cursor.col = 0;
-        core.document
-            .end_undo_group(self.cursor.line, self.cursor.col);
-        core.reparse();
+        self.grouped(core, |v, core| {
+            v.delete_chars(core, s, e);
+            let (l, _) = core.document.line_col_of_char(s);
+            v.cursor.line = l.min(core.document.line_count().saturating_sub(1));
+            v.cursor.col = 0;
+        });
     }
 
     pub fn open_line_below(&mut self, core: &mut EditorCore) {
@@ -1319,12 +1402,7 @@ impl EditorView {
         if !core.can_insert_char_at(line, insert_col, '\n') {
             return;
         }
-        core.document.begin_undo_group(
-            self.cursor.line,
-            self.cursor.col,
-            &core.frozen_lines,
-            core.lockable_through_line,
-        );
+        self.open_group(core);
         core.shift_frozen_lines_for_insert(line, insert_col, "\n");
         core.document.insert_char(line, insert_col, '\n');
         self.cursor.line += 1;
@@ -1336,12 +1414,7 @@ impl EditorView {
         if !core.can_insert_char_at(self.cursor.line, 0, '\n') {
             return;
         }
-        core.document.begin_undo_group(
-            self.cursor.line,
-            self.cursor.col,
-            &core.frozen_lines,
-            core.lockable_through_line,
-        );
+        self.open_group(core);
         core.shift_frozen_lines_for_insert(self.cursor.line, 0, "\n");
         core.document.insert_char(self.cursor.line, 0, '\n');
         self.cursor.col = 0;
@@ -1349,41 +1422,37 @@ impl EditorView {
     }
 
     pub fn undo(&mut self, core: &mut EditorCore) {
-        let cur_frozen = core.frozen_lines.clone();
-        let cur_lockable = core.lockable_through_line;
-        if let Some((line, col, frozen, lockable, shifts)) =
-            core.document.undo(&cur_frozen, cur_lockable)
-        {
-            core.frozen_lines = frozen;
-            core.lockable_through_line = lockable;
-            // C3: SHIFT the anchors to track the rope change (preserving
-            // TurnId/tool metadata) instead of resetting them.
-            core.apply_anchor_shifts(&shifts);
-            self.cursor.line = line.min(core.document.line_count().saturating_sub(1));
-            // `set_col` clears the sticky `desired_col` so the following clamp
-            // restores THIS column, not a stale one from an earlier j/k run.
-            self.cursor.set_col(col);
-            self.clamp_cursor_col(core, false);
-            core.reparse();
-        }
+        self.history_step(core, true);
     }
 
     pub fn redo(&mut self, core: &mut EditorCore) {
+        self.history_step(core, false);
+    }
+
+    /// B16: the one body behind undo and redo — restore the frozen state the
+    /// document hands back, SHIFT the anchors to track the rope change (C3:
+    /// preserving TurnId/tool metadata instead of resetting), and place the
+    /// caret.
+    fn history_step(&mut self, core: &mut EditorCore, undo: bool) {
         let cur_frozen = core.frozen_lines.clone();
         let cur_lockable = core.lockable_through_line;
-        if let Some((line, col, frozen, lockable, shifts)) =
+        let step = if undo {
+            core.document.undo(&cur_frozen, cur_lockable)
+        } else {
             core.document.redo(&cur_frozen, cur_lockable)
-        {
-            core.frozen_lines = frozen;
-            core.lockable_through_line = lockable;
-            core.apply_anchor_shifts(&shifts);
-            self.cursor.line = line.min(core.document.line_count().saturating_sub(1));
-            // `set_col` clears the sticky `desired_col` so the following clamp
-            // restores THIS column, not a stale one from an earlier j/k run.
-            self.cursor.set_col(col);
-            self.clamp_cursor_col(core, false);
-            core.reparse();
-        }
+        };
+        let Some((line, col, frozen, lockable, shifts)) = step else {
+            return;
+        };
+        core.frozen_lines = frozen;
+        core.lockable_through_line = lockable;
+        core.apply_anchor_shifts(&shifts);
+        self.cursor.line = line.min(core.document.line_count().saturating_sub(1));
+        // `set_col` clears the sticky `desired_col` so the following clamp
+        // restores THIS column, not a stale one from an earlier j/k run.
+        self.cursor.set_col(col);
+        self.clamp_cursor_col(core, false);
+        core.reparse();
     }
 
     pub fn active_block_index(&self, core: &EditorCore) -> Option<usize> {
@@ -1572,7 +1641,7 @@ impl Editor {
         self.core.programmatic_insert(char_idx, text);
         let n = text.chars().count();
         if char_idx <= cursor_char {
-            let (l, c) = char_to_line_col(self.core.document(), cursor_char + n);
+            let (l, c) = self.core.document().line_col_of_char(cursor_char + n);
             let cur = self.view.cursor_mut();
             cur.line = l;
             cur.col = c;
@@ -1580,7 +1649,7 @@ impl Editor {
         if let Some(ac) = anchor_char
             && char_idx <= ac
         {
-            let (l, c) = char_to_line_col(self.core.document(), ac + n);
+            let (l, c) = self.core.document().line_col_of_char(ac + n);
             self.view.move_selection_anchor(l, c);
         }
     }
@@ -1611,12 +1680,12 @@ impl Editor {
                 ch
             }
         };
-        let (l, c) = char_to_line_col(self.core.document(), remap(cursor_char));
+        let (l, c) = self.core.document().line_col_of_char(remap(cursor_char));
         let cur = self.view.cursor_mut();
         cur.line = l;
         cur.col = c;
         if let Some(ac) = anchor_char {
-            let (l, c) = char_to_line_col(self.core.document(), remap(ac));
+            let (l, c) = self.core.document().line_col_of_char(remap(ac));
             self.view.move_selection_anchor(l, c);
         }
     }
@@ -1753,8 +1822,8 @@ impl Editor {
         let chunk_chars = chunk.chars().count();
         let chunk_end_char = insertion_char + chunk_chars;
         let doc = self.core.document();
-        let start_line = char_to_line_col(doc, insertion_char).0;
-        let mut end_line = char_to_line_col(doc, chunk_end_char).0;
+        let start_line = doc.line_col_of_char(insertion_char).0;
+        let mut end_line = doc.line_col_of_char(chunk_end_char).0;
         if !chunk.ends_with('\n') {
             end_line += 1;
         }
@@ -2105,8 +2174,24 @@ impl Editor {
         self.view.backspace(&mut self.core);
     }
 
+    pub fn insert_str(&mut self, text: &str) {
+        self.view.insert_str(&mut self.core, text);
+    }
+
+    pub fn paste_str(&mut self, text: &str) {
+        self.view.paste_str(&mut self.core, text);
+    }
+
+    pub fn delete_back_in_line(&mut self, n: usize) {
+        self.view.delete_back_in_line(&mut self.core, n);
+    }
+
     pub fn delete_char_at_cursor(&mut self) {
         self.view.delete_char_at_cursor(&mut self.core);
+    }
+
+    pub fn delete_forward_in_insert(&mut self) {
+        self.view.delete_forward_in_insert(&mut self.core);
     }
 
     pub fn replace_char_at_cursor(&mut self, ch: char) {
@@ -2200,22 +2285,47 @@ impl Editor {
 // Helpers (private to this module)
 // =============================================================================
 
-fn char_to_line_col(doc: &Document, char_idx: usize) -> (usize, usize) {
-    let rope = doc.rope();
-    let len = rope.len_chars();
-    let i = char_idx.min(len);
-    let line = rope.char_to_line(i);
-    let line_start = rope.line_to_char(line);
-    (line, i - line_start)
+/// B13: the range in a sorted, non-overlapping half-open range list that
+/// contains `line` — a binary search on the range ends.
+fn range_containing(ranges: &[(usize, usize)], line: usize) -> Option<(usize, usize)> {
+    let i = ranges.partition_point(|&(_, e)| e <= line);
+    ranges.get(i).copied().filter(|&(s, _)| s <= line)
+}
+
+/// B13: true if any range in a sorted, non-overlapping half-open list
+/// intersects the inclusive line span `[lo, hi]`.
+fn ranges_overlap(ranges: &[(usize, usize)], lo: usize, hi: usize) -> bool {
+    let i = ranges.partition_point(|&(_, e)| e <= lo);
+    ranges.get(i).is_some_and(|&(s, _)| s <= hi)
+}
+
+/// Drop empty ranges and merge overlapping neighbours of a list already sorted
+/// by start. O(n); restores the invariant `range_containing` relies on after a
+/// shift that may have collapsed ranges.
+fn normalize_ranges(ranges: &mut Vec<(usize, usize)>) {
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for &(s, e) in ranges.iter() {
+        if s >= e {
+            continue;
+        }
+        if let Some(last) = out.last_mut()
+            && s < last.1
+        {
+            last.1 = last.1.max(e);
+            continue;
+        }
+        out.push((s, e));
+    }
+    *ranges = out;
 }
 
 fn char_to_line_floor(doc: &Document, char_idx: usize) -> usize {
-    let (line, _) = char_to_line_col(doc, char_idx);
+    let (line, _) = doc.line_col_of_char(char_idx);
     line
 }
 
 fn char_to_line_ceil(doc: &Document, char_idx: usize) -> usize {
-    let (line, col) = char_to_line_col(doc, char_idx);
+    let (line, col) = doc.line_col_of_char(char_idx);
     if col == 0 { line } else { line + 1 }
 }
 
@@ -3457,5 +3567,364 @@ fn f() { let x = 1; }
                 full_us / incr_us.max(0.01)
             );
         }
+    }
+
+    // =========================================================================
+    // Text-editing review P2 (graph exa): B1 B3 B4 B5 B7 B10 B11 B13 guards
+    // =========================================================================
+
+    /// B1: Insert-mode Delete joins the open insert session instead of
+    /// replacing its undo group — one undo reverts the whole session.
+    #[test]
+    fn insert_mode_delete_keeps_insert_session_undo_history() {
+        let mut ed = new_editor("hello\n");
+        ed.cursor_mut().set_pos(0, 2);
+        ed.begin_insert();
+        ed.insert_char('a');
+        ed.insert_char('b');
+        ed.delete_forward_in_insert();
+        ed.insert_char('c');
+        ed.end_insert();
+        assert_eq!(ed.document().full_text(), "heabclo\n");
+        ed.undo();
+        assert_eq!(
+            ed.document().full_text(),
+            "hello\n",
+            "one undo must revert the whole insert session, Delete included"
+        );
+    }
+
+    /// B1: in Insert mode the caret may rest at EOL after a forward Delete —
+    /// the Normal-mode "sit on the last char" clamp must not apply.
+    #[test]
+    fn insert_mode_delete_at_last_char_leaves_caret_at_eol() {
+        let mut ed = new_editor("abc\nxyz\n");
+        ed.cursor_mut().set_pos(0, 2);
+        ed.delete_forward_in_insert();
+        assert_eq!(ed.document().full_text(), "ab\nxyz\n");
+        assert_eq!(ed.cursor().col, 2, "Insert caret stays at EOL");
+        // Normal-mode `x` on the last char still clamps onto the new last char.
+        let mut ed = new_editor("abc\n");
+        ed.cursor_mut().set_pos(0, 2);
+        ed.delete_char_at_cursor();
+        assert_eq!(ed.cursor().col, 1);
+    }
+
+    /// B3: Enter one char before the END of a frozen line would split it —
+    /// must be rejected. Enter AT the end (and at col 0) stays legal.
+    #[test]
+    fn enter_one_char_before_frozen_line_end_is_rejected() {
+        let mut ed = new_editor("abc\nxyz\n");
+        ed.add_frozen_lines(0, 1);
+        ed.cursor_mut().set_pos(0, 2);
+        ed.begin_insert();
+        ed.insert_char('\n');
+        assert_eq!(
+            ed.document().full_text(),
+            "abc\nxyz\n",
+            "Enter at col 2 of frozen 'abc' must not split it"
+        );
+        ed.cursor_mut().set_pos(0, 3);
+        ed.insert_char('\n');
+        assert_eq!(ed.document().full_text(), "abc\n\nxyz\n", "EOL Enter is legal");
+        ed.end_insert();
+    }
+
+    /// B4: `dd` on an empty last line deletes the PREVIOUS line's '\n'; that
+    /// range must go through the frozen guard like any other delete.
+    #[test]
+    fn dd_on_empty_last_line_respects_frozen_previous_line() {
+        let mut ed = new_editor("agent\n");
+        ed.add_frozen_lines(0, 1);
+        ed.cursor_mut().set_pos(1, 0);
+        ed.delete_current_line();
+        assert_eq!(
+            ed.document().full_text(),
+            "agent\n",
+            "dd on the empty tail must not eat the frozen line's newline"
+        );
+        // Editable previous line: the empty tail line is removed.
+        let mut ed = new_editor("draft\n");
+        ed.cursor_mut().set_pos(1, 0);
+        ed.delete_current_line();
+        assert_eq!(ed.document().full_text(), "draft");
+        assert_eq!((ed.cursor().line, ed.cursor().col), (0, 0));
+        ed.undo();
+        assert_eq!(ed.document().full_text(), "draft\n");
+    }
+
+    /// B5: with a stale caret column past EOL, Backspace validated the last
+    /// visible char but deleted the line's '\n' (merging into the frozen line
+    /// below). It must delete exactly the validated char.
+    #[test]
+    fn backspace_with_stale_col_deletes_the_validated_char() {
+        let mut ed = new_editor("abc\nfrozen\n");
+        ed.add_frozen_lines(1, 2);
+        ed.begin_insert();
+        ed.cursor_mut().col = 10; // stale (e.g. a sibling view shortened the line)
+        ed.backspace();
+        ed.end_insert();
+        assert_eq!(ed.document().full_text(), "ab\nfrozen\n");
+        assert_eq!(ed.frozen_lines(), &[(1, 2)]);
+        assert_eq!((ed.cursor().line, ed.cursor().col), (0, 2));
+    }
+
+    /// B10: the bulk `insert_str` is observably identical to inserting the
+    /// same text char-by-char — text, caret, frozen ranges, locked prefix,
+    /// atomic blocks, anchors and the LLM-tail hint — at every position.
+    #[test]
+    fn bulk_insert_str_matches_char_by_char() {
+        let base = "one\n\nthree x\nfour\nfive\n";
+        let texts = ["xy", "a\nb", "\n", "\nq", "ab\n", "a\n\nb", "- \n  "];
+        for text in texts {
+            for line in 0..6 {
+                let len = base.split('\n').nth(line).map_or(0, |l| l.chars().count());
+                for col in 0..=len {
+                    let mk = || {
+                        let mut ed = new_editor(base);
+                        ed.add_frozen_lines(3, 4);
+                        ed.set_atomic_blocks(vec![(3, 4)]);
+                        let anchors: Vec<_> = (0..6).map(|l| ed.anchor_for_line(l)).collect();
+                        ed.core.set_cached_llm_line(4, true);
+                        ed.cursor_mut().set_pos(line, col);
+                        ed.begin_insert();
+                        (ed, anchors)
+                    };
+                    let (mut bulk, anchors) = mk();
+                    let (mut each, _) = mk();
+                    bulk.insert_str(text);
+                    for ch in text.chars() {
+                        each.insert_char(ch);
+                    }
+                    let ctx = format!("text={text:?} at ({line},{col})");
+                    assert_eq!(bulk.document().full_text(), each.document().full_text(), "{ctx}");
+                    assert_eq!(
+                        (bulk.cursor().line, bulk.cursor().col),
+                        (each.cursor().line, each.cursor().col),
+                        "{ctx}"
+                    );
+                    assert_eq!(bulk.frozen_lines(), each.frozen_lines(), "{ctx}");
+                    assert_eq!(bulk.atomic_blocks(), each.atomic_blocks(), "{ctx}");
+                    assert_eq!(bulk.lockable_through_line(), each.lockable_through_line(), "{ctx}");
+                    assert_eq!(bulk.core.last_llm_line, each.core.last_llm_line, "{ctx}");
+                    for a in &anchors {
+                        assert_eq!(bulk.line_for_anchor(*a), each.line_for_anchor(*a), "{ctx}");
+                    }
+                    bulk.end_insert();
+                    each.end_insert();
+                    bulk.undo();
+                    assert_eq!(bulk.document().full_text(), base, "{ctx}: bulk undo");
+                }
+            }
+        }
+    }
+
+    /// B10: a multi-line paste is ONE undo splice (one guard, one rope op),
+    /// not one per char, and undoes in one step.
+    #[test]
+    fn paste_str_is_one_splice_and_one_undo_step() {
+        let mut ed = new_editor("head\n");
+        ed.cursor_mut().set_pos(0, 4);
+        ed.paste_str("a\nb\nc");
+        assert_eq!(ed.document().full_text(), "heada\nb\nc\n");
+        assert_eq!((ed.cursor().line, ed.cursor().col), (2, 1));
+        assert_eq!(ed.document().last_undo_splice_count(), Some(1));
+        ed.undo();
+        assert_eq!(ed.document().full_text(), "head\n");
+    }
+
+    /// Pre-B11 `shift_for_delete` (rebuilds both maps) — the oracle.
+    fn shift_for_delete_oracle(
+        st: &LineAnchorStore,
+        start_line: usize,
+        start_col: usize,
+        nl: usize,
+    ) -> (BTreeMap<LineAnchor, usize>, Vec<LineAnchor>) {
+        let mut out = BTreeMap::new();
+        let mut dropped = Vec::new();
+        if nl == 0 {
+            return (st.by_anchor.clone(), dropped);
+        }
+        for (&a, &line) in st.by_anchor.iter() {
+            if line < start_line || (line == start_line && start_col != 0) {
+                out.insert(a, line);
+            } else if line <= start_line + nl {
+                dropped.push(a);
+            } else {
+                out.insert(a, line - nl);
+            }
+        }
+        (out, dropped)
+    }
+
+    /// B11: the tail-only `shift_for_delete` matches the old full rebuild for
+    /// every (start_line, start_col, nl) over a sparse anchor layout, and keeps
+    /// `by_line` the exact inverse of `by_anchor`.
+    #[test]
+    fn shift_for_delete_tail_only_matches_full_rebuild() {
+        let lines = [0usize, 1, 2, 4, 5, 7, 8, 9, 12, 13];
+        for start_line in 0..15 {
+            for start_col in [0usize, 3] {
+                for nl in 0..6 {
+                    let mut st = LineAnchorStore::default();
+                    for &l in &lines {
+                        st.allocate(l);
+                    }
+                    let (want, mut want_dropped) =
+                        shift_for_delete_oracle(&st, start_line, start_col, nl);
+                    let mut got_dropped = st.shift_for_delete(start_line, start_col, nl);
+                    want_dropped.sort();
+                    got_dropped.sort();
+                    let ctx = format!("start=({start_line},{start_col}) nl={nl}");
+                    assert_eq!(st.by_anchor, want, "{ctx}");
+                    assert_eq!(got_dropped, want_dropped, "{ctx}");
+                    let inverse: BTreeMap<usize, LineAnchor> =
+                        st.by_anchor.iter().map(|(&a, &l)| (l, a)).collect();
+                    assert_eq!(st.by_line, inverse, "{ctx}");
+                }
+            }
+        }
+    }
+
+    /// Pre-B13 `can_delete_range` (per-char `is_frozen_line` loop) — the oracle.
+    fn can_delete_range_oracle(core: &EditorCore, del_s: usize, del_e: usize) -> bool {
+        let frozen = |l: usize| core.frozen_lines.iter().any(|&(s, e)| l >= s && l < e);
+        if del_s >= del_e {
+            return true;
+        }
+        let (start_line, _) = core.document.line_col_of_char(del_s);
+        if start_line < core.lockable_through_line {
+            return false;
+        }
+        let rope = core.document.rope();
+        let mut line = start_line;
+        let mut idx = del_s;
+        let line_count = core.document.line_count();
+        while idx < del_e {
+            if frozen(line) {
+                return false;
+            }
+            let Some(ch) = rope.get_char(idx) else { break };
+            if ch == '\n' && line + 1 < line_count {
+                if frozen(line + 1) {
+                    return false;
+                }
+                line += 1;
+            }
+            idx += 1;
+        }
+        true
+    }
+
+    /// B13: the binary-search `is_frozen_line` and the range-overlap
+    /// `can_delete_range` agree with the old linear/per-char versions for
+    /// EVERY range over several frozen layouts (incl. a trailing newline, a
+    /// no-trailing-newline doc, a locked prefix, and past-EOF ends).
+    #[test]
+    fn frozen_guards_match_linear_oracle_exhaustively() {
+        let docs = ["a\nbb\n\nccc\nd\ne\n", "x\n\ny\nzz", "\n\n\n"];
+        let layouts: [&[(usize, usize)]; 5] =
+            [&[], &[(0, 1)], &[(1, 2), (3, 5)], &[(2, 3), (4, 6)], &[(0, 7)]];
+        for text in docs {
+            for layout in layouts {
+                for lockable in [0usize, 2] {
+                    let mut core = EditorCore::new(text.to_string(), PathBuf::from("t"));
+                    for &(s, e) in layout {
+                        core.add_frozen_lines(s, e);
+                    }
+                    core.set_lockable_through_line(lockable);
+                    for l in 0..10 {
+                        let lin = core.frozen_lines.iter().any(|&(s, e)| l >= s && l < e);
+                        assert_eq!(core.is_frozen_line(l), lin, "{text:?} {layout:?} line {l}");
+                    }
+                    let n = core.document.rope().len_chars();
+                    for s in 0..=n + 1 {
+                        for e in s..=n + 2 {
+                            assert_eq!(
+                                core.can_delete_range(s, e),
+                                can_delete_range_oracle(&core, s, e),
+                                "{text:?} {layout:?} lock={lockable} [{s},{e})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// B7: `e` on a line's last word continues to the next line's first word
+    /// end (vim), instead of resting on the '\n' column.
+    #[test]
+    fn word_end_from_last_word_crosses_to_next_line() {
+        let mut ed = new_editor("foo bar\n\n  baz qux\n");
+        ed.cursor_mut().set_pos(0, 4);
+        ed.move_cursor_word_end();
+        assert_eq!((ed.cursor().line, ed.cursor().col), (0, 6), "end of 'bar'");
+        ed.move_cursor_word_end();
+        assert_eq!(
+            (ed.cursor().line, ed.cursor().col),
+            (2, 4),
+            "skips the blank line + indent to the end of 'baz'"
+        );
+        ed.move_cursor_word_end();
+        assert_eq!((ed.cursor().line, ed.cursor().col), (2, 8), "end of 'qux'");
+        ed.move_cursor_word_end();
+        assert_eq!((ed.cursor().line, ed.cursor().col), (2, 8), "nothing ahead: stays");
+    }
+
+    /// B7: `b` at col 0 goes to the START of the previous line's last word
+    /// (vim), not its last char; an empty line is a stop.
+    #[test]
+    fn word_back_from_col0_lands_on_previous_word_start() {
+        let mut ed = new_editor("one two\nthree\n\nfour");
+        ed.cursor_mut().set_pos(1, 0);
+        ed.move_cursor_word_backward();
+        assert_eq!((ed.cursor().line, ed.cursor().col), (0, 4), "start of 'two'");
+        ed.cursor_mut().set_pos(3, 0);
+        ed.move_cursor_word_backward();
+        assert_eq!((ed.cursor().line, ed.cursor().col), (2, 0), "empty line stops b");
+        ed.move_cursor_word_backward();
+        assert_eq!((ed.cursor().line, ed.cursor().col), (1, 0), "start of 'three'");
+        // Within a line: unchanged behaviour (punctuation is its own word).
+        let mut ed = new_editor("foo.bar baz");
+        ed.cursor_mut().set_pos(0, 8);
+        ed.move_cursor_word_backward();
+        assert_eq!(ed.cursor().col, 4);
+        ed.move_cursor_word_backward();
+        assert_eq!(ed.cursor().col, 3);
+        ed.move_cursor_word_backward();
+        assert_eq!(ed.cursor().col, 0);
+        ed.move_cursor_word_backward();
+        assert_eq!((ed.cursor().line, ed.cursor().col), (0, 0), "doc start: stays");
+    }
+
+    /// B15: the refactored `w` / `f` / `t` / `F` / `T` (shared CharClass, no
+    /// per-call `Vec<char>`) keep their behaviour.
+    #[test]
+    fn word_forward_and_find_till_behaviour_pinned() {
+        let mut ed = new_editor("foo.bar  baz\n   next line\n");
+        ed.move_cursor_word_forward();
+        assert_eq!(ed.cursor().col, 3, "w: word -> punct");
+        ed.move_cursor_word_forward();
+        assert_eq!(ed.cursor().col, 4, "w: punct -> word");
+        ed.move_cursor_word_forward();
+        assert_eq!(ed.cursor().col, 9, "w skips the double space");
+        ed.move_cursor_word_forward();
+        assert_eq!((ed.cursor().line, ed.cursor().col), (1, 3), "w wraps to first non-blank");
+        ed.cursor_mut().set_pos(0, 0);
+        assert!(ed.find_char_forward('b'));
+        assert_eq!(ed.cursor().col, 4);
+        assert!(ed.find_char_forward('b'));
+        assert_eq!(ed.cursor().col, 9);
+        assert!(!ed.find_char_forward('n'), "f never crosses the line");
+        assert!(ed.find_char_backward('o'));
+        assert_eq!(ed.cursor().col, 2);
+        ed.cursor_mut().set_pos(0, 0);
+        assert!(ed.till_char_forward('z'));
+        assert_eq!(ed.cursor().col, 10);
+        assert!(ed.till_char_backward('.'));
+        assert_eq!(ed.cursor().col, 4);
+        assert!(!ed.find_char_backward('q'));
+        assert_eq!(ed.cursor().col, 4);
     }
 }
