@@ -27240,6 +27240,80 @@ fn cog_test_home(bindings: Vec<crate::CogTopicBinding>) -> crate::CogHomeData {
     }
 }
 
+/// UXI-Cog-20: a graph no Topic binds is still reachable from Home — listed
+/// once under the `unfiled graphs` folder (a Topic-bound graph is NOT repeated
+/// there), and the real row click selects it as that graph for opening.
+///
+/// Negative control: make `with_unfiled_graphs` return `bindings` unchanged;
+/// the folder/leaf assertions fail (the orphan graph is unreachable — the
+/// 2026-09-27 "yalda graphs missing from the Cog tile" report).
+#[gpui::test]
+fn cog_home_lists_unbound_graphs_under_unfiled_folder(cx: &mut TestAppContext) {
+    let graph = |id: &str, name: &str| crate::CogGraph {
+        id: id.into(),
+        name: name.into(),
+        description: String::new(),
+        omega: String::new(),
+        sealed: false,
+        prototype: false,
+    };
+    let bindings = crate::with_unfiled_graphs(
+        vec![cog_test_topic(
+            "work/migrations::plan",
+            crate::CogTopicKind::Graph,
+            "g1",
+            "Migration plan",
+        )],
+        &[graph("g1", "migration-plan"), graph("g2", "orphan-plan")],
+    );
+    let (view, vcx, cv, wid) = boot_with_cog(cx);
+    let req = cog_tile_req(&view, vcx);
+    view.update(vcx, |v, cx| {
+        v.cog_apply(
+            wid,
+            req,
+            Ok(crate::CogFetch::Home(Box::new(cog_test_home(bindings)))),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    let rows = cv.update(vcx, |c, _| c.topic_rows());
+    assert!(
+        rows.iter().any(|row| matches!(
+            row,
+            crate::CogTopicRow::Folder { label, .. } if label == crate::UNFILED_GRAPHS_FOLDER
+        )),
+        "Home shows the unfiled graphs folder"
+    );
+    let graph_leaves: Vec<(usize, String)> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(i, row)| match row {
+            crate::CogTopicRow::Binding { binding, .. }
+                if binding.kind == crate::CogTopicKind::Graph =>
+            {
+                Some((i, binding.object.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        graph_leaves.iter().map(|(_, id)| id.as_str()).collect::<Vec<_>>(),
+        vec!["g2", "g1"],
+        "the unbound graph is listed once; the Topic-bound graph is not repeated"
+    );
+
+    let orphan_row = graph_leaves[0].0;
+    cv.update(vcx, |c, cx| c.click_topic(orphan_row, cx));
+    vcx.run_until_parked();
+    assert_eq!(
+        cv.update(vcx, |c, _| c.selected_graph_id()),
+        Some("g2".to_string()),
+        "the real row click selects the unbound graph for opening"
+    );
+}
+
 /// UXI-Cog-13/-14: the REAL Cog reducer opens on Topics, the cached body paints
 /// a hierarchical file-explorer + typed right pane, and the real folder click
 /// collapses/restores descendants without invalid selection.

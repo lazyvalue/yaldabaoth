@@ -923,8 +923,43 @@ pub(crate) fn list_topic_bindings() -> Result<Vec<CogTopicBinding>, String> {
     Ok(bindings)
 }
 
+/// Topic-tree folder holding graphs that no Topic binds (UXI-Cog-20). The
+/// space keeps it from colliding with a real Topic path.
+pub(crate) const UNFILED_GRAPHS_FOLDER: &str = "unfiled graphs";
+
+/// Append one synthetic Graph binding per graph that no live Topic binds, under
+/// [`UNFILED_GRAPHS_FOLDER`], so every graph is reachable from Home. The
+/// synthetic address is stable (`unfiled graphs::<graph id>`); opening it uses
+/// `object` (the graph id) exactly like a real graph binding.
+pub(crate) fn with_unfiled_graphs(
+    mut bindings: Vec<CogTopicBinding>,
+    graphs: &[CogGraph],
+) -> Vec<CogTopicBinding> {
+    let bound: BTreeSet<&str> = bindings
+        .iter()
+        .filter(|b| b.kind == CogTopicKind::Graph)
+        .map(|b| b.object.as_str())
+        .collect();
+    let unfiled: Vec<CogTopicBinding> = graphs
+        .iter()
+        .filter(|g| !bound.contains(g.id.as_str()))
+        .map(|g| CogTopicBinding {
+            address: format!("{UNFILED_GRAPHS_FOLDER}::{}", g.id),
+            kind: CogTopicKind::Graph,
+            object: g.id.clone(),
+            name: g.name.clone(),
+            created_at: 0,
+        })
+        .collect();
+    bindings.extend(unfiled);
+    bindings
+}
+
 pub(crate) fn list_topics() -> Result<CogTopicTree, String> {
-    Ok(CogTopicTree::from_bindings(list_topic_bindings()?))
+    let bindings = list_topic_bindings()?;
+    // A graph-list failure must not hide the Topics that did load.
+    let graphs = list_graphs().unwrap_or_default();
+    Ok(CogTopicTree::from_bindings(with_unfiled_graphs(bindings, &graphs)))
 }
 
 pub(crate) fn load_home() -> Result<CogHomeData, String> {
