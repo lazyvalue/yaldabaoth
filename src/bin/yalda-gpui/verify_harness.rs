@@ -30695,3 +30695,288 @@ fn splash_paints_start_server_instruction_when_server_missing(cx: &mut TestAppCo
          explicitly disabled"
     );
 }
+
+// ── Cog graph 8g7 node `comments-ui`: spec B5, UXI-Diff-15 ─────────────────
+//
+// Fixture rows before any comment (diff_fixture_repo): 0 File a.txt · 1 Hunk ·
+// 2 " line1" · 3 "+changed a" (new 2) · 4 File b.txt · 5 Hunk · 6 · 7.
+
+/// Type `text` through REAL keystrokes (spaces as `space`).
+fn diff_type(vcx: &mut gpui::VisualTestContext, text: &str) {
+    let keys: Vec<String> = text
+        .chars()
+        .map(|c| if c == ' ' { "space".to_string() } else { c.to_string() })
+        .collect();
+    vcx.simulate_keystrokes(&keys.join(" "));
+    vcx.run_until_parked();
+}
+
+fn diff_compose_text(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+    id: crate::workspace::WindowId,
+) -> Option<String> {
+    view.read_with(vcx, |v, _| v.diff_tile_ref(id)?.compose.as_ref().map(|c| c.input.text()))
+}
+
+/// UXI-Diff-15 save + inline card: `c` on a line (REAL keys) opens the
+/// bottom compose captioned with the anchor; typing (a space included — the
+/// leaders are suppressed while composing) then `ctrl-enter` writes comment
+/// c1 to the review JSON on disk (path, side new, lines, snippet == the
+/// line's text, body, unsent) and PAINTS its card directly below the anchor
+/// line row; the header paints "1 unsent". `c` on a header row is a hint,
+/// not a compose.
+///
+/// Negative controls (observed RED): (a) with `self.diff_persist_review(id,
+/// cx)` in `submit_comment` commented out, the JSON has no comments; (b) with
+/// `visible_rows` placing every card at the file top (`place_comment` result
+/// ignored), the card paints ABOVE the anchor row.
+#[gpui::test]
+fn diff_comment_c_saves_json_and_paints_card_below_anchor(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let wt = temp.path().to_path_buf();
+    let (view, vcx, id) = boot_with_diff(cx, wt.clone());
+
+    vcx.simulate_keystrokes("c");
+    vcx.run_until_parked();
+    assert!(diff_compose_text(&view, vcx, id).is_none(), "c on a file header must not open a compose");
+
+    vcx.simulate_keystrokes("j j j c");
+    vcx.run_until_parked();
+    assert_eq!(diff_compose_text(&view, vcx, id).as_deref(), Some(""), "c on a line opens the compose");
+    let p = paint_diff_probes(&view, vcx, id, &["diff-comment-compose", "diff-compose-caption=commenting on a.txt:2"]);
+    assert!(p[0].is_some() && p[1].is_some(), "compose + anchor caption must paint: {p:?}");
+
+    diff_type(vcx, "rename this");
+    assert_eq!(diff_compose_text(&view, vcx, id).as_deref(), Some("rename this"));
+    vcx.simulate_keystrokes("ctrl-enter");
+    vcx.run_until_parked();
+    assert!(diff_compose_text(&view, vcx, id).is_none(), "save closes the compose");
+
+    let (_, json) = fixture_review_json(&wt);
+    let c = &json["comments"][0];
+    assert_eq!(c["id"], "c1", "comment on disk: {json}");
+    assert_eq!(c["path"], "a.txt");
+    assert_eq!(c["side"], "new");
+    assert_eq!(c["lines"], serde_json::json!([2, 2]));
+    assert_eq!(c["snippet"], "changed a");
+    assert_eq!(c["body"], "rename this");
+    assert_eq!(c["sent"], serde_json::json!([]));
+    assert_eq!(c["outdated"], false);
+
+    let p = paint_diff_probes(&view, vcx, id, &["diff-cursor-row", "diff-comment-c1", "diff-unsent=1 unsent"]);
+    let anchor = p[0].expect("anchor (cursor) row painted");
+    let card = p[1].expect("comment card header painted");
+    assert!(
+        card.1 > anchor.1 && card.1 <= anchor.1 + anchor.3 + 4.0,
+        "card {card:?} must paint directly below the anchor row {anchor:?}"
+    );
+    assert!(p[2].is_some(), "header must paint '1 unsent'");
+    let rows = diff_rows(&view, vcx, id);
+    assert!(
+        matches!(rows[4], crate::RowRef::Comment { part: 0, .. }),
+        "the card row follows the anchor line: {rows:?}"
+    );
+}
+
+/// UXI-Diff-15 range: `V j j c` on a 4-line (untracked, all-added) file
+/// anchors lines 1–3 with a 3-line snippet; the range is tinted/cleared by the
+/// real path and the saved JSON spans exactly those lines.
+#[gpui::test]
+fn diff_comment_v_range_saves_span_and_snippet(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let wt = temp.path().to_path_buf();
+    std::fs::write(wt.join("c.txt"), "p1\np2\np3\np4\n").unwrap();
+    let (view, vcx, id) = boot_with_diff(cx, wt.clone());
+    let rows = diff_rows(&view, vcx, id);
+    let header = rows.iter().rposition(|r| r.is_file()).expect("c.txt header");
+    // V on a header is a no-op with a hint.
+    vcx.simulate_keystrokes("] ] shift-v");
+    vcx.run_until_parked();
+    assert_eq!(diff_cursor(&view, vcx, id), header);
+    view.read_with(vcx, |v, _| {
+        assert_eq!(v.diff_tile_ref(id).unwrap().selection(), None, "V on a header selects nothing");
+        assert!(v.transient_status.as_ref().is_some_and(|s| s.contains("V starts a range")));
+    });
+    vcx.simulate_keystrokes("j j");
+    vcx.run_until_parked();
+    assert_eq!(diff_cursor(&view, vcx, id), header + 2, "on c.txt's first line");
+
+    vcx.simulate_keystrokes("shift-v j j");
+    vcx.run_until_parked();
+    let sel = view.read_with(vcx, |v, _| v.diff_tile_ref(id).unwrap().selection());
+    assert_eq!(sel, Some((header + 2, header + 4)));
+    vcx.simulate_keystrokes("c");
+    vcx.run_until_parked();
+    let p = paint_diff_probes(&view, vcx, id, &["diff-compose-caption=commenting on c.txt:1–3"]);
+    assert!(p[0].is_some(), "range caption painted");
+    diff_type(vcx, "three lines");
+    vcx.simulate_keystrokes("ctrl-enter");
+    vcx.run_until_parked();
+
+    let (_, json) = fixture_review_json(&wt);
+    let c = &json["comments"][0];
+    assert_eq!(c["path"], "c.txt", "{json}");
+    assert_eq!(c["lines"], serde_json::json!([1, 3]));
+    assert_eq!(c["snippet"], "p1\np2\np3");
+    assert_eq!(c["body"], "three lines");
+    let rows = diff_rows(&view, vcx, id);
+    assert!(matches!(rows[header + 5], crate::RowRef::Comment { part: 0, .. }), "card after the range's last line");
+}
+
+/// UXI-Diff-15 edit/delete: `e` on the card reopens the compose prefilled
+/// and saving rewrites the body on disk; a single `x` only ARMS (JSON
+/// untouched, hint shown), another key disarms, and `x x` deletes.
+///
+/// Negative control (observed RED): with the arm step in
+/// `DiffTile::delete_at_cursor` bypassed, a single `x` deletes.
+#[gpui::test]
+fn diff_comment_edit_and_confirmed_delete(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let wt = temp.path().to_path_buf();
+    let (view, vcx, id) = boot_with_diff(cx, wt.clone());
+    vcx.simulate_keystrokes("j j j c");
+    vcx.run_until_parked();
+    diff_type(vcx, "rename this");
+    vcx.simulate_keystrokes("ctrl-enter j e");
+    vcx.run_until_parked();
+    assert_eq!(diff_compose_text(&view, vcx, id).as_deref(), Some("rename this"), "e prefills");
+    diff_type(vcx, " now");
+    vcx.simulate_keystrokes("cmd-enter");
+    vcx.run_until_parked();
+    let (_, json) = fixture_review_json(&wt);
+    assert_eq!(json["comments"][0]["body"], "rename this now", "{json}");
+    assert_eq!(json["comments"].as_array().map(|a| a.len()), Some(1), "edit does not add");
+
+    assert!(matches!(diff_rows(&view, vcx, id)[diff_cursor(&view, vcx, id)], crate::RowRef::Comment { .. }));
+    vcx.simulate_keystrokes("x");
+    vcx.run_until_parked();
+    let status = view.read_with(vcx, |v, _| v.transient_status.clone());
+    assert_eq!(status.map(|s| s.to_string()).as_deref(), Some("x again to delete c1"));
+    let (_, json) = fixture_review_json(&wt);
+    assert_eq!(json["comments"].as_array().map(|a| a.len()), Some(1), "a single x must not delete");
+
+    // Another key disarms; the next x only re-arms.
+    vcx.simulate_keystrokes("k j x");
+    vcx.run_until_parked();
+    let (_, json) = fixture_review_json(&wt);
+    assert_eq!(json["comments"].as_array().map(|a| a.len()), Some(1), "disarmed by an intervening key");
+    vcx.simulate_keystrokes("x");
+    vcx.run_until_parked();
+    let (_, json) = fixture_review_json(&wt);
+    assert_eq!(json["comments"].as_array().map(|a| a.len()), Some(0), "x x deletes: {json}");
+    assert_eq!(diff_rows(&view, vcx, id).len(), 8, "the card is gone");
+}
+
+/// UXI-Diff-15 outdated: after the anchored line changes on disk, `r`
+/// re-derives; the comment is flagged outdated IN THE JSON (kept, not
+/// deleted) and its card PAINTS right after the file header, above the hunk.
+///
+/// Negative control (observed RED): with `review.recompute_outdated(&model)`
+/// in `refresh_diff` disabled, the JSON keeps `outdated: false`.
+#[gpui::test]
+fn diff_comment_outdated_after_change_paints_after_file_header(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let wt = temp.path().to_path_buf();
+    let (view, vcx, id) = boot_with_diff(cx, wt.clone());
+    vcx.simulate_keystrokes("j j j c");
+    vcx.run_until_parked();
+    diff_type(vcx, "rename this");
+    vcx.simulate_keystrokes("ctrl-enter");
+    vcx.run_until_parked();
+
+    std::fs::write(wt.join("a.txt"), "line1\nchanged differently\n").unwrap();
+    vcx.simulate_keystrokes("r");
+    vcx.run_until_parked();
+
+    let (_, json) = fixture_review_json(&wt);
+    assert_eq!(json["comments"][0]["outdated"], true, "flagged outdated on disk: {json}");
+    assert_eq!(json["comments"][0]["body"], "rename this", "kept, never deleted");
+    let rows = diff_rows(&view, vcx, id);
+    assert!(rows[0].is_file(), "{rows:?}");
+    assert!(matches!(rows[1], crate::RowRef::Comment { part: 0, .. }), "card right after the header: {rows:?}");
+    let hunk_ix = rows.iter().position(|r| r.is_hunk()).unwrap();
+    let hdr = format!("diff-row-{hunk_ix}");
+    let p = paint_diff_probes(&view, vcx, id, &["diff-row-0", "diff-comment-c1", &hdr]);
+    let (file, card, hunk) = (p[0].unwrap(), p[1].expect("outdated card painted"), p[2].unwrap());
+    assert!(file.1 < card.1 && card.1 < hunk.1, "file {file:?} < card {card:?} < hunk {hunk:?}");
+}
+
+/// UXI-Diff-15 idiot-proof Esc: Esc on an EMPTY draft closes; on a
+/// non-empty draft the first Esc only warns (draft kept) and the second
+/// discards (nothing saved).
+#[gpui::test]
+fn diff_comment_esc_needs_two_presses_on_nonempty_draft(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let wt = temp.path().to_path_buf();
+    let (view, vcx, id) = boot_with_diff(cx, wt.clone());
+    vcx.simulate_keystrokes("j j j c escape");
+    vcx.run_until_parked();
+    assert!(diff_compose_text(&view, vcx, id).is_none(), "Esc on an empty draft closes");
+
+    vcx.simulate_keystrokes("c");
+    vcx.run_until_parked();
+    diff_type(vcx, "abc");
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert_eq!(diff_compose_text(&view, vcx, id).as_deref(), Some("abc"), "first Esc keeps the draft");
+    let status = view.read_with(vcx, |v, _| v.transient_status.clone());
+    assert!(status.is_some_and(|s| s.contains("Esc again")), "first Esc explains");
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(diff_compose_text(&view, vcx, id).is_none(), "second Esc discards");
+    let (_, json) = fixture_review_json(&wt);
+    assert!(json["comments"].as_array().is_none_or(|a| a.is_empty()), "nothing saved: {json}");
+}
+
+/// UXI-Diff-12/15 perf: typing 10 characters into the comment compose leaves
+/// the cached `DiffView` render count FLAT (the compose is screen-level;
+/// `DiffSeqs` moves only on open/close). Paired positive control: opening the
+/// compose DOES re-render the body (the anchor highlight).
+///
+/// Negative control (observed RED): bumping `compose_gen` on every compose
+/// keystroke re-renders the body per key.
+#[gpui::test]
+fn diff_compose_typing_is_render_flat(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let (view, vcx, id) = boot_with_diff(cx, temp.path().to_path_buf());
+    vcx.simulate_keystrokes("j j j");
+    vcx.run_until_parked();
+    crate::perf_reset("diff");
+    vcx.simulate_keystrokes("c");
+    vcx.run_until_parked();
+    assert!(crate::perf_render_count("diff") >= 1, "opening the compose re-renders the body (highlight)");
+    crate::perf_reset("diff");
+    diff_type(vcx, "abcdefghij");
+    assert_eq!(diff_compose_text(&view, vcx, id).as_deref(), Some("abcdefghij"));
+    assert_eq!(
+        crate::perf_render_count("diff"),
+        0,
+        "typing in the compose must not re-render the cached Diff body"
+    );
+}
+
+/// yux rule 2: the `V` selection (`DiffSeqs::range_anchor`) busts the cached
+/// body — the tint must repaint when the range starts and when it clears.
+#[gpui::test]
+fn diff_view_v_range_rerenders_the_cached_body(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let (_view, vcx, _id) = boot_with_diff(cx, temp.path().to_path_buf());
+    vcx.simulate_keystrokes("j j j");
+    vcx.run_until_parked();
+    crate::perf_reset("diff");
+    vcx.simulate_keystrokes("shift-v");
+    vcx.run_until_parked();
+    let after_v = crate::perf_render_count("diff");
+    assert!(after_v >= 1, "V must re-render the cached body");
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(crate::perf_render_count("diff") > after_v, "Esc clearing the range must re-render");
+}

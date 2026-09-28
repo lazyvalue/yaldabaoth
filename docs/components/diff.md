@@ -37,14 +37,23 @@ with line cursor. Overlays within bound: comment compose, send picker (the only
 text-input surfaces).
 
 **Keys (bound).** `j`/`k` (and ↓/↑) line · `}`/`{` hunk · `]`/`[` file · `G` last
-row · `z` fold · `v` Viewed · `o` Zed · `r` refresh (implemented) · `V` range ·
-`c` comment · `e` edit · `x` delete · `s` send unsent · `S` send all (comments /
-send nodes). Space = tile verbs, `.` = shell verbs. The footer lists the live
+row · `z` fold · `v` Viewed · `o` Zed · `r` refresh · `V` range (j/k extend
+within the file, `Esc` clears) · `c` comment · `e` edit · `x` `x` delete
+(implemented) · `s` send unsent · `S` send all (send node). **Compose keys:**
+typing, `Enter` newline, `Ctrl-Enter`/`Cmd-Enter` save, `Esc` closes an empty
+draft; on a non-empty one the first `Esc` warns and the second discards;
+leaders are suppressed while composing. Space = tile verbs, `.` = shell verbs. The footer lists the live
 keys (`DIFF_KEY_HINTS`).
 
 **Row model.** The bound body is a virtualized `gpui::list` over the tile's
-cached `rows: Rc<Vec<RowRef>>` (`RowRef::{File, Hunk, Line{old,new}}`, from the
-pure `visible_rows(model, review, folds)`); the cursor is a flat index into it.
+cached `rows: Rc<Vec<RowRef>>` (`RowRef::{File, Hunk, Line{old,new},
+Comment{comment,part,parts}}`, from the pure `visible_rows(model, review,
+folds)`); the cursor is a flat index into it. A comment card is `parts`
+fixed-height `Comment` rows (header: `💬 c3` · badge · first body line; then the
+body wrapped at `COMMENT_WRAP_COLS` characters, capped at
+`COMMENT_MAX_BODY_ROWS`; an outdated card ends with its snippet, dimmed), placed
+after the last line of its snippet's nearest match (`place_comment`), or right
+after the file header when outdated / unplaceable.
 Every row is one fixed height, so keeping the cursor in view is exact
 arithmetic (`compose_first_visible_line`), never gpui's unmeasured-row
 estimate. A viewed file folds unless `z`-expanded (`Folds`).
@@ -82,8 +91,8 @@ click move it predictably across files, skipping collapsed content. An invalid
 worktree renders an inline error, never a panic; an empty diff renders an
 explicit "No changes" message. A key-hint footer is always visible.
 
-**Status.** `implemented` (graph 8g7 node file-viewed-ui). The header's unsent
-comment count arrives with UXI-Diff-15.
+**Status.** `implemented` (graph 8g7 nodes file-viewed-ui, comments-ui — the
+header paints `K unsent` when K > 0).
 
 **Enforcement.** `verify_harness.rs::{diff_tile_paints_rows_and_line_cursor_keys_move_it,
 diff_tile_click_row_moves_cursor, diff_tile_cursor_stays_painted_in_view_after_many_j,
@@ -98,11 +107,14 @@ the comment compose does not re-render the body. No `cx.notify()` on the render
 path.
 
 **Status.** `implemented` — the body is a cached child whose `DiffSeqs` covers
-`model_gen`, `rows_gen`, `cursor`, `review_gen`, refreshing/error, picker, zoom;
-rows are virtualized (O(visible)). The compose half is enforced with UXI-Diff-15.
+`model_gen`, `rows_gen`, `cursor`, `review_gen`, `range_anchor`, `compose_gen`
+(open/close only), refreshing/error, picker, zoom; rows are virtualized
+(O(visible)). The comment compose renders at screen level outside the cached
+body, so typing in it leaves the body's render count flat.
 
 **Enforcement.** `verify_harness.rs::{diff_view_unrelated_root_notify_is_render_flat,
-diff_view_v_and_j_rerender_the_cached_body}`.
+diff_view_v_and_j_rerender_the_cached_body, diff_view_v_range_rerenders_the_cached_body,
+diff_compose_typing_is_render_flat}`.
 
 ### UXI-Diff-13 — Refresh on focus and `r`; cursor survives
 
@@ -144,7 +156,23 @@ anchor. `e` edits, `x` deletes. When the anchored snippet no longer appears in
 the file's diff the comment is flagged outdated and listed at the file's top —
 never silently deleted or moved. No session is required.
 
-**Status.** `target`
+**Status.** `implemented` (graph 8g7 node comments-ui). Deviations/decisions:
+the compose is **pinned at the tile's bottom** (screen-level, uncached) with a
+caption naming the anchor (`commenting on a.txt:40–46`, `editing c3 on …`)
+while the anchored rows stay highlighted in the body — not a panel inside the
+virtualized list. `x` needs a second `x` on the same card (the first shows
+"x again to delete c3"; any other key disarms). A range spanning removed and
+added lines anchors to the new side (new-side lines only); old side only when
+every line is removed. `c`/`e`/`x`/`V` off their target rows show a hint.
+Cards of a folded (e.g. viewed) file are hidden with it; comments on files no
+longer in the diff stay in the JSON but have no row to render under.
+
+**Enforcement.** `verify_harness.rs::{diff_comment_c_saves_json_and_paints_card_below_anchor,
+diff_comment_v_range_saves_span_and_snippet, diff_comment_edit_and_confirmed_delete,
+diff_comment_outdated_after_change_paints_after_file_header,
+diff_comment_esc_needs_two_presses_on_nonempty_draft, diff_compose_typing_is_render_flat}`;
+`diff.rs::row_model_tests::{comment_placement_anchor_and_card_lines,
+range_selection_is_clamped_to_one_file}`.
 
 ### UXI-Diff-16 — Send picker defaults to the last session and records delivery
 

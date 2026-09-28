@@ -50,8 +50,14 @@ pub(crate) struct DiffSeqs {
     rows_gen: u64,
     /// `DiffTile::cursor` — the cursor row's highlight + scroll-into-view.
     cursor: usize,
-    /// `DiffTile::review_gen` — the header's `N/M files viewed` progress.
+    /// `DiffTile::review_gen` — the header's `N/M files viewed` progress,
+    /// the `K unsent` count, and every comment card's content.
     review_gen: u64,
+    /// `DiffTile::range_anchor` — the `V` selection tint.
+    range_anchor: Option<usize>,
+    /// `DiffTile::compose_gen` — the compose-anchor highlight (bumped on
+    /// open/close only, so typing in the compose never re-renders the body).
+    compose_gen: u64,
     refreshing: bool,
     has_error: bool,
     /// `WorktreePicker::gen_` — bumped by every picker mutation (rows loaded,
@@ -71,6 +77,8 @@ impl DiffSeqs {
             rows_gen: tile.rows_gen,
             cursor: tile.cursor,
             review_gen: tile.review_gen,
+            range_anchor: tile.range_anchor,
+            compose_gen: tile.compose_gen,
             refreshing: tile.refreshing,
             has_error: tile.error.is_some(),
             picker_gen: tile.picker.gen_,
@@ -91,10 +99,10 @@ pub(crate) struct DiffView {
     scroll: ScrollHandle,
     /// The virtualized bound body (module docs) — this view's own UI state.
     list: ScrollAnchoredList<RowRef>,
-    /// The `(cursor, rows_gen)` the list was last scrolled to reveal — the
-    /// reveal runs only when either moves, so a wheel-scroll isn't undone by
-    /// an unrelated re-render.
-    revealed: Option<(usize, u64)>,
+    /// The `(cursor, rows_gen, compose_gen)` the list was last scrolled to
+    /// reveal — the reveal runs only when one moves, so a wheel-scroll isn't
+    /// undone by an unrelated re-render.
+    revealed: Option<(usize, u64, u64)>,
     perf_label: &'static str,
 }
 
@@ -138,11 +146,18 @@ impl DiffView {
     /// scrolling. Rows are uniform (`row_h`), so the top row is exact integer
     /// arithmetic over the last laid-out viewport height. State-only (no
     /// notify) — safe on the render path, like the Doc view's reveal.
-    fn reveal_cursor(&mut self, cursor: usize, rows_gen: u64, row_count: usize, row_h: f32) {
-        if self.revealed == Some((cursor, rows_gen)) || row_count == 0 {
+    ///
+    /// `composing`: the comment compose just opened this frame — it will take
+    /// [`COMPOSE_RESERVE_ROWS`] rows' worth of height from the list's
+    /// (last-measured, still-unshrunk) viewport, so reveal against the
+    /// smaller window and the anchored line isn't hidden behind the panel.
+    fn reveal_cursor(&mut self, cursor: usize, rows_gen: u64, compose: (u64, bool), row_count: usize, row_h: f32) {
+        let key = (cursor, rows_gen, compose.0);
+        if self.revealed == Some(key) || row_count == 0 {
             return;
         }
-        self.revealed = Some((cursor, rows_gen));
+        let compose_opened = compose.1 && self.revealed.is_some_and(|r| r.2 != compose.0);
+        self.revealed = Some(key);
         let state = self.list.state();
         let vh = f32::from(state.viewport_bounds().size.height);
         if vh <= 0.0 {
@@ -150,7 +165,10 @@ impl DiffView {
             state.scroll_to_reveal_item(cursor);
             return;
         }
-        let visible = ((vh / row_h).floor() as usize).max(1);
+        let mut visible = ((vh / row_h).floor() as usize).max(1);
+        if compose_opened {
+            visible = visible.saturating_sub(COMPOSE_RESERVE_ROWS).max(1);
+        }
         let prev = state.logical_scroll_top();
         let top = compose_first_visible_line(cursor, prev.item_ix, row_count, visible);
         if top != prev.item_ix || (cursor == top && prev.offset_in_item != px(0.0)) {
@@ -165,6 +183,10 @@ impl DiffView {
 /// Unscaled height of one diff row (every row — file header, hunk header,
 /// line — is exactly this × `text_scale`, see module docs).
 const DIFF_ROW_BASE_H: f32 = 22.0;
+
+/// Rows of list height the bottom-pinned comment compose (screens.rs
+/// `render_diff_comment_compose`) is assumed to take when it opens.
+const COMPOSE_RESERVE_ROWS: usize = 8;
 
 /// Colors/fonts/sizes the `'static` row closure needs, snapshotted once per
 /// render (all `Copy`/refcounted).
@@ -181,6 +203,10 @@ struct DiffRowStyle {
     file_bg: Hsla,
     cursor_bg: Hsla,
     cursor_bar: Hsla,
+    /// `V` range / compose-anchor tint.
+    sel_bg: Hsla,
+    card_bg: Hsla,
+    prose: SharedString,
     mono: SharedString,
     text: Pixels,
     small: Pixels,
@@ -222,6 +248,9 @@ impl Render for DiffView {
             file_bg: tint(selected_bg, 0.45),
             cursor_bg: tint(selected_bg, 0.70),
             cursor_bar: rgb(CURSOR_BAR_COLOR).into(),
+            sel_bg: tint(st.accent, 0.16),
+            card_bg: tint(selected_bg, 0.55),
+            prose: st.prose.clone(),
             mono: st.mono.clone(),
             text: px(13.0 * scale),
             small: px(11.5 * scale),
@@ -238,18 +267,29 @@ impl Render for DiffView {
             && let Some(model) = t.model.clone()
         {
             let (viewed, total) = t.progress();
-            let header = diff_header(&model, viewed, total, t.refreshing, &row_style, &st);
+            let header = diff_header(&model, viewed, total, t.unsent_count(), t.refreshing, &row_style, &st);
             let rows = t.rows.clone();
             let (cursor, rows_gen) = (t.cursor, t.rows_gen);
+            let marks = RowMarks {
+                selection: t.selection(),
+                anchor: t.compose.as_ref().and_then(|c| {
+                    let fi = model.files.iter().position(|f| f.path == c.anchor.path)?;
+                    Some((fi, c.anchor.side, c.anchor.lines))
+                }),
+                comments: Rc::new(t.review.as_ref().map(|r| r.comments.clone()).unwrap_or_default()),
+                now: chrono::Utc::now(),
+            };
+            let compose = (t.compose_gen, t.compose.is_some());
             let body: AnyElement = if model.files.is_empty() {
                 diff_empty_body(&model, &st).into_any_element()
             } else {
                 self.list.reconcile(&rows, rows_gen);
-                self.reveal_cursor(cursor, rows_gen, rows.len(), f32::from(row_style.row_h));
+                self.reveal_cursor(cursor, rows_gen, compose, rows.len(), f32::from(row_style.row_h));
                 let render_fn = diff_row_renderer(
                     model,
                     rows,
                     cursor,
+                    marks,
                     row_style,
                     self.root.clone(),
                     self.window_id,
@@ -309,8 +349,28 @@ impl Render for DiffView {
 }
 
 /// The bound body's always-visible key hints (spec C6 idiot-proof).
-pub(crate) const DIFF_KEY_HINTS: &str =
-    "j/k line · {/} hunk · [/] file · v viewed · z fold · r refresh · o zed · space menu";
+pub(crate) const DIFF_KEY_HINTS: &str = "j/k line · {/} hunk · [/] file · v viewed · z fold · c comment · V range · \
+     e edit · x delete · r refresh · o zed · space menu";
+
+/// The header's unsent-comment count label (spec B2; shown only when > 0).
+pub(crate) fn diff_unsent_label(unsent: usize) -> String {
+    format!("{unsent} unsent")
+}
+
+/// `2026-09-27T14:03:00Z` relative to `now`: "just now" / "5m ago" /
+/// "3h ago" / "2d ago" (the raw string when it doesn't parse).
+pub(crate) fn relative_time(at: &str, now: chrono::DateTime<chrono::Utc>) -> String {
+    let Ok(t) = chrono::DateTime::parse_from_rfc3339(at) else {
+        return at.to_string();
+    };
+    let secs = (now - t.with_timezone(&chrono::Utc)).num_seconds().max(0);
+    match secs {
+        0..60 => "just now".to_string(),
+        60..3600 => format!("{}m ago", secs / 60),
+        3600..86400 => format!("{}h ago", secs / 3600),
+        _ => format!("{}d ago", secs / 86400),
+    }
+}
 
 /// The header progress label (spec B2/B4).
 pub(crate) fn diff_progress_label(viewed: usize, total: usize) -> String {
@@ -473,10 +533,12 @@ fn diff_picker_body(
 /// `refreshing…` while a derive is in flight · `N/M files viewed` (or "All
 /// files viewed ✓" in the success color) · a slim progress bar. Chrome — fixed
 /// sizes, doesn't zoom.
+#[allow(clippy::too_many_arguments)]
 fn diff_header(
     model: &DiffModel,
     viewed: usize,
     total: usize,
+    unsent: usize,
     refreshing: bool,
     rs: &DiffRowStyle,
     st: &DetailStyle,
@@ -521,6 +583,19 @@ fn diff_header(
                 .text_size(px(12.0))
                 .text_color(st.dim)
                 .child(SharedString::from("refreshing…"))
+                .into_any_element(),
+        ));
+    }
+    if unsent > 0 {
+        let text = diff_unsent_label(unsent);
+        top = top.child(probe_bounds_dyn(
+            format!("diff-unsent={text}"),
+            div()
+                .flex_none()
+                .font_family(st.mono.clone())
+                .text_size(px(12.0))
+                .text_color(rs.accent)
+                .child(SharedString::from(text))
                 .into_any_element(),
         ));
     }
@@ -585,6 +660,7 @@ fn diff_row_renderer(
     model: Rc<DiffModel>,
     rows: Rc<Vec<RowRef>>,
     cursor: usize,
+    marks: RowMarks,
     rs: DiffRowStyle,
     root: WeakEntity<YaldaGpuiView>,
     wid: workspace::WindowId,
@@ -594,7 +670,14 @@ fn diff_row_renderer(
             return div().h(rs.row_h).into_any_element();
         };
         let is_cursor = ix == cursor;
+        let marked = marks.is_marked(ix, row);
         let (content, bg): (AnyElement, Option<Hsla>) = match row {
+            RowRef::Comment {
+                comment,
+                part,
+                parts,
+                ..
+            } => (diff_comment_row(&marks, comment, part, parts, &rs), None),
             RowRef::File {
                 file,
                 viewed,
@@ -633,6 +716,7 @@ fn diff_row_renderer(
                 (diff_line_row(old, new, sign, text, color, &rs), bg)
             }
         };
+        let bg = if marked { Some(rs.sel_bg) } else { bg };
         let transparent: Hsla = rgba(0x00000000).into();
         let click_root = root.clone();
         let mut outer = div()
@@ -843,4 +927,121 @@ fn diff_line_row(
                 .child(SharedString::from(text.to_string())),
         )
         .into_any_element()
+}
+
+/// Per-render row decorations beyond the cursor (snapshotted into the
+/// `'static` row closure): the `V` selection, the open compose's anchor
+/// (file index, side, line span — resolved by line numbers so it survives a
+/// rows rebuild), and the review's comments for the cards.
+struct RowMarks {
+    selection: Option<(usize, usize)>,
+    anchor: Option<(usize, CommentSide, [usize; 2])>,
+    comments: Rc<Vec<ReviewComment>>,
+    now: chrono::DateTime<chrono::Utc>,
+}
+
+impl RowMarks {
+    /// A `Line` row inside the `V` selection or the compose's anchor span.
+    fn is_marked(&self, ix: usize, row: RowRef) -> bool {
+        let RowRef::Line { file, old, new, .. } = row else {
+            return false;
+        };
+        if self.selection.is_some_and(|(lo, hi)| (lo..=hi).contains(&ix)) {
+            return true;
+        }
+        let Some((f, side, [lo, hi])) = self.anchor else {
+            return false;
+        };
+        let n = match side {
+            CommentSide::New => new,
+            CommentSide::Old if new.is_none() => old,
+            CommentSide::Old => None,
+        };
+        file == f && n.is_some_and(|n| (lo..=hi).contains(&(n as usize)))
+    }
+}
+
+/// One row of an inline comment card (spec B5): an inset, tinted panel with
+/// an accent left border (dim red when outdated), rounded at the card's first
+/// and last row. Row 0 = `💬 c3` · badge (`unsent` / `sent to <label> ·
+/// <time>` / `outdated`) · the first body line; later rows = the rest of
+/// [`comment_card_lines`] (an outdated card ends with its snippet, dimmed).
+fn diff_comment_row(marks: &RowMarks, ci: usize, part: u8, parts: u8, rs: &DiffRowStyle) -> AnyElement {
+    let Some(c) = marks.comments.get(ci) else {
+        return div().into_any_element();
+    };
+    let lines = comment_card_lines(c);
+    let line = lines.get(part as usize).cloned().unwrap_or(CardLine::More);
+    let (first, last) = (part == 0, part + 1 >= parts);
+    let border = if c.outdated { rs.remove } else { rs.accent };
+    let radius = px(5.0);
+    let mut card = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.0))
+        .h_full()
+        .ml(rs.gutter_w * 2.0 + px(16.0))
+        .mr(px(16.0))
+        .flex_1()
+        .min_w_0()
+        .px(px(10.0))
+        .bg(rs.card_bg)
+        .border_l(px(3.0))
+        .border_color(border)
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .font_family(rs.prose.clone())
+        .text_size(rs.text);
+    if first {
+        card = card.rounded_tr(radius).mt(px(2.0));
+    }
+    if last {
+        card = card.rounded_br(radius).mb(px(2.0));
+    }
+    let text_el = |t: String, color: Hsla, mono: bool| {
+        let el = single_line_ellipsis(&t).flex_1().text_color(color);
+        if mono { el.font_family(rs.mono.clone()).text_size(rs.small) } else { el }
+    };
+    let content: AnyElement = if first {
+        let (badge, badge_color) = if c.outdated {
+            ("outdated — code changed since this comment".to_string(), rs.remove)
+        } else if let Some(s) = c.sent.last() {
+            let who = if s.label.is_empty() { &s.session } else { &s.label };
+            (format!("sent to {who} · {}", relative_time(&s.at, marks.now)), rs.add)
+        } else {
+            ("unsent".to_string(), rs.accent)
+        };
+        let body0 = match &line {
+            CardLine::Body(t) => t.clone(),
+            _ => String::new(),
+        };
+        let header = card
+            .child(
+                div()
+                    .flex_none()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rs.fg)
+                    .child(SharedString::from(format!("💬 {}", c.id))),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .font_family(rs.mono.clone())
+                    .text_size(rs.small)
+                    .text_color(badge_color)
+                    .child(SharedString::from(badge)),
+            )
+            .child(text_el(body0, rs.fg, false))
+            .into_any_element();
+        probe_bounds_dyn(format!("diff-comment-{}", c.id), header)
+    } else {
+        let el = match line {
+            CardLine::Body(t) => text_el(t, rs.fg, false),
+            CardLine::Snippet(t) => text_el(t, rs.dim, true),
+            CardLine::More => text_el("…".to_string(), rs.dim, false),
+        };
+        card.child(el).into_any_element()
+    };
+    div().flex().flex_row().size_full().child(content).into_any_element()
 }

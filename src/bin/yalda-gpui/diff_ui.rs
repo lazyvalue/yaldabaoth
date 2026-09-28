@@ -397,7 +397,7 @@ impl YaldaGpuiView {
     /// — never on the render path; atomic tmp + rename inside `save_review`).
     /// Serialized + generation-guarded by `save_review_latest`, so rapid
     /// toggles can't land out of order. No-op without a resolved review path.
-    fn diff_persist_review(&mut self, id: workspace::WindowId, cx: &mut Context<Self>) {
+    pub(crate) fn diff_persist_review(&mut self, id: workspace::WindowId, cx: &mut Context<Self>) {
         let Some(tile) = self.diff_tile_ref(id) else {
             return;
         };
@@ -485,7 +485,12 @@ impl YaldaGpuiView {
 
     /// Key handler for a focused Diff tile. Unbound ⇒ the worktree picker
     /// (spec B1: `j`/`k`/arrows move, Enter binds the selection, `p` binds
-    /// the folder row); bound ⇒ diff navigation.
+    /// the folder row); bound ⇒ diff navigation + comments (spec B5).
+    ///
+    /// The comment compose is checked FIRST (before the platform/control bail
+    /// and `leader_intercept`) so Ctrl-/Cmd-Enter reach it;
+    /// `focused_in_insert_mode` keys off `tile.compose`, so the leaders are
+    /// suppressed while composing.
     pub(crate) fn handle_diff_key(
         &mut self,
         ev: &KeyDownEvent,
@@ -496,6 +501,13 @@ impl YaldaGpuiView {
         let Some(id) = self.workspace.focused_window_id() else {
             return;
         };
+        if self.diff_tile_ref(id).is_some_and(|t| t.compose.is_some()) {
+            if is_ctrl_w_shell_prefix(&press) {
+                return;
+            }
+            self.handle_diff_comment_key(id, press, cx);
+            return;
+        }
         if ev.keystroke.modifiers.platform || ev.keystroke.modifiers.control {
             return;
         }
@@ -531,19 +543,32 @@ impl YaldaGpuiView {
             }
             return;
         }
-        let nav: Option<fn(&mut DiffTile)> = match press.key {
-            Key::Char('j') | Key::Down => Some(|t| t.move_cursor(1)),
-            Key::Char('k') | Key::Up => Some(|t| t.move_cursor(-1)),
-            Key::Char('}') => Some(|t| t.jump_hunk(true)),
-            Key::Char('{') => Some(|t| t.jump_hunk(false)),
-            Key::Char(']') => Some(|t| t.jump_file(true)),
-            Key::Char('[') => Some(|t| t.jump_file(false)),
-            Key::Char('G') => Some(|t| t.cursor_to_end()),
-            Key::Char('z') => Some(|t| t.toggle_fold_at_cursor()),
+        // Every bound-tile key replaces the previous one-shot hint, and any
+        // key but a second `x` disarms a pending delete (spec C6).
+        let had_status = self.transient_status.take().is_some();
+        if press.key != Key::Char('x')
+            && let Some(tile) = self.diff_tile_mut(id)
+        {
+            tile.pending_delete = None;
+        }
+        // j/k extend an active `V` range (clamped to its file); every other
+        // navigation key drops the range first.
+        let nav: Option<(fn(&mut DiffTile), bool)> = match press.key {
+            Key::Char('j') | Key::Down => Some((|t| t.move_cursor(1), true)),
+            Key::Char('k') | Key::Up => Some((|t| t.move_cursor(-1), true)),
+            Key::Char('}') => Some((|t| t.jump_hunk(true), false)),
+            Key::Char('{') => Some((|t| t.jump_hunk(false), false)),
+            Key::Char(']') => Some((|t| t.jump_file(true), false)),
+            Key::Char('[') => Some((|t| t.jump_file(false), false)),
+            Key::Char('G') => Some((|t| t.cursor_to_end(), false)),
+            Key::Char('z') => Some((|t| t.toggle_fold_at_cursor(), false)),
             _ => None,
         };
-        if let Some(nav) = nav {
+        if let Some((nav, keeps_range)) = nav {
             if let Some(tile) = self.diff_tile_mut(id) {
+                if !keeps_range {
+                    tile.range_anchor = None;
+                }
                 nav(tile);
             }
             cx.notify();
@@ -553,8 +578,145 @@ impl YaldaGpuiView {
             Key::Char('r') => self.refresh_diff(id, cx),
             Key::Char('v') => self.toggle_file_viewed(id, cx),
             Key::Char('o') => self.open_in_zed(id, cx),
-            _ => {}
+            Key::Char('V') => self.diff_toggle_range(id, cx),
+            Key::Char('c') => self.open_comment_compose(id, cx),
+            Key::Char('e') => self.edit_comment_at_cursor(id, cx),
+            Key::Char('x') => self.delete_comment_at_cursor(id, cx),
+            Key::Esc => {
+                if let Some(tile) = self.diff_tile_mut(id) {
+                    tile.range_anchor = None;
+                }
+                cx.notify();
+            }
+            _ => {
+                if had_status {
+                    cx.notify();
+                }
+            }
         }
+    }
+
+    // ── Cog graph 8g7 node `comments-ui`: spec B5, UXI-Diff-15 ─────────────
+
+    /// A one-shot hint in the status toast (spec C6: every refusal explains).
+    fn diff_hint(&mut self, msg: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.transient_status = Some(msg.into());
+        cx.notify();
+    }
+
+    /// `V`: start a line-range selection at the cursor, or clear the active
+    /// one. On a non-line row it is a no-op with a hint.
+    pub(crate) fn diff_toggle_range(&mut self, id: workspace::WindowId, cx: &mut Context<Self>) {
+        let Some(tile) = self.diff_tile_mut(id) else {
+            return;
+        };
+        if tile.toggle_range() {
+            cx.notify();
+        } else {
+            self.diff_hint("V starts a range on a diff line — move to a line first", cx);
+        }
+    }
+
+    /// `c` (spec B5): open the comment compose anchored on the active `V`
+    /// range, else the cursor's line. Anywhere else: a hint.
+    pub(crate) fn open_comment_compose(&mut self, id: workspace::WindowId, cx: &mut Context<Self>) {
+        let Some(tile) = self.diff_tile_mut(id) else {
+            return;
+        };
+        if tile.model.is_none() {
+            return;
+        }
+        match tile.comment_anchor_at_cursor() {
+            Some(anchor) => {
+                tile.open_compose(ComposeTarget::New, anchor, "");
+                cx.notify();
+            }
+            None if tile.cursor_comment().is_some() => {
+                self.diff_hint("e edits this comment · x deletes it", cx)
+            }
+            None => self.diff_hint("c comments on a diff line — move to a line (or V to select a range)", cx),
+        }
+    }
+
+    /// `e` on any row of a comment card: reopen the compose prefilled with
+    /// its body; saving replaces the body.
+    pub(crate) fn edit_comment_at_cursor(&mut self, id: workspace::WindowId, cx: &mut Context<Self>) {
+        let Some(tile) = self.diff_tile_mut(id) else {
+            return;
+        };
+        let Some(c) = tile.cursor_comment().cloned() else {
+            self.diff_hint("e edits the comment under the cursor — move onto a comment card", cx);
+            return;
+        };
+        tile.open_compose(ComposeTarget::Edit(c.id.clone()), CommentAnchor::of_comment(&c), &c.body);
+        cx.notify();
+    }
+
+    /// `x` on a comment card: first press arms ("x again to delete c3"),
+    /// second deletes + persists.
+    pub(crate) fn delete_comment_at_cursor(&mut self, id: workspace::WindowId, cx: &mut Context<Self>) {
+        let Some(tile) = self.diff_tile_mut(id) else {
+            return;
+        };
+        match tile.delete_at_cursor() {
+            DeleteOutcome::NotOnComment => {
+                self.diff_hint("x deletes the comment under the cursor — move onto a comment card", cx)
+            }
+            DeleteOutcome::Armed(cid) => self.diff_hint(format!("x again to delete {cid}"), cx),
+            DeleteOutcome::Deleted(cid) => {
+                self.diff_persist_review(id, cx);
+                self.diff_hint(format!("Deleted {cid}"), cx);
+            }
+        }
+    }
+
+    /// Ctrl-/Cmd-Enter in the compose: save (spec B5) — written to the
+    /// review file immediately as unsent (async, off the render path).
+    pub(crate) fn submit_comment(&mut self, id: workspace::WindowId, cx: &mut Context<Self>) {
+        let Some(tile) = self.diff_tile_mut(id) else {
+            return;
+        };
+        match tile.save_compose(chrono::Utc::now()) {
+            Ok(cid) => {
+                self.diff_persist_review(id, cx);
+                self.diff_hint(format!("Saved {cid} (unsent)"), cx);
+            }
+            Err(msg) => self.diff_hint(msg, cx),
+        }
+    }
+
+    /// Key dispatch while the comment compose is open. Ctrl-Enter / Cmd-Enter
+    /// save; Esc closes an empty draft, and on a non-empty one arms first
+    /// ("Esc again to discard") so a stray Esc can't lose text; everything
+    /// else is typing through the shared insert core (`dispatch_insert_core`
+    /// — Enter = newline, like the agent compose).
+    fn handle_diff_comment_key(&mut self, id: workspace::WindowId, press: KeyPress, cx: &mut Context<Self>) {
+        self.transient_status = None;
+        let enter_save = press.key == Key::Enter
+            && (press.modifiers.contains(KMods::CONTROL) || press.modifiers.contains(KMods::PLATFORM));
+        if enter_save {
+            self.submit_comment(id, cx);
+            return;
+        }
+        let Some(tile) = self.diff_tile_mut(id) else {
+            return;
+        };
+        let Some(compose) = tile.compose.as_mut() else {
+            return;
+        };
+        if press.key == Key::Esc && press.modifiers.is_empty() {
+            if compose.input.text().trim().is_empty() || compose.esc_armed {
+                tile.close_compose();
+                cx.notify();
+            } else {
+                compose.esc_armed = true;
+                self.diff_hint("Esc again to discard this comment · ctrl-enter saves", cx);
+            }
+            return;
+        }
+        compose.esc_armed = false;
+        Self::dispatch_insert_core(&mut compose.input.editor, &mut compose.input.mode, press);
+        cx.notify();
     }
 
     // ── Cog node `open-in-zed` (oc72): spec B8 ──────────────────────────────

@@ -5832,9 +5832,9 @@ impl YaldaGpuiView {
             // leaders must be suppressed then so keys reach the box.
             Some(App::Keymap(_)) => self.keymap_captures_text(cx),
             Some(App::AgentStats) => false,
-            // The Diff tile has no text-input surface yet (the comment compose
-            // returns with spec rev 2 B5) — navigation-only.
-            Some(App::Diff(_)) => false,
+            // The Diff tile is navigation-only EXCEPT while its comment
+            // compose is open (spec B5/B8) — then keys must reach the draft.
+            Some(App::Diff(tile)) => tile.compose.is_some(),
             Some(App::Buffer(BufferApp::Viewing(_))) | None => false,
         }
     }

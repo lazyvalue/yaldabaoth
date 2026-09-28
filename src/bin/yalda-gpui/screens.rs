@@ -2579,7 +2579,17 @@ impl YaldaGpuiView {
 
         let body_area = div().flex_1().min_h_0().w_full().child(cached_child(view));
 
-        root
+        // spec B5: the comment compose, pinned at the tile's bottom and
+        // rendered at the SCREEN level (like the agent compose sits outside
+        // its cached transcript), NOT inside the cached `DiffView` — typing
+        // here never re-renders the diff body (UXI-Diff-12/15). The anchored
+        // lines stay highlighted in the body (`DiffSeqs::compose_gen`).
+        let compose_panel = tile
+            .compose
+            .as_ref()
+            .map(|c| self.render_diff_comment_compose(c, dim, accent, fg, bg));
+
+        let root = root
             .key_context("DiffView")
             .on_key_down(cx.listener(Self::handle_diff_key))
             .on_action(cx.listener(Self::quit))
@@ -2609,7 +2619,95 @@ impl YaldaGpuiView {
             .size_full()
             .bg(bg)
             .child(header)
-            .child(body_area)
+            .child(body_area);
+        match compose_panel {
+            Some(panel) => root.child(panel),
+            None => root,
+        }
+    }
+
+    /// The bottom-pinned Diff comment compose (spec B5): a caption naming the
+    /// anchor ("commenting on a.txt:2–4" / "editing c3 on …"), the draft with
+    /// a caret marker, and its keys. Chrome — fixed sizes (it doesn't zoom,
+    /// like the agent compose). Every line renders unclipped and wraps in its
+    /// own `w_full` block (INV-UX-1/2 for a short comment: no scrolled region
+    /// to strand the caret in); a 4-line minimum height keeps the tile's body
+    /// bounds stable while a short draft is typed.
+    fn render_diff_comment_compose(
+        &self,
+        compose: &CommentCompose,
+        dim: Hsla,
+        accent: Hsla,
+        fg: Hsla,
+        bg: Hsla,
+    ) -> AnyElement {
+        let base = px(14.0);
+        let small = px(12.0);
+        let text = compose.input.text();
+        let cursor = compose.input.editor.cursor();
+        let doc_lines: Vec<&str> = if text.is_empty() { vec![""] } else { text.split('\n').collect() };
+        let mut lines_col = div().flex().flex_col().w_full();
+        for (i, line) in doc_lines.iter().enumerate() {
+            let rendered = if i == cursor.line {
+                let mut chars: Vec<char> = line.chars().collect();
+                let col = cursor.col.min(chars.len());
+                chars.insert(col, '\u{2758}'); // caret marker (thin vertical bar)
+                chars.into_iter().collect::<String>()
+            } else {
+                (*line).to_string()
+            };
+            lines_col = lines_col.child(
+                div()
+                    .w_full()
+                    .font_family(self.code_font.clone())
+                    .text_size(base)
+                    .text_color(fg)
+                    .child(SharedString::from(rendered)),
+            );
+        }
+        let caption = match &compose.target {
+            ComposeTarget::New => format!("commenting on {}", compose.anchor.label()),
+            ComposeTarget::Edit(id) => format!("editing {id} on {}", compose.anchor.label()),
+        };
+        let panel = div()
+            .id("diff-comment-compose")
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w_full()
+            .gap_1()
+            .px_4()
+            .py_2()
+            .border_t_1()
+            .border_color(accent)
+            .bg(bg_or(self.theme.top_bar, STATUS_BG))
+            .child(probe_bounds_dyn(
+                format!("diff-compose-caption={caption}"),
+                div()
+                    .text_color(accent)
+                    .font_family(self.code_font.clone())
+                    .text_size(small)
+                    .child(SharedString::from(caption))
+                    .into_any_element(),
+            ))
+            .child(
+                div()
+                    .w_full()
+                    .min_h(px(4.0 * 20.0))
+                    .p_1()
+                    .bg(bg)
+                    .border_1()
+                    .border_color(dim)
+                    .child(lines_col),
+            )
+            .child(
+                div()
+                    .text_color(dim)
+                    .font_family(self.code_font.clone())
+                    .text_size(small)
+                    .child(SharedString::from("ctrl-enter save · enter newline · esc cancel")),
+            );
+        probe_bounds("diff-comment-compose", panel.into_any_element())
     }
 
     /// Render a Cog explorer tile (`App::Cog`): a slim header bar plus the

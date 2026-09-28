@@ -92,18 +92,22 @@ uncommitted + untracked), base = the repo's default branch.
   file is viewed the header reads "All files viewed ✓".
 
 - **B5. Comments. [DRAFT]** `c` on the cursor line opens a comment compose
-  pinned under that line; `V` starts a line-range selection (extend with
-  `j`/`k`, `Esc` cancels) and `c` comments on the range. `Ctrl-Enter` saves,
-  `Esc` cancels (a non-empty draft asks nothing — Esc keeps it in the compose
-  until a second Esc discards). A saved comment is written to the review file
-  immediately as **unsent** and renders inline under its last anchor line as a
-  card (body, "unsent"/"sent to <session> · <time>"/"outdated" badge). `e`
-  edits and `x` deletes the comment under the cursor. Comments anchor to the
-  new-side line numbers (old side for removed lines) and store a **snippet**
-  (the anchored lines' text) so they can be relocated. When the anchored
-  content no longer appears in that file's diff, the comment is marked
-  **outdated** (kept, never deleted or silently moved) and listed at the top of
-  its file. Comments do not require a session.
+  pinned at the bottom of the tile, captioned with its anchor
+  ("commenting on src/foo.rs:40–46"), while the anchored lines stay highlighted
+  in the diff; `V` starts a line-range selection (extend with `j`/`k`, confined
+  to one file; `Esc` cancels) and `c` comments on the range. `Enter` inserts a
+  newline, `Ctrl-Enter` / `Cmd-Enter` saves, `Esc` closes an empty draft — on a
+  non-empty draft the first `Esc` only warns ("Esc again to discard") and a
+  second discards. A saved comment is written to the review file immediately as
+  **unsent** and renders inline under its last anchor line as a card (body,
+  "unsent"/"sent to <session> · <time>"/"outdated" badge). `e` edits the
+  comment under the cursor; `x` deletes it after a confirming second `x`.
+  Comments anchor to the new-side line numbers (old side only when every
+  anchored line is removed) and store a **snippet** (the anchored lines' text)
+  so they can be relocated. When the anchored content no longer appears in that
+  file's diff, the comment is marked **outdated** (kept, never deleted or
+  silently moved) and listed at the top of its file. Comments do not require a
+  session.
 
 - **B6. Send comments. [DRAFT]** `s` (and `space → Send comments…`) opens the
   **send picker**, a `cmd-p`-style fuzzy session list whose initial selection
