@@ -7253,6 +7253,52 @@ fn transcript_drag_on_frozen_markdown_line_copies_visual_span(cx: &mut TestAppCo
     );
 }
 
+/// Tab-line hit-test (text-editing review, the inverse of C4): transcript rows
+/// are TAB-expanded for display, so the painted token sink registers DISPLAY
+/// columns. A real click on `def` in `\tabc def` must place the caret at RAW
+/// col 5 (the tab is one raw column) — not display col 8, three columns per tab
+/// too far right.
+///
+/// Negative control: drop the `raw_col_from_display` mapping in
+/// `TranscriptView::transcript_pos_at` → the caret lands at col 8 (RED).
+#[gpui::test]
+fn transcript_click_after_tab_places_caret_at_raw_column(cx: &mut TestAppContext) {
+    use gpui::{Modifiers, MouseButton};
+    let (view, vcx, id, session) = boot_with_transcript(cx);
+    session.update(vcx, |s, cx: &mut gpui::Context<crate::AgentSession>| {
+        s.state.editor.programmatic_insert(0, "\tabc def\nnext\n");
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+
+    let tv = view
+        .update(vcx, |v, _| v.transcript_views.get(&id).cloned())
+        .expect("transcript view exists");
+    let tokens: Vec<crate::TokenHit> = tv.update(vcx, |t, _| t.token_hits.borrow().clone());
+    // `def` starts at DISPLAY col 8 (4 tab cells + `abc` + space).
+    let def_tok = tokens
+        .iter()
+        .find(|t| t.line_idx == 0 && t.start_char == 8 && t.char_count == 3)
+        .unwrap_or_else(|| panic!("no painted `def` token at display col 8: {tokens:?}"));
+    let midy = def_tok.bounds.top() + (def_tok.bounds.bottom() - def_tok.bounds.top()) / 2.0;
+    let at = point(def_tok.bounds.left() + px(1.0), midy);
+
+    vcx.simulate_mouse_down(at, MouseButton::Left, Modifiers::default());
+    vcx.simulate_mouse_up(at, MouseButton::Left, Modifiers::default());
+    vcx.run_until_parked();
+
+    let (line, col) = session.read_with(vcx, |s, _| {
+        (s.state.editor.cursor().line, s.state.editor.cursor().col)
+    });
+    assert_eq!(
+        (line, col),
+        (0, 5),
+        "click on `def` after a TAB must land on RAW col 5 (got {col}; display col leaked)"
+    );
+}
+
 /// UXI-Selection-1 (agent surface): X11-style select-to-clipboard over the transcript.
 /// A real mouse drag over the rendered transcript selects text and auto-copies
 /// it to the system clipboard on release. Drives the REAL `simulate_mouse_*`
