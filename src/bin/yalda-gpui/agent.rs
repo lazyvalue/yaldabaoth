@@ -1360,7 +1360,17 @@ pub(crate) fn build_wrapped_line(
     // cursor's column boundary, splitting the containing token if needed.
     #[cfg(test)]
     crate::push_caret_beam(matches!(mode, EditMode::Insert)); // bug-0031
-    let line_chars = line_str.chars().count();
+    // D2: `cursor_col` is a column in `line_str` (the RAW line), but the tokens
+    // walked below are the RENDERED (markdown-stripped) segments. Map it through
+    // the same stripped↔raw alignment the hit-test sink uses, or the caret
+    // drifts right by every stripped delimiter before it (`**`, `[..](..)`).
+    let (cursor_col, line_chars) = match &raw_cols {
+        Some(map) => (
+            raw_to_stripped_col(map, cursor_col),
+            stripped_render.chars().count(),
+        ),
+        None => (cursor_col, line_str.chars().count()),
+    };
     let cursor_col = cursor_col.min(line_chars);
     let token_lens: Vec<usize> = tokens.iter().map(|(t, _)| t.chars().count()).collect();
     // Which token owns the caret, and where it splits. `None` ⇒ the caret sits

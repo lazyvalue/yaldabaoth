@@ -31003,3 +31003,71 @@ fn wp_selected_prose_stays_in_body_font(cx: &mut TestAppContext) {
         );
     }
 }
+
+/// D2 (text-editing review): a FROZEN transcript line renders markdown-STRIPPED
+/// segments, but the transcript caret column is RAW. The caret on `t` of
+/// `"[bold](x) tail"` (raw col 10) must paint where the caret on `t` of the
+/// already-plain `"bold tail"` (col 5) paints — asserted on PAINTED geometry.
+///
+/// Negative control (observed RED): drop the raw→stripped `raw_cols` mapping of
+/// `cursor_col` in `build_wrapped_line` → the caret lands 5 columns right (at
+/// EOL of the stripped text).
+#[gpui::test]
+fn frozen_line_caret_maps_raw_col_through_stripped_markdown(cx: &mut TestAppContext) {
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+    install_agent_slot(&view, vcx, None);
+    view.update(vcx, |v, cx| {
+        v.splash_until = None;
+        let id = v.agent_tile().unwrap().session().unwrap();
+        let session = v.session_entity(id).unwrap();
+        session.update(cx, |session, cx| {
+            session
+                .state
+                .editor
+                .programmatic_insert(0, "[bold](x) tail\nbold tail\n");
+            session.state.editor.add_frozen_lines(0, 2);
+            session.state.focus = crate::AgentFocus::Transcript;
+            session.state.mode = crate::EditMode::Normal;
+            cx.notify();
+        });
+        cx.notify();
+    });
+    let session = view
+        .update(vcx, |v, _| {
+            let id = v.agent_tile().unwrap().session().unwrap();
+            v.session_entity(id)
+        })
+        .expect("agent session");
+    let mut caret_x = |line: usize, col: usize| -> f32 {
+        session.update(vcx, |s, cx| {
+            let c = s.state.editor.cursor_mut();
+            c.line = line;
+            c.col = col;
+            cx.notify();
+        });
+        for _ in 0..2 {
+            view.update(vcx, |_, cx| cx.notify());
+            vcx.run_until_parked();
+        }
+        // Bust the cached TranscriptView so the probed frame really paints it
+        // (a cache hit replays the old scene without running paint).
+        crate::layout_probe_begin();
+        session.update(vcx, |s, cx| {
+            s.state.pending_reveal_cursor = true;
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        let caret = crate::layout_probe_get("caret");
+        crate::layout_probe_end();
+        caret.expect("transcript caret must paint").0
+    };
+    let plain_start = caret_x(1, 0);
+    let plain_t = caret_x(1, 5);
+    let link_t = caret_x(0, 10);
+    assert!(plain_t - plain_start > 8.0, "non-vacuous: {plain_start} vs {plain_t}");
+    assert!(
+        (link_t - plain_t).abs() < 0.5,
+        "frozen-line caret at raw col 10 of '[bold](x) tail' painted at x={link_t}; \
+         the same rendered char on 'bold tail' paints at x={plain_t}"
+    );
+}
