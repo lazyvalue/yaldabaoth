@@ -1,6 +1,6 @@
 # ADR-0034 — Tile attachment is independent of visibility
 
-**Status:** accepted
+**Status:** accepted; Detached state superseded by ADR-0039
 **Date:** 2026-08-19
 **Supersedes:** ADR-0033's Bound/Unbound vocabulary and direct-Unbound-only
 presentation model; `UXI-Workspace-18` (Scratchpad); `UXI-Workspace-23`
