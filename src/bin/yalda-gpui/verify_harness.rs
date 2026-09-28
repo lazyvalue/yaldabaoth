@@ -15557,6 +15557,64 @@ fn count_prefix_repeats_normal_motion(cx: &mut TestAppContext) {
     assert_eq!(line, 10, "`10j` moves the caret ten lines down");
 }
 
+/// C6 (text-editing review): a counted `delete-char` (`5x` under a vim-style
+/// config binding `x` → `delete-char`) is ONE range delete — one undo step
+/// restores all five chars — and yanks the WHOLE deleted text to the GPUI
+/// clipboard (the same one `copy_selection` / Cmd-C use), not one subprocess
+/// per char leaving only the last. `P` then puts from that same clipboard.
+/// Drives the REAL `handle_edit_key` → `dispatch_normal` path.
+/// NEGATIVE CONTROL (observed RED): restore the per-char loop +
+/// `yank_to_clipboard` subprocess → the GPUI clipboard is empty and one `u`
+/// restores only one char.
+#[gpui::test]
+fn counted_delete_char_is_one_undo_step_and_yanks_all(cx: &mut TestAppContext) {
+    use crate::EditOps;
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let fh = cx.focus_handle();
+        fh.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            fh,
+        )
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |v, _| v.test_open_edit("abcdefghij\nkl\n"));
+    view.update(vcx, |v, _| {
+        let e = v.edit_mut().unwrap();
+        e.mode = crate::EditMode::Normal;
+        e.editor.cursor_set(0, 0);
+        e.keybinds.apply_bindings(&[(
+            vec![yalda::keys::KeyPress::new(yalda::keys::Key::Char('x'), yalda::keys::Modifiers::NONE)],
+            "delete-char".into(),
+        )]);
+    });
+    let key = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext, k: &str| {
+        view.update_in(vcx, |v, w, cx| v.handle_edit_key(&ws_bare_key(k), w, cx));
+    };
+    let line0 = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.update(vcx, |v, _| {
+            let e = v.edit_mut().unwrap();
+            e.editor.cursor_set(0, 0);
+            e.editor.line_text_at_cursor()
+        })
+    };
+    key(&view, vcx, "5");
+    key(&view, vcx, "x");
+    assert_eq!(line0(&view, vcx), "fghij\n", "`5x` deletes five chars");
+    let clip = view
+        .update(vcx, |_, cx| cx.read_from_clipboard())
+        .and_then(|i| i.text());
+    assert_eq!(clip.as_deref(), Some("abcde"), "the clipboard holds ALL five deleted chars");
+    key(&view, vcx, "u");
+    assert_eq!(line0(&view, vcx), "abcdefghij\n", "ONE undo restores the whole `5x`");
+
+    // `P` puts from the same GPUI clipboard.
+    view.update(vcx, |_, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string("ZZ".into())));
+    key(&view, vcx, "P");
+    assert_eq!(line0(&view, vcx), "ZZabcdefghij\n", "`P` reads the GPUI clipboard");
+}
+
 /// The Normal-mode block caret lands ON the char under the cursor, even when the
 /// cursor sits exactly on a word start (a token boundary — where `w`/`b` land).
 /// The old `<=` predicate handed the boundary to the PRECEDING token, drawing a

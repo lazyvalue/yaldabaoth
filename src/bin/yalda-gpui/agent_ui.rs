@@ -6224,6 +6224,7 @@ impl YaldaGpuiView {
                 cx.notify();
                 return;
             }
+            let mut register = None;
             let Some(outcome) = self.with_session_silent(focused_id, cx, |claude| {
                 claude.status = None;
                 claude.mode = EditMode::Normal;
@@ -6233,6 +6234,7 @@ impl YaldaGpuiView {
                     &mut claude.mode,
                     &mut claude.keybinds,
                     press,
+                    &mut register,
                 );
                 // Never leave the read-only transcript in Insert mode.
                 claude.mode = EditMode::Normal;
@@ -6245,6 +6247,7 @@ impl YaldaGpuiView {
             }) else {
                 return;
             };
+            Self::write_register(register, cx);
             if !matches!(outcome, NormalOutcome::Skipped)
                 && let Some(mut c) = self.agent_mut(cx)
             {
@@ -6357,6 +6360,7 @@ impl YaldaGpuiView {
         // (Compose has its own scroll/list_state, so no `pending_reveal_cursor`
         // transcript-reveal is needed for typing.)
         let topic_catalog = self.topic_completions.clone();
+        let mut register = None;
         let Some(outcome) = self.with_session_silent(focused_id, cx, |claude| {
             claude.status = None;
 
@@ -6471,6 +6475,7 @@ impl YaldaGpuiView {
                     &mut cb.mode,
                     &mut claude.keybinds,
                     press,
+                    &mut register,
                 ),
             };
             let text_after = claude.input_surface.compose().text();
@@ -6491,6 +6496,7 @@ impl YaldaGpuiView {
         }) else {
             return;
         };
+        Self::write_register(register, cx);
         // The key that introduced `%` may have opened a new Topic query inside
         // the closure above. Inspect after dispatch so the first generation
         // refreshes once, while suffix edits reuse that request.
@@ -6555,9 +6561,10 @@ impl YaldaGpuiView {
             NormalOutcome::Quit => cx.quit(),
             NormalOutcome::OpenMenu => self.open_menu_inner(cx),
             NormalOutcome::Paste { before } => {
+                let text = Self::clipboard_text(cx);
                 if let Some(mut c) = self.agent_mut(cx) {
                     let cb = c.input_surface.compose_mut();
-                    Self::apply_paste(&mut cb.editor, before);
+                    Self::apply_paste(&mut cb.editor, text, before);
                 }
                 cx.notify();
             }
@@ -6565,7 +6572,7 @@ impl YaldaGpuiView {
     }
 
     /// Cmd+V into the compose. Reads GPUI's clipboard (which carries images, not
-    /// just text — unlike the `pbpaste` text path). An image entry is staged as
+    /// just text — the vim `p` put reads the same clipboard for text). An image entry is staged as
     /// a `PendingImage` attachment (rendered as a chip, sent as an ACP
     /// `ContentBlock::Image` on submit); otherwise the clipboard text is pasted
     /// into the compose editor. Multiple image entries stage multiple chips.
