@@ -22,6 +22,47 @@ impl YaldaGpuiView {
         }
     }
 
+    /// A code block's copy button (`render_blocks::code_copy_button`): write
+    /// the plain text of the code block at `path` in tile `tile`'s CURRENT
+    /// blocks to the clipboard, and flag it "Copied" for a moment. Resolved
+    /// here, at event time, never from data captured at build time.
+    pub(crate) fn copy_doc_code_block(
+        &mut self,
+        tile: workspace::WindowId,
+        path: &[usize],
+        cx: &mut Context<Self>,
+    ) {
+        let Some(App::Buffer(BufferApp::Viewing(d))) =
+            self.workspace.tile_mut(tile).map(|w| &mut w.content)
+        else {
+            return;
+        };
+        let Some(text) = block_at_path(&d.blocks, path).and_then(code_block_text) else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        d.code_copied = Some(Rc::new(path.to_vec()));
+        d.code_copied_seq = d.code_copied_seq.wrapping_add(1);
+        let seq = d.code_copied_seq;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(1500))
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if let Some(App::Buffer(BufferApp::Viewing(d))) =
+                    view.workspace.tile_mut(tile).map(|w| &mut w.content)
+                    && d.code_copied_seq == seq
+                {
+                    d.code_copied = None;
+                    d.code_copied_seq = d.code_copied_seq.wrapping_add(1);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     // ---- Painted-Doc re-derive (the effect path) ---------------------------
 
     /// C3: re-derive (`DocState::refresh_blocks`) only the Doc tiles that can be

@@ -470,13 +470,14 @@ impl EditBodyView {
                     apply_line_selection(&segs, &line_str, sel, line_idx, base_style, selection_bg);
             }
 
+            // Headings follow the shared type scale (`yux/typography.rs`) —
+            // the same size / leading / space-above the Doc view renders.
             let (raw_size_px, font_weight, top_pad) = match kind {
-                WpLineKind::Heading(1) => (26.0, FontWeight::BOLD, 10.0),
-                WpLineKind::Heading(2) => (22.0, FontWeight::BOLD, 8.0),
-                WpLineKind::Heading(3) => (18.0, FontWeight::BOLD, 6.0),
-                WpLineKind::Heading(4) => (16.0, FontWeight::BOLD, 5.0),
-                WpLineKind::Heading(5) => (15.0, FontWeight::BOLD, 4.0),
-                WpLineKind::Heading(_) => (14.0, FontWeight::BOLD, 4.0),
+                WpLineKind::Heading(l) => (
+                    TYPE_SCALE.heading(l),
+                    FontWeight::BOLD,
+                    TYPE_SCALE.heading_space_above(l),
+                ),
                 WpLineKind::CodeFence | WpLineKind::CodeContent => (13.0, FontWeight::NORMAL, 0.0),
                 WpLineKind::TableRow => (13.0, FontWeight::NORMAL, 0.0),
                 // UXI-ParagraphSpacing-1: list items get a readability gap above.
@@ -511,6 +512,14 @@ impl EditBodyView {
                 None,
             );
 
+            // Test seam: a WP heading line's painted text box (excludes the
+            // row's space-above) — compared against the Doc's heading.
+            #[cfg(test)]
+            let content = if matches!(kind, WpLineKind::Heading(_)) {
+                probe_bounds_dyn(format!("wp-heading-{line_idx}"), content.into_any_element())
+            } else {
+                content.into_any_element()
+            };
             let line_div = match kind {
                 WpLineKind::Blockquote => div()
                     .flex()
@@ -537,6 +546,14 @@ impl EditBodyView {
                     .text_size(px(text_size_px))
                     // UXI-ParagraphSpacing-1: blank line carries the gap; scaled.
                     .h(px(18.0 * text_scale) + paragraph_gap(text_scale))
+                    .child(content),
+                WpLineKind::Heading(_) => div()
+                    .flex()
+                    .flex_row()
+                    .text_size(px(text_size_px))
+                    .line_height(TYPE_SCALE.heading_leading())
+                    .font_weight(font_weight)
+                    .pt(px(top_pad * text_scale))
                     .child(content),
                 _ => div()
                     .flex()

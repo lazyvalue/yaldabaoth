@@ -102,6 +102,17 @@ style bundle so a caller themes once:
   clear the cell at the top of each render. Used by the transcript's inline
   You-block (`YouBlockView`, D11).
 
+### `typography.rs` — the one type scale
+- **`TypeScale` / `TYPE_SCALE`** — the typography tokens for the markdown
+  reading/writing surfaces: body/code/label sizes, heading sizes h1–h6,
+  heading leading (`heading_leading()`, relative to the heading size) and
+  space-above, the base block gap (the `PARAGRAPH_GAP_PX` readability gap is
+  added to it), the Doc reading measure (`measure_ch` = 72ch), and the list
+  marker gutter (`list_gutter(widest_marker_chars, zoom)`). Values are at 1×;
+  multiply by `text_scale`. The Doc view (`render_blocks.rs`) and the WP editor
+  (`edit_view.rs`) both size headings from it — never hard-code a heading size.
+  Spec: `docs/components/common/typography.md`.
+
 ## Efficiency practices (non-negotiable)
 
 1. **O(changed), never O(whole tree).** An expensive surface that is usually

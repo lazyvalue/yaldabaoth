@@ -871,3 +871,146 @@ fn clicking_a_checkbox_toggles_that_item(cx: &mut TestAppContext) {
     assert!(probe_get("md-task-0.1").is_some());
     crate::layout_probe_end();
 }
+
+// ---------------------------------------------------------------------------
+// Reading typography (graph 4f1 typography): measure, type scale, hanging list
+// markers, blockquote bar, code-block copy. Geometry in the headless harness:
+// the test text system (`NoopTextSystem`) advances every glyph 0.6em, so the
+// body font's `ch` at 14px is 8.4px and a 72ch measure is 604.8px.
+// ---------------------------------------------------------------------------
+
+const LONG_PARA: &str = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur.";
+
+fn set_zoom(view: &Entity<YaldaGpuiView>, vcx: &mut VisualTestContext, scale: f32) {
+    view.update(vcx, |v, cx| v.set_text_scale(scale, cx));
+    frames_n(view, vcx, 2);
+}
+
+/// The Doc's text column is capped at the reading measure (72ch of the body
+/// font, + the 15px cursor-bar/padding chrome) and centered in a wide tile;
+/// it scales with zoom; in a narrow tile it takes the full width.
+///
+/// Negative control (observed RED): drop the `max_w(column_max)` wrapper in
+/// `build_doc_body` → the column is the full ~1500px tile width.
+#[gpui::test]
+fn doc_reading_measure_caps_centers_and_scales(cx: &mut TestAppContext) {
+    let md = format!("{LONG_PARA}\n\nsecond\n");
+    let (view, vcx, _file) = boot_probed(cx, "measure", &md);
+    vcx.simulate_resize(gpui::size(gpui::px(1600.0), gpui::px(600.0)));
+    frames_n(&view, vcx, 2);
+    let expect = |scale: f32| 72.0 * 0.6 * 14.0 * scale + 15.0;
+    let (bx, _, bw, _) = probe_get("doc-body").expect("doc body painted");
+    let (x, _, w, _) = probe_get("doc-column-0").expect("column painted");
+    assert!(bw > 1000.0, "non-vacuous: a wide tile ({bw})");
+    assert!((w - expect(1.0)).abs() < 1.0, "capped at the measure: {w} vs {}", expect(1.0));
+    let (mid, body_mid) = (x + w / 2.0, bx + bw / 2.0);
+    assert!((mid - body_mid).abs() < 1.0, "centered: column mid {mid} vs body mid {body_mid}");
+
+    // The measure scales with zoom.
+    set_zoom(&view, vcx, 1.5);
+    let (_, _, w15, _) = probe_get("doc-column-0").expect("column painted at 1.5x");
+    assert!((w15 - expect(1.5)).abs() < 1.0, "zoomed measure: {w15} vs {}", expect(1.5));
+
+    // Narrow tile: full width (the body's inner width, minus its px_8).
+    set_zoom(&view, vcx, 1.0);
+    vcx.simulate_resize(gpui::size(gpui::px(500.0), gpui::px(600.0)));
+    frames_n(&view, vcx, 2);
+    let (_, _, nbw, _) = probe_get("doc-body").expect("doc body");
+    let (_, _, nw, _) = probe_get("doc-column-0").expect("column");
+    assert!(nw < expect(1.0), "non-vacuous: narrower than the measure");
+    assert!((nw - (nbw - 64.0)).abs() < 1.0, "narrow tile: full width {nw} vs {}", nbw - 64.0);
+    crate::layout_probe_end();
+}
+
+/// Hanging markers: every item of a list starts its text at the same x (one
+/// gutter sized to the widest marker — `9.` vs `10.`), right of the marker,
+/// and a wrapped item's continuation lines stay in the text column.
+///
+/// Negative control (observed RED): per-item `min_w(24)` marker (the old
+/// layout) → at 2× zoom `10.` is wider than `9.` and the item texts misalign.
+#[gpui::test]
+fn list_markers_hang_in_a_shared_gutter(cx: &mut TestAppContext) {
+    let md = format!("9. short\n10. {LONG_PARA}\n");
+    let (view, vcx, _file) = boot_probed(cx, "hang", &md);
+    vcx.simulate_resize(gpui::size(gpui::px(900.0), gpui::px(900.0)));
+    set_zoom(&view, vcx, 2.0);
+    let (t0x, _, _, _) = probe_get("md-li-0.0-text").expect("item 0 text");
+    let (t1x, _, _, t1h) = probe_get("md-li-0.1-text").expect("item 1 text");
+    let (m1x, _, m1w, _) = probe_get("md-li-0.1-marker").expect("item 1 marker");
+    let (_, _, _, t0h) = probe_get("md-li-0.0-text").expect("item 0 text");
+    assert!(t1h > 2.0 * t0h, "non-vacuous: the long item wraps ({t1h} vs one line {t0h})");
+    assert!((t0x - t1x).abs() < 0.5, "item texts align: {t0x} vs {t1x}");
+    assert!(t1x >= m1x + m1w, "the text (and its wrapped lines) sit right of the marker");
+    crate::layout_probe_end();
+}
+
+/// A blockquote's left rule runs the full height of the quoted text.
+#[gpui::test]
+fn blockquote_bar_spans_the_quote(cx: &mut TestAppContext) {
+    let md = format!("> {LONG_PARA}\n>\n> second quoted paragraph\n");
+    let (_view, _vcx, _file) = boot_probed(cx, "quote", &md);
+    let (bx, by, bw, bh) = probe_get("md-quote-bar-0").expect("bar painted");
+    let (tx, ty, _, th) = probe_get("md-quote-text-0").expect("quote text painted");
+    assert!(th > 100.0, "non-vacuous: the long quote wraps to several lines ({th})");
+    assert!(bw >= 2.0 && bx < tx, "a visible rule left of the text: bar {bx},{by} {bw}x{bh} text {tx},{ty} h{th}");
+    assert!((by - ty).abs() < 0.5 && (bh - th).abs() < 0.5, "rule spans the quote: {by}+{bh} vs {ty}+{th}");
+    crate::layout_probe_end();
+}
+
+/// The copy button of a fenced code block (clicked through the real mouse
+/// dispatch at its painted rect) writes the block's exact plain text to the
+/// clipboard and flags it "Copied"; nested code blocks resolve by path too.
+///
+/// Negative control (observed RED): make `copy_doc_code_block` skip the
+/// clipboard write → the clipboard stays empty.
+#[gpui::test]
+fn code_block_copy_button_writes_the_code(cx: &mut TestAppContext) {
+    let code = "fn main() {\n    println!(\"hi\");\n}";
+    let md = format!("intro\n\n```rust\n{code}\n```\n\n- item\n\n  ```\n  nested\n  ```\n");
+    let (view, vcx, _file) = boot_probed(cx, "copy", &md);
+    let (x, y, w, h) = probe_get("md-code-copy-1").expect("copy button painted");
+    assert!(w > 0.0 && h > 0.0);
+    vcx.simulate_click(gpui::point(gpui::px(x + w / 2.0), gpui::px(y + h / 2.0)), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    let clip = view.update(vcx, |_, cx| cx.read_from_clipboard()).and_then(|c| c.text());
+    assert_eq!(clip.as_deref(), Some(code), "the exact code text is on the clipboard");
+    let copied = view.read_with(vcx, |v, _| match v.workspace.focused_content() {
+        Some(App::Buffer(BufferApp::Viewing(d))) => d.code_copied.as_deref().cloned(),
+        _ => panic!("expected a Doc"),
+    });
+    assert_eq!(copied, Some(vec![1]), "the button flags itself Copied");
+    assert!(
+        view.read_with(vcx, |v, _| v.doc_selection.is_none()),
+        "the press did not start a text selection"
+    );
+
+    // A code block nested in a list item: path [2, item 0, content block 1].
+    frames_n(&view, vcx, 1);
+    let (x, y, w, h) = probe_get("md-code-copy-2.0.1").expect("nested copy button painted");
+    vcx.simulate_click(gpui::point(gpui::px(x + w / 2.0), gpui::px(y + h / 2.0)), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    let clip = view.update(vcx, |_, cx| cx.read_from_clipboard()).and_then(|c| c.text());
+    assert_eq!(clip.as_deref(), Some("nested"));
+    crate::layout_probe_end();
+}
+
+/// One type scale: a WP heading paints at the same size (line box) as the
+/// Doc's heading of the same level.
+///
+/// Negative control (observed RED): restore WP's old 26px h1 → painted 34 vs 36.5.
+#[gpui::test]
+fn wp_heading_matches_doc_heading(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let md = "# Title\n\nbody\n\n## Sub\n\nmore\n";
+    let (view, vcx, _file) = boot_probed(cx, "wph", md);
+    let (_, _, _, d1) = probe_get("md-heading-0").expect("doc h1");
+    let (_, _, _, d2) = probe_get("md-heading-2").expect("doc h2");
+    crate::layout_probe_end();
+    assert!((d1 - 28.0 * 1.3).abs() < 0.5, "doc h1 on the scale: {d1}");
+    vcx.simulate_keystrokes("ctrl-shift-e");
+    paint(&view, vcx);
+    let wp1 = probe(&view, vcx, "wp-heading-0").expect("wp h1").3;
+    let wp2 = probe(&view, vcx, "wp-heading-4").expect("wp h2").3;
+    assert!((wp1 - d1).abs() < 0.5, "h1: WP {wp1} == Doc {d1}");
+    assert!((wp2 - d2).abs() < 0.5, "h2: WP {wp2} == Doc {d2}");
+}
