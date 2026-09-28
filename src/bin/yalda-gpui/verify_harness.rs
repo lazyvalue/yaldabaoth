@@ -1286,7 +1286,7 @@ fn doc_drag_autocopies_selection_to_clipboard(cx: &mut TestAppContext) {
 /// build-root closure to hand to `add_window_view` (whose `&mut
 /// VisualTestContext` return tie-up keeps it from being wrapped in a helper).
 #[cfg(test)]
-fn hermetic_browser_view(
+pub(crate) fn hermetic_browser_view(
     window: &mut gpui::Window,
     cx: &mut gpui::Context<YaldaGpuiView>,
 ) -> YaldaGpuiView {

@@ -2469,6 +2469,15 @@ pub(crate) fn render_with_wiki(
     theme: &Theme,
     path: Option<&std::path::Path>,
 ) -> Vec<RenderedBlock> {
+    render_with_wiki_mapped(text, theme, path).blocks
+}
+
+/// [`render_with_wiki`] plus each block's [`SourceSpan`] in `text`.
+pub(crate) fn render_with_wiki_mapped(
+    text: &str,
+    theme: &Theme,
+    path: Option<&std::path::Path>,
+) -> Rendered {
     if let Some(lang) = path.and_then(lang_for_path) {
         let hl = yalda::highlight::Highlighter::with_syntect_theme(theme.name.syntect_theme());
         // Use a transparent base style — source files render against the
@@ -2489,7 +2498,23 @@ pub(crate) fn render_with_wiki(
         // a whole file as one giant block can neither scroll nor virtualize.
         // Highlighting ran over the full text above, so cross-line state
         // (block comments, raw strings) is already correct in the split.
-        return lines
+        let mut spans = Vec::with_capacity(lines.len());
+        let mut at = 0;
+        for (i, raw) in text.split_inclusive('\n').enumerate().take(lines.len()) {
+            spans.push(SourceSpan {
+                bytes: at..at + raw.len(),
+                lines: i..i + 1,
+            });
+            at += raw.len();
+        }
+        while spans.len() < lines.len() {
+            let i = spans.len();
+            spans.push(SourceSpan {
+                bytes: at..at,
+                lines: i..i + 1,
+            });
+        }
+        let blocks = lines
             .into_iter()
             .enumerate()
             .map(|(i, line)| RenderedBlock::CodeBlock {
@@ -2499,10 +2524,11 @@ pub(crate) fn render_with_wiki(
                 start_line: i,
             })
             .collect();
+        return Rendered { blocks, spans };
     }
-    let mut blocks = render::render(text, theme);
-    expand_wiki_links_in_blocks(&mut blocks, theme);
-    blocks
+    let mut rendered = render::render_mapped(text, theme);
+    expand_wiki_links_in_blocks(&mut rendered.blocks, theme);
+    rendered
 }
 
 pub(crate) fn expand_wiki_links_in_blocks(blocks: &mut [RenderedBlock], theme: &Theme) {
@@ -2742,14 +2768,14 @@ pub(crate) fn re_render_one_doc(d: &mut DocState, theme: &Theme) {
         Some(src) => {
             let seq = src.edit_seq();
             let text = src.full_text();
-            d.set_blocks(render_with_wiki(&text, theme, Some(&path)));
+            d.set_blocks(render_with_wiki_mapped(&text, theme, Some(&path)));
             if let Some(src) = d.source.as_mut() {
                 src.rendered_seq = seq;
             }
         }
         None => {
             let text = std::fs::read_to_string(&path).unwrap_or_default();
-            d.set_blocks(render_with_wiki(&text, theme, Some(&path)));
+            d.set_blocks(render_with_wiki_mapped(&text, theme, Some(&path)));
         }
     }
 }

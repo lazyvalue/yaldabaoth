@@ -110,6 +110,9 @@ mod transcript_view;
 mod you_block_view;
 #[cfg(test)]
 mod verify_harness;
+/// Headless guards for the markdown view/edit experience (graph 4f1).
+#[cfg(test)]
+mod md_harness;
 /// yux — reusable UX component layer (cached-view infra + view primitives).
 /// All UX work is built from here; see `yux/CLAUDE.md`.
 mod yux;
@@ -166,7 +169,9 @@ pub(crate) use gpui::{
 };
 
 pub(crate) use yalda::acp_channel::{AcpChannelClient, AgentProvider, ReplyEvent, YaldaFrontend};
-pub(crate) use yalda::blocks::{ColumnAlignment, ListItem, RenderedBlock, StyledLine, StyledSpan};
+pub(crate) use yalda::blocks::{
+    ColumnAlignment, ListItem, Rendered, RenderedBlock, SourceSpan, StyledLine, StyledSpan,
+};
 pub(crate) use yalda::cursor::CursorPos;
 pub(crate) use yalda::document::Document;
 pub(crate) use yalda::editor::{EditAccess, Editor, EditorCore, EditorView, LineAnchor};
@@ -764,6 +769,9 @@ struct DocState {
     /// closure (`blocks_rc`) — a re-parse swaps the `Rc`, never deep-clones
     /// (C3). Replaced only via `set_blocks`.
     blocks: Rc<Vec<RenderedBlock>>,
+    /// `spans[i]` = where `blocks[i]` came from in the source text; empty when
+    /// the blocks are unmapped (string-backed docs). See `Rendered`.
+    spans: Vec<SourceSpan>,
     file_label: SharedString,
     cursor_block: usize,
     /// Variable-height virtualized list driving the doc body. Only the visible
@@ -839,12 +847,14 @@ impl DocState {
     /// lockstep with field changes — the trap that made the scroll-anchor fix
     /// touch a dozen sites).
     fn viewing(
-        blocks: Vec<RenderedBlock>,
+        rendered: impl Into<Rendered>,
         file_label: SharedString,
         source: Option<DocSource>,
     ) -> Self {
+        let Rendered { blocks, spans } = rendered.into();
         DocState {
             blocks: Rc::new(blocks),
+            spans,
             file_label,
             cursor_block: 0,
             // Top-aligned: a doc reads from its first block (the agent transcript
@@ -860,8 +870,10 @@ impl DocState {
     /// `blocks_seq`, so the next render re-splices lazily — no separate
     /// invalidation call to remember. This is the only path that mutates
     /// `blocks` after construction.
-    fn set_blocks(&mut self, blocks: Vec<RenderedBlock>) {
+    fn set_blocks(&mut self, rendered: impl Into<Rendered>) {
+        let Rendered { blocks, spans } = rendered.into();
         self.blocks = Rc::new(blocks);
+        self.spans = spans;
         self.blocks_seq = self.blocks_seq.wrapping_add(1);
     }
 
@@ -895,8 +907,7 @@ impl DocState {
                 .or_insert(0) += 1
         });
         let path = PathBuf::from(self.file_label.as_ref());
-        let blocks = render_with_wiki(&text, theme, Some(&path));
-        self.set_blocks(blocks);
+        self.set_blocks(render_with_wiki_mapped(&text, theme, Some(&path)));
         if let Some(src) = self.source.as_mut() {
             src.rendered_seq = seq;
         }
@@ -3145,7 +3156,7 @@ impl YaldaGpuiView {
                 return None;
             }
         };
-        let blocks = render_with_wiki(
+        let blocks = render_with_wiki_mapped(
             &core.borrow().document().full_text(),
             &self.theme,
             Some(path),
@@ -4658,7 +4669,7 @@ impl YaldaGpuiView {
             // view of the file — the multi-home / also-show live case.
             match self.workspace.open_and_retain(&path) {
                 Ok((id, core)) => {
-                    let blocks = render_with_wiki(
+                    let blocks = render_with_wiki_mapped(
                         &core.borrow().document().full_text(),
                         &self.theme,
                         Some(&path),

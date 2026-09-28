@@ -7,10 +7,121 @@ use crate::style::Style;
 use crate::theme::Theme;
 
 pub fn render(markdown: &str, theme: &Theme) -> Vec<RenderedBlock> {
+    render_mapped(markdown, theme).blocks
+}
+
+/// Render plus a [`SourceSpan`] per top-level block (see [`Rendered`]).
+pub fn render_mapped(markdown: &str, theme: &Theme) -> Rendered {
     // Match the theme so code fences aren't always base16-ocean.dark regardless
     // of the active theme (e.g. dark tokens washing out on Folio's linen bg).
     let highlighter = Highlighter::with_syntect_theme(theme.name.syntect_theme());
-    render_with_highlighter(markdown, theme, &highlighter)
+    let (events, ranges): (Vec<_>, Vec<_>) = parse::parse_with_offsets(markdown).unzip();
+    let mut renderer = Renderer::new(theme, &highlighter);
+    renderer.top_ranges = Some(ranges);
+    let blocks = renderer.render(&events);
+    let starts = renderer.top_spans;
+    let mut lines = LineIndex::new(markdown);
+    let spans = starts
+        .into_iter()
+        .map(|bytes| SourceSpan {
+            lines: lines.lines_of(&bytes),
+            bytes,
+        })
+        .collect();
+    Rendered { blocks, spans }
+}
+
+/// Byte offset → 0-based line, for monotonically non-decreasing queries.
+struct LineIndex<'s> {
+    text: &'s str,
+    pos: usize,
+    line: usize,
+}
+
+impl<'s> LineIndex<'s> {
+    fn new(text: &'s str) -> Self {
+        Self { text, pos: 0, line: 0 }
+    }
+
+    fn line_of(&mut self, byte: usize) -> usize {
+        let byte = byte.min(self.text.len());
+        if byte < self.pos {
+            // Out-of-order query: recount from the start.
+            self.pos = 0;
+            self.line = 0;
+        }
+        self.line += self.text.as_bytes()[self.pos..byte]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count();
+        self.pos = byte;
+        self.line
+    }
+
+    /// Half-open line range covered by `bytes` (a trailing newline does not
+    /// extend it onto the next line).
+    fn lines_of(&mut self, bytes: &std::ops::Range<usize>) -> std::ops::Range<usize> {
+        let start = self.line_of(bytes.start);
+        let last = if bytes.end > bytes.start {
+            self.line_of(bytes.end - 1)
+        } else {
+            start
+        };
+        start..last + 1
+    }
+}
+
+/// One heading in a document outline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutlineHeading {
+    pub level: u8,
+    /// Plain heading text (markup stripped).
+    pub text: String,
+    /// Source byte range of the heading element.
+    pub bytes: std::ops::Range<usize>,
+    /// 0-based source line the heading starts on.
+    pub line: usize,
+}
+
+/// Every heading in `markdown` at any nesting depth (ATX and setext; `#`
+/// lines inside code blocks are code, not headings). The one outline both the
+/// rendered and raw views use, so they always agree.
+pub fn outline(markdown: &str) -> Vec<OutlineHeading> {
+    let mut out = Vec::new();
+    let mut lines = LineIndex::new(markdown);
+    let mut current: Option<OutlineHeading> = None;
+    for (event, range) in parse::parse_with_offsets(markdown) {
+        match event {
+            Event::Start(Tag::Heading { level, .. }) => {
+                current = Some(OutlineHeading {
+                    level: heading_level_to_u8(level),
+                    text: String::new(),
+                    line: lines.line_of(range.start),
+                    bytes: range,
+                });
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                if let Some(mut h) = current.take() {
+                    h.text = h.text.trim().to_string();
+                    if !h.text.is_empty() {
+                        out.push(h);
+                    }
+                }
+            }
+            Event::Text(t) | Event::Code(t) => {
+                if let Some(h) = current.as_mut() {
+                    h.text.push_str(&t);
+                }
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                if let Some(h) = current.as_mut() {
+                    h.text.push(' ');
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Render using an existing Highlighter (avoids re-loading syntax definitions).
@@ -27,6 +138,12 @@ pub fn render_with_highlighter(
 struct Renderer<'a, 't> {
     theme: &'t Theme,
     highlighter: &'a Highlighter,
+    /// Source ranges parallel to the top-level event slice, when mapping.
+    top_ranges: Option<Vec<std::ops::Range<usize>>>,
+    /// Byte range of each top-level block emitted (filled only when mapping).
+    top_spans: Vec<std::ops::Range<usize>>,
+    /// `render` nesting depth: only depth 1 is the top-level event slice.
+    depth: usize,
 }
 
 struct InlineState {
@@ -73,14 +190,45 @@ impl InlineState {
 
 impl<'a, 't> Renderer<'a, 't> {
     fn new(theme: &'t Theme, highlighter: &'a Highlighter) -> Self {
-        Self { theme, highlighter }
+        Self {
+            theme,
+            highlighter,
+            top_ranges: None,
+            top_spans: Vec::new(),
+            depth: 0,
+        }
     }
 
     fn render(&mut self, events: &[Event<'_>]) -> Vec<RenderedBlock> {
+        self.depth += 1;
         let mut blocks = Vec::new();
         let mut i = 0;
 
         while i < events.len() {
+            let (event_start, blocks_before) = (i, blocks.len());
+            i = self.render_one(events, i, &mut blocks);
+            if self.depth == 1
+                && let Some(ranges) = &self.top_ranges
+            {
+                for _ in blocks_before..blocks.len() {
+                    self.top_spans.push(ranges[event_start].clone());
+                }
+            }
+        }
+
+        self.depth -= 1;
+        blocks
+    }
+
+    /// Consume the element starting at `events[*i]`, pushing its block (if
+    /// any) onto `blocks`.
+    fn render_one(
+        &mut self,
+        events: &[Event<'_>],
+        mut i: usize,
+        blocks: &mut Vec<RenderedBlock>,
+    ) -> usize {
+        {
             match &events[i] {
                 Event::Start(Tag::Heading { level, .. }) => {
                     let level_num = heading_level_to_u8(*level);
@@ -262,8 +410,7 @@ impl<'a, 't> Renderer<'a, 't> {
                 }
             }
         }
-
-        blocks
+        i
     }
 
     fn plain_code_lines(&self, code: &str) -> Vec<StyledLine> {
@@ -652,6 +799,78 @@ mod highlight_theme_tests {
         assert_ne!(
             folio_string, dark_string,
             "block path must vary syntax colors by theme"
+        );
+    }
+}
+
+#[cfg(test)]
+mod source_map_tests {
+    use super::*;
+
+    const CORPUS: &[&str] = &[
+        "",
+        "plain",
+        "# Title\n\nPara one\nstill one.\n\n## Sub\n\n- a\n- b\n  - nested\n\n> quote\n> more\n",
+        "---\ntitle: x\n---\n# After frontmatter\n\ntext\n",
+        "```rust\n# not a heading\nfn a() {}\n```\n\n# Real\n",
+        "| a | b |\n|:--|--:|\n| 1 | 2 |\n\n***\n\n1. one\n2. two\n",
+        "Setext\n======\n\nbody\n\nSub\n---\n",
+        "- [ ] todo\n- [x] done\n\n![alt](img.png)\n\n    indented code\n",
+        "<div>html</div>\n\npara after html\n",
+        "no trailing newline at end",
+        "\n\n\n# heading after blanks\n\n\n",
+        "```mermaid\ngraph TD; A-->B;\n```\n",
+    ];
+
+    fn theme() -> Theme {
+        Theme::default()
+    }
+
+    /// Every top-level block gets exactly one span; spans are ordered,
+    /// non-overlapping, inside the text, and their line ranges agree with the
+    /// bytes they cover.
+    #[test]
+    fn spans_tile_the_document_in_order() {
+        for md in CORPUS {
+            let r = render_mapped(md, &theme());
+            assert_eq!(r.blocks, render(md, &theme()), "mapping must not change blocks: {md:?}");
+            assert_eq!(r.blocks.len(), r.spans.len(), "one span per block: {md:?}");
+            let mut prev_end = 0;
+            for s in &r.spans {
+                assert!(s.bytes.start >= prev_end, "ordered/non-overlapping: {md:?} {s:?}");
+                assert!(s.bytes.start < s.bytes.end && s.bytes.end <= md.len(), "{md:?} {s:?}");
+                let line = md[..s.bytes.start].matches('\n').count();
+                assert_eq!(s.lines.start, line, "start line: {md:?} {s:?}");
+                assert!(s.lines.end > s.lines.start, "{md:?} {s:?}");
+                prev_end = s.bytes.end;
+            }
+        }
+    }
+
+    #[test]
+    fn spans_point_at_their_source() {
+        let md = "# Title\n\nPara\n\n## Sub\n\n```rust\nfn a() {}\n```\n";
+        let r = render_mapped(md, &theme());
+        let src: Vec<&str> = r.spans.iter().map(|s| &md[s.bytes.clone()]).collect();
+        assert!(src[0].starts_with("# Title"));
+        assert!(src[1].starts_with("Para"));
+        assert!(src[2].starts_with("## Sub"));
+        assert!(src[3].starts_with("```rust"));
+        assert_eq!(r.spans[3].lines, 6..9);
+        assert_eq!(r.block_at_line(0), Some(0));
+        assert_eq!(r.block_at_line(1), Some(0), "blank line maps to preceding block");
+        assert_eq!(r.block_at_line(7), Some(3));
+    }
+
+    #[test]
+    fn outline_excludes_code_and_includes_setext_and_nested() {
+        let md = "    # indented code\n\n# One\n\n```sh\n# comment, not a heading\n```\n\nTwo\n===\n\n- item\n\n  ## Nested in list\n\n### `code` *three*\n";
+        let o = outline(md);
+        let got: Vec<(u8, &str, usize)> =
+            o.iter().map(|h| (h.level, h.text.as_str(), h.line)).collect();
+        assert_eq!(
+            got,
+            vec![(1, "One", 2), (1, "Two", 8), (2, "Nested in list", 13), (3, "code three", 15)]
         );
     }
 }

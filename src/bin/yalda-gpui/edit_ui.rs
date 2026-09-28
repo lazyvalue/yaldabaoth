@@ -187,7 +187,7 @@ impl YaldaGpuiView {
             App::Buffer(BufferApp::Editing(edit)) => {
                 let edit_path = PathBuf::from(edit.file_label.as_ref());
                 let blocks =
-                    render_with_wiki(&edit.editor.full_text(), &self.theme, Some(&edit_path));
+                    render_with_wiki_mapped(&edit.editor.full_text(), &self.theme, Some(&edit_path));
                 let file_label = edit.file_label.clone();
                 // 5c: the new Doc keeps the SAME pooled core the Edit view held
                 // (shared text + undo). No stash — the core IS the live state.
@@ -364,7 +364,7 @@ impl YaldaGpuiView {
                 let (blocks, source) = match pooled {
                     Some((id, core)) => {
                         core.borrow_mut().replace_text(text, path.clone());
-                        let blocks = render_with_wiki(
+                        let blocks = render_with_wiki_mapped(
                             &core.borrow().document().full_text(),
                             &self.theme,
                             Some(&path),
@@ -373,7 +373,8 @@ impl YaldaGpuiView {
                     }
                     None => {
                         let doc = Document::from_text(text, path.clone());
-                        let blocks = render_with_wiki(&doc.full_text(), &self.theme, Some(&path));
+                        let blocks =
+                            render_with_wiki_mapped(&doc.full_text(), &self.theme, Some(&path));
                         (blocks, None)
                     }
                 };
