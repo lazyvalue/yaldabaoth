@@ -13,17 +13,15 @@ on 2026-09-27 (`cog bulletin get yaldabaoth/docs::backlog-archive`).
 
 ## Needs runtime
 
-- **Text-editing code review + fixes** — `NEEDS-DECISION` (built 2026-09-27, Cog
-  graph `exa`, branch `text-edit-review`, **not merged** per Scott; see
+- **Text-editing code review + fixes** — `NEEDS-RUNTIME` (built 2026-09-27, Cog
+  graphs `exa` + `ls2`, merged to `main` at `7c0cb75`; see
   [review](research/2026-09-27-text-editing-review.md),
-  [worklog](worklog/2026-09-27-text-editing-review.md), UXI-TextEditing-5).
-  36 findings fixed (shared `LineInput` for all 14 single-line fields, undo/frozen
-  engine bugs, highlight cache O(changed), tab caret, clipboard via GPUI, compose
-  hot path, Diff paste). Decision: review + merge to `main`. After merge,
-  NEEDS-RUNTIME: gap 1 (caret/font pixels), and the Restart-path draft save order.
-  Deferred follow-ups listed in the review's Outcome section (B2/B8/B9/B14, C3,
-  C10/D11 cached Edit body + You-block, compose typing not undoable, tab-line
-  mouse hit-test, A8 async file-filter search).
+  [worklog](worklog/2026-09-27-text-editing-review.md),
+  [deferred worklog](worklog/2026-09-27-text-editing-deferred-fixes.md)).
+  Every finding fixed except the small leftovers in the review's Outcome.
+  Needs a release build + GUI restart by Scott to activate. Gap 1 (pixels):
+  caret/selection fonts, the cached You-block overlay, zoomed gutter. Restart-path
+  draft save ordering (spawns a real process) untested.
 
 - **Diff Review rework (rev 2)** — `NEEDS-RUNTIME` (built 2026-09-27, Cog graph
   `8g7`, branch `diff-rework` → `main`; see
