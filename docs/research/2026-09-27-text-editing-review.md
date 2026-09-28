@@ -122,16 +122,20 @@ under a custom binding (`x` defaults to `extend-line`); D1's `paste_into_compose
 not what a real Cmd-V runs (the global paste action wins, bug-0039) — the real path
 already pasted at the caret, but recorded no undo; both were fixed.
 
-**Deferred (not done here):**
+**Deferred items — fixed in graph `ls2` (2026-09-27, landed on `main` `7c0cb75`):**
 
-- B2/B12 — undo restores a stale frozen-lines snapshot; needs replaying anchor shifts.
-- B8 — ropey `unicode_lines`/`cr_lines` vs `\n`-only engine; needs CRLF normalization on load/save.
-- B9 — undo stack never trimmed; `shift_recorded_splices` walks all of it per chunk.
-- B14 — tree-sitter reparse copies the whole doc for an unused tree (removal is a product call).
-- B17, C8, C9, C11, D12–D15, E3, E4, A8 (sync FS walk per file-filter keystroke), A9.
-- C3 (every Doc tile re-parses on sibling edits) and C10 / D11 (Edit body and
-  You-block not cached yux entities) — the remaining large per-frame costs.
-- Found during implementation: typed text in the agent compose isn't undoable
-  (Insert entered without `begin_insert`); mouse hit-test on tab lines still uses
-  display columns (the inverse of C4); restart-path draft save ordering (D3) has no
-  automated test because it spawns a real process.
+| Package | IDs | Key guards |
+|---|---|---|
+| Q1 engine | B2, B12, B8, B9, B14, B17, compose typing undoable | `undo_after_streamed_agent_lines_keeps_new_frozen_ranges`, `crlf_file_edit_at_eol_saves_clean_crlf`, `unicode_line_separator_in_stream_does_not_desync_frozen_lines`, `undo_stack_is_capped_and_save_point_survives_eviction`, `edits_do_not_parse_until_the_tree_is_read`, `failed_prefix_fires_first_keys_single_binding_then_the_rest`, `chatbox_typed_text_is_undone_by_esc_u` |
+| Q2 edit view | C8, C9, C10, C11, tab-line click | `edit_body_is_render_flat_while_another_tile_types_or_streams`, `sibling_edit_tile_typing_keeps_this_tiles_scroll`, `edit_gutter_fits_five_digit_line_numbers`, `edit_gutter_scales_with_zoom`, `transcript_click_after_tab_places_caret_at_raw_column` (shared `src/md_line.rs` marker parser) |
+| Q3 doc tiles | C3 | `c3_hidden_doc_does_not_reparse_on_sibling_edit_and_is_fresh_when_shown` |
+| Q4 compose | D11–D15 (E4 already bounded by kfa; guarded) | `worksheet_inline_typing_rerenders_you_block_not_transcript`, `compose_virtualized_rewraps_after_width_change`, `compose_eol_caret_on_full_wrapped_row_paints_inside_box`, `compose_wide_chars_wrap_by_cells_caret_inside_box`, `compose_cmd_v_normalizes_crlf`, `diff_compose_uses_shared_chatbox_wrap_and_tabs`, `diff_compose_long_comment_is_height_capped_with_caret_inside` |
+| Q5 pickers + diff | A8, A9, E3 | `browser_filter_keystroke_defers_recursive_walk`, `jump_palette_render_without_change_does_not_rerank` (+ keymap / Cog / buffer-switcher), `visible_rows_many_files_and_comments_match_reference_in_linear_work` |
+
+**Still open (small, noted by the packages):** the Edit view and chatbox have no mouse
+hit-testing at all (tab-line click fixed where it exists — the transcript); in a
+mixed-ending file, Backspace at col 0 below a CRLF line leaves the `\r`; a
+programmatic splice inside a recorded edit isn't split (bounded by the 1000-group
+undo cap); the jump palette still rebuilds its item list per render (ranking is
+memoized); `tests/session_resilience_test.rs` has a pre-existing parallel-run
+flake (Cog bulletin `an7`, entry `yx4`).
