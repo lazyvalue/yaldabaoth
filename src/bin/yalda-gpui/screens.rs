@@ -193,7 +193,7 @@ impl YaldaGpuiView {
                 d.list.state().scroll_to_reveal_item(d.cursor_block);
             }
         }
-        // A Doc landed from Edit (UXI-Buffer-5) re-checks, against the last
+        // A Doc landed from Edit (UXI-Buffer-9) re-checks, against the last
         // layout, that the cursor block painted on-screen; the follow-up frame
         // is scheduled via defer — never a notify inside render.
         if d.list.settle() {
