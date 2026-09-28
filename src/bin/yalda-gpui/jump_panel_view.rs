@@ -1467,6 +1467,24 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
+    /// The jump panel's chrome style. Navigation is UI chrome, not code, so
+    /// BOTH font slots are the UI font (UXI-JumpPanel-24): every row, header and
+    /// drag preview that reads `st.mono` renders proportional. Before d9c4c6d
+    /// the code font silently fell back to the proportional UI face on Linux;
+    /// once it resolved to a real monospace face the panel turned monospace.
+    pub(crate) fn jump_panel_style(&self, supporting_text: Hsla) -> DetailStyle {
+        DetailStyle {
+            fg: self.editor_fg(),
+            dim: nc(self.theme.agent.dim),
+            accent: supporting_text,
+            err: nc(self.theme.agent.jump_header),
+            mono: self.body_font.clone(),
+            prose: self.body_font.clone(),
+            base: px(13.0),
+            pt: 13.0,
+        }
+    }
+
     /// Build the jump-panel sidebar element (inline; see the module note).
     /// Reads workspaces + agent sessions + theme directly off `self`; row clicks
     /// re-enter through `cx.listener` and resolve their target id/index in the
@@ -1478,16 +1496,7 @@ impl YaldaGpuiView {
         // `dim` both failed as readable navigation text.
         let supporting_text = nc(jump_supporting_text_color(&self.theme.agent));
         let selection_mark = nc(self.theme.overlay.border);
-        let st = DetailStyle {
-            fg: self.editor_fg(),
-            dim: nc(self.theme.agent.dim),
-            accent: supporting_text,
-            err: nc(self.theme.agent.jump_header),
-            mono: self.code_font.clone(),
-            prose: self.body_font.clone(),
-            base: px(13.0),
-            pt: 13.0,
-        };
+        let st = self.jump_panel_style(supporting_text);
         // Selection is deliberately neutral gray. Operational state owns the
         // saturated hues: orange means working and green means ready for input.
         let sel_bg = nc(jump_selection_color(&self.theme.overlay));
