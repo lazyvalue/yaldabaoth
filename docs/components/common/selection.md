@@ -15,7 +15,6 @@ buffer.
 
 ## References
 
-- INV-UX-14 in `docs/ux-invariants.md` → migrated here.
 - `docs/components/agent-tile/README.md` — the transcript facet consuming this.
 
 ## UX invariants

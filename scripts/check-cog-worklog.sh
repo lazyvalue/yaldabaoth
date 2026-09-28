@@ -1,7 +1,9 @@
 #!/bin/sh
 
-# Validate mandatory Cog execution evidence in one or more feature worklogs.
-# Historical worklogs predate this policy, so callers pass only current entries.
+# Validate the Cog evidence in one or more worklogs. The graph itself holds the
+# per-node outputs and notes; the worklog only needs to point at it and prove it
+# reached `complete`. Historical worklogs predate this format — pass only current
+# entries.
 
 set -eu
 
@@ -30,16 +32,12 @@ check_worklog() {
         fi
     }
 
-    require '^## Cog execution evidence$' 'Cog execution evidence section'
-    require '^- Graph id: `[^`]+`$' 'graph id'
-    require '^### Initial render$' 'initial render heading'
-    require '^frontier [0-9]+:' 'initial frontier render'
-    require '^### Node execution$' 'node execution heading'
-    require 'claimed.*closed.*output' 'claimed/closed node execution with output'
-    require '^### Notes$' 'notes heading'
-    require '^### Final status$' 'final status heading'
+    require '\*\*Graph:\*\* `[^`<>]+`' 'graph id in the header'
+    require '^## Shipped$' 'Shipped section'
+    require '^## Caveats$' 'Caveats section'
+    require '^## Cog$' 'Cog section'
     require '^- Status: `complete`$' 'complete final status'
-    require 'omega' 'omega in execution evidence'
+    require '^frontier [0-9]+: omega \[done\]' 'final render with omega done'
 }
 
 for worklog in "$@"; do

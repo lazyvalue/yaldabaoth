@@ -6585,7 +6585,7 @@ impl YaldaGpuiView {
     /// `ContentBlock::Image` on submit); otherwise the clipboard text is pasted
     /// into the compose editor. Multiple image entries stage multiple chips.
     /// Stage any clipboard image(s) onto the focused agent tile's compose as
-    /// pending attachments (INV-UX-21), returning how many were staged. On macOS
+    /// pending attachments (UXI-AgentTile-14), returning how many were staged. On macOS
     /// the image is read straight off the pasteboard
     /// (`system_console::read_clipboard_image_png`) because GPUI's
     /// `read_from_clipboard` returns a string-only item whenever the board carries

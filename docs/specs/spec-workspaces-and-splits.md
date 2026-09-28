@@ -20,8 +20,7 @@ ADR-0028 (Projects as the top-level primitive; the workspace's `ProjectId` FK)
 `docs/specs/spec-tiles-and-apps.md` (what a leaf *holds* — one App),
 `docs/specs/spec-layout-patterns.md` (marks, automatic layouts, tags),
 `docs/specs/spec-desktop-mode.md` (the free-placement layout mode),
-`docs/specs/spec-rail.md` (persistent side columns), `docs/UX.md`
-(the reader-facing "Window & layout taxonomy" summary), `spec-agent-cwd.md`
+`docs/specs/spec-rail.md` (persistent side columns), `spec-agent-cwd.md`
 (reuses Constraint §11 + Behaviors 23–24), `spec-agent-window.md` (the leaf as
 one window-kind; partially inlines §10's editor substrate).
 
@@ -37,7 +36,7 @@ tree code is deliberately **generic over the content type** (`Frame<C>`,
 `WindowContent{Doc,Edit,Browser,Agent}` collapsed into `App{Buffer,Agent}` —
 only the type parameter changed (ADR-0019 Consequences; Constraint §1).
 
-The containment hierarchy (see `docs/UX.md` for the reader-facing table):
+The containment hierarchy (the component index is `docs/components/README.md`):
 
 | Term | Code type | Meaning |
 |---|---|---|

@@ -191,30 +191,42 @@ impl DiffView {
     /// arithmetic over the last laid-out viewport height. State-only (no
     /// notify) — safe on the render path, like the Doc view's reveal.
     ///
-    /// `composing`: the comment compose just opened this frame — it will take
-    /// [`COMPOSE_RESERVE_ROWS`] rows' worth of height from the list's
-    /// (last-measured, still-unshrunk) viewport, so reveal against the
-    /// smaller window and the anchored line isn't hidden behind the panel.
-    fn reveal_cursor(&mut self, cursor: usize, rows_gen: u64, compose: (u64, bool), row_count: usize, row_h: f32) {
-        let key = (cursor, rows_gen, compose.0);
+    /// `compose_span`: the inline comment compose's slot rows (spec B5). While
+    /// it is open the whole editor is revealed too — its last slot row first,
+    /// then the row above it (the anchor line) / the cursor, so a tall draft
+    /// never pushes the commented line out of view. The key includes
+    /// `rows_gen`, so the draft growing a line (a slot-row rebuild) re-reveals
+    /// and the editor's bottom (the caret) stays in view.
+    fn reveal_cursor(
+        &mut self,
+        cursor: usize,
+        rows_gen: u64,
+        compose_gen: u64,
+        compose_span: Option<(usize, usize)>,
+        row_count: usize,
+        row_h: f32,
+    ) {
+        let key = (cursor, rows_gen, compose_gen);
         if self.revealed == Some(key) || row_count == 0 {
             return;
         }
-        let compose_opened = compose.1 && self.revealed.is_some_and(|r| r.2 != compose.0);
         self.revealed = Some(key);
         let state = self.list.state();
         let vh = f32::from(state.viewport_bounds().size.height);
         if vh <= 0.0 {
             // Never laid out yet: fall back to gpui's own reveal.
-            state.scroll_to_reveal_item(cursor);
+            state.scroll_to_reveal_item(compose_span.map_or(cursor, |(_, last)| last));
             return;
         }
-        let mut visible = ((vh / row_h).floor() as usize).max(1);
-        if compose_opened {
-            visible = visible.saturating_sub(COMPOSE_RESERVE_ROWS).max(1);
-        }
+        let visible = ((vh / row_h).floor() as usize).max(1);
         let prev = state.logical_scroll_top();
-        let top = compose_first_visible_line(cursor, prev.item_ix, row_count, visible);
+        let top = match compose_span {
+            Some((first, last)) => {
+                let bottom = compose_first_visible_line(last, prev.item_ix, row_count, visible);
+                compose_first_visible_line(first.saturating_sub(1).min(cursor), bottom, row_count, visible)
+            }
+            None => compose_first_visible_line(cursor, prev.item_ix, row_count, visible),
+        };
         if top != prev.item_ix || (cursor == top && prev.offset_in_item != px(0.0)) {
             state.scroll_to(gpui::ListOffset {
                 item_ix: top,
@@ -222,15 +234,40 @@ impl DiffView {
             });
         }
     }
+
+    /// The virtualized body's scroll state — read by the root to paint the
+    /// inline comment compose over its slot rows (`list_rows_overlay`).
+    pub(crate) fn list_state(&self) -> gpui::ListState {
+        self.list.state().clone()
+    }
 }
 
 /// Unscaled height of one diff row (every row — file header, hunk header,
-/// line — is exactly this × `text_scale`, see module docs).
+/// line, comment-card row, compose slot — is exactly [`diff_row_h`]).
 const DIFF_ROW_BASE_H: f32 = 22.0;
 
-/// Rows of list height the bottom-pinned comment compose (screens.rs
-/// `render_diff_comment_compose`) is assumed to take when it opens.
-const COMPOSE_RESERVE_ROWS: usize = 8;
+/// The painted height of every Diff body row at `text_scale` (shared with the
+/// root's inline-compose overlay, which must land exactly on the slot rows).
+pub(crate) fn diff_row_h(text_scale: f32) -> Pixels {
+    px((DIFF_ROW_BASE_H * text_scale).round())
+}
+
+/// Left inset of a comment card / the inline compose: aligned with the code
+/// text (past both line-number gutters and the sign column).
+pub(crate) fn diff_card_inset_left(text_scale: f32) -> Pixels {
+    diff_gutter_w(text_scale) * 2.0 + px(16.0)
+}
+
+fn diff_gutter_w(text_scale: f32) -> Pixels {
+    px((40.0 * text_scale).round())
+}
+
+/// Right inset of a comment card / the inline compose.
+pub(crate) const DIFF_CARD_INSET_RIGHT: f32 = 16.0;
+/// Corner radius of a comment card / the inline compose box.
+pub(crate) const DIFF_CARD_RADIUS: f32 = 6.0;
+/// Vertical gap between a card box and the diff rows above/below it.
+pub(crate) const DIFF_CARD_GAP: f32 = 4.0;
 
 /// Colors/fonts/sizes the `'static` row closure needs, snapshotted once per
 /// render (all `Copy`/refcounted).
@@ -249,7 +286,15 @@ struct DiffRowStyle {
     cursor_bar: Hsla,
     /// `V` range / compose-anchor tint.
     sel_bg: Hsla,
+    /// Comment card body fill (OPAQUE — the border ring shows through a
+    /// translucent fill otherwise).
     card_bg: Hsla,
+    /// Comment card header strip fill (opaque).
+    card_header_bg: Hsla,
+    /// Neutral card border ring (opaque); a focused card uses `accent`, an
+    /// outdated one `card_outdated_border`.
+    card_border: Hsla,
+    card_outdated_border: Hsla,
     prose: SharedString,
     mono: SharedString,
     text: Pixels,
@@ -293,13 +338,16 @@ impl Render for DiffView {
             cursor_bg: tint(selected_bg, 0.70),
             cursor_bar: rgb(CURSOR_BAR_COLOR).into(),
             sel_bg: tint(st.accent, 0.16),
-            card_bg: tint(selected_bg, 0.55),
+            card_bg: editor_bg.blend(tint(selected_bg, 0.30)),
+            card_header_bg: editor_bg.blend(tint(selected_bg, 0.65)),
+            card_border: editor_bg.blend(tint(st.dim, 0.55)),
+            card_outdated_border: editor_bg.blend(tint(nc(at.diff_remove), 0.60)),
             prose: st.prose.clone(),
             mono: st.mono.clone(),
             text: px(13.0 * scale),
             small: px(11.5 * scale),
-            row_h: px((DIFF_ROW_BASE_H * scale).round()),
-            gutter_w: px((40.0 * scale).round()),
+            row_h: diff_row_h(scale),
+            gutter_w: diff_gutter_w(scale),
         };
         let tile = r.diff_tile_ref(self.window_id);
         self.last_rendered = tile.map(|t| DiffSeqs::of(t, scale)).unwrap_or_default();
@@ -323,12 +371,19 @@ impl Render for DiffView {
                 cards: self.cards_for(t),
                 now: chrono::Utc::now(),
             };
-            let compose = (t.compose_gen, t.compose.is_some());
+            let (compose_gen, compose_span) = (t.compose_gen, t.compose_slot_span());
             let body: AnyElement = if model.files.is_empty() {
                 diff_empty_body(&model, &st).into_any_element()
             } else {
                 self.list.reconcile(&rows, rows_gen);
-                self.reveal_cursor(cursor, rows_gen, compose, rows.len(), f32::from(row_style.row_h));
+                self.reveal_cursor(
+                    cursor,
+                    rows_gen,
+                    compose_gen,
+                    compose_span,
+                    rows.len(),
+                    f32::from(row_style.row_h),
+                );
                 let render_fn = diff_row_renderer(
                     model,
                     rows,
@@ -407,12 +462,41 @@ pub(crate) fn relative_time(at: &str, now: chrono::DateTime<chrono::Utc>) -> Str
     let Ok(t) = chrono::DateTime::parse_from_rfc3339(at) else {
         return at.to_string();
     };
-    let secs = (now - t.with_timezone(&chrono::Utc)).num_seconds().max(0);
-    match secs {
-        0..60 => "just now".to_string(),
-        60..3600 => format!("{}m ago", secs / 60),
-        3600..86400 => format!("{}h ago", secs / 3600),
-        _ => format!("{}d ago", secs / 86400),
+    relative_age((now - t.with_timezone(&chrono::Utc)).num_seconds())
+}
+
+/// Elapsed seconds → a compact age: "just now" / "5m ago" / "3h ago" /
+/// "2d ago" / "3w ago" / "4mo ago" / "2y ago". Pure (callers pass `now`);
+/// negative (clock skew) reads as "just now".
+pub(crate) fn relative_age(elapsed_secs: i64) -> String {
+    const MIN: i64 = 60;
+    const HOUR: i64 = 60 * MIN;
+    const DAY: i64 = 24 * HOUR;
+    const WEEK: i64 = 7 * DAY;
+    const MONTH: i64 = 30 * DAY;
+    const YEAR: i64 = 365 * DAY;
+    let s = elapsed_secs.max(0);
+    match s {
+        _ if s < MIN => "just now".to_string(),
+        _ if s < HOUR => format!("{}m ago", s / MIN),
+        _ if s < DAY => format!("{}h ago", s / HOUR),
+        _ if s < 2 * WEEK => format!("{}d ago", s / DAY),
+        _ if s < 2 * MONTH => format!("{}w ago", s / WEEK),
+        _ if s < YEAR => format!("{}mo ago", s / MONTH),
+        _ => format!("{}y ago", s / YEAR),
+    }
+}
+
+/// A worktree picker row's description line (UXI-Diff-10):
+/// `<HEAD subject> · <age> · <~/path>`, or just the path when the commit is
+/// unknown (fresh repo / git failure). `now_unix` is passed in (pure).
+pub(crate) fn worktree_row_description(row: &WorktreeEntry, path: &str, now_unix: i64) -> String {
+    match &row.head_commit {
+        Some(c) if !c.subject.trim().is_empty() => {
+            format!("{} · {} · {path}", c.subject.trim(), relative_age(now_unix - c.time))
+        }
+        Some(c) => format!("{} · {path}", relative_age(now_unix - c.time)),
+        None => path.to_string(),
     }
 }
 
@@ -476,8 +560,8 @@ fn home_relative(path: &std::path::Path) -> String {
 }
 
 /// The worktree picker (spec rev 2 B1, UXI-Diff-10): a title, one
-/// `picker_option_row_detailed` per worktree (branch prominent, home-relative
-/// path dimmed, a "primary" badge on the primary checkout), then the "Pick a
+/// `picker_option_row_detailed` per worktree (branch prominent; dimmed
+/// description `subject · age · ~/path`, a "primary" badge on the primary checkout), then the "Pick a
 /// folder…" row and the key-hint footer. Rows are clickable; the handler
 /// carries only the ROW INDEX and resolves the row at event time through the
 /// root (`diff_picker_activate`) — yux rule 4, since a cache hit replays this
@@ -531,14 +615,15 @@ fn diff_picker_body(
         })
     };
 
+    let now_unix = chrono::Utc::now().timestamp();
     for (i, row) in picker.rows.iter().enumerate() {
         let label = row.label();
-        let path = home_relative(&row.path);
+        let description = worktree_row_description(row, &home_relative(&row.path), now_unix);
         let el = picker_option_row_detailed(
             SharedString::from(format!("diff-picker-row-{window_id}-{i}")),
             "⎇",
             &label,
-            Some((&path, st.dim)),
+            Some((&description, st.dim)),
             row.is_primary.then_some(("primary", st.dim)),
             picker.selected == i,
             st.accent,
@@ -713,15 +798,25 @@ fn diff_row_renderer(
         let Some(row) = rows.get(ix).copied() else {
             return div().h(rs.row_h).into_any_element();
         };
+        // Compose slots paint empty: the root paints the inline editor over
+        // them (`render_diff` → `list_rows_overlay`), outside this cache.
+        if row.is_compose_slot() {
+            return div().w_full().h(rs.row_h).into_any_element();
+        }
         let is_cursor = ix == cursor;
         let marked = marks.is_marked(ix, row);
+        let is_card = row.comment_index().is_some();
         let (content, bg): (AnyElement, Option<Hsla>) = match row {
+            RowRef::ComposeSlot { .. } => unreachable!("handled above"),
             RowRef::Comment {
                 comment,
                 part,
                 parts,
                 ..
-            } => (diff_comment_row(&marks, comment, part, parts, &rs), None),
+            } => {
+                let focused = rows.get(cursor).and_then(RowRef::comment_index) == Some(comment);
+                (diff_comment_row(&marks, comment, part, parts, focused, &rs), None)
+            }
             RowRef::File {
                 file,
                 viewed,
@@ -791,7 +886,9 @@ fn diff_row_renderer(
                     .flex_1()
                     .min_w_0()
                     .h_full()
-                    .bg(if is_cursor { rs.cursor_bg } else { transparent })
+                    // A focused card is marked by its accent ring, not a
+                    // row tint behind the box.
+                    .bg(if is_cursor && !is_card { rs.cursor_bg } else { transparent })
                     .child(content),
             )
             .into_any_element();
@@ -1005,92 +1102,210 @@ impl RowMarks {
     }
 }
 
-/// One row of an inline comment card (spec B5): an inset, tinted panel with
-/// an accent left border (dim red when outdated), rounded at the card's first
-/// and last row. Row 0 = `💬 c3` · badge (`unsent` / `sent to <label> ·
-/// <time>` / `outdated`) · the first body line; later rows = the rest of
-/// [`comment_card_lines`] (an outdated card ends with its snippet, dimmed).
-fn diff_comment_row(marks: &RowMarks, ci: usize, part: u8, parts: u8, rs: &DiffRowStyle) -> AnyElement {
+/// A small rounded status pill (comment card header): tinted fill, colored
+/// mono text. Its text is a `probe_text` leaf (`tag`) so a test can read the
+/// SHAPED label.
+fn card_pill(tag: impl FnOnce() -> String, text: String, color: Hsla, fill: Hsla, rs: &DiffRowStyle) -> gpui::Div {
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .px(px(7.0))
+        .rounded_full()
+        .bg(fill)
+        .font_family(rs.mono.clone())
+        .text_size(rs.small)
+        .text_color(color)
+        .whitespace_nowrap()
+        .child(probe_text(tag, SharedString::from(text)))
+}
+
+/// One row of an inline comment card (spec B5, UXI-Diff-15). A card is ONE
+/// visually-boxed block across its `parts` fixed-height rows
+/// ([`comment_card_lines`]): row 0 is the header strip (top edge + rounded
+/// top corners: an id pill, a status pill — `unsent` / `sent to <label> ·
+/// <age>` / `outdated` — and, when focused, the `e`/`x` hints), then the body
+/// in the prose font (an outdated card appends its snippet, dimmed mono), then
+/// a footer row (bottom padding + bottom edge + rounded bottom corners).
+///
+/// The border is a real 1px ring: an OUTER frame filled with the border color,
+/// padded 1px on the box's edges for this row (sides always, top on the
+/// header, bottom on the footer), around an opaque INNER fill — so contiguous
+/// rows join into one outline and the ring is testable geometry (probes
+/// `diff-card-<id>-<part>` / `…-in`). Neutral ring; accent while the cursor is
+/// on the card; red-tinted when outdated. No emoji.
+fn diff_comment_row(marks: &RowMarks, ci: usize, part: u8, parts: u8, focused: bool, rs: &DiffRowStyle) -> AnyElement {
     let Some(c) = marks.cards.comments.get(ci) else {
         return div().into_any_element();
     };
+    // E1/E2: the per-`review_gen` snapshot's pre-wrapped lines — no re-wrap
+    // per row per frame.
     let line = marks
         .cards
         .lines
         .get(ci)
         .and_then(|l| l.get(part as usize))
         .cloned()
-        .unwrap_or(CardLine::More);
+        .unwrap_or(CardLine::Footer);
     let (first, last) = (part == 0, part + 1 >= parts);
-    let border = if c.outdated { rs.remove } else { rs.accent };
-    let radius = px(5.0);
-    let mut card = div()
+    let ring = if focused {
+        rs.accent
+    } else if c.outdated {
+        rs.card_outdated_border
+    } else {
+        rs.card_border
+    };
+    let (r_out, r_in) = (px(DIFF_CARD_RADIUS), px(DIFF_CARD_RADIUS - 1.0));
+    let gap = px(DIFF_CARD_GAP);
+
+    let mut inner = div()
         .flex()
         .flex_row()
         .items_center()
         .gap(px(8.0))
-        .h_full()
-        .ml(rs.gutter_w * 2.0 + px(16.0))
-        .mr(px(16.0))
         .flex_1()
-        .min_w_0()
-        .px(px(10.0))
-        .bg(rs.card_bg)
-        .border_l(px(3.0))
-        .border_color(border)
+        .min_h_0()
+        .w_full()
+        .px(px(12.0))
         .overflow_hidden()
-        .whitespace_nowrap()
-        .font_family(rs.prose.clone())
-        .text_size(rs.text);
+        .bg(if first { rs.card_header_bg } else { rs.card_bg });
     if first {
-        card = card.rounded_tr(radius).mt(px(2.0));
+        inner = inner.rounded_t(r_in);
+        if parts > 2 {
+            inner = inner.border_b_1().border_color(rs.card_border);
+        }
     }
     if last {
-        card = card.rounded_br(radius).mb(px(2.0));
+        inner = inner.rounded_b(r_in);
     }
     let text_el = |t: String, color: Hsla, mono: bool| {
         let el = single_line_ellipsis(&t).flex_1().text_color(color);
-        if mono { el.font_family(rs.mono.clone()).text_size(rs.small) } else { el }
-    };
-    let content: AnyElement = if first {
-        let (badge, badge_color) = if c.outdated {
-            ("outdated — code changed since this comment".to_string(), rs.remove)
-        } else if let Some(s) = c.sent.last() {
-            let who = if s.label.is_empty() { &s.session } else { &s.label };
-            (format!("sent to {who} · {}", relative_time(&s.at, marks.now)), rs.add)
+        if mono {
+            el.font_family(rs.mono.clone()).text_size(rs.small)
         } else {
-            ("unsent".to_string(), rs.accent)
-        };
-        let body0 = match &line {
-            CardLine::Body(t) => t.clone(),
-            _ => String::new(),
-        };
-        let header = card
-            .child(
-                div()
-                    .flex_none()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(rs.fg)
-                    .child(SharedString::from(format!("💬 {}", c.id))),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .font_family(rs.mono.clone())
-                    .text_size(rs.small)
-                    .text_color(badge_color)
-                    .child(SharedString::from(badge)),
-            )
-            .child(text_el(body0, rs.fg, false))
-            .into_any_element();
-        probe_bounds_dyn(format!("diff-comment-{}", c.id), header)
-    } else {
-        let el = match line {
-            CardLine::Body(t) => text_el(t, rs.fg, false),
-            CardLine::Snippet(t) => text_el(t, rs.dim, true),
-            CardLine::More => text_el("…".to_string(), rs.dim, false),
-        };
-        card.child(el).into_any_element()
+            el.font_family(rs.prose.clone()).text_size(rs.text)
+        }
     };
-    div().flex().flex_row().size_full().child(content).into_any_element()
+    let id = c.id.clone();
+    let inner = match line {
+        CardLine::Header => {
+            let (status, color) = if c.outdated {
+                ("outdated".to_string(), rs.remove)
+            } else if let Some(s) = c.sent.last() {
+                let who = if s.label.is_empty() { &s.session } else { &s.label };
+                (format!("sent to {who} · {}", relative_time(&s.at, marks.now)), rs.add)
+            } else {
+                ("unsent".to_string(), rs.accent)
+            };
+            let mut header = inner
+                .child(card_pill(
+                    || format!("diff-card-text-{id}-id"),
+                    c.id.clone(),
+                    rs.fg,
+                    rs.dim.opacity(0.22),
+                    rs,
+                ))
+                .child(card_pill(
+                    || format!("diff-card-text-{id}-status"),
+                    status,
+                    color,
+                    color.opacity(0.16),
+                    rs,
+                ));
+            if c.outdated {
+                header = header.child(text_el("code changed since this comment".to_string(), rs.dim, false));
+            } else {
+                header = header.child(div().flex_1());
+            }
+            if focused {
+                header = header.child(
+                    div()
+                        .flex_none()
+                        .font_family(rs.mono.clone())
+                        .text_size(rs.small)
+                        .text_color(rs.dim)
+                        .child(SharedString::from("e edit · x delete")),
+                );
+            }
+            header
+        }
+        CardLine::Body(t) => inner.child(text_el(t, rs.fg, false)),
+        CardLine::Snippet(t) => inner.child(text_el(t, rs.dim, true)),
+        CardLine::More => inner.child(text_el("…".to_string(), rs.dim, false)),
+        CardLine::Footer => inner,
+    };
+
+    let mut frame = div()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_w_0()
+        .ml(rs.gutter_w * 2.0 + px(16.0))
+        .mr(px(DIFF_CARD_INSET_RIGHT))
+        .bg(ring)
+        .px(px(1.0));
+    if first {
+        frame = frame.mt(gap).pt(px(1.0)).rounded_t(r_out);
+    }
+    if last {
+        frame = frame.mb(gap).pb(px(1.0)).rounded_b(r_out);
+    }
+    let probing = layout_probe_active();
+    let inner = if probing {
+        probe_bounds_dyn(format!("diff-card-{id}-{part}-in"), inner.into_any_element())
+    } else {
+        inner.into_any_element()
+    };
+    let frame = frame.child(inner).into_any_element();
+    let frame = if probing { probe_bounds_dyn(format!("diff-card-{id}-{part}"), frame) } else { frame };
+    let row = div().flex().flex_row().size_full().child(frame).into_any_element();
+    if first { probe_bounds_dyn(format!("diff-comment-{id}"), row) } else { row }
+}
+
+#[cfg(test)]
+mod picker_description_tests {
+    use super::*;
+
+    #[test]
+    fn relative_age_buckets() {
+        const DAY: i64 = 86_400;
+        assert_eq!(relative_age(-5), "just now", "clock skew clamps");
+        assert_eq!(relative_age(0), "just now");
+        assert_eq!(relative_age(59), "just now");
+        assert_eq!(relative_age(60), "1m ago");
+        assert_eq!(relative_age(3_599), "59m ago");
+        assert_eq!(relative_age(3_600), "1h ago");
+        assert_eq!(relative_age(DAY - 1), "23h ago");
+        assert_eq!(relative_age(DAY), "1d ago");
+        assert_eq!(relative_age(13 * DAY), "13d ago");
+        assert_eq!(relative_age(14 * DAY), "2w ago");
+        assert_eq!(relative_age(59 * DAY), "8w ago");
+        assert_eq!(relative_age(60 * DAY), "2mo ago");
+        assert_eq!(relative_age(364 * DAY), "12mo ago");
+        assert_eq!(relative_age(365 * DAY), "1y ago");
+        assert_eq!(relative_age(800 * DAY), "2y ago");
+    }
+
+    fn entry(head_commit: Option<HeadCommit>) -> WorktreeEntry {
+        WorktreeEntry {
+            path: PathBuf::from("/x/wt"),
+            head: "abc".into(),
+            branch: Some("topic".into()),
+            detached: false,
+            is_primary: false,
+            head_commit,
+        }
+    }
+
+    #[test]
+    fn worktree_row_description_is_subject_age_path() {
+        let now = 1_700_000_000;
+        let c = |subject: &str| Some(HeadCommit { subject: subject.into(), time: now - 7_200 });
+        assert_eq!(
+            worktree_row_description(&entry(c("feat(diff): send picker")), "~/ws/wt", now),
+            "feat(diff): send picker · 2h ago · ~/ws/wt"
+        );
+        assert_eq!(worktree_row_description(&entry(c("  ")), "~/ws/wt", now), "2h ago · ~/ws/wt");
+        assert_eq!(worktree_row_description(&entry(None), "~/ws/wt", now), "~/ws/wt");
+    }
 }

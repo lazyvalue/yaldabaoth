@@ -47,15 +47,28 @@ keys (`DIFF_KEY_HINTS`).
 
 **Row model.** The bound body is a virtualized `gpui::list` over the tile's
 cached `rows: Rc<Vec<RowRef>>` (`RowRef::{File, Hunk, Line{old,new},
-Comment{comment,part,parts}}`, from the pure `visible_rows(model, review,
-folds)`); the cursor is a flat index into it. A comment card is `parts`
-fixed-height `Comment` rows (header: `💬 c3` · badge · first body line; then the
-body wrapped at `COMMENT_WRAP_COLS` characters, capped at
-`COMMENT_MAX_BODY_ROWS`; an outdated card ends with its snippet, dimmed), placed
-after the last line of its snippet's nearest match (`place_comment`), or right
-after the file header when outdated / unplaceable.
-Every row is one fixed height, so keeping the cursor in view is exact
-arithmetic (`compose_first_visible_line`), never gpui's unmeasured-row
+Comment{comment,part,parts}, ComposeSlot{part,parts}}`, from the pure
+`visible_rows(model, review, folds)` plus the compose slots spliced in by
+`DiffTile::rebuild_rows`); the cursor is a flat index into it. A comment card is
+`parts` fixed-height `Comment` rows forming ONE bordered box (`CardLine::Header`
+— id pill + status pill; then the body wrapped at `COMMENT_WRAP_COLS`
+characters, capped at `COMMENT_MAX_BODY_ROWS`; an outdated card appends its
+snippet, dimmed; then `CardLine::Footer`), placed after the last line of its
+snippet's nearest match (`place_comment`), or right after the file header when
+outdated / unplaceable. The ring is a 1px frame (outer fill = border color,
+opaque inner fill) so contiguous rows join into one outline.
+While the comment compose is open, `ComposeSlot` rows (`compose_slot_rows`:
+draft visual lines clamped to 3..=12, + 3 chrome rows) sit directly under the
+anchor's last line (after existing cards there), or replace the edited card's
+rows. The body paints them empty; the root paints the editor over them with
+`yux::list_rows_overlay` (uncached, after the body in tree order, placed by
+uniform-row arithmetic over the list's scroll top, clipped to the viewport).
+**Any future inline row kind (e.g. context Expander rows) must keep the
+uniform row height** — both `reveal_cursor` and the overlay placement assume
+it — and should be a new `RowRef` variant that `is_inline_insert`/`host_row`
+and `compose_slot_place` classify correctly.
+Every row is one fixed height (`diff_row_h`), so keeping the cursor in view is
+exact arithmetic (`compose_first_visible_line`), never gpui's unmeasured-row
 estimate. A viewed file folds unless `z`-expanded (`Folds`).
 
 ## References
@@ -70,7 +83,10 @@ estimate. A viewed file folds unless `z`-expanded (`Folds`).
 ### UXI-Diff-10 — Worktree picker binds by keyboard or click
 
 **Statement.** An unbound tile lists every `git worktree list` entry of the active
-repo (branch prominent, path dimmed, primary labelled) plus "Pick a folder…";
+repo — two lines per row: line 1 the branch (primary labelled), line 2 a dimmed
+description `<HEAD commit subject> · <relative age> · <~/path>` (just the path when
+the commit is unknown), each line one line with an ellipsis, never blank — plus
+"Pick a folder…";
 `j`/`k` + `Enter` or a mouse click binds the tile to that worktree and derives its
 diff. Outside a git repo the picker says so and offers only the folder row.
 `space → Switch worktree` returns to the picker.
@@ -78,9 +94,14 @@ diff. Outside a git repo the picker says so and offers only the folder row.
 **Status.** `implemented` (graph 8g7 node worktree-picker)
 
 **Enforcement.** `verify_harness.rs::{diff_picker_lists_and_paints_worktrees,
+diff_picker_rows_paint_label_and_description,
+diff_picker_long_branch_label_ellipsizes_with_visible_prefix,
 diff_picker_j_enter_binds_second_worktree_and_derives,
 diff_picker_click_row_binds_worktree, diff_picker_not_a_repo_offers_only_folder_row,
-diff_tile_bound_persists_and_restores_bound}`; `diff_git.rs::list_worktrees_*`.
+diff_tile_bound_persists_and_restores_bound}`; `diff_git.rs::{list_worktrees_*,
+parse_head_commits_reads_batched_log}`; `diff_view.rs::picker_description_tests`.
+The label/description guards read the SHAPED text through the `probe_text` seam
+(bug-0072: rows painted a bare "…" while their boxes had full width).
 
 ### UXI-Diff-11 — Diff paints with a line cursor; nav never strands it
 
@@ -109,8 +130,10 @@ path.
 **Status.** `implemented` — the body is a cached child whose `DiffSeqs` covers
 `model_gen`, `rows_gen`, `cursor`, `review_gen`, `range_anchor`, `compose_gen`
 (open/close only), refreshing/error, picker, zoom; rows are virtualized
-(O(visible)). The comment compose renders at screen level outside the cached
-body, so typing in it leaves the body's render count flat.
+(O(visible)). The inline comment compose is painted by the root OVER its slot
+rows (`yux::list_rows_overlay`), outside the cached body, so typing in it
+leaves the body's render count flat; only a change in the draft's visual line
+count (a slot-row rebuild, `rows_gen`) re-renders the body.
 
 **Enforcement.** `verify_harness.rs::{diff_view_unrelated_root_notify_is_render_flat,
 diff_view_v_and_j_rerender_the_cached_body, diff_view_v_range_rerenders_the_cached_body,
@@ -148,31 +171,50 @@ derive's older load.
 diff_edit_clears_viewed_and_prunes_review_json, diff_checkbox_click_toggles_viewed}`;
 `diff.rs::row_model_tests::tile_toggle_viewed_advances_then_unmark_reexpands`.
 
-### UXI-Diff-15 — Comments are saved drafts, shown inline, marked outdated
+### UXI-Diff-15 — Comments are authored inline, saved as drafts, boxed, marked outdated
 
-**Statement.** `c` (line) or `V…c` (range) opens a compose; saving writes the
-comment to the review file immediately as unsent and paints it inline under its
-anchor. `e` edits, `x` deletes. When the anchored snippet no longer appears in
-the file's diff the comment is flagged outdated and listed at the file's top —
-never silently deleted or moved. No session is required.
+**Statement.** `c` (line) or `V…c` (range) opens the compose **inline,
+GitHub-style: directly under the commented line** (the range's last line;
+below any cards already there) — a bordered, rounded box whose header names
+what is being commented (`Comment on a.txt:40–46` / `Editing c3 on a.txt:40`)
+and whose footer hints `ctrl-enter save · esc cancel`. It moves with the diff
+when it scrolls and grows with the draft. Saving writes the comment to the
+review file immediately as unsent and paints it inline under its anchor as a
+card — one bordered box (full ring, rounded corners, padding) with id + status
+pills and the body in the prose font; no emoji anywhere. `e` edits in the same
+inline compose, opened in place of the card; `x` deletes. When the anchored
+snippet no longer appears in the file's diff the comment is flagged outdated
+and listed at the file's top — never silently deleted or moved. No session is
+required.
 
-**Status.** `implemented` (graph 8g7 node comments-ui). Deviations/decisions:
-the compose is **pinned at the tile's bottom** (screen-level, uncached) with a
-caption naming the anchor (`commenting on a.txt:40–46`, `editing c3 on …`)
-while the anchored rows stay highlighted in the body — not a panel inside the
-virtualized list. `x` needs a second `x` on the same card (the first shows
-"x again to delete c3"; any other key disarms). A range spanning removed and
-added lines anchors to the new side (new-side lines only); old side only when
-every line is removed. `c`/`e`/`x`/`V` off their target rows show a hint.
-Cards of a folded (e.g. viewed) file are hidden with it; comments on files no
-longer in the diff stay in the JSON but have no row to render under.
+**Status.** `implemented` (graph 8g7 node comments-ui; placement + box revised
+in graph kfa node comment-inline — the compose was previously pinned at the
+tile's bottom). Deviations/decisions: the editor is a root-level overlay over
+`ComposeSlot` rows rather than an element inside the cached list (typing must
+not re-render the body, UXI-Diff-12); the draft is monospace and hard-wraps at
+`COMPOSE_WRAP_COLS` characters (fixed-height rows), showing at most 12 lines
+with the caret line kept in view; the compose text and cards scale with the
+text zoom. A focused card (cursor on any of its rows) shows an accent ring and
+`e edit · x delete` in its header instead of a row tint. `x` needs a second `x`
+on the same card (the first shows "x again to delete c3"; any other key
+disarms). A range spanning removed and added lines anchors to the new side
+(new-side lines only); old side only when every line is removed. `c`/`e`/`x`/`V`
+off their target rows show a hint. Cards of a folded (e.g. viewed) file are
+hidden with it; comments on files no longer in the diff stay in the JSON but
+have no row to render under.
 
 **Enforcement.** `verify_harness.rs::{diff_comment_c_saves_json_and_paints_card_below_anchor,
+diff_compose_inline_tracks_scroll, diff_comment_card_paints_bordered_box_without_emoji,
 diff_comment_v_range_saves_span_and_snippet, diff_comment_edit_and_confirmed_delete,
 diff_comment_outdated_after_change_paints_after_file_header,
 diff_comment_esc_needs_two_presses_on_nonempty_draft, diff_compose_typing_is_render_flat}`;
 `diff.rs::row_model_tests::{comment_placement_anchor_and_card_lines,
-range_selection_is_clamped_to_one_file}`.
+compose_layout_wraps_places_caret_and_sizes_slots, range_selection_is_clamped_to_one_file}`;
+`yux::list::tests::uniform_rows_rect_tracks_the_scroll_top`. Negative controls
+observed RED (graph kfa): slots at the end of the rows (compose not under the
+anchor); overlay ignoring the list scroll top; slot rows rebuilt per keystroke
+(10 body renders for 10 keys); card ring padding removed (inner == outer); `💬`
+restored on the id pill; `e` not replacing the card.
 
 ### UXI-Diff-16 — Send picker defaults to the last session and records delivery
 

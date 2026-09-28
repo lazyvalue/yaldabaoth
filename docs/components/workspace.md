@@ -61,8 +61,6 @@ new tile in its project's workspace (ADR-0039, `UXI-Workspace-30`).
   signed-coordinate plane with a pan/semantic-zoom camera. When those UXIs ship,
   this Description is rewritten around the plane and the split/layout-mode text
   above becomes historical.
-- Migrated from `docs/ux-invariants.md` INV-UX-11 (`ctrl-<n>` workspace jump). That
-  entry is now `→ migrated here`.
 
 ## UX invariants
 

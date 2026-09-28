@@ -52,6 +52,10 @@ style bundle so a caller themes once:
   owns the option model and dispatch.
 - **`picker_option_row_detailed(id, glyph, label, detail, badge, …)`** — the
   same row with a dimmed monospace second line (e.g. a path under a branch).
+  Both lines are `single_line_ellipsis` leaves — one line via `line_clamp(1)`
+  over NORMAL whitespace, never `whitespace_nowrap` (gpui 0.2.2 caches a nowrap
+  leaf's first taffy measure, which in a `flex_col` wrapper is width 0 ⇒ a
+  bare "…"; bug-0072).
 - **`completion_popup(id, rows, selected, colors, mono)`** — shared compact
   completion shell + primary/secondary rows for keyboard-owned input
   suggestions. The caller owns query/filter state and key dispatch.
@@ -75,6 +79,15 @@ style bundle so a caller themes once:
   unit-testable against a raw `ListState`. The agent transcript's
   `TranscriptScroll` reconciles by item COUNT (streaming tail + follow-output),
   not a content diff, so it stays separate — don't force it onto this.
+- **`list_rows_overlay(state, first_row, rows, row_h, child)`** — paint an
+  element over a span of rows of a UNIFORM-row-height `gpui::list` so it
+  scrolls with the list and is clipped to its viewport, while living OUTSIDE
+  the list's (cached) render. The pattern for an inline text input inside a
+  cached list (the Diff tile's comment compose): reserve its height with
+  spacer rows in the list, paint the input from the uncached parent through
+  this, added AFTER the list in tree order. Placement = `uniform_rows_rect`
+  (pure, unit-tested). A child entity inside the cached list would instead
+  dirty the list on every keystroke (gpui marks ancestors dirty).
 
 ## Efficiency practices (non-negotiable)
 

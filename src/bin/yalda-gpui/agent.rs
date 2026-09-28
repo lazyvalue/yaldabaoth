@@ -5395,7 +5395,7 @@ impl AgentState {
     /// in the worksheet.
     ///
     /// The `|| focus == Compose` clause is LOAD-BEARING and closes the recurring
-    /// "`/clear` worksheet-invisible" bug (docs/projects/clear-worksheet-invisible).
+    /// "`/clear` worksheet-invisible" bug (docs/bugs/saga-clear-worksheet-invisible/).
     /// Keystroke ROUTING keys on `focus` (a worksheet key routes to the compose
     /// whenever `focus == Compose`, agent_ui.rs:4231); if PAINTING keyed only on
     /// `you_block_open`, any state with `focus == Compose` but a closed block —

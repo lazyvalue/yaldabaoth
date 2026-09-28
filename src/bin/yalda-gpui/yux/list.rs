@@ -220,11 +220,171 @@ impl<T: PartialEq> ScrollAnchoredList<T> {
     }
 }
 
+/// Paint `child` over rows `first_row .. first_row + rows` of a virtualized
+/// `gpui::list` whose rows are ALL exactly `row_h` tall, so it scrolls with
+/// the list and is clipped to the list's viewport — an "inline" surface that
+/// is NOT part of the list's (possibly cached) render.
+///
+/// Why: a cached list body (e.g. `DiffView`) re-renders only when its own
+/// inputs move, and a child entity notifying inside it would dirty it too
+/// (gpui marks ancestors dirty). A text input that must LOOK inline (the Diff
+/// tile's GitHub-style comment compose) therefore reserves its height with
+/// spacer rows inside the list and is painted by the (uncached) parent through
+/// this element, placed over the spacers. The parent must add it AFTER the
+/// list in tree order: its `prepaint` reads the list's scroll + viewport,
+/// which the list (or its reused cached prepaint) has settled by then.
+///
+/// Placement is exact integer arithmetic over the uniform row height and the
+/// list's logical scroll top (no measurement), so it holds for rows the list
+/// has not measured yet. Takes no layout space itself (absolute, zero-size);
+/// skips prepaint/paint entirely while the rows are scrolled out of view.
+pub(crate) fn list_rows_overlay(
+    state: ListState,
+    first_row: usize,
+    rows: usize,
+    row_h: Pixels,
+    child: gpui::AnyElement,
+) -> gpui::AnyElement {
+    gpui::IntoElement::into_any_element(ListRowsOverlay {
+        state,
+        first_row,
+        rows,
+        row_h,
+        child,
+    })
+}
+
+/// The window-space rect of rows `first_row .. first_row + rows` of a
+/// uniform-height list whose viewport is `viewport` and whose logical scroll
+/// top is `(top_ix, offset_in_item)`. Pure (unit-tested).
+pub(crate) fn uniform_rows_rect(
+    viewport: gpui::Bounds<Pixels>,
+    top_ix: usize,
+    offset_in_item: Pixels,
+    first_row: usize,
+    rows: usize,
+    row_h: Pixels,
+) -> gpui::Bounds<Pixels> {
+    let y = viewport.origin.y + row_h * (first_row as f32 - top_ix as f32) - offset_in_item;
+    gpui::Bounds::new(
+        gpui::point(viewport.origin.x, y),
+        gpui::size(viewport.size.width, row_h * rows as f32),
+    )
+}
+
+struct ListRowsOverlay {
+    state: ListState,
+    first_row: usize,
+    rows: usize,
+    row_h: Pixels,
+    child: gpui::AnyElement,
+}
+
+impl gpui::IntoElement for ListRowsOverlay {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl gpui::Element for ListRowsOverlay {
+    type RequestLayoutState = ();
+    /// The viewport clip, when the rows are (partly) visible this frame.
+    type PrepaintState = Option<gpui::Bounds<Pixels>>;
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut gpui::Window,
+        cx: &mut gpui::App,
+    ) -> (gpui::LayoutId, ()) {
+        let style = gpui::Style {
+            position: gpui::Position::Absolute,
+            ..gpui::Style::default()
+        };
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: gpui::Bounds<Pixels>,
+        _request_layout: &mut (),
+        window: &mut gpui::Window,
+        cx: &mut gpui::App,
+    ) -> Option<gpui::Bounds<Pixels>> {
+        let viewport = self.state.viewport_bounds();
+        if viewport.size.height <= Pixels::ZERO || self.rows == 0 {
+            return None;
+        }
+        let top = self.state.logical_scroll_top();
+        let rect = uniform_rows_rect(viewport, top.item_ix, top.offset_in_item, self.first_row, self.rows, self.row_h);
+        if !rect.intersects(&viewport) {
+            return None;
+        }
+        self.child.layout_as_root(
+            gpui::size(
+                gpui::AvailableSpace::Definite(rect.size.width),
+                gpui::AvailableSpace::Definite(rect.size.height),
+            ),
+            window,
+            cx,
+        );
+        window.with_content_mask(Some(gpui::ContentMask { bounds: viewport }), |window| {
+            self.child.prepaint_at(rect.origin, window, cx)
+        });
+        Some(viewport)
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: gpui::Bounds<Pixels>,
+        _request_layout: &mut (),
+        clip: &mut Option<gpui::Bounds<Pixels>>,
+        window: &mut gpui::Window,
+        cx: &mut gpui::App,
+    ) {
+        if let Some(viewport) = *clip {
+            window.with_content_mask(Some(gpui::ContentMask { bounds: viewport }), |window| {
+                self.child.paint(window, cx)
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        compose_first_visible_col, compose_first_visible_line, compose_window, ComposeWindow,
+        compose_first_visible_col, compose_first_visible_line, compose_window, uniform_rows_rect,
+        ComposeWindow,
     };
+
+    /// `list_rows_overlay`'s placement: rows below the scroll top land at
+    /// `(first_row - top) * row_h - offset` under the viewport top; scrolling
+    /// by one row (or a partial row) moves the rect by exactly that much.
+    #[test]
+    fn uniform_rows_rect_tracks_the_scroll_top() {
+        use gpui::{point, px, size, Bounds};
+        let vp = Bounds::new(point(px(10.0), px(100.0)), size(px(500.0), px(300.0)));
+        let r = uniform_rows_rect(vp, 0, px(0.0), 4, 3, px(20.0));
+        assert_eq!((r.origin.x, r.origin.y, r.size.width, r.size.height), (px(10.0), px(180.0), px(500.0), px(60.0)));
+        let r = uniform_rows_rect(vp, 2, px(5.0), 4, 3, px(20.0));
+        assert_eq!(r.origin.y, px(135.0), "scrolled 2 rows + 5px");
+        let r = uniform_rows_rect(vp, 6, px(0.0), 4, 3, px(20.0));
+        assert_eq!(r.origin.y, px(60.0), "scrolled past: above the viewport");
+    }
 
     /// Horizontal mirror of `caret_is_always_within_the_chosen_window`: whatever
     /// LEFT column the function picks, the caret column is inside the window AND
@@ -350,3 +510,4 @@ mod tests {
         assert_eq!(compose_first_visible_line(5, 0, 6, 8), 0);
     }
 }
+

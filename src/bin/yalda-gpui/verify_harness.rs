@@ -14154,7 +14154,7 @@ fn image_paste_direct_read_stages_even_with_text_on_clipboard(cx: &mut TestAppCo
     );
 }
 
-/// PROBE: a pasted-image chip PAINTS above the chatbox before send (INV-UX-21
+/// PROBE: a pasted-image chip PAINTS above the chatbox before send (UXI-AgentTile-14
 /// property 2). A state-only assert can't catch a repaint miss (the reported
 /// symptom: "indication only appears after sent"). Boots chatbox mode, pastes an
 /// image via the real cmd-v action, and asserts the `compose-image-chips` element
@@ -14200,7 +14200,7 @@ fn image_paste_chip_paints_before_send_chatbox(cx: &mut TestAppContext) {
 /// PROBE: the reported bug — in WORKSHEET-IDLE mode there is no compose panel
 /// (`show_compose` is false), so before this fix a pasted image had NO on-screen
 /// indication until send. The standalone chip strip must paint here too
-/// (INV-UX-21 property 2; bug-0039 follow-up). Negative control: delete the
+/// (UXI-AgentTile-14 property 2; bug-0039 follow-up). Negative control: delete the
 /// `else if let Some(strip) = …` standalone-strip arm in `render_agent` and this
 /// goes RED (the chatbox test stays green — it uses the in-panel strip).
 #[gpui::test]
@@ -15055,7 +15055,7 @@ fn worksheet_typing_after_clear_is_visible_without_pressing_i(cx: &mut TestAppCo
 }
 
 // ============================================================================
-// /clear worksheet-invisible reproduction (docs/projects/clear-worksheet-invisible)
+// /clear worksheet-invisible reproduction (docs/bugs/saga-clear-worksheet-invisible/)
 //
 // The recurring bug: after `/clear` in worksheet mode, typed text is INVISIBLE
 // until a chatbox toggle. The text IS in the buffer — it just doesn't REPAINT.
@@ -30168,6 +30168,97 @@ fn diff_picker_lists_and_paints_worktrees(cx: &mut TestAppContext) {
     assert_eq!(view.read_with(vcx, |v, _| v.diff_tile_ref(id).unwrap().picker.selected), 0);
 }
 
+/// bug-0072 / UXI-Diff-10: every worktree row PAINTS its name and its
+/// description — the label leaf's SHAPED text (after `text_ellipsis`
+/// truncation, read back through the `probe_text` seam) is the branch name and
+/// the detail leaf's shaped text is non-empty and carries the path; both
+/// leaves have non-zero painted size and sit horizontally inside their row.
+/// Real entry point (`open_diff_inner` → async `list_worktrees`), real layout.
+#[gpui::test]
+fn diff_picker_rows_paint_label_and_description(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (primary, _lp, _linked) = diff_worktree_fixture();
+    let (view, vcx, id) = boot_diff_picker(cx, primary.path().to_path_buf());
+    let rows = view.read_with(vcx, |v, _| v.diff_tile_ref(id).unwrap().picker.rows.clone());
+    assert_eq!(rows.len(), 2, "fixture has two worktrees");
+
+    let tags: Vec<String> = (0..rows.len()).map(|i| format!("diff-picker-row-{i}")).collect();
+    let tag_refs: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
+    let rects = paint_diff_probes(&view, vcx, id, &tag_refs);
+    for (i, row) in rows.iter().enumerate() {
+        let (rx, _ry, rw, _rh) = rects[i].unwrap_or_else(|| panic!("row {i} did not paint"));
+        let branch = row.branch.clone().expect("fixture rows are on branches");
+        // Fixture: primary `feature` HEAD = "two file change"; linked `topic`
+        // was cut from `main` = "initial".
+        let subject = if i == 0 { "two file change" } else { "initial" };
+        let wt_name = row.path.file_name().unwrap().to_string_lossy().to_string();
+        let detail_needs = [format!("{subject} · "), wt_name];
+        for (part, needs) in [("label", vec![branch.clone()]), ("detail", detail_needs.to_vec())] {
+            let tag = format!("diff-picker-row-{id}-{i}-{part}");
+            let (text, (x, _y, w, h)) = crate::layout_probe_text(&tag)
+                .unwrap_or_else(|| panic!("row {i} {part} text leaf never painted ({tag})"));
+            eprintln!("row {i} {part}: {text:?} at x={x} w={w} h={h} (row x={rx} w={rw})");
+            assert!(
+                w > 0.0 && h > 0.0,
+                "row {i} {part} painted with zero size: {text:?} w={w} h={h}"
+            );
+            assert!(
+                x >= rx - 0.5 && x + w <= rx + rw + 0.5,
+                "row {i} {part} leaf [{x}, {}] outside its row [{rx}, {}]",
+                x + w,
+                rx + rw
+            );
+            let visible = text.trim_end_matches('…');
+            assert!(
+                !visible.trim().is_empty(),
+                "row {i} {part} shaped to no visible text: {text:?}"
+            );
+            for need in &needs {
+                assert!(
+                    text.contains(need.as_str()),
+                    "row {i} {part} must paint {need:?}, painted {text:?}"
+                );
+            }
+        }
+    }
+}
+
+/// bug-0072 companion: the fix keeps the ellipsis contract — a branch name
+/// far wider than the tile paints as a visible PREFIX + "…" (truncated at the
+/// row's real width), not as a bare "…" and not as unclipped overflow.
+#[gpui::test]
+fn diff_picker_long_branch_label_ellipsizes_with_visible_prefix(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (primary, _lp, _linked) = diff_worktree_fixture();
+    let long_parent = tempfile::tempdir().expect("tempdir");
+    let long_branch = format!("long-{}", "x".repeat(235));
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(primary.path())
+        .args(["worktree", "add", "--quiet", "-b", &long_branch])
+        .arg(long_parent.path().join("wt-long"))
+        .arg("main")
+        .status()
+        .expect("git worktree add");
+    assert!(status.success());
+    let (view, vcx, id) = boot_diff_picker(cx, primary.path().to_path_buf());
+    let rows = view.read_with(vcx, |v, _| v.diff_tile_ref(id).unwrap().picker.rows.clone());
+    let i = rows
+        .iter()
+        .position(|r| r.branch.as_deref() == Some(long_branch.as_str()))
+        .expect("long-branch row listed");
+    let row_tag = format!("diff-picker-row-{i}");
+    let (rx, _, rw, _) = paint_diff_probes(&view, vcx, id, &[row_tag.as_str()])[0].expect("row painted");
+    let (text, (x, _, w, _)) =
+        crate::layout_probe_text(&format!("diff-picker-row-{id}-{i}-label")).expect("label painted");
+    assert!(text.ends_with('…'), "a too-wide label must ellipsize: {text:?}");
+    assert!(
+        text.starts_with("long-xxx") && text.chars().count() > 10,
+        "the ellipsized label must keep a visible prefix: {text:?}"
+    );
+    assert!(x >= rx && x + w <= rx + rw + 0.5, "label leaf inside its row");
+}
+
 /// UXI-Diff-10: `j` then `Enter` (REAL keystrokes through the keymap →
 /// `handle_diff_key`) binds the tile to the SECOND worktree and derives its
 /// diff — the linked worktree's untracked `topic.txt` is in the model.
@@ -30557,17 +30648,21 @@ fn diff_compose_text(
 }
 
 /// UXI-Diff-15 save + inline card: `c` on a line (REAL keys) opens the
-/// bottom compose captioned with the anchor; typing (a space included — the
-/// leaders are suppressed while composing) then `ctrl-enter` writes comment
-/// c1 to the review JSON on disk (path, side new, lines, snippet == the
-/// line's text, body, unsent) and PAINTS its card directly below the anchor
-/// line row; the header paints "1 unsent". `c` on a header row is a hint,
-/// not a compose.
+/// GitHub-style INLINE compose — its box painted directly under the anchor
+/// line (within one row), horizontally inside the diff list, captioned
+/// "Comment on a.txt:2", with the caret painted inside its editor; typing (a
+/// space included — the leaders are suppressed while composing) then
+/// `ctrl-enter` writes comment c1 to the review JSON on disk (path, side new,
+/// lines, snippet == the line's text, body, unsent) and PAINTS its card
+/// directly below the anchor line row; the header paints "1 unsent". `c` on a
+/// header row is a hint, not a compose.
 ///
 /// Negative controls (observed RED): (a) with `self.diff_persist_review(id,
 /// cx)` in `submit_comment` commented out, the JSON has no comments; (b) with
 /// `visible_rows` placing every card at the file top (`place_comment` result
-/// ignored), the card paints ABOVE the anchor row.
+/// ignored), the card paints ABOVE the anchor row; (c) with
+/// `compose_slot_place` returning the end of the rows (the old bottom-pinned
+/// placement), the compose box does not paint under the anchor.
 #[gpui::test]
 fn diff_comment_c_saves_json_and_paints_card_below_anchor(cx: &mut TestAppContext) {
     cx.update(crate::register_keymap);
@@ -30582,8 +30677,34 @@ fn diff_comment_c_saves_json_and_paints_card_below_anchor(cx: &mut TestAppContex
     vcx.simulate_keystrokes("j j j c");
     vcx.run_until_parked();
     assert_eq!(diff_compose_text(&view, vcx, id).as_deref(), Some(""), "c on a line opens the compose");
-    let p = paint_diff_probes(&view, vcx, id, &["diff-comment-compose", "diff-compose-caption=commenting on a.txt:2"]);
-    assert!(p[0].is_some() && p[1].is_some(), "compose + anchor caption must paint: {p:?}");
+    let p = paint_diff_probes(
+        &view,
+        vcx,
+        id,
+        &[
+            "diff-comment-compose",
+            "diff-compose-caption=Comment on a.txt:2",
+            "diff-cursor-row",
+            "diff-list",
+            "diff-compose-editor",
+            "diff-compose-caret",
+        ],
+    );
+    assert!(p[1].is_some(), "the anchor caption must paint inside the compose: {p:?}");
+    let boxed = p[0].expect("inline compose box painted");
+    let anchor = p[2].expect("anchor (cursor) row painted");
+    let list = p[3].expect("diff list painted");
+    let editor = p[4].expect("compose editor painted");
+    let caret = p[5].expect("compose caret painted");
+    assert_compose_under_anchor(boxed, anchor, list);
+    assert!(
+        editor.1 >= boxed.1 && editor.1 + editor.3 <= boxed.1 + boxed.3 + 0.5,
+        "editor {editor:?} inside the box {boxed:?}"
+    );
+    assert!(
+        caret.1 >= editor.1 && caret.1 + caret.3 <= editor.1 + editor.3 + 0.5 && caret.0 >= editor.0,
+        "caret {caret:?} painted inside the editor {editor:?}"
+    );
 
     diff_type(vcx, "rename this");
     assert_eq!(diff_compose_text(&view, vcx, id).as_deref(), Some("rename this"));
@@ -30602,7 +30723,12 @@ fn diff_comment_c_saves_json_and_paints_card_below_anchor(cx: &mut TestAppContex
     assert_eq!(c["sent"], serde_json::json!([]));
     assert_eq!(c["outdated"], false);
 
-    let p = paint_diff_probes(&view, vcx, id, &["diff-cursor-row", "diff-comment-c1", "diff-unsent=1 unsent"]);
+    let p = paint_diff_probes(
+        &view,
+        vcx,
+        id,
+        &["diff-cursor-row", "diff-comment-c1", "diff-unsent=1 unsent", "diff-comment-compose"],
+    );
     let anchor = p[0].expect("anchor (cursor) row painted");
     let card = p[1].expect("comment card header painted");
     assert!(
@@ -30610,11 +30736,140 @@ fn diff_comment_c_saves_json_and_paints_card_below_anchor(cx: &mut TestAppContex
         "card {card:?} must paint directly below the anchor row {anchor:?}"
     );
     assert!(p[2].is_some(), "header must paint '1 unsent'");
+    assert!(p[3].is_none(), "the compose is gone after saving");
     let rows = diff_rows(&view, vcx, id);
     assert!(
         matches!(rows[4], crate::RowRef::Comment { part: 0, .. }),
         "the card row follows the anchor line: {rows:?}"
     );
+    assert!(!rows.iter().any(|r| r.is_compose_slot()), "no compose slots left: {rows:?}");
+}
+
+/// The inline compose box sits DIRECTLY under the anchor row (its top within
+/// one row height below the anchor's bottom) and inside the list horizontally.
+fn assert_compose_under_anchor(boxed: (f32, f32, f32, f32), anchor: (f32, f32, f32, f32), list: (f32, f32, f32, f32)) {
+    let anchor_bottom = anchor.1 + anchor.3;
+    assert!(
+        boxed.1 >= anchor_bottom - 0.5 && boxed.1 <= anchor_bottom + anchor.3,
+        "compose box {boxed:?} must paint directly below the anchor row {anchor:?}"
+    );
+    assert!(
+        boxed.0 >= list.0 - 0.5 && boxed.0 + boxed.2 <= list.0 + list.2 + 0.5 && boxed.2 > list.2 * 0.5,
+        "compose box {boxed:?} must span the diff body horizontally inside the list {list:?}"
+    );
+    assert!(boxed.3 >= anchor.3 * 4.0, "compose box {boxed:?} is a real editor, not a sliver");
+}
+
+/// UXI-Diff-15 inline compose TRACKS SCROLL: in a diff far taller than the
+/// viewport, 150 real `j` then `c` opens the compose under a deep line (the
+/// list has scrolled — row 0 is no longer painted) and it paints directly
+/// under the anchor, inside the viewport. Then a REAL mouse-wheel scroll over
+/// the list moves the diff: the anchor row and the compose box move by the
+/// SAME distance and the box stays directly under the anchor.
+///
+/// Negative control (observed RED): with `uniform_rows_rect` ignoring the
+/// list's scroll top (`top_ix` treated as 0), the box paints far below the
+/// anchor / out of view.
+#[gpui::test]
+fn diff_compose_inline_tracks_scroll(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let long: String = (0..400).map(|i| format!("long line {i}\n")).collect();
+    std::fs::write(temp.path().join("long.txt"), long).unwrap();
+    let (view, vcx, id) = boot_with_diff(cx, temp.path().to_path_buf());
+    vcx.simulate_keystrokes(&vec!["j"; 150].join(" "));
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("c");
+    vcx.run_until_parked();
+    assert_eq!(diff_compose_text(&view, vcx, id).as_deref(), Some(""), "compose opened on line row 150");
+
+    let tags = ["diff-comment-compose", "diff-cursor-row", "diff-list", "diff-row-0"];
+    let p = paint_diff_probes(&view, vcx, id, &tags);
+    let list = p[2].expect("list painted");
+    let anchor = p[1].expect("anchor row painted (revealed)");
+    assert!(p[3].is_none(), "non-vacuous: the list really scrolled (row 0 not painted)");
+    assert!(150.0 * anchor.3 > list.3, "non-vacuous: the anchor is beyond the first screenful");
+    let boxed = p[0].expect("compose painted after the reveal");
+    assert_compose_under_anchor(boxed, anchor, list);
+    assert!(rect_inside(boxed, list), "the whole compose {boxed:?} is revealed inside the list {list:?}");
+
+    // A real wheel scroll (content moves DOWN by 3 rows) over the list, off
+    // the compose box.
+    let at = point(px(list.0 + 20.0), px(list.1 + 10.0));
+    vcx.simulate_mouse_move(at, None, gpui::Modifiers::default());
+    vcx.simulate_event(gpui::ScrollWheelEvent {
+        position: at,
+        delta: gpui::ScrollDelta::Pixels(point(px(0.0), px(anchor.3 * 3.0))),
+        modifiers: gpui::Modifiers::default(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    vcx.run_until_parked();
+    let p2 = paint_diff_probes(&view, vcx, id, &tags);
+    let anchor2 = p2[1].expect("anchor still painted after the wheel scroll");
+    let boxed2 = p2[0].expect("compose still painted after the wheel scroll");
+    let moved = anchor2.1 - anchor.1;
+    assert!(moved > anchor.3 * 2.0, "non-vacuous: the wheel really scrolled the diff ({moved}px)");
+    assert!(
+        ((boxed2.1 - boxed.1) - moved).abs() < 0.5,
+        "the compose must move WITH the diff: anchor moved {moved}px, box moved {}px",
+        boxed2.1 - boxed.1
+    );
+    assert_compose_under_anchor(boxed2, anchor2, list);
+}
+
+/// UXI-Diff-15 box: a saved comment's card PAINTS as one bordered box — its
+/// rows (header, body, footer) are contiguous frames of the same x/width, and
+/// each frame's inner fill is inset by the 1px ring on the box's edges (sides
+/// on every row, top on the header, bottom on the footer) — and its header
+/// pills read exactly "c1" / "unsent" (shaped text), with no emoji.
+///
+/// Negative controls (observed RED): (a) the ring padding removed from the
+/// card frame ⇒ inner == outer; (b) the old `💬 ` prefix restored on the id
+/// pill ⇒ the shaped id text contains the emoji.
+#[gpui::test]
+fn diff_comment_card_paints_bordered_box_without_emoji(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let (view, vcx, id) = boot_with_diff(cx, temp.path().to_path_buf());
+    diff_add_comment(vcx, "j j j", "rename this");
+    let rows = diff_rows(&view, vcx, id);
+    let parts = match rows[4] {
+        crate::RowRef::Comment { part: 0, parts, .. } => parts as usize,
+        r => panic!("card expected at row 4, got {r:?}"),
+    };
+    assert_eq!(parts, 3, "header + one body line + footer");
+    let tags: Vec<String> = (0..parts)
+        .flat_map(|k| [format!("diff-card-c1-{k}"), format!("diff-card-c1-{k}-in")])
+        .chain(["diff-list".to_string()])
+        .collect();
+    let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
+    let p = paint_diff_probes(&view, vcx, id, &tag_refs);
+    let list = p[parts * 2].expect("list painted");
+    let frames: Vec<_> = (0..parts).map(|k| p[k * 2].unwrap_or_else(|| panic!("card row {k} frame painted"))).collect();
+    let inners: Vec<_> = (0..parts).map(|k| p[k * 2 + 1].unwrap_or_else(|| panic!("card row {k} fill painted"))).collect();
+    for k in 0..parts {
+        let (f, i) = (frames[k], inners[k]);
+        assert!(f.2 > list.2 * 0.5 && rect_inside(f, list), "frame {k} {f:?} spans the body inside {list:?}");
+        assert!((f.0 - frames[0].0).abs() < 0.5 && (f.2 - frames[0].2).abs() < 0.5, "frame {k} aligned: {f:?}");
+        assert!((i.0 - (f.0 + 1.0)).abs() < 0.5, "row {k}: left ring 1px ({f:?} / {i:?})");
+        assert!(((i.0 + i.2) - (f.0 + f.2 - 1.0)).abs() < 0.5, "row {k}: right ring 1px ({f:?} / {i:?})");
+        let top_ring = if k == 0 { 1.0 } else { 0.0 };
+        let bottom_ring = if k + 1 == parts { 1.0 } else { 0.0 };
+        assert!((i.1 - (f.1 + top_ring)).abs() < 0.5, "row {k}: top ring {top_ring}px ({f:?} / {i:?})");
+        assert!(
+            ((i.1 + i.3) - (f.1 + f.3 - bottom_ring)).abs() < 0.5,
+            "row {k}: bottom ring {bottom_ring}px ({f:?} / {i:?})"
+        );
+        if k > 0 {
+            let prev = frames[k - 1];
+            assert!(((prev.1 + prev.3) - f.1).abs() < 0.5, "rows {} and {k} contiguous: {prev:?} / {f:?}", k - 1);
+        }
+    }
+    let (id_text, _) = crate::layout_probe_text("diff-card-text-c1-id").expect("id pill painted");
+    let (status, _) = crate::layout_probe_text("diff-card-text-c1-status").expect("status pill painted");
+    assert_eq!(id_text, "c1", "id pill shaped text");
+    assert_eq!(status, "unsent", "status pill shaped text");
+    assert!(!id_text.contains('💬') && !status.contains('💬'), "no emoji in the card header");
 }
 
 /// UXI-Diff-15 range: `V j j c` on a 4-line (untracked, all-added) file
@@ -30647,7 +30902,7 @@ fn diff_comment_v_range_saves_span_and_snippet(cx: &mut TestAppContext) {
     assert_eq!(sel, Some((header + 2, header + 4)));
     vcx.simulate_keystrokes("c");
     vcx.run_until_parked();
-    let p = paint_diff_probes(&view, vcx, id, &["diff-compose-caption=commenting on c.txt:1–3"]);
+    let p = paint_diff_probes(&view, vcx, id, &["diff-compose-caption=Comment on c.txt:1–3"]);
     assert!(p[0].is_some(), "range caption painted");
     diff_type(vcx, "three lines");
     vcx.simulate_keystrokes("ctrl-enter");
@@ -30663,8 +30918,9 @@ fn diff_comment_v_range_saves_span_and_snippet(cx: &mut TestAppContext) {
     assert!(matches!(rows[header + 5], crate::RowRef::Comment { part: 0, .. }), "card after the range's last line");
 }
 
-/// UXI-Diff-15 edit/delete: `e` on the card reopens the compose prefilled
-/// and saving rewrites the body on disk; a single `x` only ARMS (JSON
+/// UXI-Diff-15 edit/delete: `e` on the card reopens the compose prefilled,
+/// INLINE at the card (it replaces the card's rows), and saving rewrites the
+/// body on disk (cursor back on the card); a single `x` only ARMS (JSON
 /// untouched, hint shown), another key disarms, and `x x` deletes.
 ///
 /// Negative control (observed RED): with the arm step in
@@ -30678,9 +30934,24 @@ fn diff_comment_edit_and_confirmed_delete(cx: &mut TestAppContext) {
     vcx.simulate_keystrokes("j j j c");
     vcx.run_until_parked();
     diff_type(vcx, "rename this");
-    vcx.simulate_keystrokes("ctrl-enter j e");
+    vcx.simulate_keystrokes("ctrl-enter j j e");
     vcx.run_until_parked();
     assert_eq!(diff_compose_text(&view, vcx, id).as_deref(), Some("rename this"), "e prefills");
+    // `e` (pressed on the card's BODY row) opens the inline compose AT the
+    // card: its slots replace the card rows, the box paints right under the
+    // anchor line where the card was, and the card itself is hidden.
+    let rows = diff_rows(&view, vcx, id);
+    assert!(rows[4].is_compose_slot(), "slots replace the card in place: {rows:?}");
+    assert!(!rows.iter().any(|r| r.comment_index().is_some()), "the edited card is hidden: {rows:?}");
+    let p = paint_diff_probes(
+        &view,
+        vcx,
+        id,
+        &["diff-comment-compose", "diff-row-3", "diff-list", "diff-compose-caption=Editing c1 on a.txt:2", "diff-comment-c1"],
+    );
+    assert_compose_under_anchor(p[0].expect("inline edit compose painted"), p[1].expect("anchor row"), p[2].unwrap());
+    assert!(p[3].is_some(), "edit caption painted: {p:?}");
+    assert!(p[4].is_none(), "the card is not painted while it is being edited");
     diff_type(vcx, " now");
     vcx.simulate_keystrokes("cmd-enter");
     vcx.run_until_parked();
@@ -30771,13 +31042,16 @@ fn diff_comment_esc_needs_two_presses_on_nonempty_draft(cx: &mut TestAppContext)
     assert!(json["comments"].as_array().is_none_or(|a| a.is_empty()), "nothing saved: {json}");
 }
 
-/// UXI-Diff-12/15 perf: typing 10 characters into the comment compose leaves
-/// the cached `DiffView` render count FLAT (the compose is screen-level;
-/// `DiffSeqs` moves only on open/close). Paired positive control: opening the
-/// compose DOES re-render the body (the anchor highlight).
+/// UXI-Diff-12/15 perf: typing 10 characters into the INLINE comment compose
+/// leaves the cached `DiffView` render count FLAT (the editor is a root-level
+/// overlay over slot rows; `DiffSeqs` moves only on open/close and slot-count
+/// changes) — while the overlay DOES repaint: the painted caret moves right.
+/// Paired positive controls: opening the compose re-renders the body (slots +
+/// anchor highlight), and a draft growing past the minimum editor height (a
+/// 4th line) rebuilds the slots — the body re-renders and the box grows.
 ///
-/// Negative control (observed RED): bumping `compose_gen` on every compose
-/// keystroke re-renders the body per key.
+/// Negative control (observed RED): with `sync_compose_slots` rebuilding the
+/// rows on every keystroke, the body re-renders per key.
 #[gpui::test]
 fn diff_compose_typing_is_render_flat(cx: &mut TestAppContext) {
     cx.update(crate::register_keymap);
@@ -30788,7 +31062,11 @@ fn diff_compose_typing_is_render_flat(cx: &mut TestAppContext) {
     crate::perf_reset("diff");
     vcx.simulate_keystrokes("c");
     vcx.run_until_parked();
-    assert!(crate::perf_render_count("diff") >= 1, "opening the compose re-renders the body (highlight)");
+    assert!(crate::perf_render_count("diff") >= 1, "opening the compose re-renders the body (slots + highlight)");
+    let before = paint_diff_probes(&view, vcx, id, &["diff-compose-caret", "diff-comment-compose"]);
+    let caret0 = before[0].expect("caret painted");
+    let box0 = before[1].expect("compose painted");
+
     crate::perf_reset("diff");
     diff_type(vcx, "abcdefghij");
     assert_eq!(diff_compose_text(&view, vcx, id).as_deref(), Some("abcdefghij"));
@@ -30797,6 +31075,26 @@ fn diff_compose_typing_is_render_flat(cx: &mut TestAppContext) {
         0,
         "typing in the compose must not re-render the cached Diff body"
     );
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify()); // a ROOT repaint only
+    vcx.run_until_parked();
+    let caret1 = crate::layout_probe_get("diff-compose-caret");
+    crate::layout_probe_end();
+    let caret1 = caret1.expect("caret painted after typing");
+    assert!(caret1.0 > caret0.0 + 20.0, "the overlay repainted the draft: caret {caret0:?} -> {caret1:?}");
+    assert_eq!(crate::perf_render_count("diff"), 0, "a root repaint leaves the cached body flat");
+
+    // Growing past 3 editor lines adds a slot row: the body re-renders once
+    // per line-count change and the painted box grows by one row.
+    crate::perf_reset("diff");
+    vcx.simulate_keystrokes("enter x enter y enter z");
+    vcx.run_until_parked();
+    assert!(crate::perf_render_count("diff") >= 1, "a 4th line rebuilds the slot rows");
+    let after = paint_diff_probes(&view, vcx, id, &["diff-comment-compose", "diff-compose-caret"]);
+    let box1 = after[0].expect("compose painted");
+    assert!(box1.3 > box0.3 + 10.0, "the box grew with the draft: {box0:?} -> {box1:?}");
+    let caret2 = after[1].expect("caret painted on the 4th line");
+    assert!(caret2.1 + caret2.3 <= box1.1 + box1.3, "caret {caret2:?} inside the grown box {box1:?}");
 }
 
 /// C7 (text-editing review): Cmd-V pastes into an open Diff review-comment
@@ -30892,7 +31190,8 @@ fn diff_card_snapshot_is_shared_across_cursor_moves(cx: &mut TestAppContext) {
     let dv = view
         .read_with(vcx, |v, _| v.diff_tile_ref(id).and_then(|t| t.view.clone()))
         .expect("DiffView");
-    let painted = dv.read_with(vcx, |d, _| d.cached_card_line(0, 0));
+    // Row 0 is the card header (kfa boxed cards); the body starts at row 1.
+    let painted = dv.read_with(vcx, |d, _| d.cached_card_line(0, 1));
     assert_eq!(
         painted,
         Some(crate::CardLine::Body("first body edited".into())),

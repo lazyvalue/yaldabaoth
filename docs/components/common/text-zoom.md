@@ -15,7 +15,6 @@ live transcript view rather than carried as a per-session seq.
 
 ## References
 
-- INV-UX-13 in `docs/ux-invariants.md` → migrated here.
 - `docs/components/agent-tile/README.md` — the transcript facet consuming this.
 
 ## UX invariants
@@ -31,10 +30,10 @@ state): its action handler pushes `notify_transcript_views(TextStyle)` so every 
 `RootSnapshot`) — it is NOT a per-session `TranscriptSeqs` seq. As with buffers,
 **chrome stays at native size**: the turn/tool gutter labels, tool-card status
 glyphs, the right sidepanel (Plan/Subagents), the status footer, and the **compose input** (its caret
-and line-box are pixel-pinned for caret-containment — INV-UX-1 — so its font is held
+and line-box are pixel-pinned for caret-containment — UXI-TextEditing-1 — so its font is held
 fixed; scaling it would require scaling the caret + `CHATBOX_CHAR_W` in lockstep, a
 separate change). `Cmd-0` resets zoom everywhere EXCEPT agent tiles, where it is
-panel-focus (INV-UX-12) — zoom-out then back is the reset there.
+panel-focus (UXI-AgentTile-3) — zoom-out then back is the reset there.
 
 **Applies to.** `transcript_view.rs`: `RootSnapshot.text_scale` (read from
 `root.text_scale`), the per-line `text_size(px(13.0 * text_scale))` on the

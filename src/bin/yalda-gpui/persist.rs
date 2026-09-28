@@ -705,6 +705,56 @@ pub(crate) struct Preferences {
     /// so one global list suffices. `None`/absent = layout order (the default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) jump_tile_order: Option<Vec<workspace::WindowId>>,
+    /// User-preferred code-presentation font family name (no UI to set this
+    /// yet — hand-edit the preferences file). `None` means "no preference; let
+    /// `choose_code_font` pick from the installed-font fallback chain."
+    /// Honored only when the named family is actually registered with the
+    /// platform text system (see `choose_code_font`); an uninstalled name
+    /// falls through the chain rather than silently rendering proportional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) code_font: Option<String>,
+}
+
+/// Pick the code-presentation font: the user's `preferred` name if it's
+/// actually installed, else the first installed name (in priority order) of a
+/// fixed fallback chain, else the generic `"monospace"` family name (which
+/// every platform text system resolves to *some* monospace face, unlike an
+/// arbitrary unregistered family name which silently falls back to
+/// proportional). `available` is the platform's registered font-family list
+/// (`cx.text_system().all_font_names()`) — pure and unit-testable without a
+/// GPUI text system.
+///
+/// Chain order rationale: JetBrains Mono first (Scott's pick on Linux/niri,
+/// where neither "SF Mono" nor "Menlo" exist), then the macOS built-ins (SF
+/// Mono/Menlo — SF Mono is only nameable if the user installed it separately;
+/// see the startup-probe comment in `main`), then other popular coding fonts,
+/// then the Linux distro-default monos, with "monospace" as the total
+/// fallback.
+pub(crate) fn choose_code_font(available: &[String], preferred: Option<&str>) -> SharedString {
+    const FALLBACK_CHAIN: &[&str] = &[
+        "JetBrains Mono",
+        "SF Mono",
+        "Menlo",
+        "Cascadia Code",
+        "Fira Code",
+        "Iosevka",
+        "Source Code Pro",
+        "DejaVu Sans Mono",
+        "Ubuntu Mono",
+        "Noto Mono",
+        "Liberation Mono",
+    ];
+    if let Some(name) = preferred
+        && available.iter().any(|n| n == name)
+    {
+        return SharedString::from(name.to_string());
+    }
+    for candidate in FALLBACK_CHAIN {
+        if available.iter().any(|n| n == candidate) {
+            return SharedString::new_static(candidate);
+        }
+    }
+    SharedString::new_static("monospace")
 }
 
 pub(crate) fn load_preferences() -> Preferences {

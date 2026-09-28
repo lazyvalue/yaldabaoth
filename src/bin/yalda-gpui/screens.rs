@@ -969,7 +969,7 @@ impl YaldaGpuiView {
         Some(probe_bounds("recap-panel", panel.into_any_element()))
     }
 
-    /// The staged-image chip strip (INV-UX-21 property 2): one `🖼 label` chip
+    /// The staged-image chip strip (UXI-AgentTile-14 property 2): one `🖼 label` chip
     /// per pending attachment, tinted with the accent so they read as pending
     /// payload. Rendered inside the compose panel in chatbox/mid-turn mode AND as
     /// a standalone strip in worksheet-idle mode (where there is no compose panel)
@@ -1376,7 +1376,7 @@ impl YaldaGpuiView {
         // Staged image attachments (pasted via Cmd+V) → chip labels. Computed at
         // the outer scope so the strip renders in BOTH the compose panel
         // (chatbox/mid-turn) and standalone in worksheet-idle where no compose
-        // panel shows — a paste must be visible before send (INV-UX-21 prop 2).
+        // panel shows — a paste must be visible before send (UXI-AgentTile-14 prop 2).
         let pending_image_labels: Vec<SharedString> = c
             .input_surface
             .compose()
@@ -2315,7 +2315,7 @@ impl YaldaGpuiView {
             self.code_font.clone(),
         ) {
             // Worksheet-idle: no compose panel, but a pasted image must still show
-            // its chip before send (INV-UX-21 prop 2; bug-0039 follow-up). Pin the
+            // its chip before send (UXI-AgentTile-14 prop 2; bug-0039 follow-up). Pin the
             // strip to the bottom of the main column.
             main_col = main_col.child(
                 div().flex().flex_col().flex_none().pb_1().child(strip),
@@ -2589,17 +2589,20 @@ impl YaldaGpuiView {
                     .child(SharedString::from(hint)),
             );
 
-        let body_area = div().flex_1().min_h_0().w_full().child(cached_child(view));
+        // spec B5 (GitHub-style): the comment compose opens INLINE, under the
+        // commented line. The cached body reserves its height with
+        // `RowRef::ComposeSlot` rows; the editor itself is painted HERE, at
+        // the screen level (uncached, like the agent compose outside its
+        // transcript), over exactly those rows via `list_rows_overlay` — so it
+        // scrolls with the diff and is clipped to it, while typing never
+        // re-renders the cached `DiffView` (UXI-Diff-12/15). It must follow
+        // the body in tree order (it reads the list's settled scroll).
+        let compose_overlay = tile.compose.as_ref().zip(tile.compose_slot_span()).map(|(c, (first, last))| {
+            let el = self.render_diff_comment_compose(c, last - first + 1);
+            list_rows_overlay(view.read(cx).list_state(), first, last - first + 1, diff_row_h(scale), el)
+        });
 
-        // spec B5: the comment compose, pinned at the tile's bottom and
-        // rendered at the SCREEN level (like the agent compose sits outside
-        // its cached transcript), NOT inside the cached `DiffView` — typing
-        // here never re-renders the diff body (UXI-Diff-12/15). The anchored
-        // lines stay highlighted in the body (`DiffSeqs::compose_gen`).
-        let compose_panel = tile
-            .compose
-            .as_ref()
-            .map(|c| self.render_diff_comment_compose(c, dim, accent, fg, bg));
+        let body_area = div().flex_1().min_h_0().w_full().child(cached_child(view));
 
         // spec B6: the send picker, centered over the tile and — like the
         // compose — rendered at the SCREEN level, so query typing never
@@ -2641,8 +2644,8 @@ impl YaldaGpuiView {
             .bg(bg)
             .child(header)
             .child(body_area);
-        let root = match compose_panel {
-            Some(panel) => root.child(panel),
+        let root = match compose_overlay {
+            Some(overlay) => root.child(overlay),
             None => root,
         };
         match send_overlay {
@@ -2701,88 +2704,131 @@ impl YaldaGpuiView {
         )
     }
 
-    /// The bottom-pinned Diff comment compose (spec B5): a caption naming the
-    /// anchor ("commenting on a.txt:2–4" / "editing c3 on …"), the draft with
-    /// a caret marker, and its keys. Chrome — fixed sizes (it doesn't zoom,
-    /// like the agent compose). Every line renders unclipped and wraps in its
-    /// own `w_full` block (INV-UX-1/2 for a short comment: no scrolled region
-    /// to strand the caret in); a 4-line minimum height keeps the tile's body
-    /// bounds stable while a short draft is typed.
-    fn render_diff_comment_compose(
-        &self,
-        compose: &CommentCompose,
-        dim: Hsla,
-        accent: Hsla,
-        fg: Hsla,
-        bg: Hsla,
-    ) -> AnyElement {
-        let base = px(14.0);
-        let small = px(12.0);
-        let text = compose.input.text();
-        let cursor = compose.input.editor.cursor();
-        let doc_lines: Vec<&str> = if text.is_empty() { vec![""] } else { text.split('\n').collect() };
-        let mut lines_col = div().flex().flex_col().w_full();
-        for (i, line) in doc_lines.iter().enumerate() {
-            let rendered = if i == cursor.line {
-                let mut chars: Vec<char> = line.chars().collect();
-                let col = cursor.col.min(chars.len());
-                chars.insert(col, '\u{2758}'); // caret marker (thin vertical bar)
-                chars.into_iter().collect::<String>()
+    /// The inline Diff comment compose (spec B5, UXI-Diff-15) — a
+    /// GitHub-style review-comment box painted over its `slots` reserved rows
+    /// (`render_diff` → `list_rows_overlay`): a header strip captioned with
+    /// what is being commented ("Comment on a.txt:2–4" / "Editing c3 on …"),
+    /// the draft (monospace, hard-wrapped at `COMPOSE_WRAP_COLS`, one row per
+    /// visual line, a thin accent caret), and a key-hint footer. Every
+    /// vertical measure is a whole number of diff rows so the box fits its
+    /// slots exactly; sizes scale with the text zoom like the body it sits in.
+    fn render_diff_comment_compose(&self, compose: &CommentCompose, slots: usize) -> AnyElement {
+        let scale = self.text_scale;
+        let row_h = diff_row_h(scale);
+        let (text_px, small) = (px(13.0 * scale), px(11.5 * scale));
+        let fg = self.editor_fg();
+        let bg = self.editor_bg();
+        let dim = nc(self.theme.agent.dim);
+        let accent = nc(self.theme.agent.warm_accent);
+        let remove = nc(self.theme.agent.diff_remove);
+        let selected_bg: Hsla = nc(self.theme.overlay.selected_bg);
+        let header_bg = bg.blend(Hsla { a: 0.65, ..selected_bg });
+        let hairline = bg.blend(Hsla { a: 0.55, ..dim });
+
+        let laid = compose.visual_lines();
+        let top = compose_window_top(laid.caret.0, laid.lines.len());
+        let shown = slots.saturating_sub(COMPOSE_CHROME_ROWS).max(1);
+        let mut editor = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .px(px(12.0))
+            .py(px(2.0))
+            .bg(bg)
+            .overflow_hidden()
+            .font_family(self.code_font.clone())
+            .text_size(text_px)
+            .text_color(fg);
+        for (i, line) in laid.lines.iter().enumerate().skip(top).take(shown) {
+            let mut row = div().flex().flex_row().items_center().flex_none().h(row_h).whitespace_nowrap();
+            if i == laid.caret.0 {
+                let split = line.char_indices().nth(laid.caret.1).map_or(line.len(), |(b, _)| b);
+                let (before, after) = line.split_at(split);
+                row = row
+                    .child(SharedString::from(before.to_string()))
+                    .child(
+                        probe_bounds(
+                            "diff-compose-caret",
+                            div().flex_none().w(px(2.0)).h(row_h * 0.7).bg(accent).into_any_element(),
+                        ),
+                    )
+                    .child(SharedString::from(after.to_string()));
             } else {
-                (*line).to_string()
-            };
-            lines_col = lines_col.child(
-                div()
-                    .w_full()
-                    .font_family(self.code_font.clone())
-                    .text_size(base)
-                    .text_color(fg)
-                    .child(SharedString::from(rendered)),
-            );
+                row = row.child(SharedString::from(line.clone()));
+            }
+            editor = editor.child(row);
         }
+
         let caption = match &compose.target {
-            ComposeTarget::New => format!("commenting on {}", compose.anchor.label()),
-            ComposeTarget::Edit(id) => format!("editing {id} on {}", compose.anchor.label()),
+            ComposeTarget::New => format!("Comment on {}", compose.anchor.label()),
+            ComposeTarget::Edit(id) => format!("Editing {id} on {}", compose.anchor.label()),
         };
-        let panel = div()
+        let header = div()
+            .flex_none()
+            .h(row_h)
+            .flex()
+            .flex_row()
+            .items_center()
+            .px(px(12.0))
+            .bg(header_bg)
+            .border_b_1()
+            .border_color(hairline)
+            .child(probe_bounds_dyn(
+                format!("diff-compose-caption={caption}"),
+                single_line_ellipsis(&caption)
+                    .flex_1()
+                    .font_family(self.body_font.clone())
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_size(small)
+                    .text_color(fg)
+                    .into_any_element(),
+            ));
+        let (hint, hint_color) = if compose.esc_armed {
+            ("esc again to discard · ctrl-enter save", remove)
+        } else {
+            ("ctrl-enter save · esc cancel", dim)
+        };
+        let footer = div()
+            .flex_none()
+            .h(row_h)
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_end()
+            .px(px(12.0))
+            .font_family(self.code_font.clone())
+            .text_size(small)
+            .text_color(hint_color)
+            .child(SharedString::from(hint));
+
+        let boxed = div()
             .id("diff-comment-compose")
             .flex()
             .flex_col()
-            .flex_none()
-            .w_full()
-            .gap_1()
-            .px_4()
-            .py_2()
-            .border_t_1()
+            .flex_1()
+            .min_w_0()
+            .ml(diff_card_inset_left(scale))
+            .mr(px(DIFF_CARD_INSET_RIGHT))
+            .my(px(DIFF_CARD_GAP))
+            .rounded(px(DIFF_CARD_RADIUS))
+            .border_1()
             .border_color(accent)
-            .bg(bg_or(self.theme.top_bar, STATUS_BG))
-            .child(probe_bounds_dyn(
-                format!("diff-compose-caption={caption}"),
-                div()
-                    .text_color(accent)
-                    .font_family(self.code_font.clone())
-                    .text_size(small)
-                    .child(SharedString::from(caption))
-                    .into_any_element(),
-            ))
-            .child(
-                div()
-                    .w_full()
-                    .min_h(px(4.0 * 20.0))
-                    .p_1()
-                    .bg(bg)
-                    .border_1()
-                    .border_color(dim)
-                    .child(lines_col),
-            )
-            .child(
-                div()
-                    .text_color(dim)
-                    .font_family(self.code_font.clone())
-                    .text_size(small)
-                    .child(SharedString::from("ctrl-enter save · enter newline · esc cancel")),
-            );
-        probe_bounds("diff-comment-compose", panel.into_any_element())
+            .bg(bg)
+            .overflow_hidden()
+            // Clicks on the box never fall through to the diff row beneath
+            // (scrolling still reaches the list).
+            .block_mouse_except_scroll()
+            .child(header)
+            .child(probe_bounds("diff-compose-editor", editor.into_any_element()))
+            .child(footer);
+        div()
+            .size_full()
+            .flex()
+            .flex_row()
+            .child(probe_bounds("diff-comment-compose", boxed.into_any_element()))
+            .into_any_element()
     }
 
     /// Render a Cog explorer tile (`App::Cog`): a slim header bar plus the

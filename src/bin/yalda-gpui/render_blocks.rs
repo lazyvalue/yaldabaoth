@@ -1135,6 +1135,7 @@ thread_local! {
 pub(crate) fn layout_probe_begin() {
     LAYOUT_PROBE.with(|p| *p.borrow_mut() = Some(HashMap::new()));
     LAYOUT_PROBE_DYN.with(|p| *p.borrow_mut() = Some(HashMap::new()));
+    LAYOUT_PROBE_TEXT.with(|p| p.borrow_mut().clear());
 }
 
 /// The last painted bounds `(x, y, w, h)` of the element tagged `label`, or
@@ -1177,6 +1178,114 @@ fn layout_probe_record_dyn(label: &str, b: (f32, f32, f32, f32)) {
 /// probe is active (no-op otherwise). The headless geometry-assertion primitive.
 pub(crate) fn probe_bounds(label: &'static str, inner: AnyElement) -> AnyElement {
     ProbeBounds { label, inner }.into_any_element()
+}
+
+/// Whether the layout probe is recording (always `false` in production). Lets a
+/// primitive skip building a per-instance probe tag string when nobody reads it.
+pub(crate) fn layout_probe_active() -> bool {
+    LAYOUT_PROBE_DYN.with(|p| p.borrow().is_some())
+}
+
+/// A text leaf whose SHAPED content is recorded when the probe is active: after
+/// paint, `layout_probe_text(tag)` returns the text gpui actually laid out (i.e.
+/// AFTER `text_ellipsis` truncation — a label truncated to "…" shows up as "…")
+/// plus the text leaf's painted bounds. Production (probe inactive) returns the
+/// plain `SharedString` element — byte-identical to `.child(text)`.
+pub(crate) fn probe_text(tag: impl FnOnce() -> String, text: SharedString) -> AnyElement {
+    if !layout_probe_active() {
+        return text.into_any_element();
+    }
+    let styled = gpui::StyledText::new(text);
+    let layout = styled.layout().clone();
+    ProbeText {
+        label: tag(),
+        layout,
+        inner: styled.into_any_element(),
+    }
+    .into_any_element()
+}
+
+thread_local! {
+    static LAYOUT_PROBE_TEXT: RefCell<HashMap<String, (String, (f32, f32, f32, f32))>> =
+        RefCell::new(HashMap::new());
+}
+
+/// The last painted `(shaped_text, (x, y, w, h))` of the [`probe_text`] leaf
+/// tagged `label`, recorded while the probe was active.
+#[cfg(test)]
+pub(crate) fn layout_probe_text(label: &str) -> Option<(String, (f32, f32, f32, f32))> {
+    LAYOUT_PROBE_TEXT.with(|p| p.borrow().get(label).cloned())
+}
+
+struct ProbeText {
+    label: String,
+    layout: gpui::TextLayout,
+    inner: AnyElement,
+}
+
+impl IntoElement for ProbeText {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for ProbeText {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut GpuiApp,
+    ) -> (LayoutId, ()) {
+        (self.inner.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut (),
+        window: &mut Window,
+        cx: &mut GpuiApp,
+    ) {
+        self.inner.prepaint(window, cx);
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut (),
+        _prepaint: &mut (),
+        window: &mut Window,
+        cx: &mut GpuiApp,
+    ) {
+        self.inner.paint(window, cx);
+        if layout_probe_active() {
+            let rect = (
+                f32::from(bounds.origin.x),
+                f32::from(bounds.origin.y),
+                f32::from(bounds.size.width),
+                f32::from(bounds.size.height),
+            );
+            let text = self.layout.text();
+            LAYOUT_PROBE_TEXT.with(|p| p.borrow_mut().insert(self.label.clone(), (text, rect)));
+        }
+    }
 }
 
 /// Dynamic-label sibling of [`probe_bounds`] for per-instance tags whose label

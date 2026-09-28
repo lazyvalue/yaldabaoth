@@ -728,6 +728,10 @@ impl YaldaGpuiView {
         }
         compose.esc_armed = false;
         Self::dispatch_insert_core(&mut compose.input.editor, &mut compose.input.mode, press);
+        // The inline editor's height tracks the draft's visual line count:
+        // only a line-count change rebuilds rows (re-rendering the cached
+        // body); plain typing is root-only (UXI-Diff-12).
+        tile.sync_compose_slots();
         cx.notify();
     }
 

@@ -15,7 +15,7 @@
 > steering queue + cancelable chips + `flush_idle_steering`** were removed (an
 > unrequested addition that, once its chips UI was reverted, hid the user's text
 > on a failed send). Sections mentioning `AgentState.steering`, chips, or
-> at-boundary flush are HISTORICAL; the queue no longer exists. See INV-UX-7.
+> at-boundary flush are HISTORICAL; the queue no longer exists. See UXI-AgentTile-13.
 
 ## Builds On
 
@@ -32,7 +32,7 @@
 - **`spec-agent-session-ownership.md`** — strict 1:1 tile↔session; session state
   is owned by the `AgentSession` model. The steering queue is session-owned so it
   survives unbind/rebind and a turn ending in a non-focused session still flushes.
-- **`ux-invariants.md`** — this spec adds **INV-UX-7** (steering-queue
+- **`docs/components/agent-tile/compose.md`** — this spec adds **UXI-AgentTile-13** (steering-queue
   affordance + delivery semantics + Esc-interrupts-in-flight).
 - **`src/acp_channel.rs`** — the worker driver loop serializes prompts: it fires
   `session/prompt` and awaits the response (turn end) before draining the next.
@@ -134,7 +134,7 @@ Named artifacts:
    compose box), in FIFO order, showing a one-line snippet + a ✕.
 6. **Cancel** (✕) removes that steer (`cancel_steering_chip` → `cancel_steer`).
 7. **Edit** (click the chip body) pulls the steer's text back into the compose
-   (caret at end, INV-UX-1), drops it from the queue, focuses the compose
+   (caret at end, UXI-TextEditing-1), drops it from the queue, focuses the compose
    (`edit_steering_chip` → `take_steer` + `Compose::set_text`). Re-submitting
    re-queues it at the back. No per-chip mini-editor — the compose is the single
    authoring surface.
@@ -202,4 +202,4 @@ from the agent's advertised capabilities; v1 is hard-wired `AtBoundary`.
 - 2026-06-26 — Created (DRAFT); v1 implemented on `agent-steering`. Steering queue
   with capability-gated delivery (v1 at-boundary / v2 immediate), multiple FIFO
   messages, compose-based chip editing, and Esc-interrupts-in-flight. Adds
-  INV-UX-7. Guards `steering_*` in `verify_harness.rs`.
+  UXI-AgentTile-13. Guards `steering_*` in `verify_harness.rs`.

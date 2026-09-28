@@ -8,11 +8,12 @@ description: Capture a new UX / behavioral requirement, remove all ambiguity, ch
 The front door for a fresh behavioral requirement. It captures the requirement,
 interrogates it to zero ambiguity, routes it into the **component spec** harness
 (`docs/components/`), implements it, and reconciles the spec with reality. It does
-not replace `/spec` (deep design), `/decision` (rationale), or `/plan` (multi-session
-decomposition) — it invokes them when a step calls for it.
+not replace `/spec` (deep design), `/decision` (rationale), or `/cog-plan`
+(multi-step execution) — it invokes them when a step calls for it.
 
-Read `docs/components/README.md` before starting — it defines the component-spec
-format, the `UXI-<Component>-N` id scheme, and the migration rules.
+Read `docs/ux-patterns/README.md` (the universal `UXP-N` laws every surface obeys)
+and `docs/components/README.md` (the component-spec format and `UXI-<Component>-N`
+ids) before starting.
 
 ## Checklist
 
@@ -20,8 +21,7 @@ Create a task for each; complete in order. Do NOT skip the interrogation or the
 already-built check — they are what stop wasted or duplicate work.
 
 1. **Capture verbatim.** Restate the requirement in the user's own terms so there's
-   a durable record before anything else. Add a `docs/backlog.md` entry now (status
-   `NEEDS-DECISION` while ambiguous, else `READY`).
+   a durable record before anything else (in the Cog graph for this work).
 2. **Interrogate to zero ambiguity (spec-style).** Ask clarifying questions **one at
    a time**. Do not proceed while any behavior is undefined. Pin down: the exact
    trigger, every surface it applies to, edge/empty/error states, what must NOT
@@ -30,11 +30,13 @@ already-built check — they are what stop wasted or duplicate work.
    made — offer `/decision` to record the why.
 3. **Check if already planned or built — in code AND in specs.** Search the code for
    the behavior (it may already exist, like tile click-focus did) and search
-   `docs/components/`, `docs/ux-invariants.md`, `docs/specs/`, `docs/backlog.md`,
-   `docs/projects/` for an existing UXI / spec / ticket. Report one of: *already
+   `docs/ux-patterns/`, `docs/components/`, `docs/specs/`, `docs/backlog.md`, and the
+   Cog graphs/bulletins for an existing UXP / UXI / spec / plan. Check the new
+   behavior against every `UXP` — a conflict is resolved before anything is written. Report one of: *already
    built* (then this is a verify or bug, not new work — consider `/bug`), *planned
    not built*, or *net-new*. Reuse/extend before creating.
-4. **Write the spec.** Identify the owning component (`Workspace`, `Tile`,
+4. **Write the spec.** If the rule binds every surface with no surface named, it is a
+   pattern: add `UXP-N` in `docs/ux-patterns/` (rare — see its litmus). Otherwise identify the owning component (`Workspace`, `Tile`,
    `AgentTile`, `TextEditing`, …). Add or extend its component spec under
    `docs/components/` with a new `UXI-<Component>-N` at status `not implemented`
    (Statement / Applies-to / Why / Enforcement-seam-named). Shared behavior →
@@ -47,9 +49,8 @@ already-built check — they are what stop wasted or duplicate work.
    suite.
 6. **Reconcile the spec with reality.** Flip the UXI status `not implemented → implemented`, fill
    the real test name in Enforcement, and record any **deviation from plan** (what
-   you intended in step 4 vs what actually shipped, and why). Update the backlog
-   entry (`NEEDS-RUNTIME` / done) and the crosswalk in `docs/components/README.md` if
-   an `INV-UX-N` was migrated.
+   you intended in step 4 vs what actually shipped, and why). Add a `docs/backlog.md`
+   `NEEDS-RUNTIME` entry only if a genuine harness gap remains for Scott to check.
 
 ## Constraints
 

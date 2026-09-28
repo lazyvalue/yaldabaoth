@@ -21,7 +21,7 @@ strip**, the **transcript** (a cached child, `TranscriptView`), the **compose** 
 - `docs/components/common/text-editing.md` — the compose buffer obeys `TextEditing`.
 - `docs/specs/spec-agent-session-ownership.md` — the 1:1 binding + placement choke.
 - `docs/specs/spec-agent-presentation.md` — transcript/tool rendering.
-- `docs/projects/gpui-responsiveness/` — the cached-child performance model.
+- `docs/reference/gpui-render-model.md` — the cached-child performance model.
 - ADR-0019 (Tiles & Apps), ADR-0024 (worksheet = read-only transcript + compose).
 
 ## Facets (decomposed files)

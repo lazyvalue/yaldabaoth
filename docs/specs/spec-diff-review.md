@@ -58,8 +58,11 @@ uncommitted + untracked), base = the repo's default branch.
 - **B1. Pick a worktree. [ACTIVE]** An unbound tile renders the **worktree
   picker**: every entry of `git worktree list --porcelain` for the repo
   containing the active workspace's cwd (fallback: process cwd), one row each
-  — branch name prominent, path dimmed (home-relative), primary checkout
-  labelled. Rows are selectable with `j`/`k`/arrows + `Enter`, or a mouse click.
+  — two lines: the branch name prominent (primary checkout labelled), then a
+  dimmed description `<HEAD commit subject> · <relative age> · <~/path>`
+  (home-relative path; just the path when the commit is unknown). Subject +
+  commit time come from ONE batched `git log --no-walk` in the async worktree
+  load, never the paint path. Rows are selectable with `j`/`k`/arrows + `Enter`, or a mouse click.
   A final row "Pick a folder…" binds an arbitrary path. Not in a git repo ⇒ the
   picker says so plainly and offers only the folder row. `space → Switch
   worktree` returns a bound tile to the picker. A deleted/invalid worktree
@@ -92,16 +95,21 @@ uncommitted + untracked), base = the repo's default branch.
   file is viewed the header reads "All files viewed ✓".
 
 - **B5. Comments. [ACTIVE]** `c` on the cursor line opens a comment compose
-  pinned at the bottom of the tile, captioned with its anchor
-  ("commenting on src/foo.rs:40–46"), while the anchored lines stay highlighted
-  in the diff; `V` starts a line-range selection (extend with `j`/`k`, confined
+  **inline, GitHub-style — directly under the commented line** (under the
+  range's last line; below any comments already on that line), as a bordered
+  box with a header captioning what is being commented ("Comment on
+  src/foo.rs:40–46") and a footer hint ("ctrl-enter save · esc cancel"); it
+  scrolls with the diff, grows with the draft (up to a cap, then keeps the
+  caret in view), and the anchored lines stay highlighted in the diff; `V` starts a line-range selection (extend with `j`/`k`, confined
   to one file; `Esc` cancels) and `c` comments on the range. `Enter` inserts a
   newline, `Ctrl-Enter` / `Cmd-Enter` saves, `Esc` closes an empty draft — on a
   non-empty draft the first `Esc` only warns ("Esc again to discard") and a
   second discards. A saved comment is written to the review file immediately as
-  **unsent** and renders inline under its last anchor line as a card (body,
-  "unsent"/"sent to <session> · <time>"/"outdated" badge). `e` edits the
-  comment under the cursor; `x` deletes it after a confirming second `x`.
+  **unsent** and renders inline under its last anchor line as a card: one
+  bordered, rounded, padded box (header strip with the id and a status pill —
+  "unsent" / "sent to <session> · <time>" / "outdated" — then the body in the
+  prose font; no emoji). `e` edits the comment under the cursor in the same
+  inline compose, opened in place of its card; `x` deletes it after a confirming second `x`.
   Comments anchor to the new-side line numbers (old side only when every
   anchored line is removed) and store a **snippet** (the anchored lines' text)
   so they can be relocated. When the anchored content no longer appears in that
@@ -274,6 +282,11 @@ are **removed** (ADR-0040).
   session via a `cmd-p`-style picker defaulting to the last session sent to,
   pointing the agent at the file + comment ids; refresh on focus + `r`. Merge
   gate, hook, `--hash-diff`, session triggers, and unreviewed badge deleted.
+- 2026-09-27 — B5 revised (graph `kfa` node comment-inline, Scott): the
+  compose moved from a bottom-pinned panel to an inline GitHub-style box under
+  the commented line (`e` edits in place of the card); cards became bordered
+  boxes with status pills; the 💬 emoji was removed.
 - 2026-09-27 — rev 2 implemented (graph `8g7`), DRAFT → ACTIVE. Deviations are
-  recorded per-UXI in `docs/components/diff.md` (bottom-pinned compose,
+  recorded per-UXI in `docs/components/diff.md` (bottom-pinned compose — since
+  replaced by the inline compose, graph `kfa`,
   uniform-row virtualization ⇒ long lines truncate, send picker session universe).

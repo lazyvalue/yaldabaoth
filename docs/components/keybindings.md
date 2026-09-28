@@ -15,8 +15,6 @@ registry, re-applies the whole keymap atomically, and persists the diff to
 
 ## References
 
-- Migrated from `docs/ux-invariants.md` INV-UX-17 (live keymap + in-place rebind).
-  That entry is now `→ migrated here`.
 
 ## UX invariants
 
@@ -44,7 +42,7 @@ consequences that must hold:
 
 **Applies to.** `keymap_registry.rs` (the table + `apply`/`rebind`/`reset`/
 `persist`/`conflicts`), `keymap_view.rs` (`KeymapView` — the cached body; the
-browse cursor is always on a marked row via the `›` gutter, INV-UX-1's spirit for
+browse cursor is always on a marked row via the `›` gutter, UXI-TextEditing-1's spirit for
 this surface), `keymap_ui.rs` (the key handler + capture grab), and `main.rs`
 `register_keymap` (now data-driven from the table).
 

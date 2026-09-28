@@ -21,8 +21,8 @@ everywhere.
 
 ## References
 
-- `docs/ux-invariants.md` INV-UX-1 (cursor always visible), INV-UX-2 (compose
-  word-wraps) — **to be migrated into `UXI-TextEditing-N` here.**
+- `UXI-AgentTile-9` (compose word-wraps) — to be generalized here as `UXI-TextEditing-2`.
+- `docs/ux-patterns/` — `UXP-1` (the caret is always visible) is the universal law this component realizes for text surfaces.
 - `docs/specs/spec-chatbox-caret-containment.md` — the caret-window chokepoint.
 - Naming: View Mode / Edit Mode / Normal / Insert — see root `CLAUDE.md`.
 
@@ -41,13 +41,12 @@ a region the caret has left.
 **Why.** A caret you can't see is a caret you can't use. The single most-regressed
 property in the app.
 
-**Status.** `implemented` — this is INV-UX-1, hosted here during migration; that entry
-remains authoritative until fully moved.
+**Status.** `implemented`.
 
 **Enforcement.** `verify_harness.rs::compose_caret_row_painted_inside_box_when_wrapped`
-+ the caret-containment model guards (see INV-UX-1 for the full list).
++ the caret-containment model guards (listed in `spec-chatbox-caret-containment.md`).
 
-<!-- TODO(migration): move INV-UX-2 (word-wrap) here as UXI-TextEditing-2, then
+<!-- TODO(migration): move UXI-AgentTile-9 (word-wrap) here as UXI-TextEditing-2, then
      specify the helix-style selection/motion/operator model as further UXI-TextEditing-N. -->
 
 ### UXI-TextEditing-3 — Enter continues a list/quote at the same indent (nesting is preserved)

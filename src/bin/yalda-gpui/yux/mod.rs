@@ -15,7 +15,9 @@
 //!    `fmt_iso_datetime`) that any surface composes from.
 //! 3. **Virtualized scroll surfaces** (`list`) — `ScrollAnchoredList`, the one
 //!    place the "splice the changed range, never `reset()`" reconcile lives, so
-//!    no scroll surface re-derives it (or re-introduces the jump-to-top bug).
+//!    no scroll surface re-derives it (or re-introduces the jump-to-top bug) —
+//!    and `list_rows_overlay`, an uncached element painted over a span of a
+//!    uniform-row list's rows (inline inputs inside a cached list).
 //! 4. **Display text** (`display_text`) — the one document-line → rendered
 //!    string projection (newline-trimmed, tab-expanded) and the raw→display
 //!    column mapper every caret/selection painter must go through.
