@@ -13,6 +13,8 @@
 
 use super::*;
 
+use std::rc::Rc;
+
 /// What a palette row jumps to. Projects remain containers rather than targets;
 /// a tile id names the exact stateful shell object in either ownership domain.
 #[derive(Clone, Debug, PartialEq)]
@@ -30,9 +32,12 @@ pub(crate) enum PaletteTarget {
 }
 
 /// One palette candidate: what it points at, what you read, and what you type
-/// against (`label`).
-pub(crate) struct PaletteItem {
-    pub(crate) target: PaletteTarget,
+/// against (`label`). Generic over the target so another picker can reuse the
+/// item model, the fuzzy ranking and the panel render (the Diff tile's send
+/// picker uses `PaletteItem<SendTarget>` — spec-diff-review B6); the jump
+/// palette's own items are the default `PaletteItem<PaletteTarget>`.
+pub(crate) struct PaletteItem<T = PaletteTarget> {
+    pub(crate) target: T,
     /// The matched text — the workspace's or session's name, exactly as the
     /// sidebar shows it.
     pub(crate) label: String,
@@ -58,6 +63,22 @@ pub(crate) struct JumpPaletteOverlay {
 
 /// Rows drawn at once; the window scrolls to keep `selected` visible.
 const PALETTE_VISIBLE_ROWS: usize = 12;
+
+/// What [`YaldaGpuiView::render_palette_panel`] draws: a title, the query, and
+/// the ranked rows of `items` with `selected` (a DISPLAY index into `ranked`)
+/// highlighted. `glyph_of` / `tag_of` take an ITEM index: the leading glyph
+/// and an optional small trailing tag (e.g. the send picker's "last sent").
+pub(crate) struct PalettePanel<'a, T> {
+    pub(crate) id_prefix: &'static str,
+    pub(crate) title: String,
+    pub(crate) query: &'a str,
+    pub(crate) items: &'a [PaletteItem<T>],
+    pub(crate) ranked: &'a [usize],
+    pub(crate) selected: usize,
+    pub(crate) footer: &'static str,
+    pub(crate) glyph_of: &'a dyn Fn(usize) -> &'static str,
+    pub(crate) tag_of: &'a dyn Fn(usize) -> Option<&'static str>,
+}
 
 /// Score `query` against `text` as a fuzzy subsequence match; `None` when the
 /// query's characters don't appear in order (i.e. not a candidate at all).
@@ -119,7 +140,7 @@ pub(crate) fn fuzzy_score(text: &str, query: &str) -> Option<i32> {
 /// match first. An empty query keeps every item in **panel order**; a non-empty
 /// query drops non-matches and orders by `fuzzy_score` descending, with panel
 /// order as the tiebreak (the sort is stable).
-pub(crate) fn rank_palette_items(items: &[PaletteItem], query: &str) -> Vec<usize> {
+pub(crate) fn rank_palette_items<T>(items: &[PaletteItem<T>], query: &str) -> Vec<usize> {
     if query.is_empty() {
         return (0..items.len()).collect();
     }
@@ -433,6 +454,99 @@ impl YaldaGpuiView {
     }
 
     pub(crate) fn render_jump_palette(&self, cx: &mut Context<Self>) -> AnyElement {
+        let (items, ranked) = self.jump_palette_ranked(cx);
+        let (query, selected) = match self.jump_palette_ref() {
+            Some(p) => (p.query.clone(), p.selected),
+            None => (String::new(), 0),
+        };
+        let targets: Vec<PaletteTarget> = items.iter().map(|it| it.target.clone()).collect();
+        let glyphs: Vec<&'static str> = items
+            .iter()
+            .map(|it| {
+                if matches!(&it.target, PaletteTarget::AgentStats) {
+                    "◫"
+                } else if it.is_agent {
+                    "✦"
+                } else {
+                    "⊞"
+                }
+            })
+            .collect();
+        let ranked_for_click = ranked.clone();
+        let panel = self.render_palette_panel(
+            PalettePanel {
+                id_prefix: "jump-palette",
+                title: "JUMP TO".to_string(),
+                query: &query,
+                items: &items,
+                ranked: &ranked,
+                selected,
+                footer: "↑↓:select  enter:jump  esc:cancel",
+                glyph_of: &|i| glyphs[i],
+                tag_of: &|_| None,
+            },
+            Rc::new(move |this: &mut Self, row_n: usize, cx: &mut Context<Self>| {
+                let Some(target) = ranked_for_click.get(row_n).and_then(|&i| targets.get(i)).cloned() else {
+                    return;
+                };
+                this.clear_overlay();
+                match target {
+                    PaletteTarget::AgentStats => this.open_agent_stats(cx),
+                    PaletteTarget::Workspace(i) => this.select_workspace(i, cx),
+                    PaletteTarget::Tile(id) => this.jump_to_tile(id, cx),
+                    PaletteTarget::Session(sid) => this.open_tileless_session(sid, cx),
+                }
+                cx.notify();
+            }),
+            Rc::new(|this: &mut Self, row_n: usize, cx: &mut Context<Self>| {
+                if let Some(p) = this.jump_palette_mut() {
+                    p.selected = row_n;
+                    cx.notify();
+                }
+            }),
+            cx,
+        );
+
+        probe_bounds(
+            "jump-palette",
+            div()
+                .absolute()
+                .top(px(80.0))
+                .left_0()
+                .right_0()
+                .flex()
+                .flex_row()
+                .justify_center()
+                .child(panel)
+                .into_any_element(),
+        )
+    }
+
+    /// The shared palette popup (title · query · ranked rows · footer) used by
+    /// the jump palette (`Cmd-P`) and the Diff tile's send picker (spec B6).
+    /// The caller positions it and owns the key handling; `on_click` /
+    /// `on_hover` receive the DISPLAY row index (into `ranked`) and resolve
+    /// their target at event time. Each row is probed as
+    /// `<id_prefix>-row=<label>` and a tagged row's tag as
+    /// `<id_prefix>-tag=<label>` (headless paint assertions).
+    pub(crate) fn render_palette_panel<T>(
+        &self,
+        panel: PalettePanel<'_, T>,
+        on_click: Rc<dyn Fn(&mut Self, usize, &mut Context<Self>)>,
+        on_hover: Rc<dyn Fn(&mut Self, usize, &mut Context<Self>)>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let PalettePanel {
+            id_prefix,
+            title,
+            query,
+            items,
+            ranked,
+            selected,
+            footer,
+            glyph_of,
+            tag_of,
+        } = panel;
         let st = DetailStyle {
             fg: self.editor_fg(),
             dim: nc(self.theme.agent.dim),
@@ -454,19 +568,17 @@ impl YaldaGpuiView {
         let working_orange: Hsla = nc(self.theme.agent.jump_working);
         let ready: Hsla = nc(self.theme.agent.tool_completed);
 
-        let (items, ranked) = self.jump_palette_ranked(cx);
-        let (query, selected) = match self.jump_palette_ref() {
-            Some(p) => (p.query.clone(), p.selected),
-            None => (String::new(), 0),
-        };
-
-        let header = div()
-            .px_4()
-            .py_1()
-            .text_color(label_fg)
-            .font_weight(FontWeight::BOLD)
-            .text_size(px(11.0))
-            .child(SharedString::new_static("JUMP TO"));
+        let header = probe_bounds_dyn(
+            format!("{id_prefix}-title={title}"),
+            div()
+                .px_4()
+                .py_1()
+                .text_color(label_fg)
+                .font_weight(FontWeight::BOLD)
+                .text_size(px(11.0))
+                .child(SharedString::from(title))
+                .into_any_element(),
+        );
 
         let input_row = div()
             .px_4()
@@ -507,16 +619,9 @@ impl YaldaGpuiView {
                     Some(AgentDotStatus::WaitingForYou) => ready,
                     _ => st.dim,
                 };
-                let glyph = if matches!(&it.target, PaletteTarget::AgentStats) {
-                    "◫"
-                } else if it.is_agent {
-                    "✦"
-                } else {
-                    "⊞"
-                };
-                let target = it.target.clone();
+                let glyph = glyph_of(idx);
                 let mut row = div()
-                    .id(SharedString::from(format!("jump-palette-row-{row_n}")))
+                    .id(SharedString::from(format!("{id_prefix}-row-{row_n}")))
                     .flex()
                     .flex_row()
                     .items_center()
@@ -544,40 +649,45 @@ impl YaldaGpuiView {
                                 st.fg
                             })
                             .child(SharedString::from(it.label.clone())),
-                    )
-                    .child(
+                    );
+                if let Some(tag) = tag_of(idx) {
+                    row = row.child(probe_bounds_dyn(
+                        format!("{id_prefix}-tag={}", it.label),
                         div()
                             .flex_none()
+                            .px_1()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(st.dim)
                             .text_size(px(10.0))
                             .text_color(st.dim)
-                            .child(SharedString::from(it.detail.clone())),
-                    );
+                            .child(SharedString::new_static(tag))
+                            .into_any_element(),
+                    ));
+                }
+                row = row.child(
+                    div()
+                        .flex_none()
+                        .text_size(px(10.0))
+                        .text_color(st.dim)
+                        .child(SharedString::from(it.detail.clone())),
+                );
                 if is_sel {
                     row = row.bg(sel_bg);
                 }
+                let click = on_click.clone();
+                let hover = on_hover.clone();
                 row = row
-                    .on_click(cx.listener({
-                        let target = target.clone();
-                        move |this, _ev, _w, cx| {
-                            this.clear_overlay();
-                            match target.clone() {
-                                PaletteTarget::AgentStats => this.open_agent_stats(cx),
-                                PaletteTarget::Workspace(i) => this.select_workspace(i, cx),
-                                PaletteTarget::Tile(id) => this.jump_to_tile(id, cx),
-                                PaletteTarget::Session(sid) => {
-                                    this.open_tileless_session(sid, cx)
-                                }
-                            }
-                            cx.notify();
-                        }
-                    }))
+                    .on_click(cx.listener(move |this, _ev, _w, cx| click(this, row_n, cx)))
                     .on_hover(cx.listener(move |this, hovered: &bool, _w, cx| {
-                        if *hovered && let Some(p) = this.jump_palette_mut() {
-                            p.selected = row_n;
-                            cx.notify();
+                        if *hovered {
+                            hover(this, row_n, cx);
                         }
                     }));
-                list = list.child(row);
+                list = list.child(probe_bounds_dyn(
+                    format!("{id_prefix}-row={}", it.label),
+                    row.into_any_element(),
+                ));
             }
         }
 
@@ -586,34 +696,19 @@ impl YaldaGpuiView {
             .py_1()
             .text_color(label_fg)
             .text_size(px(11.0))
-            .child(SharedString::new_static(
-                "↑↓:select  enter:jump  esc:cancel",
-            ));
+            .child(SharedString::new_static(footer));
 
-        probe_bounds(
-            "jump-palette",
-            div()
-                .absolute()
-                .top(px(80.0))
-                .left_0()
-                .right_0()
-                .flex()
-                .flex_row()
-                .justify_center()
-                .child(
-                    div()
-                        .w(px(560.0))
-                        .bg(popup_bg)
-                        .border_2()
-                        .border_color(popup_border)
-                        .flex()
-                        .flex_col()
-                        .child(header)
-                        .child(input_row)
-                        .child(list)
-                        .child(footer),
-                )
-                .into_any_element(),
-        )
+        div()
+            .w(px(560.0))
+            .max_w_full()
+            .bg(popup_bg)
+            .border_2()
+            .border_color(popup_border)
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(input_row)
+            .child(list)
+            .child(footer)
     }
 }

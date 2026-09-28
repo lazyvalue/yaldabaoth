@@ -1,288 +1,279 @@
 # Diff Review Tile (`App::Diff`)
 
-**Status:** ACTIVE (implemented — see `docs/components/diff.md` for the shipped
-`UXI-Diff-N` invariants)
-**Last updated:** 2026-08-29
+**Status:** ACTIVE (rev 2 implemented via Cog graph `8g7` — worktree-bound review
+with stored comments; supersedes rev 1. See ADR-0040 and `docs/components/diff.md`.)
+**Last updated:** 2026-09-27
 
 ## Builds On
 
 - **`spec-tiles-and-apps.md` / ADR-0019** — Tiles hold exactly one App. WHY:
-  `App::Diff` is a new peer App variant (precedent: `App::Linear`); HOW: this
-  spec adds the variant and its tile payload without touching the split tree,
-  which stays generic over the content type (C1 there).
-- **`spec-agent-session-ownership.md`** — sessions are store-owned with an
-  immutable spawn `cwd`. WHY: a Diff tile's primary binding is *a session*, and
-  the session's `cwd` is the ground truth for which worktree to diff; HOW: the
-  tile holds a `SessionId` reference and reads session state via the store; it
-  never owns session state.
-- **`spec-turn-steering.md`** — mid-turn prompt delivery via `promptQueueing`.
-  WHY: review comments are feedback to the *authoring* agent; HOW: a hunk
-  comment is submitted through the existing `send_prompt_to_session` path, so it
-  steers mid-turn and prompts normally when idle. No new transport.
+  `App::Diff` is a peer App variant (precedent: `App::Linear`); HOW: the variant
+  and its tile payload live beside the others; the split tree stays generic.
+- **`spec-turn-steering.md`** — prompt delivery via `send_prompt_to_session`.
+  WHY: sending review comments to an agent is just a prompt; HOW: the send
+  command delivers one short prompt through the existing path (mid-turn it
+  steers, idle it prompts). No new transport.
 - **`spec-yux.md` + `yux/CLAUDE.md`** — cached-view rules. WHY: the diff body is
-  an expensive, mostly-stable surface; HOW: it renders as its own cached child
-  entity (`cached_child`), invalidated at mutation sites, with a render-count
-  test.
-- **`docs/components/jump-panel.md`** — the session-list navigator and its
-  unread badge model. WHY: "N unreviewed hunks" is the review analogue of
-  unread; HOW: the jump panel reads a per-session unreviewed count projected
-  from the tile's review model.
+  an expensive, mostly-stable surface; HOW: it renders as a cached child entity
+  (`cached_child`) with a render-count test.
+- **Jump palette (`jump_palette.rs`)** — the `cmd-p` fuzzy session list. WHY:
+  choosing which session receives comments should feel exactly like jumping to
+  a session; HOW: the send picker reuses the palette's item model and fuzzy
+  filter.
 
 ## Overview
 
-**Problem.** Agents author code in worktrees faster than Scott reviews it.
-There is no surface to see a branch's cumulative changes, no low-friction way to
-send feedback about a specific change back to the authoring agent, and nothing
-stops an unreviewed branch from merging.
+**Problem.** Agents write code in worktrees faster than Scott reviews it. He
+needs one calm place to read a branch's changes, tick files off as he reads
+them, jot comments against specific lines, and hand those comments to *any*
+agent session to act on.
 
-**`App::Diff`** is a read-only review App. Like lazygit, it owns no git logic:
-it shells out to `git` and parses unified-diff output. Named entities:
+**Why rev 2.** Rev 1 bound the tile to an agent *session* and diffed the
+session's `cwd`. Sessions start in the primary checkout and do their work in
+`.claude/worktrees/<slug>`, so a session-bound tile usually diffed `main`
+against itself and showed nothing. It also coupled review to one conversation,
+reviewed at the git-hunk grain (whose boundaries git chooses, not the reader),
+and threw comments away after sending. Rev 2 makes the **worktree** the thing
+under review, the **file** the thing you mark, and the **review file** (JSON)
+the durable home for comments, which can be sent to any session.
 
-- **`DiffTile`** — the tile payload: an optional **`DiffSource`** binding plus
-  view state (focus, collapse, comment compose).
-- **`DiffSource`** — what to diff: `Session(SessionId)` (worktree derived from
-  the session's `cwd`) or `Path(PathBuf)` (an explicit worktree, no session).
-- **`DiffModel`** — the parsed diff: base/head SHAs, dirty flag, files, hunks.
-  A **hunk** carries a content hash (`hunk_hash`) that is its review identity.
-- **`ReviewState`** — the per-repo persisted record of reviewed hunk hashes,
-  keyed by branch. Sidecar file, not in git history.
-- **Merge gate** — two layers: the tile's merge command, and a
-  `pre-merge-commit` git hook that reads `ReviewState`.
-- **Comment→steering** — hunk-anchored feedback sent into the bound session.
-- **Open-in-Zed** — `zed <path>:<line>` escape hatch for deep exploration.
+`App::Diff` stays read-only with respect to code: it shells out to `git` and
+parses unified-diff text (C1). Named entities:
 
-The diff shown is always **merge-base(base, HEAD) → working tree**: committed
-and uncommitted changes both appear, because agents edit long before they
-commit. Base defaults to the repo's default branch.
+- **`DiffTile`** — tile payload: an optional bound worktree + view state
+  (cursor, visual range, collapse, comment compose, send picker).
+- **`DiffModel`** — the parsed diff: branch, base, merge-base, files → hunks →
+  lines. Each file carries a **`file_hash`** (its review identity).
+- **`Review`** — the persisted review record for one branch: viewed files,
+  comments, last session sent to. One JSON file per branch (Data Model).
+- **Hunk** — a contiguous block of changed lines plus ~3 lines of unchanged
+  context, as produced by `git diff` (`@@ -40,6 +40,8 @@`). In rev 2 hunks are
+  purely a **navigation** unit (`{`/`}`); nothing is marked per hunk.
+
+The diff shown is always **merge-base(base, HEAD) → working tree** (committed +
+uncommitted + untracked), base = the repo's default branch.
 
 ## Behaviors
 
-- **B1. Binding. [DRAFT]** An unbound `DiffTile` renders a selector (sessions
-  whose `cwd` is inside a git repo, plus "pick a path"). Binding to a session
-  derives the worktree from the session's `cwd` at bind time. Closing the
-  session does not close the tile; the tile falls back to `Path` binding on the
-  same worktree (the diff outlives the conversation). A deleted worktree renders
-  an inline error state, never a panic.
+- **B1. Pick a worktree. [ACTIVE]** An unbound tile renders the **worktree
+  picker**: every entry of `git worktree list --porcelain` for the repo
+  containing the active workspace's cwd (fallback: process cwd), one row each
+  — branch name prominent, path dimmed (home-relative), primary checkout
+  labelled. Rows are selectable with `j`/`k`/arrows + `Enter`, or a mouse click.
+  A final row "Pick a folder…" binds an arbitrary path. Not in a git repo ⇒ the
+  picker says so plainly and offers only the folder row. `space → Switch
+  worktree` returns a bound tile to the picker. A deleted/invalid worktree
+  renders an inline error with a "Pick another worktree" hint, never a panic.
 
-- **B2. Cumulative diff view. [DRAFT]** The tile shows a file list (with
-  add/remove counts) and, per file, hunk blocks in monospace with add/remove
-  line coloring. No syntax highlighting in v1. Untracked files appear as
-  all-added hunks via a non-mutating listing (`git ls-files --others` +
-  `git diff --no-index /dev/null <file>`); the tile never writes the worktree's
-  index (no `git add -N`). Navigation is vim-style: j/k move hunk focus,
-  file-level collapse/expand, `[`/`]` jump files. Text zoom (INV-UX-13 pattern)
-  scales the diff body; chrome stays fixed.
+- **B2. Read the diff. [ACTIVE]** A bound tile shows a header (branch, base,
+  `N/M files viewed` progress, `K unsent comments`) and, per file, a file header
+  row (status glyph, path, `+a −r`, Viewed checkbox) followed by its diff lines
+  in monospace with add/remove backgrounds and old/new line-number gutters. A
+  **line cursor** (left accent bar + subtle row highlight) moves with `j`/`k`/
+  arrows across every visible row; `}`/`{` jump to next/prev hunk, `]`/`[` to
+  next/prev file, `z` collapses/expands the file under the cursor, mouse click
+  on a line moves the cursor there. A keyboard-hint footer always lists the
+  current keys. Untracked files appear as all-added (non-mutating listing, no
+  `git add -N`). Text zoom scales the diff body; chrome stays fixed. Empty diff
+  ⇒ "No changes on <branch> vs <base>."
 
-- **B3. Refresh. [DRAFT]** The diff re-derives by re-running git: (a) when a
-  bound session's turn completes, (b) debounced after any tool-call completion
-  in the bound session that reports file changes, (c) on manual refresh (`r`).
-  Git runs asynchronously off the paint path; the tile shows the previous model
-  until the new one lands. Hunk focus survives refresh when the focused hunk's
-  hash still exists; otherwise focus moves to the nearest hunk.
+- **B3. Refresh. [ACTIVE]** The diff re-derives by re-running git (async, off
+  the paint path) when the tile **gains focus** and on `r`. The previous model
+  stays on screen until the new one lands (a quiet "refreshing" indicator in
+  the header). The cursor stays on the same file + nearest line after a
+  refresh. There are no session-driven triggers.
 
-- **B4. Comment → steering. [DRAFT]** With a hunk focused, one keypress (`c`)
-  opens a comment compose (the standard Compose primitive, pinned in the tile).
-  Submit sends to the bound session via `send_prompt_to_session` with the
-  comment text prefixed by machine-readable context: repo-relative path, new
-  line range, and the hunk patch text. Mid-turn it steers (per
-  spec-turn-steering); idle it prompts. On send failure the draft stays in the
-  compose (no silent drop). A `Path`-bound tile with no session cannot comment;
-  the affordance is absent, not erroring.
+- **B4. Viewed files. [ACTIVE]** `v` (or clicking the checkbox) toggles
+  **Viewed** on the file under the cursor. A viewed file collapses to its
+  header row, dimmed, with a check. Viewed-ness is keyed by `path + file_hash`
+  (hash of the file's diff content lines, position-independent), so **any
+  change to that file's diff clears Viewed automatically** — no timestamps.
+  Marking a file viewed moves the cursor to the next unviewed file. When every
+  file is viewed the header reads "All files viewed ✓".
 
-- **B5. Review marks. [DRAFT]** A keypress (`v`) toggles the focused hunk
-  reviewed. Reviewed-ness is keyed by `hunk_hash` (hash of the hunk's
-  repo-relative path + content lines, excluding `@@` positions). Any edit that
-  changes a hunk's content changes its hash, so it reverts to unreviewed
-  automatically — staleness needs no timestamps or SHA comparison. File-level
-  "mark all" exists. Marks persist in `ReviewState` across restarts.
+- **B5. Comments. [ACTIVE]** `c` on the cursor line opens a comment compose
+  pinned at the bottom of the tile, captioned with its anchor
+  ("commenting on src/foo.rs:40–46"), while the anchored lines stay highlighted
+  in the diff; `V` starts a line-range selection (extend with `j`/`k`, confined
+  to one file; `Esc` cancels) and `c` comments on the range. `Enter` inserts a
+  newline, `Ctrl-Enter` / `Cmd-Enter` saves, `Esc` closes an empty draft — on a
+  non-empty draft the first `Esc` only warns ("Esc again to discard") and a
+  second discards. A saved comment is written to the review file immediately as
+  **unsent** and renders inline under its last anchor line as a card (body,
+  "unsent"/"sent to <session> · <time>"/"outdated" badge). `e` edits the
+  comment under the cursor; `x` deletes it after a confirming second `x`.
+  Comments anchor to the new-side line numbers (old side only when every
+  anchored line is removed) and store a **snippet** (the anchored lines' text)
+  so they can be relocated. When the anchored content no longer appears in that
+  file's diff, the comment is marked **outdated** (kept, never deleted or
+  silently moved) and listed at the top of its file. Comments do not require a
+  session.
 
-- **B6. Unreviewed badge. [DRAFT]** The jump panel shows the count of
-  unreviewed hunks next to a session whose worktree has any, rendered alongside
-  (not replacing) the unread badge when both are present. The count lives in a
-  root-owned worktree-keyed projection (`DiffProjections`, Data Model) updated
-  whenever any `DiffModel` derives, so it survives tile close and is shared by
-  multiple tiles on one worktree. It is a projection of derived state, not a
-  background scan: a worktree never opened in a Diff tile shows no count, and a
-  count goes stale-frozen once nothing refreshes that worktree.
+- **B6. Send comments.** `s` (and `space → Send comments…`) opens the
+  **send picker**, a `cmd-p`-style fuzzy session list (the jump palette's item
+  model, ranking and panel) over every agent session the GUI knows — the
+  palette's agent tiles first, then free loaded sessions, then the rest of the
+  universal roster; archived sessions hidden — whose initial selection
+  is this review's `last_sent_session` when that session still exists (tagged
+  "last sent"; otherwise the first row). Typing edits the query; ↑/↓ and
+  ctrl-n/ctrl-p move. A session this GUI has not attached is prompted by
+  server sid — no attach, no tile bind, and the Diff tile keeps focus. The
+  review file is written before the prompt is delivered. `Enter` sends one short prompt
+  via `send_prompt_to_session` naming the review file's **absolute path** and
+  the ids of every **unsent** comment, with the instruction to read the file
+  and address those comments (line numbers may have drifted — use `snippet`;
+  do not edit the review file). On success each sent comment gains a
+  `sent: [{session, at}]` entry and `last_sent_session` is updated; on failure
+  nothing is marked and a status line explains. With zero unsent comments the
+  picker does not open; the status line says "No unsent comments." Already-sent
+  comments can be re-sent explicitly (`S` = send all, including sent; with no
+  comments at all: "No comments.").
 
-- **B7. Merge gate. [DRAFT]** The tile's `merge` command merges the branch into
-  base only when every hunk in the current `DiffModel` is reviewed and the
-  **feature worktree** is clean; otherwise it refuses with the unreviewed
-  count. The merge executes in the primary checkout (`git -C <primary> merge
-  --no-ff <branch>`); it refuses if the primary checkout is dirty, and on
-  conflict it runs `git merge --abort` and reports — the tile never leaves
-  conflict markers in a live checkout. Independently, an installable git-hook
-  layer (installed per-repo by an explicit tile command, never automatically)
-  recomputes the same predicate from `ReviewState` + `git diff` and aborts the
-  merge — catching merges by agents or at the CLI. Because `pre-merge-commit`
-  does not fire on fast-forward merges, the installer also sets
-  `git config merge.ff false`, and installs a `pre-commit` fragment that runs
-  the same check when `MERGE_HEAD` exists (covering conflicted merges committed
-  via `git commit`). Residual holes are documented, not defended: `--no-verify`
-  bypasses hooks; the gate is defense-in-depth, not access control. Repos
-  without the hook simply lack the second layer.
+- **B7. Open in Zed. [ACTIVE]** `o` spawns `zed <abs-path>:<cursor line>`
+  fire-and-forget; a missing `zed` shows a status hint.
 
-- **B8. Open in Zed. [DRAFT]** A keypress (`o`) on a focused hunk spawns
-  `zed <abs-path>:<first-new-line>`. Fire-and-forget; a missing `zed` binary
-  surfaces a status hint.
-
-- **B9. Leaders. [DRAFT]** The tile implements `leader_intercept` (space = tile
-  verbs: bind, refresh, merge, install hook; `.` = shell verbs) per the
-  universal-leaders contract. The comment compose is the only insert-mode
-  surface in the tile.
+- **B8. Leaders. [ACTIVE]** Space = tile verbs (Switch worktree, Refresh, Send
+  comments…, Open in Zed); `.` = shell verbs (ADR-0032). The comment compose and
+  the send picker are the tile's only text-input surfaces.
 
 ## Data Model
 
 ```rust
-enum DiffSource { Session(SessionId), Path(PathBuf) }
-
 struct DiffTile {
-    source: Option<DiffSource>,      // None ⇒ selector
+    worktree: Option<PathBuf>,       // None ⇒ worktree picker
+    picker: WorktreePickerState,     // rows + selection (unbound only)
     model: Option<DiffModel>,        // last derived diff (kept during refresh)
-    focus: DiffFocus,                // file index + hunk index
-    collapsed: HashSet<PathBuf>,
-    compose: Option<Compose>,        // open comment compose, hunk-anchored
-    refreshing: bool,
+    review: Option<Review>,          // loaded review for model.branch
+    rows: Rc<Vec<RowRef>>,           // visible rows: File / Hunk / Line{old,new}
+    cursor: usize,                   // flat index into rows
+    range_anchor: Option<usize>,     // V-selection start
+    folds: Folds,                    // user collapse / expand (viewed ⇒ folded unless expanded)
+    compose: Option<CommentCompose>, // new or editing comment
+    send_picker: Option<SendPicker>,
+    refreshing: bool, error: Option<String>,
 }
 
-struct DiffModel {
-    worktree: PathBuf,
-    branch: String,
-    base: String,                    // e.g. "main"
-    merge_base: String,              // SHA
-    dirty: bool,
-    files: Vec<FileDiff>,            // path, status, Vec<Hunk>
-}
+struct FileDiff { path, status, hunks: Vec<Hunk>, added, removed, file_hash: u64 }
+```
 
-struct Hunk {
-    header: String,                  // "@@ -a,b +c,d @@"
-    lines: Vec<DiffLine>,            // Context | Added | Removed
-    hunk_hash: u64,                  // hash(path + occurrence index + content lines)
-    reviewed: bool,                  // joined from ReviewState at derive time
+**`Review`** — persisted at
+`<primary-checkout-root>/.yaldabaoth/reviews/<sanitized-branch>.json`, where the
+primary checkout root is the parent of `git rev-parse --git-common-dir`. Every
+worktree of a repo therefore shares one reviews directory, it survives the
+feature worktree's deletion, and agents can read it without touching `.git/`.
+On first write, `/.yaldabaoth/` is appended (idempotently) to
+`<git-common-dir>/info/exclude` so it never shows as untracked. Branch names
+are sanitized (`/` → `__`); a detached HEAD uses `detached-<worktree-dir-name>`.
+
+```json
+{
+  "version": 2,
+  "branch": "diff-rework",
+  "base": "main",
+  "worktree": "/abs/path/to/worktree",
+  "viewed": { "src/foo.rs": 1234567890 },
+  "next_comment": 4,
+  "comments": [
+    { "id": "c3", "path": "src/foo.rs", "side": "new", "lines": [40, 46],
+      "snippet": "fn foo() {\n    bar();\n}", "body": "rename this",
+      "created": "2026-09-27T14:03:00Z",
+      "sent": [{ "session": "<session id>", "label": "<session title>", "at": "…" }],
+      "outdated": false }
+  ],
+  "last_sent_session": "<session id>"
 }
 ```
 
-`hunk_hash` excludes `@@` positions (stable across unrelated edits) but is
-salted with the hunk's per-file occurrence index, so two identical hunks in one
-file review independently.
+The GUI is the only writer (atomic tmp + rename). Writes happen off the render
+path. `viewed` entries whose `file_hash` no longer matches are dropped on write.
+Comments are never garbage-collected (outdated ones stay until deleted).
+Under `cfg(test)` the root takes the standard `*_PATH_OVERRIDE` seam.
 
-**`ReviewState`** persists in the repo's **git common dir**
-(`$(git rev-parse --git-common-dir)/yalda-review/<branch>.json`, one file per
-branch): `{ reviewed_hashes: [u64] }`. The common dir is shared by the primary
-checkout and every linked worktree, so marks written while reviewing the
-feature worktree are visible to a hook running a merge in the primary checkout
-— and it is never inside the tracked tree. Hashes of hunks that no longer exist
-are garbage-collected on write. Under `cfg(test)` the location takes the
-standard `*_PATH_OVERRIDE` seam.
-
-**`DiffProjections`** — root-owned map `worktree → unreviewed_count`, updated
-at `DiffModel` derive time; read by the jump panel (B6). Not persisted.
-
-Data ownership: `DiffTile` owns its view state and derived `DiffModel`; the
-root view owns `DiffProjections`; `ReviewState` is owned by the diff subsystem
-(read by the hook script as a plain JSON consumer). Session state stays in
-`AgentSessions`; the tile only holds a `SessionId`.
-
-**Persistence.** The workspace layout persists a Diff tile as its worktree path
-only (a new `PersistedKind` arm in `persist.rs`). `SessionId` is runtime-local
-and meaningless across restarts, so a session-bound tile restores as
-`Path`-bound to the same worktree; re-binding to a session is a manual act.
+**Persistence (workspace).** A Diff tile persists as its worktree path only
+(`PersistedKind::Diff { worktree }`); an unbound tile restores unbound.
 
 ## Interfaces
 
 View methods on `YaldaGpuiView` (module-internal):
 
-- `bind_diff_source(source, cx)` / selector flow — B1.
-- `refresh_diff(cx)` — async git spawn → parse → swap `DiffModel`, notify. B3.
-- `toggle_hunk_reviewed(cx)` / `mark_file_reviewed(cx)` — B5; writes
-  `ReviewState`, notifies the jump panel projection.
-- `submit_hunk_comment(cx)` — B4; delegates to `send_prompt_to_session`.
-- `merge_reviewed_branch(cx)` / `install_merge_hook(cx)` — B7.
-- `open_hunk_in_zed(cx)` — B8.
+- `open_diff_inner(cx)` — new unbound tile (picker). B1.
+- `bind_diff_worktree(id, path, cx)` / `diff_unbind(id, cx)` — B1.
+- `refresh_diff(id, cx)` → async `collect_raw_diff` + `load_review` → `diff_apply`. B3.
+- `toggle_file_viewed(id, cx)` — B4.
+- `open_comment_compose` / `submit_comment` / `edit_comment` / `delete_comment` — B5.
+- `open_send_picker(id, include_sent, cx)` / `send_review_comments(id, sid, cx)` — B6.
+- `open_in_zed(id, cx)` — B7.
 
-Subprocess boundary: one async helper runs
-`git -C <worktree> diff <merge-base> --no-color` (+ `status`/`merge-base`
-queries) and returns raw output; a pure parser (`diff_model.rs`) turns it into
-`DiffModel`. The parser is the unit-testable core and never touches the
-filesystem.
+Subprocess boundary (`diff_git.rs`): `collect_raw_diff(worktree, base)` and
+`list_worktrees(repo_dir)`; errors are values. Pure core: `diff_model.rs`
+(parser, `file_hash`) and `review_state.rs` (schema, viewed/comment ops,
+`recompute_outdated`, `build_send_prompt`).
 
-Hook: `scripts/yalda-pre-merge-hook` (shell), reads the branch's `ReviewState`
-file from the git common dir, resolves the branch's worktree via
-`git worktree list` to evaluate its dirty state, and recomputes hunk hashes via
-the same normalization — exposed as a hidden `yalda-gpui --hash-diff`
-subcommand so hook and GUI cannot drift. The installer bakes the resolved
-absolute binary path into the hook script; if the binary is missing at merge
-time the hook **fails closed** with an explanatory message. Exits non-zero on
-any unreviewed hunk or dirty feature worktree.
-
-Events/messages: none new — refresh triggers ride the existing session pump
-(turn/tool-call completion observed in the reducer path).
-
-## State Machine
-
-Hunk review lifecycle (per hunk identity):
+The send prompt (exact shape, one message):
 
 ```
- unreviewed ──v──► reviewed ──(content edit ⇒ new hash)──► unreviewed
-     ▲                │
-     └──────v─────────┘        merge allowed ⇔ all current hunks reviewed
+Review comments for branch `<branch>` (worktree <abs worktree path>).
+Read <abs review json path> and address comments <c3, c5, c7>.
+Each comment has `path`, `lines` (may have drifted since — locate by `snippet`)
+and `body`. Do not edit the review file.
+```
+
+## State Machines
+
+File viewed (per path):
+
+```
+ unviewed ──v──► viewed ──(file diff content changes ⇒ new file_hash)──► unviewed
+     ▲             │
+     └─────v───────┘
+```
+
+Comment:
+
+```
+ draft-compose ──save──► unsent ──send──► sent ──send (S)──► sent (+entry)
+                           │                │
+                           └──(anchor content gone)──► outdated (flag; still unsent/sent)
+ any ──x──► deleted
 ```
 
 ## Constraints
 
-- **C1. No in-process git.** All diff/merge-base/status data comes from the git
-  CLI; yalda parses, never computes. Parsing lives in a pure module.
-- **C2. Paint-path purity.** Git subprocesses and `ReviewState` I/O never run
-  on the render path; the diff body is a `cached_child` with a render-count
-  test; no `cx.notify()` in render (yux rules).
-- **C3. Read-only.** No staging, no `git apply`, no file editing from this
-  tile. The only write surfaces are `ReviewState`, the hook installer, and the
-  merge command.
-- **C4. Session decoupling.** The tile references sessions by id only; every
-  behavior except B4 works `Path`-bound with no session.
-- **C5. Test hygiene.** Tests use tempdir git fixtures; never the user's repos
-  or `~/.yalda`; `ReviewState` gets a path-override seam. Guard tests live in
-  `verify_harness.rs` (parser unit tests beside `diff_model.rs`).
-- **C6. Gate honesty.** The hook and the tile must evaluate the same predicate
-  from the same normalization (shared via `--hash-diff`); a drift between them
-  is a bug, not a fallback.
+- **C1. No in-process git.** All diff/worktree data comes from the git CLI; yalda
+  parses, never computes.
+- **C2. Paint-path purity.** Git subprocesses and review-file I/O never run on
+  the render path; the diff body is a `cached_child` with a render-count test;
+  no `cx.notify()` in render.
+- **C3. Read-only code.** No staging, applying, or editing from this tile. The
+  only write surface is the review file (and the one-time `info/exclude` line).
+- **C4. Session-free review.** Every behavior except B6 works with no agent
+  session at all.
+- **C5. Test hygiene.** Tests use tempdir git fixtures; never the user's repos or
+  `~/.yalda`; the review root has a path-override seam.
+- **C6. Idiot-proof.** Every state has visible guidance: picker empty/not-a-repo
+  text, key-hint footer, empty-diff text, status line for every refusal.
+
+## Out of scope (later)
+
+Suggestion comments (replacement code), resolved/unresolved threads, a
+review-level summary note, syntax highlighting, side-by-side view, file watcher
+refresh. The merge gate, pre-merge hook, `--hash-diff` subcommand, session
+binding, session-driven refresh, and the jump-panel unreviewed badge from rev 1
+are **removed** (ADR-0040).
 
 ## Revision History
 
-- 2026-08-29 — Initial DRAFT. Design settled conversationally: session-bound
-  cumulative diff, hash-keyed review marks, comment→steering over the existing
-  prompt path, two-layer merge gate, Zed escape hatch. Exploration (LSP, symbol
-  nav, highlighting) deliberately out of scope — Zed covers it.
-- 2026-08-29 — Adversarial-review pass (verdict RETHINK, both blocking items +
-  all lesser items folded in): merge gate hardened (`merge.ff false` +
-  `MERGE_HEAD` pre-commit fragment for the fast-forward / conflicted-merge
-  holes, `--no-verify` documented as a hole); `ReviewState` moved from the
-  worktree sidecar to the shared git common dir so hook and tile read the same
-  file; merge execution site pinned to the primary checkout with abort-on-
-  conflict; `DiffProjections` added as the owned home of the B6 badge count;
-  restart persistence defined (worktree path, restore `Path`-bound);
-  `hunk_hash` salted with occurrence index; `git add -N` dropped for a
-  non-mutating untracked listing; hook binary path baked at install, fail
-  closed.
-- 2026-08-29 — Implemented via Cog graph `ec3` (13 nodes). Status DRAFT→ACTIVE.
-  Behaviors B1–B9 + Data Model + C1–C6 shipped on `main` and reconciled to
-  `docs/components/diff.md` (`UXI-Diff-1..9`). Deviations from the draft:
-  - **`DiffView` observes the root entity**, not a separate model entity —
-    `DiffTile` owns `model`/`focus`/`collapsed` inline (unlike Linear/Cog), so
-    the cached body reads the tile back through the root and self-notifies on a
-    `DiffSeqs` change; text-zoom rides the same fingerprint (no separate notify
-    walk).
-  - **Persist arm** stores `tile.worktree()` (cx-free) rather than resolving a
-    live session `cwd` at snapshot time; a `Session`-bound tile's derived
-    worktree *is* that session's cwd at derive time.
-  - **Comment compose renders at the screen level** (uncached, like the agent
-    compose), so typing never touches the cached `DiffView` — no new `DiffSeqs`
-    input was needed.
-  - **Jump panel has no per-row unread glyph today** (`docs/components/jump-panel.md`
-    — unread only tints the workspace-folder aggregate), so B6 "alongside the
-    unread badge" is realized as the unreviewed chip painting while the row's
-    `unread` flag is independently true.
-  - **Open gesture added** (`OpenDiff`, global `cmd-*` + menu) so an unbound
-    tile (the selector) is reachable from the GUI — the draft named no open key.
-  - **`--no-verify`** documented in-code as the residual gate hole (defense in
-    depth, not access control).
+- 2026-08-29 — rev 1 DRAFT → ACTIVE via Cog graph `ec3`: session-bound
+  cumulative diff, hunk-hash review marks in the git common dir, comment →
+  steering, two-layer merge gate, jump-panel unreviewed badge, open in Zed.
+- 2026-09-27 — rev 2 DRAFT (Cog graph `8g7`, ADR-0040). Scott found session
+  binding broken in practice (sessions' cwd is the primary checkout, not their
+  worktree) and unintuitive. Redesign: worktree picker; file-level Viewed
+  (GitHub/Gerrit convention) with hunks as navigation only; line/range comments
+  stored as drafts in `<primary>/.yaldabaoth/reviews/<branch>.json`; send to any
+  session via a `cmd-p`-style picker defaulting to the last session sent to,
+  pointing the agent at the file + comment ids; refresh on focus + `r`. Merge
+  gate, hook, `--hash-diff`, session triggers, and unreviewed badge deleted.
+- 2026-09-27 — rev 2 implemented (graph `8g7`), DRAFT → ACTIVE. Deviations are
+  recorded per-UXI in `docs/components/diff.md` (bottom-pinned compose,
+  uniform-row virtualization ⇒ long lines truncate, send picker session universe).

@@ -203,6 +203,26 @@ pub(crate) fn single_line_ellipsis(label: &str) -> gpui::Div {
         .child(SharedString::from(label.to_string()))
 }
 
+/// A one-line keyboard-hint footer (`j/k move · enter select · …`) — the
+/// "every state has visible guidance" strip at the bottom of a keyboard-first
+/// surface. Chrome: fixed 12px mono, dimmed, never wraps (ellipsis instead),
+/// so it keeps one stable row regardless of zoom or tile width.
+pub(crate) fn key_hint_footer(text: &str, st: &DetailStyle) -> gpui::Div {
+    div()
+        .flex_none()
+        .w_full()
+        .min_w_0()
+        .px(px(10.0))
+        .py(px(6.0))
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_ellipsis()
+        .text_color(st.dim)
+        .font_family(st.mono.clone())
+        .text_size(px(12.0))
+        .child(SharedString::from(text.to_string()))
+}
+
 /// A quiet but explicit status mark for dense navigation rows. This is a
 /// semantic companion to [`compact_count_indicator`]: the caller chooses the
 /// label and tint while yux owns the compact pill geometry and typography.
@@ -381,6 +401,39 @@ pub(crate) fn picker_option_row(
     body_font: &SharedString,
     mono_font: &SharedString,
 ) -> gpui::Stateful<gpui::Div> {
+    picker_option_row_detailed(
+        id,
+        glyph,
+        label,
+        None,
+        badge,
+        selected,
+        accent,
+        label_color,
+        selected_bg,
+        body_font,
+        mono_font,
+    )
+}
+
+/// [`picker_option_row`] with an optional dimmed, monospace second line under
+/// the label (`detail = Some((text, color))`) — e.g. a path under a branch
+/// name. Same rail / selection / badge chrome; the row keeps its fixed height
+/// so detailed and plain rows align in one list.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn picker_option_row_detailed(
+    id: impl Into<ElementId>,
+    glyph: &str,
+    label: &str,
+    detail: Option<(&str, Hsla)>,
+    badge: Option<(&str, Hsla)>,
+    selected: bool,
+    accent: Hsla,
+    label_color: Hsla,
+    selected_bg: Hsla,
+    body_font: &SharedString,
+    mono_font: &SharedString,
+) -> gpui::Stateful<gpui::Div> {
     let transparent: Hsla = rgba(0x00000000).into();
     let mut hover_bg = selected_bg;
     hover_bg.a *= 0.62;
@@ -415,9 +468,8 @@ pub(crate) fn picker_option_row(
                 .text_color(accent)
                 .child(SharedString::from(glyph.to_string())),
         )
-        .child(
-            single_line_ellipsis(label)
-                .flex_1()
+        .child({
+            let label_el = single_line_ellipsis(label)
                 .font_family(body_font.clone())
                 .font_weight(if selected {
                     FontWeight::SEMIBOLD
@@ -425,8 +477,23 @@ pub(crate) fn picker_option_row(
                     FontWeight::MEDIUM
                 })
                 .text_size(px(13.0))
-                .text_color(label_color),
-        );
+                .text_color(label_color);
+            match detail {
+                None => label_el.flex_1(),
+                Some((detail, detail_color)) => div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .child(label_el)
+                    .child(
+                        single_line_ellipsis(detail)
+                            .font_family(mono_font.clone())
+                            .text_size(px(11.0))
+                            .text_color(detail_color),
+                    ),
+            }
+        });
     if let Some((badge, badge_color)) = badge {
         let mut badge_bg = badge_color;
         badge_bg.a *= 0.10;

@@ -13,6 +13,16 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Diff Review rework (rev 2)** — `NEEDS-RUNTIME` (built 2026-09-27, Cog graph
+  `8g7`, branch `diff-rework` → `main`; see
+  [worklog](worklog/2026-09-27-diff-review-rework.md), ADR-0040, UXI-Diff-8..17).
+  Worktree picker, per-file Viewed, draft comments in
+  `<repo>/.yaldabaoth/reviews/<branch>.json`, send-to-any-session picker; merge
+  gate + session binding removed. Gap 1: colors/card styling need a human look.
+  Gap 2: roster-only session sends are fire-and-forget (late server rejection is
+  logged only). Open: long lines truncate (no wrap / h-scroll); comments on a
+  file that left the diff aren't shown. Needs a GUI restart by Scott to activate.
+
 - **Remove ephemeral virtual workspaces (dead code?)** — `READY` (noted
   2026-09-27 during ADR-0039, single-owner workspaces). With Detached tiles gone
   and tile-less sessions opening into their project's workspace

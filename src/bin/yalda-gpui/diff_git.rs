@@ -13,8 +13,6 @@
 //! this module never panics on bad input (spec B1).
 #![allow(dead_code)]
 
-use super::*;
-
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -45,8 +43,7 @@ pub(crate) struct RawGitDiff {
     /// `git diff --no-index /dev/null <file>` comparison (spec B2 — never
     /// `git add -N`, never touches the index).
     pub(crate) diff_text: String,
-    /// Raw `git worktree list` output — needed by the merge gate/hook to
-    /// resolve a branch's worktree (spec Interfaces).
+    /// Raw `git worktree list` output (spec Interfaces).
     pub(crate) worktree_list: String,
 }
 
@@ -196,214 +193,102 @@ pub(crate) async fn collect_raw_diff(
     })
 }
 
-// ── Cog node `merge-gate` (v5tg): spec B7 git execution ─────────────────────
-//
-// The thin, real-git half of the merge gate — the pure go/no-go call is
-// `diff.rs::merge_gate_decision`; everything below just shells out (spec C1)
-// and is invoked off the paint path by `diff_ui.rs::run_merge_gate` /
-// `install_merge_gate_hook` (spec C2). None of this parses diff content, so
-// it stays out of `diff_model.rs` (spec C1's "parsing lives in a pure
-// module" is about DIFF parsing specifically).
-
-/// `git status --porcelain` in `path`, reporting whether it printed nothing
-/// at all (spec B7 "clean"). Deliberately distinct from `DiffModel::dirty`,
-/// which means "differs from merge-base" (see `diff_model.rs`'s `parse_diff`
-/// docs) — a hunk can exist (committed ahead of base) while the WORKING TREE
-/// itself has no uncommitted changes, which is exactly the state a clean
-/// feature worktree is in right before a review-gated merge.
-pub(crate) fn worktree_is_clean(path: &Path) -> Result<bool, GitDiffError> {
-    Ok(run_git(path, &["status", "--porcelain"])?.trim().is_empty())
-}
-
-/// Why `execute_merge_no_ff` refused/failed. Carries git's combined
-/// stdout+stderr for the status message — `git merge`'s conflict summary
-/// ("Auto-merging...", "CONFLICT...") is printed to STDOUT, so stderr alone
-/// is often empty for the common conflict case. The abort has ALREADY
-/// happened by the time a caller sees this (see the function docs) — there
-/// is nothing left for the caller to clean up.
+/// One entry of `git worktree list --porcelain` (spec rev 2 B1 — the rows of
+/// the unbound Diff tile's worktree picker).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MergeConflict {
-    pub(crate) message: String,
+pub(crate) struct WorktreeEntry {
+    /// Absolute worktree root.
+    pub(crate) path: PathBuf,
+    /// `HEAD` commit SHA (empty for a fresh repo with no commits).
+    pub(crate) head: String,
+    /// Checked-out branch with `refs/heads/` stripped; `None` when detached.
+    pub(crate) branch: Option<String>,
+    pub(crate) detached: bool,
+    /// The first entry git lists — the primary checkout.
+    pub(crate) is_primary: bool,
 }
 
-impl std::fmt::Display for MergeConflict {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message.trim())
+impl WorktreeEntry {
+    /// The picker's prominent label: the branch, else `detached @ <sha8>`.
+    pub(crate) fn label(&self) -> String {
+        match &self.branch {
+            Some(b) => b.clone(),
+            None => format!("detached @ {}", &self.head[..self.head.len().min(8)]),
+        }
     }
 }
 
-/// Merge `branch` into whatever is checked out in `primary` via
-/// `git merge --no-ff` (spec B7: "the merge executes in the primary
-/// checkout"). On ANY non-zero exit — a real content conflict, or any other
-/// merge-blocking condition — this unconditionally runs `git merge --abort`
-/// in `primary` BEFORE returning `Err`, per spec B7's hard requirement that
-/// "the tile never leaves conflict markers in a live checkout": a caller
-/// never has to remember to clean up after a failed merge, because by the
-/// time this function returns, there is nothing left to clean up.
-pub(crate) fn execute_merge_no_ff(primary: &Path, branch: &str) -> Result<(), MergeConflict> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(primary)
-        .args(["merge", "--no-ff", branch])
-        .output();
-    let out = match out {
-        Ok(o) => o,
-        Err(e) => {
-            return Err(MergeConflict {
-                message: format!("failed to spawn `git merge`: {e}"),
+/// Parse `git worktree list --porcelain` output. Pure (unit-tested without
+/// git). Bare entries and entries whose path no longer exists (prunable /
+/// deleted out from under git) are skipped; `is_primary` marks the FIRST
+/// entry git reports (git always lists the primary checkout first).
+pub(crate) fn parse_worktree_porcelain(text: &str) -> Vec<WorktreeEntry> {
+    struct Raw {
+        path: PathBuf,
+        head: String,
+        branch: Option<String>,
+        detached: bool,
+        bare: bool,
+    }
+    let mut raws: Vec<Raw> = Vec::new();
+    for line in text.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            raws.push(Raw {
+                path: PathBuf::from(p),
+                head: String::new(),
+                branch: None,
+                detached: false,
+                bare: false,
             });
+            continue;
         }
-    };
-    if out.status.success() {
-        return Ok(());
-    }
-    // `git merge`'s conflict summary ("Auto-merging...", "CONFLICT...") goes
-    // to STDOUT, not stderr — only a handful of git error paths use stderr —
-    // so both streams are captured and joined to make sure the reported
-    // reason is never empty for the common conflict case.
-    let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
-    let stderr_text = String::from_utf8_lossy(&out.stderr);
-    if !stderr_text.trim().is_empty() {
-        if !combined.is_empty() {
-            combined.push('\n');
-        }
-        combined.push_str(&stderr_text);
-    }
-    // Best-effort abort: if THIS also fails (e.g. there was nothing to
-    // abort because the merge failed before even starting one), there is
-    // nothing more we can do beyond reporting the original failure — but we
-    // always attempt it, because leaving conflict markers is the one
-    // outcome spec B7 rules out entirely.
-    let _ = Command::new("git")
-        .arg("-C")
-        .arg(primary)
-        .args(["merge", "--abort"])
-        .output();
-    Err(MergeConflict { message: combined })
-}
-
-// ── Cog node `merge-gate` (v5tg): spec B7 hook installer ────────────────────
-
-/// Marker line every hook file THIS installer writes carries at its top, so
-/// a re-install can tell "a hook we own" (safe to overwrite) apart from "a
-/// foreign hook that predates us" (must be preserved, not clobbered).
-const YALDA_HOOK_MARKER: &str = "# yalda-merge-gate-hook (auto-installed by yalda-gpui; safe to remove)";
-
-/// The canonical hook logic, checked into the repo at
-/// `scripts/yalda-pre-merge-hook` (same file a human/CI can read, and the
-/// literal file the hook tests in `verify_harness.rs` shell out to
-/// directly). Embedded at COMPILE time so the installed hook is fully
-/// self-contained in the TARGET repo — it must keep working even if this
-/// yaldabaoth checkout later moves or is deleted.
-const PRE_MERGE_COMMIT_HOOK_SOURCE: &str =
-    include_str!("../../../scripts/yalda-pre-merge-hook");
-
-/// `pre-commit` fragment installed alongside `pre-merge-commit` (spec B7:
-/// "installs a pre-commit fragment that runs the same check when MERGE_HEAD
-/// exists"). Deliberately does NOT duplicate the check logic — it just execs
-/// the sibling `pre-merge-commit` hook (which is itself name-agnostic; it
-/// only branches on whether `MERGE_HEAD` exists) when a merge is in
-/// progress, then chains to whatever pre-commit hook was already installed
-/// here before this installer ran (renamed to `pre-commit.pre-yalda` — see
-/// `install_pre_commit_fragment`), so installing this gate never silently
-/// disables an unrelated pre-existing pre-commit hook.
-const PRE_COMMIT_FRAGMENT: &str = "#!/bin/sh
-# yalda-merge-gate-hook (auto-installed by yalda-gpui; safe to remove)
-# Cog node `merge-gate` (v5tg), spec B7: `pre-merge-commit` never fires for a
-# merge finished by hand via `git commit` after resolving conflicts, so this
-# fragment re-runs the SAME check (the installed `pre-merge-commit` hook is
-# name-agnostic — it only cares whether MERGE_HEAD exists) whenever
-# MERGE_HEAD is present, then chains to whatever pre-commit hook was already
-# installed here (if any), preserving it.
-set -eu
-HOOKS_DIR=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\"
-if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
-    \"$HOOKS_DIR/pre-merge-commit\" || exit 1
-fi
-if [ -x \"$HOOKS_DIR/pre-commit.pre-yalda\" ]; then
-    exec \"$HOOKS_DIR/pre-commit.pre-yalda\"
-fi
-exit 0
-";
-
-/// Write `content` to `path` and mark it executable (spec: hooks must be
-/// runnable by git directly).
-fn write_executable_hook(path: &Path, content: &str) -> Result<(), String> {
-    std::fs::write(path, content).map_err(|e| format!("couldn't write {}: {e}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(path)
-            .map_err(|e| format!("couldn't stat {}: {e}", path.display()))?
-            .permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(path, perms)
-            .map_err(|e| format!("couldn't chmod {}: {e}", path.display()))?;
-    }
-    Ok(())
-}
-
-/// Install (or update) the `pre-commit` fragment in `hooks_dir`, preserving
-/// any FOREIGN (not-ours) pre-existing `pre-commit` hook by renaming it to
-/// `pre-commit.pre-yalda` the first time — never on a subsequent reinstall,
-/// which would otherwise clobber the real backup with our own fragment's
-/// prior content.
-fn install_pre_commit_fragment(hooks_dir: &Path) -> Result<(), String> {
-    let pre_commit = hooks_dir.join("pre-commit");
-    let backup = hooks_dir.join("pre-commit.pre-yalda");
-    if pre_commit.exists() {
-        let existing = std::fs::read_to_string(&pre_commit).unwrap_or_default();
-        if !existing.contains(YALDA_HOOK_MARKER) && !backup.exists() {
-            std::fs::rename(&pre_commit, &backup)
-                .map_err(|e| format!("couldn't back up existing pre-commit hook: {e}"))?;
+        let Some(cur) = raws.last_mut() else { continue };
+        if let Some(h) = line.strip_prefix("HEAD ") {
+            cur.head = h.to_string();
+        } else if let Some(b) = line.strip_prefix("branch ") {
+            cur.branch = Some(b.strip_prefix("refs/heads/").unwrap_or(b).to_string());
+        } else if line == "detached" {
+            cur.detached = true;
+        } else if line == "bare" {
+            cur.bare = true;
         }
     }
-    write_executable_hook(&pre_commit, PRE_COMMIT_FRAGMENT)
+    raws.into_iter()
+        .enumerate()
+        .filter(|(_, r)| !r.bare && r.path.is_dir())
+        .map(|(i, r)| WorktreeEntry {
+            path: r.path,
+            head: r.head,
+            branch: r.branch,
+            detached: r.detached,
+            is_primary: i == 0,
+        })
+        .collect()
 }
 
-/// Cog node `merge-gate` (v5tg), spec B7 installer (`diff_ui.rs`'s
-/// `diff_install_hook_focused` is the only caller): installs the two-layer
-/// merge-gate hook into `worktree`'s git COMMON dir (shared by every linked
-/// worktree of this repo, spec § Data Model) — `hooks/pre-merge-commit` with
-/// `yalda_gpui_bin`'s resolved absolute path baked into the
-/// `@@YALDA_GPUI_BIN@@` placeholder (spec: "bakes the RESOLVED ABSOLUTE path
-/// ... into the installed hook"), a chained `hooks/pre-commit` fragment, and
-/// `merge.ff false` (spec: "`pre-merge-commit` does not fire on fast-forward
-/// merges"). Never called automatically — spec B7: "installed per-repo by an
-/// explicit tile command, never automatically". Idempotent: re-running
-/// updates our own fragments in place without re-chaining a second copy of a
-/// pre-existing foreign hook.
-pub(crate) fn install_merge_gate_hook(worktree: &Path, yalda_gpui_bin: &Path) -> Result<String, String> {
-    let common = resolve_git_common_dir(worktree)
-        .ok_or_else(|| format!("not a git repo (or git not found): {}", worktree.display()))?;
-    let hooks_dir = common.join("hooks");
-    std::fs::create_dir_all(&hooks_dir)
-        .map_err(|e| format!("couldn't create {}: {e}", hooks_dir.display()))?;
-
-    let bin_str = yalda_gpui_bin.to_string_lossy();
-    let pre_merge_commit = PRE_MERGE_COMMIT_HOOK_SOURCE.replace("@@YALDA_GPUI_BIN@@", &bin_str);
-    write_executable_hook(&hooks_dir.join("pre-merge-commit"), &pre_merge_commit)?;
-
-    install_pre_commit_fragment(&hooks_dir)?;
-
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .args(["config", "merge.ff", "false"])
-        .output()
-        .map_err(|e| format!("couldn't run git config: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "installed hooks in {} but `git config merge.ff false` failed: {}",
-            hooks_dir.display(),
-            String::from_utf8_lossy(&out.stderr)
-        ));
+/// List every worktree of the repo containing `repo_dir` (spec rev 2 B1,
+/// § Interfaces). Blocking — run on the background executor, never the paint
+/// path (C2). A non-repo / missing dir is an `Err` value, never a panic.
+pub(crate) fn list_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeEntry>, GitDiffError> {
+    if !repo_dir.is_dir() {
+        return Err(GitDiffError::InvalidWorktree(repo_dir.to_path_buf()));
     }
+    let out = run_git(repo_dir, &["worktree", "list", "--porcelain"])?;
+    Ok(parse_worktree_porcelain(&out))
+}
 
-    Ok(format!(
-        "merge-gate hook installed in {} (pre-merge-commit + pre-commit fragment, merge.ff=false)",
-        hooks_dir.display()
-    ))
+impl GitDiffError {
+    /// `true` when git refused because `dir` is not inside any repository —
+    /// the picker renders that as the plain "Not inside a git repository."
+    /// state rather than an error (spec B1).
+    pub(crate) fn is_not_a_repo(&self) -> bool {
+        match self {
+            GitDiffError::CommandFailed { stderr, .. } => {
+                stderr.to_ascii_lowercase().contains("not a git repository")
+            }
+            _ => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -568,488 +453,86 @@ mod tests {
         );
     }
 
-    // ── Cog node `merge-gate` (v5tg): spec B7 ───────────────────────────────
-
-    /// A two-worktree fixture: `<tmp>/primary` is the MAIN checkout (on
-    /// `main`), `<tmp>/feature` is a LINKED worktree checked out on `feature`
-    /// one commit ahead — the exact shape `execute_merge_no_ff` /
-    /// `install_merge_gate_hook` are meant to operate over (spec B7: "the
-    /// merge executes in the primary checkout"; the primary must be resolved
-    /// via `git worktree list`, not assumed to be the same directory as the
-    /// worktree being reviewed). Entirely inside a tempdir (spec C5).
-    /// Returns `(tempdir, feature_worktree_path)`; the primary checkout is
-    /// always `tempdir.path().join("primary")`.
-    fn build_merge_fixture() -> (tempfile::TempDir, PathBuf) {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let primary = temp.path().join("primary");
-        std::fs::create_dir_all(&primary).unwrap();
-
-        git_ok(&primary, &["init", "--quiet"]);
-        git_ok(&primary, &["config", "user.email", "test@example.com"]);
-        git_ok(&primary, &["config", "user.name", "Test"]);
-        git_ok(&primary, &["config", "commit.gpgsign", "false"]);
-
-        std::fs::write(primary.join("a.txt"), "line1\n").unwrap();
-        git_ok(&primary, &["add", "a.txt"]);
-        git_ok(&primary, &["commit", "--quiet", "-m", "initial"]);
-        git_ok(&primary, &["branch", "-M", "main"]);
-        git_ok(&primary, &["branch", "feature"]);
-
-        let feature = temp.path().join("feature");
+    /// Spec rev 2 B1: a repo with a linked worktree lists both — primary
+    /// first (flagged), branch names with `refs/heads/` stripped, real paths.
+    #[test]
+    fn list_worktrees_lists_primary_and_linked_worktree() {
+        let temp = build_fixture();
+        let primary = temp.path().to_path_buf();
+        let linked_parent = tempfile::tempdir().expect("tempdir");
+        let linked = linked_parent.path().join("wt-topic");
         git_ok(
             &primary,
-            &["worktree", "add", "--quiet", feature.to_str().unwrap(), "feature"],
+            &["worktree", "add", "--quiet", "-b", "topic", linked.to_str().unwrap()],
         );
-        std::fs::write(feature.join("a.txt"), "line1\nfeature change\n").unwrap();
-        git_ok(&feature, &["add", "a.txt"]);
-        git_ok(&feature, &["commit", "--quiet", "-m", "feature change"]);
 
-        (temp, feature)
-    }
-
-    /// `worktree_is_clean` must distinguish a freshly-committed worktree
-    /// (clean) from one with an uncommitted edit (dirty) — the exact
-    /// "current git state" check spec B7 requires INSTEAD of trusting
-    /// `DiffModel::dirty`.
-    #[test]
-    fn worktree_is_clean_reports_clean_then_dirty() {
-        let (_temp, feature) = build_merge_fixture();
-        assert!(
-            worktree_is_clean(&feature).expect("status should succeed"),
-            "freshly committed worktree must be clean"
-        );
-        std::fs::write(feature.join("a.txt"), "line1\nfeature change\nuncommitted\n").unwrap();
-        assert!(
-            !worktree_is_clean(&feature).expect("status should succeed"),
-            "worktree with an uncommitted edit must be dirty"
-        );
-    }
-
-    /// DONE_WHEN: "merge ALLOWED when all reviewed + clean... the real git
-    /// merge succeeds in the fixture" — `execute_merge_no_ff` actually
-    /// performs a real `--no-ff` merge in the primary checkout when there is
-    /// no conflict, producing a merge commit (not a fast-forward).
-    #[test]
-    fn execute_merge_no_ff_merges_cleanly_when_no_conflict() {
-        let (temp, _feature) = build_merge_fixture();
-        let primary = temp.path().join("primary");
-
-        let result = execute_merge_no_ff(&primary, "feature");
-        assert!(result.is_ok(), "expected a clean merge, got {result:?}");
-
-        let log = Command::new("git")
-            .arg("-C")
-            .arg(&primary)
-            .args(["log", "-1", "--format=%s"])
-            .output()
-            .expect("git log");
-        let subject = String::from_utf8_lossy(&log.stdout);
-        assert!(
-            subject.to_lowercase().contains("merge"),
-            "expected a --no-ff merge commit (not a fast-forward), got subject: {subject:?}"
-        );
+        let rows = list_worktrees(&primary).expect("list_worktrees on a real repo");
+        assert_eq!(rows.len(), 2, "primary + linked worktree: {rows:?}");
+        assert!(rows[0].is_primary && !rows[1].is_primary);
+        assert_eq!(rows[0].branch.as_deref(), Some("feature"));
+        assert_eq!(rows[1].branch.as_deref(), Some("topic"));
         assert_eq!(
-            std::fs::read_to_string(primary.join("a.txt")).unwrap(),
-            "line1\nfeature change\n",
-            "feature's content must have actually landed in primary"
+            rows[1].path.canonicalize().unwrap(),
+            linked.canonicalize().unwrap()
         );
-        assert!(worktree_is_clean(&primary).expect("status should succeed"));
+        assert!(!rows[1].head.is_empty());
+
+        // Listing from INSIDE the linked worktree finds the same set.
+        let from_linked = list_worktrees(&linked).expect("list from linked");
+        assert_eq!(from_linked.len(), 2);
+        assert!(from_linked[0].is_primary);
     }
 
-    /// DONE_WHEN: "conflict path calls merge --abort and leaves NO conflict
-    /// markers" — force a real content conflict (both sides edit the same
-    /// line differently since their common ancestor), then assert
-    /// `execute_merge_no_ff` reports failure AND the primary checkout is
-    /// left clean with no `<<<<<<<` markers and no `MERGE_HEAD` — i.e. the
-    /// abort actually ran, not just that an error was returned.
+    /// A worktree whose directory was deleted (prunable) is skipped, not
+    /// listed as a dead row.
     #[test]
-    fn execute_merge_no_ff_conflict_aborts_and_leaves_no_markers() {
-        let (temp, _feature) = build_merge_fixture();
-        let primary = temp.path().join("primary");
-
-        // Diverge primary from the common ancestor with a CONFLICTING edit
-        // to the same line `feature` already changed.
-        std::fs::write(primary.join("a.txt"), "line1\nprimary change\n").unwrap();
-        git_ok(&primary, &["add", "a.txt"]);
-        git_ok(&primary, &["commit", "--quiet", "-m", "primary conflicting change"]);
-
-        let result = execute_merge_no_ff(&primary, "feature");
-        assert!(result.is_err(), "expected a merge conflict");
-        assert!(
-            !result.unwrap_err().message.is_empty(),
-            "conflict error should carry git's stderr"
+    fn list_worktrees_skips_deleted_worktree() {
+        let temp = build_fixture();
+        let primary = temp.path().to_path_buf();
+        let linked_parent = tempfile::tempdir().expect("tempdir");
+        let linked = linked_parent.path().join("wt-gone");
+        git_ok(
+            &primary,
+            &["worktree", "add", "--quiet", "-b", "gone", linked.to_str().unwrap()],
         );
-
-        let content = std::fs::read_to_string(primary.join("a.txt")).unwrap();
-        assert!(
-            !content.contains("<<<<<<<"),
-            "no conflict markers may remain in the working tree: {content:?}"
-        );
-        assert!(
-            worktree_is_clean(&primary).expect("status should succeed"),
-            "primary must be clean after merge --abort, not left mid-conflict"
-        );
-        assert!(
-            !primary.join(".git").join("MERGE_HEAD").exists(),
-            "MERGE_HEAD must be gone — the abort must have actually run"
-        );
+        std::fs::remove_dir_all(&linked).unwrap();
+        let rows = list_worktrees(&primary).expect("list");
+        assert_eq!(rows.len(), 1, "deleted worktree must be skipped: {rows:?}");
+        assert!(rows[0].is_primary);
     }
 
-    /// `install_merge_gate_hook` writes both hook files, bakes the resolved
-    /// binary path into `pre-merge-commit` (spec: "bakes the RESOLVED
-    /// ABSOLUTE path... into the installed hook"), marks them executable,
-    /// and sets `merge.ff false` (spec: required because `pre-merge-commit`
-    /// never fires on a fast-forward merge).
+    /// Non-repo dir ⇒ an `Err` value flagged not-a-repo; missing dir ⇒
+    /// `InvalidWorktree`. Never a panic.
     #[test]
-    fn install_merge_gate_hook_writes_hooks_bakes_path_and_sets_merge_ff_false() {
-        let (_temp, feature) = build_merge_fixture();
-        let bin = PathBuf::from("/opt/fake/yalda-gpui-test-binary");
-
-        let msg = install_merge_gate_hook(&feature, &bin).expect("install should succeed");
-        assert!(msg.contains("installed"), "got: {msg:?}");
-
-        let common = resolve_git_common_dir(&feature).expect("common dir");
-        let hooks_dir = common.join("hooks");
-
-        let pre_merge_commit = std::fs::read_to_string(hooks_dir.join("pre-merge-commit"))
-            .expect("pre-merge-commit must exist");
-        assert!(
-            pre_merge_commit.contains(bin.to_str().unwrap()),
-            "the resolved binary path must be baked into the hook"
-        );
-        assert!(
-            !pre_merge_commit.contains("@@YALDA_GPUI_BIN@@"),
-            "the placeholder must be fully substituted"
-        );
-
-        let pre_commit =
-            std::fs::read_to_string(hooks_dir.join("pre-commit")).expect("pre-commit must exist");
-        assert!(pre_commit.contains("MERGE_HEAD"));
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            for name in ["pre-merge-commit", "pre-commit"] {
-                let mode = std::fs::metadata(hooks_dir.join(name))
-                    .unwrap()
-                    .permissions()
-                    .mode();
-                assert_ne!(mode & 0o111, 0, "{name} must be executable");
-            }
-        }
-
-        let cfg = Command::new("git")
-            .arg("-C")
-            .arg(&feature)
-            .args(["config", "merge.ff"])
-            .output()
-            .expect("git config");
-        assert_eq!(String::from_utf8_lossy(&cfg.stdout).trim(), "false");
-    }
-
-    /// Installing over a repo that ALREADY has an unrelated `pre-commit`
-    /// hook must preserve it (as `pre-commit.pre-yalda`) rather than
-    /// silently deleting it — and a SECOND install must not clobber that
-    /// preserved backup with the fragment's own prior content.
-    #[test]
-    fn install_merge_gate_hook_preserves_foreign_pre_commit_hook() {
-        let (_temp, feature) = build_merge_fixture();
-        let common = resolve_git_common_dir(&feature).expect("common dir");
-        let hooks_dir = common.join("hooks");
-        std::fs::create_dir_all(&hooks_dir).unwrap();
-        let foreign_hook = "#!/bin/sh\necho existing-hook-ran\nexit 0\n";
-        write_executable_hook(&hooks_dir.join("pre-commit"), foreign_hook)
-            .expect("write foreign hook");
-
-        install_merge_gate_hook(&feature, &PathBuf::from("/bin/true")).expect("install");
-
-        let backup = std::fs::read_to_string(hooks_dir.join("pre-commit.pre-yalda"))
-            .expect("the foreign hook must be preserved as a backup");
-        assert_eq!(backup, foreign_hook);
-        let installed = std::fs::read_to_string(hooks_dir.join("pre-commit")).unwrap();
-        assert!(installed.contains(YALDA_HOOK_MARKER));
-
-        // Reinstalling again must not clobber the ORIGINAL foreign backup.
-        install_merge_gate_hook(&feature, &PathBuf::from("/bin/true")).expect("reinstall");
-        let backup_after = std::fs::read_to_string(hooks_dir.join("pre-commit.pre-yalda")).unwrap();
+    fn list_worktrees_non_repo_is_error_value() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let err = list_worktrees(temp.path()).expect_err("non-repo must error");
+        assert!(err.is_not_a_repo(), "expected not-a-repo, got {err:?}");
+        let bogus = PathBuf::from("/nonexistent/definitely-not-a-repo-wt-list");
         assert_eq!(
-            backup_after, foreign_hook,
-            "a reinstall must not overwrite the original foreign hook's backup"
+            list_worktrees(&bogus),
+            Err(GitDiffError::InvalidWorktree(bogus))
         );
     }
 
-    // ── Cog node `merge-gate` (v5tg): C6 (`--hash-diff`) + hook script ──────
-    //
-    // These tests shell out to the REAL `yalda-gpui` debug binary (for
-    // `--hash-diff`) and the REAL `scripts/yalda-pre-merge-hook` file (not a
-    // copy/rewrite of its logic) — the actual artifacts a human's git hook
-    // would run, not a simulation of them.
-
-    /// Absolute path to `target/debug/yalda-gpui`, derived from this TEST
-    /// binary's own `current_exe()` (`.../target/debug/deps/yalda_gpui-<hash>`
-    /// → `.../target/debug/yalda-gpui`) rather than `CARGO_BIN_EXE_*` — that
-    /// env var is only populated for `tests/` integration binaries, not for
-    /// `#[test]`s compiled into the binary crate itself (`cargo test --bin
-    /// yalda-gpui`), which is what these are.
-    fn yalda_gpui_bin_path() -> PathBuf {
-        let mut exe = std::env::current_exe().expect("current_exe");
-        exe.pop(); // drop the test binary's own filename
-        if exe.file_name().is_some_and(|n| n == "deps") {
-            exe.pop(); // deps/ -> debug/
-        }
-        let name = if cfg!(windows) { "yalda-gpui.exe" } else { "yalda-gpui" };
-        exe.join(name)
-    }
-
-    /// `target/debug/yalda-gpui`, building it first via `cargo build --bin
-    /// yalda-gpui` if it isn't already there — `cargo test --bin yalda-gpui`
-    /// alone does not build the production binary artifact, only the test
-    /// harness binary, so a bare `cargo test` run (outside `scripts/ci.sh`,
-    /// which builds bins first) would otherwise find it missing.
-    fn ensure_yalda_gpui_built() -> PathBuf {
-        let bin = yalda_gpui_bin_path();
-        if bin.is_file() {
-            return bin;
-        }
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let status = Command::new(env!("CARGO"))
-            .current_dir(manifest_dir)
-            .args(["build", "--bin", "yalda-gpui"])
-            .status()
-            .expect("failed to invoke cargo build --bin yalda-gpui");
-        assert!(status.success(), "cargo build --bin yalda-gpui failed");
-        assert!(bin.is_file(), "expected {} to exist after building", bin.display());
-        bin
-    }
-
-    /// Path to the checked-in hook script, resolved from `CARGO_MANIFEST_DIR`
-    /// so it works regardless of the test runner's cwd.
-    fn hook_script_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/yalda-pre-merge-hook")
-    }
-
-    /// **REQUIRED DONE_WHEN**: "`--hash-diff` output matches `diff_model.rs`
-    /// hashes for the same input" (spec C6). Runs the REAL binary's
-    /// `--hash-diff` over a two-file, two-hunk fixture and compares its
-    /// stdout, line for line, against `DiffModel::hunk_hashes()` computed
-    /// in-process from `collect_raw_diff` + `parse_diff` over the SAME
-    /// fixture — proving the CLI path and the tile's own derive path
-    /// (`diff_ui.rs::refresh_diff`) compute IDENTICAL hashes, never a second
-    /// implementation.
     #[test]
-    fn hash_diff_subcommand_output_matches_diff_model_hashes() {
-        let bin = ensure_yalda_gpui_built();
-        let temp = build_fixture(); // two-file fixture (`a.txt`, `b.txt`), from the top of this module
-        let worktree = temp.path().to_path_buf();
-
-        // Expected: the SAME in-process path `refresh_diff` uses.
-        let raw = futures::executor::block_on(collect_raw_diff(worktree.clone(), Some("main".into())))
-            .expect("collect_raw_diff should succeed on the fixture");
-        let model = crate::diff_model::parse_diff(&raw.diff_text, worktree.clone(), &raw.branch, &raw.base, &raw.merge_base);
-        let expected: Vec<u64> = model.hunk_hashes();
-        assert!(!expected.is_empty(), "fixture must have at least one hunk");
-
-        // Actual: the real subprocess.
-        let out = Command::new(&bin)
-            .args(["--hash-diff", worktree.to_str().unwrap(), "main"])
-            .output()
-            .unwrap_or_else(|e| panic!("failed to run {}: {e}", bin.display()));
-        assert!(
-            out.status.success(),
-            "--hash-diff should exit 0, stderr: {}",
-            String::from_utf8_lossy(&out.stderr)
+    fn parse_worktree_porcelain_handles_detached_and_bare() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let text = format!(
+            "worktree {}\nbare\n\nworktree {}\nHEAD 0123456789abcdef\ndetached\n\nworktree {}\nHEAD fff\nbranch refs/heads/x/y\n\n",
+            dir.path().display(),
+            a.display(),
+            b.display()
         );
-        let actual: Vec<u64> = String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(|l| l.parse::<u64>().unwrap_or_else(|e| panic!("non-numeric hash line {l:?}: {e}")))
-            .collect();
-
-        assert_eq!(
-            actual, expected,
-            "--hash-diff output must match diff_model.rs's own hunk_hashes() exactly (spec C6)"
-        );
-    }
-
-    /// `--hash-diff` on a non-repo path exits non-zero and touches nothing.
-    #[test]
-    fn hash_diff_subcommand_nonzero_exit_on_invalid_worktree() {
-        let bin = ensure_yalda_gpui_built();
-        let out = Command::new(&bin)
-            .args(["--hash-diff", "/definitely/not/a/repo/xyz"])
-            .output()
-            .expect("run --hash-diff");
-        assert!(!out.status.success());
-    }
-
-    /// Build a two-worktree fixture (like `build_merge_fixture`) but leave
-    /// `primary` mid-merge (`git merge --no-commit --no-ff feature`) so
-    /// `MERGE_HEAD` is set — the exact state git puts a repo in right before
-    /// firing `pre-merge-commit`, which is what the hook script keys off.
-    /// The merge here is content-clean (primary hasn't diverged from the
-    /// fixture's common ancestor), so `--no-commit` always succeeds.
-    fn build_hook_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
-        let (temp, feature) = build_merge_fixture();
-        let primary = temp.path().join("primary");
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(&primary)
-            .args(["merge", "--no-commit", "--no-ff", "feature"])
-            .status()
-            .expect("git merge --no-commit");
-        assert!(status.success(), "expected a clean (non-conflicting) merge --no-commit");
-        assert!(primary.join(".git").join("MERGE_HEAD").exists());
-        (temp, primary, feature)
-    }
-
-    /// **REQUIRED DONE_WHEN**: "unreviewed-branch merge attempt exits
-    /// non-zero" — with NO `ReviewState` file present at all (nothing ever
-    /// reviewed), the hook, run from `primary` with `MERGE_HEAD` set, must
-    /// refuse.
-    #[test]
-    fn pre_merge_hook_refuses_unreviewed_merge() {
-        let bin = ensure_yalda_gpui_built();
-        let (_temp, primary, _feature) = build_hook_fixture();
-
-        let out = Command::new("sh")
-            .arg(hook_script_path())
-            .current_dir(&primary)
-            .env("YALDA_GPUI_BIN", &bin)
-            .output()
-            .expect("run hook script");
-        assert!(
-            !out.status.success(),
-            "hook must refuse an unreviewed merge; stderr: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert!(
-            String::from_utf8_lossy(&out.stderr).contains("unreviewed"),
-            "refusal message should mention 'unreviewed', got: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    /// The other half of the same DONE_WHEN: once every current hunk hash is
-    /// written into the branch's `ReviewState` file (the exact file/shape
-    /// `save_review_state`, `review_state.rs`, writes) AND the feature
-    /// worktree is clean, the hook ALLOWS (exit 0).
-    #[test]
-    fn pre_merge_hook_allows_fully_reviewed_clean_merge() {
-        let bin = ensure_yalda_gpui_built();
-        let (_temp, primary, feature) = build_hook_fixture();
-
-        let hash_out = Command::new(&bin)
-            .args(["--hash-diff", feature.to_str().unwrap()])
-            .output()
-            .expect("run --hash-diff");
-        assert!(hash_out.status.success());
-        let hashes: Vec<String> = String::from_utf8_lossy(&hash_out.stdout)
-            .lines()
-            .map(|l| l.to_string())
-            .collect();
-        assert!(!hashes.is_empty(), "feature fixture must have at least one hunk");
-
-        let common = resolve_git_common_dir(&feature).expect("common dir");
-        let review_dir = common.join("yalda-review");
-        std::fs::create_dir_all(&review_dir).unwrap();
-        let json = format!("{{\n  \"reviewed_hashes\": [\n    {}\n  ]\n}}\n", hashes.join(",\n    "));
-        std::fs::write(review_dir.join("feature.json"), json).unwrap();
-
-        let out = Command::new("sh")
-            .arg(hook_script_path())
-            .current_dir(&primary)
-            .env("YALDA_GPUI_BIN", &bin)
-            .output()
-            .expect("run hook script");
-        assert!(
-            out.status.success(),
-            "hook must allow a fully-reviewed, clean merge; stderr: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    /// **REQUIRED DONE_WHEN**: "missing-binary fails closed (exit non-zero)"
-    /// — with `YALDA_GPUI_BIN` unset and the script's own baked-in
-    /// placeholder left un-substituted (this is the checked-in file, not an
-    /// installed copy), the binary path resolves to a nonexistent path, so
-    /// the hook must refuse rather than silently allow.
-    #[test]
-    fn pre_merge_hook_fails_closed_when_binary_missing() {
-        let (_temp, primary, _feature) = build_hook_fixture();
-
-        let out = Command::new("sh")
-            .arg(hook_script_path())
-            .current_dir(&primary)
-            .env_remove("YALDA_GPUI_BIN")
-            .output()
-            .expect("run hook script");
-        assert!(
-            !out.status.success(),
-            "missing binary must fail closed, not silently allow"
-        );
-        assert!(
-            String::from_utf8_lossy(&out.stderr).contains("failing closed"),
-            "expected an explicit fail-closed message, got: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    /// A completely ordinary (non-merge) commit — no `MERGE_HEAD` at all —
-    /// must be a silent allow: the hook only ever gates an in-progress
-    /// merge, so `pre-commit`-fragment invocations on every other commit
-    /// must not refuse.
-    #[test]
-    fn pre_merge_hook_allows_when_no_merge_in_progress() {
-        let (_temp, feature) = build_merge_fixture();
-        let out = Command::new("sh")
-            .arg(hook_script_path())
-            .current_dir(&feature)
-            .env_remove("YALDA_GPUI_BIN")
-            .output()
-            .expect("run hook script");
-        assert!(
-            out.status.success(),
-            "no MERGE_HEAD must allow unconditionally, stderr: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    /// The installer's `git config merge.ff false` is exactly the config the
-    /// hook relies on to fire on a merge that WOULD otherwise fast-forward
-    /// (spec B7: "`pre-merge-commit` does not fire on fast-forward merges").
-    /// This is the Rust-side half of that DONE_WHEN bullet (the shell script
-    /// itself has no config-setting responsibility — only the installer
-    /// does, already covered by
-    /// `install_merge_gate_hook_writes_hooks_bakes_path_and_sets_merge_ff_false`
-    /// above); restated here for discoverability next to the other hook
-    /// DONE_WHEN coverage.
-    #[test]
-    fn installer_merge_ff_false_prevents_fast_forward_merge_commit() {
-        let (temp, _feature) = build_merge_fixture();
-        let primary = temp.path().join("primary");
-        install_merge_gate_hook(&primary, &PathBuf::from("/bin/true")).expect("install");
-
-        // A fast-forward-ELIGIBLE merge (primary hasn't diverged from
-        // feature) must still produce a MERGE COMMIT, not a fast-forward,
-        // once `merge.ff false` is set — proving `pre-merge-commit` WILL be
-        // invoked for this merge.
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(&primary)
-            .args(["merge", "feature"])
-            .status()
-            .expect("git merge");
-        assert!(status.success());
-        let log = Command::new("git")
-            .arg("-C")
-            .arg(&primary)
-            .args(["log", "-1", "--format=%P"])
-            .output()
-            .expect("git log");
-        let parents = String::from_utf8_lossy(&log.stdout);
-        assert_eq!(
-            parents.split_whitespace().count(),
-            2,
-            "merge.ff=false must force a real 2-parent merge commit (not a fast-forward): {parents:?}"
-        );
+        let rows = parse_worktree_porcelain(&text);
+        assert_eq!(rows.len(), 2, "bare entry skipped: {rows:?}");
+        assert!(rows[0].detached && rows[0].branch.is_none());
+        assert_eq!(rows[0].label(), "detached @ 01234567");
+        assert_eq!(rows[1].branch.as_deref(), Some("x/y"));
+        assert!(!rows[0].is_primary && !rows[1].is_primary, "primary was the bare entry");
     }
 }

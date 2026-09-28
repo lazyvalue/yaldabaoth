@@ -2518,7 +2518,7 @@ impl YaldaGpuiView {
 
     /// Render a Diff tile (`App::Diff`): a slim header bar (title + key hints)
     /// over the cached scrollable body (`DiffView`). Navigation-only (spec
-    /// B9) — all keys route through `handle_diff_key`. `id` is the tile's
+    /// B8) — all keys route through `handle_diff_key`. `id` is the tile's
     /// stable `WindowId`, needed so the lazily-created `DiffView` can find its
     /// own `DiffTile` back through the root (see `diff_view.rs` module docs).
     pub(crate) fn render_diff(
@@ -2528,12 +2528,9 @@ impl YaldaGpuiView {
         tile: &mut DiffTile,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        // Restored/freshly-bound tiles kick their first derive here (mirrors
-        // `CogTile::needs_load` — `restore_content` has no `cx`).
-        if tile.needs_load && tile.source.is_some() {
-            self.refresh_diff(id, cx);
-        }
-
+        // Restored tiles' first derive / picker load is kicked by the root
+        // per-frame reconcile (`diff_reconcile`, diff_ui.rs), never here —
+        // this is a render path (yux rule 1).
         let view = self.diff_view_for(id, cx);
 
         let scale = self.text_scale;
@@ -2543,18 +2540,9 @@ impl YaldaGpuiView {
         let fg = self.editor_fg();
         let bg = self.editor_bg();
 
-        let commentable = matches!(tile.source, Some(DiffSource::Session(_)));
-        let hint = if tile.source.is_none() {
-            "1-9 diff a session · p diff this workspace dir".to_string()
-        } else if tile.compose.is_some() {
-            "esc cancel · ctrl-enter send comment".to_string()
-        } else if commentable {
-            // spec B4/C4: the comment affordance is absent (not merely inert)
-            // on a `Path`-bound tile — no session to steer the comment into.
-            "j/k hunk · [ / ] file · z fold · r refresh · c comment · space tile menu".to_string()
-        } else {
-            "j/k hunk · [ / ] file · z fold · r refresh · space tile menu".to_string()
-        };
+        // The bound body carries its own always-visible key-hint footer
+        // (`DIFF_KEY_HINTS`, diff_view.rs); the chrome bar only names the menu.
+        let hint = "space tile menu";
         let header = div()
             .flex()
             .flex_row()
@@ -2591,19 +2579,26 @@ impl YaldaGpuiView {
 
         let body_area = div().flex_1().min_h_0().w_full().child(cached_child(view));
 
-        // spec B4: the hunk-comment compose, pinned in the tile — rendered at
-        // the SCREEN level (like the agent tile's compose sits outside its
-        // cached transcript), NOT inside the cached `DiffView`, so typing here
-        // never re-renders the expensive diff body and needs no `DiffSeqs`
-        // entry. `None` renders nothing (the common case).
-        let comment_panel = match (&tile.comment_target, &tile.compose) {
-            (Some(target), Some(compose)) => Some(self.render_diff_comment_compose(
-                target, compose, scale, dim, accent, fg, bg,
-            )),
-            _ => None,
-        };
+        // spec B5: the comment compose, pinned at the tile's bottom and
+        // rendered at the SCREEN level (like the agent compose sits outside
+        // its cached transcript), NOT inside the cached `DiffView` — typing
+        // here never re-renders the diff body (UXI-Diff-12/15). The anchored
+        // lines stay highlighted in the body (`DiffSeqs::compose_gen`).
+        let compose_panel = tile
+            .compose
+            .as_ref()
+            .map(|c| self.render_diff_comment_compose(c, dim, accent, fg, bg));
 
-        let mut root = root
+        // spec B6: the send picker, centered over the tile and — like the
+        // compose — rendered at the SCREEN level, so query typing never
+        // re-renders the cached body (it is not a `DiffSeqs` input).
+        let send_overlay = tile
+            .send_picker
+            .as_ref()
+            .map(|p| self.render_diff_send_picker(id, p, cx));
+
+        let root = root
+            .relative()
             .key_context("DiffView")
             .on_key_down(cx.listener(Self::handle_diff_key))
             .on_action(cx.listener(Self::quit))
@@ -2634,45 +2629,87 @@ impl YaldaGpuiView {
             .bg(bg)
             .child(header)
             .child(body_area);
-        if let Some(panel) = comment_panel {
-            root = root.child(panel);
+        let root = match compose_panel {
+            Some(panel) => root.child(panel),
+            None => root,
+        };
+        match send_overlay {
+            Some(overlay) => root.child(overlay),
+            None => root,
         }
-        root
     }
 
-    /// The pinned hunk-comment compose body (spec B4). Renders EVERY line of
-    /// the draft unclipped and unscrolled (no fixed height, no
-    /// `overflow_hidden`) — for a short review comment this trivially upholds
-    /// INV-UX-1 (the caret can't be stranded off-screen: there is no scrolled
-    /// region to strand it in) without needing the full wrapped/virtualized
-    /// machinery the agent compose (INV-UX-1/2) carries for its much larger
-    /// worksheet/chatbox surfaces. Each line renders in its own `w_full()`
-    /// block, which wraps long text the same way `yux::multiline_text` does
-    /// (gpui's default block-text flow) — the INV-UX-2 word-wrap property,
-    /// without a bespoke wrap pass. `target` is the snapshot captured at open
-    /// time (`open_hunk_comment`), not live model state.
-    #[allow(clippy::too_many_arguments)]
+    /// The Diff send picker overlay (spec B6, UXI-Diff-16): the shared palette
+    /// panel (`render_palette_panel`, the jump palette's look + fuzzy ranking)
+    /// titled "Send N comments to…", centered near the top of the tile. The
+    /// row matching the review's `last_sent_session` carries a "last sent"
+    /// tag. Clicks/hovers resolve against the tile's live picker at event
+    /// time (yux rule 4).
+    fn render_diff_send_picker(
+        &self,
+        id: workspace::WindowId,
+        picker: &SendPicker,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let ranked = picker.ranked();
+        let title = format!("Send {} to…", comments_phrase(picker.ids.len()));
+        let last_sent = picker.last_sent;
+        let panel = self.render_palette_panel(
+            PalettePanel {
+                id_prefix: "diff-send",
+                title,
+                query: &picker.query,
+                items: &picker.items,
+                ranked: &ranked,
+                selected: picker.selected,
+                footer: "↑↓ ctrl-n/p:select  enter:send  esc:cancel",
+                glyph_of: &|_| "✦",
+                tag_of: &|i| (Some(i) == last_sent).then_some("last sent"),
+            },
+            std::rc::Rc::new(move |this: &mut Self, row: usize, cx: &mut Context<Self>| {
+                this.send_picker_activate(id, row, cx)
+            }),
+            std::rc::Rc::new(move |this: &mut Self, row: usize, cx: &mut Context<Self>| {
+                this.send_picker_hover(id, row, cx)
+            }),
+            cx,
+        );
+        probe_bounds(
+            "diff-send-picker",
+            div()
+                .absolute()
+                .top(px(48.0))
+                .left_0()
+                .right_0()
+                .flex()
+                .flex_row()
+                .justify_center()
+                .child(panel)
+                .into_any_element(),
+        )
+    }
+
+    /// The bottom-pinned Diff comment compose (spec B5): a caption naming the
+    /// anchor ("commenting on a.txt:2–4" / "editing c3 on …"), the draft with
+    /// a caret marker, and its keys. Chrome — fixed sizes (it doesn't zoom,
+    /// like the agent compose). Every line renders unclipped and wraps in its
+    /// own `w_full` block (INV-UX-1/2 for a short comment: no scrolled region
+    /// to strand the caret in); a 4-line minimum height keeps the tile's body
+    /// bounds stable while a short draft is typed.
     fn render_diff_comment_compose(
         &self,
-        target: &CommentTarget,
-        compose: &Compose,
-        scale: f32,
+        compose: &CommentCompose,
         dim: Hsla,
         accent: Hsla,
         fg: Hsla,
         bg: Hsla,
     ) -> AnyElement {
-        let base = px(14.0 * scale);
-        let small = px(12.0 * scale);
-        let text = compose.text();
-        let cursor = compose.editor.cursor();
-        let doc_lines: Vec<&str> = if text.is_empty() {
-            vec![""]
-        } else {
-            text.split('\n').collect()
-        };
-
-        let mut lines_col = div().flex().flex_col().w_full().gap_0();
+        let base = px(14.0);
+        let small = px(12.0);
+        let text = compose.input.text();
+        let cursor = compose.input.editor.cursor();
+        let doc_lines: Vec<&str> = if text.is_empty() { vec![""] } else { text.split('\n').collect() };
+        let mut lines_col = div().flex().flex_col().w_full();
         for (i, line) in doc_lines.iter().enumerate() {
             let rendered = if i == cursor.line {
                 let mut chars: Vec<char> = line.chars().collect();
@@ -2691,7 +2728,10 @@ impl YaldaGpuiView {
                     .child(SharedString::from(rendered)),
             );
         }
-
+        let caption = match &compose.target {
+            ComposeTarget::New => format!("commenting on {}", compose.anchor.label()),
+            ComposeTarget::Edit(id) => format!("editing {id} on {}", compose.anchor.label()),
+        };
         let panel = div()
             .id("diff-comment-compose")
             .flex()
@@ -2704,22 +2744,19 @@ impl YaldaGpuiView {
             .border_t_1()
             .border_color(accent)
             .bg(bg_or(self.theme.top_bar, STATUS_BG))
-            .child(
+            .child(probe_bounds_dyn(
+                format!("diff-compose-caption={caption}"),
                 div()
                     .text_color(accent)
                     .font_family(self.code_font.clone())
                     .text_size(small)
-                    .child(SharedString::from(format!(
-                        "commenting on {} lines {}-{}",
-                        target.path.display(),
-                        target.line_range.0,
-                        target.line_range.1
-                    ))),
-            )
+                    .child(SharedString::from(caption))
+                    .into_any_element(),
+            ))
             .child(
                 div()
                     .w_full()
-                    .min_h(px(24.0 * scale))
+                    .min_h(px(4.0 * 20.0))
                     .p_1()
                     .bg(bg)
                     .border_1()
@@ -2731,7 +2768,7 @@ impl YaldaGpuiView {
                     .text_color(dim)
                     .font_family(self.code_font.clone())
                     .text_size(small)
-                    .child(SharedString::from("esc cancel · ctrl-enter send")),
+                    .child(SharedString::from("ctrl-enter save · enter newline · esc cancel")),
             );
         probe_bounds("diff-comment-compose", panel.into_any_element())
     }

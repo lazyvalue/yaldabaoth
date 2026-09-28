@@ -11,7 +11,7 @@
 //!    `compact_list_group_heading`,
 //!    `single_line_ellipsis`, `compact_status_mark`, `compact_bounded_group`,
 //!    `context_menu_item`,
-//!    `picker_option_row`, `note_block`,
+//!    `picker_option_row`, `picker_option_row_detailed`, `note_block`,
 //!    `fmt_iso_datetime`) that any surface composes from.
 //! 3. **Virtualized scroll surfaces** (`list`) — `ScrollAnchoredList`, the one
 //!    place the "splice the changed range, never `reset()`" reconcile lives, so
