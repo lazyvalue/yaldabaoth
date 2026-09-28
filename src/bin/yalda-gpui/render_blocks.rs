@@ -699,14 +699,25 @@ pub(crate) struct BlockHits {
 pub(crate) struct CaptureBounds {
     pub(crate) inner: AnyElement,
     pub(crate) sink: std::rc::Rc<std::cell::Cell<(f32, f32, f32, f32)>>,
-    /// D12: the enclosing view LAYS OUT from this width next frame (the
-    /// compose wraps at `floor(w / CHATBOX_CHAR_W)` columns), so a width change
-    /// must schedule that frame — otherwise the frame after a resize/split
-    /// keeps the previous width's wrap until an unrelated event. When set, a
-    /// painted width that differs from the sink's previous value notifies the
-    /// current view via `cx.defer` (runs after the draw — never a mid-draw,
-    /// parked notify).
-    pub(crate) rerender_on_width_change: bool,
+    /// D12: who LAYS OUT from this width next frame (the compose wraps at
+    /// `floor(w / CHATBOX_CHAR_W)` columns) — a width change must schedule
+    /// that frame, otherwise the frame after a resize/split keeps the previous
+    /// width's wrap until an unrelated event. A painted width that differs from
+    /// the sink's previous value notifies the target via `cx.defer` (runs
+    /// after the draw — never a mid-draw, parked notify).
+    pub(crate) on_width_change: OnWidthChange,
+}
+
+/// Who a [`CaptureBounds`] notifies when its painted width changes (D12).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum OnWidthChange {
+    /// Nobody — the width is only read by event handlers.
+    Nothing,
+    /// The view being painted (the chatbox compose, rendered by the root).
+    NotifyCurrentView,
+    /// A specific view — the inline You-block's width sizes the TRANSCRIPT's
+    /// placeholder, while the block itself paints as a root-level overlay (D11).
+    Notify(gpui::EntityId),
 }
 
 impl IntoElement for CaptureBounds {
@@ -768,9 +779,15 @@ impl Element for CaptureBounds {
             new_w,
             f32::from(bounds.size.height),
         ));
-        if self.rerender_on_width_change && (old_w - new_w).abs() > 0.5 {
-            let view = window.current_view();
-            cx.defer(move |cx| cx.notify(view));
+        if (old_w - new_w).abs() > 0.5 {
+            let target = match self.on_width_change {
+                OnWidthChange::Nothing => None,
+                OnWidthChange::NotifyCurrentView => Some(window.current_view()),
+                OnWidthChange::Notify(id) => Some(id),
+            };
+            if let Some(view) = target {
+                cx.defer(move |cx| cx.notify(view));
+            }
         }
         self.inner.paint(window, cx);
     }

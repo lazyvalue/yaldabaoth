@@ -1838,6 +1838,9 @@ pub(crate) fn build_chatbox_wrapped_line(
 /// the caret's absolute visual-row index, the total visual-row count, and each
 /// logical line's visual-row count (so the list scroll can map a target visual
 /// row back to a `(list item, offset)` pair via [`compose_item_for_visual_row`]).
+// The full-draft oracle the tests check the render path's incremental
+// `compose_caret_visual_row` + render-snapshot counts against.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn compose_visual_metrics(
     lines: &[String],
     caret_line: usize,
@@ -1949,17 +1952,14 @@ pub(crate) struct TranscriptScroll {
     /// of `reset()`-ing the whole list (which nulled the scroll → the worksheet
     /// "newline jumps to the top of the viewport" bug).
     pub(crate) last_keys: Vec<FlatKey>,
-    /// Render-input hash of the ACTIVE inline You-block (compose text + caret +
-    /// mode + selection) at the last reconcile. The You-block is ONE list item
-    /// whose *content* is driven by the COMPOSE buffer, NOT the transcript
-    /// `edit_seq` — so a keystroke in it never bumps `last_reconciled_edit_seq`
-    /// and `FlatKey::YouBlock` (keys on `parked` only) stays identical. Without
-    /// a dedicated seq the item is never spliced, so GPUI repaints its CACHED
-    /// element at the old text — the recurring "/clear worksheet invisible"
-    /// bug: you type, the observe fires, `build_body` runs, but the You-block
-    /// row shows nothing until an unrelated event forces a splice/reset. When
-    /// this hash moves, `build_body` splices the You-block item to re-measure
-    /// it. `u64::MAX` = never rendered a block.
+    /// Height code (`rows + 1`, 0 = none) of the ACTIVE inline You-block's
+    /// PLACEHOLDER item at the last reconcile (D11: the block paints as the
+    /// root-level `YouBlockView` overlay; the list only reserves its height).
+    /// The height is driven by the COMPOSE buffer, NOT the transcript
+    /// `edit_seq`, and `FlatKey::YouBlock` keys on `parked` only — so without a
+    /// dedicated code the resized placeholder is never re-measured. When it
+    /// moves, `build_body` splices exactly that item. `u64::MAX` = never
+    /// rendered a block.
     pub(crate) last_you_block_seq: u64,
 }
 
@@ -3072,6 +3072,11 @@ pub(crate) struct AgentViewModel {
     /// Bumped on every view-model rebuild. Lets tests assert a fingerprint
     /// hit reused the cache (seq unchanged) vs. forced a rebuild.
     pub(crate) view_model_seq: u64,
+    /// Index of the ACTIVE inline You-block (`FlatItem::YouBlock { parked:
+    /// None }`) in `flat_items_cache`, recorded ONCE per rebuild (D11) so the
+    /// transcript's splice / reveal paths read it instead of re-scanning the
+    /// flat list on every render.
+    pub(crate) active_you_block_ix: Option<usize>,
 }
 
 impl AgentViewModel {
@@ -3127,6 +3132,9 @@ impl AgentViewModel {
         {
             VIEW_MODEL_REBUILDS.with(|n| n.set(n.get() + 1));
         }
+        self.active_you_block_ix = flat_items
+            .iter()
+            .position(|it| matches!(it, FlatItem::YouBlock { parked: None }));
         let flat_rc = std::rc::Rc::new(flat_items);
         let gutter_rc = std::rc::Rc::new(gutter);
         self.flat_items_cache = flat_rc.clone();

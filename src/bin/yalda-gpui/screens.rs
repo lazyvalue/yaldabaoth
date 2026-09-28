@@ -1067,10 +1067,33 @@ impl YaldaGpuiView {
         // self-notify path keeps invalidating normally meanwhile.
         let live_fp = TranscriptSeqs::of(&session_ent.read(cx).state).fingerprint_hash();
         let transcript_fp = transcript_view.read(cx).element_fp(live_fp);
+        // D11: the ACTIVE inline You-block paints HERE, over the transcript's
+        // placeholder item (`slot_overlay`), as its own cached view — outside the
+        // transcript's subtree, so a keystroke into it (which notifies only the
+        // `YouBlockView`) never re-renders the cached transcript. It must follow
+        // the transcript in tree order: it reads the slot the list settled this
+        // frame. Keyed on its render fingerprint — the same dropped-self-notify
+        // backstop the transcript wrapper uses.
+        let you_block_overlay = {
+            let st = &session_ent.read(cx).state;
+            st.inline_you_block_active().then(|| {
+                let yb_fp = YouBlockSeqs::of(st).fingerprint_hash();
+                let tv = transcript_view.read(cx);
+                slot_overlay(
+                    tv.you_block_slot.clone(),
+                    div()
+                        .id(("you-block-fp", yb_fp))
+                        .size_full()
+                        .child(cached_child(tv.you_block_view.clone()))
+                        .into_any_element(),
+                )
+            })
+        };
         let transcript_body: AnyElement = div()
             .id(("transcript-fp", transcript_fp))
             .size_full()
             .child(cached_child(transcript_view))
+            .children(you_block_overlay)
             .into_any_element();
 
         // Build the status strips + compose + sidebars inside the session
@@ -1519,7 +1542,7 @@ impl YaldaGpuiView {
                     .child(CaptureBounds {
                         inner: inner.into_any_element(),
                         sink: compose_bounds_sink,
-                        rerender_on_width_change: true,
+                        on_width_change: OnWidthChange::NotifyCurrentView,
                     })
                     .into_any_element()
             } else {
@@ -1532,7 +1555,7 @@ impl YaldaGpuiView {
                 // (A wrap-width change alone needs no splice: gpui re-measures
                 // every VISIBLE item each frame, and the window below places the
                 // caret by (item, offset) — D12's fix is the follow-up frame
-                // `CaptureBounds::rerender_on_width_change` schedules.)
+                // `CaptureBounds::on_width_change` schedules.)
                 let compose_edit_seq = tb.editor.document().edit_seq();
                 tb.list.reconcile(&lines_snap, compose_edit_seq);
                 // UXI-TextEditing-1 under UXI-AgentTile-9: once lines wrap, the box scrolls in
@@ -1608,7 +1631,7 @@ impl YaldaGpuiView {
                             .w_full()
                             .into_any_element(),
                         sink: compose_bounds_sink,
-                        rerender_on_width_change: true,
+                        on_width_change: OnWidthChange::NotifyCurrentView,
                     })
                     .into_any_element()
             };

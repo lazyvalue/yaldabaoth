@@ -291,8 +291,9 @@ paint probe; the live `/clear` producer is confirmed via `YALDA_CLEAR_DEBUG`).
 
 **Enforcement.** `verify_harness.rs::clear_worksheet_hole_types_and_paints` —
 enter the hole (pre-asserted 4-part state), type via the REAL `handle_claude_key`,
-assert the cached transcript re-renders (render count advances) AND an inline
-You-block PAINTS inside the transcript viewport. **Negative control: each of the
+assert the surface painting the draft re-renders (render count advances — since
+D11 the `YouBlockView` overlay's, not the transcript's) AND an inline You-block
+PAINTS inside the transcript viewport. **Negative control: each of the
 three edits (predicate :3977, injection :2892, memo :3350) reverted independently
 produces RED for its OWN reason** (flat count / no paint / stale-list no paint) —
 verified. Plus `tests.rs::inline_you_block_active_truth_table` (the
@@ -300,8 +301,22 @@ verified. Plus `tests.rs::inline_you_block_active_truth_table` (the
 (`compose().text()=="hello"`) is explicitly NOT the guard — it is green while the
 screen is blank.
 
-**Enforcement (second mechanism).**
-`verify_harness.rs::clear_worksheet_you_block_keystroke_splices_item` — rest in the
+**Enforcement (second mechanism — SUPERSEDED by D11, 2026-09-27).** The active
+You-block is no longer painted by the transcript list: the list holds a
+fixed-height PLACEHOLDER (`overlay_slot`) and the root paints the block over it as
+its own cached view (`YouBlockView`, `slot_overlay`). A keystroke re-renders only
+that view; the placeholder is re-spliced only when the block's HEIGHT changes —
+pinned by `worksheet_you_block_placeholder_resplices_on_height_change` (keystroke
+⇒ no splice, newline ⇒ splice, painted block == painted slot; negative control:
+drop the splice block → RED) and
+`worksheet_inline_typing_rerenders_you_block_not_transcript` (transcript render
+count flat while typing, You-block renders per key, painted caret advances;
+negative controls: re-latch the reveal on every key, or fold the compose `edit_seq`
+back into `TranscriptSeqs` → RED). The caret reveal now fires only when the caret
+row would leave the viewport (`inline_you_block_caret_in_view`) —
+`worksheet_typing_after_scrolling_away_reveals_caret_without_forced_reveal`
+(negative control: never reveal → RED). Historical text follows.
+`verify_harness.rs::clear_worksheet_you_block_keystroke_splices_item` (retired) — rest in the
 post-`/clear` typeable worksheet (inline block active, pre-asserted), settle so
 `last_you_block_seq` catches up, then type via the REAL `handle_claude_key` and
 assert the `YOU_BLOCK_SPLICE_LABEL` perf counter advances (the You-block item was

@@ -185,18 +185,20 @@ pub(crate) struct TranscriptSeqs {
     /// cursor-row bar render ONLY when focused; flipping focus must bust the
     /// cache so the caret appears/disappears.
     pub(crate) transcript_focused: bool,
-    /// UXI-AgentTile-11 (stage 2): the inline You-block renders the live `Compose` INSIDE
-    /// the transcript, so its draft text + caret + mode are render inputs of this
-    /// cached view. Without them in the fingerprint, typing into the inline block
-    /// would not bust the transcript cache (stale caret/text — the cached-surface
-    /// bug class). `compose_edit_seq` covers the text; caret + mode cover the
-    /// glyph. Inert (constant) when no block is open.
+    /// UXI-AgentTile-11 (stage 2): whether the ACTIVE inline You-block is shown
+    /// and where it anchors — the transcript renders its PLACEHOLDER item there.
     pub(crate) you_block_open: bool,
     pub(crate) you_block_anchor: Option<usize>,
-    pub(crate) compose_edit_seq: u64,
-    pub(crate) compose_cursor: (usize, usize),
-    pub(crate) compose_mode: EditMode,
-    pub(crate) compose_selection: Option<((usize, usize), (usize, usize))>,
+    /// D11: the active block's CONTENT (draft text, caret, mode, selection) is
+    /// NOT a render input of this view any more — the block paints as a
+    /// root-level overlay (`YouBlockView`, its own seqs), so a keystroke leaves
+    /// the transcript cached. Only the placeholder's HEIGHT is: the draft's
+    /// visual-row count at the measured wrap width (0 before the block's box
+    /// has painted). A newline / wrap that grows or shrinks the block moves
+    /// this and re-renders the transcript (to resize the slot). Zero when no
+    /// block is active.
+    pub(crate) you_block_cols: usize,
+    pub(crate) you_block_rows: usize,
     /// Hash of the PARKED You-blocks (rule 6) — their anchors + text. A park/unpark/
     /// submit changes this so the cached transcript re-renders the inline set. (Copy
     /// fingerprint, so a hash not the Vec.) 0 when idle-chatbox/none.
@@ -213,27 +215,21 @@ impl TranscriptSeqs {
     /// O(1) (len + last range), the rest are field reads.
     pub(crate) fn of(c: &AgentState) -> Self {
         let cursor = c.editor.cursor();
-        // UXI-AgentTile-11 (stage 2): the compose's text/caret/mode are render inputs of
-        // THIS cached view ONLY while the inline You-block is active (worksheet,
-        // idle, block open). When the compose renders in the bottom panel instead
-        // (chatbox mode, or the mid-turn chatbox), its changes must NOT bust the
-        // transcript cache — otherwise chatbox typing re-renders the whole
-        // transcript (the `transcript_021_*` perf regression). So zero the compose
-        // fields off-inline.
+        // UXI-AgentTile-11 / D11: only the active You-block's HEIGHT (visual rows
+        // at the measured wrap width) is an input of this view — its content
+        // paints in `YouBlockView`. Off-inline (chatbox / mid-turn) the compose
+        // must not touch the transcript at all (`transcript_021_*`). The row
+        // count comes from the compose's `(edit_seq, cols)` render snapshot —
+        // the same one the overlay paints from, so no second O(draft) pass.
         let inline_block_active = c.inline_you_block_active();
-        let (compose_edit_seq, compose_cursor, compose_mode, compose_selection) =
-            if inline_block_active {
-                let compose = c.input_surface.compose();
-                let cc = compose.editor.cursor();
-                (
-                    compose.editor.document().edit_seq(),
-                    (cc.line, cc.col),
-                    compose.mode,
-                    compose.editor.selection_range(),
-                )
-            } else {
-                (0, (0, 0), EditMode::Normal, None)
-            };
+        let (you_block_cols, you_block_rows) = if inline_block_active {
+            let compose = c.input_surface.compose();
+            let cols = compose_measured_cols(compose);
+            let rows = if cols > 0 { compose.render_snapshot(cols).total_rows } else { 0 };
+            (cols, rows)
+        } else {
+            (0, 0)
+        };
         Self {
             provider: c.provider,
             edit_seq: c.editor.document().edit_seq(),
@@ -249,10 +245,8 @@ impl TranscriptSeqs {
             transcript_focused: c.focus == AgentFocus::Transcript,
             you_block_open: inline_block_active,
             you_block_anchor: c.you_block_anchor,
-            compose_edit_seq,
-            compose_cursor,
-            compose_mode,
-            compose_selection,
+            you_block_cols,
+            you_block_rows,
             parked_fp: {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -340,6 +334,16 @@ pub(crate) struct TranscriptView {
     /// still invalidates normally meanwhile, so only the rare dropped-notify
     /// backstop is deferred (by one press).
     pub(crate) element_fp_freeze: Option<u64>,
+    /// D11: the ACTIVE inline You-block, painted by the root OVER this view's
+    /// placeholder item (`slot_overlay`) so typing into it never re-renders
+    /// the transcript. Owned here (one per transcript / session).
+    pub(crate) you_block_view: Entity<YouBlockView>,
+    /// The wrap width + row count this view sized the placeholder for; the
+    /// You-block view paints at exactly this layout.
+    pub(crate) you_block_layout: std::rc::Rc<std::cell::Cell<YouBlockLayout>>,
+    /// Where the placeholder landed (window bounds + clip) the last time the
+    /// list laid it out — the overlay's position. Cleared each render.
+    pub(crate) you_block_slot: OverlaySlotCell,
 }
 
 impl TranscriptView {
@@ -375,7 +379,7 @@ impl TranscriptView {
                 let c = &session.read(cx).state;
                 crate::clear_log(&format!(
                     "transcript OBSERVE: moved={:?} inline_active={} focus_compose={} \
-                     you_block_open={} awaiting={} chatbox={} compose_edit_seq={}->{} \
+                     you_block_open={} awaiting={} chatbox={} you_block_rows={}->{} \
                      transcript_focused_seq={}",
                     diff,
                     c.inline_you_block_active(),
@@ -383,8 +387,8 @@ impl TranscriptView {
                     c.you_block_open,
                     c.turn_phase.is_awaiting(),
                     c.input_surface.is_chatbox(),
-                    this.last_rendered.compose_edit_seq,
-                    now.compose_edit_seq,
+                    this.last_rendered.you_block_rows,
+                    now.you_block_rows,
                     now.transcript_focused,
                 ));
             }
@@ -394,6 +398,12 @@ impl TranscriptView {
             }
         })
         .detach();
+        let you_block_layout = std::rc::Rc::new(std::cell::Cell::new(YouBlockLayout::default()));
+        let transcript_id = cx.entity_id();
+        let you_block_view = {
+            let (session, root, layout) = (session.clone(), root.clone(), you_block_layout.clone());
+            cx.new(|ycx| YouBlockView::new(session, root, layout, transcript_id, ycx))
+        };
         Self {
             session,
             root,
@@ -403,6 +413,9 @@ impl TranscriptView {
             token_hits: std::rc::Rc::new(RefCell::new(Vec::new())),
             dragging: false,
             element_fp_freeze: None,
+            you_block_view,
+            you_block_layout,
+            you_block_slot: std::rc::Rc::new(std::cell::Cell::new(None)),
         }
     }
 
@@ -560,6 +573,18 @@ impl TranscriptView {
         let token_sink = self.token_hits.clone();
         token_sink.borrow_mut().clear();
         let dragging = self.dragging;
+        // D11: the active You-block's placeholder re-records its slot when the
+        // list lays it out below; a stale slot must not survive a render in
+        // which the placeholder is absent or scrolled out of the laid-out range.
+        self.you_block_slot.set(None);
+        // The compose's exact bounds are written only when the inline block
+        // paints. On the first render after `r`, they are necessarily zero; a
+        // hard-coded 40-column fallback made long seeded quotes render as a
+        // narrow strip and stay that way until another event invalidated the
+        // cached transcript. The transcript viewport is already measured by
+        // then, so it is the authoritative first-paint fallback.
+        let transcript_width_px =
+            f32::from(self.scroll.list_state.viewport_bounds().size.width);
 
         // Snapshot the root-owned render inputs into OWNED locals, releasing the
         // root read borrow before any `session.update` (which needs `&mut cx`).
@@ -636,6 +661,7 @@ impl TranscriptView {
             you_parked_snap,
             you_wrap_cols,
             you_block_seq,
+            active_you_block_ix,
             provider_snap,
         } = session.update(cx, |sp, _scx| {
             let c: &mut AgentState = &mut sp.state;
@@ -708,11 +734,9 @@ impl TranscriptView {
             // ACTUALLY builds — whether a live inline YouBlock row is present, the
             // memo hit/miss, and the gate. If a keystroke leaves `has_you_block=false`
             // while inline-active, the render (not the gate) is the break.
-            // D9: gated first — the YouBlock scan is O(flat items) per build.
+            // D9: gated first. (D11: the index is recorded once per rebuild.)
             if crate::clear_log_enabled() {
-                let has_you_block = flat_items_arc
-                    .iter()
-                    .any(|it| matches!(it, FlatItem::YouBlock { parked: None }));
+                let has_you_block = c.view_model.active_you_block_ix.is_some();
                 crate::clear_log(&format!(
                     "build_body: inline_active={} focus_compose={} you_block_open={} \
                      has_YouBlock_row={has_you_block} flat_items={} memo_hit={memo_hit} fp={view_model_fp}",
@@ -749,9 +773,8 @@ impl TranscriptView {
                 // YouBlock item itself (it grows as you type), not the anchor line
                 // above it, or a multi-line reply's caret scrolls below the fold.
                 if c.inline_you_block_active() {
-                    flat_items_arc
-                        .iter()
-                        .position(|it| matches!(it, FlatItem::YouBlock { parked: None }))
+                    c.view_model
+                        .active_you_block_ix
                         .or_else(|| Some(c.view_model.item_for_line(c.editor.cursor().line)))
                 } else {
                     let cl = c.editor.cursor().line;
@@ -779,54 +802,41 @@ impl TranscriptView {
             let turn_started_snap = c.turn_phase.turn_started();
             let last_event_at_snap = c.turn_phase.last_event_at();
 
-            // UXI-AgentTile-11 (stage 2): snapshot the inline You-block draft (the separate
-            // Compose) so the render arm draws it without re-borrowing the session.
-            // Gate EXACTLY like the injection (agent.rs) — `you_block_open` alone
-            // would allocate a snapshot every streaming-frame for a block left open
-            // mid-turn that is never injected (bug-hunt 11).
-            // Anchor → the doc line the block highlights on in nav (tail = last line).
+            // D11: the ACTIVE inline You-block paints as a root-level overlay
+            // (`YouBlockView`); this view only sizes its PLACEHOLDER. Decide the
+            // wrap width (measured box, else the transcript-viewport fallback),
+            // take the draft's `(edit_seq, cols)` snapshot (shared with the
+            // overlay — one O(draft) pass per edit), and keep what the height +
+            // the caret reveal need. Gate EXACTLY like the injection (agent.rs).
             let last_line = c.editor.document().line_count().saturating_sub(1);
+            let measured_cols = compose_measured_cols(c.input_surface.compose());
+            let you_wrap_cols = inline_you_block_wrap_cols(measured_cols, transcript_width_px);
             let you_block_snap = if c.inline_you_block_active() {
                 let compose = c.input_surface.compose();
+                let snap = compose.render_snapshot(you_wrap_cols);
                 let cc = compose.editor.cursor();
+                // C4: DISPLAY columns (the block's rows are tab-expanded).
+                let col = crate::display_col(compose.editor.document(), cc.line, cc.col);
                 Some(YouBlockSnap {
-                    lines: crate::display_lines(compose.editor.document()),
-                    cursor_line: cc.line,
-                    // C4: DISPLAY columns (the block's rows are tab-expanded).
-                    cursor_col: crate::display_col(compose.editor.document(), cc.line, cc.col),
-                    mode: compose.mode,
-                    anchor_line: c.effective_you_block_anchor().unwrap_or(last_line),
-                    focused: c.focus == AgentFocus::Compose,
-                    selection: crate::display_selection(
-                        compose.editor.document(),
-                        compose.editor.selection_range(),
+                    rows: snap.total_rows,
+                    caret_vrow: crate::compose_caret_visual_row(
+                        &snap.lines,
+                        &snap.per_line_rows,
+                        cc.line,
+                        col,
+                        you_wrap_cols,
                     ),
-                    bounds: compose.bounds.clone(),
+                    focused: c.focus == AgentFocus::Compose,
                 })
             } else {
                 None
             };
-            // Render-input hash of the ACTIVE You-block, driving the dedicated
-            // list-item splice below. Folds EXACTLY the fields the `YouBlock`
-            // render arm reads (text via `edit_seq`, caret, mode, selection) — a
-            // move in any of them changes the drawn element, but none bump the
-            // transcript `edit_seq` that `reconcile_list` keys on. 0 when no block
-            // is active (the item isn't present, so no splice is owed).
-            let you_block_seq = if let Some(snap) = &you_block_snap {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                c.input_surface.compose().editor.document().edit_seq().hash(&mut h);
-                snap.cursor_line.hash(&mut h);
-                snap.cursor_col.hash(&mut h);
-                (snap.mode == EditMode::Insert).hash(&mut h);
-                snap.selection.hash(&mut h);
-                // Non-zero even for an empty just-opened block so the FIRST
-                // keystroke (edit_seq 0→1) is a genuine move off `u64::MAX`.
-                let v = h.finish();
-                if v == 0 { 1 } else { v }
-            } else {
-                0
-            };
+            let active_you_block_ix = c.view_model.active_you_block_ix;
+            // The placeholder's HEIGHT drives the dedicated list-item splice
+            // below: 0 when no block is active (no item, no splice owed), else a
+            // non-zero code of the row count (a keystroke that keeps the height
+            // leaves the list alone — the overlay repaints the text).
+            let you_block_seq = you_block_snap.as_ref().map_or(0, |yb| yb.rows as u64 + 1);
             // Parked You-blocks (rule 6): (anchor_line, read-only text lines) per
             // additional insertion point, rendered by the `YouBlock { parked: Some(i)
             // }` arm. Cheap; only when idle worksheet so it can't allocate mid-turn.
@@ -848,19 +858,6 @@ impl TranscriptView {
                 } else {
                     Vec::new()
                 };
-            // Measured wrap width (cols) of the compose's box — PARKED blocks render
-            // read-only with no `CaptureBounds` of their own, so they reuse this so
-            // they wrap at the real column width, not a narrow 40-col fallback (the
-            // "strange wordwrap length" once a block parks). 0 = unmeasured.
-            let you_wrap_cols = {
-                let w = c.input_surface.compose().bounds.get().2;
-                if w > 1.0 {
-                    (w / crate::CHATBOX_CHAR_W).floor().max(1.0) as usize
-                } else {
-                    0
-                }
-            };
-
             TranscriptPrep {
                 flat_items_arc,
                 gutter_tag_snap,
@@ -898,20 +895,23 @@ impl TranscriptView {
                 you_parked_snap,
                 you_wrap_cols,
                 you_block_seq,
+                active_you_block_ix,
                 provider_snap: c.provider,
             }
         });
 
-        // The compose's exact bounds are written only when the inline block
-        // paints. On the first render after `r`, they are necessarily zero; a
-        // hard-coded 40-column fallback made long seeded quotes render as a
-        // narrow strip and stay that way until another event invalidated the
-        // cached transcript. The transcript viewport is already measured by
-        // then, so it is the authoritative first-paint fallback.
-        let transcript_width_px =
-            f32::from(self.scroll.list_state.viewport_bounds().size.width);
-        let you_wrap_cols =
-            inline_you_block_wrap_cols(you_wrap_cols, transcript_width_px);
+        // D11: publish the layout the placeholder is sized for; the overlay
+        // paints at exactly this wrap width. If it moved (width change) while
+        // the block's height didn't, the cached overlay still needs a repaint:
+        // schedule it after this draw (never a mid-render notify).
+        let you_layout = YouBlockLayout {
+            cols: you_wrap_cols,
+            rows: you_block_snap.as_ref().map_or(0, |yb| yb.rows),
+        };
+        if self.you_block_layout.replace(you_layout) != you_layout {
+            let ybv = self.you_block_view.clone();
+            cx.defer(move |cx| ybv.update(cx, |_, cx| cx.notify()));
+        }
 
         // Per-flat-item raw line range for each `FlatItem::Block`, paired in the
         // SAME ascending order the renderer emits blocks (bug-0008). Lets the block
@@ -933,29 +933,16 @@ impl TranscriptView {
         // view-owned `TranscriptScroll`. The session borrow is dropped. ──
         self.scroll
             .reconcile_list(block_ranges_active, &flat_items_arc, edit_seq);
-        // The ACTIVE inline You-block is ONE list item whose content is driven by
-        // the COMPOSE buffer, not the transcript `edit_seq` — so `reconcile_list`
-        // (which keys the tail re-measure on `edit_seq`, and `FlatKey::YouBlock` on
-        // `parked` only) never marks it dirty when you type into it. GPUI caches
-        // rendered list items, so without an explicit splice it repaints the block
-        // at its STALE text: the recurring "/clear worksheet invisible" bug — the
-        // observe fires and `build_body` runs, but the typed char never appears
-        // until an unrelated event (jump bar, chatbox toggle) forces a splice. When
-        // the block's render-input hash moves, splice exactly its item so GPUI
-        // re-measures it. Targets `YouBlock { parked: None }` (the active block; a
-        // parked block's text is frozen). Serves UXI-TextEditing-1 — the caret + its text
-        // stay visible as you type. Pinned by
-        // `clear_worksheet_you_block_keystroke_splices_item`.
+        // The ACTIVE inline You-block is ONE list item — a PLACEHOLDER (D11; the
+        // block itself paints as a root-level overlay) whose height is driven by
+        // the COMPOSE buffer, not the transcript `edit_seq`, so `reconcile_list`
+        // (tail re-measure on `edit_seq`, `FlatKey::YouBlock` on `parked` only)
+        // never re-measures it when the draft grows. When the height code moves,
+        // splice exactly its item so gpui re-measures it (and the overlay slot
+        // follows). A keystroke that keeps the height changes nothing here.
         if you_block_seq != self.scroll.last_you_block_seq {
-            if let Some(yb_idx) = flat_items_arc
-                .iter()
-                .position(|it| matches!(it, FlatItem::YouBlock { parked: None }))
-            {
+            if let Some(yb_idx) = active_you_block_ix {
                 self.scroll.list_state.splice(yb_idx..yb_idx + 1, 1);
-                // Test/perf seam: a splice here IS the fix — it's the invalidation
-                // GPUI needs to repaint the You-block with the just-typed text.
-                // `clear_worksheet_you_block_keystroke_splices_item` asserts this
-                // count advances on the real keystroke path (RED when reverted).
                 record_render(YOU_BLOCK_SPLICE_LABEL);
             }
             self.scroll.last_you_block_seq = you_block_seq;
@@ -976,33 +963,13 @@ impl TranscriptView {
             // the doc-authoring feel (you type at the tail; earlier lines flow up),
             // and UXI-TextEditing-1 holds for any block height. Pinned by
             // `worksheet_tall_you_block_grows_caret_painted_in_viewport`.
-            let active_yb_item = flat_items_arc
-                .iter()
-                .position(|it| matches!(it, FlatItem::YouBlock { parked: None }));
             let reveal_caret_row = you_block_snap
                 .as_ref()
-                .filter(|yb| yb.focused && Some(target) == active_yb_item);
+                .filter(|yb| yb.focused && Some(target) == active_you_block_ix);
             if let Some(yb) = reveal_caret_row {
-                let wrap_cols = {
-                    let bw = yb.bounds.get().2;
-                    if bw > 1.0 {
-                        (bw / crate::CHATBOX_CHAR_W).floor().max(1.0) as usize
-                    } else {
-                        you_wrap_cols
-                    }
-                };
-                let (caret_vrow, _, _) = crate::compose_visual_metrics(
-                    &yb.lines,
-                    yb.cursor_line,
-                    yb.cursor_col,
-                    wrap_cols,
-                );
-                // Block chrome above the first content row (pt_2 + the "You" label).
-                const YB_HEADER_PX: f32 = 34.0;
-                const YB_LINE_H: f32 = 18.0;
-                let caret_off = YB_HEADER_PX + caret_vrow as f32 * YB_LINE_H;
+                let caret_off = YB_HEADER_PX + yb.caret_vrow as f32 * YB_ROW_H_PX;
                 let vh = f32::from(self.scroll.list_state.viewport_bounds().size.height);
-                let want_from_top = (vh - YB_LINE_H * 2.0).max(0.0);
+                let want_from_top = (vh - YB_ROW_H_PX * 2.0).max(0.0);
                 let offset = (caret_off - want_from_top).max(0.0);
                 self.scroll.list_state.scroll_to(gpui::ListOffset {
                     item_ix: target,
@@ -1018,16 +985,17 @@ impl TranscriptView {
             ranges.iter().any(|&(s, e)| line_idx >= s && line_idx < e)
         };
 
-        // UXI-AgentTile-11 (stage 2): the inline You-block snapshot is shared into the
-        // per-item render closure by refcount (it owns Vecs, so not `Copy`).
-        let you_block_snap = std::rc::Rc::new(you_block_snap);
+        // UXI-AgentTile-11 (stage 2): the parked You-blocks are shared into the
+        // per-item render closure by refcount (they own Vecs, so not `Copy`).
+        let you_block_rows = you_block_snap.as_ref().map_or(1, |yb| yb.rows);
+        let you_block_slot = self.you_block_slot.clone();
         let you_parked_snap = std::rc::Rc::new(you_parked_snap);
 
         let render_fn = {
             let flat_items = flat_items_arc.clone();
             let weak_self = weak_self.clone();
             let link_base_dir = link_base_dir.clone();
-            let you_block_snap = you_block_snap.clone();
+            let you_block_slot = you_block_slot.clone();
             let you_parked_snap = you_parked_snap.clone();
             let you_wrap_cols = you_wrap_cols;
             let lines_snap = lines_snap.clone();
@@ -1633,144 +1601,44 @@ impl TranscriptView {
                             .into_any_element()
                     }
                     FlatItem::YouBlock { parked } => {
-                        // UXI-AgentTile-11 rules 5/6: an inline You-block rendered INSIDE the
-                        // transcript at its anchor. `parked = None` is the ACTIVE block
-                        // (live compose snapshot, caret-bearing, measured width); a
-                        // `parked = Some(i)` is an additional insertion point shown
-                        // read-only from its stored text. Draft text always lives
-                        // OUTSIDE the transcript (Model C). Word-wrapped (UXI-AgentTile-9);
-                        // active caret on its visual row, windowed (UXI-TextEditing-1).
-                        let accent = cursor_color; // RED — the block caret
-                        // The ACTIVE (live-compose) block reads RED — border + label +
-                        // wash — so an in-progress turn is visually distinct from the
-                        // SENT turns above it, which keep the teal accent. A parked
-                        // (read-only) insertion block stays teal.
-                        let ws_accent = crate::screens::you_block_accent(
-                            parked.is_none(),
-                            cursor_color,          // deep red (at.cursor / jump_header)
-                            nc(at_snap.warm_accent), // TEAL — sent/parked border + label
-                        );
-                        let fg = self_editor_fg;
-                        let sel_bg = nc(at_snap.selection_bg);
-                        // (lines, caret_line, caret_col, mode, focused, selection, anchor_line)
-                        let active = parked.is_none();
-                        let bounds = you_block_snap.as_ref().as_ref().map(|yb| yb.bounds.clone());
-                        let (lines, caret_line, caret_col, mode, focused, selection, anchor_line) =
-                            match parked {
-                                None => match you_block_snap.as_ref() {
-                                    Some(yb) => (
-                                        &yb.lines,
-                                        yb.cursor_line,
-                                        yb.cursor_col,
-                                        yb.mode,
-                                        yb.focused,
-                                        yb.selection,
-                                        yb.anchor_line,
-                                    ),
-                                    None => return div().into_any_element(),
-                                },
-                                Some(i) => match you_parked_snap.get(*i) {
-                                    // Read-only: no caret (caret_line out of range), no sel.
-                                    Some((al, l)) => {
-                                        (l, usize::MAX, 0, EditMode::Normal, false, None, *al)
-                                    }
-                                    None => return div().into_any_element(),
-                                },
-                            };
-                        // Active block measures its own box; parked blocks (no bounds)
-                        // reuse the compose's measured column width so they wrap at the
-                        // real width, not a narrow 40-col fallback ("strange wordwrap").
-                        let box_w = bounds.as_ref().map(|b| b.get().2).unwrap_or(0.0);
-                        let wrap_cols = if box_w > 1.0 {
-                            (box_w / crate::CHATBOX_CHAR_W).floor().max(1.0) as usize
-                        } else {
-                            you_wrap_cols
-                        };
-                        // INTENT — co-authoring a document: the inline You-block renders
-                        // EVERY line and GROWS with its content. It is part of the doc
-                        // flow, never a fixed-height box that scrolls its own text out of
-                        // view. Keeping the caret visible is the TRANSCRIPT scroll's job
-                        // (reveal/follow the caret row below), not an internal window.
-                        // (Was windowed to 10 logical lines around the caret — the "You
-                        // div has limited space and scrolls after a while" bug. UXI-TextEditing-1
-                        // is now upheld by revealing the caret's row within the block, not
-                        // by truncating the block.)
-                        let mut inner = div().flex().flex_col().w_full().min_w_0();
-                        let row_style =
-                            crate::ChatboxRowStyle::compose(code_font_snap.clone(), fg, accent, sel_bg);
-                        for (i, line) in lines.iter().enumerate() {
-                            inner = inner.child(crate::build_chatbox_wrapped_line(
-                                line,
-                                focused && i == caret_line,
-                                caret_col,
-                                mode,
-                                selection,
-                                i,
-                                wrap_cols,
-                                &row_style,
-                            ));
+                        // UXI-AgentTile-11 rules 5/6: an inline You-block at its
+                        // anchor. Draft text always lives OUTSIDE the transcript
+                        // (Model C); word-wrapped (UXI-AgentTile-9).
+                        match parked {
+                            // D11: the ACTIVE block is a fixed-height PLACEHOLDER
+                            // here; `YouBlockView` paints the live draft over it
+                            // from the root (`slot_overlay`), so typing never
+                            // re-renders this cached transcript. Its height is
+                            // exact arithmetic over the shared layout.
+                            None => crate::overlay_slot(
+                                you_block_slot.clone(),
+                                crate::probe_bounds(
+                                    "you-block-slot",
+                                    div()
+                                        .w_full()
+                                        .h(px(you_block_height_px(you_block_rows)))
+                                        .into_any_element(),
+                                ),
+                            ),
+                            // A PARKED block is an additional insertion point,
+                            // shown read-only from its stored text (static — it
+                            // stays in the cached transcript).
+                            Some(i) => match you_parked_snap.get(*i) {
+                                Some((al, lines)) => you_block_element(
+                                    lines,
+                                    None,
+                                    EditMode::Normal,
+                                    None,
+                                    false,
+                                    cursor_line == *al,
+                                    you_wrap_cols,
+                                    &code_font_snap,
+                                    YouBlockColors::of(&at_snap, self_editor_fg),
+                                    None,
+                                ),
+                                None => div().into_any_element(),
+                            },
                         }
-                        // Nav-focus highlight: while navigating the transcript, the
-                        // block the cursor is on tints like an agent row (the cursor
-                        // is "on" a block when it sits on the block's anchor line).
-                        // `cursor_line` is `usize::MAX` off-nav, so this never lights
-                        // up during compose/idle.
-                        // you-div SCOPED-NORMAL indicator: when the block holds focus
-                        // in Normal mode (Esc-once: editing the reply with motions),
-                        // tint it with the accent and badge the label `You · NORMAL`,
-                        // so it's unmistakable you're editing THIS block (vs Insert,
-                        // vs the nav-focus tint). Insert keeps the plain `You`.
-                        let scoped_normal = focused && mode == EditMode::Normal;
-                        let row_bg: Hsla = if active && focused {
-                            // Light RED wash behind the live draft — slighter while
-                            // typing (Insert) than at rest (Normal). Marks the ACTIVE
-                            // block; sent blocks above stay teal. (Was teal; reverted to
-                            // red per request — a brighter red than the deep border red.)
-                            let mut h = crate::screens::worksheet_wash_red();
-                            h.a = crate::screens::worksheet_backdrop_alpha(mode);
-                            h
-                        } else if cursor_line == anchor_line {
-                            let mut h = nc(at_snap.dim);
-                            h.a = 0.2;
-                            h
-                        } else {
-                            rgba(0x00000000).into()
-                        };
-                        let label = if scoped_normal {
-                            SharedString::from("You · NORMAL")
-                        } else {
-                            SharedString::new_static("You")
-                        };
-                        let mut block = div()
-                            .flex()
-                            .flex_col()
-                            .w_full()
-                            .min_w_0()
-                            .pt_2()
-                            .pb_2()
-                            .pl_2()
-                            .border_l_2()
-                            .border_color(ws_accent)
-                            .bg(row_bg)
-                            .child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(ws_accent)
-                                    .font_family(code_font_snap.clone())
-                                    .child(label),
-                            );
-                        // Only the ACTIVE block measures its width (it owns the bounds
-                        // Cell that drives wrap_cols); parked blocks render plainly.
-                        block = match (active, bounds) {
-                            (true, Some(sink)) => block.child(crate::CaptureBounds {
-                                inner: inner.into_any_element(),
-                                sink,
-                                rerender_on_width_change: true,
-                            }),
-                            _ => block.child(inner),
-                        };
-                        crate::probe_bounds("you-block", block.into_any_element())
                     }
                 }
             }
@@ -1884,44 +1752,29 @@ struct TranscriptPrep {
     block_ranges_snap: Vec<(usize, usize)>,
     follow_tail: bool,
     pending_reveal_line: Option<usize>,
-    /// UXI-AgentTile-11 (stage 2): live snapshot of the inline You-block's draft for the
-    /// `FlatItem::YouBlock` render arm — the per-logical-line text, the caret
-    /// position, and the edit mode. `None` when no block is open.
+    /// UXI-AgentTile-11 (stage 2) / D11: what the ACTIVE You-block's placeholder
+    /// + caret reveal need (`None` when no block is active).
     you_block_snap: Option<YouBlockSnap>,
     you_parked_snap: Vec<(usize, Vec<String>)>,
     you_wrap_cols: usize,
     /// Active backend used for the agent-turn header label.
     provider_snap: yalda::acp_channel::AgentProvider,
-    /// Render-input hash of the ACTIVE You-block (compose text + caret + mode +
-    /// selection), or 0 when no block is active. The You-block is one list item
-    /// driven by the COMPOSE buffer, not the transcript `edit_seq`, so
-    /// `reconcile_list` can't see its content move. When this differs from
+    /// Height code of the ACTIVE You-block's placeholder (`rows + 1`), or 0 when
+    /// no block is active. When it differs from
     /// `TranscriptScroll::last_you_block_seq`, `build_body` splices that one item
-    /// so GPUI re-measures it instead of repainting the stale cached element (the
-    /// "/clear worksheet invisible" bug). See [`TranscriptScroll::last_you_block_seq`].
+    /// so gpui re-measures the resized placeholder.
     you_block_seq: u64,
+    /// The active You-block's flat-item index, recorded once per view-model
+    /// rebuild (`AgentViewModel::active_you_block_ix`).
+    active_you_block_ix: Option<usize>,
 }
 
-/// Per-frame snapshot of the inline You-block draft (the separate `Compose`),
-/// rendered inside the transcript at its anchor (UXI-AgentTile-11 rule 5, stage 2).
+/// What the transcript needs of the ACTIVE inline You-block (D11): its
+/// placeholder height (`rows` at the resolved wrap width) and, for the caret
+/// reveal, the caret's visual row within the block and whether it has focus.
+/// The block's content paints in `YouBlockView`.
 struct YouBlockSnap {
-    lines: Vec<String>,
-    cursor_line: usize,
-    cursor_col: usize,
-    mode: EditMode,
-    /// The doc line the block is anchored at (tail → the last line) — the transcript
-    /// nav cursor "is on" the block when it sits on this line, which drives the
-    /// focus highlight in nav, matching agent rows (UXI-AgentTile-11 nav feedback).
-    anchor_line: usize,
-    /// Whether the compose holds focus. The caret renders ONLY when focused — a
-    /// persisted (non-empty Esc) block shows no caret while the user navigates the
-    /// transcript, so there aren't two carets on screen (bug-hunt-2 B5).
+    rows: usize,
+    caret_vrow: usize,
     focused: bool,
-    /// The compose selection, so a visual selection inside the inline reply is
-    /// actually highlighted (bug-hunt-2 B6).
-    selection: Option<((usize, usize), (usize, usize))>,
-    /// Measured inner width sink (shared with the `Compose`) — written via
-    /// `CaptureBounds` during paint, read next frame to word-wrap at the real
-    /// column count (UXI-AgentTile-9), exactly like the bottom-panel chatbox.
-    bounds: std::rc::Rc<std::cell::Cell<(f32, f32, f32, f32)>>,
 }

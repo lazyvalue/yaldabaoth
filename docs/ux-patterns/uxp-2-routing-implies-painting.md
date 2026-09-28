@@ -18,6 +18,7 @@ its render gate from its routing.
 
 **Enforcement.** Drive the REAL key path, then assert paint:
 `verify_harness.rs::clear_worksheet_hole_types_and_paints`,
-`verify_harness.rs::clear_worksheet_you_block_keystroke_splices_item`.
+`verify_harness.rs::worksheet_inline_typing_rerenders_you_block_not_transcript`
+(since D11 the inline block paints as its own cached overlay, `YouBlockView`).
 
 **Realized by.** `UXI-AgentTile-12`.

@@ -106,6 +106,7 @@ mod system_console;
 mod telemetry;
 mod tool_body;
 mod transcript_view;
+mod you_block_view;
 #[cfg(test)]
 mod verify_harness;
 /// yux — reusable UX component layer (cached-view infra + view primitives).
@@ -139,6 +140,7 @@ pub(crate) use system_console::*;
 pub(crate) use telemetry::*;
 pub(crate) use tool_body::*;
 pub(crate) use transcript_view::*;
+pub(crate) use you_block_view::*;
 pub(crate) use yux::*;
 mod workspace;
 
@@ -3866,6 +3868,11 @@ impl YaldaGpuiView {
             let label = v.read(cx).perf_label;
             record_notify(label, reason);
             v.update(cx, |_tv, vcx| vcx.notify());
+            // D11: the active You-block overlay reads the same globals (theme,
+            // fonts) — push to it too.
+            let ybv = v.read(cx).you_block_view.clone();
+            record_notify(YOU_BLOCK_PERF_LABEL, reason);
+            ybv.update(cx, |_, ycx| ycx.notify());
         }
     }
 

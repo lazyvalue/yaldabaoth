@@ -291,6 +291,199 @@ impl gpui::Element for ListRowsOverlay {
     }
 }
 
+/// Where an inline overlay's placeholder landed in the frame it was last laid
+/// out: its window-space `bounds` and the `clip` (content mask) it painted
+/// under. Written by [`overlay_slot`] at prepaint, read by [`slot_overlay`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct OverlaySlot {
+    pub(crate) bounds: gpui::Bounds<Pixels>,
+    pub(crate) clip: gpui::Bounds<Pixels>,
+}
+
+/// Shared cell carrying an [`OverlaySlot`] from a (possibly cached) list body
+/// to the uncached parent that paints the overlay. `None` = the placeholder
+/// was not laid out (scrolled away / absent) the last time the body rendered.
+pub(crate) type OverlaySlotCell = Rc<Cell<Option<OverlaySlot>>>;
+
+/// Wrap a PLACEHOLDER element inside a virtualized list so its laid-out bounds
+/// (and clip) are recorded into `cell` at prepaint — the exact position the
+/// list chose, whatever its alignment or scroll model (non-uniform rows,
+/// bottom-pinned follow-tail). Pair with [`slot_overlay`].
+///
+/// The body that renders the placeholder must CLEAR the cell at the top of
+/// each render (so a placeholder that scrolled out of the laid-out range reads
+/// `None`); a cached body whose prepaint is reused leaves the cell untouched —
+/// correct, since nothing it laid out moved.
+pub(crate) fn overlay_slot(cell: OverlaySlotCell, child: gpui::AnyElement) -> gpui::AnyElement {
+    gpui::IntoElement::into_any_element(OverlaySlotSink { cell, child })
+}
+
+/// Paint `child` exactly over the placeholder recorded in `cell` (see
+/// [`overlay_slot`]), clipped like the placeholder — an "inline" surface that
+/// is NOT part of the list's (cached) render. The non-uniform-row sibling of
+/// [`list_rows_overlay`]: the agent transcript's inline You-block (D11) is one
+/// variable-height item in a bottom-aligned list, so its position is read
+/// back from the placeholder instead of computed.
+///
+/// Why: a child entity notifying INSIDE a cached body dirties the body too
+/// (gpui marks ancestors dirty), so a text input that must LOOK inline reserves
+/// its height with a placeholder and is painted by the (uncached) parent
+/// through this element. The parent must add it AFTER the body in tree order:
+/// its `prepaint` reads the slot the body's list settled this frame. Takes no
+/// layout space itself (absolute, zero-size); skips prepaint/paint entirely
+/// while the slot is absent or clipped away.
+pub(crate) fn slot_overlay(cell: OverlaySlotCell, child: gpui::AnyElement) -> gpui::AnyElement {
+    gpui::IntoElement::into_any_element(SlotOverlay { cell, child })
+}
+
+struct OverlaySlotSink {
+    cell: OverlaySlotCell,
+    child: gpui::AnyElement,
+}
+
+impl gpui::IntoElement for OverlaySlotSink {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl gpui::Element for OverlaySlotSink {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut gpui::Window,
+        cx: &mut gpui::App,
+    ) -> (gpui::LayoutId, ()) {
+        (self.child.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: gpui::Bounds<Pixels>,
+        _request_layout: &mut (),
+        window: &mut gpui::Window,
+        cx: &mut gpui::App,
+    ) {
+        self.cell.set(Some(OverlaySlot {
+            bounds,
+            clip: window.content_mask().bounds,
+        }));
+        self.child.prepaint(window, cx);
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: gpui::Bounds<Pixels>,
+        _request_layout: &mut (),
+        _prepaint: &mut (),
+        window: &mut gpui::Window,
+        cx: &mut gpui::App,
+    ) {
+        self.child.paint(window, cx);
+    }
+}
+
+struct SlotOverlay {
+    cell: OverlaySlotCell,
+    child: gpui::AnyElement,
+}
+
+impl gpui::IntoElement for SlotOverlay {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl gpui::Element for SlotOverlay {
+    type RequestLayoutState = ();
+    /// The clip, when the slot is (partly) visible this frame.
+    type PrepaintState = Option<gpui::Bounds<Pixels>>;
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut gpui::Window,
+        cx: &mut gpui::App,
+    ) -> (gpui::LayoutId, ()) {
+        let style = gpui::Style {
+            position: gpui::Position::Absolute,
+            ..gpui::Style::default()
+        };
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: gpui::Bounds<Pixels>,
+        _request_layout: &mut (),
+        window: &mut gpui::Window,
+        cx: &mut gpui::App,
+    ) -> Option<gpui::Bounds<Pixels>> {
+        let slot = self.cell.get()?;
+        if !slot.bounds.intersects(&slot.clip) {
+            return None;
+        }
+        self.child.layout_as_root(
+            gpui::size(
+                gpui::AvailableSpace::Definite(slot.bounds.size.width),
+                gpui::AvailableSpace::Definite(slot.bounds.size.height),
+            ),
+            window,
+            cx,
+        );
+        window.with_content_mask(Some(gpui::ContentMask { bounds: slot.clip }), |window| {
+            self.child.prepaint_at(slot.bounds.origin, window, cx)
+        });
+        Some(slot.clip)
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: gpui::Bounds<Pixels>,
+        _request_layout: &mut (),
+        clip: &mut Option<gpui::Bounds<Pixels>>,
+        window: &mut gpui::Window,
+        cx: &mut gpui::App,
+    ) {
+        if let Some(clip) = *clip {
+            window.with_content_mask(Some(gpui::ContentMask { bounds: clip }), |window| {
+                self.child.paint(window, cx)
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{compose_first_visible_line, uniform_rows_rect};
