@@ -31623,17 +31623,20 @@ fn edit_insert_delete_last_char_keeps_caret_at_eol(cx: &mut TestAppContext) {
     assert_eq!(col, 2, "Insert-mode caret stays at EOL after Delete");
 }
 
-/// Type `hello` into the chatbox compose through the REAL `handle_claude_key`
-/// path, step the caret back two columns, and put `XY` on the clipboard.
+/// Type `hello` into the You-block compose through the REAL `handle_claude_key`
+/// path, commit that insert session (`Esc`), re-enter Insert and step the
+/// caret back to column 3, and put `XY` on the clipboard.
 fn compose_hello_caret_at_3(
     cx: &mut TestAppContext,
 ) -> (gpui::Entity<YaldaGpuiView>, &mut gpui::VisualTestContext, crate::SessionId) {
     cx.update(crate::register_keymap);
     let (view, vcx) = boot_worksheet_nav(cx);
     let id = view.update(vcx, |v, _| v.focused_bound_session().expect("bound"));
-    // `i` opens the tail You-block in Insert (no undo group is opened — the
-    // compose Insert session is group-less), then type through the real path.
-    for k in ["i", "h", "e", "l", "l", "o", "left", "left"] {
+    // `i` opens the tail You-block in Insert (its insert session's undo group
+    // open — Q1), type, `Esc` commits "hello" as one undo step
+    // (the worksheet's 1st Esc keeps the caret at col 5), `i` starts a fresh
+    // session, `left left` → col 3.
+    for k in ["i", "h", "e", "l", "l", "o", "escape", "i", "left", "left"] {
         view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(k), w, cx));
     }
     view.update(vcx, |_, cx| {
@@ -31658,12 +31661,13 @@ fn compose_text_and_col(
 
 /// D1 on the REAL Cmd+V path (`cmd-v` → `PasteFromClipboard` →
 /// `paste_from_clipboard`): an Insert-mode paste lands AT the caret, the caret
-/// ends after the pasted text, and the paste is ONE undo step (the old
-/// char-by-char insert in the group-less chatbox Insert session recorded no
-/// undo at all, so `undo` left the pasted text in place).
+/// ends after the pasted text, and — as part of the insert session it was
+/// pasted in (Q1: compose Insert sessions now record undo) — `Esc u` removes
+/// exactly the paste, leaving the previously committed "hello".
 ///
-/// Negative control (observed RED): restore the per-char `insert_char` loop in
-/// `paste_from_clipboard` → after undo the compose still reads "helXYlo".
+/// Negative control (observed RED, pre-Q1): restore the per-char
+/// `insert_char` loop in `paste_from_clipboard` → after undo the compose still
+/// read "helXYlo".
 #[gpui::test]
 fn compose_cmd_v_pastes_at_caret_as_one_undo_step(cx: &mut TestAppContext) {
     let (view, vcx, id) = compose_hello_caret_at_3(cx);
@@ -31675,14 +31679,86 @@ fn compose_cmd_v_pastes_at_caret_as_one_undo_step(cx: &mut TestAppContext) {
         ("helXYlo".into(), 5),
         "paste lands at the caret; caret after the pasted run"
     );
-    view.update(vcx, |v, cx| {
-        v.with_session(id, cx, |c| c.input_surface.compose_mut().editor.undo())
-    });
+    for k in ["escape", "u"] {
+        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(k), w, cx));
+    }
     assert_eq!(
         compose_text_and_col(&view, vcx, id).0,
         "hello",
         "one undo removes exactly the paste"
     );
+}
+
+/// Text-editing Q1 (graph ls2 node q1-engine): typed compose text is
+/// undoable. The chatbox compose rests in Insert from construction, but no
+/// undo group was ever opened, so typed chars recorded nothing and `Esc u`
+/// left the draft in place. Real path: the real mode toggle, then every key
+/// through `handle_claude_key`. NEGATIVE CONTROL (observed RED): drop the
+/// `begin_insert` from `Compose::new` → the draft still reads "hello".
+#[gpui::test]
+fn chatbox_typed_text_is_undone_by_esc_u(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_worksheet_nav(cx);
+    let id = view.update(vcx, |v, _| v.focused_bound_session().expect("bound"));
+    view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
+    let chatbox = view.update(vcx, |v, cx| {
+        v.read_session(id, cx, |c| c.input_surface.is_chatbox()).unwrap()
+    });
+    assert!(chatbox, "toggled to the Message Box");
+    for k in ["h", "e", "l", "l", "o"] {
+        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(k), w, cx));
+    }
+    assert_eq!(compose_text_and_col(&view, vcx, id).0, "hello");
+    for k in ["escape", "u"] {
+        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(k), w, cx));
+    }
+    assert_eq!(compose_text_and_col(&view, vcx, id).0, "", "`Esc u` undoes the typed run");
+    // And it redoes.
+    view.update_in(vcx, |v, w, cx| {
+        let ctrl_r = gpui::KeyDownEvent {
+            keystroke: gpui::Keystroke {
+                modifiers: gpui::Modifiers { control: true, ..Default::default() },
+                key: "r".into(),
+                key_char: None,
+            },
+            is_held: false,
+        };
+        v.handle_claude_key(&ctrl_r, w, cx)
+    });
+    assert_eq!(compose_text_and_col(&view, vcx, id).0, "hello", "ctrl-r redoes it");
+}
+
+/// Q1: in a worksheet You-block, `Esc u` first undoes the typed reply (the
+/// block stays open, still focused) and only the NEXT `u` pops the empty block
+/// (UXI-AgentTile-24). Before the fix the typing recorded no undo, so the
+/// first `u` found nothing to undo and popped the block, discarding the reply.
+/// NEGATIVE CONTROL (observed RED): drop the `begin_insert` from BOTH
+/// `Compose::new` and `Compose::enter_insert` → the first `u` pops the block.
+#[gpui::test]
+fn worksheet_block_esc_u_undoes_typing_before_popping(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_worksheet_nav(cx);
+    let id = view.update(vcx, |v, _| v.focused_bound_session().expect("bound"));
+    for k in ["i", "h", "e", "l", "l", "o", "escape", "u"] {
+        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(k), w, cx));
+    }
+    let state = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.update(vcx, |v, cx| {
+            v.read_session(id, cx, |c| {
+                (c.input_surface.compose().text(), c.you_block_open, c.focus)
+            })
+            .unwrap()
+        })
+    };
+    assert_eq!(
+        state(&view, vcx),
+        (String::new(), true, crate::AgentFocus::Compose),
+        "first `u` undoes the typed reply; the block stays open"
+    );
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("u"), w, cx));
+    let (_, open, focus) = state(&view, vcx);
+    assert!(!open, "the next `u` pops the now-empty block");
+    assert_eq!(focus, crate::AgentFocus::Transcript);
 }
 
 /// D1 on `paste_into_compose` (the agent key-handler's Cmd+V branch): in

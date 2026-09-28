@@ -2684,7 +2684,16 @@ impl PendingImage {
 pub(crate) const CHATBOX_CHAR_W: f32 = 8.0;
 
 impl Compose {
+    /// A fresh, empty compose resting in Insert — with its insert session's
+    /// undo group OPEN, so the text typed into it is undoable (`Esc u`).
+    /// (Q1: it used to rest in Insert with no group, recording nothing.)
     pub(crate) fn new() -> Self {
+        let mut c = Self::bare();
+        c.editor.begin_insert();
+        c
+    }
+
+    fn bare() -> Self {
         Self {
             editor: Editor::new(String::new(), std::path::PathBuf::from("*compose*")),
             mode: EditMode::Insert,
@@ -2788,11 +2797,11 @@ impl Compose {
     }
 
     /// A fresh compose seeded with `text` (cursor at the end). Used on restore to
-    /// re-apply a persisted draft, and on the not-delivered resubmit path.
+    /// re-apply a persisted draft, and on the not-delivered resubmit path. The
+    /// seed is the baseline (not undoable), as it always was; typing after it
+    /// is (Q1).
     pub(crate) fn seeded(text: &str) -> Self {
-        let mut c = Self::new();
-        c.editor.insert_str(text);
-        c
+        Self::seeded_committed(text)
     }
 
     /// Like [`seeded`], but the seed is the compose's **committed baseline** — it
@@ -2802,13 +2811,14 @@ impl Compose {
     /// once the user's own typing (if any) has been undone (UXI-AgentTile-24).
     /// Cursor rests at the end of the seed (like `seeded`).
     pub(crate) fn seeded_committed(text: &str) -> Self {
-        let mut c = Self::new();
+        let mut c = Self::bare();
         c.editor = Editor::new(text.to_string(), std::path::PathBuf::from("*compose*"));
         c.render_cache.replace(None);
         let last = c.editor.document().line_count().saturating_sub(1);
         let col = c.editor.document().line_len_chars(last);
         c.editor.cursor_mut().line = last;
         c.editor.cursor_mut().col = col;
+        c.editor.begin_insert();
         c
     }
 
@@ -2826,7 +2836,15 @@ impl Compose {
         let col = self.editor.document().line_len_chars(last);
         self.editor.cursor_mut().line = last;
         self.editor.cursor_mut().col = col;
+        self.enter_insert();
+    }
+
+    /// Put the compose in Insert with its insert session's undo group open
+    /// (Q1: the typed run is one undo step). The one door for "compose →
+    /// Insert"; a no-op on the group if one is already open (B1).
+    pub(crate) fn enter_insert(&mut self) {
         self.mode = EditMode::Insert;
+        self.editor.begin_insert();
     }
 }
 
@@ -5002,7 +5020,7 @@ impl AgentState {
             self.you_block_open = true;
             self.you_block_anchor = None; // tail
             self.focus = AgentFocus::Compose;
-            self.input_surface.compose_mut().mode = EditMode::Insert;
+            self.input_surface.compose_mut().enter_insert();
         } else {
             self.close_you_block();
             self.focus = AgentFocus::Transcript;
@@ -5247,7 +5265,7 @@ impl AgentState {
             self.you_block_anchor = None;
         }
         // else: illegal caret while a block is open → resume the active block.
-        self.input_surface.compose_mut().mode = EditMode::Insert;
+        self.input_surface.compose_mut().enter_insert();
         self.focus = AgentFocus::Compose;
         self.pending_reveal_cursor = true;
     }
@@ -5318,7 +5336,7 @@ impl AgentState {
         // so the first `u` pops the block rather than erasing the quotation.
         self.input_surface =
             InputSurface::with_committed_draft(InputModeKind::Worksheet, &format!("re\n{quote}\n"));
-        self.input_surface.compose_mut().mode = EditMode::Insert;
+        self.input_surface.compose_mut().enter_insert();
         self.focus = AgentFocus::Compose;
         self.pending_reveal_cursor = true;
         true
