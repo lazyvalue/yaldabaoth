@@ -370,7 +370,8 @@ impl TranscriptView {
             // moved. If the user types after /clear and this prints "moved=NONE"
             // (no re-render) while inline-active flips, the keystroke isn't busting
             // the cache — the invisible-text bug, caught on the REAL path.
-            {
+            // D9: gated before the args are built (runs on every observe fire).
+            if crate::clear_log_enabled() {
                 let c = &session.read(cx).state;
                 crate::clear_log(&format!(
                     "transcript OBSERVE: moved={:?} inline_active={} focus_compose={} \
@@ -714,17 +715,20 @@ impl TranscriptView {
             // ACTUALLY builds — whether a live inline YouBlock row is present, the
             // memo hit/miss, and the gate. If a keystroke leaves `has_you_block=false`
             // while inline-active, the render (not the gate) is the break.
-            let has_you_block = flat_items_arc
-                .iter()
-                .any(|it| matches!(it, FlatItem::YouBlock { parked: None }));
-            crate::clear_log(&format!(
-                "build_body: inline_active={} focus_compose={} you_block_open={} \
-                 has_YouBlock_row={has_you_block} flat_items={} memo_hit={memo_hit} fp={view_model_fp}",
-                c.inline_you_block_active(),
-                c.focus == AgentFocus::Compose,
-                c.you_block_open,
-                flat_items_arc.len(),
-            ));
+            // D9: gated first — the YouBlock scan is O(flat items) per build.
+            if crate::clear_log_enabled() {
+                let has_you_block = flat_items_arc
+                    .iter()
+                    .any(|it| matches!(it, FlatItem::YouBlock { parked: None }));
+                crate::clear_log(&format!(
+                    "build_body: inline_active={} focus_compose={} you_block_open={} \
+                     has_YouBlock_row={has_you_block} flat_items={} memo_hit={memo_hit} fp={view_model_fp}",
+                    c.inline_you_block_active(),
+                    c.focus == AgentFocus::Compose,
+                    c.you_block_open,
+                    flat_items_arc.len(),
+                ));
+            }
 
             let new_count = flat_items_arc.len();
             let block_ranges_active = !c.block_ranges.is_empty();

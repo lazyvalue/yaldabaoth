@@ -6607,3 +6607,90 @@ fn topic_query_refreshes_once_per_opening() {
         "a later percent query starts a fresh catalog request",
     );
 }
+
+/// D7/D10 (text-editing review): the copy-free slash/topic queries keep the
+/// exact semantics of the old whole-draft scans on the edges the rewrite
+/// touches — multi-line drafts, caret on a later line, line-start carets, and
+/// the name-dedup order of the popup rows (local shadows agent, first wins).
+#[test]
+fn slash_and_topic_queries_are_draft_copy_free_but_equivalent() {
+    use crate::agent::AgentState;
+    use yalda::acp_channel::AgentCommand;
+
+    let mut s = AgentState::new_for_test();
+    let set = |s: &mut AgentState, text: &str| s.input_surface.compose_mut().set_recalled(text);
+
+    // Slash: single line only; a trailing newline or second line disqualifies.
+    set(&mut s, "/co\n");
+    assert_eq!(s.slash_query(), None, "a newline ends the bare token");
+    set(&mut s, "/co\nmore");
+    assert_eq!(s.slash_query(), None, "multi-line drafts are not slash tokens");
+    set(&mut s, " /co");
+    assert_eq!(s.slash_query(), None, "the slash must be the first char");
+    set(&mut s, "");
+    assert_eq!(s.slash_query(), None);
+    set(&mut s, "/résumé");
+    assert_eq!(s.slash_query().as_deref(), Some("résumé"));
+
+    // Topic: caret on line 2; indices are GLOBAL char offsets and the token
+    // never crosses the newline.
+    set(&mut s, "first line\nsee %proj/x now");
+    {
+        let cb = s.input_surface.compose_mut();
+        cb.editor.cursor_mut().line = 1;
+        cb.editor.cursor_mut().col = 9; // right after `%proj`
+    }
+    let q = s.topic_query().expect("percent token on the caret line");
+    assert_eq!(q.text, "proj/x");
+    assert_eq!((q.start, q.end), (15, 22));
+    // Caret at the start of a line directly after a `%token` on the previous
+    // line must not pick that token up across the `\n`.
+    set(&mut s, "%prev\nnext");
+    {
+        let cb = s.input_surface.compose_mut();
+        cb.editor.cursor_mut().line = 1;
+        cb.editor.cursor_mut().col = 0;
+    }
+    assert!(s.topic_query().is_none(), "tokens never span lines");
+    // Caret at the very start of a `%` token on line 2.
+    set(&mut s, "x\n%abc");
+    {
+        let cb = s.input_surface.compose_mut();
+        cb.editor.cursor_mut().line = 1;
+        cb.editor.cursor_mut().col = 0;
+    }
+    let q = s.topic_query().expect("caret at token start");
+    assert_eq!((q.text.as_str(), q.start, q.end), ("abc", 2, 6));
+
+    // Popup rows: local `/clear` shadows the agent's, and an agent duplicate
+    // collapses to its first occurrence — same order as `slash_commands()`.
+    let cmd = |n: &str, d: &str| AgentCommand {
+        name: n.into(),
+        description: d.into(),
+    };
+    s.available_commands = vec![
+        cmd("clear", "agent clear"),
+        cmd("compact", "first"),
+        cmd("compact", "dup"),
+        cmd("review", "r"),
+    ];
+    set(&mut s, "/c");
+    let rows = s.slash_popup_rows();
+    let expected: Vec<AgentCommand> = s
+        .slash_commands()
+        .into_iter()
+        .filter(|c| c.name.starts_with('c'))
+        .collect();
+    assert_eq!(
+        rows.iter()
+            .map(|c| (c.name.as_str(), c.description.as_str()))
+            .collect::<Vec<_>>(),
+        expected
+            .iter()
+            .map(|c| (c.name.as_str(), c.description.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(rows.len(), 2);
+    assert_ne!(rows[0].description, "agent clear", "local /clear wins");
+    assert_eq!(rows[1].description, "first", "first duplicate wins");
+}

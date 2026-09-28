@@ -69,6 +69,121 @@ fn prompt_rejected_settles_agent_turn_idle(cx: &mut TestAppContext) {
     }));
 }
 
+/// REGRESSION (D4, text-editing review): a rejected prompt's text is put back
+/// in the compose in the WORKSHEET too, not only the chatbox, and — since an
+/// idle worksheet draft is only visible as a You-block — it lands in a visible,
+/// typeable tail block. Drives the REAL reducer (`apply_server_batch` with a
+/// `PromptRejected` notification).
+///
+/// Negative control: restore the `chatbox_mut()`-gated restore → in Worksheet
+/// the compose stays empty → the text assert fails RED.
+#[gpui::test]
+fn prompt_rejected_restores_draft_in_worksheet(cx: &mut TestAppContext) {
+    use crate::{AgentFocus, InputModeKind, InputSurface};
+    use crate::TurnPhase;
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let (view, vcx, id, _session) = boot_with_transcript(cx);
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| {
+            c.input_surface = InputSurface::new(InputModeKind::Worksheet);
+            c.focus = AgentFocus::Transcript;
+            c.turn_phase = TurnPhase::begin(std::time::Instant::now());
+        });
+        v.apply_server_batch(
+            vec![ServerNotification::PromptRejected {
+                session_id: "S1".into(),
+                reason: "agent disconnected".into(),
+                text: "please retry".into(),
+            }],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    let (text, worksheet, visible) = view.read_with(vcx, |v, cx| {
+        v.read_session(id, cx, |c| {
+            (
+                c.input_surface.compose().text(),
+                !c.input_surface.is_chatbox(),
+                c.inline_you_block_active(),
+            )
+        })
+        .expect("session")
+    });
+    assert!(worksheet, "placement stays Worksheet");
+    assert_eq!(text, "please retry", "the rejected text is restored in Worksheet");
+    assert!(visible, "the restored worksheet draft is a visible inline You-block");
+}
+
+/// REGRESSION (D3, text-editing review): a draft typed since the last ring save
+/// survives Quit. Typing never saves the ring, so the app-quit hook must. Types
+/// the draft through REAL keystrokes, proves nothing persisted it yet, then runs
+/// the REAL `on_app_quit` hook body and reads the on-disk sessions file back
+/// (redirected to a tempdir — never `~/.yalda`).
+///
+/// Negative control: drop `self.save_agent_ring(cx)` from `on_app_quit_hook` →
+/// the file never carries the draft → the final assert fails RED.
+#[gpui::test]
+fn app_quit_hook_persists_unsaved_compose_draft(cx: &mut TestAppContext) {
+    use crate::{AgentFocus, EditMode, InputModeKind, InputSurface};
+    use crate::persist::{ACP_PERSIST_PATH_OVERRIDE, load_persisted_acp_sessions};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("acp_sessions.json");
+    let cwd = std::env::current_dir().expect("cwd");
+    cx.update(crate::register_keymap);
+    let (view, vcx, id, _session) = boot_with_transcript(cx);
+    ACP_PERSIST_PATH_OVERRIDE.with(|c| *c.borrow_mut() = Some(file.clone()));
+
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| {
+            c.input_surface = InputSurface::new(InputModeKind::Chatbox);
+            c.input_surface.compose_mut().mode = EditMode::Insert;
+            c.focus = AgentFocus::Compose;
+        });
+        // Baseline save (as any earlier session mutation would have done).
+        v.save_agent_ring(cx);
+    });
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("h e l l o");
+    vcx.run_until_parked();
+
+    let typed = view.read_with(vcx, |v, cx| {
+        v.read_session(id, cx, |c| c.input_surface.compose().text())
+            .expect("session")
+    });
+    assert_eq!(typed, "hello", "keystrokes reached the compose");
+    let draft_of = |slots: Vec<crate::persist::PersistedSlot>| {
+        slots
+            .into_iter()
+            .find(|s| s.id.as_str() == "S1")
+            .and_then(|s| s.compose_draft)
+    };
+    assert_eq!(
+        draft_of(load_persisted_acp_sessions(&cwd)),
+        None,
+        "non-vacuous: typing alone has not persisted the draft"
+    );
+
+    view.update(vcx, |v, cx| v.on_app_quit_hook(cx));
+    let persisted = draft_of(load_persisted_acp_sessions(&cwd));
+    ACP_PERSIST_PATH_OVERRIDE.with(|c| *c.borrow_mut() = None);
+    assert_eq!(
+        persisted.as_deref(),
+        Some("hello"),
+        "the quit hook persists the draft typed since the last ring save"
+    );
+    // The atomic write (tmp + rename) leaves no temp file behind.
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        .expect("read tempdir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "acp_sessions.json")
+        .collect();
+    assert!(leftovers.is_empty(), "no temp files left behind: {leftovers:?}");
+}
+
 /// A detach is another terminal lifecycle event: the transport is gone, so a
 /// locally awaiting turn cannot remain live after the notification is folded.
 #[gpui::test]
@@ -18703,6 +18818,47 @@ fn slash_popup_filters_navigates_and_accepts(cx: &mut TestAppContext) {
     assert!(rows(&view, vcx).is_empty(), "popup closes after accept");
 }
 
+/// D7 (text-editing review): `handle_claude_key` detects "this keystroke edited
+/// the draft" by the compose's edit generation instead of copying the draft
+/// before + after. Pins the behavior that detection drives: after an Esc-dismiss,
+/// a caret-only key keeps the popup dismissed, while a real edit un-dismisses
+/// and re-filters it (UXI-AgentTile-42). Drives the REAL `handle_claude_key`.
+///
+/// Negative control: force `edited = false` → the edit no longer un-dismisses →
+/// the final assert fails RED.
+#[gpui::test]
+fn slash_popup_undismisses_only_on_a_real_edit(cx: &mut TestAppContext) {
+    use crate::agent::{AgentFocus, InputSurface};
+
+    let (view, vcx, id, _s) = boot_with_transcript(cx);
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| {
+            c.input_surface = InputSurface::with_draft(crate::InputModeKind::Chatbox, "");
+            c.focus = AgentFocus::Compose;
+        });
+    });
+    let key = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext, k: &str| {
+        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(k), w, cx));
+    };
+    let open = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.read_with(vcx, |v, cx| {
+            v.read_session(id, cx, |c| !c.slash_popup_rows().is_empty())
+                .unwrap()
+        })
+    };
+
+    key(&view, vcx, "/");
+    key(&view, vcx, "c");
+    assert!(open(&view, vcx), "`/c` opens the popup");
+    key(&view, vcx, "escape");
+    assert!(!open(&view, vcx), "Esc dismisses it");
+    key(&view, vcx, "left");
+    assert!(!open(&view, vcx), "a caret-only key is not an edit — stays dismissed");
+    key(&view, vcx, "right");
+    key(&view, vcx, "l");
+    assert!(open(&view, vcx), "a real edit un-dismisses and re-filters (`/cl`)");
+}
+
 /// UXI-AgentTile-42 (n3b, PAINT): the slash popup paints ABOVE the compose box when
 /// the draft is a bare slash token, and is absent when it isn't. Layout probe.
 ///
@@ -18793,7 +18949,7 @@ fn topic_popup_message_box_navigates_and_accepts_without_submit(cx: &mut TestApp
     use crate::agent::{AgentFocus, InputSurface};
     let (view, vcx, id, _s) = boot_with_transcript(cx);
     view.update(vcx, |v, cx| {
-        v.topic_completions = test_topic_bindings();
+        v.topic_completions = test_topic_bindings().into();
         v.with_session(id, cx, |c| {
             c.sent_history = vec!["old message".into()];
             c.input_surface =
@@ -18877,7 +19033,7 @@ fn topic_popup_worksheet_accepts_and_paints(cx: &mut TestAppContext) {
     use crate::agent::{AgentFocus, InputSurface};
     let (view, vcx, id, _s) = boot_with_transcript(cx);
     view.update(vcx, |v, cx| {
-        v.topic_completions = test_topic_bindings();
+        v.topic_completions = test_topic_bindings().into();
         v.with_session(id, cx, |c| {
             c.input_surface =
                 InputSurface::with_draft(crate::InputModeKind::Worksheet, "route %projects/cog/m");
@@ -18919,7 +19075,7 @@ fn topic_popup_percent_opening_refreshes_stale_catalog(cx: &mut TestAppContext) 
     use crate::agent::{AgentFocus, InputSurface};
     let (view, vcx, id, _s) = boot_with_transcript(cx);
     view.update(vcx, |v, cx| {
-        v.topic_completions = test_topic_bindings();
+        v.topic_completions = test_topic_bindings().into();
         v.with_session(id, cx, |c| {
             c.input_surface = InputSurface::with_draft(crate::InputModeKind::Chatbox, "");
             c.focus = AgentFocus::Compose;
@@ -18936,7 +19092,7 @@ fn topic_popup_percent_opening_refreshes_stale_catalog(cx: &mut TestAppContext) 
     );
 
     key(&view, vcx, "backspace");
-    view.update(vcx, |v, _cx| v.topic_completions = test_topic_bindings());
+    view.update(vcx, |v, _cx| v.topic_completions = test_topic_bindings().into());
     key(&view, vcx, "%");
     assert!(
         view.read_with(vcx, |v, _cx| v.topic_completions.is_empty()),

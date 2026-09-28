@@ -14,7 +14,7 @@ use super::*;
 /// the /clear causal chain (keystroke → observe → build_body → splice).
 pub(crate) fn clear_log(msg: &str) {
     use std::io::Write;
-    if std::env::var_os("YALDA_CLEAR_DEBUG").is_none() {
+    if !clear_log_enabled() {
         return;
     }
     if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -28,6 +28,27 @@ pub(crate) fn clear_log(msg: &str) {
             .unwrap_or(0);
         let _ = writeln!(f, "{t} {msg}");
     }
+}
+
+/// Whether `clear_log` diagnostics are on (`YALDA_CLEAR_DEBUG` set), read once
+/// and cached. Call sites on hot paths (every keystroke / observe / build_body)
+/// MUST check this BEFORE building their message: the `format!` arguments
+/// themselves (draft copies, O(transcript) scans) are the cost, not the write
+/// (D9). Use via [`clear_log!`](crate::clear_log!), which does exactly that.
+pub(crate) fn clear_log_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("YALDA_CLEAR_DEBUG").is_some())
+}
+
+/// `clear_log!("fmt", args…)` — logs via [`clear_log`] but evaluates the format
+/// arguments only when [`clear_log_enabled`] (D9: zero cost when logging is off).
+#[macro_export]
+macro_rules! clear_log {
+    ($($arg:tt)*) => {
+        if $crate::clear_log_enabled() {
+            $crate::clear_log(&format!($($arg)*));
+        }
+    };
 }
 
 /// Domain newtype for a tool-call identity (Finding 7, parse-don't-validate).
@@ -2242,9 +2263,10 @@ impl InputSurface {
     pub(crate) fn compose_mut(&mut self) -> &mut Compose {
         &mut self.compose
     }
-    /// Back-compat shim: `Some` only in Chatbox mode. Retained for the
-    /// not-delivered resubmit path, which only refills the box in chatbox mode.
-    /// New code uses the total `compose()`/`compose_mut()`.
+    /// Back-compat shim: `Some` only in Chatbox mode. Test-only now — the
+    /// not-delivered resubmit path restores in both placements (D4). New code
+    /// uses the total `compose()`/`compose_mut()`.
+    #[cfg(test)]
     pub(crate) fn chatbox_mut(&mut self) -> Option<&mut Compose> {
         if self.is_chatbox() {
             Some(&mut self.compose)
@@ -2628,6 +2650,19 @@ impl Compose {
 
     pub(crate) fn text(&self) -> String {
         self.editor.document().full_text()
+    }
+
+    /// Whether the draft is empty or whitespace-only — `text().trim().is_empty()`
+    /// without copying the rope (D7: this is asked on every keystroke).
+    pub(crate) fn is_blank(&self) -> bool {
+        self.editor.document().is_blank()
+    }
+
+    /// The draft's edit generation (`Document::edit_seq`): equal values across
+    /// two observations guarantee identical text, so a keystroke's "did this
+    /// edit the draft?" check needs no before/after copies (D7).
+    pub(crate) fn edit_seq(&self) -> u64 {
+        self.editor.document().edit_seq()
     }
 
     /// Recompute the caret-containment window from the CURRENT editor state and
@@ -4129,6 +4164,9 @@ impl AgentState {
     /// The full slash-command list for the compose autocomplete popup
     /// (UXI-AgentTile-42): the local commands (`/clear`) followed by the agent's
     /// advertised `available_commands`, de-duplicated by name (local wins).
+    /// Test-only reference: `slash_popup_rows` applies the same order + dedup
+    /// while cloning only the matching rows (D10).
+    #[cfg(test)]
     pub(crate) fn slash_commands(&self) -> Vec<yalda::acp_channel::AgentCommand> {
         let mut out = Self::local_slash_commands();
         for c in &self.available_commands {
@@ -4145,8 +4183,14 @@ impl AgentState {
     /// single line, no space/newline) — e.g. `/co` ⇒ `Some("co")`, `/` ⇒
     /// `Some("")`, `hello` / `/co x` / `a/b` ⇒ `None`.
     pub(crate) fn slash_query(&self) -> Option<String> {
-        let text = self.input_surface.compose().text();
-        let rest = text.strip_prefix('/')?;
+        // D7: answered on every keystroke, so reject without copying the draft —
+        // an ordinary draft fails the first-char probe in O(1). Only a real
+        // single-line `/token` is scanned, stopping at the first whitespace.
+        let rope = self.input_surface.compose().editor.document().rope();
+        if rope.get_char(0) != Some('/') || rope.len_lines() != 1 {
+            return None;
+        }
+        let rest = rope.slice(1..);
         if rest.chars().any(char::is_whitespace) {
             return None;
         }
@@ -4167,10 +4211,20 @@ impl AgentState {
             return Vec::new();
         };
         let q = query.to_ascii_lowercase();
-        self.slash_commands()
-            .into_iter()
-            .filter(|c| c.name.to_ascii_lowercase().starts_with(&q))
-            .collect()
+        // D10: filter BEFORE cloning — same order + name-dedup (first wins, so
+        // local commands shadow the agent's) as `slash_commands()`, but only the
+        // matching rows are cloned. Dedup commutes with the prefix filter since
+        // both depend only on the name.
+        let locals = Self::local_slash_commands();
+        let mut out: Vec<yalda::acp_channel::AgentCommand> = Vec::new();
+        for c in locals.iter().chain(self.available_commands.iter()) {
+            if c.name.to_ascii_lowercase().starts_with(&q)
+                && !out.iter().any(|e| e.name == c.name)
+            {
+                out.push(c.clone());
+            }
+        }
+        out
     }
 
     /// Return the percent-triggered, whitespace-delimited token containing the
@@ -4185,31 +4239,36 @@ impl AgentState {
         if compose.mode != EditMode::Insert {
             return None;
         }
-        let text = compose.text();
-        let chars: Vec<char> = text.chars().collect();
+        // D7: scan only the caret's token on the caret line — never copy the
+        // draft. A token is whitespace-delimited and `\n` is whitespace, so it
+        // can never span lines; walking the rope in place is equivalent to the
+        // old whole-draft `Vec<char>` scan.
+        let doc = compose.editor.document();
+        let rope = doc.rope();
         let cursor = compose.editor.cursor();
-        let line = cursor
-            .line
-            .min(compose.editor.document().line_count().saturating_sub(1));
-        let caret = compose.editor.document().rope().line_to_char(line)
-            + cursor
-                .col
-                .min(compose.editor.document().line_len_chars(line));
-        let mut start = caret.min(chars.len());
-        while start > 0 && !chars[start - 1].is_whitespace() {
+        let line = cursor.line.min(doc.line_count().saturating_sub(1));
+        let line_start = rope.line_to_char(line);
+        let caret = line_start + cursor.col.min(doc.line_len_chars(line));
+        let mut start = caret;
+        let mut back = rope.chars_at(caret);
+        while let Some(ch) = back.prev() {
+            if ch.is_whitespace() {
+                break;
+            }
             start -= 1;
         }
-        let mut end = caret.min(chars.len());
-        while end < chars.len() && !chars[end].is_whitespace() {
+        let mut end = caret;
+        for ch in rope.chars_at(caret) {
+            if ch.is_whitespace() {
+                break;
+            }
             end += 1;
         }
-        if start == end {
+        if start == end || rope.char(start) != '%' {
             return None;
         }
-        let token: String = chars[start..end].iter().collect();
-        let prefix = token.strip_prefix('%')?;
         Some(TopicQuery {
-            text: prefix.to_string(),
+            text: rope.slice(start + 1..end).to_string(),
             start,
             end,
         })
@@ -4839,7 +4898,7 @@ impl AgentState {
         if self.input_surface.is_chatbox() {
             self.close_you_block();
             self.focus = AgentFocus::Compose;
-        } else if fresh || !self.input_surface.compose().text().trim().is_empty() {
+        } else if fresh || !self.input_surface.compose().is_blank() {
             // Open a VISIBLE tail block AND make it immediately TYPEABLE (focus=Compose,
             // Insert): a fresh/cleared worksheet is a blank doc you write in, so typing
             // must land + be visible with NO `i` (the "can't see anything I type after
@@ -4911,7 +4970,7 @@ impl AgentState {
             // idle. If the user typed a steer that wasn't sent, DON'T lose it —
             // carry it over as a tail You-block (so it stays visible + editable);
             // otherwise rest in transcript navigation. (bug-hunt 6 follow-through.)
-            if self.input_surface.compose().text().trim().is_empty() {
+            if self.input_surface.compose().is_blank() {
                 self.close_you_block();
                 self.focus = AgentFocus::Transcript;
             } else {

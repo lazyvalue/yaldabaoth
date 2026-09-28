@@ -2089,8 +2089,10 @@ struct YaldaGpuiView {
     transcript_views: HashMap<SessionId, Entity<TranscriptView>>,
     /// Installation-wide Cog Topic address catalog for Agent compose
     /// autocomplete (UXI-AgentTile-43). Refreshed off the paint thread for every
-    /// newly opened percent query and shared by every Agent session.
-    topic_completions: Vec<CogTopicBinding>,
+    /// newly opened percent query and shared by every Agent session. An `Rc`
+    /// slice so the compose key path shares it per keystroke instead of deep-
+    /// cloning the catalog (D8).
+    topic_completions: std::rc::Rc<[CogTopicBinding]>,
     topic_completions_generation: u64,
     /// Scroll state for the root-level jump panel (jump-panel;
     /// spec-jump-panel.md). The panel itself is rendered inline (it's cheap —
@@ -2237,7 +2239,7 @@ impl YaldaGpuiView {
             sessions: AgentSessions::new(),
             agent_roster: AgentRoster::default(),
             transcript_views: HashMap::new(),
-            topic_completions: Vec::new(),
+            topic_completions: std::rc::Rc::from([]),
             topic_completions_generation: 0,
             jump_panel_scroll: ScrollHandle::new(),
             jump_panel_visible: true,
@@ -2310,7 +2312,7 @@ impl YaldaGpuiView {
             sessions: AgentSessions::new(),
             agent_roster: AgentRoster::default(),
             transcript_views: HashMap::new(),
-            topic_completions: Vec::new(),
+            topic_completions: std::rc::Rc::from([]),
             topic_completions_generation: 0,
             jump_panel_scroll: ScrollHandle::new(),
             jump_panel_visible: true,
@@ -3131,7 +3133,7 @@ impl YaldaGpuiView {
         if let Some(tile) = self.agent_tile_mut() {
             tile.bind(id);
         }
-        crate::clear_log(&format!("show_local_session: new_id={id:?} bound to tile"));
+        crate::clear_log!("show_local_session: new_id={id:?} bound to tile");
         id
     }
 
@@ -3472,6 +3474,9 @@ impl YaldaGpuiView {
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::null());
+        // D3: persist drafts BEFORE spawning the successor — it loads the
+        // sessions file at startup, which can race the quit-hook save.
+        self.save_agent_ring(cx);
         match cmd.spawn() {
             Ok(_) => cx.quit(),
             Err(e) => {
@@ -3601,6 +3606,9 @@ impl YaldaGpuiView {
                                 cmd.stdin(std::process::Stdio::null());
                                 cmd.stdout(std::process::Stdio::null());
                                 cmd.stderr(std::process::Stdio::inherit());
+                                // D3: persist drafts before the successor
+                                // starts reading the sessions file.
+                                this.save_agent_ring(cx);
                                 match cmd.spawn() {
                                     Ok(child) => {
                                         this.append_system_console(
@@ -4311,6 +4319,16 @@ impl YaldaGpuiView {
     /// usually finishes in time but the order is non-deterministic and
     /// lingering child agents have been observed at exit. Called from
     /// `on_app_quit` in `main`.
+    /// The `on_app_quit` hook body (registered in `main`): persist every live
+    /// session's draft/presentation state, THEN tear down the ACP channels.
+    /// D3: the ring is otherwise saved only on session mutations, so anything
+    /// typed since the last one was lost on Quit. Save first — before any
+    /// channel teardown — so the snapshot sees the full live state.
+    pub(crate) fn on_app_quit_hook(&mut self, cx: &mut Context<Self>) {
+        self.save_agent_ring(cx);
+        self.shutdown_acp(cx);
+    }
+
     fn shutdown_acp(&mut self, cx: &mut Context<Self>) {
         // Drop every session's channel so the worker thread shuts down its
         // child agent before GPUI's window teardown races with us. Sessions
@@ -5702,7 +5720,7 @@ impl YaldaGpuiView {
                         // leaders are suppressed. Pinned by
                         // `real_midturn_worksheet_empty_draft_space_opens_menu` /
                         // `real_midturn_worksheet_typed_draft_space_is_suppressed`.
-                        let draft_empty = c.input_surface.compose().text().trim().is_empty();
+                        let draft_empty = c.input_surface.compose().is_blank();
                         // Focused compose in Insert is text entry — EXCEPT an empty
                         // WORKSHEET block: a fresh/cleared worksheet rests focused +
                         // Insert (so typing lands immediately, no `i`), but while its
@@ -10398,7 +10416,7 @@ fn main() {
         // future satisfies the async signature; the real work is sync.
         app.on_app_quit(move |cx| {
             let _ = window_handle.update(cx, |view, _w, ctx| {
-                view.shutdown_acp(ctx);
+                view.on_app_quit_hook(ctx);
             });
             async move {}
         })
