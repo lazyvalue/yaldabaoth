@@ -59,6 +59,23 @@ pub(crate) struct PaletteItem<T = PaletteTarget> {
 pub(crate) struct JumpPaletteOverlay {
     pub(crate) query: LineInput,
     pub(crate) selected: usize,
+    /// A9: the ranking memo, keyed on `(query text, label fingerprint)` — the
+    /// ranking is a pure function of exactly those, so a render or key that
+    /// changes neither reuses it instead of re-scoring every item.
+    pub(crate) rank_memo: KeyedMemo<(String, u64), Vec<usize>>,
+}
+
+/// Perf label counting jump-palette re-ranks (`perf_render_count`).
+pub(crate) const JUMP_PALETTE_RANK_LABEL: &str = "rank:jump_palette";
+
+impl JumpPaletteOverlay {
+    pub(crate) fn new() -> Self {
+        JumpPaletteOverlay {
+            query: LineInput::new(),
+            selected: 0,
+            rank_memo: KeyedMemo::new(JUMP_PALETTE_RANK_LABEL),
+        }
+    }
 }
 
 /// Rows drawn at once; the window scrolls to keep `selected` visible.
@@ -330,10 +347,27 @@ impl YaldaGpuiView {
     /// The palette's current ranked candidates, as `(item, is_selected)` pairs in
     /// display order. The single place the key handler, the render, and the tests
     /// all derive "what's on screen" from.
-    pub(crate) fn jump_palette_ranked(&self, cx: &gpui::App) -> (Vec<PaletteItem>, Vec<usize>) {
+    ///
+    /// The item list is rebuilt (it carries live status/labels), but the
+    /// RANKING is memoized on the overlay keyed by `(query, label
+    /// fingerprint)` (A9): a render or key that changes neither re-uses it.
+    pub(crate) fn jump_palette_ranked(
+        &self,
+        cx: &gpui::App,
+    ) -> (Vec<PaletteItem>, Rc<Vec<usize>>) {
         let items = self.jump_palette_items(cx);
-        let query = self.jump_palette_ref().map_or("", |p| p.query.text());
-        let ranked = rank_palette_items(&items, query);
+        let ranked = match self.jump_palette_ref() {
+            Some(p) => {
+                let query = p.query.text();
+                let key = (
+                    query.to_string(),
+                    fingerprint_strs(items.iter().map(|it| it.label.as_str())),
+                );
+                p.rank_memo
+                    .get_or_compute(key, || rank_palette_items(&items, query))
+            }
+            None => Rc::new(rank_palette_items(&items, "")),
+        };
         (items, ranked)
     }
 
@@ -355,10 +389,7 @@ impl YaldaGpuiView {
         }
         // A fresh palette clears any lingering toast (same idiom as the pickers).
         self.transient_status = None;
-        self.open_overlay(ActiveOverlay::JumpPalette(JumpPaletteOverlay {
-            query: LineInput::new(),
-            selected: 0,
-        }));
+        self.open_overlay(ActiveOverlay::JumpPalette(JumpPaletteOverlay::new()));
         cx.notify();
     }
 
@@ -460,7 +491,7 @@ impl YaldaGpuiView {
                 }
             })
             .collect();
-        let ranked_for_click = ranked.clone();
+        let ranked_for_click = ranked.clone(); // Rc — a pointer copy
         let panel = self.render_palette_panel(
             PalettePanel {
                 id_prefix: "jump-palette",

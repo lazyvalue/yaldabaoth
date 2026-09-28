@@ -13,6 +13,8 @@
 
 use super::*;
 
+use std::rc::Rc;
+
 /// Modal state of the tile: `Browse` = vim navigation over the rows; `Filter` =
 /// typing into the search box.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -45,7 +47,15 @@ pub(crate) struct KeymapView {
     filter: LineInput,
     capture: Option<CaptureState>,
     perf_label: &'static str,
+    /// A9: the filtered visible order + the section model, memoized on
+    /// `(filter text, registry generation)` so a cursor move / unrelated
+    /// re-render reuses them instead of re-matching every binding.
+    order_memo: KeyedMemo<(String, u64), Vec<usize>>,
+    sections_memo: KeyedMemo<(String, u64), Vec<SectionVM>>,
 }
+
+/// Perf label counting keymap filter recomputes (`perf_render_count`).
+pub(crate) const KEYMAP_FILTER_LABEL: &str = "rank:keymap";
 
 /// One rendered row.
 struct RowVM {
@@ -82,6 +92,8 @@ impl KeymapView {
             filter: LineInput::new(),
             capture: None,
             perf_label: "keymap",
+            order_memo: KeyedMemo::new(KEYMAP_FILTER_LABEL),
+            sections_memo: KeyedMemo::new("rank:keymap_sections"),
         }
     }
 
@@ -155,6 +167,16 @@ impl KeymapView {
 
     pub(crate) fn cursor(&self) -> usize {
         self.cursor
+    }
+
+    /// The memoized [`keymap_visible_order`] for this view's filter over `reg`
+    /// (recomputed only when the filter text or the registry generation moves).
+    pub(crate) fn visible_order(&self, reg: &KeymapRegistry) -> Rc<Vec<usize>> {
+        let filter = self.filter.text();
+        self.order_memo
+            .get_or_compute((filter.to_string(), reg.generation()), || {
+                keymap_visible_order(reg, filter)
+            })
     }
 
     /// Move the browse cursor by `delta`, clamped to `count` visible rows. The
@@ -242,9 +264,7 @@ impl Render for KeymapView {
             };
             let reg = &r.keymap_registry;
             let filter = self.filter.text().to_lowercase();
-            let cursor_entry = keymap_visible_order(reg, self.filter.text())
-                .get(self.cursor)
-                .copied();
+            let cursor_entry = self.visible_order(reg).get(self.cursor).copied();
             let conflicts: std::collections::HashSet<usize> = cursor_entry
                 .map(|i| {
                     let mut s: std::collections::HashSet<usize> =
@@ -255,7 +275,11 @@ impl Render for KeymapView {
                     s
                 })
                 .unwrap_or_default();
-            let sections = self.build_sections(reg, &filter, cursor_entry);
+            let sections = self
+                .sections_memo
+                .get_or_compute((self.filter.text().to_string(), reg.generation()), || {
+                    self.build_sections(reg, &filter, cursor_entry)
+                });
             (
                 st,
                 r.editor_bg(),

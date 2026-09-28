@@ -1586,6 +1586,23 @@ struct BufferSwitcher {
     selected: usize,
     filter_mode: bool,
     filter_text: LineInput,
+    /// A9: the filtered buffer indices, memoized on `(filter text, workspace
+    /// label fingerprint)` so the render and nav keys reuse one match pass.
+    filter_memo: KeyedMemo<(String, u64), Vec<usize>>,
+}
+
+/// Perf label counting buffer-switcher filter recomputes (`perf_render_count`).
+pub(crate) const BUFFER_SWITCHER_FILTER_LABEL: &str = "rank:buffer_switcher";
+
+impl BufferSwitcher {
+    fn new(selected: usize) -> Self {
+        BufferSwitcher {
+            selected,
+            filter_mode: false,
+            filter_text: LineInput::new(),
+            filter_memo: KeyedMemo::new(BUFFER_SWITCHER_FILTER_LABEL),
+        }
+    }
 }
 
 /// What the workspace picker will do with the chosen target. Drives the
@@ -6505,11 +6522,9 @@ impl YaldaGpuiView {
         if self.overlay_is_buffer() || self.workspace.workspaces.is_empty() {
             return;
         }
-        self.open_overlay(ActiveOverlay::BufferSwitcher(BufferSwitcher {
-            selected: self.workspace.active_workspace,
-            filter_mode: false,
-            filter_text: LineInput::new(),
-        }));
+        self.open_overlay(ActiveOverlay::BufferSwitcher(BufferSwitcher::new(
+            self.workspace.active_workspace,
+        )));
         cx.notify();
     }
 
@@ -8241,23 +8256,31 @@ impl YaldaGpuiView {
     }
 
     /// Return the indices of buffers matching the current filter query.
-    fn filtered_buffer_indices(&self) -> Vec<usize> {
-        let bs = match self.buffer_ref() {
-            Some(bs) => bs,
-            None => return (0..self.workspace.workspaces.len()).collect(),
+    /// Memoized on the overlay keyed by `(filter text, label fingerprint)` —
+    /// the match list is a pure function of exactly those (A9).
+    fn filtered_buffer_indices(&self) -> Rc<Vec<usize>> {
+        let wsps = &self.workspace.workspaces;
+        let Some(bs) = self.buffer_ref() else {
+            return Rc::new((0..wsps.len()).collect());
         };
-        if bs.filter_text.is_empty() {
-            return (0..self.workspace.workspaces.len()).collect();
-        }
-        let query = bs.filter_text.text().to_lowercase();
-        (0..self.workspace.workspaces.len())
-            .filter(|&i| {
-                let label = workspace_doc_label(&self.workspace.workspaces[i])
-                    .map(|s| s.to_lowercase())
-                    .unwrap_or_default();
-                fuzzy_match_gpui(&label, &query)
-            })
-            .collect()
+        let key = (
+            bs.filter_text.text().to_string(),
+            fingerprint_strs(wsps.iter().map(|w| workspace_doc_label_str(w).unwrap_or(""))),
+        );
+        bs.filter_memo.get_or_compute(key, || {
+            if bs.filter_text.is_empty() {
+                return (0..wsps.len()).collect();
+            }
+            let query = bs.filter_text.text().to_lowercase();
+            (0..wsps.len())
+                .filter(|&i| {
+                    let label = workspace_doc_label(&wsps[i])
+                        .map(|s| s.to_lowercase())
+                        .unwrap_or_default();
+                    fuzzy_match_gpui(&label, &query)
+                })
+                .collect()
+        })
     }
 
     fn handle_buffer_switcher_key(
@@ -10096,6 +10119,19 @@ fn workspace_picker_destination_label(wsp: &workspace::Workspace<App>) -> String
 
 /// Extract the file label of a workspace's focused window, if Doc or Edit.
 /// Returns `None` for Browser/Claude workspaces or non-leaf layouts.
+/// Borrowed form of [`workspace_doc_label`] (no allocation) — for fingerprints.
+fn workspace_doc_label_str(wsp: &workspace::Workspace<App>) -> Option<&str> {
+    if let workspace::Layout::Leaf(w) = &wsp.layout {
+        match &w.content {
+            App::Buffer(BufferApp::Viewing(d)) => Some(d.file_label.as_ref()),
+            App::Buffer(BufferApp::Editing(e)) => Some(e.file_label.as_ref()),
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
 fn workspace_doc_label(wsp: &workspace::Workspace<App>) -> Option<String> {
     if let workspace::Layout::Leaf(w) = &wsp.layout {
         match &w.content {

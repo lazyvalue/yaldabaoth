@@ -4016,11 +4016,7 @@ fn active_overlay_open_replaces_and_clears(cx: &mut TestAppContext) {
     view.update(vcx, |v, cx| {
         assert!(!v.has_overlay(), "fresh view has no overlay");
 
-        v.open_overlay(ActiveOverlay::BufferSwitcher(BufferSwitcher {
-            selected: 0,
-            filter_mode: false,
-            filter_text: crate::LineInput::new(),
-        }));
+        v.open_overlay(ActiveOverlay::BufferSwitcher(BufferSwitcher::new(0)));
         assert!(v.has_overlay() && v.overlay_is_buffer());
         assert!(v.buffer_ref().is_some());
         assert!(
@@ -20948,6 +20944,61 @@ fn keymap_rebind_via_real_keystrokes(cx: &mut TestAppContext) {
     ));
 }
 
+/// A9: the Keymap tile's filtered order + section model are memoized on
+/// (filter text, registry generation). Moving the browse cursor re-renders the
+/// cached body but must NOT re-match every binding; a rebind (generation bump)
+/// must.
+///
+/// Negative control (observed RED): make `KeyedMemo::get_or_compute` always
+/// recompute → the cursor-move render bumps `rank:keymap`.
+#[gpui::test]
+fn keymap_cursor_move_does_not_refilter(cx: &mut TestAppContext) {
+    let label = crate::KEYMAP_FILTER_LABEL;
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_browser(cx);
+    view.update(vcx, |v, cx| v.open_keymap_inner(cx));
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("/ z o o m enter");
+    vcx.run_until_parked();
+
+    let vw = view
+        .read_with(vcx, |v, _| v.keymap_focused_view())
+        .expect("keymap body must exist");
+    crate::perf_reset(label);
+    crate::perf_reset("keymap");
+    vw.update(vcx, |kv, c| {
+        kv.move_cursor(1, 50);
+        c.notify();
+    });
+    vcx.run_until_parked();
+    assert!(
+        crate::perf_render_count("keymap") >= 1,
+        "the cursor move re-rendered the cached body (non-vacuous)"
+    );
+    assert_eq!(
+        crate::perf_render_count(label),
+        0,
+        "a cursor move with the same filter/registry must not re-match bindings"
+    );
+
+    // A rebind bumps the registry generation → the next read recomputes.
+    let idx = view.read_with(vcx, |v, _| {
+        v.keymap_registry
+            .entries
+            .iter()
+            .find(|e| e.action == "ZoomIn")
+            .unwrap()
+            .idx
+    });
+    view.update(vcx, |v, _| assert!(v.keymap_registry.rebind(idx, "cmd-shift-9")));
+    let order = view.update(vcx, |v, cx| {
+        let kv = vw.read(cx);
+        kv.visible_order(&v.keymap_registry)
+    });
+    assert!(order.contains(&idx));
+    assert!(crate::perf_render_count(label) >= 1, "a rebind re-filters");
+}
+
 /// The Keymap body is a cached child: an unrelated root notify leaves its render
 /// count flat, while moving its own browse cursor busts it. Mirrors the
 /// `linear_*_is_render_flat` / `transcript_021_*` perf guards.
@@ -27000,6 +27051,108 @@ fn jump_palette_paints_over_the_screen(cx: &mut TestAppContext) {
     );
 }
 
+/// A9: the jump palette's ranking is memoized on (query, label fingerprint).
+/// A repaint with no query/source change must NOT re-rank; a query edit must.
+/// The forced frame demonstrably paints the palette (layout probe), so the flat
+/// count is not vacuous.
+///
+/// Negative control (observed RED): make `KeyedMemo::get_or_compute` always
+/// recompute → the render-only frame bumps `rank:jump_palette`.
+#[gpui::test]
+fn jump_palette_render_without_change_does_not_rerank(cx: &mut TestAppContext) {
+    let label = crate::JUMP_PALETTE_RANK_LABEL;
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_browser(cx);
+    name_workspaces(&view, vcx, &["alpha", "beta", "gamma"]);
+    vcx.simulate_keystrokes("cmd-p");
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("g a");
+    vcx.run_until_parked();
+
+    crate::perf_reset(label);
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let painted = crate::layout_probe_get("jump-palette");
+    crate::layout_probe_end();
+    assert!(painted.is_some(), "the forced frame painted the palette");
+    assert_eq!(
+        crate::perf_render_count(label),
+        0,
+        "a repaint with no query/source change must reuse the memoized ranking"
+    );
+
+    // A query edit DOES re-rank (the memo is keyed on the text), and the top
+    // match follows it.
+    vcx.simulate_keystrokes("m");
+    vcx.run_until_parked();
+    assert!(
+        crate::perf_render_count(label) >= 1,
+        "editing the query re-ranks"
+    );
+    view.update(vcx, |v, cx| {
+        let (items, ranked) = v.jump_palette_ranked(cx);
+        assert_eq!(items[ranked[0]].label, "gamma");
+    });
+
+    // A source change (a renamed workspace label) re-ranks too.
+    crate::perf_reset(label);
+    name_workspaces(&view, vcx, &["alpha", "beta", "gamut"]);
+    view.update(vcx, |v, cx| {
+        let (items, ranked) = v.jump_palette_ranked(cx);
+        assert_eq!(items[ranked[0]].label, "gamut", "renamed source re-ranks");
+    });
+    assert!(crate::perf_render_count(label) >= 1);
+}
+
+/// A9: the buffer switcher's filtered list is memoized on (filter text,
+/// workspace label fingerprint): a repaint without change does no re-filter.
+///
+/// Negative control (observed RED): make `KeyedMemo::get_or_compute` always
+/// recompute → the render-only frame bumps `rank:buffer_switcher`.
+#[gpui::test]
+fn buffer_switcher_render_without_change_does_not_refilter(cx: &mut TestAppContext) {
+    let label = crate::BUFFER_SWITCHER_FILTER_LABEL;
+    let (view, vcx) = boot_browser(cx);
+    let tmp = tempfile::tempdir().unwrap();
+    view.update(vcx, |v, _| {
+        for f in ["alpha.md", "beta.md", "gamma.md"] {
+            let p = tmp.path().join(f);
+            std::fs::write(&p, b"# x\n").unwrap();
+            assert!(v.open_file(p), "open {f}");
+        }
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        v.open_buffer_switcher(cx);
+        let bs = v.buffer_mut().expect("switcher open");
+        bs.filter_mode = true;
+        bs.filter_text.set_text("gamma");
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    let first = view.read_with(vcx, |v, _| v.filtered_buffer_indices());
+
+    crate::perf_reset(label);
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    assert_eq!(
+        crate::perf_render_count(label),
+        0,
+        "a repaint with no filter/source change must reuse the memoized match list"
+    );
+    view.update(vcx, |v, cx| {
+        v.buffer_mut().unwrap().filter_text.set_text("beta");
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    assert!(crate::perf_render_count(label) >= 1, "a filter edit re-filters");
+    let after = view.read_with(vcx, |v, _| v.filtered_buffer_indices());
+    assert_eq!(first.len(), 1, "`gamma` matches one buffer: {first:?}");
+    assert_eq!(after.len(), 1, "`beta` matches one buffer: {after:?}");
+    assert_ne!(*first, *after, "the edited filter changes the match list");
+}
+
 /// UXI-JumpPanel-18: a real archive-flag toggle announces itself — one `Info`
 /// system-console line naming the agent, plus a `TurnId::System` transcript
 /// notice when this GUI has the session open. Drives the REAL mutator both
@@ -29619,6 +29772,58 @@ fn cog_graph_picker_search_filters(cx: &mut TestAppContext) {
         cv.update(vcx, |c, _| c.selected_graph_id()),
         Some("aid".to_string()),
         "clearing the filter restores the full list"
+    );
+}
+
+/// A9: the Cog graph explorer's filtered indices are memoized on (filter text,
+/// state generation). A cursor move re-renders the cached CogView but must not
+/// re-filter the graph list; a filter edit must.
+///
+/// Negative control (observed RED): make `KeyedMemo::get_or_compute` always
+/// recompute → the cursor-move render bumps `rank:cog_graphs`.
+#[gpui::test]
+fn cog_graph_filter_cursor_move_does_not_refilter(cx: &mut TestAppContext) {
+    use crate::{KMods, Key, KeyPress};
+    let label = crate::COG_GRAPH_FILTER_LABEL;
+    let kp = |c: char| KeyPress::new(Key::Char(c), KMods::NONE);
+    let (view, vcx, cv, wid) = boot_with_cog(cx);
+    let req = cog_tile_req(&view, vcx);
+    view.update(vcx, |v, cx| {
+        v.cog_apply(
+            wid,
+            req,
+            Ok(crate::CogFetch::Graphs(vec![
+                cog_test_graph("aid", "alpha"),
+                cog_test_graph("bid", "beta"),
+                cog_test_graph("cid", "gamma"),
+            ])),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| v.handle_cog_press(kp('/'), cx));
+    view.update(vcx, |v, cx| v.handle_cog_press(kp('a'), cx));
+    vcx.run_until_parked();
+
+    crate::perf_reset(label);
+    crate::perf_reset("cog");
+    cv.update(vcx, |_, c| c.notify());
+    vcx.run_until_parked();
+    assert!(
+        crate::perf_render_count("cog") >= 1,
+        "the CogView re-rendered (non-vacuous)"
+    );
+    assert_eq!(
+        crate::perf_render_count(label),
+        0,
+        "a re-render with the same filter/graphs must not re-filter"
+    );
+    view.update(vcx, |v, cx| v.handle_cog_press(kp('l'), cx)); // "al" → alpha
+    vcx.run_until_parked();
+    assert!(crate::perf_render_count(label) >= 1, "a filter edit re-filters");
+    assert_eq!(
+        cv.update(vcx, |c, _| c.selected_graph_id()),
+        Some("aid".to_string())
     );
 }
 

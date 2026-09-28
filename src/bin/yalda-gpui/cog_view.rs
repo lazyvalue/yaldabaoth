@@ -221,7 +221,16 @@ pub(crate) struct CogView {
     remembered: CogRememberedHandle,
     root: WeakEntity<YaldaGpuiView>,
     perf_label: &'static str,
+    /// Bumped whenever `state` is replaced wholesale — the only way the graph
+    /// list changes — so the explorer filter memo can key on it (A9).
+    state_gen: u64,
+    /// A9: the explorer's filtered graph indices, memoized on
+    /// `(filter text, state_gen)` so renders / cursor moves reuse them.
+    graph_filter_memo: yux::KeyedMemo<(String, u64), Vec<usize>>,
 }
+
+/// Perf label counting graph-explorer filter recomputes (`perf_render_count`).
+pub(crate) const COG_GRAPH_FILTER_LABEL: &str = "rank:cog_graphs";
 
 /// Case-insensitive substring match of a graph's label + id against a filter.
 fn graph_matches(g: &CogGraph, filter: &str) -> bool {
@@ -256,6 +265,8 @@ impl CogView {
             remembered,
             root,
             perf_label: "cog",
+            state_gen: 0,
+            graph_filter_memo: yux::KeyedMemo::new(COG_GRAPH_FILTER_LABEL),
         }
     }
 
@@ -455,6 +466,7 @@ impl CogView {
         let changed = !matches!(&self.state, CogViewState::Home(current) if **current == home);
         if changed {
             self.state = CogViewState::Home(Box::new(home));
+            self.state_gen += 1;
             self.sync_remembered(true);
         }
         changed
@@ -464,6 +476,7 @@ impl CogView {
     /// The caller notifies (mutation-site notify busts this cached view).
     pub(crate) fn set_state(&mut self, state: CogViewState) {
         self.state = state;
+        self.state_gen += 1;
         self.reset_scrolls();
         self.events.clear();
         self.events_scroll.set_offset(gpui::point(px(0.0), px(0.0)));
@@ -691,15 +704,21 @@ impl CogView {
     }
 
     /// The full-list indices of graphs matching the current filter, in order.
-    fn filtered_graph_indices(&self) -> Vec<usize> {
+    /// Memoized on `(filter text, state_gen)` (A9).
+    fn filtered_graph_indices(&self) -> std::rc::Rc<Vec<usize>> {
         match &self.state {
-            CogViewState::Graphs { graphs, .. } => graphs
-                .iter()
-                .enumerate()
-                .filter(|(_, g)| graph_matches(g, self.graph_filter.text()))
-                .map(|(i, _)| i)
-                .collect(),
-            _ => Vec::new(),
+            CogViewState::Graphs { graphs, .. } => self.graph_filter_memo.get_or_compute(
+                (self.graph_filter.text().to_string(), self.state_gen),
+                || {
+                    graphs
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, g)| graph_matches(g, self.graph_filter.text()))
+                        .map(|(i, _)| i)
+                        .collect()
+                },
+            ),
+            _ => std::rc::Rc::new(Vec::new()),
         }
     }
 
