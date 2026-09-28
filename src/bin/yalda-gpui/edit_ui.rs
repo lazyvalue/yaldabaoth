@@ -51,12 +51,26 @@ impl YaldaGpuiView {
     /// Test-only: `(last_recomputed, last_was_skip)` of the focused Edit view's
     /// incremental highlight cache — the O(changed) latency-gate observable.
     #[cfg(test)]
-    pub(crate) fn test_edit_cache_stats(&mut self) -> (usize, bool) {
-        let e = self.edit_mut().expect("focused window is not an Edit view");
+    pub(crate) fn test_edit_cache_stats(&mut self, cx: &GpuiApp) -> (usize, bool) {
+        let body = self.test_edit_body().expect("edit body view not created yet");
+        let b = body.read(cx);
         (
-            e.highlight_cache.last_recomputed,
-            e.highlight_cache.last_was_skip,
+            b.highlight_cache.last_recomputed,
+            b.highlight_cache.last_was_skip,
         )
+    }
+
+    /// Test-only: the focused Edit tile's cached body view (C10), once rendered.
+    #[cfg(test)]
+    pub(crate) fn test_edit_body(&mut self) -> Option<Entity<EditBodyView>> {
+        self.edit_mut()?.body.clone()
+    }
+
+    /// Test-only: the focused Edit body's virtualized row-list state (scroll).
+    #[cfg(test)]
+    pub(crate) fn test_edit_list(&mut self, cx: &GpuiApp) -> gpui::ListState {
+        let body = self.test_edit_body().expect("edit body view not created yet");
+        body.read(cx).list.state().clone()
     }
 
     /// Test-only: install a fresh Doc screen rendering `blocks` so the headless

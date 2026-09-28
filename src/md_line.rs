@@ -81,7 +81,11 @@ mod tests {
         assert_eq!(bullet_marker("-x"), None);
         assert_eq!(bullet_marker("-"), None);
         assert_eq!(bullet_marker(""), None);
-        assert_eq!(bullet_marker("• x"), None, "non-ASCII lead byte is not a bullet");
+        assert_eq!(
+            bullet_marker("• x"),
+            None,
+            "non-ASCII lead byte is not a bullet"
+        );
     }
 
     #[test]
@@ -164,8 +168,16 @@ mod tests {
             i
         }
         for_each_corpus(6, &mut |s| {
-            assert_eq!(list_marker_len(s), old_list_marker_len(s), "list_marker_len({s:?})");
-            assert_eq!(quote_prefix_len(s), old_split_quote_prefix(s), "quote({s:?})");
+            assert_eq!(
+                list_marker_len(s),
+                old_list_marker_len(s),
+                "list_marker_len({s:?})"
+            );
+            assert_eq!(
+                quote_prefix_len(s),
+                old_split_quote_prefix(s),
+                "quote({s:?})"
+            );
         });
     }
 

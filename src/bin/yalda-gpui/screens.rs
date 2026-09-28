@@ -64,7 +64,7 @@ pub(crate) fn edit_render_tap_snapshot() -> Vec<EditRenderLineTap> {
 }
 
 #[cfg(test)]
-fn push_edit_render_line(line_idx: usize, text: &str, segs: &[Segment], code_bg: NStyle) {
+pub(crate) fn push_edit_render_line(line_idx: usize, text: &str, segs: &[Segment], code_bg: NStyle) {
     EDIT_RENDER_TAP.with(|tap| {
         tap.borrow_mut().push(EditRenderLineTap {
             line_idx,
@@ -385,6 +385,7 @@ impl YaldaGpuiView {
     pub(crate) fn render_edit(
         &self,
         root: gpui::Div,
+        id: workspace::WindowId,
         e: &mut EditState,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
@@ -400,10 +401,30 @@ impl YaldaGpuiView {
             EditView::WordProcessor => "WP",
         };
 
-        let body: AnyElement = match e.view {
-            EditView::Code => self.build_edit_body_code(e).into_any_element(),
-            EditView::WordProcessor => self.build_edit_body_wp(e).into_any_element(),
+        // C10: the rows are a cached child entity (`EditBodyView`) that
+        // re-renders only when its own inputs move (`EditSeqs`), so a root
+        // notify from another tile / agent streaming is a cache hit. Created
+        // lazily here (`EditState` constructors have no `cx`); no notify.
+        let body_view = match &e.body {
+            Some(v) => v.clone(),
+            None => {
+                let root_ent = cx.entity();
+                let v = cx.new(|vcx| EditBodyView::new(root_ent, id, vcx));
+                e.body = Some(v.clone());
+                v
+            }
         };
+        // Touch the entity every frame: gpui only routes a child's own
+        // `cx.notify()` to a redraw if the entity was ACCESSED during the last
+        // draw (`window_invalidators_by_entity`). A cache-hit frame whose
+        // parent merely clones the handle drops the body from that set, and
+        // its observe-driven self-notify would then never repaint it.
+        let _ = body_view.read(cx);
+        let body = div()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .child(cached_child(body_view));
 
         let top = self.theme.top_bar;
         let bot = self.theme.bottom_bar;
@@ -514,297 +535,6 @@ impl YaldaGpuiView {
             .child(header)
             .child(body)
             .child(footer)
-    }
-
-    /// Code (raw markdown) view: monospace, gutter with line numbers,
-    /// per-line `md_highlight` source colors. Lines soft-wrap and the cursor
-    /// splices inline via the shared `build_wrapped_line` helper.
-    ///
-    /// **Virtualized**: rendered through a `gpui::list` so only the visible rows
-    /// are built/laid-out per frame, not one element per document line. Combined
-    /// with the incremental highlight cache this makes a keystroke O(changed),
-    /// not O(document).
-    pub(crate) fn build_edit_body_code(&self, e: &mut EditState) -> impl IntoElement {
-        // C4: caret + selection in DISPLAY columns (rows are tab-expanded).
-        let (cursor, sel) = e.editor.display_caret_and_selection();
-        let cursor_line = cursor.line;
-        let cursor_col = cursor.col;
-        let cursor_color: Hsla = rgb(CURSOR_BAR_COLOR).into();
-        let dim_fg: Hsla = rgb(0x6272a4).into();
-        let mode = e.mode;
-        let edit_seq = e.editor.edit_seq();
-
-        // Incremental highlight: only changed lines are re-tokenized; unchanged
-        // frames recompute zero. `lines_rc`/`hl_snap` are cheap Rc clones.
-        let (lines_rc, hl_snap) = e.highlight_snapshot(&self.theme, &self.syntect_hl);
-
-        // Splice the changed range + keep the caret revealed (shared with WP).
-        e.reconcile_and_reveal(&lines_rc, edit_seq, cursor_line, cursor_col);
-
-        // Owned snapshots for the `'static` per-row render closure — all cheap
-        // (Rc pointer clones / Copy / SharedString refcount bumps).
-        let base_style = self.theme.paragraph;
-        let lines_snap = lines_rc.clone();
-        let hl_snap = hl_snap.clone();
-        let code_font = self.code_font.clone();
-        let editor_fg = self.editor_fg();
-        let selection_bg = self.theme.agent.selection_bg;
-        #[cfg(test)]
-        let code_block_style = self.theme.code_block_bg;
-        let text_size = px(14.0 * self.text_scale);
-
-        let render_fn = move |line_idx: usize, _w: &mut Window, _app: &mut GpuiApp| -> AnyElement {
-            let line_str = lines_snap.get(line_idx).cloned().unwrap_or_default();
-            let mut segs = hl_snap
-                .get(line_idx)
-                .map(|lh| lh.raw.clone())
-                .unwrap_or_else(|| vec![(line_str.clone(), base_style)]);
-            if let Some(sel) = sel {
-                segs = apply_line_selection(&segs, &line_str, sel, line_idx, base_style, selection_bg);
-            }
-
-            #[cfg(test)]
-            push_edit_render_line(line_idx, &line_str, &segs, code_block_style);
-
-            let gutter = div()
-                .w(px(40.0))
-                .flex_none()
-                .text_color(dim_fg)
-                .child(format!("{:>3} ", line_idx + 1));
-
-            // Soft-wrap: long lines break at whitespace and stack below the
-            // gutter rather than running off the right edge — which is what
-            // let the cursor scroll out of view. `build_wrapped_line` emits
-            // the caret as an inline flex child so it wraps with the text.
-            let content = build_wrapped_line(
-                &segs,
-                &line_str,
-                line_idx == cursor_line,
-                cursor_col,
-                mode,
-                cursor_color,
-                base_style,
-                DEFAULT_FG,
-                &code_font,
-                &code_font,
-                None,
-                None,
-                line_idx,
-                None,
-            );
-
-            let row = div()
-                .flex()
-                .flex_row()
-                // Fill the list width so `content`'s `flex_1` has a bounded
-                // space to soft-wrap within. `gpui::list` lays each row out in
-                // isolation (no parent align-items: stretch), so without this
-                // the row shrinks to content width and long lines never wrap —
-                // they overflow and get clipped by the body's overflow_x_hidden.
-                .w_full()
-                .child(gutter)
-                .child(content);
-            #[cfg(test)]
-            let row = probe_bounds_dyn(format!("code-line-{line_idx}"), row.into_any_element());
-            row.into_any_element()
-        };
-
-        div()
-            .id("edit-body")
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h_0()
-            // Clip the rare unbroken token (no whitespace to wrap at) instead
-            // of letting it widen the row and reintroduce horizontal scroll.
-            .overflow_x_hidden()
-            .px_4()
-            .py_2()
-            .text_size(text_size)
-            .font_family(self.code_font.clone())
-            .text_color(editor_fg)
-            .child(
-                gpui::list(e.list.state().clone(), render_fn)
-                    .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
-                    .flex_1()
-                    .w_full(),
-            )
-    }
-
-    /// Word-Processor view: proportional body font + per-line typographic
-    /// styling driven by `classify_wp_line`. Headings get larger sizes and
-    /// bold weight; lists/blockquote/code get block-level decorations.
-    /// `md_highlight`'s segments still carry inline `**bold**`/`*italic*`
-    /// modifiers, which `font_for` maps to FontWeight/FontStyle on render.
-    /// No gutter — word processors don't show line numbers.
-    pub(crate) fn build_edit_body_wp(&self, e: &mut EditState) -> impl IntoElement {
-        // C4: caret + selection in DISPLAY columns (rows are tab-expanded).
-        let (cursor, sel) = e.editor.display_caret_and_selection();
-        let cursor_line = cursor.line;
-        let cursor_col = cursor.col;
-        let cursor_color: Hsla = rgb(CURSOR_BAR_COLOR).into();
-        let mode = e.mode;
-        let edit_seq = e.editor.edit_seq();
-
-        // Incremental highlight: only changed lines are re-tokenized; unchanged
-        // frames recompute zero. `lines_rc`/`hl_snap` are cheap Rc clones.
-        let (lines_rc, hl_snap) = e.highlight_snapshot(&self.theme, &self.syntect_hl);
-
-        // Per-line typographic kind, cached on `edit_seq` (012): the fold runs
-        // once per edit, not once per frame, so idle frames (cursor blink,
-        // selection, scroll, theme, cross-tile notify) recompute zero. The
-        // virtualized render closure indexes any visible line off the `Rc`.
-        let kinds = e.wp_kinds_snapshot(&lines_rc, edit_seq);
-
-        // Splice the changed range + keep the caret revealed (shared with Code).
-        e.reconcile_and_reveal(&lines_rc, edit_seq, cursor_line, cursor_col);
-
-        // Owned snapshots for the `'static` per-row closure.
-        let base_style = self.theme.paragraph;
-        let lines_snap = lines_rc.clone();
-        let hl_snap = hl_snap.clone();
-        let kinds = std::rc::Rc::new(kinds);
-        let body_font = self.body_font.clone();
-        let code_font = self.code_font.clone();
-        let editor_fg = self.editor_fg();
-        let selection_bg = self.theme.agent.selection_bg;
-        let text_scale = self.text_scale;
-        // Code-line bg follows the active theme (Folio's dark tokens were
-        // invisible on the old hardcoded dark bg). See `wp_code_block_bg`.
-        let wp_code_bg = wp_code_block_bg(&self.theme);
-
-        let render_fn = move |line_idx: usize, _w: &mut Window, _app: &mut GpuiApp| -> AnyElement {
-            let line_str = lines_snap.get(line_idx).cloned().unwrap_or_default();
-            let kind = kinds
-                .get(line_idx)
-                .copied()
-                .unwrap_or(WpLineKind::Paragraph);
-
-            let mut segs = hl_snap
-                .get(line_idx)
-                .map(|lh| lh.raw.clone())
-                .unwrap_or_else(|| vec![(line_str.clone(), base_style)]);
-            if let Some(sel) = sel {
-                segs = apply_line_selection(&segs, &line_str, sel, line_idx, base_style, selection_bg);
-            }
-
-            // Per-kind typography. Headings get scaled sizes + bold; lists
-            // and paragraphs use the body font at the default size; code and
-            // tables use monospace.
-            let (raw_size_px, font_weight, top_pad) = match kind {
-                WpLineKind::Heading(1) => (26.0, FontWeight::BOLD, 10.0),
-                WpLineKind::Heading(2) => (22.0, FontWeight::BOLD, 8.0),
-                WpLineKind::Heading(3) => (18.0, FontWeight::BOLD, 6.0),
-                WpLineKind::Heading(4) => (16.0, FontWeight::BOLD, 5.0),
-                WpLineKind::Heading(5) => (15.0, FontWeight::BOLD, 4.0),
-                WpLineKind::Heading(_) => (14.0, FontWeight::BOLD, 4.0),
-                WpLineKind::CodeFence | WpLineKind::CodeContent => (13.0, FontWeight::NORMAL, 0.0),
-                WpLineKind::TableRow => (13.0, FontWeight::NORMAL, 0.0),
-                // UXI-ParagraphSpacing-1: list items get a readability gap above
-                // each one so bullets break apart (mirrors the Doc view's list gap).
-                WpLineKind::BulletItem | WpLineKind::OrderedItem => {
-                    (14.0, FontWeight::NORMAL, PARAGRAPH_GAP_PX)
-                }
-                _ => (14.0, FontWeight::NORMAL, 0.0),
-            };
-            let text_size_px = raw_size_px * text_scale;
-            let line_font = match kind {
-                WpLineKind::CodeFence | WpLineKind::CodeContent | WpLineKind::TableRow => {
-                    &code_font
-                }
-                _ => &body_font,
-            };
-
-            // Soft-wrap (mirrors the Code view): tokens break at whitespace
-            // so long prose lines wrap below instead of pushing the caret
-            // off-screen. WP uses a proportional `line_font`; whitespace
-            // tokens at wrap boundaries can leave a slightly ragged left
-            // margin — acceptable vs. an invisible cursor.
-            let content = build_wrapped_line(
-                &segs,
-                &line_str,
-                line_idx == cursor_line,
-                cursor_col,
-                mode,
-                cursor_color,
-                base_style,
-                DEFAULT_FG,
-                line_font,
-                &code_font,
-                // C5: the selection bg painted onto `segs` above must be
-                // excluded from the inline-code font proxy, or selected prose
-                // reflows into the monospace code font.
-                sel.map(|_| selection_bg),
-                None,
-                line_idx,
-                None,
-            );
-
-            // Block-level decoration per kind.
-            let line_div = match kind {
-                WpLineKind::Blockquote => div()
-                    .flex()
-                    .flex_row()
-                    .text_size(px(text_size_px))
-                    .font_weight(font_weight)
-                    .pt(px(top_pad * text_scale))
-                    .italic()
-                    .text_color(rgb(0xbfbfbf))
-                    .child(div().w(px(3.0)).bg(rgb(0xffb86c)).mr_2())
-                    .child(content),
-                WpLineKind::CodeFence | WpLineKind::CodeContent => div()
-                    .flex()
-                    .flex_row()
-                    .text_size(px(text_size_px))
-                    .font_weight(font_weight)
-                    .px_2()
-                    .py_0p5()
-                    // Theme-driven: the fenced-code syntax colors are designed
-                    // against `theme.code_block_bg`; a hardcoded dark bg made a
-                    // light theme's dark tokens (and the caret char) invisible.
-                    .bg(wp_code_bg)
-                    .child(content),
-                WpLineKind::Empty => div()
-                    .flex()
-                    .flex_row()
-                    .text_size(px(text_size_px))
-                    // UXI-ParagraphSpacing-1: the blank paragraph-break line carries
-                    // the readability gap on top of the base 18px blank row; scaled.
-                    .h(px(18.0 * text_scale) + paragraph_gap(text_scale))
-                    .child(content),
-                _ => div()
-                    .flex()
-                    .flex_row()
-                    .text_size(px(text_size_px))
-                    .font_weight(font_weight)
-                    .pt(px(top_pad * text_scale))
-                    .child(content),
-            };
-
-            // Fill the list width (same reason as the Code view): rows in a
-            // `gpui::list` don't stretch, so `content`'s `flex_1` needs `w_full`
-            // on the row to have a bounded width to soft-wrap within.
-            line_div.w_full().into_any_element()
-        };
-
-        div()
-            .id("edit-body-wp")
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h_0()
-            .overflow_x_hidden()
-            .px_8()
-            .py_4()
-            .text_size(px(14.0 * self.text_scale))
-            .font_family(self.body_font.clone())
-            .text_color(editor_fg)
-            .child(
-                gpui::list(e.list.state().clone(), render_fn)
-                    .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
-                    .flex_1()
-                    .w_full(),
-            )
     }
 
     // Render a single ACP tool call as a collapsible block. The

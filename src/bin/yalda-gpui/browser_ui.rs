@@ -596,13 +596,9 @@ impl YaldaGpuiView {
                 Some(App::Buffer(BufferApp::Editing(e))) => {
                     let lines = e.editor.line_count();
                     let line = idx.min(lines.saturating_sub(1));
+                    // The cached Edit body reveals the caret on its next render
+                    // (a focused-tile cursor move moves its reveal key).
                     e.editor.set_cursor(line, 0);
-                    // The Edit body is now a virtualized `gpui::list`; reveal
-                    // through the ListState (the old ScrollHandle drove the
-                    // pre-virtualization overflow container).
-                    if line < e.list.len() {
-                        e.list.state().scroll_to_reveal_item(line);
-                    }
                 }
                 _ => {}
             }

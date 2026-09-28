@@ -578,7 +578,7 @@ fn edit_view_keystroke_is_o_changed(cx: &mut TestAppContext) {
 
     // --- Cold paint: first render highlights every line once. ---
     vcx.run_until_parked();
-    let (cold_recomputed, cold_skip) = view.update(vcx, |v, cx| v.test_edit_cache_stats());
+    let (cold_recomputed, cold_skip) = view.update(vcx, |v, cx| v.test_edit_cache_stats(cx));
     assert!(
         cold_recomputed >= N,
         "cold paint should highlight all {N} lines, got {cold_recomputed}"
@@ -586,10 +586,13 @@ fn edit_view_keystroke_is_o_changed(cx: &mut TestAppContext) {
     assert!(!cold_skip, "cold paint is not a skip");
 
     // --- No-edit re-render: a notify with no buffer mutation must fast-skip
-    //     (edit_seq unchanged) and recompute zero lines. ---
-    view.update(vcx, |_v, cx| cx.notify());
+    //     (edit_seq unchanged) and recompute zero lines. A ROOT notify is now
+    //     a cache hit for the body entity (C10), so force the body itself to
+    //     re-render to exercise the highlight fast-skip path. ---
+    let body = view.update(vcx, |v, _| v.test_edit_body().expect("edit body"));
+    body.update(vcx, |_b, cx| cx.notify());
     vcx.run_until_parked();
-    let (idle_recomputed, idle_skip) = view.update(vcx, |v, cx| v.test_edit_cache_stats());
+    let (idle_recomputed, idle_skip) = view.update(vcx, |v, cx| v.test_edit_cache_stats(cx));
     assert_eq!(
         idle_recomputed, 0,
         "no-change re-render must recompute 0 lines (fast skip), got {idle_recomputed}"
@@ -610,7 +613,7 @@ fn edit_view_keystroke_is_o_changed(cx: &mut TestAppContext) {
         cx.notify();
     });
     vcx.run_until_parked();
-    let (edit_recomputed, edit_skip) = view.update(vcx, |v, cx| v.test_edit_cache_stats());
+    let (edit_recomputed, edit_skip) = view.update(vcx, |v, cx| v.test_edit_cache_stats(cx));
     assert!(!edit_skip, "an edit must not fast-skip");
     assert_eq!(
         edit_recomputed, 1,
@@ -736,13 +739,13 @@ fn edit_newline_delete_keeps_viewport_anchored(cx: &mut TestAppContext) {
     vcx.run_until_parked();
 
     // Scroll the viewport into the middle of the file.
-    let count_before = view.update(vcx, |v, _cx| {
-        let e = v.edit_mut().expect("edit view");
-        e.list.state().scroll_to(gpui::ListOffset {
+    let count_before = view.update(vcx, |v, cx| {
+        let list = v.test_edit_list(cx);
+        list.scroll_to(gpui::ListOffset {
             item_ix: 80,
             offset_in_item: px(0.),
         });
-        e.list.len()
+        list.item_count()
     });
 
     // Backspace at column 0, well below the viewport top: a line MERGE (the line
@@ -756,9 +759,9 @@ fn edit_newline_delete_keeps_viewport_anchored(cx: &mut TestAppContext) {
     });
     vcx.run_until_parked();
 
-    let (top, count) = view.update(vcx, |v, _cx| {
-        let e = v.edit_mut().expect("edit view");
-        (e.list.state().logical_scroll_top().item_ix, e.list.len())
+    let (top, count) = view.update(vcx, |v, cx| {
+        let list = v.test_edit_list(cx);
+        (list.logical_scroll_top().item_ix, list.item_count())
     });
     assert_eq!(
         count,
@@ -802,9 +805,8 @@ fn edit_column_move_reveals_cursor_line(cx: &mut TestAppContext) {
 
     // Scroll the viewport far below line 0 (so line 0 is off-screen), WITHOUT a
     // cursor change — the reveal must not fire yet (cursor still at 0,0).
-    view.update(vcx, |v, _cx| {
-        let e = v.edit_mut().expect("edit view");
-        e.list.state().scroll_to(gpui::ListOffset {
+    view.update(vcx, |v, cx| {
+        v.test_edit_list(cx).scroll_to(gpui::ListOffset {
             item_ix: 50,
             offset_in_item: px(0.),
         });
@@ -818,14 +820,7 @@ fn edit_column_move_reveals_cursor_line(cx: &mut TestAppContext) {
     });
     vcx.run_until_parked();
 
-    let top = view.update(vcx, |v, _| {
-        v.edit_mut()
-            .expect("edit view")
-            .list
-            .state()
-            .logical_scroll_top()
-            .item_ix
-    });
+    let top = view.update(vcx, |v, cx| v.test_edit_list(cx).logical_scroll_top().item_ix);
     assert_eq!(
         top, 0,
         "a column move on line 0 must scroll it back into view (item 0), got {top}"
@@ -16051,7 +16046,7 @@ fn code_edit_wraps_unbroken_token_in_bullet(cx: &mut TestAppContext) {
         vcx.run_until_parked();
     }
     crate::layout_probe_begin();
-    view.update(vcx, |_, cx| cx.notify());
+    repaint_edit_body(&view, vcx);
     vcx.run_until_parked();
     let line = crate::layout_probe_get("code-line-0");
     crate::layout_probe_end();
@@ -31708,6 +31703,16 @@ fn paste_into_compose_in_insert_pastes_at_caret(cx: &mut TestAppContext) {
 }
 
 
+/// Force the focused Edit tile's cached body (C10) AND the root to re-render
+/// next frame — a root notify alone is a cache hit for the body, so a test that
+/// taps paint (layout probe / font-run tap) must bust the body itself.
+fn repaint_edit_body(view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext) {
+    if let Some(body) = view.update(vcx, |v, _| v.test_edit_body()) {
+        body.update(vcx, |_b, cx| cx.notify());
+    }
+    view.update(vcx, |_, cx| cx.notify());
+}
+
 /// Measure the PAINTED caret x of an Edit view (`view_kind`) showing `text`
 /// with the caret at RAW `(0, col)`. Drives the real render path (highlight
 /// snapshot → build_edit_body_* → build_wrapped_line → make_caret).
@@ -31730,7 +31735,7 @@ fn edit_caret_painted_x(
         vcx.run_until_parked();
     }
     crate::layout_probe_begin();
-    view.update(vcx, |_, cx| cx.notify());
+    repaint_edit_body(&view, vcx);
     vcx.run_until_parked();
     let caret = crate::layout_probe_get("caret");
     crate::layout_probe_end();
@@ -31848,7 +31853,7 @@ fn wp_selected_prose_stays_in_body_font(cx: &mut TestAppContext) {
         vcx.run_until_parked();
     }
     crate::font_run_tap_begin();
-    view.update(vcx, |_, cx| cx.notify());
+    repaint_edit_body(&view, vcx);
     vcx.run_until_parked();
     let runs = crate::font_run_tap_end();
     let selected: Vec<_> = runs.iter().filter(|(t, _)| t.contains("hello")).collect();
@@ -32034,4 +32039,293 @@ fn compose_idle_render_does_not_rebuild_lines(cx: &mut TestAppContext) {
         .expect("agent")
     });
     assert_eq!(lines.as_deref().map(|l| l.as_slice()), Some(&["recalled".to_string()][..]));
+}
+
+// ─────────────── Buffer Edit body: cached view (C10), sibling reveal (C8),
+// ─────────────── scalable gutter (C11) — text-editing review Q2 ─────────────
+
+/// The focused Edit tile's window id.
+#[cfg(test)]
+fn focused_tile_id(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+) -> crate::workspace::WindowId {
+    view.update(vcx, |v, _| v.workspace.focused_window_id().expect("focused tile"))
+}
+
+/// Move workspace focus to tile `id` (a click on it, minus the pointer).
+#[cfg(test)]
+fn focus_tile(view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext, id: crate::workspace::WindowId) {
+    view.update(vcx, |v, cx| {
+        v.workspace.active_workspace_mut().expect("workspace").focused = id;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+}
+
+/// The cached body entity of Editing tile `id` (once rendered).
+#[cfg(test)]
+fn edit_body_of(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+    id: crate::workspace::WindowId,
+) -> gpui::Entity<crate::EditBodyView> {
+    view.update(vcx, |v, _| match &v.workspace.tile(id).expect("tile").content {
+        crate::App::Buffer(crate::BufferApp::Editing(e)) => e.body.clone().expect("body rendered"),
+        _ => panic!("tile {id:?} is not an Edit tile"),
+    })
+}
+
+/// Boot an Edit tile over `text` (Insert mode, focused), split an agent tile
+/// bound to session "S1" beside it (focus moves to the agent tile), and settle.
+/// Returns (view, vcx, edit tile id, agent session entity).
+#[cfg(test)]
+fn boot_edit_beside_agent<'a>(
+    cx: &'a mut TestAppContext,
+    text: &str,
+) -> (
+    gpui::Entity<YaldaGpuiView>,
+    &'a mut gpui::VisualTestContext,
+    crate::workspace::WindowId,
+    gpui::Entity<crate::AgentSession>,
+) {
+    use crate::{AgentSession, AgentState, AgentTile, App};
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+    vcx.run_until_parked();
+    let text = text.to_string();
+    let (edit_id, session) = view.update(vcx, |v, cx| {
+        v.test_open_edit(&text);
+        let edit_id = v.workspace.focused_window_id().expect("edit tile");
+        v.workspace
+            .split_focused(crate::workspace::SplitDir::V, App::Agent(AgentTile::new()))
+            .expect("split");
+        let id = v.show_local_session(
+            AgentSession {
+                state: AgentState::new_server_managed(None),
+                label: "claude-1".into(),
+                cwd: PathBuf::from("."),
+                resume_id: None,
+            },
+            cx,
+        );
+        v.sessions.bind_sid(id, ServerSid::new("S1".to_string())).expect("sid binds");
+        cx.notify();
+        (edit_id, v.session_entity(id).expect("session"))
+    });
+    for _ in 0..3 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+    (view, vcx, edit_id, session)
+}
+
+/// C10 (text-editing review) — yux rule 5 render-count guard for the cached
+/// Edit body. With an Edit tile beside an agent tile: typing in the agent
+/// compose and agent streaming (root + session notifies) must leave the Edit
+/// body's render count FLAT; a keystroke in the Edit tile itself (the real
+/// `handle_edit_key`) must re-render it.
+///
+/// Negative control (observed RED): make the root-observe filter in
+/// `EditBodyView::new` notify unconditionally → every root notify re-renders
+/// the body and the flat assert fails.
+#[gpui::test]
+fn edit_body_is_render_flat_while_another_tile_types_or_streams(cx: &mut TestAppContext) {
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::session_proto::Notification as ServerNotification;
+    crate::perf_reset("edit-body");
+    let text: String = (0..40).map(|i| format!("line {i}\n")).collect();
+    let (view, vcx, edit_id, session) = boot_edit_beside_agent(cx, &text);
+    let base = crate::perf_render_count("edit-body");
+    assert!(base >= 1, "the Edit body must have rendered (live beside the agent)");
+
+    // (a) Typing in the agent tile's compose: session + root notifies.
+    for _ in 0..5 {
+        session.update(vcx, |s, cx: &mut gpui::Context<crate::AgentSession>| {
+            let c = s.state.input_surface.compose_mut();
+            let len = c.editor.document().rope().len_chars();
+            c.editor.programmatic_insert(len, "x");
+            cx.notify();
+        });
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+    // (b) Agent streaming through the REAL reducer.
+    for i in 0..5 {
+        view.update(vcx, |v, cx| {
+            v.apply_server_batch(
+                vec![ServerNotification::ReplyEvent {
+                    session_id: "S1".into(),
+                    event: ReplyEvent::Chunk(format!("streamed chunk {i}\n")),
+                }],
+                cx,
+            );
+            cx.notify();
+        });
+        vcx.run_until_parked();
+    }
+    let streamed = session.read_with(vcx, |s, _| s.state.editor.document().full_text());
+    assert!(streamed.contains("streamed chunk 4"), "non-vacuous: the stream landed");
+    let after = crate::perf_render_count("edit-body");
+    assert_eq!(
+        after, base,
+        "agent typing/streaming must not re-render the cached Edit body ({base} → {after})"
+    );
+
+    // (c) Typing in the Edit tile itself re-renders it.
+    focus_tile(&view, vcx, edit_id);
+    let before_key = crate::perf_render_count("edit-body");
+    view.update_in(vcx, |v, w, cx| v.handle_edit_key(&ws_bare_key("q"), w, cx));
+    vcx.run_until_parked();
+    let typed = crate::perf_render_count("edit-body");
+    assert!(typed > before_key, "a keystroke in the Edit tile must re-render its body");
+    let first = view.update(vcx, |v, _| {
+        use crate::EditOps;
+        v.edit_mut().unwrap().editor.line_text_at_cursor()
+    });
+    assert!(first.starts_with('q'), "the keystroke landed: {first:?}");
+}
+
+/// C8 (text-editing review): two Edit tiles on ONE buffer. Tile A is scrolled
+/// away from its own caret; typing in sibling tile B (the real
+/// `handle_edit_key`) changes the shared text, so A re-renders the new content
+/// — but A's viewport must stay where the user left it, not snap back to A's
+/// caret.
+///
+/// Negative control (observed RED): drop the `focused ||` gate in
+/// `EditBodyView::reconcile_and_reveal` (reveal on any `edit_seq` move) → A's
+/// scroll top jumps from 100 back to 0.
+#[gpui::test]
+fn sibling_edit_tile_typing_keeps_this_tiles_scroll(cx: &mut TestAppContext) {
+    use crate::{App, BufferApp, EditState, EditView, SharedEditor};
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+    vcx.run_until_parked();
+    let text: String = (0..300).map(|i| format!("line {i}\n")).collect();
+    let (a_id, b_id) = view.update(vcx, |v, cx| {
+        v.splash_until = None;
+        v.test_open_edit(&text);
+        let a_id = v.workspace.focused_window_id().expect("tile A");
+        let (core, label) = {
+            let e = v.edit_mut().expect("A");
+            e.editor.set_cursor(0, 0);
+            (e.editor.core.clone(), e.file_label.clone())
+        };
+        let mut b = EditState::new(SharedEditor::new(1, core), label, EditView::Code);
+        b.mode = crate::EditMode::Insert;
+        let b_id = v
+            .workspace
+            .split_focused(crate::workspace::SplitDir::V, App::Buffer(BufferApp::Editing(b)))
+            .expect("split B");
+        cx.notify();
+        (a_id, b_id)
+    });
+    for _ in 0..3 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+    assert_eq!(focused_tile_id(&view, vcx), b_id, "B is focused");
+
+    // Scroll A far below its caret (line 0).
+    let a_body = edit_body_of(&view, vcx, a_id);
+    a_body.update(vcx, |b, _| {
+        b.list.state().scroll_to(gpui::ListOffset { item_ix: 100, offset_in_item: px(0.) });
+    });
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let a_top = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        edit_body_of(view, vcx, a_id).update(vcx, |b, _| b.list.state().logical_scroll_top().item_ix)
+    };
+    assert_eq!(a_top(&view, vcx), 100, "precondition: A scrolled to 100");
+
+    // Type in B, near the bottom of the shared buffer.
+    view.update(vcx, |v, _| v.edit_mut().expect("B").editor.set_cursor(250, 0));
+    let renders = crate::perf_render_count("edit-body");
+    for k in ["z", "z", "enter"] {
+        view.update_in(vcx, |v, w, cx| v.handle_edit_key(&ws_bare_key(k), w, cx));
+        vcx.run_until_parked();
+    }
+    assert!(crate::perf_render_count("edit-body") > renders, "bodies re-rendered for the edit");
+    let a_len = edit_body_of(&view, vcx, a_id).update(vcx, |b, _| b.list.len());
+    assert_eq!(a_len, 302, "non-vacuous: A sees B's edit (a new line)");
+    assert_eq!(
+        a_top(&view, vcx),
+        100,
+        "a sibling tile's edit must not reset this tile's scroll to its own caret"
+    );
+}
+
+/// Paint an Edit tile over `text` at `scale` (caret on `caret_line`) and return
+/// the painted `(gutter, number-text)` rects of line `line`.
+#[cfg(test)]
+fn edit_gutter_rects(
+    cx: &mut TestAppContext,
+    text: &str,
+    caret_line: usize,
+    scale: f32,
+    line: usize,
+) -> ((f32, f32, f32, f32), (f32, f32, f32, f32)) {
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        v.splash_until = None;
+        v.test_open_edit(text);
+        v.edit_mut().unwrap().editor.set_cursor(caret_line, 0);
+        v.set_text_scale(scale, cx);
+    });
+    for _ in 0..3 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+    // Scroll the target line to the top explicitly (gpui's reveal can't see
+    // past unmeasured rows of a 10k-line list).
+    let body = view.update(vcx, |v, _| v.test_edit_body().expect("body"));
+    body.update(vcx, |b, _| {
+        b.list.state().scroll_to(gpui::ListOffset { item_ix: line, offset_in_item: px(0.) });
+    });
+    crate::layout_probe_begin();
+    repaint_edit_body(&view, vcx);
+    vcx.run_until_parked();
+    let g = crate::layout_probe_get(&format!("edit-gutter-{line}"));
+    let n = crate::layout_probe_get(&format!("edit-gutter-num-{line}"));
+    crate::layout_probe_end();
+    (
+        g.unwrap_or_else(|| panic!("gutter of line {line} must paint")),
+        n.unwrap_or_else(|| panic!("number of line {line} must paint")),
+    )
+}
+
+/// C11 (text-editing review): the Code-view gutter fits a 5-digit line number.
+/// A 10 005-line buffer with the caret on the last line paints `10005 ` INSIDE
+/// its gutter (the number's natural width ≤ the gutter width).
+///
+/// Negative control (observed RED): restore the fixed `px(40.0)` gutter → the
+/// number overflows the 40px gutter.
+#[gpui::test]
+fn edit_gutter_fits_five_digit_line_numbers(cx: &mut TestAppContext) {
+    let n = 10_005;
+    let text: String = (0..n).map(|i| format!("l{i}\n")).collect();
+    let last = n - 1;
+    let ((_, _, gw, _), (_, _, nw, _)) = edit_gutter_rects(cx, &text, last, 1.0, last);
+    assert!(nw > 0.0, "non-vacuous: the number painted with width");
+    assert!(
+        nw <= gw + 0.5,
+        "line number {n} ({nw}px) overflows its gutter ({gw}px)"
+    );
+}
+
+/// C11 (text-editing review): the gutter scales with document zoom
+/// (UXI-TextZoom-1) — at 2× it paints twice as wide as at 1×.
+///
+/// Negative control (observed RED): restore the fixed `px(40.0)` gutter → both
+/// widths are 40px.
+#[gpui::test]
+fn edit_gutter_scales_with_zoom(cx: &mut TestAppContext) {
+    let text: String = (0..50).map(|i| format!("l{i}\n")).collect();
+    let ((_, _, w1, _), _) = edit_gutter_rects(cx, &text, 0, 1.0, 0);
+    let ((_, _, w2, _), (_, _, nw2, _)) = edit_gutter_rects(cx, &text, 0, 2.0, 0);
+    assert!(w1 > 0.0, "non-vacuous gutter width");
+    assert!(
+        (w2 - 2.0 * w1).abs() <= 2.0,
+        "gutter must scale with zoom: 1× {w1}px, 2× {w2}px"
+    );
+    assert!(nw2 <= w2 + 0.5, "zoomed number ({nw2}px) fits its gutter ({w2}px)");
 }

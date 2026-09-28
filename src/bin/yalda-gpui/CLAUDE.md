@@ -114,7 +114,9 @@ so items stay crate-visible regardless of file):
   handler.
 - `chrome.rs` — focused-window/layout render, tab strip, tag bar, rails.
 - `edit_ui.rs` / `browser_ui.rs` — per-screen methods (edit entry/exit + key
-  dispatch; browser nav + rail).
+  dispatch; browser nav + rail). `edit_view.rs` — `EditBodyView`, the cached
+  yux body of an Editing tile (Code + WP rows, gutter, caret reveal; the
+  `DiffView` root-observed shape, fingerprint `EditSeqs`).
 - `render_blocks.rs` — free render helpers for the markdown doc/transcript
   path: colors/fonts, styled-line/block/table elements, wiki links.
 - `linear.rs` / `linear_ui.rs` / `linear_view.rs` — `App::Linear`: the Linear
