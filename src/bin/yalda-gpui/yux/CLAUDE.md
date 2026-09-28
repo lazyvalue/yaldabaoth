@@ -79,6 +79,15 @@ style bundle so a caller themes once:
   unit-testable against a raw `ListState`. The agent transcript's
   `TranscriptScroll` reconciles by item COUNT (streaming tail + follow-output),
   not a content diff, so it stays separate — don't force it onto this.
+- **`list_rows_overlay(state, first_row, rows, row_h, child)`** — paint an
+  element over a span of rows of a UNIFORM-row-height `gpui::list` so it
+  scrolls with the list and is clipped to its viewport, while living OUTSIDE
+  the list's (cached) render. The pattern for an inline text input inside a
+  cached list (the Diff tile's comment compose): reserve its height with
+  spacer rows in the list, paint the input from the uncached parent through
+  this, added AFTER the list in tree order. Placement = `uniform_rows_rect`
+  (pure, unit-tested). A child entity inside the cached list would instead
+  dirty the list on every keystroke (gpui marks ancestors dirty).
 
 ## Efficiency practices (non-negotiable)
 

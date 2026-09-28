@@ -59,9 +59,10 @@ pub(crate) enum RowRef {
         new: Option<u32>,
     },
     /// One fixed-height row of an inline comment card (spec B5,
-    /// UXI-Diff-15). A card is `parts` consecutive rows (`part` 0 = the
-    /// header: id · badge · first body line; then wrapped body lines — see
-    /// [`comment_card_lines`]) so the body stays uniform-height and
+    /// UXI-Diff-15). A card is `parts` consecutive rows forming ONE bordered
+    /// box (`part` 0 = the header: id + status pills; then wrapped body lines;
+    /// then a footer row — see [`comment_card_lines`]) so the body stays
+    /// uniform-height and
     /// `DiffView::reveal_cursor` stays exact. `comment` indexes
     /// `Review::comments` at the time the rows were built (rows are rebuilt
     /// at every review mutation).
@@ -71,6 +72,16 @@ pub(crate) enum RowRef {
         part: u8,
         parts: u8,
     },
+    /// One fixed-height spacer row reserved for the inline comment compose
+    /// (spec B5, UXI-Diff-15): while the compose is open, `parts` of these sit
+    /// directly under the anchor's last line (after any existing cards there)
+    /// — or replace the edited comment's card rows. The cached body paints
+    /// them empty; the editor itself is an UNCACHED overlay the root paints
+    /// over exactly these rows (`render_diff`, `yux::list_rows_overlay`), so
+    /// typing never re-renders the body (UXI-Diff-12). `parts` grows with the
+    /// draft's visual line count ([`compose_slot_rows`]) — only a line-count
+    /// change rebuilds rows.
+    ComposeSlot { file: usize, part: u8, parts: u8 },
 }
 
 impl RowRef {
@@ -80,8 +91,19 @@ impl RowRef {
             RowRef::File { file, .. }
             | RowRef::Hunk { file, .. }
             | RowRef::Line { file, .. }
-            | RowRef::Comment { file, .. } => file,
+            | RowRef::Comment { file, .. }
+            | RowRef::ComposeSlot { file, .. } => file,
         }
+    }
+
+    /// A row INSERTED under a diff line (a comment-card row or a compose
+    /// slot) rather than a row of the diff itself.
+    pub(crate) fn is_inline_insert(&self) -> bool {
+        matches!(self, RowRef::Comment { .. } | RowRef::ComposeSlot { .. })
+    }
+
+    pub(crate) fn is_compose_slot(&self) -> bool {
+        matches!(self, RowRef::ComposeSlot { .. })
     }
 
     pub(crate) fn is_line(&self) -> bool {
@@ -275,15 +297,19 @@ pub(crate) const COMMENT_MAX_BODY_ROWS: usize = 8;
 /// Snippet rows an outdated card shows (dimmed) before an ellipsis.
 pub(crate) const COMMENT_MAX_SNIPPET_ROWS: usize = 3;
 
-/// One row of a comment card's content (row 0 is always `Body` — the header
-/// row shows it after the id + badge).
+/// One row of a comment card (spec B5, UXI-Diff-15). A card is a single
+/// visually-boxed block spread over fixed-height rows: a `Header` row (the
+/// box's top edge: id + status pills), the body rows, then a `Footer` row
+/// (bottom padding + the box's bottom edge).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CardLine {
+    Header,
     Body(String),
     /// The anchored code, shown dimmed on an outdated card.
     Snippet(String),
     /// "…" — more body / snippet than fits.
     More,
+    Footer,
 }
 
 /// Greedy word-wrap of `text` at `cols` characters (hard-breaking a word
@@ -320,12 +346,13 @@ pub(crate) fn wrap_cols(text: &str, cols: usize) -> Vec<String> {
     out
 }
 
-/// The content rows of `c`'s card (see [`CardLine`]): wrapped body capped at
-/// [`COMMENT_MAX_BODY_ROWS`] (last shown row becomes "…" when cut), then — for
-/// an outdated comment — its snippet capped at [`COMMENT_MAX_SNIPPET_ROWS`].
+/// The rows of `c`'s card (see [`CardLine`]): the header, the wrapped body
+/// capped at [`COMMENT_MAX_BODY_ROWS`] (last shown row becomes "…" when cut),
+/// then — for an outdated comment — its snippet capped at
+/// [`COMMENT_MAX_SNIPPET_ROWS`], then the footer.
 pub(crate) fn comment_card_lines(c: &ReviewComment) -> Vec<CardLine> {
     let mut body = wrap_cols(c.body.trim_end(), COMMENT_WRAP_COLS);
-    let mut out: Vec<CardLine> = Vec::new();
+    let mut out: Vec<CardLine> = vec![CardLine::Header];
     if body.len() > COMMENT_MAX_BODY_ROWS {
         body.truncate(COMMENT_MAX_BODY_ROWS - 1);
         out.extend(body.into_iter().map(CardLine::Body));
@@ -343,6 +370,7 @@ pub(crate) fn comment_card_lines(c: &ReviewComment) -> Vec<CardLine> {
             out.push(CardLine::Snippet("…".to_string()));
         }
     }
+    out.push(CardLine::Footer);
     out
 }
 
@@ -397,26 +425,32 @@ pub(crate) fn comment_anchor_for_range(model: &DiffModel, rows: &[RowRef], lo: u
     })
 }
 
-/// The index of `rows[i]`'s "host" row: a comment-card row resolves to the
-/// nearest preceding non-card row (its anchor line, or the file header for
-/// a top-of-file card); any other row is itself.
+/// The index of `rows[i]`'s "host" row: a comment-card / compose-slot row
+/// resolves to the nearest preceding diff row (its anchor line, or the file
+/// header for a top-of-file card); any other row is itself.
 pub(crate) fn host_row(rows: &[RowRef], i: usize) -> usize {
     let mut j = i.min(rows.len().saturating_sub(1));
-    while j > 0 && matches!(rows.get(j), Some(RowRef::Comment { .. })) {
+    while j > 0 && rows.get(j).is_some_and(RowRef::is_inline_insert) {
         j -= 1;
     }
     j
 }
 
-/// The comment editor pinned at the bottom of a Diff tile (spec B5): the
-/// text input (the app's shared [`Compose`] editor, dispatched through
-/// `dispatch_insert_core` like every other compose), what saving does, and
-/// the anchor snapshot taken when it opened (a background refresh can't move
-/// the ground the comment is being written against).
+/// The inline comment editor of a Diff tile (spec B5, GitHub-style): it
+/// opens AT the commented line — [`RowRef::ComposeSlot`] rows reserve its
+/// height under the anchor's last line (or in place of the edited card) and
+/// the root paints the editor over them. Holds the text input (the app's
+/// shared [`Compose`] editor, dispatched through `dispatch_insert_core` like
+/// every other compose), what saving does, and the anchor snapshot taken when
+/// it opened (a background refresh can't move the ground the comment is
+/// being written against).
 pub(crate) struct CommentCompose {
     pub(crate) input: Compose,
     pub(crate) target: ComposeTarget,
     pub(crate) anchor: CommentAnchor,
+    /// How many [`RowRef::ComposeSlot`] rows the draft currently reserves
+    /// ([`compose_slot_rows`]); rows are rebuilt only when this changes.
+    pub(crate) slot_rows: usize,
     /// First Esc on a non-empty draft arms this ("Esc again to discard");
     /// a second Esc discards; any other key disarms.
     pub(crate) esc_armed: bool,
@@ -428,6 +462,109 @@ pub(crate) enum ComposeTarget {
     New,
     /// Save replaces this comment's body.
     Edit(String),
+}
+
+/// Mono columns a draft line hard-wraps at in the inline compose (the editor
+/// is monospace, so a character count IS the visual width; same budget as a
+/// card body).
+pub(crate) const COMPOSE_WRAP_COLS: usize = COMMENT_WRAP_COLS;
+/// Editor lines the inline compose always shows (an empty draft still gets a
+/// comfortable box) …
+pub(crate) const COMPOSE_MIN_LINES: usize = 3;
+/// … and the most it grows to before scrolling its own window to the caret.
+pub(crate) const COMPOSE_MAX_LINES: usize = 12;
+/// Rows of compose chrome around the editor lines: the caption header, the
+/// key-hint footer, and one row of vertical room for margins + borders.
+pub(crate) const COMPOSE_CHROME_ROWS: usize = 3;
+
+/// A draft laid out for the inline compose: its visual lines (each doc line
+/// hard-wrapped at [`COMPOSE_WRAP_COLS`] chars; an empty line is one empty
+/// visual line) and the caret as `(visual line, char column)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ComposeLines {
+    pub(crate) lines: Vec<String>,
+    pub(crate) caret: (usize, usize),
+}
+
+/// Lay `text` out for the inline compose (see [`ComposeLines`]); the caret is
+/// the editor's `(line, col)` in chars.
+pub(crate) fn compose_visual_lines(text: &str, caret_line: usize, caret_col: usize) -> ComposeLines {
+    let mut lines = Vec::new();
+    let mut caret = (0, 0);
+    for (li, doc_line) in text.split('\n').enumerate() {
+        let chars: Vec<char> = doc_line.chars().collect();
+        let chunks: Vec<String> = if chars.is_empty() {
+            vec![String::new()]
+        } else {
+            chars.chunks(COMPOSE_WRAP_COLS).map(|c| c.iter().collect()).collect()
+        };
+        if li == caret_line {
+            let col = caret_col.min(chars.len());
+            let k = (col / COMPOSE_WRAP_COLS).min(chunks.len() - 1);
+            caret = (lines.len() + k, col - k * COMPOSE_WRAP_COLS);
+        }
+        lines.extend(chunks);
+    }
+    ComposeLines { lines, caret }
+}
+
+/// How many [`RowRef::ComposeSlot`] rows a draft of `visual_lines` reserves:
+/// the editor lines (clamped to [`COMPOSE_MIN_LINES`]..=[`COMPOSE_MAX_LINES`])
+/// plus [`COMPOSE_CHROME_ROWS`].
+pub(crate) fn compose_slot_rows(visual_lines: usize) -> usize {
+    visual_lines.clamp(COMPOSE_MIN_LINES, COMPOSE_MAX_LINES) + COMPOSE_CHROME_ROWS
+}
+
+/// The first visual line the compose's editor window shows so the caret line
+/// is visible (caret kept on the last shown line once the draft outgrows
+/// [`COMPOSE_MAX_LINES`]).
+pub(crate) fn compose_window_top(caret_line: usize, line_count: usize) -> usize {
+    let visible = line_count.clamp(COMPOSE_MIN_LINES, COMPOSE_MAX_LINES);
+    (caret_line + 1).saturating_sub(visible).min(line_count.saturating_sub(visible))
+}
+
+impl CommentCompose {
+    /// The draft laid out for the inline editor.
+    pub(crate) fn visual_lines(&self) -> ComposeLines {
+        let c = self.input.editor.cursor();
+        compose_visual_lines(&self.input.text(), c.line, c.col)
+    }
+
+    /// The slot rows this draft needs right now.
+    pub(crate) fn wanted_slot_rows(&self) -> usize {
+        compose_slot_rows(compose_visual_lines(&self.input.text(), 0, 0).lines.len())
+    }
+}
+
+/// Where the open compose's slot rows go among `rows` (built WITHOUT slots):
+/// `(at, remove, file)` — splice the slots in at `at`, replacing `remove`
+/// rows there. Editing a comment replaces its card rows in place; a new
+/// comment goes directly under its anchor's last line, after any cards
+/// already there (a thread); an unplaceable anchor falls back to under its
+/// file header, else the end.
+fn compose_slot_place(model: &DiffModel, review: Option<&Review>, rows: &[RowRef], c: &CommentCompose) -> (usize, usize, usize) {
+    if let ComposeTarget::Edit(id) = &c.target
+        && let Some(ci) = review.and_then(|r| r.comments.iter().position(|x| &x.id == id))
+        && let Some(start) = rows.iter().position(|r| r.comment_index() == Some(ci))
+    {
+        let len = rows[start..].iter().take_while(|r| r.comment_index() == Some(ci)).count();
+        return (start, len, rows[start].file());
+    }
+    let Some(fi) = model.files.iter().position(|f| f.path == c.anchor.path) else {
+        return (rows.len(), 0, rows.last().map(RowRef::file).unwrap_or(0));
+    };
+    let target = c.anchor.lines[1] as u32;
+    let after = rows
+        .iter()
+        .position(|r| r.file() == fi && r.is_line() && side_number(*r, c.anchor.side) == Some(target))
+        .or_else(|| file_header_row(rows, fi));
+    match after {
+        Some(i) => {
+            let at = i + 1 + rows[i + 1..].iter().take_while(|r| r.is_inline_insert()).count();
+            (at, 0, fi)
+        }
+        None => (rows.len(), 0, fi),
+    }
 }
 
 /// `j`/`k`: move by `delta` rows, clamped (no wrap).
@@ -493,7 +630,7 @@ pub(crate) fn cursor_anchor(model: &DiffModel, rows: &[RowRef], cursor: usize) -
     let row = rows[host_row(rows, cursor)];
     let file = model.files.get(row.file())?;
     let kind = match row {
-        RowRef::File { .. } | RowRef::Comment { .. } => AnchorKind::File,
+        RowRef::File { .. } | RowRef::Comment { .. } | RowRef::ComposeSlot { .. } => AnchorKind::File,
         RowRef::Hunk { hunk, .. } => AnchorKind::Hunk {
             new_start: file.hunks.get(hunk).map(|h| h.starts().1).unwrap_or(0),
         },
@@ -604,13 +741,15 @@ pub(crate) fn zed_target(model: &DiffModel, rows: &[RowRef], cursor: usize) -> O
     let f = model.files.get(row.file())?;
     let hunk_start = |hi: usize| f.hunks.get(hi).map(|h| h.starts().1).unwrap_or(1);
     let line = match row {
-        RowRef::File { .. } | RowRef::Comment { .. } => f.hunks.first().map(|h| h.starts().1).unwrap_or(1),
+        RowRef::File { .. } | RowRef::Comment { .. } | RowRef::ComposeSlot { .. } => {
+            f.hunks.first().map(|h| h.starts().1).unwrap_or(1)
+        }
         RowRef::Hunk { hunk, .. } => hunk_start(hunk),
         RowRef::Line { new: Some(n), .. } => n as usize,
         RowRef::Line { hunk, .. } => rows[..cursor]
             .iter()
             .rev()
-            .filter(|r| !matches!(r, RowRef::Comment { .. }))
+            .filter(|r| !r.is_inline_insert())
             .take_while(|r| matches!(r, RowRef::Line { hunk: h, .. } if *h == hunk))
             .find_map(|r| match r {
                 RowRef::Line { new: Some(n), .. } => Some(*n as usize + 1),
@@ -906,7 +1045,15 @@ impl DiffTile {
     /// Call at every mutation site of those inputs — never from render.
     pub(crate) fn rebuild_rows(&mut self) {
         let rows = match &self.model {
-            Some(m) => visible_rows(m, self.review.as_ref(), &self.folds),
+            Some(m) => {
+                let mut rows = visible_rows(m, self.review.as_ref(), &self.folds);
+                if let Some(c) = &self.compose {
+                    let (at, remove, file) = compose_slot_place(m, self.review.as_ref(), &rows, c);
+                    let parts = c.slot_rows.clamp(1, u8::MAX as usize) as u8;
+                    rows.splice(at..at + remove, (0..parts).map(|part| RowRef::ComposeSlot { file, part, parts }));
+                }
+                rows
+            }
             None => Vec::new(),
         };
         self.rows = Rc::new(rows);
@@ -989,28 +1136,70 @@ impl DiffTile {
         self.review.as_ref()?.comments.get(ci)
     }
 
-    /// Open the comment editor (bumps `compose_gen`, clears the range).
+    /// Open the inline comment editor (bumps `compose_gen`, clears the
+    /// range, and rebuilds rows so its [`RowRef::ComposeSlot`]s appear under
+    /// the anchor). Editing parks the cursor on the card's first row first,
+    /// which the slots then replace — so saving lands the cursor back on it.
     pub(crate) fn open_compose(&mut self, target: ComposeTarget, anchor: CommentAnchor, body: &str) {
         let mut input = Compose::new();
         for ch in body.chars() {
             input.editor.insert_char(ch);
         }
-        self.compose = Some(CommentCompose {
+        if matches!(target, ComposeTarget::Edit(_))
+            && let Some(ci) = self.cursor_row().and_then(|r| r.comment_index())
+        {
+            while self.cursor > 0 && self.rows.get(self.cursor - 1).and_then(RowRef::comment_index) == Some(ci) {
+                self.cursor -= 1;
+            }
+        }
+        let mut compose = CommentCompose {
             input,
             target,
             anchor,
+            slot_rows: 0,
             esc_armed: false,
-        });
-        self.range_anchor = None;
-        self.pending_delete = None;
+        };
+        compose.slot_rows = compose.wanted_slot_rows();
+        self.compose = Some(compose);
         self.compose_gen = self.compose_gen.wrapping_add(1);
+        let cursor = self.cursor;
+        self.rebuild_rows();
+        self.cursor = cursor.min(self.rows.len().saturating_sub(1));
     }
 
-    /// Close the comment editor, discarding its draft.
+    /// Close the comment editor, discarding its draft (its slot rows go).
     pub(crate) fn close_compose(&mut self) {
         if self.compose.take().is_some() {
             self.compose_gen = self.compose_gen.wrapping_add(1);
+            let cursor = self.cursor;
+            self.rebuild_rows();
+            self.cursor = cursor.min(self.rows.len().saturating_sub(1));
         }
+    }
+
+    /// After a compose keystroke: when the draft's visual line count moved
+    /// the slot-row count, rebuild rows (the only time typing touches the
+    /// cached body). Returns whether rows were rebuilt.
+    pub(crate) fn sync_compose_slots(&mut self) -> bool {
+        let Some(c) = self.compose.as_mut() else {
+            return false;
+        };
+        let want = c.wanted_slot_rows();
+        if want == c.slot_rows {
+            return false;
+        }
+        c.slot_rows = want;
+        let cursor = self.cursor;
+        self.rebuild_rows();
+        self.cursor = cursor.min(self.rows.len().saturating_sub(1));
+        true
+    }
+
+    /// The `[first, last]` row span of the open compose's slots.
+    pub(crate) fn compose_slot_span(&self) -> Option<(usize, usize)> {
+        let first = self.rows.iter().position(RowRef::is_compose_slot)?;
+        let n = self.rows[first..].iter().take_while(|r| r.is_compose_slot()).count();
+        Some((first, first + n - 1))
     }
 
     /// Save the open compose into the review (spec B5): a `New` target adds
@@ -1038,7 +1227,8 @@ impl DiffTile {
                 id
             }
         };
-        self.close_compose();
+        self.compose = None;
+        self.compose_gen = self.compose_gen.wrapping_add(1);
         self.review_gen = self.review_gen.wrapping_add(1);
         let cursor = self.cursor;
         self.rebuild_rows();
@@ -1385,7 +1575,12 @@ index 1..2 100644
         assert_eq!(at(2), 1, "outdated card right after the header");
         assert!(matches!(rows[at(1) - 1], RowRef::Line { new: Some(2), .. }), "drifted card after TWO");
         assert!(matches!(rows[at(0) - 1], RowRef::Line { new: Some(21), .. }), "card after inserted");
-        assert!(matches!(rows[at(2) + 1], RowRef::Comment { part: 1, parts: 2, .. }), "outdated card shows its snippet");
+        // Outdated card: header, body "old", snippet "gone", footer.
+        assert!(matches!(rows[at(2) + 3], RowRef::Comment { part: 3, parts: 4, .. }), "outdated card shows its snippet");
+        assert_eq!(
+            comment_card_lines(&review.comments[2]),
+            vec![CardLine::Header, CardLine::Body("old".into()), CardLine::Snippet("gone".into()), CardLine::Footer]
+        );
         assert_eq!(host_row(&rows, at(0)), at(0) - 1);
 
         // Mixed removed/added span ⇒ new side, new-side lines only.
@@ -1402,12 +1597,32 @@ index 1..2 100644
         assert_eq!(wrap_cols("a\n\nb", 10), vec!["a", "", "b"]);
         let long = comment("a.rs", CommentSide::New, [1, 1], "", &"x\n".repeat(20));
         let lines = comment_card_lines(&long);
-        assert_eq!(lines.len(), COMMENT_MAX_BODY_ROWS);
-        assert_eq!(lines.last(), Some(&CardLine::More));
+        assert_eq!(lines.len(), COMMENT_MAX_BODY_ROWS + 2, "header + capped body + footer");
+        assert_eq!(lines.first(), Some(&CardLine::Header));
+        assert_eq!(lines[lines.len() - 2], CardLine::More);
+        assert_eq!(lines.last(), Some(&CardLine::Footer));
     }
 
     /// `V` confines j/k to the range's file (never onto a header or the next
     /// file); `V` on a non-line row refuses.
+    #[test]
+    fn compose_layout_wraps_places_caret_and_sizes_slots() {
+        let w = COMPOSE_WRAP_COLS;
+        let long: String = "x".repeat(w + 5);
+        let l = compose_visual_lines(&format!("ab\n{long}\n"), 1, w + 2);
+        assert_eq!(l.lines.len(), 4, "ab · x*w · xxxxx · empty last line");
+        assert_eq!(l.lines[1].chars().count(), w);
+        assert_eq!(l.caret, (2, 2), "caret past the wrap lands on the continuation");
+        assert_eq!(compose_visual_lines("", 0, 0), ComposeLines { lines: vec![String::new()], caret: (0, 0) });
+        assert_eq!(compose_visual_lines("abc", 0, 99).caret, (0, 3), "col clamped to the line");
+        assert_eq!(compose_slot_rows(1), COMPOSE_MIN_LINES + COMPOSE_CHROME_ROWS);
+        assert_eq!(compose_slot_rows(5), 5 + COMPOSE_CHROME_ROWS);
+        assert_eq!(compose_slot_rows(500), COMPOSE_MAX_LINES + COMPOSE_CHROME_ROWS);
+        assert_eq!(compose_window_top(2, 3), 0);
+        assert_eq!(compose_window_top(COMPOSE_MAX_LINES + 3, COMPOSE_MAX_LINES + 10), 4, "caret on the last shown line");
+        assert_eq!(compose_window_top(0, 40), 0);
+    }
+
     #[test]
     fn range_selection_is_clamped_to_one_file() {
         let mut t = DiffTile::bound_to(PathBuf::from("/wt"));
