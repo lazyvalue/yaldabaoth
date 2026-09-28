@@ -2091,6 +2091,11 @@ struct YaldaGpuiView {
     /// spec-jump-panel.md). The panel itself is rendered inline (it's cheap —
     /// see `render_jump_panel`), so only its scroll position is retained here.
     jump_panel_scroll: ScrollHandle,
+    /// Scroll state of the outline rail's virtualized row list, and the row it
+    /// was last asked to reveal (so reveal is issued only when the highlighted
+    /// row changes, never fighting a user wheel-scroll).
+    outline_scroll: gpui::UniformListScrollHandle,
+    outline_revealed: std::cell::Cell<Option<usize>>,
     /// Whether the jump panel is shown. Toggled by `cmd-j` / the `?` menu and
     /// persisted (`Preferences::jump_panel_visible`). Defaults to `true`.
     jump_panel_visible: bool,
@@ -2239,6 +2244,8 @@ impl YaldaGpuiView {
             topic_completions: std::rc::Rc::from([]),
             topic_completions_generation: 0,
             jump_panel_scroll: ScrollHandle::new(),
+            outline_scroll: gpui::UniformListScrollHandle::new(),
+            outline_revealed: std::cell::Cell::new(None),
             jump_panel_visible: true,
             jump_cwd_order: Vec::new(),
             jump_session_order: Vec::new(),
@@ -2315,6 +2322,8 @@ impl YaldaGpuiView {
             topic_completions: std::rc::Rc::from([]),
             topic_completions_generation: 0,
             jump_panel_scroll: ScrollHandle::new(),
+            outline_scroll: gpui::UniformListScrollHandle::new(),
+            outline_revealed: std::cell::Cell::new(None),
             jump_panel_visible: true,
             jump_cwd_order: Vec::new(),
             jump_session_order: Vec::new(),

@@ -589,9 +589,8 @@ impl YaldaGpuiView {
                     }
                 }
                 workspace::RailContent::Outline(o) => {
-                    if !o.entries.is_empty() {
-                        o.selected = (o.selected + 1) % o.entries.len();
-                    }
+                    o.move_selection(1);
+                    self.outline_preview_selected(cx);
                 }
             }
             cx.notify();
@@ -609,13 +608,8 @@ impl YaldaGpuiView {
                     }
                 }
                 workspace::RailContent::Outline(o) => {
-                    if !o.entries.is_empty() {
-                        o.selected = if o.selected == 0 {
-                            o.entries.len() - 1
-                        } else {
-                            o.selected - 1
-                        };
-                    }
+                    o.move_selection(-1);
+                    self.outline_preview_selected(cx);
                 }
             }
             cx.notify();
@@ -656,33 +650,89 @@ impl YaldaGpuiView {
             return;
         }
 
-        // Outline: jump the focused window to the selected heading.
-        let target = self
+        // Outline: jump to the selected heading and hand focus back to the
+        // buffer (UXI-Rail-4).
+        let selected = self
             .workspace
             .active_workspace()
             .and_then(|t| t.rail.as_ref())
             .and_then(|r| match &r.content {
-                workspace::RailContent::Outline(o) => {
-                    o.entries.get(o.selected).map(|(_, _, idx)| *idx)
-                }
+                workspace::RailContent::Outline(o) => Some(o.selected),
                 _ => None,
             });
-        if let Some(idx) = target {
-            match self.workspace.focused_content_mut() {
-                Some(App::Buffer(BufferApp::Viewing(d))) => {
-                    d.cursor_block = idx.min(d.blocks.len().saturating_sub(1));
-                    d.reveal_block(d.cursor_block);
+        if let Some(ix) = selected {
+            self.outline_activate(ix, cx);
+        }
+    }
+
+    /// Jump the focused buffer to outline entry `ix` and return focus to it —
+    /// the Enter / click action (UXI-Rail-4).
+    pub(crate) fn outline_activate(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(r) = self.rail_mut() else { return };
+        let workspace::RailContent::Outline(o) = &mut r.content else {
+            return;
+        };
+        let Some(entry) = o.entries.get(ix).cloned() else {
+            return;
+        };
+        o.selected = ix;
+        o.current = Some(ix);
+        r.focused = false;
+        self.outline_jump_to(&entry, cx);
+        cx.notify();
+    }
+
+    /// While the rail has focus, j/k preview: the buffer follows the rail
+    /// selection (UXI-Rail-3) without taking focus.
+    fn outline_preview_selected(&mut self, cx: &mut Context<Self>) {
+        let entry = self
+            .workspace
+            .active_workspace()
+            .and_then(|t| t.rail.as_ref())
+            .and_then(|r| match &r.content {
+                workspace::RailContent::Outline(o) => o.entries.get(o.selected).cloned(),
+                _ => None,
+            });
+        if let Some(entry) = entry {
+            self.outline_jump_to(&entry, cx);
+        }
+    }
+
+    /// Put the focused buffer's cursor on `entry`'s heading and scroll so the
+    /// heading is the first thing in view (not merely revealed at the bottom).
+    fn outline_jump_to(&mut self, entry: &workspace::OutlineEntry, cx: &mut Context<Self>) {
+        match self.workspace.focused_content_mut() {
+            Some(App::Buffer(BufferApp::Viewing(d))) => {
+                let Some(block) = entry.block else { return };
+                let block = block.min(d.blocks.len().saturating_sub(1));
+                d.cursor_block = block;
+                if block < d.list.len() {
+                    d.list.state().scroll_to(gpui::ListOffset {
+                        item_ix: block,
+                        offset_in_item: gpui::px(0.0),
+                    });
+                    d.last_cursor_block.set(Some(block));
+                } else {
+                    d.reveal_block(block);
                 }
-                Some(App::Buffer(BufferApp::Editing(e))) => {
-                    let lines = e.editor.line_count();
-                    let line = idx.min(lines.saturating_sub(1));
-                    // The cached Edit body reveals the caret on its next render
-                    // (a focused-tile cursor move moves its reveal key).
-                    e.editor.set_cursor(line, 0);
-                }
-                _ => {}
             }
-            cx.notify();
+            Some(App::Buffer(BufferApp::Editing(e))) => {
+                let line = entry.line.min(e.editor.line_count().saturating_sub(1));
+                e.editor.set_cursor(line, 0);
+                // The cached Edit body owns the row list; put the heading at
+                // its top (its caret reveal is then a no-op).
+                if let Some(body) = e.body.clone() {
+                    body.update(cx, |b, _| {
+                        if line < b.list.len() {
+                            b.list.state().scroll_to(gpui::ListOffset {
+                                item_ix: line,
+                                offset_in_item: gpui::px(0.0),
+                            });
+                        }
+                    });
+                }
+            }
+            _ => {}
         }
     }
 
