@@ -1881,7 +1881,7 @@ impl YaldaGpuiView {
             // it to make room would destroy the user's work.
             if claude.input_surface.compose().is_blank() {
                 if claude.input_surface.is_chatbox() {
-                    claude.input_surface.compose_mut().mode = EditMode::Insert;
+                    claude.input_surface.compose_mut().enter_insert();
                     claude.focus = AgentFocus::Compose;
                 } else if claude.turn_phase.is_awaiting() {
                     // Mid-turn worksheet: input already routes to the bottom chatbox
@@ -1889,7 +1889,7 @@ impl YaldaGpuiView {
                     // Focus must STAY on the transcript — `focus = Compose` here is
                     // the state that strands focus over a vanished box when the turn
                     // ends (the fuzzer-found edge B1).
-                    claude.input_surface.compose_mut().mode = EditMode::Insert;
+                    claude.input_surface.compose_mut().enter_insert();
                 } else {
                     // Idle worksheet: the typeable surface is an inline You-block.
                     // This focuses the compose in Insert and reveals it.
@@ -6296,8 +6296,12 @@ impl YaldaGpuiView {
         if let Some(mode) = ws_esc_mode {
             self.with_session(focused_id, cx, |c| {
                 if mode == EditMode::Insert {
-                    // 1st Esc: edit-in-place (Normal), stay in the block.
-                    c.input_surface.compose_mut().mode = EditMode::Normal;
+                    // 1st Esc: edit-in-place (Normal), stay in the block. Ends
+                    // the insert session (Q1) so the typed run is one undo step
+                    // and later Normal edits are their own steps.
+                    let cb = c.input_surface.compose_mut();
+                    cb.editor.end_insert();
+                    cb.mode = EditMode::Normal;
                 } else {
                     // 2nd Esc: leave the block to navigation.
                     if c.input_surface.compose().is_blank() {

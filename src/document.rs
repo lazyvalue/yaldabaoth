@@ -1,7 +1,28 @@
 use ropey::Rope;
+use std::collections::VecDeque;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+
+/// B9: maximum number of undo groups retained. The oldest group is evicted
+/// past this, so history memory and the per-chunk splice shift stay bounded.
+pub const UNDO_CAP: usize = 1000;
+
+// Test-only instrumentation for B9: counts every recorded splice
+// `shift_recorded_splices` visits, so a guard can prove entries entirely
+// below a programmatic insert are skipped.
+#[cfg(test)]
+thread_local! {
+    static SHIFT_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+fn shift_visits() -> usize {
+    SHIFT_VISITS.with(|c| c.get())
+}
+#[cfg(test)]
+fn shift_visits_reset() {
+    SHIFT_VISITS.with(|c| c.set(0));
+}
 
 /// One primitive text edit recorded for undo: at `start` (a rope char index in
 /// the state *before* this splice applied) the run of `removed` text was
@@ -49,11 +70,11 @@ pub struct UndoEntry {
     cursor_before_col: usize,
     cursor_after_line: usize,
     cursor_after_col: usize,
-    /// Snapshot of the editor's frozen-line ranges + lockable-through-line
-    /// taken at begin_undo_group; restored on undo so frozen state stays in
-    /// sync with the rope content. Empty + 0 if the editor never set them.
-    frozen_lines_before: Vec<(usize, usize)>,
-    lockable_through_line_before: usize,
+    /// B9: upper bound on every splice `start` in this entry, so a
+    /// programmatic splice strictly after it can skip the entry in O(1).
+    /// (B2/B12: the old frozen-lines snapshot is gone — undo/redo replay the
+    /// frozen/lock shifts through the returned [`AnchorShift`]s instead.)
+    hi: usize,
 }
 
 /// Advance a tree-sitter `Point` by appending `text`. Columns are byte
@@ -147,9 +168,10 @@ pub struct Document {
     /// undo, redo). Cheap O(1) signal that lets readers — notably the GUI
     /// highlight cache — skip work when the text is unchanged. Never reset.
     edit_seq: u64,
-    undo_stack: Vec<UndoEntry>,
+    /// B9: capped at [`UNDO_CAP`] groups; the oldest is evicted from the front.
+    undo_stack: VecDeque<UndoEntry>,
     redo_stack: Vec<UndoEntry>,
-    /// Pending undo group: snapshot taken at begin_undo_group
+    /// Pending undo group, opened by begin_undo_group
     pending_undo: Option<UndoEntry>,
     /// One-clean-splice incremental-reparse tracking. `record_splice` computes
     /// the tree-sitter `InputEdit` for each primitive splice (against the OLD
@@ -158,14 +180,51 @@ pub struct Document {
     /// (the typing hot path). Zero or multiple splices reset it to `None`, so
     /// reparse falls back to a full parse — making a wrong `InputEdit` the only
     /// possible incremental hazard, confined to `note_pending_edit`.
-    pending_edit: Option<tree_sitter::InputEdit>,
-    pending_splice_count: u32,
+    ///
+    /// B14: `Cell`s so the lazily-parsing editor can consume the window from
+    /// a `&self` block-API read. Undo/redo (which bypass `note_pending_edit`)
+    /// mark the window multi-splice, forcing the next parse to be full.
+    pending_edit: std::cell::Cell<Option<tree_sitter::InputEdit>>,
+    pending_splice_count: std::cell::Cell<u32>,
     /// B6: undo-stack depth at which the buffer matches what is on disk (the
     /// save point). `None` once that state is unreachable through undo/redo
     /// (history diverged past it, or an unrecorded edit changed the text).
     /// Undo/redo recompute `modified` against it instead of assuming "empty
     /// undo stack == pristine".
     saved_depth: Option<usize>,
+    /// B8: the file's line ending. A consistently-CRLF file is normalized to
+    /// LF in the rope (the engine counts only `\n`) and converted back on save,
+    /// so an untouched file round-trips byte-identical. Mixed endings are left
+    /// as-is in the rope (`Lf`), where a CR before `\n` is simply excluded from
+    /// the visible line length.
+    line_ending: LineEnding,
+}
+
+/// B8: on-disk line ending of a [`Document`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineEnding {
+    Lf,
+    CrLf,
+}
+
+/// B8: detect a consistently-CRLF text (every `\n` preceded by `\r`, at least
+/// one line break) and return it normalized to LF; anything else is returned
+/// unchanged as `Lf` so its bytes survive a save exactly.
+fn normalize_line_endings(text: String) -> (String, LineEnding) {
+    let bytes = text.as_bytes();
+    let mut saw_nl = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'\n' {
+            if i == 0 || bytes[i - 1] != b'\r' {
+                return (text, LineEnding::Lf);
+            }
+            saw_nl = true;
+        }
+    }
+    if !saw_nl {
+        return (text, LineEnding::Lf);
+    }
+    (text.replace("\r\n", "\n"), LineEnding::CrLf)
 }
 
 /// Which way an undo-history step walks (B16: one body for undo and redo).
@@ -188,18 +247,25 @@ impl Document {
         file_path: PathBuf,
         edit_seq: u64,
     ) -> Self {
+        let (text, line_ending) = normalize_line_endings(text);
         Self {
             rope: Rope::from_str(&text),
             file_path,
             modified: false,
             edit_seq,
-            undo_stack: Vec::new(),
+            undo_stack: VecDeque::new(),
             redo_stack: Vec::new(),
             pending_undo: None,
-            pending_edit: None,
-            pending_splice_count: 0,
+            pending_edit: std::cell::Cell::new(None),
+            pending_splice_count: std::cell::Cell::new(0),
             saved_depth: Some(0),
+            line_ending,
         }
+    }
+
+    /// B8: the line ending the document is written back with.
+    pub fn line_ending(&self) -> LineEnding {
+        self.line_ending
     }
 
     /// Current edit generation. Increases on every content mutation; equal
@@ -252,6 +318,7 @@ impl Document {
                 }
                 return;
             }
+            entry.hi = entry.hi.max(s);
             entry.splices.push(Splice {
                 start: s,
                 removed,
@@ -296,26 +363,23 @@ impl Document {
             old_end_position: old_end_point,
             new_end_position: new_end_point,
         };
-        self.pending_splice_count += 1;
-        self.pending_edit = if self.pending_splice_count == 1 {
-            Some(edit)
-        } else {
-            None
-        };
+        let n = self.pending_splice_count.get().saturating_add(1);
+        self.pending_splice_count.set(n);
+        self.pending_edit.set(if n == 1 { Some(edit) } else { None });
     }
 
     /// Consume the pending incremental `InputEdit` for the next reparse,
     /// resetting the per-reparse window. `Some` ONLY when exactly one clean
     /// splice happened since the last call (the typing hot path); `None`
     /// otherwise (zero or multiple splices → full reparse).
-    pub fn take_pending_edit(&mut self) -> Option<tree_sitter::InputEdit> {
-        let edit = if self.pending_splice_count == 1 {
-            self.pending_edit.take()
+    pub fn take_pending_edit(&self) -> Option<tree_sitter::InputEdit> {
+        let edit = if self.pending_splice_count.get() == 1 {
+            self.pending_edit.get()
         } else {
             None
         };
-        self.pending_edit = None;
-        self.pending_splice_count = 0;
+        self.pending_edit.set(None);
+        self.pending_splice_count.set(0);
         edit
     }
 
@@ -340,9 +404,15 @@ impl Document {
         }
         let line_slice = self.rope.line(line);
         let len = line_slice.len_chars();
-        // Exclude trailing newline from length for cursor purposes
+        // Exclude the trailing newline from the length for cursor purposes —
+        // and (B8) a CR right before it, so a CRLF line left in a mixed-ending
+        // file never lets the caret split the `\r\n` pair.
         if len > 0 && line_slice.char(len - 1) == '\n' {
-            len - 1
+            if len > 1 && line_slice.char(len - 2) == '\r' {
+                len - 2
+            } else {
+                len - 1
+            }
         } else {
             len
         }
@@ -492,22 +562,50 @@ impl Document {
     }
 
     /// Position-shift every recorded user splice (the open group + both stacks)
-    /// at or after `at` by `delta`, after a non-recorded programmatic splice
-    /// changed the rope. Keeps user undo/redo targeting the right characters
-    /// across interleaved agent content. Cheap: O(recorded user splices), which
-    /// is small (a handful of user edits), not O(transcript).
+    /// after a non-recorded programmatic splice changed the rope: an insert of
+    /// `delta > 0` chars at `at`, or a delete of `-delta` chars starting at
+    /// `at`. Keeps user undo/redo targeting the right characters across
+    /// interleaved agent content.
+    ///
+    /// B9: an entry whose splices all start before `at` (its `hi` bound) is
+    /// skipped without touching its splices — the append-after-the-draft
+    /// stream costs O(entries), bounded by [`UNDO_CAP`], not O(splices). A
+    /// delete that swallows a splice's start moves it to the deletion point
+    /// (the old `start + delta` clamped to 0, replaying the undo at the top of
+    /// the document).
     fn shift_recorded_splices(&mut self, at: usize, delta: isize) {
-        let bump = |sp: &mut Splice| {
-            if sp.start >= at {
-                sp.start = (sp.start as isize + delta).max(0) as usize;
+        let remap = |start: usize| -> usize {
+            if start < at {
+                start
+            } else if delta >= 0 {
+                start + delta as usize
+            } else {
+                let del_end = at + delta.unsigned_abs();
+                if start >= del_end {
+                    start - delta.unsigned_abs()
+                } else {
+                    at
+                }
             }
         };
+        let shift_entry = |entry: &mut UndoEntry| {
+            if entry.hi < at {
+                return;
+            }
+            let mut hi = 0;
+            for sp in entry.splices.iter_mut() {
+                #[cfg(test)]
+                SHIFT_VISITS.with(|c| c.set(c.get() + 1));
+                sp.start = remap(sp.start);
+                hi = hi.max(sp.start);
+            }
+            entry.hi = hi;
+        };
         if let Some(entry) = self.pending_undo.as_mut() {
-            entry.splices.iter_mut().for_each(bump);
+            shift_entry(entry);
         }
-        for entry in self.undo_stack.iter_mut().chain(self.redo_stack.iter_mut()) {
-            entry.splices.iter_mut().for_each(bump);
-        }
+        self.undo_stack.iter_mut().for_each(shift_entry);
+        self.redo_stack.iter_mut().for_each(shift_entry);
     }
 
     /// B4: the char range `dd` on `line` actually removes — the line plus its
@@ -560,23 +658,16 @@ impl Document {
     }
 
     /// Begin an undo group. Call before a sequence of edits that should undo
-    /// as one. `frozen_lines` and `lockable_through_line` are snapshotted so
-    /// the editor's frozen-region state is restored on undo alongside the
-    /// rope text — otherwise undo can desynchronize them, leaving stale
-    /// indices that misclassify frozen vs. editable lines.
+    /// as one. (B2/B12: no frozen-lines snapshot — undo/redo hand back the
+    /// line-level [`AnchorShift`]s and the editor replays the frozen/lock
+    /// shifts from them, so agent lines streamed meanwhile are kept.)
     ///
     /// B1: a group that is already open is NOT replaced — the call is a no-op
     /// and returns `false`, so an edit issued inside an insert session (e.g.
     /// Insert-mode Delete) joins that session instead of discarding its
     /// recorded splices. Returns `true` when this call opened the group; only
     /// that caller should `end_undo_group`.
-    pub fn begin_undo_group(
-        &mut self,
-        cursor_line: usize,
-        cursor_col: usize,
-        frozen_lines: &[(usize, usize)],
-        lockable_through_line: usize,
-    ) -> bool {
+    pub fn begin_undo_group(&mut self, cursor_line: usize, cursor_col: usize) -> bool {
         if self.pending_undo.is_some() {
             return false;
         }
@@ -586,8 +677,7 @@ impl Document {
             cursor_before_col: cursor_col,
             cursor_after_line: 0,
             cursor_after_col: 0,
-            frozen_lines_before: frozen_lines.to_vec(),
-            lockable_through_line_before: lockable_through_line,
+            hi: 0,
         });
         true
     }
@@ -618,11 +708,23 @@ impl Document {
             }
             entry.cursor_after_line = cursor_line;
             entry.cursor_after_col = cursor_col;
-            self.undo_stack.push(entry);
+            self.push_undo(entry);
         }
     }
 
-    // (AnchorShift defined at module scope below.)
+    /// B9: push onto the capped undo stack, evicting the oldest group past
+    /// [`UNDO_CAP`]. The save point is a depth, so it moves down with the
+    /// eviction — or becomes unreachable if it WAS the evicted state.
+    fn push_undo(&mut self, entry: UndoEntry) {
+        self.undo_stack.push_back(entry);
+        while self.undo_stack.len() > UNDO_CAP {
+            self.undo_stack.pop_front();
+            self.saved_depth = match self.saved_depth {
+                Some(d) if d > 0 => Some(d - 1),
+                _ => None,
+            };
+        }
+    }
 
     /// `(line, col)` of a char index in the current rope (clamped to the end).
     pub fn line_col_of_char(&self, char_idx: usize) -> (usize, usize) {
@@ -659,7 +761,16 @@ impl Document {
             }
             if !put_in.is_empty() {
                 let at = sp.start.min(doc.rope.len_chars());
-                let (line, col) = doc.line_col_of_char(at);
+                let (mut line, mut col) = doc.line_col_of_char(at);
+                // Same normalization as the forward insert path
+                // (`shift_frozen_lines_for_insert`): inserting at/after the
+                // visible end of a line == inserting at the start of the next,
+                // so a `\n` re-inserted at the end of a frozen line doesn't
+                // push that frozen line down.
+                if col >= doc.line_len_chars(line) {
+                    line += 1;
+                    col = 0;
+                }
                 let nl = put_in.chars().filter(|c| *c == '\n').count();
                 doc.rope.insert(at, put_in);
                 ops.push(AnchorShift::Insert { line, col, nl });
@@ -673,66 +784,47 @@ impl Document {
     }
 
     /// One undo-history step in `dir` (B16). Pops the source stack, pushes the
-    /// mirror record (cursor before/after swapped, the editor's CURRENT frozen
-    /// state captured for the step back) onto the other stack, walks the rope,
-    /// and recomputes `modified` against the save point (B6).
-    #[allow(clippy::type_complexity)]
-    fn history_step(
-        &mut self,
-        dir: HistoryDir,
-        current_frozen_lines: &[(usize, usize)],
-        current_lockable_through_line: usize,
-    ) -> Option<(usize, usize, Vec<(usize, usize)>, usize, Vec<AnchorShift>)> {
+    /// mirror record (cursor before/after swapped) onto the other stack, walks
+    /// the rope, and recomputes `modified` against the save point (B6).
+    /// Returns the caret to restore and the line-level [`AnchorShift`]s the
+    /// editor must replay on its frozen ranges, lock and anchors (B2).
+    fn history_step(&mut self, dir: HistoryDir) -> Option<(usize, usize, Vec<AnchorShift>)> {
         let entry = match dir {
-            HistoryDir::Undo => self.undo_stack.pop()?,
+            HistoryDir::Undo => self.undo_stack.pop_back()?,
             HistoryDir::Redo => self.redo_stack.pop()?,
         };
+        let shifts = self.apply_splices(&entry, dir);
+        // B14: the rope changed without `note_pending_edit`; no single
+        // InputEdit describes it, so the next (lazy) parse must be full.
+        self.pending_edit.set(None);
+        self.pending_splice_count.set(2);
+        let (line, col) = (entry.cursor_before_line, entry.cursor_before_col);
         let mirror = UndoEntry {
-            splices: entry.splices.clone(),
+            splices: entry.splices,
             cursor_before_line: entry.cursor_after_line,
             cursor_before_col: entry.cursor_after_col,
-            cursor_after_line: entry.cursor_before_line,
-            cursor_after_col: entry.cursor_before_col,
-            frozen_lines_before: current_frozen_lines.to_vec(),
-            lockable_through_line_before: current_lockable_through_line,
+            cursor_after_line: line,
+            cursor_after_col: col,
+            hi: entry.hi,
         };
         match dir {
             HistoryDir::Undo => self.redo_stack.push(mirror),
-            HistoryDir::Redo => self.undo_stack.push(mirror),
+            HistoryDir::Redo => self.push_undo(mirror),
         }
-        let shifts = self.apply_splices(&entry, dir);
         self.modified = self.saved_depth != Some(self.undo_stack.len());
         self.edit_seq = self.edit_seq.wrapping_add(1);
-        Some((
-            entry.cursor_before_line,
-            entry.cursor_before_col,
-            entry.frozen_lines_before,
-            entry.lockable_through_line_before,
-            shifts,
-        ))
+        Some((line, col, shifts))
     }
 
-    /// Undo the last action. Returns the cursor position to restore, plus the
-    /// frozen-line snapshot and lockable-through-line value to restore.
-    // type alias would hurt readability here more than help
-    #[allow(clippy::type_complexity)]
-    pub fn undo(
-        &mut self,
-        current_frozen_lines: &[(usize, usize)],
-        current_lockable_through_line: usize,
-    ) -> Option<(usize, usize, Vec<(usize, usize)>, usize, Vec<AnchorShift>)> {
-        self.history_step(HistoryDir::Undo, current_frozen_lines, current_lockable_through_line)
+    /// Undo the last action. Returns the cursor position to restore plus the
+    /// line-level shifts to replay on frozen state / anchors.
+    pub fn undo(&mut self) -> Option<(usize, usize, Vec<AnchorShift>)> {
+        self.history_step(HistoryDir::Undo)
     }
 
-    /// Redo the last undone action. Returns cursor + frozen state to restore.
-    // type alias would hurt readability here more than help
-    #[allow(clippy::type_complexity)]
-    pub fn redo(
-        &mut self,
-        current_frozen_lines: &[(usize, usize)],
-        current_lockable_through_line: usize,
-    ) -> Option<(usize, usize, Vec<(usize, usize)>, usize, Vec<AnchorShift>)> {
-        self.history_step(HistoryDir::Redo, current_frozen_lines, current_lockable_through_line)
+    /// Redo the last undone action. Returns cursor + shifts, like [`undo`](Self::undo).
+    pub fn redo(&mut self) -> Option<(usize, usize, Vec<AnchorShift>)> {
+        self.history_step(HistoryDir::Redo)
     }
 
     /// Save the document to disk atomically.
@@ -747,7 +839,23 @@ impl Document {
             ".{}.tmp",
             path.file_name().unwrap_or_default().to_string_lossy()
         ));
-        fs::write(&temp_path, self.rope.to_string())?;
+        let text = match self.line_ending {
+            LineEnding::Lf => self.rope.to_string(),
+            // B8: restore the file's CRLF endings (the rope holds LF only).
+            LineEnding::CrLf => {
+                let mut out = String::with_capacity(self.rope.len_bytes() + self.rope.len_lines());
+                for chunk in self.rope.chunks() {
+                    for (i, piece) in chunk.split('\n').enumerate() {
+                        if i > 0 {
+                            out.push_str("\r\n");
+                        }
+                        out.push_str(piece);
+                    }
+                }
+                out
+            }
+        };
+        fs::write(&temp_path, text)?;
         fs::rename(&temp_path, path)?;
         self.file_path = path.to_path_buf();
         self.modified = false;
@@ -771,7 +879,7 @@ impl Document {
     /// O(edit), not O(document).
     #[cfg(test)]
     pub fn last_undo_entry_bytes(&self) -> Option<usize> {
-        self.undo_stack.last().map(|e| {
+        self.undo_stack.back().map(|e| {
             e.splices
                 .iter()
                 .map(|s| s.removed.len() + s.inserted.len())
@@ -788,7 +896,7 @@ impl Document {
     /// (B10 coalescing observable).
     #[cfg(test)]
     pub fn last_undo_splice_count(&self) -> Option<usize> {
-        self.undo_stack.last().map(|e| e.splices.len())
+        self.undo_stack.back().map(|e| e.splices.len())
     }
 }
 
@@ -832,7 +940,7 @@ mod tests {
         assert!(n_bytes > 100_000, "fixture must be large: {n_bytes}");
 
         // Type one character inside an undo group (mirrors begin_insert).
-        d.begin_undo_group(0, 0, &[], 0);
+        d.begin_undo_group(0, 0);
         d.insert_char(0, 0, 'X');
         d.end_undo_group(0, 1);
 
@@ -849,7 +957,7 @@ mod tests {
         let big = "abcdefghij\n".repeat(4000);
         let mut d = doc(&big);
         let n_bytes = d.len_bytes();
-        d.begin_undo_group(0, 0, &[], 0);
+        d.begin_undo_group(0, 0);
         d.delete_range(0, 5); // remove "abcde"
         d.end_undo_group(0, 0);
         let bytes = d.last_undo_entry_bytes().expect("entry");
@@ -864,17 +972,17 @@ mod tests {
     fn undo_redo_roundtrip_insert() {
         let mut d = doc("hello\nworld\n");
         let before = d.full_text();
-        d.begin_undo_group(0, 5, &[], 0);
+        d.begin_undo_group(0, 5);
         d.insert_str(0, 5, " there");
         d.end_undo_group(0, 11);
         let after = d.full_text();
         assert_eq!(after, "hello there\nworld\n");
 
-        d.undo(&[], 0);
+        d.undo();
         assert_eq!(d.full_text(), before);
-        d.redo(&[], 0);
+        d.redo();
         assert_eq!(d.full_text(), after);
-        d.undo(&[], 0);
+        d.undo();
         assert_eq!(d.full_text(), before);
     }
 
@@ -883,7 +991,7 @@ mod tests {
         // A group with several mixed ops must undo/redo as one atomic step.
         let mut d = doc("one\ntwo\nthree\n");
         let before = d.full_text();
-        d.begin_undo_group(0, 0, &[], 0);
+        d.begin_undo_group(0, 0);
         d.insert_str(0, 0, "ZERO\n"); // insert a line
         d.delete_line(3); // delete a line ("two" shifted to idx? recompute)
         d.replace_line_text(0, "AAAA"); // overwrite line 0
@@ -891,9 +999,9 @@ mod tests {
         let after = d.full_text();
         assert_ne!(after, before);
 
-        d.undo(&[], 0);
+        d.undo();
         assert_eq!(d.full_text(), before, "multi-op group must fully revert");
-        d.redo(&[], 0);
+        d.redo();
         assert_eq!(d.full_text(), after, "redo must replay the whole group");
     }
 
@@ -901,38 +1009,24 @@ mod tests {
     fn undo_redo_roundtrip_unicode() {
         let mut d = doc("héllo 世界\n");
         let before = d.full_text();
-        d.begin_undo_group(0, 0, &[], 0);
+        d.begin_undo_group(0, 0);
         d.insert_str(0, 0, "→★ "); // multibyte insert
         d.delete_char(0, 3);
         d.end_undo_group(0, 0);
         let after = d.full_text();
-        d.undo(&[], 0);
+        d.undo();
         assert_eq!(d.full_text(), before);
-        d.redo(&[], 0);
+        d.redo();
         assert_eq!(d.full_text(), after);
     }
 
     #[test]
     fn empty_group_is_dropped() {
         let mut d = doc("x\n");
-        d.begin_undo_group(0, 0, &[], 0);
+        d.begin_undo_group(0, 0);
         // no edits
         d.end_undo_group(0, 0);
         assert_eq!(d.undo_stack_len(), 0, "no-op group must not push an entry");
-    }
-
-    #[test]
-    fn frozen_state_restored_on_undo() {
-        let mut d = doc("a\nb\nc\n");
-        let frozen = vec![(0usize, 2usize)];
-        d.begin_undo_group(0, 0, &frozen, 1);
-        d.insert_str(2, 0, "X\n");
-        d.end_undo_group(0, 0);
-        // Undo with a *different* current frozen state; we should get the
-        // snapshotted pre-group frozen back.
-        let (_l, _c, restored_frozen, restored_lockable, _shifts) = d.undo(&[(0, 5)], 3).unwrap();
-        assert_eq!(restored_frozen, frozen);
-        assert_eq!(restored_lockable, 1);
     }
 
     /// B10: typing a run of characters in one insert session records ONE
@@ -941,16 +1035,16 @@ mod tests {
     #[test]
     fn typed_run_coalesces_into_one_splice() {
         let mut d = doc("hello\n");
-        d.begin_undo_group(0, 5, &[], 0);
+        d.begin_undo_group(0, 5);
         for (i, ch) in " world".chars().enumerate() {
             d.insert_char(0, 5 + i, ch);
         }
         d.end_undo_group(0, 11);
         assert_eq!(d.full_text(), "hello world\n");
         assert_eq!(d.last_undo_splice_count(), Some(1), "typed run must coalesce");
-        d.undo(&[], 0);
+        d.undo();
         assert_eq!(d.full_text(), "hello\n");
-        d.redo(&[], 0);
+        d.redo();
         assert_eq!(d.full_text(), "hello world\n");
     }
 
@@ -960,7 +1054,7 @@ mod tests {
     fn delete_runs_coalesce_and_round_trip() {
         let mut d = doc("abcdefgh\n");
         // Backspace run: delete h, g, f (each one before the previous).
-        d.begin_undo_group(0, 8, &[], 0);
+        d.begin_undo_group(0, 8);
         d.delete_char(0, 7);
         d.delete_char(0, 6);
         d.delete_char(0, 5);
@@ -968,14 +1062,14 @@ mod tests {
         assert_eq!(d.full_text(), "abcde\n");
         assert_eq!(d.last_undo_splice_count(), Some(1), "backspace run coalesces");
         // Forward-Delete run at the same position.
-        d.begin_undo_group(0, 0, &[], 0);
+        d.begin_undo_group(0, 0);
         d.delete_char(0, 0);
         d.delete_char(0, 0);
         d.end_undo_group(0, 0);
         assert_eq!(d.full_text(), "cde\n");
         assert_eq!(d.last_undo_splice_count(), Some(1), "delete run coalesces");
         // Type then backspace part of it: net one splice.
-        d.begin_undo_group(0, 3, &[], 0);
+        d.begin_undo_group(0, 3);
         d.insert_char(0, 3, 'x');
         d.insert_char(0, 4, 'y');
         d.insert_char(0, 5, 'z');
@@ -983,15 +1077,15 @@ mod tests {
         d.end_undo_group(0, 5);
         assert_eq!(d.full_text(), "cdexy\n");
         assert_eq!(d.last_undo_splice_count(), Some(1));
-        d.undo(&[], 0);
+        d.undo();
         assert_eq!(d.full_text(), "cde\n");
-        d.undo(&[], 0);
+        d.undo();
         assert_eq!(d.full_text(), "abcde\n");
-        d.undo(&[], 0);
+        d.undo();
         assert_eq!(d.full_text(), "abcdefgh\n");
-        d.redo(&[], 0);
-        d.redo(&[], 0);
-        d.redo(&[], 0);
+        d.redo();
+        d.redo();
+        d.redo();
         assert_eq!(d.full_text(), "cdexy\n");
     }
 
@@ -1000,13 +1094,13 @@ mod tests {
     #[test]
     fn newlines_stay_separate_splices() {
         let mut d = doc("\n");
-        d.begin_undo_group(0, 0, &[], 0);
+        d.begin_undo_group(0, 0);
         d.insert_char(0, 0, 'a');
         d.insert_char(0, 1, '\n');
         d.insert_char(1, 0, 'b');
         d.end_undo_group(1, 1);
         assert_eq!(d.last_undo_splice_count(), Some(3));
-        d.undo(&[], 0);
+        d.undo();
         assert_eq!(d.full_text(), "\n");
     }
 
@@ -1015,13 +1109,13 @@ mod tests {
     #[test]
     fn nested_begin_undo_group_does_not_clobber_open_group() {
         let mut d = doc("abc\n");
-        assert!(d.begin_undo_group(0, 0, &[], 0));
+        assert!(d.begin_undo_group(0, 0));
         d.insert_char(0, 0, 'X');
-        assert!(!d.begin_undo_group(0, 1, &[], 0), "nested begin must not open");
+        assert!(!d.begin_undo_group(0, 1), "nested begin must not open");
         d.delete_char(0, 1);
         d.end_undo_group(0, 1);
         assert_eq!(d.full_text(), "Xbc\n");
-        d.undo(&[], 0);
+        d.undo();
         assert_eq!(d.full_text(), "abc\n", "one undo reverts the whole session");
     }
 
@@ -1035,24 +1129,24 @@ mod tests {
     fn modified_tracks_the_save_point_not_an_empty_undo_stack() {
         let dir = tempfile::tempdir().unwrap();
         let mut d = doc("a\n");
-        d.begin_undo_group(0, 1, &[], 0);
+        d.begin_undo_group(0, 1);
         d.insert_char(0, 1, 'b');
         d.end_undo_group(0, 2);
         save_tmp(&mut d, &dir);
         assert!(!d.is_modified());
-        d.begin_undo_group(0, 2, &[], 0);
+        d.begin_undo_group(0, 2);
         d.insert_char(0, 2, 'c');
         d.end_undo_group(0, 3);
         assert!(d.is_modified());
-        d.undo(&[], 0);
+        d.undo();
         assert_eq!(d.full_text(), "ab\n");
         assert!(!d.is_modified(), "back at the saved text: not modified");
-        d.undo(&[], 0);
+        d.undo();
         assert_eq!(d.full_text(), "a\n");
         assert!(d.is_modified(), "past the save point: modified");
-        d.redo(&[], 0);
+        d.redo();
         assert!(!d.is_modified(), "redo back onto the save point");
-        d.redo(&[], 0);
+        d.redo();
         assert!(d.is_modified());
     }
 
@@ -1062,16 +1156,90 @@ mod tests {
     fn save_point_lost_after_diverging_edit() {
         let dir = tempfile::tempdir().unwrap();
         let mut d = doc("a\n");
-        d.begin_undo_group(0, 1, &[], 0);
+        d.begin_undo_group(0, 1);
         d.insert_char(0, 1, 'b');
         d.end_undo_group(0, 2);
         save_tmp(&mut d, &dir);
-        d.undo(&[], 0); // "a" — save point now in redo history
-        d.begin_undo_group(0, 1, &[], 0);
+        d.undo(); // "a" — save point now in redo history
+        d.begin_undo_group(0, 1);
         d.insert_char(0, 1, 'z'); // diverge: redo cleared
         d.end_undo_group(0, 2);
-        d.undo(&[], 0);
+        d.undo();
         assert_eq!(d.full_text(), "a\n");
         assert!(d.is_modified(), "'a' was never saved");
+    }
+
+    // ---- Q1 (graph ls2 node q1-engine): B9 ----
+
+    fn push_group(d: &mut Document, ch: char) {
+        d.begin_undo_group(0, 0);
+        d.insert_char(0, 0, ch);
+        d.end_undo_group(0, 1);
+    }
+
+    /// B9: the undo history is capped; evicting the oldest group keeps the B6
+    /// save point pointing at the same state.
+    #[test]
+    fn undo_stack_is_capped_and_save_point_survives_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = doc("\n");
+        for _ in 0..UNDO_CAP + 10 {
+            push_group(&mut d, 'a');
+        }
+        assert_eq!(d.undo_stack_len(), UNDO_CAP, "history is capped");
+        save_tmp(&mut d, &dir);
+        push_group(&mut d, 'b'); // evicts one more
+        assert!(d.is_modified());
+        d.undo();
+        assert!(!d.is_modified(), "save point tracked through the eviction");
+        d.redo();
+        assert!(d.is_modified());
+    }
+
+    /// B9: once the save point itself is evicted it is unreachable.
+    #[test]
+    fn evicted_save_point_is_unreachable() {
+        let mut d = doc("\n");
+        assert!(!d.is_modified());
+        for _ in 0..UNDO_CAP + 1 {
+            push_group(&mut d, 'a');
+        }
+        while d.undo_stack_len() > 0 {
+            d.undo();
+        }
+        assert_ne!(d.full_text(), "\n", "the oldest group was evicted");
+        assert!(d.is_modified(), "pristine state is no longer reachable");
+    }
+
+    /// B9: a programmatic insert AFTER every recorded splice (the common
+    /// append-at-EOF stream) doesn't walk the history at all.
+    #[test]
+    fn stream_after_all_recorded_splices_skips_history() {
+        let mut d = doc("\n");
+        for _ in 0..200 {
+            push_group(&mut d, 'a');
+        }
+        shift_visits_reset();
+        let eof = d.rope().len_chars();
+        d.insert_str_at_char_no_undo(eof, "agent\n");
+        assert_eq!(shift_visits(), 0, "entries entirely below the insert are skipped");
+        // An insert BEFORE them still shifts them (correctness).
+        d.insert_str_at_char_no_undo(0, "top\n");
+        d.undo();
+        assert_eq!(d.full_text(), format!("top\n{}\nagent\n", "a".repeat(199)));
+    }
+
+    /// B9: a programmatic delete spanning a recorded splice's start moves that
+    /// start to the deletion point — not `delta` past it (which clamped to 0
+    /// and replayed the undo at the top of the document).
+    #[test]
+    fn programmatic_delete_clamps_spanned_splice_to_delete_start() {
+        let mut d = doc("0123456789");
+        d.begin_undo_group(0, 5);
+        d.delete_char(0, 5); // "012346789", undo re-inserts "5" at 5
+        d.end_undo_group(0, 5);
+        d.delete_range_no_undo(3, 8); // removes "34678" → "0129"
+        d.undo();
+        assert_eq!(d.full_text(), "01259", "re-inserted at the collapse point");
     }
 }

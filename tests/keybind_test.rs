@@ -84,3 +84,38 @@ fn test_enter_command() {
     let result = mgr.process_key(k(':'));
     assert_eq!(result, Some("enter-command".to_string()));
 }
+
+/// B17: a failed multi-key prefix resolves its FIRST key's own single binding
+/// (it used to be dropped) and then re-feeds the rest.
+#[test]
+fn failed_prefix_fires_first_keys_single_binding_then_the_rest() {
+    let mut mgr = KeybindManager::default();
+    // `]` is both a single binding and the prefix of `]]`.
+    mgr.apply_bindings(&[(vec![k(']')], "bracket-single".to_string())]);
+    assert_eq!(mgr.process_key(k(']')), None, "still a possible `]]`");
+    assert_eq!(
+        mgr.process_key(k('j')).as_deref(),
+        Some("bracket-single"),
+        "the prefix key's own binding fires first"
+    );
+    assert_eq!(mgr.next_queued_action().as_deref(), Some("move-down"));
+    assert_eq!(mgr.next_queued_action(), None);
+    // The full sequence still wins when it completes.
+    assert_eq!(mgr.process_key(k(']')), None);
+    assert_eq!(
+        mgr.process_key(k(']')).as_deref(),
+        Some("next-heading-same-level")
+    );
+}
+
+/// B17: a digit typed while a multi-key prefix is pending breaks the prefix;
+/// it must not be folded into the count that preceded the prefix.
+#[test]
+fn digit_mid_prefix_does_not_corrupt_the_count() {
+    let mut mgr = KeybindManager::default();
+    assert_eq!(mgr.process_key(k('2')), None);
+    assert_eq!(mgr.process_key(k('g')), None);
+    assert_eq!(mgr.process_key(k('3')), None);
+    assert_eq!(mgr.process_key(k('j')).as_deref(), Some("move-down"));
+    assert_eq!(mgr.take_count(), Some(3), "the aborted `2g` discards its count");
+}

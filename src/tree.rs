@@ -13,6 +13,9 @@ pub struct BlockInfo {
 pub struct TreeState {
     parser: Parser,
     tree: Option<Tree>,
+    /// B14: number of parses run (incremental or full) — the observable that
+    /// proves edits don't parse until the tree is actually read.
+    parse_count: u64,
 }
 
 impl TreeState {
@@ -22,7 +25,11 @@ impl TreeState {
         parser
             .set_language(&language.into())
             .expect("Failed to set tree-sitter markdown language");
-        Self { parser, tree: None }
+        Self {
+            parser,
+            tree: None,
+            parse_count: 0,
+        }
     }
 
     /// Re-parse `source`. When `edit` is `Some`, reuse the previous tree
@@ -45,6 +52,31 @@ impl TreeState {
             _ => self.tree = None,
         }
         self.tree = self.parser.parse(source, self.tree.as_ref());
+        self.parse_count += 1;
+    }
+
+    /// B14: how many parses this state has run.
+    pub fn parse_count(&self) -> u64 {
+        self.parse_count
+    }
+
+    /// B14: parse straight out of a rope's chunks via `parse_with` — no
+    /// whole-document `String` copy. Same `edit` contract as [`parse`](Self::parse).
+    pub fn parse_rope(&mut self, rope: &ropey::Rope, edit: Option<tree_sitter::InputEdit>) {
+        match (edit, self.tree.as_mut()) {
+            (Some(e), Some(tree)) => tree.edit(&e),
+            _ => self.tree = None,
+        }
+        let len = rope.len_bytes();
+        let mut read = |byte: usize, _: tree_sitter::Point| -> &[u8] {
+            if byte >= len {
+                return &[];
+            }
+            let (chunk, chunk_start, _, _) = rope.chunk_at_byte(byte);
+            &chunk.as_bytes()[byte - chunk_start..]
+        };
+        self.tree = self.parser.parse_with(&mut read, self.tree.as_ref());
+        self.parse_count += 1;
     }
 
     pub fn tree(&self) -> Option<&Tree> {

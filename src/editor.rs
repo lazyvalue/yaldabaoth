@@ -190,7 +190,12 @@ impl<'a, T: Any + Send + Sync> LineMetadataMut<'a, T> {
 /// `&mut EditorCore` to access this substrate.
 pub struct EditorCore {
     document: Document,
-    tree_state: TreeState,
+    /// B14: parsed LAZILY — edits never touch tree-sitter; the first block-API
+    /// read after a change (`ensure_parsed`) parses straight from the rope.
+    /// `RefCell` because those reads take `&self`.
+    tree_state: std::cell::RefCell<TreeState>,
+    /// B14: `Document::edit_seq` the tree was last parsed at (`None` = never).
+    parsed_seq: std::cell::Cell<Option<u64>>,
     /// Half-open line ranges marking lines that are wholly frozen — content
     /// the user cannot edit (typically Claude's words in the *claude* buffer).
     /// A line is either entirely frozen or entirely editable; mid-line splits
@@ -308,13 +313,11 @@ impl EditorCore {
     }
 
     fn new_with_edit_seq(text: String, file_path: PathBuf, edit_seq: u64) -> Self {
-        let mut tree_state = TreeState::new();
-        tree_state.parse(text.as_bytes(), None);
-
         let document = Document::from_text_with_edit_seq(text, file_path, edit_seq);
         Self {
             document,
-            tree_state,
+            tree_state: std::cell::RefCell::new(TreeState::new()),
+            parsed_seq: std::cell::Cell::new(None),
             frozen_lines: Vec::new(),
             lockable_through_line: 0,
             line_anchors: LineAnchorStore::default(),
@@ -516,27 +519,44 @@ impl EditorCore {
         self.last_llm_open = false;
     }
 
-    /// Replay an undo/redo's line-level [`AnchorShift`]s on the anchor store so
-    /// frozen-line metadata (TurnId / tool tags) tracks the rope change — the
-    /// fix for "undo wiped the gutter / tool calls jumped to the bottom"
-    /// (worksheet-frozen-blocks ticket 001 / C3). The metadata is keyed by
-    /// stable anchor id, so SHIFTING the anchors (instead of the old
-    /// `reset_line_anchors`) preserves every surviving tag; only anchors on
-    /// lines a delete actually consumed are dropped. The LLM-tail perf hint is
-    /// line-derived, so it's safely invalidated (re-derived on next use).
+    /// Replay an undo/redo's line-level [`AnchorShift`]s through the SAME
+    /// shift machinery the forward edits used: frozen ranges, the locked
+    /// prefix, atomic blocks and the anchor store all move exactly as a live
+    /// insert/delete would move them.
+    ///
+    /// - C3 (worksheet-frozen-blocks ticket 001): metadata is keyed by stable
+    ///   anchor id, so SHIFTING the anchors (instead of the old
+    ///   `reset_line_anchors`) preserves every surviving TurnId/tool tag.
+    /// - B2/B12: frozen ranges + lock are shifted too, instead of restoring a
+    ///   snapshot taken when the undo group opened — which discarded any agent
+    ///   lines frozen (streamed) since, and cloned all ranges per group.
+    ///
+    /// The LLM-tail perf hint is line-derived, so it's safely invalidated
+    /// (re-derived on next use).
     pub fn apply_anchor_shifts(&mut self, shifts: &[AnchorShift]) {
         for op in shifts {
             match *op {
                 AnchorShift::Insert { line, col, nl } => {
-                    self.line_anchors.shift_for_insert(line, col, nl);
+                    if nl > 0 {
+                        self.shift_frozen_at(line, col, nl);
+                    }
                 }
                 AnchorShift::Delete { line, col, nl } => {
-                    for a in self.line_anchors.shift_for_delete(line, col, nl) {
-                        self.line_metadata.drop_anchor(a);
-                    }
+                    self.shift_frozen_for_delete_at(line, col, nl);
                 }
             }
         }
+        // An undone line insert re-joins the two halves of a frozen range it
+        // split; merge touching ranges (the `add_frozen_lines` canonical form)
+        // so the range comes back whole, as it was before the edit.
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(self.frozen_lines.len());
+        for &(s, e) in &self.frozen_lines {
+            match merged.last_mut() {
+                Some(last) if s <= last.1 => last.1 = last.1.max(e),
+                _ => merged.push((s, e)),
+            }
+        }
+        self.frozen_lines = merged;
         self.last_llm_line = None;
         self.last_llm_open = false;
     }
@@ -757,10 +777,18 @@ impl EditorCore {
             return;
         }
         let deleted_nl = rope.slice(del_s..end).chars().filter(|c| *c == '\n').count();
+        let (start_line, start_col) = self.document.line_col_of_char(del_s);
+        self.shift_frozen_for_delete_at(start_line, start_col, deleted_nl);
+    }
+
+    /// Shift frozen ranges, atomic blocks, the locked prefix, anchors and the
+    /// LLM-tail hint for a delete that started at `(start_line, start_col)`
+    /// and removed `deleted_nl` line breaks. Shared by the live delete path
+    /// and the undo/redo replay (B2), so both move frozen state identically.
+    fn shift_frozen_for_delete_at(&mut self, start_line: usize, start_col: usize, deleted_nl: usize) {
         if deleted_nl == 0 {
             return;
         }
-        let (start_line, start_col) = self.document.line_col_of_char(del_s);
         for (s, e) in self.frozen_lines.iter_mut() {
             if *s > start_line {
                 *s = s.saturating_sub(deleted_nl);
@@ -878,46 +906,72 @@ impl EditorCore {
         &mut self.document
     }
 
-    pub fn tree_state(&self) -> &TreeState {
-        &self.tree_state
+    /// The tree-sitter state, parsed up to date first (B14: lazily).
+    pub fn tree_state(&self) -> std::cell::Ref<'_, TreeState> {
+        self.ensure_parsed();
+        self.tree_state.borrow()
+    }
+
+    /// B14: parses run so far on this buffer (see `TreeState::parse_count`).
+    /// Does NOT parse.
+    pub fn tree_parse_count(&self) -> u64 {
+        self.tree_state.borrow().parse_count()
     }
 
     /// Get block boundary info.
     pub fn block_boundaries(&self) -> Vec<BlockInfo> {
-        self.tree_state.block_boundaries()
+        self.tree_state().block_boundaries()
     }
 
-    /// Get the text for a specific block by index.
+    /// Get the text for a specific block by index (a rope slice — no
+    /// whole-document copy).
     pub fn block_text(&self, block_index: usize) -> String {
         let blocks = self.block_boundaries();
         if let Some(block) = blocks.get(block_index) {
-            let text = self.document.full_text();
-            let start = block.start_byte.min(text.len());
-            let end = block.end_byte.min(text.len());
-            text[start..end].to_string()
+            let rope = self.document.rope();
+            let len = rope.len_bytes();
+            let s = rope.byte_to_char(block.start_byte.min(len));
+            let e = rope.byte_to_char(block.end_byte.min(len));
+            rope.slice(s..e).to_string()
         } else {
             String::new()
         }
     }
 
-    /// Re-parse the document with tree-sitter, incrementally when exactly one
-    /// clean splice has happened since the last reparse (the typing hot path),
-    /// else a full parse. The edit is computed in `Document::record_splice` and
-    /// consumed here via `take_pending_edit`.
+    /// Eagerly bring the tree up to date (tests / callers that want the parse
+    /// cost now). Edits no longer call this — see [`ensure_parsed`](Self::ensure_parsed).
     pub fn reparse(&mut self) {
+        self.ensure_parsed();
+    }
+
+    /// B14: parse iff the text changed since the last parse. Incremental when
+    /// exactly one clean splice happened since then (`take_pending_edit`),
+    /// else full; either way read straight from the rope's chunks
+    /// (`parse_rope`), never a `full_text()` copy. Called only from the block
+    /// API, so typing / `x` / `dd` / undo pay nothing for a tree the app
+    /// doesn't read on those paths.
+    fn ensure_parsed(&self) {
+        let seq = self.document.edit_seq();
+        if self.parsed_seq.get() == Some(seq) {
+            return;
+        }
         let edit = self.document.take_pending_edit();
-        let text = self.document.full_text();
+        let mut ts = self.tree_state.borrow_mut();
         if std::env::var("YALDA_PARSE_TIMING").as_deref() == Ok("1") {
             let kind = if edit.is_some() { "incr" } else { "full" };
             let t0 = std::time::Instant::now();
-            self.tree_state.parse(text.as_bytes(), edit);
+            ts.parse_rope(self.document.rope(), edit);
             let us = t0.elapsed().as_micros();
             if us > 100 {
-                eprintln!("[parse] {kind} reparse {} bytes in {us}µs", text.len());
+                eprintln!(
+                    "[parse] {kind} reparse {} bytes in {us}µs",
+                    self.document.len_bytes()
+                );
             }
         } else {
-            self.tree_state.parse(text.as_bytes(), edit);
+            ts.parse_rope(self.document.rope(), edit);
         }
+        self.parsed_seq.set(Some(seq));
     }
 
     pub fn save(&mut self) -> std::io::Result<()> {
@@ -1176,16 +1230,12 @@ impl EditorView {
     /// Open an undo group at the cursor unless one is already open (B1).
     /// Returns whether THIS call opened it.
     fn open_group(&self, core: &mut EditorCore) -> bool {
-        core.document.begin_undo_group(
-            self.cursor.line,
-            self.cursor.col,
-            &core.frozen_lines,
-            core.lockable_through_line,
-        )
+        core.document
+            .begin_undo_group(self.cursor.line, self.cursor.col)
     }
 
     /// Run a discrete edit as one undo step: opens a group if none is open,
-    /// runs `f`, closes the group only if this call opened it, then reparses.
+    /// runs `f`, and closes the group only if this call opened it.
     /// Inside an insert session (group already open) the edit joins the
     /// session instead of clobbering it (B1).
     fn grouped(&mut self, core: &mut EditorCore, f: impl FnOnce(&mut Self, &mut EditorCore)) {
@@ -1195,7 +1245,6 @@ impl EditorView {
             core.document
                 .end_undo_group(self.cursor.line, self.cursor.col);
         }
-        core.reparse();
     }
 
     /// Guarded delete of the char range `[del_s, del_e)`: checks the frozen /
@@ -1224,7 +1273,6 @@ impl EditorView {
         self.in_insert_mode = false;
         core.document
             .end_undo_group(self.cursor.line, self.cursor.col);
-        core.reparse();
     }
 
     pub fn insert_char(&mut self, core: &mut EditorCore, ch: char) {
@@ -1286,7 +1334,6 @@ impl EditorView {
         if opened {
             core.document
                 .end_undo_group(self.cursor.line, self.cursor.col);
-            core.reparse();
         }
     }
 
@@ -1429,37 +1476,31 @@ impl EditorView {
         self.history_step(core, false);
     }
 
-    /// B16: the one body behind undo and redo — restore the frozen state the
-    /// document hands back, SHIFT the anchors to track the rope change (C3:
-    /// preserving TurnId/tool metadata instead of resetting), and place the
-    /// caret.
+    /// B16: the one body behind undo and redo — replay the document's
+    /// line-level shifts on frozen ranges, lock and anchors (B2: no stale
+    /// snapshot; C3: TurnId/tool metadata preserved), and place the caret.
     fn history_step(&mut self, core: &mut EditorCore, undo: bool) {
-        let cur_frozen = core.frozen_lines.clone();
-        let cur_lockable = core.lockable_through_line;
         let step = if undo {
-            core.document.undo(&cur_frozen, cur_lockable)
+            core.document.undo()
         } else {
-            core.document.redo(&cur_frozen, cur_lockable)
+            core.document.redo()
         };
-        let Some((line, col, frozen, lockable, shifts)) = step else {
+        let Some((line, col, shifts)) = step else {
             return;
         };
-        core.frozen_lines = frozen;
-        core.lockable_through_line = lockable;
         core.apply_anchor_shifts(&shifts);
         self.cursor.line = line.min(core.document.line_count().saturating_sub(1));
         // `set_col` clears the sticky `desired_col` so the following clamp
         // restores THIS column, not a stale one from an earlier j/k run.
         self.cursor.set_col(col);
         self.clamp_cursor_col(core, false);
-        core.reparse();
     }
 
     pub fn active_block_index(&self, core: &EditorCore) -> Option<usize> {
         let byte_offset = core
             .document
             .line_col_to_byte(self.cursor.line, self.cursor.col);
-        core.tree_state.active_block_at_byte(byte_offset)
+        core.tree_state().active_block_at_byte(byte_offset)
     }
 
     // --- Motion delegates (operate on cursor with core's document) ---
@@ -2054,7 +2095,7 @@ impl Editor {
         self.core.document_mut()
     }
 
-    pub fn tree_state(&self) -> &TreeState {
+    pub fn tree_state(&self) -> std::cell::Ref<'_, TreeState> {
         self.core.tree_state()
     }
 
@@ -2964,13 +3005,11 @@ mod tests {
             let Editor { core, view } = &mut ed;
             view.cursor_mut().line = 0;
             view.cursor_mut().col = 5; // end of "draft"
-            let fl = core.frozen_lines.clone();
-            let lk = core.lockable_through_line;
             let (cl, cc) = {
                 let c = view.cursor();
                 (c.line, c.col)
             };
-            core.document.begin_undo_group(cl, cc, &fl, lk);
+            core.document.begin_undo_group(cl, cc);
             view.insert_char(core, '\n');
             let (al, ac) = {
                 let c = view.cursor();
@@ -3502,7 +3541,7 @@ fn f() { let x = 1; }
                 // Oracle: the incremental tree must equal a fresh full parse.
                 let text = core.document.full_text();
                 let incr = core
-                    .tree_state
+                    .tree_state()
                     .tree()
                     .map(|t| t.root_node().to_sexp())
                     .unwrap_or_default();
@@ -3926,5 +3965,184 @@ fn f() { let x = 1; }
         assert_eq!(ed.cursor().col, 4);
         assert!(!ed.find_char_backward('q'));
         assert_eq!(ed.cursor().col, 4);
+    }
+
+    // =========================================================================
+    // Text-editing deferred fixes Q1 (graph ls2 node q1-engine): B2 B8 B9 B14
+    // =========================================================================
+
+    /// Frozen-state oracle for the Q1 guards: a line is frozen iff its text is
+    /// agent content (starts with "agent").
+    fn assert_agent_lines_frozen(ed: &Editor, ctx: &str) {
+        for l in 0..ed.document().line_count() {
+            let text = ed.document().line_text(l);
+            assert_eq!(
+                ed.is_frozen_line(l),
+                text.starts_with("agent"),
+                "{ctx}: line {l} {text:?} frozen state wrong; frozen={:?}",
+                ed.frozen_lines()
+            );
+        }
+    }
+
+    /// B2: undo/redo replay the forward edit's frozen/lock shifts instead of
+    /// restoring a snapshot taken at group start — so agent lines streamed
+    /// between a user edit and its undo keep correct frozen ranges.
+    #[test]
+    fn undo_after_streamed_agent_lines_keeps_new_frozen_ranges() {
+        let mut ed = new_editor("agent one\n");
+        ed.add_frozen_lines(0, 1);
+        let a = ed.anchor_for_line(0);
+        ed.metadata_mut::<TurnId>().insert(a, TurnId::Llm(1));
+        // The user types a two-line draft on the editable tail (one session).
+        ed.cursor_mut().set_pos(1, 0);
+        ed.begin_insert();
+        for ch in "hi\nthere".chars() {
+            ed.insert_char(ch);
+        }
+        // Mid-session a new agent turn streams in ABOVE the draft.
+        let floor = ed.document().line_col_to_char(1, 0);
+        ed.append_llm_chunk_floored(TurnId::Llm(2), "agent two\n", floor);
+        ed.end_insert();
+        assert_agent_lines_frozen(&ed, "after stream");
+        ed.undo();
+        let text = ed.document().full_text();
+        assert!(!text.contains("hi") && !text.contains("there"), "draft undone: {text:?}");
+        assert_agent_lines_frozen(&ed, "after undo");
+        ed.redo();
+        assert!(ed.document().full_text().contains("hi\nthere"));
+        assert_agent_lines_frozen(&ed, "after redo");
+    }
+
+    /// B14: edits (typing, `x`, `dd`, undo/redo, paste) never run tree-sitter;
+    /// the tree is parsed lazily, once, on the first block-API read after them.
+    #[test]
+    fn edits_do_not_parse_until_the_tree_is_read() {
+        let mut ed = new_editor("# Head\n\npara one\n\npara two\n");
+        let parses = |ed: &Editor| ed.core().tree_parse_count();
+        assert_eq!(parses(&ed), 0, "opening a buffer does not parse");
+        ed.cursor_mut().set_pos(2, 0);
+        ed.begin_insert();
+        ed.insert_char('X');
+        ed.end_insert();
+        ed.delete_char_at_cursor();
+        ed.delete_current_line();
+        ed.undo();
+        ed.redo();
+        ed.paste_str("pasted\n");
+        assert_eq!(parses(&ed), 0, "no parse on the edit hot path");
+        let blocks = ed.block_boundaries();
+        assert!(blocks.len() >= 2, "{blocks:?}");
+        assert_eq!(parses(&ed), 1, "parsed once, on read");
+        let _ = ed.active_block_index();
+        let _ = ed.block_text(0);
+        assert_eq!(parses(&ed), 1, "a clean tree is not re-parsed");
+        // The lazily-parsed tree matches a fresh full parse of the text.
+        let mut fresh = crate::tree::TreeState::new();
+        fresh.parse(ed.document().full_text().as_bytes(), None);
+        assert_eq!(ed.block_boundaries(), fresh.block_boundaries());
+        // Multi-chunk rope: `parse_rope` reads across chunk boundaries (é is
+        // 2 bytes so chunk splits land mid-line in varied places).
+        let big: String = (0..800)
+            .map(|i| format!("# H{i}\n\npara é {i} with words\n\n"))
+            .collect();
+        let big_ed = new_editor(&big);
+        assert!(big_ed.document().rope().chunks().count() > 10);
+        let mut fresh = crate::tree::TreeState::new();
+        fresh.parse(big.as_bytes(), None);
+        assert_eq!(big_ed.block_boundaries(), fresh.block_boundaries());
+        assert_eq!(big_ed.block_text(1), "para é 0 with words\n");
+    }
+
+    /// B2: redo replays a `\n` re-inserted at the END of a frozen line with the
+    /// forward path's normalization (start of the next line), so the frozen
+    /// line stays put and the new blank line below it stays editable.
+    #[test]
+    fn redo_newline_at_end_of_frozen_line_keeps_frozen_line_in_place() {
+        let mut ed = new_editor("agent\n");
+        ed.add_frozen_lines(0, 1);
+        ed.cursor_mut().set_pos(0, 5);
+        ed.begin_insert();
+        ed.insert_char('\n');
+        ed.end_insert();
+        assert_eq!(ed.document().full_text(), "agent\n\n");
+        assert_agent_lines_frozen(&ed, "after enter");
+        ed.undo();
+        assert_agent_lines_frozen(&ed, "after undo");
+        ed.redo();
+        assert_eq!(ed.document().full_text(), "agent\n\n");
+        assert_agent_lines_frozen(&ed, "after redo");
+    }
+
+    /// B2: the lockable prefix is shifted by undo too (not restored from a
+    /// stale snapshot): a user newline above the lock, the agent locks more
+    /// lines, undo keeps the newly locked prefix.
+    #[test]
+    fn undo_shifts_lockable_prefix_instead_of_restoring_snapshot() {
+        let mut ed = new_editor("a\nb\nc\n");
+        ed.cursor_mut().set_pos(0, 1);
+        ed.begin_insert();
+        ed.insert_char('\n'); // "a\n\nb\nc\n"
+        ed.end_insert();
+        // Something locks through line 3 ("b" and above) after the edit.
+        ed.set_lockable_through_line(3);
+        ed.undo(); // removes the blank line → "b" is line 1 now
+        assert_eq!(ed.document().full_text(), "a\nb\nc\n");
+        assert_eq!(ed.lockable_through_line(), 2, "lock shifted up with the undone line");
+    }
+
+    /// B8: a CRLF file edits at the visible end of line and saves back as
+    /// clean CRLF; an untouched CRLF file round-trips byte-identical.
+    #[test]
+    fn crlf_file_edit_at_eol_saves_clean_crlf() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crlf.md");
+        let original = "one\r\ntwo\r\n";
+        let mut ed = Editor::new(original.to_string(), path.clone());
+        assert_eq!(ed.document().line_len_chars(0), 3, "visible line excludes the CR");
+        ed.save().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+        let end = ed.document().line_len_chars(0);
+        ed.cursor_mut().set_pos(0, end);
+        ed.begin_insert();
+        ed.insert_char('X');
+        ed.end_insert();
+        ed.save().unwrap();
+        assert_eq!(
+            String::from_utf8(std::fs::read(&path).unwrap()).unwrap(),
+            "oneX\r\ntwo\r\n"
+        );
+    }
+
+    /// B8: mixed line endings are left untouched (byte-identical save) and a
+    /// bare CR is not a line break; `line_len_chars` never counts a CR before
+    /// the newline.
+    #[test]
+    fn mixed_line_endings_round_trip_and_bare_cr_is_not_a_break() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixed.md");
+        let original = "a\r\nb\nx\ry\n";
+        let mut ed = Editor::new(original.to_string(), path.clone());
+        assert_eq!(ed.document().line_count(), 4, "only \\n breaks lines");
+        assert_eq!(ed.document().line_len_chars(0), 1, "CR before LF not counted");
+        assert_eq!(ed.document().line_len_chars(2), 3, "bare CR is an ordinary char");
+        ed.save().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+    }
+
+    /// B8: U+2028 (and friends) inside streamed agent text must not act as a
+    /// line break for the rope while the frozen/anchor machinery counts only
+    /// `\n` — the two would desync.
+    #[test]
+    fn unicode_line_separator_in_stream_does_not_desync_frozen_lines() {
+        let mut ed = new_editor("");
+        ed.append_llm_chunk(TurnId::Llm(1), "agent a\u{2028}b\u{85}c\n");
+        ed.append_llm_chunk(TurnId::Llm(1), "agent d\n");
+        ed.append_llm_chunk(TurnId::User(1), "user\n");
+        assert_eq!(ed.document().line_count(), 4, "{:?}", ed.document().full_text());
+        assert_eq!(ed.frozen_lines(), &[(0, 3)]);
+        assert_eq!(ed.document().line_text(1), "agent d\n");
+        let a = ed.anchor_for_line_opt(2).expect("user line anchored");
+        assert_eq!(ed.metadata::<TurnId>().get(a), Some(&TurnId::User(1)));
     }
 }
