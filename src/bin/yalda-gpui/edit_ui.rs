@@ -139,15 +139,17 @@ impl YaldaGpuiView {
         // undo), so edits show live in any Doc tile of the file and there's no
         // stash to shuttle. Snapshot the (id, core) without holding the borrow
         // across the pool mutation below.
-        let (shared, label, place): (
+        let (shared, label, place, folds): (
             Option<(workspace::FileBufferId, workspace::SharedCore)>,
             SharedString,
             Option<DocPlace>,
+            DocFolds,
         ) = match self.workspace.focused_content_mut() {
             Some(App::Buffer(BufferApp::Viewing(d))) => (
                 d.source.as_ref().map(|s| (s.buffer_id, s.core.clone())),
                 d.file_label.clone(),
                 DocPlace::of(d),
+                d.folds.clone(),
             ),
             _ => return,
         };
@@ -165,6 +167,7 @@ impl YaldaGpuiView {
         };
         let mut edit_state = EditState::new(SharedEditor::new(id, core), label, view);
         edit_state.view = view;
+        edit_state.doc_folds = folds;
         // UXI-Buffer-8: keep the reading position — caret at the focused
         // block's first source line, the top visible block's first line at the
         // top of the edit viewport. Unmapped Docs keep the 0,0 landing.
@@ -224,7 +227,11 @@ impl YaldaGpuiView {
                     .map(|b| b.read(cx).list.state().logical_scroll_top().item_ix);
                 let landing = doc_landing_from_edit(&edit, edit_top, &blocks);
                 let mut doc = DocState::viewing(blocks, file_label, Some(source));
+                // The Doc's folds survive the round trip (UXI-Buffer-13), re-keyed
+                // onto the edited text; a landing inside a fold opens it.
+                doc.restore_folds(edit.doc_folds.clone());
                 if let Some((cursor_block, top)) = landing {
+                    doc.reveal_fold(cursor_block);
                     doc.cursor_block = cursor_block;
                     doc.list.land(top, cursor_block);
                 }

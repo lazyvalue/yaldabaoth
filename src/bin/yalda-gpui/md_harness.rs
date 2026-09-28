@@ -742,3 +742,245 @@ fn doc_body_repaints_a_same_file_sibling_edit(cx: &mut TestAppContext) {
         "the Doc must PAINT the sibling Edit tile's text, not stale content: {painted:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// heading-nav (graph 4f1): `]]` / `[[` heading jumps (UXI-Buffer-12) and
+// heading folds `za` / `zM` / `zR` (UXI-Buffer-13) in the Doc view.
+// ---------------------------------------------------------------------------
+
+/// `n` filler paragraphs.
+fn filler(tag: &str, n: usize) -> String {
+    (0..n).map(|i| format!("{tag} filler paragraph {i}.\n\n")).collect()
+}
+
+/// `(cursor_block, fold keys, hidden blocks)` of the focused Doc.
+fn fold_state(
+    view: &Entity<YaldaGpuiView>,
+    vcx: &mut VisualTestContext,
+) -> (usize, Vec<usize>, Vec<usize>) {
+    view.read_with(vcx, |v, _| match v.workspace.focused_content() {
+        Some(App::Buffer(BufferApp::Viewing(d))) => (
+            d.cursor_block,
+            d.folds.keys().copied().collect(),
+            (0..d.blocks.len()).filter(|&i| d.is_block_hidden(i)).collect(),
+        ),
+        _ => panic!("expected a Doc"),
+    })
+}
+
+/// UXI-Buffer-12: `]]` puts the cursor on the next heading (any level) and
+/// scrolls it to the top of the view, painted there; `[[` from inside a
+/// section goes back to that section's heading, and from a heading to the
+/// previous one. Real keystrokes through the keymap.
+///
+/// Negative control (observed RED): unbind `] ]` in `DEFAULT_BINDINGS` → the
+/// cursor stays on block 0; drop `scroll_block_to_top` from
+/// `doc_heading_jump` → the heading is not the top block.
+#[gpui::test]
+fn heading_jumps_move_cursor_and_scroll_heading_to_top(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    // Blocks: 0 `# One`, 1..=12, 13 `## Two`, 14..=25, 26 `# Three`, 27..=38.
+    let md = format!(
+        "# One\n\n{}## Two\n\n{}# Three\n\n{}",
+        filler("one", 12),
+        filler("two", 12),
+        filler("three", 12)
+    );
+    let (view, vcx, _file) = boot_doc(cx, "hnav", &md);
+    vcx.simulate_resize(gpui::size(gpui::px(900.0), gpui::px(300.0)));
+    paint(&view, vcx);
+
+    vcx.simulate_keystrokes("] ]");
+    paint(&view, vcx);
+    let (cursor, top, vp) = doc_pos(&view, vcx);
+    assert_eq!((cursor, top), (13, 13), "`]]` → `## Two`, scrolled to the top");
+    let (_, y, _, _) = probe(&view, vcx, "doc-block-13").expect("heading painted");
+    assert!((y - vp.0).abs() < 20.0, "heading painted at the viewport top: {y} vs {vp:?}");
+    assert!(probe(&view, vcx, "doc-block-0").is_none(), "non-vacuous: block 0 scrolled away");
+
+    vcx.simulate_keystrokes("] ]");
+    paint(&view, vcx);
+    assert_eq!(doc_pos(&view, vcx).0, 26, "`]]` → `# Three`");
+
+    // Into the section, then `[[` returns to its heading…
+    vcx.simulate_keystrokes("j j j");
+    paint(&view, vcx);
+    assert_eq!(doc_pos(&view, vcx).0, 29);
+    vcx.simulate_keystrokes("[ [");
+    paint(&view, vcx);
+    assert_eq!(doc_pos(&view, vcx).0, 26, "`[[` inside a section → its heading");
+    // …and from a heading to the previous one, at the top.
+    vcx.simulate_keystrokes("[ [");
+    paint(&view, vcx);
+    let (cursor, top, _) = doc_pos(&view, vcx);
+    assert_eq!((cursor, top), (13, 13), "`[[` → `## Two`, scrolled to the top");
+    // Past the last heading: no move.
+    vcx.simulate_keystrokes("] ] ] ] ] ]");
+    paint(&view, vcx);
+    assert_eq!(doc_pos(&view, vcx).0, 26, "`]]` stops at the last heading");
+}
+
+/// Blocks: 0 `# One`, 1, 2, 3 `## Two`, 4, 5 `# Three`, 6 — fits the viewport.
+const FOLD_MD: &str =
+    "# One\n\npara 1a\n\npara 1b\n\n## Two\n\npara 2a\n\n# Three\n\npara 3a\n";
+
+/// UXI-Buffer-13: `za` inside a section folds it — its blocks (incl. the nested
+/// `## Two`) are NOT painted, the heading paints a `… N hidden` marker, the
+/// cursor lands on the heading, and `j` skips the folded blocks. `za` again
+/// unfolds. The outline rail marks the folded heading.
+///
+/// Negative controls (observed RED): make `FoldLayout::is_hidden` always false
+/// → the hidden blocks paint; revert `doc_next_block` to `cursor + 1` → `j`
+/// lands on block 1.
+#[gpui::test]
+fn za_folds_the_section_out_of_paint_and_j_skips_it(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (view, vcx, _file) = boot_doc(cx, "fold-za", FOLD_MD);
+    paint(&view, vcx);
+    for i in 0..7 {
+        assert!(probe(&view, vcx, &format!("doc-block-{i}")).is_some(), "non-vacuous: block {i} painted before folding");
+    }
+    vcx.simulate_keystrokes("j j");
+    vcx.simulate_keystrokes("z a");
+    paint(&view, vcx);
+    let (cursor, folds, hidden) = fold_state(&view, vcx);
+    assert_eq!(cursor, 0, "folding from inside the section lands on its heading");
+    assert_eq!(folds, vec![0]);
+    assert_eq!(hidden, vec![1, 2, 3, 4]);
+    for i in 1..=4 {
+        assert!(probe(&view, vcx, &format!("doc-block-{i}")).is_none(), "block {i} folded away, not painted");
+    }
+    for i in [0, 5, 6] {
+        assert!(probe(&view, vcx, &format!("doc-block-{i}")).is_some(), "block {i} still painted");
+    }
+    let (_, hy, _, hh) = probe(&view, vcx, "doc-block-0").unwrap();
+    let (_, my, _, _) = probe(&view, vcx, "doc-fold-marker-0").expect("fold marker painted");
+    assert!(my >= hy && my < hy + hh, "the marker trails the heading row");
+
+    vcx.simulate_keystrokes("j");
+    paint(&view, vcx);
+    assert_eq!(fold_state(&view, vcx).0, 5, "`j` skips the folded section");
+    vcx.simulate_keystrokes("k");
+    paint(&view, vcx);
+    assert_eq!(fold_state(&view, vcx).0, 0, "`k` skips it back");
+
+    // The outline rail marks the folded heading.
+    vcx.simulate_keystrokes("cmd-shift-o");
+    crate::layout_probe_begin();
+    frames(&view, vcx);
+    let folded_row = crate::layout_probe_get("outline-folded-row");
+    crate::layout_probe_end();
+    assert!(folded_row.is_some(), "the outline shows the folded heading with its marker");
+    vcx.simulate_keystrokes("escape");
+    paint(&view, vcx);
+
+    vcx.simulate_keystrokes("z a");
+    paint(&view, vcx);
+    let (_, folds, hidden) = fold_state(&view, vcx);
+    assert!(folds.is_empty() && hidden.is_empty(), "`za` on a folded heading unfolds");
+    assert!(probe(&view, vcx, "doc-block-2").is_some(), "unfolded block paints again");
+}
+
+/// UXI-Buffer-13: `zM` folds every section (nested ones inside their parent),
+/// `zR` unfolds everything; `G` stops at the last painted block.
+///
+/// Negative control (observed RED): unbind `z shift-r` → the folds stay.
+#[gpui::test]
+fn zm_folds_all_and_zr_unfolds_all(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (view, vcx, _file) = boot_doc(cx, "fold-zm", FOLD_MD);
+    vcx.simulate_keystrokes("z shift-m");
+    paint(&view, vcx);
+    let (_, folds, hidden) = fold_state(&view, vcx);
+    assert_eq!(folds, vec![0, 6, 10], "every heading with a section folds");
+    assert_eq!(hidden, vec![1, 2, 3, 4, 6]);
+    assert!(probe(&view, vcx, "doc-fold-marker-0").is_some());
+    assert!(probe(&view, vcx, "doc-fold-marker-5").is_some());
+    assert!(probe(&view, vcx, "doc-fold-marker-3").is_none(), "a nested fold is hidden with its parent");
+    vcx.simulate_keystrokes("shift-g");
+    paint(&view, vcx);
+    assert_eq!(fold_state(&view, vcx).0, 5, "`G` lands on the last PAINTED block");
+
+    vcx.simulate_keystrokes("z shift-r");
+    paint(&view, vcx);
+    let (_, folds, hidden) = fold_state(&view, vcx);
+    assert!(folds.is_empty() && hidden.is_empty(), "`zR` unfolds everything");
+    for i in 0..7 {
+        assert!(probe(&view, vcx, &format!("doc-block-{i}")).is_some(), "block {i} painted after zR");
+    }
+}
+
+/// UXI-Buffer-13: a fold follows its heading across a re-parse. A Doc and an
+/// Edit tile of the SAME file: fold `# One` in the Doc, then type a newline
+/// ABOVE it in the Edit tile (real keystrokes) — the heading moves from line 0
+/// to line 1, the Doc re-derives, and the section stays folded out of paint. A
+/// Doc → Edit → Doc round trip keeps the fold too.
+///
+/// Negative control (observed RED): make `rekey_folds` keep only folds whose
+/// line still holds the heading (no identity re-key) → the fold is dropped.
+#[gpui::test]
+fn fold_survives_an_edit_that_moves_its_heading(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_doc_beside_edit(cx, "fold-edit", FOLD_MD, "", true);
+    vcx.simulate_keystrokes("ctrl-w h");
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("z a");
+    paint(&view, vcx);
+    assert_eq!(fold_state(&view, vcx).1, vec![0], "folded `# One` at line 0");
+
+    vcx.simulate_keystrokes("ctrl-w l");
+    vcx.run_until_parked();
+    let caret = view.update(vcx, |v, _| v.edit_mut().expect("edit").editor.cursor());
+    assert_eq!((caret.line, caret.col), (0, 0), "typing lands above the heading");
+    vcx.simulate_keystrokes("enter");
+    paint(&view, vcx);
+    let text = view.update(vcx, |v, _| v.edit_mut().expect("edit").editor.full_text());
+    assert!(text.starts_with("\n# One"), "non-vacuous: the heading moved down: {text:?}");
+
+    vcx.simulate_keystrokes("ctrl-w h");
+    paint(&view, vcx);
+    let (_, folds, hidden) = fold_state(&view, vcx);
+    assert_eq!(folds, vec![1], "the fold re-keyed to the heading's new line");
+    assert_eq!(hidden, vec![1, 2, 3, 4]);
+    assert!(probe(&view, vcx, "doc-block-2").is_none(), "still folded out of paint");
+    assert!(probe(&view, vcx, "doc-fold-marker-0").is_some());
+
+    // Doc → Edit → Doc keeps it.
+    vcx.simulate_keystrokes("ctrl-e");
+    paint(&view, vcx);
+    vcx.simulate_keystrokes("ctrl-v");
+    paint(&view, vcx);
+    assert_eq!(fold_state(&view, vcx).1, vec![1], "the fold survives Doc → Edit → Doc");
+    assert!(probe(&view, vcx, "doc-block-2").is_none());
+}
+
+/// yux rule 2 / UXP-3: a fold toggle is a `DocView` render input — it must
+/// re-render the cached body (the cursor stays on the heading and the scroll
+/// top is unchanged, so `fold_seq` is the only input that moved).
+///
+/// Negative control (observed RED): drop `fold_seq` from `DocSeqs::of`
+/// (default it) → the body's render count stays flat and block 1 keeps painting.
+#[gpui::test]
+fn fold_toggle_rerenders_the_cached_doc_body(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (view, vcx, _file) = boot_doc(cx, "fold-perf", FOLD_MD);
+    paint(&view, vcx);
+    let before = crate::perf_render_count("doc-body");
+    vcx.simulate_keystrokes("z a");
+    vcx.run_until_parked();
+    assert_eq!(fold_state(&view, vcx).0, 0, "cursor stayed on the heading");
+    let after = crate::perf_render_count("doc-body");
+    assert!(after > before, "the fold must re-render the Doc body ({before} → {after})");
+    // What the body painted on its own (no forced re-render) excludes the
+    // folded text — read from its paint-time hit-test sink.
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let painted = painted_doc_text(&view, vcx);
+    assert!(painted.contains("One"), "non-vacuous: the heading painted: {painted:?}");
+    assert!(!painted.contains("para 1a"), "folded text not painted: {painted:?}");
+}
+
+#[test]
+fn outline_row_label_marks_folded_headings() {
+    assert_eq!(crate::chrome::outline_row_label("Intro", true), "▸ Intro");
+    assert_eq!(crate::chrome::outline_row_label("Intro", false), "Intro");
+}

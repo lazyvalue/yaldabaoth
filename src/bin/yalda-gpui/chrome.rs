@@ -2134,6 +2134,8 @@ impl YaldaGpuiView {
                     self.outline_revealed.set(highlighted);
                 }
                 let entries = o.entries.clone();
+                // Headings folded in the focused Doc (UXI-Buffer-13) get a `▸`.
+                let folded_lines = self.focused_doc_fold_lines();
                 let min_level = o.min_level();
                 let active_bg: Hsla = nc(self.theme.overlay.selected_bg);
                 let here_bar = accent_fg;
@@ -2168,13 +2170,15 @@ impl YaldaGpuiView {
                                     row = row.border_color(here_bar).text_color(accent_fg);
                                 }
                                 let view = view.clone();
+                                let folded = e.block.is_some() && folded_lines.contains(&e.line);
                                 let row = row
                                     .on_mouse_down(gpui::MouseButton::Left, move |_, _w, cx| {
                                         if let Some(v) = view.upgrade() {
                                             v.update(cx, |v, cx| v.outline_activate(i, cx));
                                         }
                                     })
-                                    .child(SharedString::from(e.text.clone()));
+                                    .child(SharedString::from(outline_row_label(&e.text, folded)));
+                                let row = probe_bounds_if(folded, "outline-folded-row", row);
                                 probe_bounds_if(is_hl, "outline-highlighted-row", row)
                             })
                             .collect::<Vec<_>>()
@@ -2187,6 +2191,15 @@ impl YaldaGpuiView {
                 col.child(header).child(list)
             }
         }
+    }
+}
+
+/// An outline row's text: a folded heading (UXI-Buffer-13) is prefixed `▸ `.
+pub(crate) fn outline_row_label(text: &str, folded: bool) -> String {
+    if folded {
+        format!("▸ {text}")
+    } else {
+        text.to_string()
     }
 }
 

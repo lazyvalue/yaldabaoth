@@ -58,6 +58,14 @@ pub(crate) struct DocState {
     /// Per tile (the old root-global sink mixed two Docs' lines). Read by the
     /// root's mouse handlers (`doc_pos_in`).
     pub(crate) line_layouts: DocLineLayouts,
+    /// Folded headings (UXI-Buffer-13, `doc_fold.rs`), keyed by source line.
+    /// Mutated only by the fold commands, `set_blocks` (re-key) and
+    /// `restore_folds`, each of which rebuilds `fold_layout` and bumps `fold_seq`.
+    pub(crate) folds: DocFolds,
+    /// Per-block visibility derived from `(blocks, folds)`; read by the body.
+    pub(crate) fold_layout: Rc<FoldLayout>,
+    /// Monotonic version of `fold_layout` — a `DocSeqs` input.
+    pub(crate) fold_seq: u64,
 }
 
 /// Per-Doc mouse hit-test sink: `(block_idx, line_idx)` → painted `TextLayout`.
@@ -110,7 +118,7 @@ impl DocState {
         source: Option<DocSource>,
     ) -> Self {
         let Rendered { blocks, spans } = rendered.into();
-        let d = DocState {
+        let mut d = DocState {
             blocks: Rc::new(blocks),
             spans,
             file_label,
@@ -122,8 +130,12 @@ impl DocState {
             source,
             body: None,
             line_layouts: DocLineLayouts::default(),
+            folds: DocFolds::new(),
+            fold_layout: Rc::default(),
+            fold_seq: 0,
         };
         d.reconcile_list();
+        d.refold();
         d
     }
 
@@ -136,6 +148,8 @@ impl DocState {
         self.spans = spans;
         self.blocks_seq = self.blocks_seq.wrapping_add(1);
         self.reconcile_list();
+        // Folds follow their headings across the re-parse (UXI-Buffer-13).
+        self.rekey_folds();
     }
 
     /// Re-derive `blocks` from the shared core if it has advanced since the
@@ -198,6 +212,9 @@ impl DocState {
             return false;
         };
         let to = to.min(last);
+        // A jump into a folded section opens the folds hiding it (UXI-Buffer-13);
+        // block nav itself only ever targets painted blocks.
+        self.reveal_fold(to);
         self.cursor_block = to;
         self.reveal_block(to);
         true

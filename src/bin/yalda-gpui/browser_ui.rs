@@ -705,16 +705,14 @@ impl YaldaGpuiView {
             Some(App::Buffer(BufferApp::Viewing(d))) => {
                 let Some(block) = entry.block else { return };
                 let block = block.min(d.blocks.len().saturating_sub(1));
+                // A heading inside a folded section: open the folds hiding it
+                // (UXI-Buffer-13).
+                d.reveal_fold(block);
                 d.cursor_block = block;
                 // The list is reconciled at every block mutation, so `block`
                 // is a real item; the body repaints off `DocSeqs` (cursor +
                 // scroll top).
-                if block < d.list.len() {
-                    d.list.state().scroll_to(gpui::ListOffset {
-                        item_ix: block,
-                        offset_in_item: gpui::px(0.0),
-                    });
-                }
+                d.scroll_block_to_top(block);
             }
             Some(App::Buffer(BufferApp::Editing(e))) => {
                 let line = entry.line.min(e.editor.line_count().saturating_sub(1));

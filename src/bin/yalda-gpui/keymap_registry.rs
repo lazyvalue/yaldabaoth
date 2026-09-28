@@ -78,6 +78,12 @@ const DEFAULT_BINDINGS: &[DefaultBinding] = &[
     b!("left",         "CursorPrevBlock",  YV, "Navigation", "Previous block"),
     b!("g",            "CursorTop",        YV, "Navigation", "Go to top"),
     b!("shift-g",      "CursorBottom",     YV, "Navigation", "Go to bottom"),
+    // Heading nav + folding (UXI-Buffer-12/13) — vim's `]]`/`[[` and `za`/`zM`/`zR`.
+    b!("] ]",          "NextHeading",      YV, "Navigation", "Next heading (to the top)"),
+    b!("[ [",          "PrevHeading",      YV, "Navigation", "Previous heading (to the top)"),
+    b!("z a",          "ToggleFold",       YV, "Folding", "Fold / unfold the section under the cursor"),
+    b!("z shift-m",    "FoldAll",          YV, "Folding", "Fold every section"),
+    b!("z shift-r",    "UnfoldAll",        YV, "Folding", "Unfold every section"),
     b!("ctrl-o",       "OpenBrowser",      YV, "Apps & files", "Open file browser"),
     b!("ctrl-e",       "EnterEdit",        YV, "Editing", "Edit — raw markdown"),
     b!("ctrl-shift-e", "EnterWp",          YV, "Editing", "Edit — word processor"),

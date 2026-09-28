@@ -51,6 +51,9 @@ pub(crate) struct DocSeqs {
     source_seq: Option<u64>,
     /// The block carrying the cursor bar.
     cursor_block: usize,
+    /// Heading folds (`DocState::fold_seq`, UXI-Buffer-13) — which blocks are
+    /// hidden and which headings carry the `… N hidden` marker.
+    fold_seq: u64,
     /// The list's logical scroll top `(item, offset bits)` — root-side nav /
     /// outline jumps / landings scroll the list without notifying the body.
     scroll_top: (usize, u32),
@@ -79,6 +82,7 @@ impl DocSeqs {
             blocks_seq: d.blocks_seq,
             source_seq: d.source.as_ref().map(DocSource::edit_seq),
             cursor_block: d.cursor_block,
+            fold_seq: d.fold_seq,
             scroll_top: (top.item_ix, f32::from(top.offset_in_item).to_bits()),
             selection: root.doc_selection,
             text_scale_bits: root.text_scale.to_bits(),
@@ -190,11 +194,18 @@ fn build_doc_body(
     let line_layouts = d.line_layouts.clone();
     let blocks_rc = d.blocks_rc();
     let diagrams = r.diagrams.clone();
+    let folds = d.fold_layout.clone();
+    let fold_muted = fg_or(r.theme.line_number, 0x6272a4);
 
     let render_fn = move |idx: usize, _w: &mut Window, _app: &mut GpuiApp| -> AnyElement {
         let Some(block) = blocks_rc.get(idx) else {
             return div().into_any_element();
         };
+        // Inside a folded section (UXI-Buffer-13): a zero-height row — not
+        // painted, and the list keeps one item per block.
+        if folds.is_hidden(idx) {
+            return div().into_any_element();
+        }
         #[cfg(test)]
         DOC_BLOCK_BUILDS.with(|c| c.set(c.get() + 1));
         let ctx = RenderCtx {
@@ -210,6 +221,10 @@ fn build_doc_body(
             ..RenderCtx::new(&theme, body_font.clone(), code_font.clone(), text_scale)
         };
         let el = block_element(&ctx, idx, block);
+        let el = match folds.hidden_count(idx) {
+            Some(n) => folded_heading_row(el, n, idx, fold_muted, text_scale),
+            None => el,
+        };
         // UXI-ParagraphSpacing-1 test seam: expose each doc block's painted
         // bounds so `verify_harness` can measure the inter-block gap.
         #[cfg(test)]

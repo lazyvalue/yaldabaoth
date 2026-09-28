@@ -86,14 +86,15 @@ impl YaldaGpuiView {
         }
     }
 
-    /// j / ↓ — next block (stops at the last).
+    /// j / ↓ — next painted block (stops at the last; skips folded sections,
+    /// UXI-Buffer-13).
     fn doc_next_block(d: &DocState) -> Option<usize> {
-        (d.cursor_block + 1 < d.blocks.len()).then_some(d.cursor_block + 1)
+        d.visible_step(d.cursor_block, 1)
     }
 
-    /// k / ↑ — previous block (stops at the first).
+    /// k / ↑ — previous painted block (stops at the first).
     fn doc_prev_block(d: &DocState) -> Option<usize> {
-        d.cursor_block.checked_sub(1)
+        d.visible_step(d.cursor_block, -1)
     }
 
     pub(crate) fn scroll_down(&mut self, _: &ScrollDown, _w: &mut Window, cx: &mut Context<Self>) {
@@ -103,10 +104,10 @@ impl YaldaGpuiView {
         self.doc_nav(cx, Self::doc_prev_block);
     }
     pub(crate) fn page_down(&mut self, _: &ScrollPageDown, _w: &mut Window, cx: &mut Context<Self>) {
-        self.doc_nav(cx, |d| Some(d.cursor_block + 8));
+        self.doc_nav(cx, |d| d.visible_step(d.cursor_block, 8).or(Some(d.cursor_block)));
     }
     pub(crate) fn page_up(&mut self, _: &ScrollPageUp, _w: &mut Window, cx: &mut Context<Self>) {
-        self.doc_nav(cx, |d| Some(d.cursor_block.saturating_sub(8)));
+        self.doc_nav(cx, |d| d.visible_step(d.cursor_block, -8).or(Some(d.cursor_block)));
     }
     pub(crate) fn cursor_next(&mut self, _: &CursorNextBlock, _w: &mut Window, cx: &mut Context<Self>) {
         self.doc_nav(cx, Self::doc_next_block);
@@ -118,8 +119,8 @@ impl YaldaGpuiView {
         self.doc_nav(cx, |_| Some(0));
     }
     pub(crate) fn cursor_bottom(&mut self, _: &CursorBottom, _w: &mut Window, cx: &mut Context<Self>) {
-        // Clamped to the last block by `move_cursor_to`.
-        self.doc_nav(cx, |_| Some(usize::MAX));
+        // The last PAINTED block — never into a folded tail.
+        self.doc_nav(cx, DocState::last_visible);
     }
 
     /// Move the doc cursor to the next block (wrapping past EOF) matching
@@ -398,6 +399,9 @@ fn doc_selection_text(d: &DocState, sel: &DocSelection) -> Option<String> {
     let mut out = String::new();
     for bi in start.block_idx..=end.block_idx {
         let block = blocks.get(bi)?;
+        if d.is_block_hidden(bi) {
+            continue; // folded away (UXI-Buffer-13): not painted, not copied
+        }
         let lines = block_selectable_lines(block);
         if lines.is_empty() {
             continue;
