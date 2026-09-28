@@ -114,6 +114,17 @@ pub(crate) enum CogTopicRow {
     },
 }
 
+/// A folder's effective fold state. `✓ done` folders start collapsed, so the
+/// saved set records a user toggle *away from each folder's default*
+/// (UXI-Cog-21); ordinary folders start expanded, as before.
+pub(crate) fn topic_folder_collapsed(
+    label: &str,
+    path: &str,
+    toggled: &std::collections::HashSet<String>,
+) -> bool {
+    (label == crate::DONE_GRAPHS_FOLDER) != toggled.contains(path)
+}
+
 fn flatten_topic_nodes(
     nodes: &[CogTopicNode],
     depth: usize,
@@ -132,7 +143,7 @@ fn flatten_topic_nodes(
                     path: path.clone(),
                     depth,
                 });
-                if !collapsed.contains(path) {
+                if !topic_folder_collapsed(label, path, collapsed) {
                     flatten_topic_nodes(children, depth + 1, collapsed, out);
                 }
             }
@@ -1108,7 +1119,11 @@ impl CogView {
     }
 
     fn topic_collapsed_row(&self, row: &CogTopicRow) -> bool {
-        matches!(row, CogTopicRow::Folder { path, .. } if self.topic_collapsed.contains(path))
+        matches!(
+            row,
+            CogTopicRow::Folder { label, path, .. }
+                if topic_folder_collapsed(label, path, &self.topic_collapsed)
+        )
     }
 
     fn topic_detail_body(

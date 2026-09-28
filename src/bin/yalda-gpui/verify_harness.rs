@@ -27240,6 +27240,79 @@ fn cog_test_home(bindings: Vec<crate::CogTopicBinding>) -> crate::CogHomeData {
     }
 }
 
+/// UXI-Cog-21: inside a Topic folder, open graphs lead newest-first and
+/// finished graphs sit in a `✓ done` subfolder that starts collapsed; the real
+/// folder click expands it, and the toggle persists as a flip from default.
+///
+/// Negative control: build the tree with an empty `done` set (i.e. make
+/// `from_bindings_with_done` ignore `done`); the "no finished graph visible"
+/// assertion fails because the finished graph paints among the open ones.
+#[gpui::test]
+fn cog_home_groups_finished_graphs_in_collapsed_done_folder(cx: &mut TestAppContext) {
+    let topic = |address: &str, kind, id: &str, created_at: i64| crate::CogTopicBinding {
+        address: address.into(),
+        kind,
+        object: id.into(),
+        name: id.into(),
+        created_at,
+    };
+    let graph = crate::CogTopicKind::Graph;
+    let bindings = vec![
+        // Leaf style: one row per graph in an area folder.
+        topic("yaldabaoth/cog::older-open", graph, "g-old", 1),
+        topic("yaldabaoth/cog::finished", graph, "g-done", 2),
+        topic("yaldabaoth/cog::newest-open", graph, "g-new", 3),
+        // Project style: `<name>::plan` + `<name>::chat`; a finished plan
+        // retires the whole `<name>` folder.
+        topic("yaldabaoth/cog/shipped::plan", graph, "g-shipped", 4),
+        topic("yaldabaoth/cog/shipped::chat", crate::CogTopicKind::Chat, "c1", 4),
+    ];
+    let done: std::collections::BTreeSet<String> =
+        ["g-done".to_string(), "g-shipped".to_string()].into();
+    let home = crate::CogHomeData {
+        topics: crate::CogTopicTree::from_bindings_with_done(bindings, &done),
+        agents: vec![],
+        agent_presence: Default::default(),
+    };
+    let (view, vcx, cv, wid) = boot_with_cog(cx);
+    let req = cog_tile_req(&view, vcx);
+    view.update(vcx, |v, cx| {
+        v.cog_apply(wid, req, Ok(crate::CogFetch::Home(Box::new(home))), cx);
+    });
+    vcx.run_until_parked();
+
+    let visible = |rows: &[crate::CogTopicRow]| -> Vec<String> {
+        rows.iter()
+            .map(|row| match row {
+                crate::CogTopicRow::Folder { label, .. } => format!("[{label}]"),
+                crate::CogTopicRow::Binding { binding, .. } => binding.object.clone(),
+            })
+            .collect()
+    };
+    assert_eq!(
+        visible(&cv.update(vcx, |c, _| c.topic_rows())),
+        vec!["[yaldabaoth]", "[cog]", "g-new", "g-old", "[✓ done]"],
+        "open graphs lead newest-first; finished graphs and finished project \
+         folders are grouped in a collapsed ✓ done folder"
+    );
+
+    // Real folder click expands it: the finished leaf and the retired project
+    // folder (itself expanded, with no nested ✓ done) appear inside.
+    cv.update(vcx, |c, cx| c.click_topic(4, cx));
+    vcx.run_until_parked();
+    assert_eq!(
+        visible(&cv.update(vcx, |c, _| c.topic_rows())),
+        vec![
+            "[yaldabaoth]", "[cog]", "g-new", "g-old", "[✓ done]",
+            "[shipped]", "g-shipped", "c1", "g-done",
+        ]
+    );
+    // Clicking again restores the collapsed default.
+    cv.update(vcx, |c, cx| c.click_topic(4, cx));
+    vcx.run_until_parked();
+    assert_eq!(cv.update(vcx, |c, _| c.topic_rows()).len(), 5);
+}
+
 /// UXI-Cog-20: a graph no Topic binds is still reachable from Home — listed
 /// once under the `unfiled graphs` folder (a Topic-bound graph is NOT repeated
 /// there), and the real row click selects it as that graph for opening.

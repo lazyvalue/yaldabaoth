@@ -69,8 +69,8 @@ Before editing tracked files:
 
 1. Confirm `cogd` is reachable with `cog graph list`.
 2. Create or import a graph and use actor `claude-code` for every mutation.
-3. Bind it at `yaldabaoth/<area>/<graph-name>::plan`
-   (`cog topic bind yaldabaoth/<area>/<graph-name>::plan --graph <id> --actor claude-code`)
+3. Bind it at `yaldabaoth/<area>::<graph-name>`
+   (`cog topic bind yaldabaoth/<area>::<graph-name> --graph <id> --actor claude-code`)
    so it shows in the Cog tile's Topic tree. Areas: `agent`, `models`,
    `workspace`, `jump`, `cog`, `session-server`, `diff`, `editor`, `platform`,
    `process` (add one only when none fits). Addresses are immutable — bind once.

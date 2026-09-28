@@ -636,3 +636,56 @@ name-first labels while retaining stable ids. `cog_agents_tab_reads_delivery_and
 also proves registered mail participants paint name-first. Unknown and empty
 fallbacks are guarded. Bypassing directory lookup fails with bare `ncz`. Exact
 pixels and colours remain runtime gap #1.
+
+### UXI-Cog-20 — Every graph is reachable from Home, bound or not
+
+**Statement.** Home's Topic tree also lists every graph that no live Topic
+binds, as a Graph leaf under an `unfiled graphs` folder (address
+`unfiled graphs::<graph id>`, label `<id> · <name>`). A Topic-bound graph is
+never repeated there. Opening an unfiled leaf opens that graph exactly like a
+bound graph leaf (both use the binding's graph id). A failure to list graphs
+never hides the Topics that loaded.
+
+**Applies to.** `cog.rs`: `with_unfiled_graphs`, `list_topics`,
+`UNFILED_GRAPHS_FOLDER`.
+
+**Why.** 2026-09-27: Yaldabaoth graphs were invisible in the tile because Home
+lists only Topic bindings and none had been bound (the workflow now binds each
+graph at `yaldabaoth/<area>::<graph-name>`, CLAUDE.md). The unfiled folder makes
+an unbound graph discoverable instead of silently missing.
+
+**Status.** `implemented (headless)`.
+
+**Enforcement.** `verify_harness.rs::cog_home_lists_unbound_graphs_under_unfiled_folder`
+(real reducer + real row click; negative control — `with_unfiled_graphs`
+returning `bindings` unchanged — fails at "Home shows the unfiled graphs
+folder"). The `cog` subprocess itself is gap 2.
+
+### UXI-Cog-21 — Finished graphs fold away; open graphs lead newest-first
+
+**Statement.** Within every Topic folder, open graph leaves come first, newest
+first by binding `created_at` (unfiled graphs rank by `cog graph list`
+creation order), then other kinds alphabetically. Finished graphs — sealed, or
+`cog graph status` = `complete` — move into a per-folder `✓ done` subfolder
+that starts **collapsed**. A subfolder whose subtree binds ≥1 graph and whose
+graphs are all finished (e.g. a project-style `<name>::plan` + `<name>::chat`
+folder) retires into the parent's `✓ done` as a whole. Nothing is grouped again
+inside a `✓ done` folder. The saved fold set records a toggle *away from each
+folder's default*, so existing expanded/collapsed folders keep their state.
+Finished statuses are cached for the process lifetime; each Home reload
+re-queries only open graphs.
+
+**Applies to.** `cog.rs`: `DONE_GRAPHS_FOLDER`, `TopicFolderBuilder::{finish,
+is_finished}`, `CogTopicTree::from_bindings_with_done`, `done_graph_ids`
+(`DONE_GRAPH_CACHE`); `cog_view.rs`: `topic_folder_collapsed`.
+
+**Why.** Binding all 34 Yaldabaoth graphs made Home a wall of mostly-finished
+work. Grouping by status keeps the in-flight few visible without discipline;
+area folders (`yaldabaoth/<area>::…`) give browsing by subject.
+
+**Status.** `implemented (headless)`.
+
+**Enforcement.** `verify_harness.rs::cog_home_groups_finished_graphs_in_collapsed_done_folder`
+(both address shapes; real folder clicks expand/restore; negative control —
+building the tree with an empty done set — paints the finished graph among the
+open ones and fails).
