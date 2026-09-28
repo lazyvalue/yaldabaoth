@@ -33993,3 +33993,249 @@ fn compose_virtualized_rewraps_after_width_change(cx: &mut TestAppContext) {
     let v2 = view.clone();
     check("sidepanel", &mut |vcx| v2.update(vcx, |v, cx| v.toggle_tasklist(cx)));
 }
+
+// ---- Buffer ⇄ disk sync (UXI-Buffer-4..7, file_sync.rs) --------------------
+
+/// Boot the real view over a tempdir file: open it through `open_file` (the
+/// picker's open path), enter Edit (`enter_edit_with`, the space-e path), and
+/// start disk sync (`start_file_sync`, what `main()` runs). Returns the
+/// canonical path the pool keys the buffer by.
+fn boot_file_sync<'a>(
+    cx: &'a mut TestAppContext,
+    dir: &std::path::Path,
+    initial: &str,
+) -> (
+    gpui::Entity<YaldaGpuiView>,
+    &'a mut gpui::VisualTestContext,
+    PathBuf,
+) {
+    let path = dir.join("synced.md");
+    std::fs::write(&path, initial).expect("write initial file");
+    let canon = path.canonicalize().expect("canonicalize");
+    let start = dir.to_path_buf();
+    let (view, vcx) = cx.add_window_view(move |window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        let mut v = crate::with_no_session_server(|| {
+            YaldaGpuiView::new_browser(start, Theme::default(), focus_handle)
+        });
+        v.splash_until = None;
+        v
+    });
+    vcx.run_until_parked();
+    let open_path = path.clone();
+    view.update(vcx, |v, cx| {
+        assert!(v.open_file(open_path), "open the file through the real open path");
+        v.enter_edit_with(crate::EditView::Code, cx);
+        v.start_file_sync(cx);
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    let tracked = view.read_with(vcx, |v, _| v.file_sync.is_tracked(&canon));
+    assert!(tracked, "an open pool buffer must be watched");
+    (view, vcx, canon)
+}
+
+fn fs_edit_text(view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext) -> String {
+    view.update(vcx, |v, _| v.edit_mut().expect("edit view").editor.full_text())
+}
+
+fn fs_type(view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext, s: &str) {
+    view.update(vcx, |v, cx| {
+        for ch in s.chars() {
+            v.dispatch_insert(
+                yalda::keys::KeyPress {
+                    key: yalda::keys::Key::Char(ch),
+                    modifiers: yalda::keys::Modifiers::NONE,
+                },
+                cx,
+            );
+        }
+    });
+    vcx.run_until_parked();
+}
+
+/// Deliver a watcher event through the real filter → debounce → background
+/// read → apply pump.
+fn fs_event(view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext, p: &std::path::Path) {
+    view.read_with(vcx, |v, _| v.test_inject_fs_event(p.to_path_buf()));
+    vcx.executor().advance_clock(crate::WATCH_DEBOUNCE + Duration::from_millis(50));
+    vcx.run_until_parked();
+}
+
+use std::time::Duration;
+
+/// UXI-Buffer-4: an external write to a CLEAN buffer reloads it silently, the
+/// caret keeps its line/col, and the new text is what the Edit view PAINTS.
+#[gpui::test]
+fn file_sync_external_write_reloads_clean_buffer_preserving_caret(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (view, vcx, canon) =
+        boot_file_sync(cx, dir.path(), "zero\nline one\nline two\nline three\n");
+    view.update(vcx, |v, _| v.edit_mut().unwrap().editor.set_cursor(2, 3));
+
+    std::fs::write(&canon, "zero\nline one\nLINE TWO CHANGED\nline three\ntail\n").unwrap();
+    crate::screens::edit_render_tap_begin();
+    fs_event(&view, vcx, &canon);
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+
+    assert_eq!(
+        fs_edit_text(&view, vcx),
+        "zero\nline one\nLINE TWO CHANGED\nline three\ntail\n",
+        "clean buffer must take the external change"
+    );
+    view.update(vcx, |v, _| {
+        let e = v.edit_mut().unwrap();
+        let c = e.editor.cursor();
+        assert_eq!((c.line, c.col), (2, 3), "caret line/col preserved across reload");
+        assert!(!e.editor.is_modified(), "reloaded buffer is clean");
+    });
+    assert!(!view.read_with(vcx, |v, _| v.buffer_has_disk_conflict(&canon)));
+    let painted = crate::screens::edit_render_tap_snapshot();
+    assert!(
+        painted.iter().any(|l| l.line_idx == 2 && l.text == "LINE TWO CHANGED"),
+        "the reloaded text must be painted by the real Edit render path"
+    );
+}
+
+/// UXI-Buffer-5: an external write to a DIRTY buffer never clobbers it (not
+/// by the reload, not by autosave); the conflict badge PAINTS; keep-mine lets
+/// the next save overwrite; reload-theirs takes the disk text.
+#[gpui::test]
+fn file_sync_dirty_buffer_external_change_conflicts_and_is_not_clobbered(
+    cx: &mut TestAppContext,
+) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (view, vcx, canon) = boot_file_sync(cx, dir.path(), "alpha\nbeta\n");
+    fs_type(&view, vcx, "MINE ");
+    let mine = fs_edit_text(&view, vcx);
+    assert!(mine.starts_with("MINE "), "typed into the buffer: {mine:?}");
+
+    std::fs::write(&canon, "theirs\n").unwrap();
+    fs_event(&view, vcx, &canon);
+    assert_eq!(fs_edit_text(&view, vcx), mine, "dirty buffer must not be clobbered");
+    assert!(view.read_with(vcx, |v, _| v.buffer_has_disk_conflict(&canon)));
+
+    // The status-bar badge actually paints.
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let badge = crate::layout_probe_get("buffer-disk-conflict");
+    crate::layout_probe_end();
+    let (_, _, w, h) = badge.expect("conflict badge must paint in the tile status bar");
+    assert!(w > 0.0 && h > 0.0, "conflict badge painted with no area");
+
+    // Autosave must not overwrite the external change while in conflict.
+    vcx.executor().advance_clock(Duration::from_secs(3));
+    vcx.run_until_parked();
+    assert_eq!(std::fs::read_to_string(&canon).unwrap(), "theirs\n", "conflict blocks autosave");
+
+    // Keep mine → the (re-armed) autosave overwrites disk with the buffer.
+    view.update(vcx, |v, cx| v.dispatch_menu_command("disk-keep-mine", cx));
+    vcx.run_until_parked();
+    assert!(!view.read_with(vcx, |v, _| v.buffer_has_disk_conflict(&canon)));
+    vcx.executor().advance_clock(Duration::from_millis(1100));
+    vcx.run_until_parked();
+    assert_eq!(std::fs::read_to_string(&canon).unwrap(), mine, "keep mine: next save overwrites");
+
+    // Dirty again + external change → reload theirs takes the disk text.
+    fs_type(&view, vcx, "more ");
+    std::fs::write(&canon, "theirs again\n").unwrap();
+    fs_event(&view, vcx, &canon);
+    assert!(view.read_with(vcx, |v, _| v.buffer_has_disk_conflict(&canon)));
+    view.update(vcx, |v, cx| v.dispatch_menu_command("disk-reload-theirs", cx));
+    vcx.run_until_parked();
+    assert_eq!(fs_edit_text(&view, vcx), "theirs again\n");
+    assert!(!view.read_with(vcx, |v, _| v.buffer_has_disk_conflict(&canon)));
+    view.update(vcx, |v, _| assert!(!v.edit_mut().unwrap().editor.is_modified()));
+}
+
+/// UXI-Buffer-6: a dirty buffer autosaves ~1s after the LAST edit (debounced:
+/// an edit restarts the clock), and immediately when its tile loses focus.
+#[gpui::test]
+fn file_sync_autosave_writes_after_idle_and_on_focus_loss(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (view, vcx, canon) = boot_file_sync(cx, dir.path(), "base\n");
+
+    fs_type(&view, vcx, "a");
+    vcx.executor().advance_clock(Duration::from_millis(600));
+    vcx.run_until_parked();
+    fs_type(&view, vcx, "b");
+    vcx.executor().advance_clock(Duration::from_millis(600));
+    vcx.run_until_parked();
+    assert_eq!(
+        std::fs::read_to_string(&canon).unwrap(),
+        "base\n",
+        "1.2s after the first edit but only 0.6s after the last: not yet saved"
+    );
+    vcx.executor().advance_clock(Duration::from_millis(500));
+    vcx.run_until_parked();
+    let text = fs_edit_text(&view, vcx);
+    assert_eq!(std::fs::read_to_string(&canon).unwrap(), text, "autosaved after idle");
+    view.update(vcx, |v, _| assert!(!v.edit_mut().unwrap().editor.is_modified()));
+    // Atomic write leaves no temp file behind.
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "temp file left behind: {leftovers:?}");
+
+    // Focus loss: edit, then move focus to a new tile — saved without waiting.
+    fs_type(&view, vcx, "c");
+    view.update(vcx, |v, cx| v.dispatch_menu_command("split-v", cx));
+    vcx.run_until_parked();
+    let text = view.read_with(vcx, |v, _| {
+        let id = *v.workspace.path_index.get(&canon).unwrap();
+        v.workspace.buffer_core(id).unwrap().borrow().document().full_text()
+    });
+    assert!(text.contains('c'));
+    assert_eq!(std::fs::read_to_string(&canon).unwrap(), text, "saved on tile focus loss");
+}
+
+/// UXI-Buffer-7: our own write's watcher echo is ignored — even when the user
+/// kept typing after the save (buffer dirty, disk ≠ buffer), the echo neither
+/// reloads nor raises a conflict.
+#[gpui::test]
+fn file_sync_own_write_echo_does_not_reload_or_conflict(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (view, vcx, canon) = boot_file_sync(cx, dir.path(), "start\n");
+    fs_type(&view, vcx, "saved ");
+    view.update(vcx, |v, cx| v.save_buffer(cx));
+    vcx.run_until_parked();
+    assert_eq!(std::fs::read_to_string(&canon).unwrap(), "saved start\n");
+    fs_type(&view, vcx, "after ");
+    let buffer = fs_edit_text(&view, vcx);
+    // The watcher's (late) echo of our own save arrives now.
+    fs_event(&view, vcx, &canon);
+    assert!(
+        !view.read_with(vcx, |v, _| v.buffer_has_disk_conflict(&canon)),
+        "our own write's echo must not raise a conflict"
+    );
+    assert_eq!(fs_edit_text(&view, vcx), buffer, "echo must not reload the buffer");
+    view.update(vcx, |v, _| assert!(v.edit_mut().unwrap().editor.is_modified()));
+}
+
+/// UXI-Buffer-4: the watch set follows the pool — closing the last tile on a
+/// (clean) buffer drops it from the pool and unwatches it.
+#[gpui::test]
+fn file_sync_unwatches_closed_buffer(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (view, vcx, canon) = boot_file_sync(cx, dir.path(), "x\n");
+    assert!(view.update(vcx, |v, _| v.edit_mut().is_some()), "focused on the Edit tile");
+    view.update(vcx, |v, cx| v.dispatch_menu_command("close-window", cx));
+    vcx.run_until_parked();
+    let (pooled, tracked, n) = view.read_with(vcx, |v, _| {
+        let n = v
+            .workspace
+            .path_index
+            .get(&canon)
+            .and_then(|id| v.workspace.buffer_core(*id))
+            .map(|c| std::rc::Rc::strong_count(&c));
+        (v.workspace.path_index.contains_key(&canon), v.file_sync.is_tracked(&canon), n)
+    });
+    assert!(!pooled, "closed clean buffer leaves the pool (strong count incl. probe: {n:?})");
+    assert!(!tracked, "closed buffer is unwatched");
+}

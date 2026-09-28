@@ -70,3 +70,42 @@ versa. Primary code home: `screens.rs::render_doc` / `render_edit` /
   reload. Guard: `verify_harness.rs`
   `buffer_reload_does_not_reuse_old_syntax_state`; generation seam:
   `editor.rs::replace_text_preserves_monotonic_content_generation`.
+- **`UXI-Buffer-4` (open buffers track the disk; a clean buffer follows external
+  edits).** Every file in the buffer pool is watched (its parent directory,
+  non-recursively, so an external editor's temp-file + rename write is seen);
+  closing the last view of a clean buffer drops it from the pool and unwatches
+  it. When a watched file changes on disk and its buffer is **clean**, the buffer
+  reloads silently: every Edit view of the file keeps its caret line/col
+  (clamped to the new text) and its scroll position, and the reload advances the
+  content generation so every derived view repaints (`UXI-Buffer-3`). Watcher
+  events are debounced (~100 ms) and the file is read on the background executor
+  — the watcher never blocks paint. Status: implemented (`file_sync.rs`). Guards:
+  `verify_harness.rs` `file_sync_external_write_reloads_clean_buffer_preserving_caret`,
+  `file_sync_unwatches_closed_buffer`; `file_sync.rs`
+  `os_watcher_forwards_only_tracked_files`.
+- **`UXI-Buffer-5` (an external change never clobbers unsaved work).** When a
+  watched file changes on disk while its buffer is **dirty**, the buffer text is
+  left untouched and the buffer enters a *disk conflict*: the tile status bar
+  (Doc and Edit) shows "changed on disk — space k keep mine · space R reload
+  theirs". While conflicted, neither autosave nor `Ctrl-S` writes the file
+  (`Ctrl-S` reports "not saved: changed on disk …"). The Buffer tile menu
+  resolves it: **`k` keep mine** clears the conflict so the next save (manual or
+  the autosave it re-arms) overwrites the disk version; **`R` reload theirs**
+  replaces the buffer with the disk text (carets clamped, buffer clean). An
+  explicit `r` reload from disk also clears the conflict. Status: implemented.
+  Guard: `verify_harness.rs`
+  `file_sync_dirty_buffer_external_change_conflicts_and_is_not_clobbered`.
+- **`UXI-Buffer-6` (autosave).** A dirty, non-conflicted file buffer is written
+  ~1 s after its **last** edit (each edit restarts the clock), immediately when
+  its tile loses focus, and when the OS window deactivates. Writes are atomic —
+  a temp file in the same directory renamed over the target — so no reader ever
+  sees a half-written file and no temp file is left behind. Status: implemented.
+  Guard: `verify_harness.rs` `file_sync_autosave_writes_after_idle_and_on_focus_loss`.
+  (OS-window deactivation is wired in `main()` via `observe_window_activation`
+  and is not headlessly exercised.)
+- **`UXI-Buffer-7` (our own writes are not external changes).** Every save
+  (manual or autosave) records the hash of the content it wrote; a watcher event
+  whose disk content matches the last loaded/written content is our own echo
+  (or a no-op touch) and is ignored — it neither reloads the buffer nor raises a
+  conflict, even if the user kept typing after the save. Status: implemented.
+  Guard: `verify_harness.rs` `file_sync_own_write_echo_does_not_reload_or_conflict`.

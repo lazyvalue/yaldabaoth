@@ -304,6 +304,9 @@ impl YaldaGpuiView {
             .child(format!("yalda-gpui — {}", d.file_label))
             .child(self.multi_home_dot(d.file_label.as_ref()));
 
+        let doc_conflict = d.source.as_ref().is_some_and(|s| {
+            self.buffer_has_disk_conflict(&s.core.borrow().document().file_path)
+        });
         let footer = div()
             .flex()
             .flex_row()
@@ -315,15 +318,22 @@ impl YaldaGpuiView {
             .bg(bg_or(bot, STATUS_BG))
             .text_color(fg_or(bot, 0x666666))
             .text_size(px(11.0))
-            .child({
-                // The workspace interior is always a Plane (infinite-plane,
-                // Stage D) — no layout-mode sigil. Just the block counter.
-                format!(
-                    "block {} / {}",
-                    d.cursor_block.saturating_add(1),
-                    d.blocks.len()
-                )
-            })
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .child({
+                        // The workspace interior is always a Plane (infinite-plane,
+                        // Stage D) — no layout-mode sigil. Just the block counter.
+                        format!(
+                            "block {} / {}",
+                            d.cursor_block.saturating_add(1),
+                            d.blocks.len()
+                        )
+                    })
+                    .children(doc_conflict.then(disk_conflict_badge)),
+            )
             .child(SharedString::new_static(
                 "j/k scroll · h/l block · g/G top/bot · Ctrl-O browse · Space tile menu · . workspace menu",
             ));
@@ -442,6 +452,10 @@ impl YaldaGpuiView {
             ))
             .child(self.multi_home_dot(e.file_label.as_ref()));
 
+        let edit_conflict = {
+            let core = e.editor.core.borrow();
+            self.buffer_has_disk_conflict(&core.document().file_path)
+        };
         let dirty_mark = if e.editor.is_modified() { "•" } else { " " };
         let extend_mark = if e.editor.extend_mode() { " EXT" } else { "" };
         let sel_size: Option<usize> = e.editor.selection_range().map(|((sl, sc), (el, ec))| {
@@ -491,7 +505,14 @@ impl YaldaGpuiView {
             .bg(bg_or(bot, STATUS_BG))
             .text_color(fg_or(bot, 0x666666))
             .text_size(px(11.0))
-            .child(left_status)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .child(left_status)
+                    .children(edit_conflict.then(disk_conflict_badge)),
+            )
             .child(SharedString::new_static(
                 "Space menu for wp/raw · Ctrl-S save · Ctrl-V view · v ext · d del · y yank",
             ));
@@ -3332,4 +3353,20 @@ impl YaldaGpuiView {
             .child(list)
             .child(hint)
     }
+}
+
+/// Status-bar badge for a Buffer whose dirty text diverged from an external
+/// change on disk (UXI-Buffer-5). Wrapped in a layout probe so the harness can
+/// assert it actually PAINTS, not just that the flag is set.
+fn disk_conflict_badge() -> AnyElement {
+    probe_bounds(
+        "buffer-disk-conflict",
+        div()
+            .text_color(rgb(0xE0A030))
+            .font_weight(FontWeight::BOLD)
+            .child(SharedString::new_static(
+                "changed on disk — space k keep mine · space R reload theirs",
+            ))
+            .into_any_element(),
+    )
 }

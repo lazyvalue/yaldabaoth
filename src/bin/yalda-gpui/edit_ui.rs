@@ -339,6 +339,7 @@ impl YaldaGpuiView {
                     }
                 };
                 core.borrow_mut().replace_text(text, path);
+                self.note_core_matches_disk(&core);
                 // The text may have shrunk; reset the focused view's cursor to
                 // the top so it can't dangle past the new end (matches the old
                 // reload-replaces-editor behavior). Other shared views keep
@@ -364,6 +365,7 @@ impl YaldaGpuiView {
                 let (blocks, source) = match pooled {
                     Some((id, core)) => {
                         core.borrow_mut().replace_text(text, path.clone());
+                        self.note_core_matches_disk(&core);
                         let blocks = render_with_wiki_mapped(
                             &core.borrow().document().full_text(),
                             &self.theme,
@@ -487,14 +489,24 @@ impl YaldaGpuiView {
     /// Save the current edit buffer; record the outcome on `last_save_msg`
     /// so the footer can surface it. No-op if the screen isn't Edit.
     pub(crate) fn save_buffer(&mut self, cx: &mut Context<Self>) {
-        let edit = match self.edit_mut() {
-            Some(e) => e,
+        let core = match self.edit_mut() {
+            Some(e) => Rc::clone(&e.editor.core),
             None => return,
         };
-        let msg: SharedString = match edit.editor.save() {
-            Ok(()) => "saved".into(),
-            Err(e) => format!("save failed: {}", e).into(),
+        // A disk conflict (UXI-Buffer-5) blocks the save until the user picks
+        // keep-mine / reload-theirs — Ctrl-S must not silently clobber an
+        // external change. Otherwise write through THE file-sync write path
+        // (atomic + echo-suppressed, UXI-Buffer-6/7).
+        let path = core.borrow().document().file_path.clone();
+        let msg: SharedString = if self.buffer_has_disk_conflict(&path) {
+            "not saved: changed on disk — space k keep mine / space R reload theirs".into()
+        } else {
+            match self.write_core_to_disk(&core) {
+                Ok(()) => "saved".into(),
+                Err(e) => format!("save failed: {}", e).into(),
+            }
         };
+        let Some(edit) = self.edit_mut() else { return };
         edit.last_save_msg = Some(msg);
         cx.notify();
     }

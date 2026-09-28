@@ -87,6 +87,7 @@ mod diff_ui;
 mod diff_view;
 mod edit_ui;
 mod edit_view;
+mod file_sync;
 mod highlight_cache;
 mod jump_palette;
 mod jump_panel_view;
@@ -129,6 +130,7 @@ pub(crate) use diff_git::*;
 pub(crate) use diff_model::*;
 pub(crate) use diff_view::*;
 pub(crate) use edit_view::*;
+pub(crate) use file_sync::*;
 pub(crate) use jump_palette::*;
 pub(crate) use jump_panel_view::*;
 pub(crate) use keymap_registry::*;
@@ -1118,9 +1120,6 @@ impl SharedEditor {
     fn insert_char(&mut self, ch: char) {
         self.view.insert_char(&mut self.core.borrow_mut(), ch);
     }
-    fn save(&mut self) -> std::io::Result<()> {
-        self.core.borrow_mut().save()
-    }
 }
 
 impl EditAccess for SharedEditor {
@@ -1807,6 +1806,8 @@ fn doc_local_menu() -> Vec<MenuNode> {
         MenuNode::entry("e", "edit (raw markdown)", "enter-edit"),
         MenuNode::entry("w", "edit (word processor)", "enter-wp"),
         MenuNode::entry("r", "reload from disk", "reload-file"),
+        MenuNode::entry("k", "disk conflict: keep mine", "disk-keep-mine"),
+        MenuNode::entry("R", "disk conflict: reload theirs", "disk-reload-theirs"),
         MenuNode::entry("o", "outline", "rail-outline"),
         MenuNode::separator(),
         MenuNode::submenu(
@@ -1837,6 +1838,8 @@ fn edit_local_menu() -> Vec<MenuNode> {
         MenuNode::entry("v", "back to doc view", "back-to-doc"),
         MenuNode::entry("w", "toggle code/word-processor", "wp-toggle"),
         MenuNode::entry("r", "reload from disk", "reload-file"),
+        MenuNode::entry("k", "disk conflict: keep mine", "disk-keep-mine"),
+        MenuNode::entry("R", "disk conflict: reload theirs", "disk-reload-theirs"),
         // `b` file-browser dropped — Cmd-O already opens it (ADR-0032).
         MenuNode::separator(),
         MenuNode::entry("a", "select all", "select-all"),
@@ -1947,6 +1950,9 @@ struct YaldaGpuiView {
     /// completion writes it. Read-only during render; written only from the
     /// spawn callback (an event context).
     diagrams: Rc<RefCell<DiagramCache>>,
+    /// Buffer ⇄ disk sync: watcher, conflict set, autosave debounce
+    /// (`file_sync.rs`, UXI-Buffer-4..7).
+    file_sync: FileSync,
     /// Last observed outer-window restore size. Kept in the view so every
     /// settings save preserves it, and updated only by the window-bounds
     /// observer (never as a render side effect).
@@ -2211,6 +2217,7 @@ impl YaldaGpuiView {
             window_height_px: DEFAULT_WINDOW_HEIGHT_PX,
             show_agent_heading_markers: true,
             diagrams: Default::default(),
+            file_sync: FileSync::default(),
             keymap_registry: KeymapRegistry::load(),
             desktop_grid_cols: DEFAULT_DESKTOP_GRID_COLS,
             desktop_grid_rows: DEFAULT_DESKTOP_GRID_ROWS,
@@ -2289,6 +2296,7 @@ impl YaldaGpuiView {
             window_height_px: DEFAULT_WINDOW_HEIGHT_PX,
             show_agent_heading_markers: true,
             diagrams: Default::default(),
+            file_sync: FileSync::default(),
             keymap_registry: KeymapRegistry::load(),
             desktop_grid_cols: DEFAULT_DESKTOP_GRID_COLS,
             desktop_grid_rows: DEFAULT_DESKTOP_GRID_ROWS,
@@ -5025,10 +5033,18 @@ impl YaldaGpuiView {
             && matches!(press.key, Key::Char('s') | Key::Char('S'))
         {
             if let Some(d) = self.doc_mut() {
-                if let Some(source) = d.source.as_ref() {
-                    let msg: SharedString = match source.core.borrow_mut().save() {
-                        Ok(()) => "saved".into(),
-                        Err(e) => format!("save failed: {}", e).into(),
+                if let Some(core) = d.source.as_ref().map(|s| s.core.clone()) {
+                    // Same write path + conflict gate as the Edit view's Ctrl-S
+                    // (UXI-Buffer-5/7).
+                    let path = core.borrow().document().file_path.clone();
+                    let msg: SharedString = if self.buffer_has_disk_conflict(&path) {
+                        "not saved: changed on disk — space k keep mine / space R reload theirs"
+                            .into()
+                    } else {
+                        match self.write_core_to_disk(&core) {
+                            Ok(()) => "saved".into(),
+                            Err(e) => format!("save failed: {}", e).into(),
+                        }
                     };
                     self.transient_status = Some(msg);
                 } else {
@@ -5966,6 +5982,8 @@ impl YaldaGpuiView {
             "keymap-reset-all" => self.keymap_menu_reset_all(cx),
             "back-to-doc" => self.back_to_doc(cx),
             "reload-file" => self.reload_focused_from_disk(cx),
+            "disk-keep-mine" => self.disk_conflict_keep_mine(cx),
+            "disk-reload-theirs" => self.disk_conflict_reload_theirs(cx),
             "rename-workspace" => self.open_rename_active_workspace_overlay(cx),
             "toggle-jump-panel" => self.toggle_jump_panel_impl(cx),
             "workspace-set-cwd" => self.open_set_workspace_cwd_overlay(cx),
@@ -10490,6 +10508,17 @@ fn main() {
                         })
                         .detach();
                         YaldaGpuiView::observe_window_size(window, cx);
+                        // Buffer ⇄ disk sync (UXI-Buffer-4..7): watch pooled
+                        // files, reload/conflict on external change, autosave
+                        // after idle + on tile focus loss; also autosave when
+                        // the OS window deactivates.
+                        view.start_file_sync(cx);
+                        cx.observe_window_activation(window, |v, window, cx| {
+                            if !window.is_window_active() {
+                                v.autosave_dirty_buffers(cx);
+                            }
+                        })
+                        .detach();
                         view
                     })
                 },
