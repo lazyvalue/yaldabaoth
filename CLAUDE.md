@@ -69,7 +69,10 @@ Before editing tracked files:
 
 1. Confirm `cogd` is reachable with `cog graph list`.
 2. Create or import a graph and use actor `claude-code` for every mutation.
-3. Show the graph id and `cog graph render <id> --frontiers` to the user.
+3. Bind it at `yaldabaoth/<graph-name>::plan`
+   (`cog topic bind yaldabaoth/<graph-name>::plan --graph <id> --actor claude-code`)
+   so it shows in the Cog tile's Topic tree. Addresses are immutable — bind once.
+4. Show the graph id and `cog graph render <id> --frontiers` to the user.
 
 Then claim each ready node before doing its work and close it only after its
 acceptance criteria are verified, attaching meaningful JSON output. Heartbeat
