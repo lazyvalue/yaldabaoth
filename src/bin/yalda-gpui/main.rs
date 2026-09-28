@@ -1911,14 +1911,11 @@ fn cog_local_menu() -> Vec<MenuNode> {
 }
 
 /// Diff tile verbs (spec B9): refresh, bind (choose a different
-/// session/path), merge + install-hook are wired STUBS — the merge gate
-/// (B7) is a later cog node's job; this node ships the menu surface per B9.
+/// session/path).
 fn diff_local_menu() -> Vec<MenuNode> {
     with_tile_commands(vec![
         MenuNode::entry("r", "refresh", "diff-refresh"),
         MenuNode::entry("b", "bind (choose session/path)", "diff-bind"),
-        MenuNode::entry("m", "merge (reviewed only)", "diff-merge"),
-        MenuNode::entry("i", "install merge-gate hook", "diff-install-hook"),
     ])
 }
 
@@ -6014,8 +6011,6 @@ impl YaldaGpuiView {
             "cog-toggle-events" => self.cog_toggle_events(cx),
             "diff-refresh" => self.diff_refresh_focused(cx),
             "diff-bind" => self.diff_bind_focused(cx),
-            "diff-merge" => self.diff_merge_focused(cx),
-            "diff-install-hook" => self.diff_install_hook_focused(cx),
             "keymap-filter" => self.keymap_menu_filter(cx),
             "keymap-rebind" => self.keymap_menu_rebind(cx),
             "keymap-reset" => self.keymap_menu_reset(cx),
@@ -10264,43 +10259,6 @@ fn register_keymap(app: &mut GpuiApp) {
     KeymapRegistry::load().apply(app);
 }
 
-/// Cog node `merge-gate` (v5tg), spec-diff-review.md § Interfaces: the hidden
-/// `yalda-gpui --hash-diff <worktree> [<base>]` subcommand — the ONE place
-/// hunk hashes are computed outside the GUI, so the git hook
-/// (`scripts/yalda-pre-merge-hook`) and the tile (`diff_ui.rs::refresh_diff`)
-/// can never drift (spec C6: "the hook and the tile must evaluate the same
-/// predicate from the same normalization"). Reuses `diff_git::collect_raw_diff`
-/// + `diff_model::parse_diff` + `DiffModel::hunk_hashes` VERBATIM — this
-/// function itself never touches a hash.
-///
-/// **Contract:** `yalda-gpui --hash-diff <worktree> [<base>]` runs the same
-/// `merge_base(base, HEAD) → working tree` derive the tile uses (`base`
-/// defaults to `main` when omitted, matching `DEFAULT_BASE_BRANCH`) and
-/// prints one `hunk_hash` (decimal `u64`) per hunk to **stdout**, in
-/// file/occurrence order, one per line, then exits `0`. Any failure (missing
-/// `<worktree>` argument, invalid worktree, a git error) prints a message to
-/// **stderr** and exits non-zero. Intercepted at the very top of `main()`,
-/// before any GUI/window setup, per spec.
-fn run_hash_diff_subcommand(args: &[String]) -> i32 {
-    let Some(worktree) = args.get(2).map(PathBuf::from) else {
-        eprintln!("usage: yalda-gpui --hash-diff <worktree> [<base>]");
-        return 2;
-    };
-    let base = args.get(3).cloned();
-    let raw = match futures::executor::block_on(diff_git::collect_raw_diff(worktree.clone(), base)) {
-        Ok(raw) => raw,
-        Err(e) => {
-            eprintln!("yalda-gpui --hash-diff: {e}");
-            return 1;
-        }
-    };
-    let model = diff_model::parse_diff(&raw.diff_text, worktree, &raw.branch, &raw.base, &raw.merge_base);
-    for hash in model.hunk_hashes() {
-        println!("{hash}");
-    }
-    0
-}
-
 /// On Linux, GPUI picks its windowing backend purely from `WAYLAND_DISPLAY`
 /// (`gpui::guess_compositor`): set ⇒ Wayland, else X11. Yalda draws no
 /// **client-side decorations** — it was built against macOS's native titlebar
@@ -10377,13 +10335,6 @@ fn main() {
     // MUST run before any GPUI init reads the environment (see the fn docs).
     prefer_x11_for_window_decorations();
     let args: Vec<String> = std::env::args().collect();
-    // Cog node `merge-gate` (v5tg): intercept the hidden `--hash-diff`
-    // subcommand BEFORE any GUI/window setup (before the orphan reaper, the
-    // config load, anything) — this is a plain CLI utility invoked by the
-    // git hook, not a GUI launch, and must never touch a window/app server.
-    if args.get(1).map(String::as_str) == Some("--hash-diff") {
-        process::exit(run_hash_diff_subcommand(&args));
-    }
     // Reap ACP adapters orphaned by a previously crashed/killed yalda (parent
     // reparented to PID 1). Graceful exits reap via kill_on_drop; this catches
     // the crash/SIGKILL path that accumulated ~70 idle adapters over weeks.
