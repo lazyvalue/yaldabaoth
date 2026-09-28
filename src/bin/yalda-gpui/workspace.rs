@@ -3837,7 +3837,7 @@ mod tests {
         {
             let mut c = core1.borrow_mut();
             let doc = c.document_mut();
-            doc.begin_undo_group(0, 0, &[], 0);
+            doc.begin_undo_group(0, 0);
             doc.insert_str(0, 0, "X");
             doc.end_undo_group(0, 1);
         }
@@ -3850,7 +3850,7 @@ mod tests {
         // edit — one history per file, not per view.
         {
             let mut c = core2.borrow_mut();
-            c.document_mut().undo(&[], 0);
+            c.document_mut().undo();
         }
         assert!(
             core1.borrow().document().full_text().starts_with("hello"),

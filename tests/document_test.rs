@@ -47,10 +47,10 @@ fn test_delete_line() {
 #[test]
 fn test_undo_insert() {
     let mut doc = Document::from_text("Hello".to_string(), PathBuf::from("test.md"));
-    doc.begin_undo_group(0, 5, &[], 0);
+    doc.begin_undo_group(0, 5);
     doc.insert_char(0, 5, 'X');
     doc.end_undo_group(0, 6);
-    doc.undo(&[], 0);
+    doc.undo();
     assert_eq!(doc.line_text(0), "Hello");
     assert!(!doc.is_modified());
 }
@@ -58,12 +58,12 @@ fn test_undo_insert() {
 #[test]
 fn test_undo_redo() {
     let mut doc = Document::from_text("Hello".to_string(), PathBuf::from("test.md"));
-    doc.begin_undo_group(0, 5, &[], 0);
+    doc.begin_undo_group(0, 5);
     doc.insert_char(0, 5, 'X');
     doc.end_undo_group(0, 6);
-    doc.undo(&[], 0);
+    doc.undo();
     assert_eq!(doc.line_text(0), "Hello");
-    doc.redo(&[], 0);
+    doc.redo();
     assert_eq!(doc.line_text(0), "HelloX");
 }
 

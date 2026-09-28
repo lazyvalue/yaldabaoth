@@ -10,7 +10,9 @@ kdl = "6"
 clap = { version = "4", features = ["derive"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 dirs = "6"
-ropey = "1"
+# B8: LF-only line breaks — the engine (frozen lines, anchors, tree-sitter
+# points) counts only `\n`, so ropey must not also break on CR / U+2028 / NEL.
+ropey = { version = "1", default-features = false, features = ["simd"] }
 tree-sitter = "0.24"
 tree-sitter-md = { git = "https://github.com/MDeiml/tree-sitter-markdown", tag = "v0.3.2" }
 serde = { version = "1", features = ["derive"] }
