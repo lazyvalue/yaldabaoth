@@ -1288,6 +1288,9 @@ struct EditState {
     wp_kinds_cache: std::rc::Rc<Vec<WpLineKind>>,
     /// `edit_seq` the `wp_kinds_cache` was built at; `u64::MAX` = never built.
     wp_kinds_cache_seq: u64,
+    /// The source lines `wp_kinds_cache` was classified from — the alignment
+    /// baseline that lets an edit re-classify only the changed range (C2).
+    wp_kinds_lines: std::rc::Rc<Vec<String>>,
     /// Set after `r` in normal mode: the *next* keypress is consumed as the
     /// replacement character (vim `r{char}`) rather than a normal-mode action.
     /// Cleared after that next key (Esc / non-char cancels).
@@ -1313,6 +1316,7 @@ impl EditState {
             pending_replace: false,
             wp_kinds_cache: std::rc::Rc::new(Vec::new()),
             wp_kinds_cache_seq: u64::MAX,
+            wp_kinds_lines: std::rc::Rc::new(Vec::new()),
         }
     }
 
@@ -1352,16 +1356,9 @@ impl EditState {
         edit_seq: u64,
     ) -> std::rc::Rc<Vec<WpLineKind>> {
         if self.wp_kinds_cache_seq != edit_seq {
-            let mut kinds = Vec::with_capacity(lines.len());
-            let mut in_fence = false;
-            for line_str in lines.iter() {
-                let kind = classify_wp_line(line_str, in_fence);
-                if matches!(kind, WpLineKind::CodeFence) {
-                    in_fence = !in_fence;
-                }
-                kinds.push(kind);
-            }
+            let kinds = wp_kinds_incremental(&self.wp_kinds_lines, &self.wp_kinds_cache, lines);
             self.wp_kinds_cache = std::rc::Rc::new(kinds);
+            self.wp_kinds_lines = lines.clone();
             self.wp_kinds_cache_seq = edit_seq;
         }
         self.wp_kinds_cache.clone()
@@ -1380,20 +1377,12 @@ impl EditState {
         std::rc::Rc<Vec<String>>,
         std::rc::Rc<Vec<std::rc::Rc<LineHl>>>,
     ) {
-        let line_count = self.editor.line_count();
         let edit_seq = self.editor.edit_seq();
         let lines_rc: std::rc::Rc<Vec<String>> = if self.lines_cache_seq == edit_seq {
             self.lines_cache.clone()
         } else {
             let core = self.editor.core.borrow();
-            let doc = core.document();
-            let built: Vec<String> = (0..line_count.max(1))
-                .map(|i| {
-                    doc.line_text(i)
-                        .trim_end_matches('\n')
-                        .replace('\t', "    ")
-                })
-                .collect();
+            let built: Vec<String> = display_lines(core.document());
             drop(core);
             let rc = std::rc::Rc::new(built);
             self.lines_cache = rc.clone();
@@ -1407,6 +1396,51 @@ impl EditState {
             .snapshot_syn(&lines_rc, theme, edit_seq, &[], hl);
         (lines_rc, snap)
     }
+}
+
+/// Re-derive the WordProcessor per-line kinds for `lines`, reusing `old_kinds`
+/// (classified from `old_lines`) wherever the content is unchanged (C2).
+/// `classify_wp_line` folds a fence flag, so after the changed middle it keeps
+/// classifying only while the inbound fence state differs from the old one;
+/// once they agree, the old tail is copied verbatim. Result is identical to a
+/// from-scratch fold (pinned by `wp_kinds_incremental_matches_full_fold`).
+fn wp_kinds_incremental(
+    old_lines: &[String],
+    old_kinds: &[WpLineKind],
+    lines: &[String],
+) -> Vec<WpLineKind> {
+    let is_fence = |k: &WpLineKind| matches!(k, WpLineKind::CodeFence);
+    let (pre, suf) = if old_kinds.len() == old_lines.len() {
+        common_prefix_suffix(old_lines, lines)
+    } else {
+        (0, 0)
+    };
+    let (n, old_n) = (lines.len(), old_lines.len());
+    let mut kinds = Vec::with_capacity(n);
+    let mut in_fence = false;
+    for k in &old_kinds[..pre] {
+        in_fence ^= is_fence(k);
+        kinds.push(*k);
+    }
+    // Old inbound fence state at the first suffix line.
+    let mut old_in = old_kinds[..old_n - suf].iter().filter(|k| is_fence(k)).count() % 2 == 1;
+    let suffix_start = n - suf;
+    let mut i = pre;
+    while i < n {
+        if i >= suffix_start {
+            let j = i + old_n - n;
+            if in_fence == old_in {
+                kinds.extend_from_slice(&old_kinds[j..]);
+                break;
+            }
+            old_in ^= is_fence(&old_kinds[j]);
+        }
+        let kind = classify_wp_line(&lines[i], in_fence);
+        in_fence ^= is_fence(&kind);
+        kinds.push(kind);
+        i += 1;
+    }
+    kinds
 }
 
 // wire/event enum — boxing the large variant would ripple through serialization + every match site

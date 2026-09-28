@@ -16,6 +16,9 @@
 //! 3. **Virtualized scroll surfaces** (`list`) — `ScrollAnchoredList`, the one
 //!    place the "splice the changed range, never `reset()`" reconcile lives, so
 //!    no scroll surface re-derives it (or re-introduces the jump-to-top bug).
+//! 4. **Display text** (`display_text`) — the one document-line → rendered
+//!    string projection (newline-trimmed, tab-expanded) and the raw→display
+//!    column mapper every caret/selection painter must go through.
 //!
 //! Read `yux/CLAUDE.md` before adding to it: it states the rules (state
 //! encapsulation, the never-notify-in-render law, the render-count test) and
@@ -23,8 +26,10 @@
 
 mod cached;
 mod detail;
+mod display_text;
 mod list;
 
 pub(crate) use cached::*;
 pub(crate) use detail::*;
+pub(crate) use display_text::*;
 pub(crate) use list::*;

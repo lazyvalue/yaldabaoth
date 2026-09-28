@@ -2644,13 +2644,7 @@ impl Compose {
         // painted.
         let cursor_line_len = {
             let cl = cursor.line.min(line_count.saturating_sub(1));
-            self.editor
-                .document()
-                .line_text(cl)
-                .trim_end_matches('\n')
-                .replace('\t', "    ")
-                .chars()
-                .count()
+            display_line(self.editor.document(), cl).chars().count()
         };
         let win = compose_window(
             cursor.line,

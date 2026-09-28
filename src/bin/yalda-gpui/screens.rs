@@ -1416,7 +1416,6 @@ impl YaldaGpuiView {
             let line_h = 18.0f32;
             let max_visible_h = COMPOSE_MAX_VISIBLE_LINES as f32 * line_h;
 
-            let line_count = tb.editor.document().line_count().max(1);
             let compose_cursor_line = tb.editor.cursor().line;
             let compose_cursor_col = tb.editor.cursor().col;
             let compose_mode = tb.mode;
@@ -1469,14 +1468,7 @@ impl YaldaGpuiView {
             // line can't overflow the un-scrolled small box and hide the caret
             // (UXI-TextEditing-1).
             let compose_lines: std::rc::Rc<Vec<String>> = {
-                let doc = tb.editor.document();
-                std::rc::Rc::new(
-                    (0..line_count)
-                        .map(|i| {
-                            doc.line_text(i).trim_end_matches('\n').replace('\t', "    ")
-                        })
-                        .collect(),
-                )
+                std::rc::Rc::new(display_lines(tb.editor.document()))
             };
             let visual_rows_total: usize = compose_lines
                 .iter()

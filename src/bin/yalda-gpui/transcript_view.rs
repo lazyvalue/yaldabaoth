@@ -665,15 +665,7 @@ impl TranscriptView {
             let lines_rc: std::rc::Rc<Vec<String>> = if c.lines_cache_seq == edit_seq {
                 c.lines_cache.clone()
             } else {
-                let built: Vec<String> = (0..line_count.max(1))
-                    .map(|i| {
-                        c.editor
-                            .document()
-                            .line_text(i)
-                            .trim_end_matches('\n')
-                            .replace('\t', "    ")
-                    })
-                    .collect();
+                let built: Vec<String> = crate::display_lines(c.editor.document());
                 let rc = std::rc::Rc::new(built);
                 c.lines_cache = rc.clone();
                 c.lines_cache_seq = edit_seq;
@@ -792,18 +784,8 @@ impl TranscriptView {
             let you_block_snap = if c.inline_you_block_active() {
                 let compose = c.input_surface.compose();
                 let cc = compose.editor.cursor();
-                let n = compose.editor.document().line_count().max(1);
                 Some(YouBlockSnap {
-                    lines: (0..n)
-                        .map(|i| {
-                            compose
-                                .editor
-                                .document()
-                                .line_text(i)
-                                .trim_end_matches('\n')
-                                .replace('\t', "    ")
-                        })
-                        .collect(),
+                    lines: crate::display_lines(compose.editor.document()),
                     cursor_line: cc.line,
                     cursor_col: cc.col,
                     mode: compose.mode,
@@ -849,7 +831,7 @@ impl TranscriptView {
                                 .unwrap_or(last_line);
                             let lines = text
                                 .split('\n')
-                                .map(|l| l.replace('\t', "    "))
+                                .map(crate::display_text_of)
                                 .collect();
                             (al, lines)
                         })

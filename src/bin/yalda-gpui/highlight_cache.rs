@@ -231,7 +231,7 @@ impl HighlightCache {
         let old_hashes = std::mem::take(&mut self.hashes);
         let old_fence = std::mem::take(&mut self.fence_before);
         let old_n = old_hashes.len();
-        let (pre, suf) = common_prefix_suffix(&old_hashes, &new_hashes);
+        let (pre, suf) = crate::common_prefix_suffix(&old_hashes, &new_hashes);
         // New index → the old slot holding the same line content, if any.
         let old_slot = |i: usize| -> Option<usize> {
             if i < pre {
@@ -308,22 +308,6 @@ impl HighlightCache {
         self.last_recomputed = recomputed;
         snap
     }
-}
-
-/// Length of the shared prefix and (non-overlapping) shared suffix of two
-/// hash sequences — the alignment [`HighlightCache`] reconciles through.
-fn common_prefix_suffix(old: &[u64], new: &[u64]) -> (usize, usize) {
-    let max_pre = old.len().min(new.len());
-    let mut pre = 0;
-    while pre < max_pre && old[pre] == new[pre] {
-        pre += 1;
-    }
-    let max_suf = max_pre - pre;
-    let mut suf = 0;
-    while suf < max_suf && old[old.len() - 1 - suf] == new[new.len() - 1 - suf] {
-        suf += 1;
-    }
-    (pre, suf)
 }
 
 fn hash_line(s: &str) -> u64 {
