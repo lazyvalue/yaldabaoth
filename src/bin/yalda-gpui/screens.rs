@@ -2589,7 +2589,16 @@ impl YaldaGpuiView {
             .as_ref()
             .map(|c| self.render_diff_comment_compose(c, dim, accent, fg, bg));
 
+        // spec B6: the send picker, centered over the tile and — like the
+        // compose — rendered at the SCREEN level, so query typing never
+        // re-renders the cached body (it is not a `DiffSeqs` input).
+        let send_overlay = tile
+            .send_picker
+            .as_ref()
+            .map(|p| self.render_diff_send_picker(id, p, cx));
+
         let root = root
+            .relative()
             .key_context("DiffView")
             .on_key_down(cx.listener(Self::handle_diff_key))
             .on_action(cx.listener(Self::quit))
@@ -2620,10 +2629,64 @@ impl YaldaGpuiView {
             .bg(bg)
             .child(header)
             .child(body_area);
-        match compose_panel {
+        let root = match compose_panel {
             Some(panel) => root.child(panel),
             None => root,
+        };
+        match send_overlay {
+            Some(overlay) => root.child(overlay),
+            None => root,
         }
+    }
+
+    /// The Diff send picker overlay (spec B6, UXI-Diff-16): the shared palette
+    /// panel (`render_palette_panel`, the jump palette's look + fuzzy ranking)
+    /// titled "Send N comments to…", centered near the top of the tile. The
+    /// row matching the review's `last_sent_session` carries a "last sent"
+    /// tag. Clicks/hovers resolve against the tile's live picker at event
+    /// time (yux rule 4).
+    fn render_diff_send_picker(
+        &self,
+        id: workspace::WindowId,
+        picker: &SendPicker,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let ranked = picker.ranked();
+        let title = format!("Send {} to…", comments_phrase(picker.ids.len()));
+        let last_sent = picker.last_sent;
+        let panel = self.render_palette_panel(
+            PalettePanel {
+                id_prefix: "diff-send",
+                title,
+                query: &picker.query,
+                items: &picker.items,
+                ranked: &ranked,
+                selected: picker.selected,
+                footer: "↑↓ ctrl-n/p:select  enter:send  esc:cancel",
+                glyph_of: &|_| "✦",
+                tag_of: &|i| (Some(i) == last_sent).then_some("last sent"),
+            },
+            std::rc::Rc::new(move |this: &mut Self, row: usize, cx: &mut Context<Self>| {
+                this.send_picker_activate(id, row, cx)
+            }),
+            std::rc::Rc::new(move |this: &mut Self, row: usize, cx: &mut Context<Self>| {
+                this.send_picker_hover(id, row, cx)
+            }),
+            cx,
+        );
+        probe_bounds(
+            "diff-send-picker",
+            div()
+                .absolute()
+                .top(px(48.0))
+                .left_0()
+                .right_0()
+                .flex()
+                .flex_row()
+                .justify_center()
+                .child(panel)
+                .into_any_element(),
+        )
     }
 
     /// The bottom-pinned Diff comment compose (spec B5): a caption naming the

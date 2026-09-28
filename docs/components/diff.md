@@ -183,7 +183,30 @@ the unsent comment ids; on success those comments gain a `sent` entry and
 `last_sent_session` updates; on failure nothing changes and the status line
 explains. Zero unsent ⇒ no picker, status "No unsent comments." `S` sends all.
 
-**Status.** `target`
+**Status.** `implemented` (graph 8g7 node send-picker). Deviations/decisions:
+the picker lists every **agent session** the GUI knows — the agent tiles
+`Cmd-P` lists (palette order, so live tile-bound sessions come first), then
+sessions loaded in the store that no tile binds, then every other non-archived
+session in the universal roster (by label) — not only tile-bound ones. A
+session loaded here is delivered through `send_prompt_to_session` (transcript
+echo + turn start; busy Codex ⇒ steer); a roster-only session is prompted by
+server sid directly — **no attach, no tile bind, no focus change** (the Diff
+tile keeps focus). "Success" is the prompt being accepted for delivery (the
+server prompt is fire-and-forget; an async `PromptRejected` for an unattached
+session only logs). The review file is written (background executor) **before**
+the delivery attempt; a failed write aborts the send. The picker reuses the
+jump palette's `PaletteItem` / `rank_palette_items` / panel render
+(`render_palette_panel`), rendered at screen level over the tile (not a
+`DiffSeqs` input). Typing goes to the query (j/k are letters); ↑/↓ and
+ctrl-n / ctrl-p move; the last-sent row is tagged "last sent"; with no
+last-sent match the first row is selected. The recorded session key is the
+server sid (`local-<n>` for a sid-less local session). `S` with zero comments
+hints "No comments."; also `space → send comments…`.
+
+**Enforcement.** `verify_harness.rs::{diff_send_s_delivers_unsent_ids_to_last_sent_default,
+diff_send_failure_records_nothing_and_file_written_first}` (feature
+`test-support`: assert the real delivered `PromptPayload`) and
+`diff_send_picker_query_is_render_flat_and_filters`.
 
 ### UXI-Diff-17 — Review file location and hygiene
 

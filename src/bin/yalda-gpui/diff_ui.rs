@@ -508,6 +508,16 @@ impl YaldaGpuiView {
             self.handle_diff_comment_key(id, press, cx);
             return;
         }
+        // spec B6: the send picker owns every key while open (typing → query,
+        // ctrl-n/ctrl-p move) — so it too precedes the ctrl/cmd bail and the
+        // leaders (`focused_in_insert_mode` keys off `tile.send_picker`).
+        if self.diff_tile_ref(id).is_some_and(|t| t.send_picker.is_some()) {
+            if is_ctrl_w_shell_prefix(&press) {
+                return;
+            }
+            self.handle_diff_send_picker_key(id, press, cx);
+            return;
+        }
         if ev.keystroke.modifiers.platform || ev.keystroke.modifiers.control {
             return;
         }
@@ -582,6 +592,8 @@ impl YaldaGpuiView {
             Key::Char('c') => self.open_comment_compose(id, cx),
             Key::Char('e') => self.edit_comment_at_cursor(id, cx),
             Key::Char('x') => self.delete_comment_at_cursor(id, cx),
+            Key::Char('s') => self.open_send_picker(id, false, cx),
+            Key::Char('S') => self.open_send_picker(id, true, cx),
             Key::Esc => {
                 if let Some(tile) = self.diff_tile_mut(id) {
                     tile.range_anchor = None;
@@ -717,6 +729,373 @@ impl YaldaGpuiView {
         compose.esc_armed = false;
         Self::dispatch_insert_core(&mut compose.input.editor, &mut compose.input.mode, press);
         cx.notify();
+    }
+
+    // ── Cog graph 8g7 node `send-picker`: spec B6, UXI-Diff-16 ──────────────
+
+    /// The session key recorded for a LOCAL session: its server sid, or
+    /// `local-<n>` for a session with no server sid (never attached / tests).
+    pub(crate) fn send_key_for_local(&self, id: SessionId) -> String {
+        self.sessions
+            .sid_of(id)
+            .map(|s| s.as_str().to_string())
+            .unwrap_or_else(|| format!("local-{}", id.0))
+    }
+
+    /// A short secondary label for a session's cwd: its project's name, else
+    /// the directory name.
+    fn send_detail_for_cwd(&self, cwd: &std::path::Path) -> String {
+        match self.projects.by_cwd(cwd) {
+            Some(p) => self.projects.name_of(p).to_string(),
+            None => cwd
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| cwd.display().to_string()),
+        }
+    }
+
+    fn send_local_candidate(&self, id: SessionId, detail: Option<String>, cx: &gpui::App) -> Option<SendCandidate> {
+        let ent = self.sessions.get(id)?;
+        let s = ent.read(cx);
+        let status = if s.state.turn_phase.is_awaiting() {
+            AgentDotStatus::Working
+        } else {
+            AgentDotStatus::WaitingForYou
+        };
+        Some(SendCandidate {
+            item: PaletteItem {
+                target: SendTarget::Local(id),
+                label: s.label.clone(),
+                detail: detail.unwrap_or_else(|| self.send_detail_for_cwd(&s.cwd)),
+                is_agent: true,
+                status: Some(status),
+                active: false,
+            },
+            key: self.send_key_for_local(id),
+        })
+    }
+
+    /// Every session the send picker offers (spec B6), in the jump palette's
+    /// order: the agent tiles `Cmd-P` lists (live, loaded sessions first),
+    /// then sessions loaded in the store that no tile binds, then every other
+    /// server-known session in the universal roster (by label). Archived
+    /// sessions are hidden, as in the palette and selector.
+    pub(crate) fn send_picker_candidates(&self, cx: &gpui::App) -> Vec<SendCandidate> {
+        let mut out: Vec<SendCandidate> = Vec::new();
+        let mut seen_local: std::collections::HashSet<SessionId> = Default::default();
+        let mut seen_sid: std::collections::HashSet<String> = Default::default();
+        let archived = |sid: &str| {
+            self.jump_archived_sessions.contains(sid)
+                || self.agent_roster.get(sid).is_some_and(|i| i.archived)
+        };
+        let push_local = |this: &Self,
+                              out: &mut Vec<SendCandidate>,
+                              seen_local: &mut std::collections::HashSet<SessionId>,
+                              seen_sid: &mut std::collections::HashSet<String>,
+                              id: SessionId,
+                              detail: Option<String>| {
+            if !seen_local.insert(id) {
+                return;
+            }
+            if let Some(sid) = this.sessions.sid_of(id) {
+                seen_sid.insert(sid.as_str().to_string());
+            }
+            if let Some(c) = this.send_local_candidate(id, detail, cx) {
+                out.push(c);
+            }
+        };
+        for item in self.jump_palette_items(cx) {
+            let PaletteTarget::Tile(wid) = item.target else {
+                continue;
+            };
+            let Some(App::Agent(tile)) = self.workspace.tile(wid).map(|w| &w.content) else {
+                continue;
+            };
+            if let Some(local) = tile.session() {
+                push_local(self, &mut out, &mut seen_local, &mut seen_sid, local, Some(item.detail.clone()));
+            } else if let Some(sid) = tile.remembered_sid(|l| self.sessions.sid_of(l).cloned()) {
+                let sid = sid.as_str().to_string();
+                if !archived(&sid) && seen_sid.insert(sid.clone()) {
+                    out.push(SendCandidate {
+                        item: PaletteItem {
+                            target: SendTarget::Server(sid.clone()),
+                            label: item.label.clone(),
+                            detail: item.detail.clone(),
+                            is_agent: true,
+                            status: item.status,
+                            active: false,
+                        },
+                        key: sid,
+                    });
+                }
+            }
+        }
+        let store_ids: Vec<SessionId> = self.sessions.iter().map(|(id, _)| id).collect();
+        for id in store_ids {
+            if self.sessions.sid_of(id).is_some_and(|sid| archived(sid.as_str())) {
+                continue;
+            }
+            push_local(self, &mut out, &mut seen_local, &mut seen_sid, id, None);
+        }
+        for info in self.agent_roster.entries_by_label() {
+            let sid = info.session_id.clone();
+            if archived(&sid) || seen_sid.contains(&sid) {
+                continue;
+            }
+            if let Some(local) = self.sessions.locate(&ServerSid::new(sid.clone())) {
+                push_local(self, &mut out, &mut seen_local, &mut seen_sid, local, None);
+                continue;
+            }
+            seen_sid.insert(sid.clone());
+            let status = if !info.connected {
+                AgentDotStatus::Neutral
+            } else if info.busy {
+                AgentDotStatus::Working
+            } else {
+                AgentDotStatus::WaitingForYou
+            };
+            out.push(SendCandidate {
+                item: PaletteItem {
+                    target: SendTarget::Server(sid.clone()),
+                    label: info.label.clone(),
+                    detail: self.send_detail_for_cwd(&info.cwd),
+                    is_agent: true,
+                    status: Some(status),
+                    active: false,
+                },
+                key: sid,
+            });
+        }
+        out
+    }
+
+    /// `s` (`include_sent = false`: the unsent comments) / `S` (every
+    /// comment) / `space → send comments…`: open the send picker (spec B6).
+    /// Nothing to send ⇒ no picker, a status hint. No sessions ⇒ a hint.
+    pub(crate) fn open_send_picker(&mut self, id: workspace::WindowId, include_sent: bool, cx: &mut Context<Self>) {
+        let Some(tile) = self.diff_tile_ref(id) else {
+            return;
+        };
+        if tile.worktree.is_none() || tile.compose.is_some() {
+            return;
+        }
+        let (ids, last_sent) = match &tile.review {
+            Some(r) => (
+                if include_sent { r.all_comment_ids() } else { r.unsent_ids() },
+                r.last_sent_session.clone(),
+            ),
+            None => (Vec::new(), None),
+        };
+        if ids.is_empty() {
+            self.diff_hint(if include_sent { "No comments." } else { "No unsent comments." }, cx);
+            return;
+        }
+        let candidates = self.send_picker_candidates(cx);
+        if candidates.is_empty() {
+            self.diff_hint("No agent sessions to send to — start one first.", cx);
+            return;
+        }
+        let picker = SendPicker::new(ids, candidates, last_sent.as_deref());
+        if let Some(tile) = self.diff_tile_mut(id) {
+            tile.range_anchor = None;
+            tile.send_picker = Some(picker);
+        }
+        self.transient_status = None;
+        cx.notify();
+    }
+
+    /// Tile-menu "send comments…" verb (spec B8) for the FOCUSED Diff tile.
+    pub(crate) fn diff_send_comments_focused(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.workspace.focused_window_id() else {
+            return;
+        };
+        if !matches!(self.workspace.focused_content(), Some(App::Diff(_))) {
+            return;
+        }
+        self.open_send_picker(id, false, cx);
+    }
+
+    /// Key dispatch while the send picker is open: Esc closes; Enter sends to
+    /// the highlighted row; ↑/↓ and ctrl-p/ctrl-n move (j/k are query
+    /// letters); Backspace/characters edit the fuzzy query.
+    fn handle_diff_send_picker_key(&mut self, id: workspace::WindowId, press: KeyPress, cx: &mut Context<Self>) {
+        let ctrl = press.modifiers.contains(KMods::CONTROL);
+        let Some(picker) = self.diff_tile_mut(id).and_then(|t| t.send_picker.as_mut()) else {
+            return;
+        };
+        match press.key {
+            Key::Esc => {
+                if let Some(tile) = self.diff_tile_mut(id) {
+                    tile.send_picker = None;
+                }
+            }
+            Key::Enter => {
+                let row = picker.selected;
+                self.send_picker_activate(id, row, cx);
+                return;
+            }
+            Key::Down => picker.move_selection(1),
+            Key::Up => picker.move_selection(-1),
+            Key::Char('n') if ctrl => picker.move_selection(1),
+            Key::Char('p') if ctrl => picker.move_selection(-1),
+            Key::Backspace => picker.pop_query(),
+            Key::Char(c)
+                if !ctrl
+                    && !press.modifiers.contains(KMods::PLATFORM)
+                    && !press.modifiers.contains(KMods::ALT) =>
+            {
+                picker.push_query(c)
+            }
+            _ => return,
+        }
+        cx.notify();
+    }
+
+    /// Hover over display row `row` of the open send picker.
+    pub(crate) fn send_picker_hover(&mut self, id: workspace::WindowId, row: usize, cx: &mut Context<Self>) {
+        if let Some(p) = self.diff_tile_mut(id).and_then(|t| t.send_picker.as_mut())
+            && p.selected != row
+        {
+            p.selected = row;
+            cx.notify();
+        }
+    }
+
+    /// Enter / a row click: send to display row `row` (resolved at event time
+    /// against the picker's current ranking). A no-match query is a no-op
+    /// that leaves the picker open (the jump palette's rule). The picker
+    /// closes; the outcome lands in the status line.
+    pub(crate) fn send_picker_activate(&mut self, id: workspace::WindowId, row: usize, cx: &mut Context<Self>) {
+        let Some(tile) = self.diff_tile_mut(id) else {
+            return;
+        };
+        let Some(picker) = tile.send_picker.as_mut() else {
+            return;
+        };
+        picker.selected = row;
+        let Some(idx) = picker.selected_item() else {
+            return;
+        };
+        let target = picker.items[idx].target.clone();
+        let label = picker.items[idx].label.clone();
+        let key = picker.keys[idx].clone();
+        let ids = picker.ids.clone();
+        tile.send_picker = None;
+        self.send_review_comments(id, target, key, label, ids, cx);
+    }
+
+    /// Deliver `ids` of tile `id`'s review to `target` (spec B6). The review
+    /// file is written FIRST (on the background executor — never on the
+    /// render path) so the agent can read every named comment; only after
+    /// that write succeeds is the prompt delivered, and only a successful
+    /// delivery records `sent` entries + `last_sent_session`.
+    pub(crate) fn send_review_comments(
+        &mut self,
+        id: workspace::WindowId,
+        target: SendTarget,
+        key: String,
+        label: String,
+        ids: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tile) = self.diff_tile_ref(id) else {
+            return;
+        };
+        let (Some(path), Some(review)) = (tile.review_path.clone(), tile.review.clone()) else {
+            self.diff_hint("Send failed: this worktree's review file location couldn't be resolved.", cx);
+            return;
+        };
+        let path = std::path::absolute(&path).unwrap_or(path);
+        let prompt = build_send_prompt(&review, &path, &ids);
+        let save_gen = tile.review_gen;
+        let saved = tile.review_saved.clone();
+        self.diff_hint(format!("Sending {} to {label}…", comments_phrase(ids.len())), cx);
+        cx.spawn(async move |this, cx| {
+            let written = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut review = review;
+                    save_review_latest(&path, &mut review, None, save_gen, &saved).map_err(|e| e.to_string())
+                })
+                .await;
+            let _ = this.update(cx, |v, cx| v.diff_send_after_save(id, target, key, label, ids, prompt, written, cx));
+        })
+        .detach();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn diff_send_after_save(
+        &mut self,
+        id: workspace::WindowId,
+        target: SendTarget,
+        key: String,
+        label: String,
+        ids: Vec<String>,
+        prompt: String,
+        written: Result<(), String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(e) = written {
+            self.diff_hint(format!("Send failed: couldn't write the review file: {e}"), cx);
+            return;
+        }
+        if let Err(reason) = self.deliver_to_send_target(&target, &prompt, cx) {
+            self.diff_hint(format!("Send failed: {reason}"), cx);
+            return;
+        }
+        let Some(tile) = self.diff_tile_mut(id) else {
+            return;
+        };
+        if let Some(review) = tile.review.as_mut() {
+            review.record_sent(&ids, &key, &label, chrono::Utc::now());
+        }
+        tile.review_gen = tile.review_gen.wrapping_add(1);
+        tile.rebuild_rows();
+        self.diff_persist_review(id, cx);
+        self.diff_hint(format!("Sent {} to {label}.", comments_phrase(ids.len())), cx);
+    }
+
+    /// Deliver one prompt to a send-picker target WITHOUT attaching, binding
+    /// or focusing it. A session loaded here goes through the normal
+    /// `send_prompt_to_session` (transcript echo + turn start, same Codex
+    /// steer rule as a compose submit); a roster-only session is prompted by
+    /// server sid (the server's prompt is not owner-gated).
+    fn deliver_to_send_target(&mut self, target: &SendTarget, text: &str, cx: &mut Context<Self>) -> Result<(), String> {
+        let local = match target {
+            SendTarget::Local(id) => Some(*id),
+            SendTarget::Server(sid) => self.sessions.locate(&ServerSid::new(sid.clone())),
+        };
+        if let Some(id) = local {
+            if self.sessions.get(id).is_none() {
+                return Err("that session is closed".to_string());
+            }
+            let steer_codex = self
+                .read_session(id, cx, |c| {
+                    c.provider == AgentProvider::Codex && matches!(c.turn_phase, TurnPhase::Awaiting { .. })
+                })
+                .unwrap_or(false);
+            return if self.send_prompt_to_session(id, text, &[], None, steer_codex, cx) {
+                Ok(())
+            } else {
+                Err("the session isn't connected".to_string())
+            };
+        }
+        let SendTarget::Server(sid) = target else {
+            return Err("that session is closed".to_string());
+        };
+        let Some(server) = self.session_server.as_ref() else {
+            return Err("the session server isn't connected".to_string());
+        };
+        let steer = self
+            .agent_roster
+            .get(sid)
+            .is_some_and(|i| i.provider == AgentProvider::Codex && i.busy);
+        let r = if steer {
+            server.steer_with_images(sid, text, Vec::new())
+        } else {
+            server.prompt_with_images(sid, text, Vec::new())
+        };
+        r.map_err(|e| e.to_string())
     }
 
     // ── Cog node `open-in-zed` (oc72): spec B8 ──────────────────────────────

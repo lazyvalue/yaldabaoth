@@ -350,7 +350,7 @@ impl Render for DiffView {
 
 /// The bound body's always-visible key hints (spec C6 idiot-proof).
 pub(crate) const DIFF_KEY_HINTS: &str = "j/k line · {/} hunk · [/] file · v viewed · z fold · c comment · V range · \
-     e edit · x delete · r refresh · o zed · space menu";
+     e edit · x delete · s send · r refresh · o zed · space menu";
 
 /// The header's unsent-comment count label (spec B2; shown only when > 0).
 pub(crate) fn diff_unsent_label(unsent: usize) -> String {

@@ -727,6 +727,10 @@ pub(crate) struct DiffTile {
     pub(crate) compose_gen: u64,
     /// `x` pressed once on this comment: the next `x` deletes it (spec C6).
     pub(crate) pending_delete: Option<String>,
+    /// The open send picker (spec B6). Rendered at the SCREEN level over the
+    /// tile (not in the cached `DiffView`), so it is deliberately NOT a
+    /// `DiffSeqs` input — typing in its query never re-renders the body.
+    pub(crate) send_picker: Option<SendPicker>,
     pub(crate) refreshing: bool,
     /// Monotonic guard so a stale in-flight refresh can't clobber a newer
     /// one (mirrors `LinearTile::req` / `CogTile::req`).
@@ -744,6 +748,96 @@ pub(crate) struct DiffTile {
     /// The cached body view — lazily created at first render (mirrors
     /// `LinearTile::view` / `CogTile::view`).
     pub(crate) view: Option<Entity<DiffView>>,
+}
+
+/// Where a send-picker row delivers (spec B6): a session loaded in this GUI's
+/// `AgentSessions` store, or a server-known session (universal roster) this GUI
+/// has not attached — the latter is prompted by server sid directly, with no
+/// attach, tile bind or focus change.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum SendTarget {
+    Local(SessionId),
+    Server(String),
+}
+
+/// One send-picker candidate: the palette row (label/detail/status, matched by
+/// the shared fuzzy ranker) plus the stable session key recorded in the
+/// review's `sent` entries / `last_sent_session`.
+pub(crate) struct SendCandidate {
+    pub(crate) item: PaletteItem<SendTarget>,
+    pub(crate) key: String,
+}
+
+/// The Diff tile's send picker (spec B6, UXI-Diff-16): a `cmd-p`-style fuzzy
+/// session list over a snapshot of the candidates taken when it opened.
+pub(crate) struct SendPicker {
+    /// The comment ids this send names, fixed at open: the unsent ones (`s`)
+    /// or every comment (`S`).
+    pub(crate) ids: Vec<String>,
+    pub(crate) items: Vec<PaletteItem<SendTarget>>,
+    /// Parallel to `items`: each row's recorded session key.
+    pub(crate) keys: Vec<String>,
+    /// The item that matches the review's `last_sent_session` (tagged "last
+    /// sent", and the initial selection).
+    pub(crate) last_sent: Option<usize>,
+    pub(crate) query: String,
+    /// DISPLAY index into [`ranked`](Self::ranked).
+    pub(crate) selected: usize,
+}
+
+impl SendPicker {
+    pub(crate) fn new(
+        ids: Vec<String>,
+        candidates: Vec<SendCandidate>,
+        last_sent_session: Option<&str>,
+    ) -> Self {
+        let (items, keys): (Vec<_>, Vec<_>) = candidates.into_iter().map(|c| (c.item, c.key)).unzip();
+        let last_sent = last_sent_session.and_then(|k| keys.iter().position(|x| x == k));
+        SendPicker {
+            ids,
+            items,
+            keys,
+            last_sent,
+            query: String::new(),
+            // Empty query ⇒ ranked is the identity, so the item index IS the
+            // display index. No last-sent match ⇒ the first (most prominent)
+            // row, i.e. the jump palette's order.
+            selected: last_sent.unwrap_or(0),
+        }
+    }
+
+    /// Item indices in display order for the current query (the jump
+    /// palette's `rank_palette_items`).
+    pub(crate) fn ranked(&self) -> Vec<usize> {
+        rank_palette_items(&self.items, &self.query)
+    }
+
+    /// The highlighted item index (`None` when the query matches nothing).
+    pub(crate) fn selected_item(&self) -> Option<usize> {
+        self.ranked().get(self.selected).copied()
+    }
+
+    pub(crate) fn move_selection(&mut self, delta: isize) {
+        let n = self.ranked().len() as isize;
+        if n > 0 {
+            self.selected = (self.selected as isize + delta).rem_euclid(n) as usize;
+        }
+    }
+
+    pub(crate) fn push_query(&mut self, c: char) {
+        self.query.push(c);
+        self.selected = 0;
+    }
+
+    pub(crate) fn pop_query(&mut self) {
+        self.query.pop();
+        self.selected = 0;
+    }
+}
+
+/// "1 comment" / "3 comments".
+pub(crate) fn comments_phrase(n: usize) -> String {
+    if n == 1 { "1 comment".to_string() } else { format!("{n} comments") }
 }
 
 impl DiffTile {
@@ -769,6 +863,7 @@ impl DiffTile {
             compose: None,
             compose_gen: 0,
             pending_delete: None,
+            send_picker: None,
             refreshing: false,
             req: 0,
             model_gen: 0,
@@ -803,6 +898,7 @@ impl DiffTile {
         self.review_gen = self.review_gen.wrapping_add(1);
         self.folds = Folds::default();
         self.cursor = 0;
+        self.send_picker = None;
         self.rebuild_rows();
     }
 

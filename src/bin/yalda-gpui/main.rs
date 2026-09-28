@@ -1916,6 +1916,7 @@ fn diff_local_menu() -> Vec<MenuNode> {
     with_tile_commands(vec![
         MenuNode::entry("r", "refresh", "diff-refresh"),
         MenuNode::entry("w", "switch worktree", "diff-switch-worktree"),
+        MenuNode::entry("s", "send comments…", "diff-send-comments"),
     ])
 }
 
@@ -5833,8 +5834,9 @@ impl YaldaGpuiView {
             Some(App::Keymap(_)) => self.keymap_captures_text(cx),
             Some(App::AgentStats) => false,
             // The Diff tile is navigation-only EXCEPT while its comment
-            // compose is open (spec B5/B8) — then keys must reach the draft.
-            Some(App::Diff(tile)) => tile.compose.is_some(),
+            // compose or send picker is open (spec B5/B6/B8) — then keys must
+            // reach the draft / the picker query.
+            Some(App::Diff(tile)) => tile.compose.is_some() || tile.send_picker.is_some(),
             Some(App::Buffer(BufferApp::Viewing(_))) | None => false,
         }
     }
@@ -6005,6 +6007,7 @@ impl YaldaGpuiView {
             "cog-toggle-events" => self.cog_toggle_events(cx),
             "diff-refresh" => self.diff_refresh_focused(cx),
             "diff-switch-worktree" => self.diff_switch_worktree_focused(cx),
+            "diff-send-comments" => self.diff_send_comments_focused(cx),
             "keymap-filter" => self.keymap_menu_filter(cx),
             "keymap-rebind" => self.keymap_menu_rebind(cx),
             "keymap-reset" => self.keymap_menu_reset(cx),

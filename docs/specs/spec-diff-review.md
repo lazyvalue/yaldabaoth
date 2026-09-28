@@ -109,10 +109,16 @@ uncommitted + untracked), base = the repo's default branch.
   silently moved) and listed at the top of its file. Comments do not require a
   session.
 
-- **B6. Send comments. [DRAFT]** `s` (and `space → Send comments…`) opens the
-  **send picker**, a `cmd-p`-style fuzzy session list whose initial selection
-  is this review's `last_sent_session` when that session still exists
-  (otherwise the most recently active session). `Enter` sends one short prompt
+- **B6. Send comments.** `s` (and `space → Send comments…`) opens the
+  **send picker**, a `cmd-p`-style fuzzy session list (the jump palette's item
+  model, ranking and panel) over every agent session the GUI knows — the
+  palette's agent tiles first, then free loaded sessions, then the rest of the
+  universal roster; archived sessions hidden — whose initial selection
+  is this review's `last_sent_session` when that session still exists (tagged
+  "last sent"; otherwise the first row). Typing edits the query; ↑/↓ and
+  ctrl-n/ctrl-p move. A session this GUI has not attached is prompted by
+  server sid — no attach, no tile bind, and the Diff tile keeps focus. The
+  review file is written before the prompt is delivered. `Enter` sends one short prompt
   via `send_prompt_to_session` naming the review file's **absolute path** and
   the ids of every **unsent** comment, with the instruction to read the file
   and address those comments (line numbers may have drifted — use `snippet`;
@@ -120,7 +126,8 @@ uncommitted + untracked), base = the repo's default branch.
   `sent: [{session, at}]` entry and `last_sent_session` is updated; on failure
   nothing is marked and a status line explains. With zero unsent comments the
   picker does not open; the status line says "No unsent comments." Already-sent
-  comments can be re-sent explicitly (`S` = send all, including sent).
+  comments can be re-sent explicitly (`S` = send all, including sent; with no
+  comments at all: "No comments.").
 
 - **B7. Open in Zed. [DRAFT]** `o` spawns `zed <abs-path>:<cursor line>`
   fire-and-forget; a missing `zed` shows a status hint.

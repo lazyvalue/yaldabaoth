@@ -30980,3 +30980,282 @@ fn diff_view_v_range_rerenders_the_cached_body(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     assert!(crate::perf_render_count("diff") > after_v, "Esc clearing the range must re-render");
 }
+
+// ── Cog graph 8g7 node `send-picker`: spec B6, UXI-Diff-16 ────────────────
+//
+// Sessions are FREE sessions in the store (the focused tile is the Diff tile,
+// so `show_local_session` binds nothing) with no server sid, so
+// `send_prompt_to_session` takes the in-process `channel.send_payload` path;
+// under `test-support` a `test_connected` channel retains the REAL delivered
+// `PromptPayload` for assertion. A session with no channel is the failure seam.
+
+/// Add a comment through the REAL keys: `nav` moves the cursor onto a line,
+/// `c` opens the compose, `body` is typed, `ctrl-enter` saves.
+fn diff_add_comment(vcx: &mut gpui::VisualTestContext, nav: &str, body: &str) {
+    if !nav.is_empty() {
+        vcx.simulate_keystrokes(nav);
+    }
+    vcx.simulate_keystrokes("c");
+    vcx.run_until_parked();
+    diff_type(vcx, body);
+    vcx.simulate_keystrokes("ctrl-enter");
+    vcx.run_until_parked();
+}
+
+fn diff_status(view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext) -> String {
+    view.read_with(vcx, |v, _| v.transient_status.as_ref().map(|s| s.to_string()).unwrap_or_default())
+}
+
+/// `(selected target, selected label, ranked labels)` of the open send picker.
+fn diff_send_picker_state(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+    id: crate::workspace::WindowId,
+) -> Option<(crate::SendTarget, String, Vec<String>)> {
+    view.read_with(vcx, |v, _| {
+        let p = v.diff_tile_ref(id)?.send_picker.as_ref()?;
+        let ranked: Vec<String> = p.ranked().iter().map(|&i| p.items[i].label.clone()).collect();
+        let sel = p.selected_item()?;
+        Some((p.items[sel].target.clone(), p.items[sel].label.clone(), ranked))
+    })
+}
+
+/// Point the fixture's review file at `last_sent_session` and reload it
+/// through the real refresh (`r`).
+fn diff_seed_last_sent(vcx: &mut gpui::VisualTestContext, wt: &std::path::Path, key: &str) {
+    let (path, _) = fixture_review_json(wt);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let seed = serde_json::json!({ "branch": "feature", "base": "main", "last_sent_session": key });
+    std::fs::write(&path, serde_json::to_vec(&seed).unwrap()).unwrap();
+    vcx.simulate_keystrokes("r");
+    vcx.run_until_parked();
+}
+
+#[cfg(feature = "test-support")]
+fn add_send_session(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+    label: &str,
+) -> (crate::SessionId, yalda::acp_channel::TestChannelControls) {
+    let id = add_free_session(view, vcx, label);
+    let (client, controls) = yalda::acp_channel::AcpChannelClient::test_connected();
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| c.channel = Some(client));
+    });
+    (id, controls)
+}
+
+/// UXI-Diff-16 end-to-end on the REAL path: two comments → `s` opens the
+/// picker titled "Send 2 comments to…" with the review's `last_sent_session`
+/// (the 2nd session) preselected + tagged "last sent" → Enter delivers ONE
+/// prompt to THAT session's real channel naming the absolute review path and
+/// exactly `c1, c2`; the JSON on disk gains `sent` entries +
+/// `last_sent_session`; the header's unsent count is gone; the Diff tile keeps
+/// focus. Then a third comment → `s` names only `c3`; `S` names all three;
+/// with nothing unsent `s` opens no picker and says so.
+///
+/// Negative controls (observed RED — see node output): (a) default selection
+/// forced to row 0 ⇒ the picker preselects "alpha"; (b) `open_send_picker`
+/// using `all_comment_ids()` for `s` ⇒ the second payload names c1, c2, c3;
+/// (c) `record_sent` dropped in `diff_send_after_save` ⇒ disk `sent` is `[]`.
+#[cfg(feature = "test-support")]
+#[gpui::test]
+fn diff_send_s_delivers_unsent_ids_to_last_sent_default(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let wt = temp.path().to_path_buf();
+    let (view, vcx, id) = boot_with_diff(cx, wt.clone());
+    let (_a, ctl_a) = add_send_session(&view, vcx, "alpha");
+    let (b, ctl_b) = add_send_session(&view, vcx, "beta");
+    let key_b = view.read_with(vcx, |v, _| v.send_key_for_local(b));
+    diff_seed_last_sent(vcx, &wt, &key_b);
+
+    diff_add_comment(vcx, "j j j", "first");
+    diff_add_comment(vcx, "", "second");
+    let (review_path, json) = fixture_review_json(&wt);
+    assert_eq!(json["comments"].as_array().map(|a| a.len()), Some(2), "two comments saved: {json}");
+
+    vcx.simulate_keystrokes("s");
+    vcx.run_until_parked();
+    let (target, label, ranked) = diff_send_picker_state(&view, vcx, id).expect("s opens the send picker");
+    assert!(ranked.contains(&"alpha".to_string()) && ranked.contains(&"beta".to_string()), "{ranked:?}");
+    assert_eq!(label, "beta", "the review's last_sent_session is preselected");
+    assert_eq!(target, crate::SendTarget::Local(b));
+    let p = paint_diff_probes(
+        &view,
+        vcx,
+        id,
+        &["diff-send-picker", "diff-send-title=Send 2 comments to…", "diff-send-tag=beta", "diff-send-tag=alpha"],
+    );
+    assert!(p[0].is_some() && p[1].is_some(), "the picker + its title paint: {p:?}");
+    assert!(p[2].is_some() && p[3].is_none(), "only the last-sent row is tagged: {p:?}");
+
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    let payload = ctl_b.prompt_rx.try_recv().expect("a prompt reached beta's channel");
+    assert!(ctl_a.prompt_rx.try_recv().is_err(), "alpha received nothing");
+    let abs = std::path::absolute(&review_path).unwrap();
+    assert!(abs.is_absolute());
+    assert!(payload.text.contains(&format!("Read {} and address comments c1, c2.", abs.display())), "{}", payload.text);
+    let expected = view.read_with(vcx, |v, _| {
+        let t = v.diff_tile_ref(id).unwrap();
+        crate::build_send_prompt(t.review.as_ref().unwrap(), &abs, &["c1".into(), "c2".into()])
+    });
+    assert_eq!(payload.text, expected, "the delivered prompt is exactly build_send_prompt");
+
+    let (_, json) = fixture_review_json(&wt);
+    for c in json["comments"].as_array().unwrap() {
+        assert_eq!(c["sent"][0]["session"], key_b.as_str(), "sent entry recorded: {json}");
+        assert_eq!(c["sent"][0]["label"], "beta");
+    }
+    assert_eq!(json["last_sent_session"], key_b.as_str());
+    assert_eq!(diff_status(&view, vcx), "Sent 2 comments to beta.");
+    let p = paint_diff_probes(&view, vcx, id, &["diff-unsent=2 unsent", "diff-send-picker"]);
+    assert!(p[0].is_none() && p[1].is_none(), "unsent count gone, picker closed: {p:?}");
+    view.read_with(vcx, |v, _| {
+        assert_eq!(v.workspace.focused_window_id(), Some(id), "the Diff tile keeps focus");
+    });
+
+    // A third comment: `s` names only it.
+    diff_add_comment(vcx, "] j j j", "third");
+    vcx.simulate_keystrokes("s");
+    vcx.run_until_parked();
+    assert_eq!(diff_send_picker_state(&view, vcx, id).unwrap().1, "beta");
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    let payload = ctl_b.prompt_rx.try_recv().expect("second prompt");
+    assert!(payload.text.contains("address comments c3."), "only the unsent c3: {}", payload.text);
+
+    // `S` re-sends everything.
+    vcx.simulate_keystrokes("shift-s");
+    vcx.run_until_parked();
+    let p = paint_diff_probes(&view, vcx, id, &["diff-send-title=Send 3 comments to…"]);
+    assert!(p[0].is_some(), "S titles all three");
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    let payload = ctl_b.prompt_rx.try_recv().expect("third prompt");
+    assert!(payload.text.contains("address comments c1, c2, c3."), "{}", payload.text);
+    let (_, json) = fixture_review_json(&wt);
+    assert_eq!(json["comments"][0]["sent"].as_array().unwrap().len(), 2, "c1 sent twice: {json}");
+
+    // Nothing unsent: no picker, a hint.
+    vcx.simulate_keystrokes("s");
+    vcx.run_until_parked();
+    assert!(diff_send_picker_state(&view, vcx, id).is_none(), "no picker with zero unsent");
+    assert_eq!(diff_status(&view, vcx), "No unsent comments.");
+}
+
+/// UXI-Diff-16 failure: the chosen session can't take the prompt (no channel,
+/// no server sid) ⇒ nothing is recorded (in memory or on disk), the status
+/// line explains, and the review file was STILL written before the delivery
+/// attempt (it is deleted just before Enter; afterwards it holds c1 — the only
+/// write on this path is the pre-send save). The picker is filtered by
+/// typing (fuzzy) to reach the dead session.
+///
+/// Negative controls (observed RED): (d) `diff_send_after_save` ignoring the
+/// delivery error (recording anyway) ⇒ c1 gains a `sent` entry; (e) the
+/// pre-send `save_review_latest` skipped ⇒ the review file is absent at the
+/// delivery attempt.
+#[cfg(feature = "test-support")]
+#[gpui::test]
+fn diff_send_failure_records_nothing_and_file_written_first(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let wt = temp.path().to_path_buf();
+    let (view, vcx, id) = boot_with_diff(cx, wt.clone());
+    let (_a, ctl_a) = add_send_session(&view, vcx, "alpha");
+    let dead = add_free_session(&view, vcx, "zombie");
+    diff_add_comment(vcx, "j j j", "first");
+    let (review_path, _) = fixture_review_json(&wt);
+    std::fs::remove_file(&review_path).expect("comment save wrote the review file");
+
+    vcx.simulate_keystrokes("s");
+    vcx.run_until_parked();
+    diff_type(vcx, "zom");
+    let (target, label, ranked) = diff_send_picker_state(&view, vcx, id).unwrap();
+    assert_eq!(ranked, vec!["zombie".to_string()], "fuzzy query narrows the rows");
+    assert_eq!((target, label.as_str()), (crate::SendTarget::Local(dead), "zombie"));
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+
+    assert!(ctl_a.prompt_rx.try_recv().is_err());
+    let status = diff_status(&view, vcx);
+    assert!(status.starts_with("Send failed:"), "status explains: {status}");
+    view.read_with(vcx, |v, _| {
+        let t = v.diff_tile_ref(id).unwrap();
+        assert!(t.send_picker.is_none());
+        let r = t.review.as_ref().unwrap();
+        assert!(r.comments[0].sent.is_empty(), "nothing recorded in memory");
+        assert_eq!(r.last_sent_session, None);
+        assert_eq!(t.unsent_count(), 1);
+    });
+    let (_, json) = fixture_review_json(&wt);
+    assert_eq!(json["comments"][0]["id"], "c1", "the review file was written before the send: {json}");
+    assert_eq!(json["comments"][0]["sent"], serde_json::json!([]));
+    assert!(json["last_sent_session"].is_null());
+}
+
+/// UXI-Diff-16 picker UX (no delivery): zero comments ⇒ `s`/`S` open nothing
+/// and hint; with comments, the picker captures typing (a space included —
+/// leaders suppressed) into its fuzzy query WITHOUT re-rendering the cached
+/// Diff body (render-flat), ctrl-n / ctrl-p / arrows move, Esc closes. The
+/// overlay paints inside the tile. With no `last_sent_session` the first row
+/// (palette order) is preselected.
+///
+/// Negative control (observed RED): adding the picker query length to
+/// `DiffSeqs` re-renders the body per keystroke.
+#[gpui::test]
+fn diff_send_picker_query_is_render_flat_and_filters(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let (view, vcx, id) = boot_with_diff(cx, temp.path().to_path_buf());
+    add_free_session(&view, vcx, "alpha agent");
+    add_free_session(&view, vcx, "beta agent");
+    add_free_session(&view, vcx, "gamma");
+
+    vcx.simulate_keystrokes("s");
+    vcx.run_until_parked();
+    assert!(diff_send_picker_state(&view, vcx, id).is_none());
+    assert_eq!(diff_status(&view, vcx), "No unsent comments.");
+    vcx.simulate_keystrokes("shift-s");
+    vcx.run_until_parked();
+    assert!(diff_send_picker_state(&view, vcx, id).is_none());
+    assert_eq!(diff_status(&view, vcx), "No comments.");
+
+    diff_add_comment(vcx, "j j j", "note");
+    vcx.simulate_keystrokes("s");
+    vcx.run_until_parked();
+    let (_, label, ranked) = diff_send_picker_state(&view, vcx, id).expect("picker open");
+    assert_eq!(ranked, vec!["alpha agent", "beta agent", "gamma"]);
+    assert_eq!(label, "alpha agent", "no last-sent ⇒ first row");
+    let p = paint_diff_probes(&view, vcx, id, &["diff-send-picker", &format!("plane-tile-content-{id}")]);
+    let (pk, tile) = (p[0].expect("picker paints"), p[1].expect("tile paints"));
+    assert!(
+        pk.0 >= tile.0 && pk.1 >= tile.1 && pk.0 + pk.2 <= tile.0 + tile.2 + 0.5,
+        "the picker overlays the tile: {pk:?} in {tile:?}"
+    );
+
+    vcx.simulate_keystrokes("ctrl-n");
+    vcx.run_until_parked();
+    assert_eq!(diff_send_picker_state(&view, vcx, id).unwrap().1, "beta agent");
+    vcx.simulate_keystrokes("ctrl-p up");
+    vcx.run_until_parked();
+    assert_eq!(diff_send_picker_state(&view, vcx, id).unwrap().1, "gamma", "wraps");
+
+    crate::perf_reset("diff");
+    diff_type(vcx, "a ag");
+    let (_, _, ranked) = diff_send_picker_state(&view, vcx, id).unwrap();
+    assert_eq!(ranked, vec!["alpha agent", "beta agent"], "fuzzy filter (space typed into the query)");
+    view.read_with(vcx, |v, _| {
+        assert_eq!(v.diff_tile_ref(id).unwrap().send_picker.as_ref().unwrap().query, "a ag");
+        assert!(!v.has_overlay(), "space did not open a leader menu");
+    });
+    assert_eq!(crate::perf_render_count("diff"), 0, "query typing must not re-render the cached Diff body");
+
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(diff_send_picker_state(&view, vcx, id).is_none(), "Esc closes");
+    view.read_with(vcx, |v, _| {
+        assert_eq!(v.diff_tile_ref(id).unwrap().unsent_count(), 1, "closing sends nothing");
+    });
+}
