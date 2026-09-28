@@ -991,10 +991,7 @@ impl DiffTile {
 
     /// Open the comment editor (bumps `compose_gen`, clears the range).
     pub(crate) fn open_compose(&mut self, target: ComposeTarget, anchor: CommentAnchor, body: &str) {
-        let mut input = Compose::new();
-        for ch in body.chars() {
-            input.editor.insert_char(ch);
-        }
+        let input = Compose::seeded(body);
         self.compose = Some(CommentCompose {
             input,
             target,

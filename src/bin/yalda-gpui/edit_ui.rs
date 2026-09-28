@@ -521,18 +521,14 @@ impl YaldaGpuiView {
             Key::Enter => {
                 match list_continuation_action(editor) {
                     Some(ListContinuation::Continue(prefix)) => {
-                        editor.insert_char('\n');
-                        for ch in prefix.chars() {
-                            editor.insert_char(ch);
-                        }
+                        editor.insert_str(&format!("\n{prefix}"));
                     }
                     Some(ListContinuation::Terminate) => {
                         // Enter on an empty list item ends the list: wipe the
-                        // dangling marker, then drop to a fresh blank line.
+                        // dangling marker (one bulk delete), then drop to a
+                        // fresh blank line.
                         let col = editor.cursor().col;
-                        for _ in 0..col {
-                            editor.backspace();
-                        }
+                        editor.delete_back_in_line(col);
                         editor.insert_char('\n');
                     }
                     None => editor.insert_char('\n'),
@@ -541,10 +537,7 @@ impl YaldaGpuiView {
             Key::Backspace => {
                 editor.backspace();
             }
-            Key::Tab => {
-                editor.insert_char(' ');
-                editor.insert_char(' ');
-            }
+            Key::Tab => editor.insert_str("  "),
             // Caret motion in insert mode. `insert_mode=true` lets the caret
             // rest one past EOL (unlike Normal). Shared by the buffer EditView
             // and the agent compose, so both get identical arrow/Home/End/Delete
@@ -558,7 +551,7 @@ impl YaldaGpuiView {
             Key::Down => editor.move_down(true),
             Key::Home => editor.cursor_move_line_start(),
             Key::End => editor.move_cursor_line_end(true),
-            Key::Delete => editor.delete_char_at_cursor(),
+            Key::Delete => editor.delete_forward_in_insert(),
             Key::Char(c) => {
                 if press.modifiers.contains(KMods::CONTROL)
                     || press.modifiers.contains(KMods::PLATFORM)
@@ -908,20 +901,15 @@ impl YaldaGpuiView {
             return false;
         }
         // For `p`, start inserting after the cursor's char (unless the line
-        // is empty / cursor already past end). `begin_insert`/`end_insert`
-        // bracket the splice so it lands as one undo group, matching how
-        // insert-mode typing is grouped.
+        // is empty / cursor already past end). `paste_str` lands the text as
+        // one bulk splice in one undo group (B10).
         if !before {
             let line = editor.cursor().line;
             if editor.line_len_chars(line) > 0 {
                 editor.move_right_clamped(true);
             }
         }
-        editor.begin_insert();
-        for ch in text.chars() {
-            editor.insert_char(ch);
-        }
-        editor.end_insert();
+        editor.paste_str(text);
         // Step back onto the last inserted char (cursor sits one past it).
         if editor.cursor().col > 0 {
             editor.cursor_move_left();

@@ -2669,9 +2669,7 @@ impl Compose {
     /// re-apply a persisted draft, and on the not-delivered resubmit path.
     pub(crate) fn seeded(text: &str) -> Self {
         let mut c = Self::new();
-        for ch in text.chars() {
-            c.editor.insert_char(ch);
-        }
+        c.editor.insert_str(text);
         c
     }
 
