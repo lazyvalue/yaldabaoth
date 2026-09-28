@@ -180,8 +180,12 @@ pub struct Document {
     /// (the typing hot path). Zero or multiple splices reset it to `None`, so
     /// reparse falls back to a full parse — making a wrong `InputEdit` the only
     /// possible incremental hazard, confined to `note_pending_edit`.
-    pending_edit: Option<tree_sitter::InputEdit>,
-    pending_splice_count: u32,
+    ///
+    /// B14: `Cell`s so the lazily-parsing editor can consume the window from
+    /// a `&self` block-API read. Undo/redo (which bypass `note_pending_edit`)
+    /// mark the window multi-splice, forcing the next parse to be full.
+    pending_edit: std::cell::Cell<Option<tree_sitter::InputEdit>>,
+    pending_splice_count: std::cell::Cell<u32>,
     /// B6: undo-stack depth at which the buffer matches what is on disk (the
     /// save point). `None` once that state is unreachable through undo/redo
     /// (history diverged past it, or an unrecorded edit changed the text).
@@ -252,8 +256,8 @@ impl Document {
             undo_stack: VecDeque::new(),
             redo_stack: Vec::new(),
             pending_undo: None,
-            pending_edit: None,
-            pending_splice_count: 0,
+            pending_edit: std::cell::Cell::new(None),
+            pending_splice_count: std::cell::Cell::new(0),
             saved_depth: Some(0),
             line_ending,
         }
@@ -359,26 +363,23 @@ impl Document {
             old_end_position: old_end_point,
             new_end_position: new_end_point,
         };
-        self.pending_splice_count += 1;
-        self.pending_edit = if self.pending_splice_count == 1 {
-            Some(edit)
-        } else {
-            None
-        };
+        let n = self.pending_splice_count.get().saturating_add(1);
+        self.pending_splice_count.set(n);
+        self.pending_edit.set(if n == 1 { Some(edit) } else { None });
     }
 
     /// Consume the pending incremental `InputEdit` for the next reparse,
     /// resetting the per-reparse window. `Some` ONLY when exactly one clean
     /// splice happened since the last call (the typing hot path); `None`
     /// otherwise (zero or multiple splices → full reparse).
-    pub fn take_pending_edit(&mut self) -> Option<tree_sitter::InputEdit> {
-        let edit = if self.pending_splice_count == 1 {
-            self.pending_edit.take()
+    pub fn take_pending_edit(&self) -> Option<tree_sitter::InputEdit> {
+        let edit = if self.pending_splice_count.get() == 1 {
+            self.pending_edit.get()
         } else {
             None
         };
-        self.pending_edit = None;
-        self.pending_splice_count = 0;
+        self.pending_edit.set(None);
+        self.pending_splice_count.set(0);
         edit
     }
 
@@ -793,6 +794,10 @@ impl Document {
             HistoryDir::Redo => self.redo_stack.pop()?,
         };
         let shifts = self.apply_splices(&entry, dir);
+        // B14: the rope changed without `note_pending_edit`; no single
+        // InputEdit describes it, so the next (lazy) parse must be full.
+        self.pending_edit.set(None);
+        self.pending_splice_count.set(2);
         let (line, col) = (entry.cursor_before_line, entry.cursor_before_col);
         let mirror = UndoEntry {
             splices: entry.splices,

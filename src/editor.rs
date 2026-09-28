@@ -190,7 +190,12 @@ impl<'a, T: Any + Send + Sync> LineMetadataMut<'a, T> {
 /// `&mut EditorCore` to access this substrate.
 pub struct EditorCore {
     document: Document,
-    tree_state: TreeState,
+    /// B14: parsed LAZILY — edits never touch tree-sitter; the first block-API
+    /// read after a change (`ensure_parsed`) parses straight from the rope.
+    /// `RefCell` because those reads take `&self`.
+    tree_state: std::cell::RefCell<TreeState>,
+    /// B14: `Document::edit_seq` the tree was last parsed at (`None` = never).
+    parsed_seq: std::cell::Cell<Option<u64>>,
     /// Half-open line ranges marking lines that are wholly frozen — content
     /// the user cannot edit (typically Claude's words in the *claude* buffer).
     /// A line is either entirely frozen or entirely editable; mid-line splits
@@ -308,13 +313,11 @@ impl EditorCore {
     }
 
     fn new_with_edit_seq(text: String, file_path: PathBuf, edit_seq: u64) -> Self {
-        let mut tree_state = TreeState::new();
-        tree_state.parse(text.as_bytes(), None);
-
         let document = Document::from_text_with_edit_seq(text, file_path, edit_seq);
         Self {
             document,
-            tree_state,
+            tree_state: std::cell::RefCell::new(TreeState::new()),
+            parsed_seq: std::cell::Cell::new(None),
             frozen_lines: Vec::new(),
             lockable_through_line: 0,
             line_anchors: LineAnchorStore::default(),
@@ -903,46 +906,72 @@ impl EditorCore {
         &mut self.document
     }
 
-    pub fn tree_state(&self) -> &TreeState {
-        &self.tree_state
+    /// The tree-sitter state, parsed up to date first (B14: lazily).
+    pub fn tree_state(&self) -> std::cell::Ref<'_, TreeState> {
+        self.ensure_parsed();
+        self.tree_state.borrow()
+    }
+
+    /// B14: parses run so far on this buffer (see `TreeState::parse_count`).
+    /// Does NOT parse.
+    pub fn tree_parse_count(&self) -> u64 {
+        self.tree_state.borrow().parse_count()
     }
 
     /// Get block boundary info.
     pub fn block_boundaries(&self) -> Vec<BlockInfo> {
-        self.tree_state.block_boundaries()
+        self.tree_state().block_boundaries()
     }
 
-    /// Get the text for a specific block by index.
+    /// Get the text for a specific block by index (a rope slice — no
+    /// whole-document copy).
     pub fn block_text(&self, block_index: usize) -> String {
         let blocks = self.block_boundaries();
         if let Some(block) = blocks.get(block_index) {
-            let text = self.document.full_text();
-            let start = block.start_byte.min(text.len());
-            let end = block.end_byte.min(text.len());
-            text[start..end].to_string()
+            let rope = self.document.rope();
+            let len = rope.len_bytes();
+            let s = rope.byte_to_char(block.start_byte.min(len));
+            let e = rope.byte_to_char(block.end_byte.min(len));
+            rope.slice(s..e).to_string()
         } else {
             String::new()
         }
     }
 
-    /// Re-parse the document with tree-sitter, incrementally when exactly one
-    /// clean splice has happened since the last reparse (the typing hot path),
-    /// else a full parse. The edit is computed in `Document::record_splice` and
-    /// consumed here via `take_pending_edit`.
+    /// Eagerly bring the tree up to date (tests / callers that want the parse
+    /// cost now). Edits no longer call this — see [`ensure_parsed`](Self::ensure_parsed).
     pub fn reparse(&mut self) {
+        self.ensure_parsed();
+    }
+
+    /// B14: parse iff the text changed since the last parse. Incremental when
+    /// exactly one clean splice happened since then (`take_pending_edit`),
+    /// else full; either way read straight from the rope's chunks
+    /// (`parse_rope`), never a `full_text()` copy. Called only from the block
+    /// API, so typing / `x` / `dd` / undo pay nothing for a tree the app
+    /// doesn't read on those paths.
+    fn ensure_parsed(&self) {
+        let seq = self.document.edit_seq();
+        if self.parsed_seq.get() == Some(seq) {
+            return;
+        }
         let edit = self.document.take_pending_edit();
-        let text = self.document.full_text();
+        let mut ts = self.tree_state.borrow_mut();
         if std::env::var("YALDA_PARSE_TIMING").as_deref() == Ok("1") {
             let kind = if edit.is_some() { "incr" } else { "full" };
             let t0 = std::time::Instant::now();
-            self.tree_state.parse(text.as_bytes(), edit);
+            ts.parse_rope(self.document.rope(), edit);
             let us = t0.elapsed().as_micros();
             if us > 100 {
-                eprintln!("[parse] {kind} reparse {} bytes in {us}µs", text.len());
+                eprintln!(
+                    "[parse] {kind} reparse {} bytes in {us}µs",
+                    self.document.len_bytes()
+                );
             }
         } else {
-            self.tree_state.parse(text.as_bytes(), edit);
+            ts.parse_rope(self.document.rope(), edit);
         }
+        self.parsed_seq.set(Some(seq));
     }
 
     pub fn save(&mut self) -> std::io::Result<()> {
@@ -1206,7 +1235,7 @@ impl EditorView {
     }
 
     /// Run a discrete edit as one undo step: opens a group if none is open,
-    /// runs `f`, closes the group only if this call opened it, then reparses.
+    /// runs `f`, and closes the group only if this call opened it.
     /// Inside an insert session (group already open) the edit joins the
     /// session instead of clobbering it (B1).
     fn grouped(&mut self, core: &mut EditorCore, f: impl FnOnce(&mut Self, &mut EditorCore)) {
@@ -1216,7 +1245,6 @@ impl EditorView {
             core.document
                 .end_undo_group(self.cursor.line, self.cursor.col);
         }
-        core.reparse();
     }
 
     /// Guarded delete of the char range `[del_s, del_e)`: checks the frozen /
@@ -1245,7 +1273,6 @@ impl EditorView {
         self.in_insert_mode = false;
         core.document
             .end_undo_group(self.cursor.line, self.cursor.col);
-        core.reparse();
     }
 
     pub fn insert_char(&mut self, core: &mut EditorCore, ch: char) {
@@ -1307,7 +1334,6 @@ impl EditorView {
         if opened {
             core.document
                 .end_undo_group(self.cursor.line, self.cursor.col);
-            core.reparse();
         }
     }
 
@@ -1468,14 +1494,13 @@ impl EditorView {
         // restores THIS column, not a stale one from an earlier j/k run.
         self.cursor.set_col(col);
         self.clamp_cursor_col(core, false);
-        core.reparse();
     }
 
     pub fn active_block_index(&self, core: &EditorCore) -> Option<usize> {
         let byte_offset = core
             .document
             .line_col_to_byte(self.cursor.line, self.cursor.col);
-        core.tree_state.active_block_at_byte(byte_offset)
+        core.tree_state().active_block_at_byte(byte_offset)
     }
 
     // --- Motion delegates (operate on cursor with core's document) ---
@@ -2070,7 +2095,7 @@ impl Editor {
         self.core.document_mut()
     }
 
-    pub fn tree_state(&self) -> &TreeState {
+    pub fn tree_state(&self) -> std::cell::Ref<'_, TreeState> {
         self.core.tree_state()
     }
 
@@ -3516,7 +3541,7 @@ fn f() { let x = 1; }
                 // Oracle: the incremental tree must equal a fresh full parse.
                 let text = core.document.full_text();
                 let incr = core
-                    .tree_state
+                    .tree_state()
                     .tree()
                     .map(|t| t.root_node().to_sexp())
                     .unwrap_or_default();
@@ -3987,6 +4012,46 @@ fn f() { let x = 1; }
         ed.redo();
         assert!(ed.document().full_text().contains("hi\nthere"));
         assert_agent_lines_frozen(&ed, "after redo");
+    }
+
+    /// B14: edits (typing, `x`, `dd`, undo/redo, paste) never run tree-sitter;
+    /// the tree is parsed lazily, once, on the first block-API read after them.
+    #[test]
+    fn edits_do_not_parse_until_the_tree_is_read() {
+        let mut ed = new_editor("# Head\n\npara one\n\npara two\n");
+        let parses = |ed: &Editor| ed.core().tree_parse_count();
+        assert_eq!(parses(&ed), 0, "opening a buffer does not parse");
+        ed.cursor_mut().set_pos(2, 0);
+        ed.begin_insert();
+        ed.insert_char('X');
+        ed.end_insert();
+        ed.delete_char_at_cursor();
+        ed.delete_current_line();
+        ed.undo();
+        ed.redo();
+        ed.paste_str("pasted\n");
+        assert_eq!(parses(&ed), 0, "no parse on the edit hot path");
+        let blocks = ed.block_boundaries();
+        assert!(blocks.len() >= 2, "{blocks:?}");
+        assert_eq!(parses(&ed), 1, "parsed once, on read");
+        let _ = ed.active_block_index();
+        let _ = ed.block_text(0);
+        assert_eq!(parses(&ed), 1, "a clean tree is not re-parsed");
+        // The lazily-parsed tree matches a fresh full parse of the text.
+        let mut fresh = crate::tree::TreeState::new();
+        fresh.parse(ed.document().full_text().as_bytes(), None);
+        assert_eq!(ed.block_boundaries(), fresh.block_boundaries());
+        // Multi-chunk rope: `parse_rope` reads across chunk boundaries (é is
+        // 2 bytes so chunk splits land mid-line in varied places).
+        let big: String = (0..800)
+            .map(|i| format!("# H{i}\n\npara é {i} with words\n\n"))
+            .collect();
+        let big_ed = new_editor(&big);
+        assert!(big_ed.document().rope().chunks().count() > 10);
+        let mut fresh = crate::tree::TreeState::new();
+        fresh.parse(big.as_bytes(), None);
+        assert_eq!(big_ed.block_boundaries(), fresh.block_boundaries());
+        assert_eq!(big_ed.block_text(1), "para é 0 with words\n");
     }
 
     /// B2: redo replays a `\n` re-inserted at the END of a frozen line with the
