@@ -57,7 +57,7 @@ pub(crate) struct PaletteItem<T = PaletteTarget> {
 /// Overlay state: what you've typed and which row is highlighted. `selected`
 /// indexes into the RANKED list (`rank_palette_items`), not the item list.
 pub(crate) struct JumpPaletteOverlay {
-    pub(crate) query: String,
+    pub(crate) query: LineInput,
     pub(crate) selected: usize,
 }
 
@@ -71,7 +71,7 @@ const PALETTE_VISIBLE_ROWS: usize = 12;
 pub(crate) struct PalettePanel<'a, T> {
     pub(crate) id_prefix: &'static str,
     pub(crate) title: String,
-    pub(crate) query: &'a str,
+    pub(crate) query: &'a LineInput,
     pub(crate) items: &'a [PaletteItem<T>],
     pub(crate) ranked: &'a [usize],
     pub(crate) selected: usize,
@@ -332,11 +332,8 @@ impl YaldaGpuiView {
     /// all derive "what's on screen" from.
     pub(crate) fn jump_palette_ranked(&self, cx: &gpui::App) -> (Vec<PaletteItem>, Vec<usize>) {
         let items = self.jump_palette_items(cx);
-        let query = self
-            .jump_palette_ref()
-            .map(|p| p.query.clone())
-            .unwrap_or_default();
-        let ranked = rank_palette_items(&items, &query);
+        let query = self.jump_palette_ref().map_or("", |p| p.query.text());
+        let ranked = rank_palette_items(&items, query);
         (items, ranked)
     }
 
@@ -359,7 +356,7 @@ impl YaldaGpuiView {
         // A fresh palette clears any lingering toast (same idiom as the pickers).
         self.transient_status = None;
         self.open_overlay(ActiveOverlay::JumpPalette(JumpPaletteOverlay {
-            query: String::new(),
+            query: LineInput::new(),
             selected: 0,
         }));
         cx.notify();
@@ -395,30 +392,21 @@ impl YaldaGpuiView {
                 }
                 cx.notify();
             }
-            Key::Backspace => {
-                if let Some(p) = self.jump_palette_mut() {
-                    p.query.pop();
-                    // Editing the query re-ranks, so the highlight returns to the
-                    // (new) best match rather than a stale row index.
+            // Everything else edits the query. A modified chord (Cmd-P itself,
+            // Cmd-anything) is `Unhandled` by `LineInput` — the overlay captures
+            // keys before action dispatch, so this is where that chord dies.
+            _ => {
+                let Some(p) = self.jump_palette_mut() else { return };
+                let edit = p.query.handle(&press);
+                if edit.edited() {
+                    // Editing the query re-ranks, so the highlight returns to
+                    // the (new) best match rather than a stale row index.
                     p.selected = 0;
                 }
-                cx.notify();
-            }
-            // A modified chord (Cmd-P itself, Cmd-anything) must never type its
-            // bare letter into the query — the overlay captures keys before
-            // action dispatch, so this is where that chord dies.
-            Key::Char(c)
-                if !press.modifiers.contains(KMods::PLATFORM)
-                    && !press.modifiers.contains(KMods::CONTROL)
-                    && !press.modifiers.contains(KMods::ALT) =>
-            {
-                if let Some(p) = self.jump_palette_mut() {
-                    p.query.push(c);
-                    p.selected = 0;
+                if edit.handled() {
+                    cx.notify();
                 }
-                cx.notify();
             }
-            _ => {}
         }
     }
 
@@ -457,7 +445,7 @@ impl YaldaGpuiView {
         let (items, ranked) = self.jump_palette_ranked(cx);
         let (query, selected) = match self.jump_palette_ref() {
             Some(p) => (p.query.clone(), p.selected),
-            None => (String::new(), 0),
+            None => (LineInput::new(), 0),
         };
         let targets: Vec<PaletteTarget> = items.iter().map(|it| it.target.clone()).collect();
         let glyphs: Vec<&'static str> = items
@@ -586,7 +574,7 @@ impl YaldaGpuiView {
             .text_color(input_fg)
             .text_size(px(14.0))
             .font_family(st.mono.clone())
-            .child(SharedString::from(format!("{query}\u{2588}")));
+            .child(SharedString::from(query.with_caret(LINE_INPUT_CARET)));
 
         let mut list = div().flex().flex_col().w_full();
         if ranked.is_empty() {

@@ -14,6 +14,7 @@ pub mod file_browser;
 pub mod highlight;
 pub mod keybind;
 pub mod keys;
+pub mod line_input;
 pub mod md_highlight;
 pub mod menu;
 pub mod parse;

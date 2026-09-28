@@ -17,14 +17,20 @@
 //!    place the "splice the changed range, never `reset()`" reconcile lives, so
 //!    no scroll surface re-derives it (or re-introduces the jump-to-top bug).
 //!
+//! 4. **Single-line text input** (`line_input`) — `LineInput` (the lib-crate
+//!    model: text + caret + one key policy) and `LINE_INPUT_CARET`. Every
+//!    query / filter / rename field is one; never hand-roll `push`/`pop`.
+//!
 //! Read `yux/CLAUDE.md` before adding to it: it states the rules (state
 //! encapsulation, the never-notify-in-render law, the render-count test) and
 //! the contribution mandate — **all UX work lives here or is built from here.**
 
 mod cached;
 mod detail;
+mod line_input;
 mod list;
 
 pub(crate) use cached::*;
 pub(crate) use detail::*;
+pub(crate) use line_input::*;
 pub(crate) use list::*;

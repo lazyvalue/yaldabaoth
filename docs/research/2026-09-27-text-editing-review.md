@@ -28,6 +28,8 @@ browser screen AND the rail) · `NewProjectOverlay.cwd` · `RenameOverlay.text` 
 | A5 | dup | Selection-reset rule differs per site (reset / clamp — Cog's doc comment says reset but code clamps). |
 | A6 | nit | The browser rail filter draws no caret. |
 | A7 | cold | `SendPicker::ranked()` re-runs the fuzzy rank on every call (render, move, activate). |
+| A8 | hot | `FileBrowser::set_filter` → `rebuild_filtered` runs a synchronous recursive filesystem walk (depth 8, 200 results) on the UI thread on **every filter keystroke**. |
+| A9 | hot | The jump palette re-ranks on every key and every render (`jump_palette_ranked`); keymap / Cog / buffer-switcher filters recompute their match lists per render. |
 
 ## B. Core engine (`document.rs` / `editor.rs` / `cursor.rs`)
 
@@ -99,7 +101,10 @@ browser screen AND the rail) · `NewProjectOverlay.cwd` · `RenameOverlay.text` 
 
 ## Implementation packages
 
-- **P1 line-input** (A*): shared `yalda::line_input::LineInput` + one typed-char policy; migrate all 14 sites.
+- **P1 line-input** (A1–A7): shared `yalda::line_input::LineInput` + one typed-char
+  policy (`KeyPress::typed_char`); all 14 sites migrated; `UXI-TextEditing-5`.
+  A1–A7 **fixed** (A5: Cog keeps clamp, doc comment corrected; every other site
+  resets on edit). A8/A9 **deferred** (A8 needs an async search task).
 - **P2 engine** (B1, B3–B7, B10, B11, B13, B15, B16 + D1 bulk paste).
 - **P3 render pipeline** (C1, C2, C4, C5, D2, D5, D6).
 - **P4 compose hot path** (D3, D4, D7–D10).

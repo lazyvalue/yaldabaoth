@@ -317,7 +317,7 @@ pub(crate) enum LinearMode {
 /// `title` mirrors the loaded entity's identifier/name so the workspace strip /
 /// window title can read it without a `cx` (the body's payload needs one).
 pub(crate) struct LinearTile {
-    pub(crate) input: String,
+    pub(crate) input: LineInput,
     pub(crate) req: u64,
     pub(crate) title: String,
     pub(crate) view: Option<Entity<LinearView>>,
@@ -329,7 +329,7 @@ pub(crate) struct LinearTile {
 impl LinearTile {
     pub(crate) fn new() -> Self {
         LinearTile {
-            input: String::new(),
+            input: LineInput::new(),
             req: 0,
             title: "Linear".into(),
             view: None,

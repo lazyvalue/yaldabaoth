@@ -251,9 +251,9 @@ impl YaldaGpuiView {
             match press.key {
                 Key::Esc => b.fb.cancel_rename(),
                 Key::Enter => b.fb.commit_rename(),
-                Key::Backspace => b.fb.rename_backspace(),
-                Key::Char(c) if !press.modifiers.contains(KMods::CONTROL) => b.fb.rename_push(c),
-                _ => {}
+                _ => {
+                    b.fb.rename_key(&press);
+                }
             }
             cx.notify();
             cx.stop_propagation();
@@ -302,20 +302,13 @@ impl YaldaGpuiView {
                 }
                 cx.stop_propagation();
             }
-            Key::Backspace => {
-                let mut text = b.fb.filter_text().to_string();
-                if text.pop().is_some() {
-                    b.fb.set_filter(&text);
-                } else {
-                    b.fb.clear_filter();
-                }
+            // Backspace on an empty filter leaves filter mode.
+            Key::Backspace if b.fb.filter_text().is_empty() => {
+                b.fb.clear_filter();
                 cx.notify();
                 cx.stop_propagation();
             }
-            Key::Char(c) => {
-                let mut text = b.fb.filter_text().to_string();
-                text.push(c);
-                b.fb.set_filter(&text);
+            _ if b.fb.filter_key(&press).handled() => {
                 cx.notify();
                 cx.stop_propagation();
             }
@@ -737,20 +730,13 @@ impl YaldaGpuiView {
                 }
                 cx.stop_propagation();
             }
-            Key::Backspace => {
-                let mut text = fb.filter_text().to_string();
-                if text.pop().is_some() {
-                    fb.set_filter(&text);
-                } else {
-                    fb.clear_filter();
-                }
+            // Backspace on an empty filter leaves filter mode.
+            Key::Backspace if fb.filter_text().is_empty() => {
+                fb.clear_filter();
                 cx.notify();
                 cx.stop_propagation();
             }
-            Key::Char(c) => {
-                let mut text = fb.filter_text().to_string();
-                text.push(c);
-                fb.set_filter(&text);
+            _ if fb.filter_key(&press).handled() => {
                 cx.notify();
                 cx.stop_propagation();
             }

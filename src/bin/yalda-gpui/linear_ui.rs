@@ -35,7 +35,7 @@ impl YaldaGpuiView {
             let Some(tile) = self.linear_tile_by_id_mut(target) else {
                 return;
             };
-            let query = tile.input.trim().to_string();
+            let query = tile.input.text().trim().to_string();
             if query.is_empty() {
                 return;
             }
@@ -252,7 +252,7 @@ impl YaldaGpuiView {
             _ => return,
         };
         if let Some(t) = self.linear_focused_tile_mut() {
-            t.input = query;
+            t.input.set_text(query);
         }
         self.linear_submit(cx);
     }
@@ -468,23 +468,17 @@ impl YaldaGpuiView {
         match press.key {
             Key::Enter => self.linear_submit(cx),
             Key::Esc => self.linear_set_mode(LinearMode::Normal, cx),
-            Key::Backspace => {
-                if let Some(t) = self.linear_focused_tile_mut() {
-                    t.input.pop();
-                }
-                cx.notify();
-            }
             Key::Down => self.linear_scroll(48.0, cx),
             Key::Up => self.linear_scroll(-48.0, cx),
             Key::PageDown => self.linear_scroll(400.0, cx),
             Key::PageUp => self.linear_scroll(-400.0, cx),
-            Key::Char(c) => {
-                if let Some(t) = self.linear_focused_tile_mut() {
-                    t.input.push(c);
+            _ => {
+                if let Some(t) = self.linear_focused_tile_mut()
+                    && t.input.handle(&press).handled()
+                {
+                    cx.notify();
                 }
-                cx.notify();
             }
-            _ => {}
         }
     }
 

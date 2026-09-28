@@ -201,7 +201,7 @@ pub(crate) struct CogView {
     /// Which pane the keyboard drives (reset to `Selector` on state change).
     focus: CogFocus,
     /// Graph-explorer search filter (the `/` pattern) + whether it's capturing.
-    graph_filter: String,
+    graph_filter: LineInput,
     filtering: bool,
     /// Collapsed JSON tree paths (folded rows). Keyed by a stable path id
     /// (`surface/key/idx…`); absent = expanded. Cleared on graph change.
@@ -242,7 +242,7 @@ impl CogView {
             events: Vec::new(),
             events_scroll: ScrollHandle::new(),
             event_seq: 0,
-            graph_filter: String::new(),
+            graph_filter: LineInput::new(),
             filtering: false,
             collapsed: restored.json_collapsed.iter().cloned().collect(),
             topic_collapsed: restored.topic_collapsed.iter().cloned().collect(),
@@ -663,7 +663,7 @@ impl CogView {
 
     /// The current search filter text.
     pub(crate) fn filter_text(&self) -> &str {
-        &self.graph_filter
+        self.graph_filter.text()
     }
 
     /// Begin capturing a search filter (the `/` key), in the explorer only.
@@ -673,16 +673,14 @@ impl CogView {
         }
     }
 
-    /// Append a char to the filter and reset the selection to the first match.
-    pub(crate) fn filter_push(&mut self, c: char) {
-        self.graph_filter.push(c);
-        self.clamp_graph_selection();
-    }
-
-    /// Delete the last filter char (reset selection).
-    pub(crate) fn filter_backspace(&mut self) {
-        self.graph_filter.pop();
-        self.clamp_graph_selection();
+    /// Route an editing key to the filter; an edit clamps the selection into
+    /// the new match list.
+    pub(crate) fn filter_key(&mut self, press: &KeyPress) -> LineEdit {
+        let edit = self.graph_filter.handle(press);
+        if edit.edited() {
+            self.clamp_graph_selection();
+        }
+        edit
     }
 
     /// Exit search, clearing the filter.
@@ -698,7 +696,7 @@ impl CogView {
             CogViewState::Graphs { graphs, .. } => graphs
                 .iter()
                 .enumerate()
-                .filter(|(_, g)| graph_matches(g, &self.graph_filter))
+                .filter(|(_, g)| graph_matches(g, self.graph_filter.text()))
                 .map(|(i, _)| i)
                 .collect(),
             _ => Vec::new(),
@@ -1842,7 +1840,7 @@ impl CogView {
             CogViewState::Graphs { graphs, selected } => {
                 // Header shows the search filter (the `/` pattern) when active.
                 let hdr = if self.filtering || !self.graph_filter.is_empty() {
-                    format!("/ {}\u{2588}  ({} match)", self.graph_filter, fidx.len())
+                    format!("/ {}  ({} match)", self.graph_filter.with_caret(LINE_INPUT_CARET), fidx.len())
                 } else {
                     format!("Graphs ({}) · / to search", graphs.len())
                 };

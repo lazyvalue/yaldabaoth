@@ -2423,9 +2423,9 @@ impl YaldaGpuiView {
             ("INSERT", nc(self.theme.agent.user_bar))
         };
         let input_text = if normal {
-            tile.input.clone()
+            tile.input.text().to_string()
         } else {
-            format!("{}\u{2588}", tile.input)
+            tile.input.with_caret(LINE_INPUT_CARET)
         };
         let trailing: AnyElement = if normal {
             div()
@@ -2658,7 +2658,7 @@ impl YaldaGpuiView {
             PalettePanel {
                 id_prefix: "diff-send",
                 title,
-                query: &picker.query,
+                query: picker.query(),
                 items: &picker.items,
                 ranked: &ranked,
                 selected: picker.selected,
@@ -3410,8 +3410,8 @@ impl YaldaGpuiView {
                         .bg(nc(ov.selected_bg))
                         .text_color(nc(ov.input))
                         .child(SharedString::from(format!(
-                            "/ {}\u{2588}",
-                            b.fb.filter_text()
+                            "/ {}",
+                            b.fb.filter_input().with_caret(LINE_INPUT_CARET)
                         ))),
                 );
             }
@@ -3457,7 +3457,7 @@ impl YaldaGpuiView {
                             .bg(nc(ov.selected_bg))
                             .text_color(nc(ov.input))
                             .font_family(self.code_font.clone())
-                            .child(SharedString::from(format!("{}\u{2588}", r.input)));
+                            .child(SharedString::from(r.input.with_caret(LINE_INPUT_CARET)));
                         if let Some(err) = &r.error {
                             input_row = input_row.child(
                                 div()

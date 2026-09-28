@@ -1505,7 +1505,7 @@ struct MenuOverlay {
 struct BufferSwitcher {
     selected: usize,
     filter_mode: bool,
-    filter_text: String,
+    filter_text: LineInput,
 }
 
 /// What the workspace picker will do with the chosen target. Drives the
@@ -1561,7 +1561,7 @@ struct TileSwapPicker {
 /// workspace rename. Pre-filled with the current label; Enter commits, Esc
 /// cancels, empty input cancels.
 struct RenameOverlay {
-    text: String,
+    text: LineInput,
     target: RenameTarget,
 }
 
@@ -1593,7 +1593,7 @@ enum RenameTarget {
 /// "New project" overlay (UXI-Project-4): asks only for the cwd. Its display
 /// name is derived from the directory basename and uniquified by `Projects`.
 struct NewProjectOverlay {
-    cwd: String,
+    cwd: LineInput,
 }
 
 /// The single, mutually-exclusive overlay layered over the screen body — at
@@ -1684,7 +1684,7 @@ enum TagInputMode {
 #[derive(Debug, Clone)]
 struct TagInputOverlay {
     mode: TagInputMode,
-    text: String,
+    text: LineInput,
     prompt: &'static str,
 }
 
@@ -6365,7 +6365,7 @@ impl YaldaGpuiView {
         self.open_overlay(ActiveOverlay::BufferSwitcher(BufferSwitcher {
             selected: self.workspace.active_workspace,
             filter_mode: false,
-            filter_text: String::new(),
+            filter_text: LineInput::new(),
         }));
         cx.notify();
     }
@@ -7309,7 +7309,7 @@ impl YaldaGpuiView {
         }
         let text = format!("{}x{}", self.desktop_grid_cols, self.desktop_grid_rows);
         self.open_overlay(ActiveOverlay::Rename(RenameOverlay {
-            text,
+            text: LineInput::with_text(text),
             target: RenameTarget::DesktopTileSize,
         }));
         cx.notify();
@@ -7328,7 +7328,7 @@ impl YaldaGpuiView {
         };
         let text = ent.read(cx).label.clone();
         self.open_overlay(ActiveOverlay::Rename(RenameOverlay {
-            text,
+            text: LineInput::with_text(text),
             target: RenameTarget::AgentSession { id },
         }));
         cx.notify();
@@ -7486,7 +7486,9 @@ impl YaldaGpuiView {
             return;
         }
         let cwd = self.agent_base_cwd().display().to_string();
-        self.open_overlay(ActiveOverlay::NewProject(NewProjectOverlay { cwd }));
+        self.open_overlay(ActiveOverlay::NewProject(NewProjectOverlay {
+            cwd: LineInput::with_text(cwd),
+        }));
         cx.notify();
     }
 
@@ -7494,7 +7496,7 @@ impl YaldaGpuiView {
     /// uniquify its basename display name, create an EMPTY project, and persist.
     fn commit_new_project_overlay(&mut self, cx: &mut Context<Self>) {
         let cwd = match self.new_project_ref() {
-            Some(o) => o.cwd.trim().to_string(),
+            Some(o) => o.cwd.text().trim().to_string(),
             None => return,
         };
         if cwd.is_empty() {
@@ -7538,19 +7540,13 @@ impl YaldaGpuiView {
                 cx.notify();
             }
             Key::Enter => self.commit_new_project_overlay(cx),
-            Key::Backspace => {
-                if let Some(o) = self.new_project_mut() {
-                    o.cwd.pop();
+            _ => {
+                if let Some(o) = self.new_project_mut()
+                    && o.cwd.handle(&press).handled()
+                {
+                    cx.notify();
                 }
-                cx.notify();
             }
-            Key::Char(c) => {
-                if let Some(o) = self.new_project_mut() {
-                    o.cwd.push(c);
-                }
-                cx.notify();
-            }
-            _ => {}
         }
     }
 
@@ -7745,7 +7741,7 @@ impl YaldaGpuiView {
         };
         let text = ent.read(cx).cwd.display().to_string();
         self.open_overlay(ActiveOverlay::Rename(RenameOverlay {
-            text,
+            text: LineInput::with_text(text),
             target: RenameTarget::AgentChangeCwd { id },
         }));
         cx.notify();
@@ -7771,7 +7767,7 @@ impl YaldaGpuiView {
             .map(|p| p.display().to_string())
             .unwrap_or_default();
         self.open_overlay(ActiveOverlay::Rename(RenameOverlay {
-            text,
+            text: LineInput::with_text(text),
             target: RenameTarget::WorkspaceCwd { index: idx },
         }));
         cx.notify();
@@ -7790,7 +7786,7 @@ impl YaldaGpuiView {
         };
         let text = wsp.display_label().to_string();
         self.open_overlay(ActiveOverlay::Rename(RenameOverlay {
-            text,
+            text: LineInput::with_text(text),
             target: RenameTarget::Workspace { index: idx },
         }));
         cx.notify();
@@ -7805,7 +7801,7 @@ impl YaldaGpuiView {
     /// the user can't accidentally erase the label by hammering Enter.
     fn commit_rename_overlay(&mut self, cx: &mut Context<Self>) {
         let (target, new_label) = match self.rename_ref() {
-            Some(o) => (o.target, o.text.trim().to_string()),
+            Some(o) => (o.target, o.text.text().trim().to_string()),
             None => return,
         };
         if new_label.is_empty() {
@@ -7931,19 +7927,13 @@ impl YaldaGpuiView {
                 cx.notify();
             }
             Key::Enter => self.commit_rename_overlay(cx),
-            Key::Backspace => {
-                if let Some(o) = self.rename_mut() {
-                    o.text.pop();
+            _ => {
+                if let Some(o) = self.rename_mut()
+                    && o.text.handle(&press).handled()
+                {
+                    cx.notify();
                 }
-                cx.notify();
             }
-            Key::Char(c) => {
-                if let Some(o) = self.rename_mut() {
-                    o.text.push(c);
-                }
-                cx.notify();
-            }
-            _ => {}
         }
     }
 
@@ -7955,25 +7945,19 @@ impl YaldaGpuiView {
                 cx.notify();
             }
             Key::Enter => self.commit_tag_input(cx),
-            Key::Backspace => {
-                if let Some(o) = self.tag_input_mut() {
-                    o.text.pop();
+            _ => {
+                if let Some(o) = self.tag_input_mut()
+                    && o.text.handle(&press).handled()
+                {
+                    cx.notify();
                 }
-                cx.notify();
             }
-            Key::Char(c) => {
-                if let Some(o) = self.tag_input_mut() {
-                    o.text.push(c);
-                }
-                cx.notify();
-            }
-            _ => {}
         }
     }
 
     fn commit_tag_input(&mut self, cx: &mut Context<Self>) {
         let (mode, text) = match self.tag_input_ref() {
-            Some(o) => (o.mode, o.text.clone()),
+            Some(o) => (o.mode, o.text.text().to_string()),
             None => return,
         };
         let tag = text.trim().to_string();
@@ -8065,7 +8049,7 @@ impl YaldaGpuiView {
             .text_color(input_fg)
             .text_size(px(14.0))
             .font_family(self.code_font.clone())
-            .child(SharedString::from(format!("{}\u{2588}", o.text)));
+            .child(SharedString::from(o.text.with_caret(LINE_INPUT_CARET)));
 
         let footer = div()
             .px_4()
@@ -8107,7 +8091,7 @@ impl YaldaGpuiView {
         };
         self.active_overlay = ActiveOverlay::TagInput(TagInputOverlay {
             mode,
-            text: String::new(),
+            text: LineInput::new(),
             prompt,
         });
         cx.notify();
@@ -8122,7 +8106,7 @@ impl YaldaGpuiView {
         if bs.filter_text.is_empty() {
             return (0..self.workspace.workspaces.len()).collect();
         }
-        let query = bs.filter_text.to_lowercase();
+        let query = bs.filter_text.text().to_lowercase();
         (0..self.workspace.workspaces.len())
             .filter(|&i| {
                 let label = workspace_doc_label(&self.workspace.workspaces[i])
@@ -8167,19 +8151,13 @@ impl YaldaGpuiView {
                     cx.notify();
                     return;
                 }
-                Key::Backspace => {
-                    if let Some(bs) = self.buffer_mut() {
-                        bs.filter_text.pop();
+                _ => {
+                    if let Some(bs) = self.buffer_mut()
+                        && bs.filter_text.handle(&press).edited()
+                    {
                         bs.selected = 0;
                     }
                 }
-                Key::Char(c) => {
-                    if let Some(bs) = self.buffer_mut() {
-                        bs.filter_text.push(c);
-                        bs.selected = 0;
-                    }
-                }
-                _ => {}
             }
             cx.notify();
             return;
@@ -8598,7 +8576,7 @@ impl YaldaGpuiView {
         let header_text = if bs.filter_text.is_empty() {
             format!("BUFFERS ({})", total)
         } else {
-            format!("BUFFERS ({}/{}) — \"{}\"", visible, total, bs.filter_text)
+            format!("BUFFERS ({}/{}) — \"{}\"", visible, total, bs.filter_text.text())
         };
         let header_row = div()
             .flex()
@@ -8686,7 +8664,7 @@ impl YaldaGpuiView {
                 .text_color(filter_fg)
                 .text_size(px(14.0))
                 .font_family(self.code_font.clone())
-                .child(SharedString::from(format!("/ {}\u{2588}", bs.filter_text)))
+                .child(SharedString::from(format!("/ {}", bs.filter_text.with_caret(LINE_INPUT_CARET))))
         } else {
             div()
         };
@@ -8758,7 +8736,7 @@ impl YaldaGpuiView {
             .text_color(input_fg)
             .text_size(px(14.0))
             .font_family(self.code_font.clone())
-            .child(SharedString::from(format!("{}\u{2588}", o.text)));
+            .child(SharedString::from(o.text.with_caret(LINE_INPUT_CARET)));
 
         let footer = div()
             .px_4()
@@ -8816,7 +8794,7 @@ impl YaldaGpuiView {
             .text_color(input_fg)
             .text_size(px(14.0))
             .font_family(self.code_font.clone())
-            .child(SharedString::from(format!("cwd: {}{}", o.cwd, "\u{2588}")));
+            .child(SharedString::from(format!("cwd: {}", o.cwd.with_caret(LINE_INPUT_CARET))));
         let footer = div()
             .px_4()
             .py_1()

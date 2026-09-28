@@ -1190,11 +1190,17 @@ impl YaldaGpuiView {
             match press.key {
                 Key::Esc => self.cog_filter_op(cx, |cv| cv.filter_clear()),
                 Key::Enter => self.cog_open_selected_graph(cx),
-                Key::Backspace => self.cog_filter_op(cx, |cv| cv.filter_backspace()),
                 Key::Down => self.cog_select(1, cx),
                 Key::Up => self.cog_select(-1, cx),
-                Key::Char(c) => self.cog_filter_op(cx, |cv| cv.filter_push(c)),
-                _ => {}
+                _ => {
+                    if let Some(v) = self.cog_focused_tile_view() {
+                        v.update(cx, |cv, vcx| {
+                            if cv.filter_key(&press).handled() {
+                                vcx.notify();
+                            }
+                        });
+                    }
+                }
             }
             return;
         }

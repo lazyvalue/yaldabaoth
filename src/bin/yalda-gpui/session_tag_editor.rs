@@ -36,7 +36,7 @@ pub(crate) struct TagEditorOverlay {
     pub(crate) session: SessionId,
     pub(crate) tile: workspace::WindowId,
     pub(crate) sid: String,
-    pub(crate) input: String,
+    pub(crate) input: LineInput,
     pub(crate) column: TagEditorColumn,
     pub(crate) selected: usize,
     pub(crate) mode: TagEditorMode,
@@ -96,7 +96,7 @@ impl YaldaGpuiView {
             c
         };
         let on_session = |t: &str| current.iter().any(|c| c.eq_ignore_ascii_case(t));
-        let typed = ov.input.trim();
+        let typed = ov.input.text().trim();
         let q = typed.to_lowercase();
         let mut left: Vec<TagLeftRow> = Vec::new();
         // A "create" row when the typed text is a genuinely new tag.
@@ -162,7 +162,7 @@ impl YaldaGpuiView {
             session: id,
             tile,
             sid,
-            input: String::new(),
+            input: LineInput::new(),
             column: TagEditorColumn::Available,
             selected: 0,
             mode: TagEditorMode::Normal,
@@ -282,22 +282,23 @@ impl YaldaGpuiView {
                 Key::Enter => self.activate_tag_editor(cx),
                 Key::Down => move_sel(self, 1, cx),
                 Key::Up => move_sel(self, -1, cx),
-                Key::Backspace => {
-                    if let Some(o) = self.tag_editor_mut() {
-                        o.input.pop();
+                _ => {
+                    let Some(o) = self.tag_editor_mut() else { return };
+                    let len_before = o.input.text().len();
+                    let edit = o.input.handle(&press);
+                    if edit.edited() {
+                        // Typing (the text grew) filters the Available column;
+                        // deleting keeps the focused column. Either way the
+                        // highlight returns to the best match.
+                        if o.input.text().len() > len_before {
+                            o.column = TagEditorColumn::Available;
+                        }
                         o.selected = 0;
                     }
-                    cx.notify();
-                }
-                Key::Char(c) if unmodified => {
-                    if let Some(o) = self.tag_editor_mut() {
-                        o.input.push(c);
-                        o.column = TagEditorColumn::Available;
-                        o.selected = 0;
+                    if edit.handled() {
+                        cx.notify();
                     }
-                    cx.notify();
                 }
-                _ => {}
             },
             // ── NORMAL: vim navigation across the two columns. ───────────────
             TagEditorMode::Normal => match press.key {
@@ -426,11 +427,11 @@ impl YaldaGpuiView {
                     .text_size(px(14.0))
                     .font_family(st.mono.clone())
                     .child(SharedString::from(if inserting {
-                        format!("{input}\u{2588}")
+                        input.with_caret(LINE_INPUT_CARET)
                     } else if input.is_empty() {
                         "press i to type".to_string()
                     } else {
-                        input.clone()
+                        input.text().to_string()
                     })),
             );
 

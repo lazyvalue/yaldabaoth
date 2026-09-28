@@ -780,7 +780,12 @@ pub(crate) struct SendPicker {
     /// The item that matches the review's `last_sent_session` (tagged "last
     /// sent", and the initial selection).
     pub(crate) last_sent: Option<usize>,
-    pub(crate) query: String,
+    /// Private so every edit goes through [`query_key`](Self::query_key),
+    /// which keeps [`ranked`](Self::ranked) in sync.
+    query: LineInput,
+    /// Item indices in display order for `query` — recomputed only when the
+    /// query changes, not on every render / move / activate.
+    ranked: Vec<usize>,
     /// DISPLAY index into [`ranked`](Self::ranked).
     pub(crate) selected: usize,
 }
@@ -793,12 +798,14 @@ impl SendPicker {
     ) -> Self {
         let (items, keys): (Vec<_>, Vec<_>) = candidates.into_iter().map(|c| (c.item, c.key)).unzip();
         let last_sent = last_sent_session.and_then(|k| keys.iter().position(|x| x == k));
+        let ranked = rank_palette_items(&items, "");
         SendPicker {
             ids,
             items,
             keys,
             last_sent,
-            query: String::new(),
+            query: LineInput::new(),
+            ranked,
             // Empty query ⇒ ranked is the identity, so the item index IS the
             // display index. No last-sent match ⇒ the first (most prominent)
             // row, i.e. the jump palette's order.
@@ -808,8 +815,12 @@ impl SendPicker {
 
     /// Item indices in display order for the current query (the jump
     /// palette's `rank_palette_items`).
-    pub(crate) fn ranked(&self) -> Vec<usize> {
-        rank_palette_items(&self.items, &self.query)
+    pub(crate) fn ranked(&self) -> &[usize] {
+        &self.ranked
+    }
+
+    pub(crate) fn query(&self) -> &LineInput {
+        &self.query
     }
 
     /// The highlighted item index (`None` when the query matches nothing).
@@ -824,14 +835,15 @@ impl SendPicker {
         }
     }
 
-    pub(crate) fn push_query(&mut self, c: char) {
-        self.query.push(c);
-        self.selected = 0;
-    }
-
-    pub(crate) fn pop_query(&mut self) {
-        self.query.pop();
-        self.selected = 0;
+    /// Route an editing key to the query; an edit re-ranks and returns the
+    /// highlight to the best match.
+    pub(crate) fn query_key(&mut self, press: &KeyPress) -> LineEdit {
+        let edit = self.query.handle(press);
+        if edit.edited() {
+            self.ranked = rank_palette_items(&self.items, self.query.text());
+            self.selected = 0;
+        }
+        edit
     }
 }
 

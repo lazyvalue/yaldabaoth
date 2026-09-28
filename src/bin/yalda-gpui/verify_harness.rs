@@ -2653,7 +2653,7 @@ fn jump_palette_opens_tileless_session_into_project_workspace(cx: &mut TestAppCo
     // Type the label, then activate the top-ranked row.
     view.update(vcx, |v, cx| {
         let palette = v.jump_palette_mut().expect("palette open");
-        palette.query = "tileless target".into();
+        palette.query.set_text("tileless target");
         palette.selected = 0;
         cx.notify();
     });
@@ -2869,7 +2869,7 @@ fn bound_session_jumps_focus_single_owner_workspace(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         let palette = v.jump_palette_mut().expect("cmd-p opened the palette");
-        palette.query = "claude-1".into();
+        palette.query.set_text("claude-1");
         palette.selected = 0;
         cx.notify();
     });
@@ -3904,7 +3904,7 @@ fn active_overlay_open_replaces_and_clears(cx: &mut TestAppContext) {
         v.open_overlay(ActiveOverlay::BufferSwitcher(BufferSwitcher {
             selected: 0,
             filter_mode: false,
-            filter_text: String::new(),
+            filter_text: crate::LineInput::new(),
         }));
         assert!(v.has_overlay() && v.overlay_is_buffer());
         assert!(v.buffer_ref().is_some());
@@ -8281,7 +8281,7 @@ fn linear_input_keystroke_is_render_flat(cx: &mut TestAppContext) {
     for _ in 0..5 {
         view.update(vcx, |v, cx| {
             if let Some(crate::App::Linear(tile)) = v.workspace.focused_content_mut() {
-                tile.input.push('x');
+                tile.input.insert_char('x');
             }
             cx.notify(); // mirrors handle_linear_key's Char path (root notify)
         });
@@ -8460,7 +8460,7 @@ fn linear_normal_mode_frees_keys_for_menus(cx: &mut TestAppContext) {
         v.handle_linear_insert_key(kp('x'), cx);
     });
     let typed = view.update(vcx, |v, _| match v.workspace.focused_content() {
-        Some(crate::App::Linear(t)) => t.input.clone(),
+        Some(crate::App::Linear(t)) => t.input.text().to_string(),
         _ => String::new(),
     });
     assert_eq!(
@@ -8475,7 +8475,7 @@ fn linear_normal_mode_frees_keys_for_menus(cx: &mut TestAppContext) {
         v.handle_linear_normal_key(kp('z'), cx);
     });
     let after_letter = view.update(vcx, |v, _| match v.workspace.focused_content() {
-        Some(crate::App::Linear(t)) => t.input.clone(),
+        Some(crate::App::Linear(t)) => t.input.text().to_string(),
         _ => String::new(),
     });
     assert_eq!(
@@ -10824,7 +10824,7 @@ fn new_project_overlay_creates_from_cwd_and_rejects_duplicate_cwd(cx: &mut TestA
     let before = view.read_with(vcx, |v, _| v.projects.len());
     view.update(vcx, |v, cx| {
         v.open_new_project_overlay(cx);
-        v.new_project_mut().expect("new-project overlay open").cwd = dir1.display().to_string();
+        v.new_project_mut().expect("new-project overlay open").cwd.set_text(dir1.display().to_string());
         v.commit_new_project_overlay(cx);
     });
     let zid = view.read_with(vcx, |v, _| {
@@ -10852,7 +10852,7 @@ fn new_project_overlay_creates_from_cwd_and_rejects_duplicate_cwd(cx: &mut TestA
     let after = view.read_with(vcx, |v, _| v.projects.len());
     view.update(vcx, |v, cx| {
         v.open_new_project_overlay(cx);
-        v.new_project_mut().expect("overlay open").cwd = dir2.display().to_string();
+        v.new_project_mut().expect("overlay open").cwd.set_text(dir2.display().to_string());
         v.commit_new_project_overlay(cx);
     });
     view.read_with(vcx, |v, _| {
@@ -10864,7 +10864,7 @@ fn new_project_overlay_creates_from_cwd_and_rejects_duplicate_cwd(cx: &mut TestA
     let after_unique = view.read_with(vcx, |v, _| v.projects.len());
     view.update(vcx, |v, cx| {
         v.open_new_project_overlay(cx);
-        v.new_project_mut().expect("overlay open").cwd = dir1.display().to_string();
+        v.new_project_mut().expect("overlay open").cwd.set_text(dir1.display().to_string());
         v.commit_new_project_overlay(cx);
     });
     view.read_with(vcx, |v, _| {
@@ -26196,7 +26196,7 @@ fn rename_latches_origin_and_blocks_autoname(cx: &mut TestAppContext) {
     view.update(vcx, |v, cx| {
         v.open_rename_overlay(cx);
         if let Some(o) = v.rename_mut() {
-            o.text = "my own name".into();
+            o.text.set_text("my own name");
         }
         v.commit_rename_overlay(cx);
     });
@@ -26250,7 +26250,7 @@ fn late_autoname_result_never_clobbers_a_user_rename(cx: &mut TestAppContext) {
     view.update(vcx, |v, cx| {
         v.open_rename_overlay(cx);
         if let Some(o) = v.rename_mut() {
-            o.text = "typed by hand".into();
+            o.text.set_text("typed by hand");
         }
         v.commit_rename_overlay(cx);
     });
@@ -26343,7 +26343,7 @@ fn jump_palette_cmd_p_opens_over_any_screen(cx: &mut TestAppContext) {
             "cmd-p must open the jump palette on the focused screen"
         );
         assert_eq!(
-            v.jump_palette_ref().unwrap().query,
+            v.jump_palette_ref().unwrap().query.text(),
             "",
             "opens with an empty query"
         );
@@ -26358,7 +26358,7 @@ fn jump_palette_cmd_p_opens_over_any_screen(cx: &mut TestAppContext) {
             "cmd-p while open is a no-op, not a toggle"
         );
         assert_eq!(
-            v.jump_palette_ref().unwrap().query,
+            v.jump_palette_ref().unwrap().query.text(),
             "",
             "the cmd-p chord must never type its bare letter into the query"
         );
@@ -26452,6 +26452,38 @@ fn jump_palette_ranks_best_match_first(_cx: &mut TestAppContext) {
     );
 }
 
+/// Text-editing review A2/A4 (graph exa): every single-line field is a shared
+/// `LineInput`. On a REAL overlay through the REAL keystroke path: an unbound
+/// Cmd/Ctrl chord never types its bare letter (before, the new-project / rename
+/// / tag-input overlays had no modifier guard, so `cmd-y` typed `y`), and a
+/// prefilled path is editable at a movable caret with word delete (before: one
+/// backspace at a time from the end).
+#[gpui::test]
+fn line_input_overlay_rejects_chords_and_edits_at_caret(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_browser(cx);
+    view.update(vcx, |v, cx| {
+        v.open_new_project_overlay(cx);
+        v.new_project_mut().expect("overlay open").cwd.set_text("/tmp/ws/proj");
+    });
+    vcx.run_until_parked();
+    let cwd = |vcx: &mut gpui::VisualTestContext| {
+        view.update(vcx, |v, _| v.new_project_mut().expect("overlay open").cwd.text().to_string())
+    };
+
+    vcx.simulate_keystrokes("cmd-y ctrl-y");
+    vcx.run_until_parked();
+    assert_eq!(cwd(vcx), "/tmp/ws/proj", "unbound chords must not type their bare letter");
+
+    vcx.simulate_keystrokes("alt-backspace");
+    vcx.run_until_parked();
+    assert_eq!(cwd(vcx), "/tmp/ws/", "alt-backspace deletes the last path word");
+
+    vcx.simulate_keystrokes("left x");
+    vcx.run_until_parked();
+    assert_eq!(cwd(vcx), "/tmp/wsx/", "left moves the caret; typing inserts at it");
+}
+
 /// UXI-JumpPanel-9 (4): typing then `Enter` jumps to the top match, through the
 /// REAL keystroke path and the REAL activator (`select_workspace`).
 #[gpui::test]
@@ -26465,7 +26497,7 @@ fn jump_palette_enter_jumps_to_top_match(cx: &mut TestAppContext) {
     vcx.simulate_keystrokes("g a m");
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
-        assert_eq!(v.jump_palette_ref().unwrap().query, "gam");
+        assert_eq!(v.jump_palette_ref().unwrap().query.text(), "gam");
         let (items, ranked) = v.jump_palette_ranked(cx);
         assert_eq!(
             items[ranked[0]].label, "gamma",
@@ -26556,7 +26588,7 @@ fn jump_palette_no_match_enter_is_noop(cx: &mut TestAppContext) {
     vcx.simulate_keystrokes("z q x");
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
-        assert_eq!(v.jump_palette_ref().unwrap().query, "zqx");
+        assert_eq!(v.jump_palette_ref().unwrap().query.text(), "zqx");
         assert!(
             v.jump_palette_ranked(cx).1.is_empty(),
             "nothing matches 'zqx'"
@@ -30838,7 +30870,7 @@ fn diff_send_picker_query_is_render_flat_and_filters(cx: &mut TestAppContext) {
     let (_, _, ranked) = diff_send_picker_state(&view, vcx, id).unwrap();
     assert_eq!(ranked, vec!["alpha agent", "beta agent"], "fuzzy filter (space typed into the query)");
     view.read_with(vcx, |v, _| {
-        assert_eq!(v.diff_tile_ref(id).unwrap().send_picker.as_ref().unwrap().query, "a ag");
+        assert_eq!(v.diff_tile_ref(id).unwrap().send_picker.as_ref().unwrap().query().text(), "a ag");
         assert!(!v.has_overlay(), "space did not open a leader menu");
     });
     assert_eq!(crate::perf_render_count("diff"), 0, "query typing must not re-render the cached Diff body");

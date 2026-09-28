@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::keys::KeyPress;
+use crate::line_input::{LineEdit, LineInput};
 use crate::worktree;
 
 const MAX_SEARCH_RESULTS: usize = 200;
@@ -115,7 +117,7 @@ pub struct BrowserEntry {
 /// Transient state for an in-progress rename of the selected entry.
 pub struct RenameState {
     /// The edited name (seeded with the entry's current name).
-    pub input: String,
+    pub input: LineInput,
     /// Last failed-commit message, shown inline until the user edits again.
     pub error: Option<String>,
 }
@@ -153,7 +155,7 @@ pub struct FileBrowser {
     current_dir: PathBuf,
     entries: Vec<BrowserEntry>,
     selected: usize,
-    filter_text: String,
+    filter: LineInput,
     filtered_indices: Vec<usize>,
     /// Recursive search results (populated when filter is non-empty).
     search_results: Vec<BrowserEntry>,
@@ -174,7 +176,7 @@ impl FileBrowser {
             current_dir: start_dir,
             entries: Vec::new(),
             selected: 0,
-            filter_text: String::new(),
+            filter: LineInput::new(),
             filtered_indices: Vec::new(),
             search_results: Vec::new(),
             filter_mode: false,
@@ -206,7 +208,7 @@ impl FileBrowser {
 
     /// Get entries visible after filtering.
     pub fn visible_entries(&self) -> Vec<&BrowserEntry> {
-        if self.filter_text.is_empty() {
+        if self.filter.is_empty() {
             self.entries.iter().collect()
         } else {
             self.search_results.iter().collect()
@@ -273,7 +275,7 @@ impl FileBrowser {
     /// row in the current directory. Used by `go_parent` (land on the child dir)
     /// and by the buffer→browser open (land on the open file).
     pub fn select_path(&mut self, path: &Path) {
-        if !self.filter_text.is_empty() {
+        if !self.filter.is_empty() {
             return;
         }
         if let Some(idx) = self.entries.iter().position(|e| e.name != ".." && e.path == path) {
@@ -282,20 +284,36 @@ impl FileBrowser {
     }
 
     pub fn set_filter(&mut self, text: &str) {
-        self.filter_text = text.to_string();
+        self.filter.set_text(text);
         self.rebuild_filtered();
         self.selected = 0;
     }
 
+    /// Route an editing key to the filter field; an edit re-filters and
+    /// resets the selection to the first match.
+    pub fn filter_key(&mut self, press: &KeyPress) -> LineEdit {
+        let edit = self.filter.handle(press);
+        if edit.edited() {
+            self.rebuild_filtered();
+            self.selected = 0;
+        }
+        edit
+    }
+
+    /// The filter field (text + caret) for rendering.
+    pub fn filter_input(&self) -> &LineInput {
+        &self.filter
+    }
+
     pub fn clear_filter(&mut self) {
-        self.filter_text.clear();
+        self.filter.clear();
         self.filter_mode = false;
         self.rebuild_filtered();
         self.selected = 0;
     }
 
     pub fn filter_text(&self) -> &str {
-        &self.filter_text
+        self.filter.text()
     }
 
     pub fn toggle_hidden(&mut self) {
@@ -413,10 +431,10 @@ impl FileBrowser {
     fn rebuild_filtered(&mut self) {
         self.filtered_indices.clear();
         self.search_results.clear();
-        if self.filter_text.is_empty() {
+        if self.filter.is_empty() {
             return;
         }
-        let query = self.filter_text.to_lowercase();
+        let query = self.filter.text().to_lowercase();
 
         // Shallow filter over the current directory's entries.
         self.filtered_indices = self
@@ -484,7 +502,7 @@ impl FileBrowser {
             && e.name != ".."
         {
             self.rename = Some(RenameState {
-                input: e.name.clone(),
+                input: LineInput::with_text(e.name.clone()),
                 error: None,
             });
         }
@@ -495,20 +513,17 @@ impl FileBrowser {
         self.rename = None;
     }
 
-    /// Push a character into the rename buffer (clears any prior error).
-    pub fn rename_push(&mut self, c: char) {
-        if let Some(r) = &mut self.rename {
-            r.input.push(c);
+    /// Route an editing key to the rename field; an edit clears any prior
+    /// error.
+    pub fn rename_key(&mut self, press: &KeyPress) -> LineEdit {
+        let Some(r) = &mut self.rename else {
+            return LineEdit::Unhandled;
+        };
+        let edit = r.input.handle(press);
+        if edit.edited() {
             r.error = None;
         }
-    }
-
-    /// Delete the last character of the rename buffer.
-    pub fn rename_backspace(&mut self) {
-        if let Some(r) = &mut self.rename {
-            r.input.pop();
-            r.error = None;
-        }
+        edit
     }
 
     /// Commit the in-progress rename via `fs::rename`. On a filesystem error
@@ -516,7 +531,7 @@ impl FileBrowser {
     /// `RenameState::error`; on success (or a no-op rename) it closes.
     pub fn commit_rename(&mut self) {
         let new_name = match &self.rename {
-            Some(r) => r.input.trim().to_string(),
+            Some(r) => r.input.text().trim().to_string(),
             None => return,
         };
         let entry = match self.selected_entry() {

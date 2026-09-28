@@ -938,15 +938,11 @@ impl YaldaGpuiView {
             Key::Up => picker.move_selection(-1),
             Key::Char('n') if ctrl => picker.move_selection(1),
             Key::Char('p') if ctrl => picker.move_selection(-1),
-            Key::Backspace => picker.pop_query(),
-            Key::Char(c)
-                if !ctrl
-                    && !press.modifiers.contains(KMods::PLATFORM)
-                    && !press.modifiers.contains(KMods::ALT) =>
-            {
-                picker.push_query(c)
+            _ => {
+                if !picker.query_key(&press).handled() {
+                    return;
+                }
             }
-            _ => return,
         }
         cx.notify();
     }

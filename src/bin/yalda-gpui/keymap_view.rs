@@ -42,7 +42,7 @@ pub(crate) struct KeymapView {
     /// visible (menu-reference rows are skipped). Clamped on every rebuild.
     cursor: usize,
     mode: KeymapMode,
-    filter: String,
+    filter: LineInput,
     capture: Option<CaptureState>,
     perf_label: &'static str,
 }
@@ -79,7 +79,7 @@ impl KeymapView {
             scroll: ScrollHandle::new(),
             cursor: 0,
             mode: KeymapMode::Browse,
-            filter: String::new(),
+            filter: LineInput::new(),
             capture: None,
             perf_label: "keymap",
         }
@@ -94,17 +94,17 @@ impl KeymapView {
     }
 
     pub(crate) fn filter(&self) -> &str {
-        &self.filter
+        self.filter.text()
     }
 
-    pub(crate) fn push_filter(&mut self, c: char) {
-        self.filter.push(c);
-        self.cursor = 0;
-    }
-
-    pub(crate) fn backspace_filter(&mut self) {
-        self.filter.pop();
-        self.cursor = 0;
+    /// Route an editing key to the filter; an edit resets the cursor to the
+    /// first match.
+    pub(crate) fn filter_key(&mut self, press: &KeyPress) -> LineEdit {
+        let edit = self.filter.handle(press);
+        if edit.edited() {
+            self.cursor = 0;
+        }
+        edit
     }
 
     pub(crate) fn clear_filter(&mut self) {
@@ -241,8 +241,8 @@ impl Render for KeymapView {
                 pt: 14.0 * scale,
             };
             let reg = &r.keymap_registry;
-            let filter = self.filter.to_lowercase();
-            let cursor_entry = keymap_visible_order(reg, &self.filter)
+            let filter = self.filter.text().to_lowercase();
+            let cursor_entry = keymap_visible_order(reg, self.filter.text())
                 .get(self.cursor)
                 .copied();
             let conflicts: std::collections::HashSet<usize> = cursor_entry
@@ -395,11 +395,11 @@ impl KeymapView {
     ) -> AnyElement {
         let filtering = self.mode == KeymapMode::Filter;
         let filter_text = if filtering {
-            format!("{}\u{2588}", self.filter)
+            self.filter.with_caret(LINE_INPUT_CARET)
         } else if self.filter.is_empty() {
             "(all)".to_string()
         } else {
-            self.filter.clone()
+            self.filter.text().to_string()
         };
 
         // Contextual help line depends on mode / capture.

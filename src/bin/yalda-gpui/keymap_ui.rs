@@ -114,15 +114,11 @@ impl YaldaGpuiView {
                 kv.set_mode(KeymapMode::Browse);
                 c.notify();
             }),
-            Key::Backspace => view.update(cx, |kv, c| {
-                kv.backspace_filter();
-                c.notify();
+            _ => view.update(cx, |kv, c| {
+                if kv.filter_key(&press).handled() {
+                    c.notify();
+                }
             }),
-            Key::Char(ch) => view.update(cx, |kv, c| {
-                kv.push_filter(ch);
-                c.notify();
-            }),
-            _ => {}
         }
     }
 

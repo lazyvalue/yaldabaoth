@@ -101,3 +101,43 @@ The chunks abut, so caret / selection / hit-test offsets are unchanged.
 
 **Enforcement.** `verify_harness.rs::code_edit_wraps_unbroken_token_in_bullet`
 (layout probe; the un-chunked NC paints ~1 line and fails RED).
+
+### UXI-TextEditing-5 — Every single-line field edits the same way
+
+**Statement.** Every single-line text field — the jump palette and Diff send
+picker queries, the tag editor, the keymap / Cog / Linear / buffer-switcher
+filters, the file-browser filter + rename (screen and rail), and the rename /
+new-project cwd / tag-input overlays — is a shared `LineInput` with a movable
+caret and one key policy:
+
+- a typed character inserts at the caret; **Ctrl / Cmd chords never type** (an
+  unbound `cmd-y` must not insert `y`); **Alt types only an OS-composed
+  character** (Option-2 → `@`), never a bare ASCII letter/digit;
+- Backspace / Delete delete a char; Alt- or Ctrl-Backspace / -Delete delete a
+  word (path separators end a word); Cmd-Backspace / Ctrl-U delete to start,
+  Ctrl-K to end;
+- Left / Right move a char (Alt/Ctrl: a word; Cmd: to start/end); Home / End /
+  Ctrl-A / Ctrl-E jump to start/end;
+- Ctrl-W is never consumed (reserved shell prefix);
+- the caret draws as `█` at its position.
+
+Enter / Esc / Up / Down (and any key a site binds first) stay with the owning
+site.
+
+**Applies to.** All fields above + any future single-line field. Model:
+`src/line_input.rs` (`LineInput`, `KeyPress::typed_char`); GUI glue:
+`yux/line_input.rs` (`LINE_INPUT_CARET`). Never hand-roll `String::push`/`pop`
+editing.
+
+**Why.** The fields were 14 separate `push`/`pop` implementations with
+diverging modifier rules: six typed the bare letter of any Cmd/Ctrl chord,
+three blocked Option-composed symbols, and prefilled paths could only be edited
+one backspace at a time from the end (review
+`docs/research/2026-09-27-text-editing-review.md` A1–A5).
+
+**Status.** `implemented` (graph `exa`).
+
+**Enforcement.** `line_input::tests` (key policy, word motion, caret insert);
+`verify_harness.rs::line_input_overlay_rejects_chords_and_edits_at_caret`
+(real keystrokes on the new-project overlay; the old push/pop handler NC fails
+RED with `"/tmp/ws/projyy"`).

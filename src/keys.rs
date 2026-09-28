@@ -90,6 +90,32 @@ impl KeyPress {
     pub fn new(key: Key, modifiers: Modifiers) -> Self {
         Self { key, modifiers }
     }
+
+    /// The character this press types into a text field, or `None` when it
+    /// is a chord. The one typed-text policy for every single-line input:
+    ///
+    /// - Ctrl / Cmd (PLATFORM) chords never type — an unbound `cmd-v` must
+    ///   not insert a bare `v`.
+    /// - Alt types only when the OS composed a character with it (Option-2 →
+    ///   `@` on a German layout, Option-s → `ß`). An Alt press that still
+    ///   reports a bare ASCII letter/digit had no composition (Linux `alt-b`)
+    ///   and is a chord.
+    /// - Control characters never type.
+    pub fn typed_char(&self) -> Option<char> {
+        let Key::Char(c) = self.key else {
+            return None;
+        };
+        if self.modifiers.contains(Modifiers::CONTROL)
+            || self.modifiers.contains(Modifiers::PLATFORM)
+            || c.is_control()
+        {
+            return None;
+        }
+        if self.modifiers.contains(Modifiers::ALT) && c.is_ascii_alphanumeric() {
+            return None;
+        }
+        Some(c)
+    }
 }
 
 #[derive(Debug)]

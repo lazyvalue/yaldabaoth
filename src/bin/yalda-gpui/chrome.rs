@@ -2006,7 +2006,7 @@ impl YaldaGpuiView {
                     // ── Normal file browser ──────────────────────────
                     let dir_str = fb.current_dir().display().to_string();
                     let header_text = if fb.filter_mode {
-                        format!("/{}", fb.filter_text())
+                        format!("/{}", fb.filter_input().with_caret(LINE_INPUT_CARET))
                     } else {
                         format!("▸ {}", dir_str)
                     };
