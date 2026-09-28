@@ -86,6 +86,7 @@ mod diff_model;
 mod diff_ui;
 mod diff_view;
 mod edit_ui;
+mod edit_view;
 mod highlight_cache;
 mod jump_palette;
 mod jump_panel_view;
@@ -123,6 +124,7 @@ pub(crate) use diff::*;
 pub(crate) use diff_git::*;
 pub(crate) use diff_model::*;
 pub(crate) use diff_view::*;
+pub(crate) use edit_view::*;
 pub(crate) use jump_palette::*;
 pub(crate) use jump_panel_view::*;
 pub(crate) use keymap_registry::*;
@@ -1296,44 +1298,10 @@ struct EditState {
     /// Code (raw monospace + syntax highlight) or WordProcessor (live-preview
     /// proportional + typographic styling). Toggled by `Ctrl-W`.
     view: EditView,
-    /// Incremental per-line highlight cache, keyed on the document's
-    /// `edit_seq`. Re-highlights only changed lines instead of the whole
-    /// buffer every frame, so fast typing stays O(changed) rather than
-    /// O(document). Shared between the Code and WordProcessor views — both
-    /// consume the `raw` segments of each `LineHl`.
-    highlight_cache: HighlightCache,
-    /// `edit_seq` the `lines_cache` was extracted at; `u64::MAX` = never built.
-    lines_cache_seq: u64,
-    /// Last extracted (tab-expanded, newline-trimmed) source lines, reused
-    /// verbatim on frames where `edit_seq` is unchanged (cursor blink,
-    /// selection, cross-tile notify) so we don't re-allocate a String per line.
-    lines_cache: std::rc::Rc<Vec<String>>,
-    /// Virtualized line list — only the visible rows are built/laid-out each
-    /// frame instead of one element per document line. Variable height (lines
-    /// wrap), so a `ListState` rather than a fixed-row viewport. Reconciled by
-    /// splicing the changed range (never `reset()`) so scroll stays anchored
-    /// across edits — see `ScrollAnchoredList`.
-    list: ScrollAnchoredList<String>,
-    /// `(edit_seq, cursor_line, cursor_col)` at the last render. When any
-    /// changes we scroll the list to reveal the cursor line (so typing/motion
-    /// keeps the caret on-screen) without fighting the user's manual scroll on
-    /// idle frames. The COLUMN is part of the key because a horizontal move
-    /// along a wide soft-wrapped line (e.g. a markdown table row, which is one
-    /// long source line) changes the caret's *visual* row without changing
-    /// `cursor_line` — without the column here that move never re-revealed and
-    /// the caret drifted off the bottom of the wrapped rows.
-    last_cursor_anchor: Option<(u64, usize, usize)>,
-    /// Per-line WordProcessor typographic kinds, cached on `edit_seq` (mirrors
-    /// `lines_cache`). `classify_wp_line` is folded over the WHOLE buffer; without
-    /// this the WP render re-scanned every line on every idle frame (cursor blink,
-    /// selection, theme/scroll, cross-tile notify). Now only an edit recomputes;
-    /// idle frames reuse the `Rc` (O(changed), not O(document)).
-    wp_kinds_cache: std::rc::Rc<Vec<WpLineKind>>,
-    /// `edit_seq` the `wp_kinds_cache` was built at; `u64::MAX` = never built.
-    wp_kinds_cache_seq: u64,
-    /// The source lines `wp_kinds_cache` was classified from — the alignment
-    /// baseline that lets an edit re-classify only the changed range (C2).
-    wp_kinds_lines: std::rc::Rc<Vec<String>>,
+    /// The cached body view (C10) — owns the row list, scroll, and the
+    /// highlight / line / WP-kind caches. Created lazily on first render
+    /// (`render_edit`); dropped with this state.
+    body: Option<Entity<EditBodyView>>,
     /// Set after `r` in normal mode: the *next* keypress is consumed as the
     /// replacement character (vim `r{char}`) rather than a normal-mode action.
     /// Cleared after that next key (Esc / non-char cancels).
@@ -1349,95 +1317,9 @@ impl EditState {
             keybinds: KeybindManager::default(),
             last_save_msg: None,
             view,
-            highlight_cache: HighlightCache::new(),
-            lines_cache_seq: u64::MAX,
-            lines_cache: std::rc::Rc::new(Vec::new()),
-            // Top-aligned: editing reads from the top of the buffer, unlike the
-            // agent transcript which tails the bottom.
-            list: ScrollAnchoredList::new(gpui::ListAlignment::Top, gpui::px(256.0)),
-            last_cursor_anchor: None,
+            body: None,
             pending_replace: false,
-            wp_kinds_cache: std::rc::Rc::new(Vec::new()),
-            wp_kinds_cache_seq: u64::MAX,
-            wp_kinds_lines: std::rc::Rc::new(Vec::new()),
         }
-    }
-
-    /// Reconcile the row list to `lines` by splicing ONLY the changed range —
-    /// never `reset()` (that drops scroll + measurements and snaps the viewport
-    /// to the top on every newline edit) — then reveal the caret's line so it
-    /// stays on-screen (UXI-TextEditing-1). Shared by the Code and WordProcessor bodies so
-    /// caret-follows-scroll lives in exactly one place, not two verbatim copies.
-    /// Returns the reconciled row count.
-    fn reconcile_and_reveal(
-        &mut self,
-        lines: &std::rc::Rc<Vec<String>>,
-        edit_seq: u64,
-        cursor_line: usize,
-        cursor_col: usize,
-    ) -> usize {
-        self.list.reconcile(lines, edit_seq);
-        let new_count = self.list.len();
-        let anchor = (edit_seq, cursor_line, cursor_col);
-        if self.last_cursor_anchor != Some(anchor) {
-            self.last_cursor_anchor = Some(anchor);
-            if cursor_line < new_count {
-                self.list.state().scroll_to_reveal_item(cursor_line);
-            }
-        }
-        new_count
-    }
-
-    /// Per-line WordProcessor typographic kinds, cached on `edit_seq` (mirrors
-    /// `highlight_snapshot`/`lines_cache`). `classify_wp_line` carries fence
-    /// state so it must be folded in order over the whole buffer; this makes that
-    /// fold run once per edit instead of once per frame, so idle frames (cursor
-    /// blink, selection, scroll, theme, cross-tile notify) reuse the `Rc`.
-    fn wp_kinds_snapshot(
-        &mut self,
-        lines: &std::rc::Rc<Vec<String>>,
-        edit_seq: u64,
-    ) -> std::rc::Rc<Vec<WpLineKind>> {
-        if self.wp_kinds_cache_seq != edit_seq {
-            let kinds = wp_kinds_incremental(&self.wp_kinds_lines, &self.wp_kinds_cache, lines);
-            self.wp_kinds_cache = std::rc::Rc::new(kinds);
-            self.wp_kinds_lines = lines.clone();
-            self.wp_kinds_cache_seq = edit_seq;
-        }
-        self.wp_kinds_cache.clone()
-    }
-
-    /// Extract + highlight the buffer's source lines incrementally. Returns the
-    /// shared source-line vector and a per-line highlight snapshot whose `raw`
-    /// segments are byte-identical to `highlight_markdown_lines_syn`. Both are
-    /// keyed on the document's `edit_seq`, so a frame that didn't edit the
-    /// buffer recomputes zero lines and a single-char edit recomputes ~1.
-    fn highlight_snapshot(
-        &mut self,
-        theme: &Theme,
-        hl: &yalda::highlight::Highlighter,
-    ) -> (
-        std::rc::Rc<Vec<String>>,
-        std::rc::Rc<Vec<std::rc::Rc<LineHl>>>,
-    ) {
-        let edit_seq = self.editor.edit_seq();
-        let lines_rc: std::rc::Rc<Vec<String>> = if self.lines_cache_seq == edit_seq {
-            self.lines_cache.clone()
-        } else {
-            let core = self.editor.core.borrow();
-            let built: Vec<String> = display_lines(core.document());
-            drop(core);
-            let rc = std::rc::Rc::new(built);
-            self.lines_cache = rc.clone();
-            self.lines_cache_seq = edit_seq;
-            rc
-        };
-        // Buffer/doc highlight: one document, no agent-turn boundaries — fences
-        // span the whole file normally (bug-0033 per-turn reset is transcript-only).
-        let snap = self
-            .highlight_cache
-            .snapshot_syn(&lines_rc, theme, edit_seq, &[], hl);
-        (lines_rc, snap)
     }
 }
 

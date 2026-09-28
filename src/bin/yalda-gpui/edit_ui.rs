@@ -51,12 +51,26 @@ impl YaldaGpuiView {
     /// Test-only: `(last_recomputed, last_was_skip)` of the focused Edit view's
     /// incremental highlight cache — the O(changed) latency-gate observable.
     #[cfg(test)]
-    pub(crate) fn test_edit_cache_stats(&mut self) -> (usize, bool) {
-        let e = self.edit_mut().expect("focused window is not an Edit view");
+    pub(crate) fn test_edit_cache_stats(&mut self, cx: &GpuiApp) -> (usize, bool) {
+        let body = self.test_edit_body().expect("edit body view not created yet");
+        let b = body.read(cx);
         (
-            e.highlight_cache.last_recomputed,
-            e.highlight_cache.last_was_skip,
+            b.highlight_cache.last_recomputed,
+            b.highlight_cache.last_was_skip,
         )
+    }
+
+    /// Test-only: the focused Edit tile's cached body view (C10), once rendered.
+    #[cfg(test)]
+    pub(crate) fn test_edit_body(&mut self) -> Option<Entity<EditBodyView>> {
+        self.edit_mut()?.body.clone()
+    }
+
+    /// Test-only: the focused Edit body's virtualized row-list state (scroll).
+    #[cfg(test)]
+    pub(crate) fn test_edit_list(&mut self, cx: &GpuiApp) -> gpui::ListState {
+        let body = self.test_edit_body().expect("edit body view not created yet");
+        body.read(cx).list.state().clone()
     }
 
     /// Test-only: install a fresh Doc screen rendering `blocks` so the headless
@@ -1045,37 +1059,26 @@ pub(crate) fn list_continuation_action<E: EditOps>(editor: &E) -> Option<ListCon
 /// Returns `(chars consumed by the marker, the prefix to start the next item)`.
 /// Checkbox items reset to unchecked; ordered items increment.
 fn parse_list_marker(rest: &str) -> Option<(usize, String)> {
-    let chars: Vec<char> = rest.chars().collect();
+    use yalda::md_line;
+    // Markers are ASCII, so the shared parser's byte lengths are char counts.
     // Bullet markers: `-`, `*`, `+` followed by a space.
-    if chars.len() >= 2 && matches!(chars[0], '-' | '*' | '+') && chars[1] == ' ' {
-        let bullet = chars[0];
-        // Checkbox: `- [ ] ` / `- [x] ` / `- [X] `.
-        if chars.len() >= 6
-            && chars[2] == '['
-            && matches!(chars[3], ' ' | 'x' | 'X')
-            && chars[4] == ']'
-            && chars[5] == ' '
-        {
+    if let Some(bullet) = md_line::bullet_marker(rest) {
+        let bullet = bullet as char;
+        // Checkbox: `- [ ] ` / `- [x] ` / `- [X] ` — resets to unchecked.
+        if md_line::checkbox_after_bullet(rest).is_some() {
             return Some((6, format!("{bullet} [ ] ")));
         }
         return Some((2, format!("{bullet} ")));
     }
-    // Blockquote: `> `.
-    if chars.len() >= 2 && chars[0] == '>' && chars[1] == ' ' {
+    // Blockquote: `> ` (a bare `>` without the space doesn't continue).
+    if rest.starts_with("> ") {
         return Some((2, "> ".to_string()));
     }
     // Ordered list: digits then `.` or `)` then a space.
-    let digits = chars.iter().take_while(|c| c.is_ascii_digit()).count();
-    if digits > 0
-        && chars.len() >= digits + 2
-        && matches!(chars[digits], '.' | ')')
-        && chars[digits + 1] == ' '
-    {
-        let sep = chars[digits];
-        let n: u64 = rest[..digits].parse().ok()?;
-        return Some((digits + 2, format!("{}{sep} ", n.saturating_add(1))));
-    }
-    None
+    let (digits, sep) = md_line::ordered_marker(rest)?;
+    let sep = sep as char;
+    let n: u64 = rest[..digits].parse().ok()?;
+    Some((digits + 2, format!("{}{sep} ", n.saturating_add(1))))
 }
 
 #[cfg(test)]
@@ -1128,6 +1131,49 @@ mod list_continuation_tests {
         assert_eq!(cont("-no space"), None);
         assert_eq!(cont("---"), None);
         assert_eq!(cont(""), None);
+    }
+
+    /// C9 behavior pin: the pre-refactor char-walk, verbatim, as an oracle —
+    /// the shared-parser version must agree on every input of the corpus.
+    #[test]
+    fn matches_legacy_char_walk() {
+        fn old(rest: &str) -> Option<(usize, String)> {
+            let chars: Vec<char> = rest.chars().collect();
+            if chars.len() >= 2 && matches!(chars[0], '-' | '*' | '+') && chars[1] == ' ' {
+                let bullet = chars[0];
+                if chars.len() >= 6
+                    && chars[2] == '['
+                    && matches!(chars[3], ' ' | 'x' | 'X')
+                    && chars[4] == ']'
+                    && chars[5] == ' '
+                {
+                    return Some((6, format!("{bullet} [ ] ")));
+                }
+                return Some((2, format!("{bullet} ")));
+            }
+            if chars.len() >= 2 && chars[0] == '>' && chars[1] == ' ' {
+                return Some((2, "> ".to_string()));
+            }
+            let digits = chars.iter().take_while(|c| c.is_ascii_digit()).count();
+            if digits > 0
+                && chars.len() >= digits + 2
+                && matches!(chars[digits], '.' | ')')
+                && chars[digits + 1] == ' '
+            {
+                let sep = chars[digits];
+                let n: u64 = rest[..digits].parse().ok()?;
+                return Some((digits + 2, format!("{}{sep} ", n.saturating_add(1))));
+            }
+            None
+        }
+        // Indent is stripped by the caller, so no TAB/`#` in this alphabet.
+        let alpha = ['-', '*', '>', ' ', '1', '.', ')', '[', ']', 'x', 'X'];
+        crate::c9_for_each_corpus(6, &alpha, &mut |s| {
+            assert_eq!(parse_list_marker(s), old(s), "parse_list_marker({s:?})");
+        });
+        for s in ["* [x] é", "99999999999999999999999. x", "é- x", "- [ ] ü"] {
+            assert_eq!(parse_list_marker(s), old(s), "parse_list_marker({s:?})");
+        }
     }
 
     #[test]

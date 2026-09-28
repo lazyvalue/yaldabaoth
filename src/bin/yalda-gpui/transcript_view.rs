@@ -436,15 +436,12 @@ impl TranscriptView {
         cx: &Context<Self>,
         pt: gpui::Point<Pixels>,
     ) -> Option<(usize, usize)> {
-        let (line, col) = hit_test_tokens(pt, &self.token_hits.borrow())?;
-        let line_len = self
-            .session
-            .read(cx)
-            .state
-            .editor
-            .document()
-            .line_len_chars(line);
-        Some((line, col.min(line_len)))
+        let (line, display_col) = hit_test_tokens(pt, &self.token_hits.borrow())?;
+        let doc = self.session.read(cx).state.editor.document();
+        // The painted rows (and so the token sink) are TAB-expanded: map the
+        // DISPLAY column back to the raw editor column (inverse of C4).
+        let col = crate::raw_col_from_display(doc, line, display_col);
+        Some((line, col.min(doc.line_len_chars(line))))
     }
 
     /// Begin a mouse drag-select: focus the transcript, place the cursor at the

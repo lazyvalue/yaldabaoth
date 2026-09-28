@@ -81,7 +81,7 @@ impl YaldaGpuiView {
                 self.render_doc(leaf_root, d, cx).into_any_element()
             }
             App::Buffer(BufferApp::Editing(e)) => {
-                self.render_edit(leaf_root, e, cx).into_any_element()
+                self.render_edit(leaf_root, id, e, cx).into_any_element()
             }
             App::Buffer(BufferApp::Picking(b)) => {
                 self.render_browser(leaf_root, b, cx).into_any_element()

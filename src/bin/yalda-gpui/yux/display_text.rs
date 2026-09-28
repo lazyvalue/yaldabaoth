@@ -88,6 +88,40 @@ pub(crate) fn display_col(doc: &Document, line: usize, raw_col: usize) -> usize 
     display_col_of_chars(doc.rope().line(line).chars(), raw_col)
 }
 
+/// DISPLAY → RAW column over a line's chars — the inverse of
+/// [`display_col_of_chars`]. A display column that falls INSIDE a tab's
+/// expansion snaps to the nearer raw boundary (before the tab for the left
+/// half, after it for the right). Columns past the expanded end map 1:1 past
+/// the raw end (callers clamp to the line length).
+fn raw_col_of_display_chars(chars: impl Iterator<Item = char>, display_col: usize) -> usize {
+    let mut raw = 0usize;
+    let mut disp = 0usize;
+    for ch in chars {
+        if ch == '\n' || disp >= display_col {
+            break;
+        }
+        let w = if ch == '\t' { TAB_DISPLAY_WIDTH } else { 1 };
+        if disp + w > display_col {
+            // Inside this char's cells (only possible for a TAB).
+            return if display_col - disp <= w / 2 { raw } else { raw + 1 };
+        }
+        disp += w;
+        raw += 1;
+    }
+    raw + display_col.saturating_sub(disp)
+}
+
+/// Map a DISPLAY column on document line `line` (e.g. a mouse hit-test on the
+/// tab-expanded row) back to the RAW editor column. O(col). Every pointer →
+/// caret conversion on a tab-expanding surface MUST go through this, or a
+/// click after a TAB lands `TAB_DISPLAY_WIDTH - 1` columns too far right.
+pub(crate) fn raw_col_from_display(doc: &Document, line: usize, display_col: usize) -> usize {
+    if line >= doc.line_count() {
+        return display_col;
+    }
+    raw_col_of_display_chars(doc.rope().line(line).chars(), display_col)
+}
+
 /// Project an editor selection (`((start_line, start_col), (end_line,
 /// end_col))`, raw columns) into DISPLAY columns so it lines up with the
 /// tab-expanded rows.
@@ -132,5 +166,25 @@ mod tests {
             display_selection(&doc, Some(((0, 1), (0, 3)))),
             Some(((0, 4), (0, 9)))
         );
+    }
+
+    #[test]
+    fn raw_col_from_display_inverts_display_col() {
+        let doc = Document::from_text("\t\tab\nx\ty\n".into(), "t".into());
+        // Round-trip every raw column (incl. EOL and past it).
+        for line in 0..2 {
+            for raw in 0..8 {
+                let d = display_col(&doc, line, raw);
+                assert_eq!(raw_col_from_display(&doc, line, d), raw, "line {line} raw {raw}");
+            }
+        }
+        // Inside a tab's expansion: left half → before, right half → after.
+        assert_eq!(raw_col_from_display(&doc, 0, 1), 0);
+        assert_eq!(raw_col_from_display(&doc, 0, 2), 0);
+        assert_eq!(raw_col_from_display(&doc, 0, 3), 1);
+        assert_eq!(raw_col_from_display(&doc, 1, 2), 1);
+        assert_eq!(raw_col_from_display(&doc, 1, 4), 2);
+        assert_eq!(raw_col_from_display(&doc, 1, 5), 2, "x + tab = 5 cols → before y");
+        assert_eq!(raw_col_from_display(&doc, 9, 3), 3, "past the doc: identity");
     }
 }
