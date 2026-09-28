@@ -205,9 +205,13 @@ required.
 in graph kfa node comment-inline — the compose was previously pinned at the
 tile's bottom). Deviations/decisions: the editor is a root-level overlay over
 `ComposeSlot` rows rather than an element inside the cached list (typing must
-not re-render the body, UXI-Diff-12); the draft is monospace and hard-wraps at
-`COMPOSE_WRAP_COLS` characters (fixed-height rows), showing at most 12 lines
-with the caret line kept in view; the compose text and cards scale with the
+not re-render the body, UXI-Diff-12); the draft is monospace and renders
+through the SHARED chatbox layout + row renderer (D14, 2026-09-27:
+`wrap_line_cols` word wrap at `COMPOSE_WRAP_COLS` cells with the reserved
+EOL-caret column, tab expansion, selection highlight; `build_chatbox_line` with
+a zoom-scaled `ChatboxRowStyle` and a thin beam `CaretShape`), fixed-height
+rows, showing at most 12 lines with the caret line kept in view (E4: a long
+comment never grows the box past 15 rows); the compose text and cards scale with the
 text zoom. A focused card (cursor on any of its rows) shows an accent ring and
 `e edit · x delete` in its header instead of a row tint. `x` needs a second `x`
 on the same card (the first shows "x again to delete c3"; any other key
@@ -221,7 +225,8 @@ have no row to render under.
 diff_compose_inline_tracks_scroll, diff_comment_card_paints_bordered_box_without_emoji,
 diff_comment_v_range_saves_span_and_snippet, diff_comment_edit_and_confirmed_delete,
 diff_comment_outdated_after_change_paints_after_file_header,
-diff_comment_esc_needs_two_presses_on_nonempty_draft, diff_compose_typing_is_render_flat}`;
+diff_comment_esc_needs_two_presses_on_nonempty_draft, diff_compose_typing_is_render_flat,
+diff_compose_uses_shared_chatbox_wrap_and_tabs, diff_compose_long_comment_is_height_capped_with_caret_inside}`;
 `diff.rs::row_model_tests::{comment_placement_anchor_and_card_lines,
 compose_layout_wraps_places_caret_and_sizes_slots, range_selection_is_clamped_to_one_file}`;
 `yux::list::tests::uniform_rows_rect_tracks_the_scroll_top`. Negative controls

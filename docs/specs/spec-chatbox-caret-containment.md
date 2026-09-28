@@ -10,9 +10,12 @@
 > half described below is no longer used by the compose render — long lines flow
 > onto the next visual row instead of scrolling sideways. Treat every
 > "horizontal" / `left_col` / `visible_cols`-as-scroll passage below as
-> HISTORICAL. The **vertical** caret-containment (`compute_window`'s `top_line`,
-> the splice-anchored list, no `reset()`) is unchanged and still load-bearing,
-> and `visible_cols` survives only as the **wrap width**.
+> HISTORICAL. The **vertical** caret-containment (`compose_first_visible_line`
+> over wrapped VISUAL rows, stored in `Compose::top_vrow`; the splice-anchored
+> list, no `reset()`) is unchanged and still load-bearing, and `visible_cols`
+> survives only as the **wrap width**. (D14, 2026-09-27: the dead horizontal
+> code — `compute_window`, `compose_window`, `compose_first_visible_col`,
+> `ComposeWindow::left_col` — was deleted.)
 >
 > The VERTICAL design below is IMPLEMENTED, runtime-unverified (GPUI paint can't
 > be driven headlessly); per the 15× prior regressions it is not "fixed" until a

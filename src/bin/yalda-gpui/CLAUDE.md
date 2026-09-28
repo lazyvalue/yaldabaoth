@@ -108,6 +108,10 @@ so items stay crate-visible regardless of file):
 - `agent_sessions.rs` — the `SessionStore`/`AgentSessions` owner: the private
   `SessionId → AgentSession` registry that enforces the 1:1 binding invariant
   (`open_or_focus`, `bind_sid`, `locate`, `close`).
+- `you_block_view.rs` — `YouBlockView`: the worksheet's ACTIVE inline
+  You-block as its own cached view, painted by `render_agent` over the
+  transcript's placeholder item (`slot_overlay`) so typing never re-renders
+  the transcript (D11); plus the shared `you_block_element` builder.
 - `agent_ui.rs` — agent/session methods on the view: open/attach/create/
   close flows, server pump + reducers (`apply_server_batch`
   / `apply_reply_events` / `apply_agent_event`), submit paths, Claude key

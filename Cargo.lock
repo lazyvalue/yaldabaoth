@@ -9130,6 +9130,7 @@ dependencies = [
  "tree-sitter",
  "tree-sitter-md",
  "two-face",
+ "unicode-width 0.2.2",
  "ureq",
  "uuid",
 ]

@@ -971,9 +971,12 @@ impl YaldaGpuiView {
         }
     }
 
-    /// The system clipboard's text through GPUI, for a `p`/`P` put.
+    /// The system clipboard's text through GPUI, for a `p`/`P` put — line
+    /// endings normalized to the `\n`-only editors (D15).
     pub(crate) fn clipboard_text(cx: &mut Context<Self>) -> Option<String> {
-        cx.read_from_clipboard().and_then(|item| item.text())
+        cx.read_from_clipboard()
+            .and_then(|item| item.text())
+            .map(|t| normalize_pasted_newlines(&t))
     }
 
     /// Charwise put of `text` at (P, `before=true`) or just after (p,

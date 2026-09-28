@@ -13806,32 +13806,22 @@ fn jump_panel_groups_agent_rows_by_cwd() {
 /// THE ACTUAL ROOT CAUSE of "/clear worksheet invisible", caught on the real
 /// path — the mechanism the six paint/render-count fixes all MISSED.
 ///
-/// The inline You-block is ONE `FlatItem::YouBlock` list item whose content is
-/// driven by the COMPOSE buffer, not the transcript `edit_seq`. GPUI's
-/// `ListState` caches rendered items and only re-measures one when it's spliced.
-/// `reconcile_list` splices the tail on a transcript `edit_seq` move and diffs
-/// `FlatKey::YouBlock` on `parked` only — so a keystroke into the You-block (which
-/// bumps the *compose* seq, not the transcript seq, and doesn't change the key)
-/// left the item un-spliced. GPUI repainted its stale cached element → the typed
-/// char was invisible until an unrelated event (jump bar, chatbox toggle) forced a
-/// splice. The fix: `build_body` hashes the active You-block's render inputs
-/// (`you_block_seq`) and splices exactly that item when the hash moves.
+/// The inline You-block is ONE `FlatItem::YouBlock` list item — since D11 a
+/// fixed-height PLACEHOLDER the root-level `YouBlockView` paints over. Its height
+/// is driven by the COMPOSE buffer (visual rows), not the transcript `edit_seq`,
+/// so `reconcile_list` can't see it change: `build_body` splices exactly that
+/// item when the height code moves (so gpui re-measures it and the overlay slot
+/// follows) — and ONLY then. Here, in the post-/clear typeable worksheet: a
+/// keystroke that keeps the height does NOT splice (the overlay repaints the
+/// text alone), a newline does, and after each the painted block exactly fills
+/// its painted slot.
 ///
-/// This asserts on the SPLICE (`YOU_BLOCK_SPLICE_LABEL`), not on paint: the
-/// headless harness re-renders every list item each frame, which MASKS the
-/// `ListState` item-cache staleness — that mask is precisely why the prior
-/// paint-based repros were falsely GREEN. The splice count is the one observable
-/// that reflects the real GPUI invalidation.
-///
-/// NEGATIVE CONTROL (mandatory, observed): delete the `you_block_seq != …` splice
-/// block in `build_body` (transcript_view.rs) and this fails RED — the count stays
-/// flat at 0, i.e. the You-block item is never invalidated ⇒ the user's invisible
-/// text. Restore it and it passes. Verified by commenting the block out.
+/// NEGATIVE CONTROL (observed RED): delete the `you_block_seq != …` splice block
+/// in `build_body` → the newline's splice count stays 0 (and the grown block
+/// overflows its un-remeasured slot).
 #[gpui::test]
-fn clear_worksheet_you_block_keystroke_splices_item(cx: &mut TestAppContext) {
+fn worksheet_you_block_placeholder_resplices_on_height_change(cx: &mut TestAppContext) {
     let (view, vcx) = boot_worksheet_nav(cx);
-    // Rest in the exact post-/clear typeable worksheet: fresh transcript, focus on
-    // the Compose (UXI-AgentTile-12 gate → inline You-block active), idle, Insert.
     view.update(vcx, |v, cx| {
         let id = v.focused_bound_session().expect("bound");
         v.with_session(id, cx, |c| {
@@ -13845,55 +13835,34 @@ fn clear_worksheet_you_block_keystroke_splices_item(cx: &mut TestAppContext) {
         });
     });
     vcx.run_until_parked();
-
-    // Sanity: we ARE in the state where a You-block item is present + active, so a
-    // keystroke's staleness would actually be user-visible (non-vacuous).
-    let active = view
-        .update(vcx, |v, cx| {
-            v.agent_read(cx, |c| c.inline_you_block_active())
-        })
-        .unwrap_or(false);
-    assert!(
-        active,
-        "precondition: inline You-block must be active (else nothing to keep fresh)"
-    );
-
-    // Let the initial render settle so `last_you_block_seq` has caught up to the
-    // empty block, THEN start the measurement window — so the count we read is
-    // attributable to the KEYSTROKE, not the first paint.
-    vcx.run_until_parked();
+    let active = view.update(vcx, |v, cx| v.agent_read(cx, |c| c.inline_you_block_active())).unwrap_or(false);
+    assert!(active, "precondition: inline You-block active");
+    let block_fills_slot = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        let slot = probe_dirty(view, vcx, "you-block-slot").expect("slot painted");
+        let block = probe_dirty(view, vcx, "you-block").expect("block painted");
+        assert!(
+            (slot.1 - block.1).abs() < 0.5 && (slot.3 - block.3).abs() < 0.5,
+            "the painted block {block:?} must exactly cover its placeholder {slot:?}"
+        );
+        slot.3
+    };
+    let h0 = block_fills_slot(&view, vcx);
     crate::perf_reset(crate::YOU_BLOCK_SPLICE_LABEL);
-    view.update(vcx, |_, cx| cx.notify());
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("h"), w, cx));
     vcx.run_until_parked();
-    let base = crate::perf_render_count(crate::YOU_BLOCK_SPLICE_LABEL);
     assert_eq!(
-        base, 0,
-        "a plain notify (no compose change) must NOT splice the You-block item"
+        crate::perf_render_count(crate::YOU_BLOCK_SPLICE_LABEL),
+        0,
+        "a keystroke that keeps the block's height must not touch the transcript list"
     );
-
-    // The user types — through the REAL key handler, no `i`, no toggle.
-    view.update_in(vcx, |v, w, cx| {
-        v.handle_claude_key(&ws_bare_key("h"), w, cx)
-    });
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("enter"), w, cx));
     vcx.run_until_parked();
-    let after = crate::perf_render_count(crate::YOU_BLOCK_SPLICE_LABEL);
-
-    let text = view
-        .update(vcx, |v, cx| {
-            v.agent_read(cx, |c| c.input_surface.compose().text())
-        })
-        .expect("session");
-    assert_eq!(
-        text.trim(),
-        "h",
-        "sanity: the char landed in the compose buffer"
-    );
     assert!(
-        after > base,
-        "ROOT CAUSE: typing into the active You-block MUST splice its list item so GPUI \
-         re-measures + repaints the new text (splice count {base} -> {after}); flat == the \
-         cached-item staleness the user sees as invisible text",
+        crate::perf_render_count(crate::YOU_BLOCK_SPLICE_LABEL) >= 1,
+        "a newline grows the block: its placeholder item is re-spliced"
     );
+    let h1 = block_fills_slot(&view, vcx);
+    assert!((h1 - h0 - 18.0).abs() < 0.5, "the slot grew by one row: {h0} -> {h1}");
 }
 
 /// The jump panel can be hidden/summoned via `cmd-j` / the `?` menu
@@ -14104,6 +14073,16 @@ fn worksheet_renders_flush_chatbox_renders_boxed(cx: &mut TestAppContext) {
 /// it. `pending_reveal_cursor` is a `TranscriptSeqs` input, so toggling it on the
 /// probe frame busts the cache deterministically. Returns `None` if the tag
 /// didn't paint.
+/// Dirty every `YouBlockView` (D11: the active inline You-block is its own
+/// cached view painted as a root overlay) so a probing frame re-runs its paint
+/// — a cache-hit frame replays the previous paint and records no probes.
+fn dirty_you_block_views(v: &YaldaGpuiView, cx: &mut gpui::Context<YaldaGpuiView>) {
+    let views: Vec<_> = v.transcript_views.values().map(|tv| tv.read(cx).you_block_view.clone()).collect();
+    for ybv in views {
+        ybv.update(cx, |_, ycx| ycx.notify());
+    }
+}
+
 fn probe_dirty(
     view: &gpui::Entity<YaldaGpuiView>,
     vcx: &mut gpui::VisualTestContext,
@@ -14123,6 +14102,7 @@ fn probe_dirty(
         if let Some(mut c) = v.agent_mut(cx) {
             c.pending_reveal_cursor = true;
         }
+        dirty_you_block_views(v, cx);
         cx.notify();
     });
     vcx.run_until_parked();
@@ -15216,13 +15196,15 @@ fn worksheet_typing_after_clear_is_visible_without_pressing_i(cx: &mut TestAppCo
 // Prior tests asserted the BUFFER (`compose().text() == "hello"`) or a hand-built
 // GATE state (`inline_you_block_active()`), never that a keystroke actually
 // RE-RENDERS the cached transcript. This measures the real mechanism: typing must
-// bust the cached transcript (render count advances). Flat count = invisible = bug.
+// bust the cached surface that paints the draft (render count advances). Flat count
+// = invisible = bug. Since D11 (graph ls2) that surface is the active You-block's
+// own cached view (`YouBlockView`, a root-level overlay), not the transcript.
 // ============================================================================
 
 /// REPRO A — the SIMULATED post-clear resting state (same setup as the legacy
 /// `worksheet_typing_after_clear_is_visible_without_pressing_i`, which asserted
 /// the buffer). Here we assert the real invalidation: a keystroke after `/clear`
-/// must RE-RENDER the cached transcript (so the You-block repaints with the text).
+/// must RE-RENDER the You-block's cached view (so it repaints with the text).
 #[gpui::test]
 fn repro_clear_worksheet_typed_text_repaints_simulated(cx: &mut TestAppContext) {
     let (view, vcx) = boot_worksheet_nav(cx);
@@ -15239,18 +15221,18 @@ fn repro_clear_worksheet_typed_text_repaints_simulated(cx: &mut TestAppContext) 
         });
     });
     vcx.run_until_parked();
-    crate::perf_reset("transcript");
+    crate::perf_reset(crate::YOU_BLOCK_PERF_LABEL);
     // Force a clean baseline render, then measure the delta the keystroke causes.
     view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
-    let base = crate::perf_render_count("transcript");
+    let base = crate::perf_render_count(crate::YOU_BLOCK_PERF_LABEL);
 
     // The user types — NO `i`, NO mode toggle — via the REAL key handler.
     view.update_in(vcx, |v, w, cx| {
         v.handle_claude_key(&ws_bare_key("h"), w, cx)
     });
     vcx.run_until_parked();
-    let after = crate::perf_render_count("transcript");
+    let after = crate::perf_render_count(crate::YOU_BLOCK_PERF_LABEL);
 
     let (active, text) = view
         .update(vcx, |v, cx| {
@@ -15273,8 +15255,9 @@ fn repro_clear_worksheet_typed_text_repaints_simulated(cx: &mut TestAppContext) 
     );
     assert!(
         after > base,
-        "a keystroke after /clear MUST re-render the cached transcript so the typed \
-         text repaints (render count {base} -> {after}); flat == the invisible-text bug"
+        "a keystroke after /clear MUST re-render the You-block view (D11: the inline \
+         block is its own cached overlay) so the typed text repaints (render count \
+         {base} -> {after}); flat == the invisible-text bug"
     );
 }
 
@@ -15284,7 +15267,7 @@ fn repro_clear_worksheet_typed_text_repaints_simulated(cx: &mut TestAppContext) 
 /// prior `/clear` test ran BEFORE the user types. We feed it to the ALREADY-bound
 /// session (the bind/attach dance can't run headlessly without a server — the
 /// deferred `spawn_attach_sessions` unbinds with no server; that's gap #2, not the
-/// bug), then a REAL keystroke, and assert the cached transcript RE-RENDERS.
+/// bug), then a REAL keystroke, and assert the cached You-block view RE-RENDERS.
 #[gpui::test]
 fn repro_clear_worksheet_typed_text_repaints_real_path(cx: &mut TestAppContext) {
     use yalda::agent_event::AgentEventKind as K;
@@ -15320,17 +15303,17 @@ fn repro_clear_worksheet_typed_text_repaints_real_path(cx: &mut TestAppContext) 
     });
     vcx.run_until_parked();
 
-    crate::perf_reset("transcript");
+    crate::perf_reset(crate::YOU_BLOCK_PERF_LABEL);
     view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
-    let base = crate::perf_render_count("transcript");
+    let base = crate::perf_render_count(crate::YOU_BLOCK_PERF_LABEL);
 
     // The user types — NO `i`, NO mode toggle — through the REAL key handler.
     view.update_in(vcx, |v, w, cx| {
         v.handle_claude_key(&ws_bare_key("h"), w, cx)
     });
     vcx.run_until_parked();
-    let after = crate::perf_render_count("transcript");
+    let after = crate::perf_render_count(crate::YOU_BLOCK_PERF_LABEL);
 
     let (active, text, awaiting, open, chatbox) = view
         .update(vcx, |v, cx| {
@@ -15358,7 +15341,7 @@ fn repro_clear_worksheet_typed_text_repaints_real_path(cx: &mut TestAppContext) 
     );
     assert!(
         after > base,
-        "REAL PATH: a keystroke after /clear MUST re-render the cached transcript so \
+        "REAL PATH: a keystroke after /clear MUST re-render the You-block view (D11 overlay) so \
          the typed text repaints (render count {base} -> {after}); flat == the \
          invisible-text bug the user reports",
     );
@@ -15371,14 +15354,15 @@ fn repro_clear_worksheet_typed_text_repaints_real_path(cx: &mut TestAppContext) 
 /// it (painting keys on `you_block_open` via `inline_you_block_active`, and the
 /// bottom box only shows when chatbox/awaiting — screens.rs:1188). This drives
 /// the REAL key handler + REAL render and asserts the typed char both busts the
-/// cached transcript (render count) AND paints an inline You-block. The hole
+/// cached You-block view (render count) AND paints an inline You-block. The hole
 /// precondition is set directly because it is an invariant VIOLATION with no
 /// single named producer — the FIX (deriving the gate from `focus`) heals it
 /// regardless of producer.
 ///
 /// NEGATIVE CONTROL (mandatory): revert `inline_you_block_active` to
 /// `you_block_open && ...` and this fails RED — flat render count AND no
-/// `you-block` paint — the exact user symptom.
+/// `you-block` paint — the exact user symptom. (Since D11 the render count is the
+/// `YouBlockView`'s — the inline block paints as its own cached overlay.)
 #[gpui::test]
 fn clear_worksheet_hole_types_and_paints(cx: &mut TestAppContext) {
     let (view, vcx) = boot_worksheet_nav(cx);
@@ -15417,10 +15401,10 @@ fn clear_worksheet_hole_types_and_paints(cx: &mut TestAppContext) {
          got (focus_compose,open,awaiting,chatbox)=({focus_compose},{open},{awaiting},{chatbox})"
     );
 
-    crate::perf_reset("transcript");
+    crate::perf_reset(crate::YOU_BLOCK_PERF_LABEL);
     view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
-    let base = crate::perf_render_count("transcript");
+    let base = crate::perf_render_count(crate::YOU_BLOCK_PERF_LABEL);
 
     // REAL typing + REAL render, with the paint probe active so the keystroke's
     // re-render (if any) is captured.
@@ -15429,10 +15413,13 @@ fn clear_worksheet_hole_types_and_paints(cx: &mut TestAppContext) {
         v.handle_claude_key(&ws_bare_key("h"), w, cx)
     });
     vcx.run_until_parked();
-    let after = crate::perf_render_count("transcript");
+    let after = crate::perf_render_count(crate::YOU_BLOCK_PERF_LABEL);
     let you_block = crate::layout_probe_get("you-block");
-    let viewport = crate::layout_probe_get("transcript-viewport");
     crate::layout_probe_end();
+    // D11: the keystroke (correctly) leaves the cached transcript un-rendered, so
+    // its viewport probe comes from a separate dirtying frame (the viewport rect
+    // doesn't move on a keystroke).
+    let viewport = probe_dirty(&view, vcx, "transcript-viewport");
 
     let text = view
         .update(vcx, |v, cx| {
@@ -15447,7 +15434,7 @@ fn clear_worksheet_hole_types_and_paints(cx: &mut TestAppContext) {
     // The assertions the six prior fixes never made — RENDER + PAINT, not buffer:
     assert!(
         after > base,
-        "typing in the hole MUST bust the cached transcript (render count {base} -> {after}); \
+        "typing in the hole MUST re-render the You-block view (D11 overlay) (render count {base} -> {after}); \
          flat == the invisible-text bug",
     );
     let (_, by, _, bh) =
@@ -15468,7 +15455,7 @@ fn clear_worksheet_hole_types_and_paints(cx: &mut TestAppContext) {
 /// NEW `TranscriptView` (with `last_rendered = default`) is created and must
 /// repaint on the first keystroke. Reproduce that: settle, ChannelOpened, then
 /// DROP the transcript view (as clear does), let it re-create on a render, then
-/// type — and assert the fresh view re-renders.
+/// type — and assert the fresh view's You-block (created with it) re-renders.
 #[gpui::test]
 fn repro_clear_worksheet_typed_text_repaints_fresh_transcript_view(cx: &mut TestAppContext) {
     use yalda::agent_event::AgentEventKind as K;
@@ -15505,17 +15492,17 @@ fn repro_clear_worksheet_typed_text_repaints_fresh_transcript_view(cx: &mut Test
     view.update(vcx, |v, _| {
         v.transcript_views.remove(&id);
     });
-    crate::perf_reset("transcript");
+    crate::perf_reset(crate::YOU_BLOCK_PERF_LABEL);
     // One render re-creates + first-renders the fresh view (stamps last_rendered).
     view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
-    let base = crate::perf_render_count("transcript");
+    let base = crate::perf_render_count(crate::YOU_BLOCK_PERF_LABEL);
 
     view.update_in(vcx, |v, w, cx| {
         v.handle_claude_key(&ws_bare_key("h"), w, cx)
     });
     vcx.run_until_parked();
-    let after = crate::perf_render_count("transcript");
+    let after = crate::perf_render_count(crate::YOU_BLOCK_PERF_LABEL);
 
     let (active, text) = view
         .update(vcx, |v, cx| {
@@ -15535,7 +15522,7 @@ fn repro_clear_worksheet_typed_text_repaints_fresh_transcript_view(cx: &mut Test
     assert!(active, "inline You-block active");
     assert!(
         after > base,
-        "FRESH VIEW: a keystroke must re-render the newly-created transcript view \
+        "FRESH VIEW: a keystroke must re-render the newly-created transcript's You-block view \
          (render count {base} -> {after}); flat == invisible-text bug",
     );
 }
@@ -15560,11 +15547,15 @@ fn repro_clear_worksheet_typed_text_repaints_fresh_transcript_view(cx: &mut Test
 /// click forces a refresh. Fix: `transcript_view_for` defers a full window refresh when
 /// it CREATES a view, painting it fresh into the dispatch tree.
 ///
-/// Negative control (mandatory, observed RED): comment out the
-/// `cx.defer(|app| app.refresh_windows())` in `transcript_view_for` → after_r/after_s
-/// stay 0 and `you-block` never paints — the exact "invisible until I click" symptom,
-/// caught on the FULL real path for the first time. (A prior control also holds: revert
-/// the You-block splice in `transcript_view.rs` → the splice counter stays flat.)
+/// Negative control (mandatory, observed RED, graph exa): comment out the
+/// `cx.defer(|app| app.refresh_windows())` in `transcript_view_for` → the typed char
+/// never repainted. D11 (graph ls2) moved the active You-block OUT of the cached
+/// transcript into its own `YouBlockView` overlay, so the typed text no longer rides
+/// the transcript's cache at all and that control no longer fires (the refresh stays
+/// for the transcript itself). The D11 control (observed RED): remove BOTH overlay
+/// repaint paths — the `YouBlockView` observe `cx.notify()` and the `you-block-fp`
+/// fingerprint element-id key in `render_agent` → the You-block render count stays
+/// flat after the keystroke (as it does in every `repro_clear_*` test).
 #[gpui::test]
 fn real_clear_server_branch_then_type_paints(cx: &mut TestAppContext) {
     // HERMETIC construction (session_server = None) so the forced server branch's
@@ -15608,13 +15599,13 @@ fn real_clear_server_branch_then_type_paints(cx: &mut TestAppContext) {
         });
     });
     vcx.run_until_parked();
-    crate::perf_reset("transcript");
+    crate::perf_reset(crate::YOU_BLOCK_PERF_LABEL);
     crate::layout_probe_begin();
     view.update_in(vcx, |v, w, cx| {
         v.handle_claude_key(&ws_bare_key("x"), w, cx)
     });
     vcx.run_until_parked();
-    let ctrl_r = crate::perf_render_count("transcript");
+    let ctrl_r = crate::perf_render_count(crate::YOU_BLOCK_PERF_LABEL);
     let ctrl_yb = crate::layout_probe_get("you-block");
     crate::layout_probe_end();
     assert!(
@@ -15661,12 +15652,10 @@ fn real_clear_server_branch_then_type_paints(cx: &mut TestAppContext) {
         "post-clear worksheet must be typeable inline (active={active}, focus={focus:?})"
     );
 
-    crate::perf_reset("transcript");
-    crate::perf_reset(crate::YOU_BLOCK_SPLICE_LABEL);
+    crate::perf_reset(crate::YOU_BLOCK_PERF_LABEL);
     view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
-    let base_r = crate::perf_render_count("transcript");
-    let base_s = crate::perf_render_count(crate::YOU_BLOCK_SPLICE_LABEL);
+    let base_r = crate::perf_render_count(crate::YOU_BLOCK_PERF_LABEL);
 
     // REAL keystroke, through the REAL key handler, paint probe active.
     crate::layout_probe_begin();
@@ -15674,11 +15663,13 @@ fn real_clear_server_branch_then_type_paints(cx: &mut TestAppContext) {
         v.handle_claude_key(&ws_bare_key("h"), w, cx)
     });
     vcx.run_until_parked();
-    let after_r = crate::perf_render_count("transcript");
-    let after_s = crate::perf_render_count(crate::YOU_BLOCK_SPLICE_LABEL);
+    let after_r = crate::perf_render_count(crate::YOU_BLOCK_PERF_LABEL);
     let you_block = crate::layout_probe_get("you-block");
-    let viewport = crate::layout_probe_get("transcript-viewport");
     crate::layout_probe_end();
+    // D11: the keystroke (correctly) leaves the cached transcript un-rendered, so
+    // its viewport probe comes from a separate dirtying frame (the viewport rect
+    // doesn't move on a keystroke).
+    let viewport = probe_dirty(&view, vcx, "transcript-viewport");
 
     let text = view
         .update(vcx, |v, cx| {
@@ -15692,13 +15683,8 @@ fn real_clear_server_branch_then_type_paints(cx: &mut TestAppContext) {
     );
     assert!(
         after_r > base_r,
-        "REAL PATH: typing after /clear MUST bust the cached transcript ({base_r} -> {after_r}); \
-         flat == the invisible-text bug",
-    );
-    assert!(
-        after_s > base_s,
-        "REAL PATH: typing after /clear MUST splice the You-block item ({base_s} -> {after_s}); \
-         flat == the ListState cached-item staleness the user sees as invisible text",
+        "REAL PATH: typing after /clear MUST re-render the You-block view (D11 overlay) \
+         ({base_r} -> {after_r}); flat == the invisible-text bug",
     );
     let (_, by, _, bh) = you_block.expect("typed char MUST paint an inline You-block");
     let (_, vy, _, vh) = viewport.expect("transcript viewport did not paint");
@@ -16822,53 +16808,132 @@ fn worksheet_compose_visibility_tracks_block_and_turn(cx: &mut TestAppContext) {
     );
 }
 
-/// REGRESSION (user-reported: "typed characters don't show up until later").
-/// The inline You-block renders INSIDE the cached `TranscriptView`, so a keystroke
-/// must notify the SESSION entity to fire its `cx.observe` and bust the transcript
-/// cache. The compose dispatch used `with_session_silent` (no session notify), so
-/// inline typing left the transcript stale until an unrelated event repainted.
-/// Here: typing into an open inline block MUST re-render the transcript, and the
-/// text must land in the compose.
+/// D11 (text-editing review) + REGRESSION ("typed characters don't show up until
+/// later"): typing into the inline worksheet You-block re-renders ONLY the
+/// You-block — its own cached view (`YouBlockView`) painted by the root over the
+/// transcript's placeholder — and leaves the cached `TranscriptView` render
+/// count FLAT (it used to re-render every visible row per keystroke). The typed
+/// text must still repaint promptly: the You-block renders once per keystroke
+/// and its PAINTED caret moves right. Positive controls: a newline that grows
+/// the block re-renders the transcript (its placeholder resizes), and a theme
+/// swap re-renders the You-block (a pushed global).
+///
+/// Negative controls (observed RED): (a) latch `pending_reveal_cursor = true` on
+/// EVERY inline keystroke again (drop the `inline_you_block_caret_in_view` gate
+/// in `handle_claude_key`) → the transcript re-renders per key; (b) fold the
+/// compose `edit_seq` back into `TranscriptSeqs` → same.
 #[gpui::test]
-fn worksheet_inline_typing_rerenders_transcript(cx: &mut TestAppContext) {
-    crate::perf_reset("transcript");
+fn worksheet_inline_typing_rerenders_you_block_not_transcript(cx: &mut TestAppContext) {
     let (view, vcx) = boot_worksheet_nav(cx);
-
-    // Open a You-block, then settle one frame so the baseline excludes the open.
+    // Open a You-block, then settle so the baseline excludes the open.
     view.update_in(vcx, |v, window, cx| {
         v.handle_claude_key(&ws_bare_key("i"), window, cx)
     });
     vcx.run_until_parked();
+    let caret0 = probe_dirty(&view, vcx, "caret").expect("empty block's caret paints");
     view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
-    let base = crate::perf_render_count("transcript");
+    crate::perf_reset("transcript");
+    crate::perf_reset(crate::YOU_BLOCK_PERF_LABEL);
 
-    // Type into the inline block — each keystroke must bust the transcript cache.
+    // Type through the REAL key handler, painting every frame.
+    crate::layout_probe_begin();
     for k in ["h", "e", "l", "l", "o"] {
         view.update_in(vcx, |v, window, cx| {
             v.handle_claude_key(&ws_bare_key(k), window, cx)
         });
         vcx.run_until_parked();
     }
-    let after = crate::perf_render_count("transcript");
+    let caret1 = crate::layout_probe_get("caret");
+    crate::layout_probe_end();
+    let tv = crate::perf_render_count("transcript");
+    let yb = crate::perf_render_count(crate::YOU_BLOCK_PERF_LABEL);
+    assert_eq!(tv, 0, "typing in the inline You-block must leave the cached transcript FLAT");
+    assert!(yb >= 5, "each keystroke re-renders the You-block view ({yb} renders for 5 keys)");
+    let text = view.update(vcx, |v, cx| v.agent_read(cx, |c| c.input_surface.compose().text())).unwrap();
+    assert_eq!(text.trim(), "hello", "the typed text landed in the compose draft");
+    let caret1 = caret1.expect("the caret painted during typing");
     assert!(
-        after > base,
-        "typing into the inline You-block must re-render the cached transcript \
-         (session-notify busts the observe) — base {base}, after {after}; a flat \
-         count is the 'chars appear later' stale-render bug"
+        caret1.0 > caret0.0 + 4.0 * 7.0,
+        "the overlay repainted the draft: caret x {} -> {}",
+        caret0.0,
+        caret1.0
     );
-    view.update(vcx, |v, cx| {
-        assert_eq!(
-            v.agent_mut(cx)
-                .expect("agent")
-                .input_surface
-                .compose()
-                .text()
-                .trim(),
-            "hello",
-            "the typed text landed in the compose draft"
-        );
+
+    // A newline grows the block: the transcript re-renders to resize the slot.
+    crate::perf_reset("transcript");
+    view.update_in(vcx, |v, window, cx| {
+        v.handle_claude_key(&ws_bare_key("enter"), window, cx)
     });
+    vcx.run_until_parked();
+    assert!(crate::perf_render_count("transcript") >= 1, "a height change re-renders the transcript");
+
+    // A theme swap reaches the You-block too (pushed global).
+    crate::perf_reset(crate::YOU_BLOCK_PERF_LABEL);
+    view.update(vcx, |v, cx| v.set_theme(crate::ThemeName::Nightfox, cx));
+    vcx.run_until_parked();
+    assert!(crate::perf_render_count(crate::YOU_BLOCK_PERF_LABEL) >= 1, "theme swap re-renders the You-block");
+}
+
+/// D11: the inline You-block's caret is brought back into view when the user
+/// types after scrolling the transcript away from it — on the REAL keystroke
+/// path, with NO hand-latched reveal. The keystroke now asks the transcript to
+/// reveal only when the caret row would leave the viewport
+/// (`inline_you_block_caret_in_view`, judged from the placeholder's laid-out
+/// slot), so this proves the gate still reveals when it must. The probe frame
+/// only repaints (dirties the overlay + root), never requests a reveal.
+///
+/// Negative control (observed RED): make `inline_you_block_caret_in_view`
+/// return `true` unconditionally (never reveal) → the caret row stays scrolled
+/// out of the viewport.
+#[gpui::test]
+fn worksheet_typing_after_scrolling_away_reveals_caret_without_forced_reveal(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_worksheet_nav(cx);
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
+    vcx.run_until_parked();
+    for _ in 0..70 {
+        for k in ["x", "enter"] {
+            view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(k), w, cx));
+            vcx.run_until_parked();
+        }
+    }
+    // The user scrolls the transcript back to the top (off the caret) — the
+    // wheel handler would drop follow-output; mirror both effects.
+    let id = view.read_with(vcx, |v, _| v.focused_bound_session()).expect("bound");
+    let tv = view.read_with(vcx, |v, _| v.transcript_views.get(&id).cloned()).expect("transcript view");
+    view.update(vcx, |v, cx| v.with_session(id, cx, |c| c.follow_output.set(false)));
+    tv.update(vcx, |t, cx| {
+        t.scroll.list_state.scroll_to(gpui::ListOffset { item_ix: 0, offset_in_item: px(0.0) });
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    let away = tv.read_with(vcx, |t, _| t.you_block_slot.get()).expect("slot laid out");
+    let caret_away = f32::from(away.bounds.bottom()) - 8.0 - 18.0;
+    assert!(
+        caret_away > f32::from(away.clip.bottom()),
+        "non-vacuous: after scrolling away the caret row ({caret_away}) is below the viewport ({:?})",
+        away.clip
+    );
+    // One more keystroke — the real path decides whether to reveal.
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("y"), w, cx));
+    vcx.run_until_parked();
+    crate::layout_probe_begin();
+    view.update(vcx, |v, cx| {
+        dirty_you_block_views(v, cx);
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    let caret = crate::layout_probe_get("compose-cursor-row");
+    crate::layout_probe_end();
+    let clip = tv.read_with(vcx, |t, _| t.you_block_slot.get()).expect("slot laid out").clip;
+    let (vy, vh) = (f32::from(clip.origin.y), f32::from(clip.size.height));
+    let (_, cy, _, ch) = caret.expect("caret row NOT painted — scrolled out of view (UXI-TextEditing-1)");
+    assert!(
+        cy >= vy - 0.5 && cy + ch <= vy + vh + 0.5,
+        "caret row [{cy}, {}] must lie inside the transcript viewport [{vy}, {}]",
+        cy + ch,
+        vy + vh
+    );
 }
 
 /// REGRESSION (user-reported: "where I am inserting jumps around"). The inline
@@ -18514,16 +18579,19 @@ fn worksheet_tall_you_block_grows_caret_painted_in_viewport(cx: &mut TestAppCont
         })
         .unwrap();
     assert!(n > 80, "block genuinely long ({n} lines)");
-    // Settle: the You-block lives in the CACHED transcript, so force it to re-render +
-    // re-reveal by mutating the session (agent_mut notifies) and re-latching the caret
-    // reveal — a bare root notify would skip the cached child. Lazy item measurement
-    // means the reveal scroll lands only after several frames.
+    // Settle: the You-block's slot lives in the CACHED transcript, so force it to
+    // re-render + re-reveal by mutating the session (agent_mut notifies) and
+    // re-latching the caret reveal — a bare root notify would skip the cached child.
+    // The block itself (D11) is the cached `YouBlockView` overlay: dirty it too so
+    // the probing frame repaints it. Lazy item measurement means the reveal scroll
+    // lands only after several frames.
     let bust_and_reveal = |view: &gpui::Entity<YaldaGpuiView>,
                            vcx: &mut gpui::VisualTestContext| {
         view.update(vcx, |v, cx| {
             if let Some(mut c) = v.agent_mut(cx) {
                 c.pending_reveal_cursor = true;
             }
+            dirty_you_block_views(v, cx);
             cx.notify();
         });
         vcx.run_until_parked();
@@ -33296,7 +33364,7 @@ fn compose_idle_render_does_not_rebuild_lines(cx: &mut TestAppContext) {
     // A replaced editor (history recall) must not be served the stale snapshot.
     view.update(vcx, |v, cx| {
         let mut c = v.agent_mut(cx).expect("agent");
-        c.input_surface.compose_mut().set_recalled("recalled");
+        c.input_surface.compose_mut().reset_to("recalled");
     });
     view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
@@ -33596,4 +33664,332 @@ fn edit_gutter_scales_with_zoom(cx: &mut TestAppContext) {
         "gutter must scale with zoom: 1× {w1}px, 2× {w2}px"
     );
     assert!(nw2 <= w2 + 0.5, "zoomed number ({nw2}px) fits its gutter ({w2}px)");
+}
+
+
+// ── Q4 compose (text-editing review D11–D15, E4) ──────────────────────────────
+
+/// Paint the chatbox compose seeded with `text` (caret at `(line, col)`, mode
+/// `mode`) and return `(caret probe, compose inner bounds)`. Settles several
+/// frames first so the box's measured width feeds `visible_cols`.
+fn q4_paint_compose_caret(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+    text: &str,
+    line: usize,
+    col: usize,
+    mode: crate::EditMode,
+) -> (Option<(f32, f32, f32, f32)>, (f32, f32, f32, f32)) {
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        let tb = c.input_surface.compose_mut();
+        tb.reset_to(text);
+        tb.editor.cursor_mut().line = line;
+        tb.editor.cursor_mut().col = col;
+        tb.mode = mode;
+    });
+    for _ in 0..3 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let caret = crate::layout_probe_get("caret");
+    crate::layout_probe_end();
+    let bounds = view
+        .update(vcx, |v, cx| v.agent_read(cx, |c| c.input_surface.compose().bounds.get()))
+        .expect("agent");
+    (caret, bounds)
+}
+
+/// D13 (text-editing review): a caret at END-OF-LINE on a wrapped row that is
+/// already FULL (`visible_cols` chars) must paint INSIDE the compose box — the
+/// last row reserves the caret's column (a full last row wraps the EOL caret
+/// onto a fresh row). Drives the real chatbox render in a NARROW window (so
+/// the 8px-vs-advance slack can't hide the overflow) and reads the PAINTED
+/// caret cell against the box's measured inner right edge.
+///
+/// Negative control (observed RED): restore `wrap_line_cols`'s last-row fit
+/// test to `n - start <= width` (no reserved caret column) → the EOL caret
+/// paints one column past the box's right edge.
+#[gpui::test]
+fn compose_eol_caret_on_full_wrapped_row_paints_inside_box(cx: &mut TestAppContext) {
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    let cols = q4_whole_column_chatbox(&view, vcx);
+    // Two FULL rows of an unbreakable word, caret at EOL (Insert).
+    let text: String = "a".repeat(cols * 2);
+    let (caret, b) = q4_paint_compose_caret(&view, vcx, &text, 0, cols * 2, crate::EditMode::Insert);
+    let (cx0, _, cw, _) = caret.expect("EOL caret must paint");
+    let right = b.0 + b.2;
+    assert!(
+        cx0 + cw <= right + 0.5,
+        "EOL caret cell [{cx0}, {}] paints past the compose box's right edge {right} ({cols} cols)",
+        cx0 + cw
+    );
+    assert!(cx0 >= b.0 - 0.5, "caret {cx0} left of the box {}", b.0);
+}
+
+/// Resize so the chatbox compose box is a WHOLE number of `CHATBOX_CHAR_W`
+/// columns (no spare pixels to absorb an overflow) and return its column count.
+fn q4_whole_column_chatbox(view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext) -> usize {
+    view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
+    vcx.simulate_resize(gpui::size(px(560.0), px(600.0)));
+    vcx.run_until_parked();
+    let (_, b0) = q4_paint_compose_caret(view, vcx, "x", 0, 1, crate::EditMode::Insert);
+    let spare = b0.2 % crate::CHATBOX_CHAR_W;
+    vcx.simulate_resize(gpui::size(px(560.0 - spare), px(600.0)));
+    vcx.run_until_parked();
+    let (_, b0) = q4_paint_compose_caret(view, vcx, "x", 0, 1, crate::EditMode::Insert);
+    assert!(b0.2 % crate::CHATBOX_CHAR_W < 0.01, "box is a whole number of columns: {b0:?}");
+    let cols = (b0.2 / crate::CHATBOX_CHAR_W).floor() as usize;
+    assert!(cols >= 4 && cols < 60, "non-vacuous narrow box: {cols} cols ({b0:?})");
+    cols
+}
+
+/// D15 (text-editing review): the compose wraps by terminal CELLS, not chars —
+/// a run of 2-cell chars must not overflow the box. Drives the real chatbox
+/// render in a whole-column narrow window over a line of emoji (2 cells in
+/// both `unicode-width` and the headless text system; the headless system
+/// paints CJK at ONE advance — no CJK font — so CJK wrap is pinned at the
+/// unit level by `wrap_line_cols_counts_wide_and_zero_width_cells`) and
+/// asserts the PAINTED caret lands inside the box at every column, and that
+/// the caret right after the Nth emoji paints exactly N×2 columns in from the
+/// start of its row.
+///
+/// Negative control (observed RED): make `char_cells` return 1 for every char
+/// (the old 1 char = 1 column) → a row holds `cols` emoji (2× the box) and the
+/// caret paints far past the right edge.
+#[gpui::test]
+fn compose_wide_chars_wrap_by_cells_caret_inside_box(cx: &mut TestAppContext) {
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    let cols = q4_whole_column_chatbox(&view, vcx);
+    let n = cols * 2;
+    let text: String = "🎉".repeat(n);
+    let mut checked = 0;
+    for col in (0..=n).step_by(3) {
+        let (caret, b) = q4_paint_compose_caret(&view, vcx, &text, 0, col, crate::EditMode::Insert);
+        let (x, _, w, _) = caret.expect("caret paints");
+        assert!(
+            x >= b.0 - 0.5 && x + w <= b.0 + b.2 + 0.5,
+            "caret at col {col} painted at [{x}, {}] outside the box [{}, {}] ({cols} cols)",
+            x + w,
+            b.0,
+            b.0 + b.2
+        );
+        // Each row holds (cols-1)/2 emoji (the last row reserves the caret
+        // column; full rows hold cols/2): the caret's in-row cell is exact.
+        let per_row = cols / 2;
+        let in_row = col % per_row;
+        if col < n - n % per_row {
+            let want = b.0 + (in_row * 2) as f32 * 8.0;
+            assert!((x - want).abs() <= 2.0 + in_row as f32 * 0.5, "caret col {col}: x={x} want≈{want}");
+        }
+        checked += 1;
+    }
+    assert!(checked > 4, "non-vacuous sweep");
+}
+
+/// D15: a CRLF clipboard pasted into the compose through the REAL Cmd-V path
+/// (`cmd-v` → `PasteFromClipboard` → `paste_from_clipboard`) lands as `\n`-only
+/// text — no stray `\r` in the `\n`-only editor.
+///
+/// Negative control (observed RED): drop the `normalize_pasted_newlines` call
+/// in `paste_from_clipboard` → the compose reads "hela\r\nblo".
+#[gpui::test]
+fn compose_cmd_v_normalizes_crlf(cx: &mut TestAppContext) {
+    let (view, vcx, id) = compose_hello_caret_at_3(cx);
+    view.update(vcx, |_, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string("a\r\nb".into())));
+    vcx.simulate_keystrokes("cmd-v");
+    vcx.run_until_parked();
+    let text = view.update(vcx, |v, cx| v.read_session(id, cx, |c| c.input_surface.compose().text()).expect("session"));
+    assert_eq!(text, "hela\nblo", "CRLF normalized on paste");
+}
+
+/// Seed the open Diff comment compose with `text`, caret at `(line, col)`
+/// (raw), resync its slot rows, and paint `tags`.
+fn q4_diff_compose_paint(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+    id: crate::workspace::WindowId,
+    text: &str,
+    line: usize,
+    col: usize,
+    tags: &[&str],
+) -> Vec<Option<(f32, f32, f32, f32)>> {
+    view.update(vcx, |v, cx| {
+        let t = v.diff_tile_mut(id).expect("diff tile");
+        let c = t.compose.as_mut().expect("compose open");
+        c.input.reset_to(text);
+        c.input.editor.cursor_mut().line = line;
+        c.input.editor.cursor_mut().col = col;
+        t.sync_compose_slots();
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    paint_diff_probes(view, vcx, id, tags)
+}
+
+/// D14 (text-editing review): the Diff comment compose renders through the
+/// SHARED chatbox layout + row renderer (`compose_visual_lines` →
+/// `wrap_line_cols` → `build_chatbox_line`), not its own char-chunk caret
+/// model — so it WORD-wraps (a word never splits at the budget) and a TAB
+/// expands like every other compose. Real keys open the compose; the painted
+/// beam caret is read back.
+///
+/// Negative control (observed RED): lay the compose out with the old
+/// `chars.chunks(COMPOSE_WRAP_COLS)` hard-chunking in `compose_visual_lines`
+/// → the caret after "tail" paints 2 columns in (the word split as "ta|il").
+#[gpui::test]
+fn diff_compose_uses_shared_chatbox_wrap_and_tabs(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let (view, vcx, id) = boot_with_diff(cx, temp.path().to_path_buf());
+    vcx.simulate_keystrokes("j j j c");
+    vcx.run_until_parked();
+    let tags = ["diff-compose-caret", "diff-compose-editor"];
+    let p = q4_diff_compose_paint(&view, vcx, id, "", 0, 0, &tags);
+    let (x0, y0, _, _) = p[0].expect("caret paints");
+    let adv = {
+        let p = q4_diff_compose_paint(&view, vcx, id, "abcd", 0, 4, &tags);
+        (p[0].expect("caret").0 - x0) / 4.0
+    };
+    assert!(adv > 4.0, "non-vacuous advance {adv}");
+    // Word wrap: "y…y tail" one column over the budget breaks AFTER the space,
+    // so the EOL caret sits 4 columns into the second row.
+    let w = crate::COMPOSE_WRAP_COLS;
+    let text = format!("{} tail", "y".repeat(w - 3));
+    let p = q4_diff_compose_paint(&view, vcx, id, &text, 0, w + 2, &tags);
+    let (x, y, _, _) = p[0].expect("caret paints on the wrapped row");
+    assert!(y > y0 + 5.0, "caret moved to the second row: y {y0} -> {y}");
+    assert!(
+        (x - (x0 + 4.0 * adv)).abs() < adv * 0.5,
+        "caret after the wrapped word 'tail' paints 4 cols in (x={x}, want {})",
+        x0 + 4.0 * adv
+    );
+    // Tab expansion: the caret after a TAB lands where it does after 4 spaces.
+    let spaces = q4_diff_compose_paint(&view, vcx, id, "    z", 0, 4, &tags)[0].expect("caret").0;
+    let tab = q4_diff_compose_paint(&view, vcx, id, "\tz", 0, 1, &tags)[0].expect("caret").0;
+    assert!((tab - spaces).abs() < 0.5, "caret after TAB x={tab}; after 4 spaces x={spaces}");
+}
+
+/// E4 (text-editing review): a LONG Diff comment can't squeeze the diff — the
+/// inline compose (kfa, GitHub-style) caps its editor at `COMPOSE_MAX_LINES`
+/// rows and scrolls its own window to the caret. Types a 31-line draft through
+/// the REAL keymap and proves from paint: the box's height is capped at 15 rows
+/// (12 editor + 3 chrome) though the draft is 31 lines, the diff list keeps its
+/// height, and the caret on the last line paints INSIDE the editor. (kfa
+/// already bounded it; this pins it — raising `COMPOSE_MAX_LINES` to 100 turns
+/// it RED: the box grows to 34 rows.)
+#[gpui::test]
+fn diff_compose_long_comment_is_height_capped_with_caret_inside(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let temp = diff_fixture_repo();
+    let (view, vcx, id) = boot_with_diff(cx, temp.path().to_path_buf());
+    vcx.simulate_keystrokes("j j j c");
+    vcx.run_until_parked();
+    let tags = ["diff-comment-compose", "diff-compose-editor", "diff-compose-caret", "diff-list"];
+    let before = paint_diff_probes(&view, vcx, id, &tags);
+    let list0 = before[3].expect("diff list paints");
+    let mut keys = Vec::new();
+    for i in 0..30 {
+        keys.push(format!("{}", i % 10));
+        keys.push("enter".to_string());
+    }
+    keys.push("z".to_string());
+    vcx.simulate_keystrokes(&keys.join(" "));
+    vcx.run_until_parked();
+    let lines = diff_compose_text(&view, vcx, id).expect("compose open").lines().count();
+    assert_eq!(lines, 31, "the draft is 31 lines (far past the cap)");
+    let p = paint_diff_probes(&view, vcx, id, &tags);
+    let boxed = p[0].expect("compose paints");
+    let editor = p[1].expect("editor paints");
+    let caret = p[2].expect("caret on the last line paints");
+    let list = p[3].expect("diff list paints");
+    let row_h = f32::from(crate::diff_row_h(view.read_with(vcx, |v, _| v.text_scale)));
+    // The cap, spelled out (12 editor rows + 3 chrome rows) so a raised
+    // `COMPOSE_MAX_LINES` can't silently move the goalposts.
+    let cap = 15.0 * row_h;
+    assert!(boxed.3 <= cap + 1.0, "compose box {} tall exceeds the {cap}px cap", boxed.3);
+    assert!(boxed.3 >= cap - 2.0 * row_h, "non-vacuous: the box grew to (about) the cap: {}", boxed.3);
+    assert!((list.3 - list0.3).abs() < 1.0, "the diff list keeps its height: {list0:?} -> {list:?}");
+    assert!(
+        caret.1 >= editor.1 - 0.5 && caret.1 + caret.3 <= editor.1 + editor.3 + 0.5,
+        "caret {caret:?} inside the editor {editor:?}"
+    );
+}
+
+/// D12 (text-editing review): the VIRTUALIZED (long-draft) compose must
+/// relayout when its wrap width changes. The wrap width is derived from the
+/// box's PAINTED width (`CaptureBounds`), known only after the frame that
+/// changed it — so without a follow-up frame, the frame after a resize/split
+/// keeps the previous width's wrap (and window top) until an unrelated event.
+/// (The list's item heights are NOT the problem: gpui re-measures every
+/// visible item each frame, and the existing `(edit_seq, visible_cols)` render
+/// snapshot re-wraps correctly once a frame runs.) Drives the real chatbox
+/// render through two user actions — a window resize, then opening the Plan
+/// sidepanel (one notify) — with NO extra notify, and proves from paint that
+/// the caret row lands exactly where the fresh wrap puts it:
+/// `box inner top + (caret visual row − window top) × 18px`.
+///
+/// Negative control (observed RED): drop `CaptureBounds`' width-change
+/// re-render → [resize] the caret row paints at the OLD width's window
+/// (top_vrow stale).
+#[gpui::test]
+fn compose_virtualized_rewraps_after_width_change(cx: &mut TestAppContext) {
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
+    vcx.simulate_resize(gpui::size(px(1400.0), px(800.0)));
+    vcx.run_until_parked();
+    // 100-char lines: one row in the wide box, two after the resize, ~four
+    // once the sidepanel opens — every step moves every line's row count.
+    let text: String = (0..30)
+        .map(|i| format!("{i:02} {}", "word ".repeat(19)).trim_end().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let last = 29;
+    let eol = text.lines().last().unwrap().chars().count();
+    q4_paint_compose_caret(&view, vcx, &text, last, eol, crate::EditMode::Insert);
+
+    // Where the caret row paints after `act` (the ONLY event — no extra
+    // notify), vs where a fresh wrap at the box's current width puts it.
+    let mut check = |label: &str, act: &mut dyn FnMut(&mut gpui::VisualTestContext)| {
+        let before = view
+            .update(vcx, |v, cx| v.agent_read(cx, |c| c.input_surface.compose().bounds.get()))
+            .expect("agent");
+        crate::layout_probe_begin();
+        act(vcx);
+        vcx.run_until_parked();
+        let caret_row = crate::layout_probe_get("compose-cursor-row");
+        crate::layout_probe_end();
+        let (b, top_vrow, caret_vrow, total, rows_before) = view
+            .update(vcx, |v, cx| {
+                v.agent_read(cx, |c| {
+                    let tb = c.input_surface.compose();
+                    let b = tb.bounds.get();
+                    let cols = |w: f32| (w / crate::CHATBOX_CHAR_W).floor().max(1.0) as usize;
+                    let lines = crate::display_lines(tb.editor.document());
+                    let (cv, total, _) = crate::compose_visual_metrics(&lines, last, eol, cols(b.2));
+                    let (_, rows_before, _) = crate::compose_visual_metrics(&lines, last, eol, cols(before.2));
+                    (b, tb.top_vrow.get(), cv, total, rows_before)
+                })
+            })
+            .expect("agent");
+        assert!(b.2 < before.2 - 100.0, "[{label}] non-vacuous: the box narrowed {before:?} -> {b:?}");
+        assert!(total > rows_before, "[{label}] non-vacuous: the row count moved ({rows_before} -> {total})");
+        let (_, y, _, _) = caret_row.unwrap_or_else(|| panic!("[{label}] caret row painted"));
+        let want = b.1 + (caret_vrow - top_vrow) as f32 * 18.0;
+        assert!(
+            (y - want).abs() < 1.5,
+            "[{label}] caret row painted at y={y}, fresh wrap puts it at {want} (vrow {caret_vrow}, top {top_vrow}, box {b:?})"
+        );
+        // (+3: the box's 1px borders make the inner height 2px short of 8 rows —
+        // the same slack `compose_caret_row_painted_inside_box_when_wrapped` allows.)
+        assert!(y >= b.1 - 1.0 && y + 18.0 <= b.1 + b.3 + 3.0, "[{label}] caret row {y} inside the box {b:?}");
+    };
+    // The user drags the window narrower …
+    check("resize", &mut |vcx| vcx.simulate_resize(gpui::size(px(900.0), px(800.0))));
+    // … then opens the Plan sidepanel (Cmd-1 → `toggle_tasklist`: ONE notify).
+    let v2 = view.clone();
+    check("sidepanel", &mut |vcx| v2.update(vcx, |v, cx| v.toggle_tasklist(cx)));
 }

@@ -46,10 +46,29 @@ clip, no horizontal scroll), with the caret on the row `caret_visual_row` picks.
 The small/virtualized decision keys on TOTAL VISUAL rows so a long wrapped line
 can't overflow the un-scrolled small box. This **retired the compose's
 horizontal-scroll window** (`spec-chatbox-caret-containment.md` horizontal axis);
-the vertical caret-containment is kept.
+the vertical caret-containment is kept. **D13 (2026-09-27):** the LAST visual row
+of a line reserves the caret's column (holds ≤ width−1 columns; a tail that would
+exactly fill it wraps, leaving an empty row after a hard break), so a caret at
+end-of-line on a full row paints inside the box instead of one column past it.
+Caret-independent, so rows never jump as the caret moves. **D15 (2026-09-27):**
+row widths are terminal CELLS (`char_cells`, `unicode-width`): CJK / emoji take 2
+columns, combining marks 0 (they ride on their base char's row); the Normal-mode
+block caret spans a wide char's 2 cells. Pasted text (Cmd-V and vim `p`/`P`) is
+normalized `\r\n`/`\r` → `\n` (`normalize_pasted_newlines`) for every compose.
+**D12 (2026-09-27):** the wrap width comes from the box's PAINTED width, so a
+width change (resize, split, sidepanel) now schedules the follow-up frame that
+re-wraps at the new width (`CaptureBounds::rerender_on_width_change`, a
+`cx.defer`red notify — never mid-draw); before, that frame kept the old width's
+wrap + window until an unrelated event.
 
 **Enforcement.** Headless: `wrap_line_cols_word_wraps_and_covers_every_char`
-(wraps, hard-breaks, covers every char, ≥1 row, makes progress) +
+(wraps, hard-breaks, covers every char, ≥1 row, makes progress, last row keeps a
+free caret column) + `compose_eol_caret_on_full_wrapped_row_paints_inside_box`
+(D13: painted EOL caret inside a whole-column narrow box) +
+`wrap_line_cols_counts_wide_and_zero_width_cells` +
+`compose_wide_chars_wrap_by_cells_caret_inside_box` (D15, painted) +
+`compose_cmd_v_normalizes_crlf` (D15, real Cmd-V) +
+`compose_virtualized_rewraps_after_width_change` (D12, painted, resize + sidepanel) +
 `caret_visual_row_places_caret_on_a_rendered_row` (caret always on a rendered
 row). `verify_harness.rs::worksheet_r_first_paint_uses_transcript_width` drives
 the real `r` reply path and asserts from painted geometry that a newly opened,
@@ -272,8 +291,9 @@ paint probe; the live `/clear` producer is confirmed via `YALDA_CLEAR_DEBUG`).
 
 **Enforcement.** `verify_harness.rs::clear_worksheet_hole_types_and_paints` —
 enter the hole (pre-asserted 4-part state), type via the REAL `handle_claude_key`,
-assert the cached transcript re-renders (render count advances) AND an inline
-You-block PAINTS inside the transcript viewport. **Negative control: each of the
+assert the surface painting the draft re-renders (render count advances — since
+D11 the `YouBlockView` overlay's, not the transcript's) AND an inline You-block
+PAINTS inside the transcript viewport. **Negative control: each of the
 three edits (predicate :3977, injection :2892, memo :3350) reverted independently
 produces RED for its OWN reason** (flat count / no paint / stale-list no paint) —
 verified. Plus `tests.rs::inline_you_block_active_truth_table` (the
@@ -281,8 +301,22 @@ verified. Plus `tests.rs::inline_you_block_active_truth_table` (the
 (`compose().text()=="hello"`) is explicitly NOT the guard — it is green while the
 screen is blank.
 
-**Enforcement (second mechanism).**
-`verify_harness.rs::clear_worksheet_you_block_keystroke_splices_item` — rest in the
+**Enforcement (second mechanism — SUPERSEDED by D11, 2026-09-27).** The active
+You-block is no longer painted by the transcript list: the list holds a
+fixed-height PLACEHOLDER (`overlay_slot`) and the root paints the block over it as
+its own cached view (`YouBlockView`, `slot_overlay`). A keystroke re-renders only
+that view; the placeholder is re-spliced only when the block's HEIGHT changes —
+pinned by `worksheet_you_block_placeholder_resplices_on_height_change` (keystroke
+⇒ no splice, newline ⇒ splice, painted block == painted slot; negative control:
+drop the splice block → RED) and
+`worksheet_inline_typing_rerenders_you_block_not_transcript` (transcript render
+count flat while typing, You-block renders per key, painted caret advances;
+negative controls: re-latch the reveal on every key, or fold the compose `edit_seq`
+back into `TranscriptSeqs` → RED). The caret reveal now fires only when the caret
+row would leave the viewport (`inline_you_block_caret_in_view`) —
+`worksheet_typing_after_scrolling_away_reveals_caret_without_forced_reveal`
+(negative control: never reveal → RED). Historical text follows.
+`verify_harness.rs::clear_worksheet_you_block_keystroke_splices_item` (retired) — rest in the
 post-`/clear` typeable worksheet (inline block active, pre-asserted), settle so
 `last_you_block_seq` catches up, then type via the REAL `handle_claude_key` and
 assert the `YOU_BLOCK_SPLICE_LABEL` perf counter advances (the You-block item was
@@ -585,9 +619,10 @@ compose.mode==Normal, key==u, no mods)`: it undoes the compose editor and, if th
 undo changed nothing, resets the active block (`InputSurface::new` +
 `you_block_open=false`/anchor cleared + `focus=Transcript`) **without** touching
 `parked_you_blocks`. `agent.rs` — `reply_quote_at_cursor` seeds the compose as a
-committed **baseline** (`Compose::seeded_committed` / `InputSurface::with_committed_draft`,
-built via `Editor::new(seed)` so the quotation carries no undo history) instead of
-the char-by-char `with_draft`. Builds on
+committed **baseline** (`Compose::seeded` → `Compose::reset_to` via
+`InputSurface::with_draft`, built via `Editor::new(seed)` so the quotation carries
+no undo history — D14 unified every "reset editor + caret to end" path onto
+`reset_to`). Builds on
 [UXI-AgentTile-11](#uxi-agenttile-11--the-worksheet-is-an-inline-editable-conversation-buffer-chatbox-is-mid-turn-only)
 and [UXI-AgentTile-21](#uxi-agenttile-21--nr-over-agent-text-opens-a-reply-you-block-seeded-with-a-quotation).
 
@@ -707,7 +742,7 @@ and browses it shell-style with the arrow keys, in **Insert** mode:
    (not persisted across restart).
 
 **Applies to.** `agent.rs`: `AgentState::{sent_history, history_nav}`, `HistoryNav`,
-`history_push`/`history_up`/`history_down`/`history_reset`, `Compose::set_recalled`.
+`history_push`/`history_up`/`history_down`/`history_reset`, `Compose::reset_to`.
 `agent_ui.rs`: the Up/Down recall interception in `handle_claude_key`'s compose
 dispatch (before `dispatch_insert_core`) + the browse-reset on edit, and the
 `history_push` calls at the two submit success branches (`submit_compose`,

@@ -88,6 +88,13 @@ style bundle so a caller themes once:
   this, added AFTER the list in tree order. Placement = `uniform_rows_rect`
   (pure, unit-tested). A child entity inside the cached list would instead
   dirty the list on every keystroke (gpui marks ancestors dirty).
+- **`overlay_slot(cell, placeholder)` + `slot_overlay(cell, child)`** — the
+  same pattern for a VARIABLE-height item in any `gpui::list` (non-uniform
+  rows, bottom-pinned follow-tail): the placeholder records its laid-out
+  bounds + clip into an `OverlaySlotCell` at prepaint; the uncached parent
+  paints `child` exactly there (after the list in tree order). The body must
+  clear the cell at the top of each render. Used by the transcript's inline
+  You-block (`YouBlockView`, D11).
 
 ## Efficiency practices (non-negotiable)
 

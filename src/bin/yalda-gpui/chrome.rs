@@ -1086,6 +1086,7 @@ impl YaldaGpuiView {
         let canvas_el = CaptureBounds {
             inner: canvas.into_any_element(),
             sink: self.desktop_canvas_bounds.clone(),
+            on_width_change: OnWidthChange::Nothing,
         }
         .into_any_element();
         // Rail coexistence (spec Builds On / spec-rail.md): in desktop mode

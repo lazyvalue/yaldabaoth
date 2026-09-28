@@ -6396,7 +6396,7 @@ impl YaldaGpuiView {
                         claude
                             .input_surface
                             .compose_mut()
-                            .set_recalled(&format!("/{name}"));
+                            .reset_to(&format!("/{name}"));
                         claude.slash_popup_dismissed = true;
                         claude.history_reset();
                         return NormalOutcome::Handled;
@@ -6462,7 +6462,7 @@ impl YaldaGpuiView {
                     _ => None,
                 };
                 if let Some(text) = recalled {
-                    claude.input_surface.compose_mut().set_recalled(&text);
+                    claude.input_surface.compose_mut().reset_to(&text);
                     return NormalOutcome::Handled;
                 }
             }
@@ -6556,8 +6556,14 @@ impl YaldaGpuiView {
             ));
         }
         if inline_active {
-            // UXI-TextEditing-1: keep the inline block's caret in view as the reply grows.
-            self.with_session_silent(focused_id, cx, |c| c.pending_reveal_cursor = true);
+            // UXI-TextEditing-1: keep the inline block's caret in view as the reply
+            // grows. D11: only ask the transcript to reveal when the caret is NOT
+            // already painted inside its viewport — the reveal is a transcript
+            // render input, so requesting it on every keystroke would re-render the
+            // cached transcript per char (the overlay alone repaints the text).
+            if !self.inline_you_block_caret_in_view(focused_id, cx) {
+                self.with_session_silent(focused_id, cx, |c| c.pending_reveal_cursor = true);
+            }
             if let Some(ent) = self.session_entity(focused_id) {
                 ent.update(cx, |_, scx| scx.notify());
             }
@@ -6650,6 +6656,38 @@ impl YaldaGpuiView {
         staged
     }
 
+    /// D11: whether the ACTIVE inline You-block's caret row, at its CURRENT
+    /// position in the draft, lies inside the transcript viewport — judged from
+    /// where the block's placeholder was last laid out (`you_block_slot`) plus
+    /// the caret's visual row at the block's wrap width. `false` whenever that
+    /// can't be established (no transcript view yet, placeholder not laid out,
+    /// width unknown) so the caller falls back to a reveal.
+    pub(crate) fn inline_you_block_caret_in_view(&self, id: SessionId, cx: &Context<Self>) -> bool {
+        let Some(tv) = self.transcript_views.get(&id) else {
+            return false;
+        };
+        let (slot, layout) = {
+            let tv = tv.read(cx);
+            (tv.you_block_slot.get(), tv.you_block_layout.get())
+        };
+        let Some(slot) = slot else {
+            return false;
+        };
+        if layout.cols == 0 {
+            return false;
+        }
+        self.read_session(id, cx, |c| {
+            let compose = c.input_surface.compose();
+            let snap = compose.render_snapshot(layout.cols);
+            let cc = compose.editor.cursor();
+            let col = display_col(compose.editor.document(), cc.line, cc.col);
+            let vrow = compose_caret_visual_row(&snap.lines, &snap.per_line_rows, cc.line, col, layout.cols);
+            let top = f32::from(slot.bounds.top()) + YB_HEADER_PX + vrow as f32 * YB_ROW_H_PX;
+            top >= f32::from(slot.clip.top()) && top + YB_ROW_H_PX <= f32::from(slot.clip.bottom())
+        })
+        .unwrap_or(false)
+    }
+
     pub(crate) fn paste_into_compose(&mut self, cx: &mut Context<Self>) {
         let staged = self.stage_clipboard_images_onto_compose(cx);
         if staged == 0 {
@@ -6657,6 +6695,8 @@ impl YaldaGpuiView {
             if let Some(text) = cx.read_from_clipboard().as_ref().and_then(|i| i.text())
                 && let Some(mut c) = self.agent_mut(cx)
             {
+                // D15: `\n`-only editor — normalize a CRLF clipboard.
+                let text = normalize_pasted_newlines(&text);
                 let cb = c.input_surface.compose_mut();
                 // D1: Insert mode pastes AT the caret (caret after the text, one
                 // undo step) — only Normal mode uses the vim `p` rules.
