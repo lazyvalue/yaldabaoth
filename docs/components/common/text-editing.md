@@ -36,7 +36,7 @@ horizontally). The caret is never stranded off-screen, and the viewport never sh
 a region the caret has left.
 
 **Applies to.** Every editable/navigable surface (see Description) + any future one.
-`editor.rs` splice cursor-shift; `compute_window` / `ScrollAnchoredList`.
+`editor.rs` splice cursor-shift; `compose_first_visible_line` / `ScrollAnchoredList`.
 
 **Why.** A caret you can't see is a caret you can't use. The single most-regressed
 property in the app.

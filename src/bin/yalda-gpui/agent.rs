@@ -1474,22 +1474,19 @@ pub(crate) fn build_wrapped_line(
     row.into_any_element()
 }
 
-/// Render a single chatbox logical line as a NON-WRAPPING, horizontally-scrolled
-/// row (spec-chatbox-caret-containment.md Behavior 5).
-///
-/// The line is sliced to the visible column window `[left_col, left_col +
-/// visible_cols)` and rendered from the row's left edge — NOT pixel-offset.
-/// Slicing relies on the string boundary, so there is no per-column pixel drift
-/// (the drift that, with an inexact `char_w`, scrolls the caret off the edge —
-/// the recurring bug). A long unbreakable token therefore scrolls instead of
-/// wrapping or overflowing. The caret is injected at `cursor_col - left_col`
-/// within the slice, preserving Normal (block over the char) vs Insert
-/// (zero-width beam before it) semantics.
+/// Render ONE visual row of a wrapped chatbox line: the char range
+/// `[row_start, row_start + row_len)` of the logical line (a [`wrap_line_cols`]
+/// row), drawn from the row's left edge. Slicing on the string boundary (not a
+/// pixel offset) means there is no per-column pixel drift. The caret is injected
+/// at `cursor_col - row_start` within the slice, preserving Normal (block over
+/// the char) vs Insert (zero-width beam before it) semantics. (The old
+/// horizontal-scroll window over a NON-wrapping line is gone — D14; the compose
+/// word-wraps, UXI-AgentTile-9.)
 // builder/render fn — arg count is inherent, splitting would obscure
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_chatbox_line(
     // D5: the WHOLE logical line's chars, collected ONCE by the caller. Each
-    // visual row only slices `[left_col, left_col + visible_cols)` out of it, so
+    // visual row only slices `[row_start, row_start + row_len)` out of it, so
     // a wrapped line costs O(line) total — not O(line) per visual row.
     chars: &[char],
     is_cursor_line: bool,
@@ -1501,8 +1498,8 @@ pub(crate) fn build_chatbox_line(
     code_font: &SharedString,
     text_color: Hsla,
     selection_bg: Hsla,
-    left_col: usize,
-    visible_cols: usize,
+    row_start: usize,
+    row_len: usize,
 ) -> AnyElement {
     let line_h = px(18.0);
     let fg: Hsla = text_color;
@@ -1515,12 +1512,10 @@ pub(crate) fn build_chatbox_line(
     let char_count = chars.len();
     let total_line_chars = char_count;
 
-    // ── Horizontal window: slice the line to the visible columns. ──
-    // `vs..ve` is the char range shown; rendering it from the row's LEFT edge
-    // (not a pixel offset) is what makes the approximate `char_w` safe — no
-    // per-column drift can accumulate (spec Behavior 5).
-    let vs = left_col.min(char_count);
-    let ve = left_col.saturating_add(visible_cols.max(1)).min(char_count);
+    // `vs..ve` is this visual row's char range; rendering it from the row's
+    // LEFT edge (not a pixel offset) means no per-column drift can accumulate.
+    let vs = row_start.min(char_count);
+    let ve = row_start.saturating_add(row_len).min(char_count);
     let slice: &[char] = &chars[vs..ve];
     let slice_len = slice.len();
 
@@ -1590,8 +1585,8 @@ pub(crate) fn build_chatbox_line(
         row.child(text)
     };
 
-    // Caret column within the slice (cursor_col >= left_col by the containment
-    // invariant; saturating for safety). `None` when the caret isn't here.
+    // Caret column within the slice (the caller only marks the row that holds
+    // `cursor_col`; saturating for safety). `None` when the caret isn't here.
     let rel_caret = is_cursor_line.then(|| cursor_col.saturating_sub(vs));
 
     match rel_caret {
@@ -1750,8 +1745,8 @@ pub(crate) fn build_chatbox_wrapped_line(
             code_font,
             text_color,
             selection_bg,
-            rs,        // left_col = this visual row's start
-            re - rs,   // visible_cols = this row's exact width (no clip, no scroll)
+            rs,
+            re - rs,
         ));
     }
     col.into_any_element()
@@ -2263,21 +2258,13 @@ impl InputSurface {
         }
     }
 
-    /// A surface in `mode` whose compose is seeded with a persisted `draft`
-    /// (Model C restore — `design-c.md` §4.4). Empty `draft` ⇒ empty compose.
+    /// A surface in `mode` whose compose is seeded with `draft` as its committed
+    /// baseline ([`Compose::seeded`]; Model C restore — `design-c.md` §4.4, and
+    /// the `r`-seeded reply quotation so `u` can back the block out,
+    /// UXI-AgentTile-24). Empty `draft` ⇒ empty compose.
     pub(crate) fn with_draft(mode: InputModeKind, draft: &str) -> Self {
         Self {
             compose: Compose::seeded(draft),
-            mode,
-        }
-    }
-
-    /// Like [`with_draft`], but the draft is the compose's committed baseline
-    /// (no undo history) — see [`Compose::seeded_committed`]. Used for the
-    /// `r`-seeded reply quotation so `u` can back the block out (UXI-AgentTile-24).
-    pub(crate) fn with_committed_draft(mode: InputModeKind, draft: &str) -> Self {
-        Self {
-            compose: Compose::seeded_committed(draft),
             mode,
         }
     }
@@ -2609,13 +2596,13 @@ pub(crate) struct Compose {
     /// stays anchored — `reset()` snapped the box to its top on any newline in a
     /// >8-line draft. See `ScrollAnchoredList`.
     pub(crate) list: ScrollAnchoredList<String>,
-    /// The authoritative visible top-left grid cell (spec-chatbox-caret-
-    /// containment.md). Recomputed every render by `compose_window` from the
-    /// current caret + measured box width; the list scrolls *to* `top_line`
-    /// (never reads it back) and every row is sliced to the columns starting at
-    /// `left_col`. `Cell` so the `&Chatbox` (or `&mut`) render path can store
-    /// the new window without a wider borrow.
-    pub(crate) window: std::cell::Cell<ComposeWindow>,
+    /// The authoritative top VISUAL row of the virtualized (long-draft) box
+    /// (spec-chatbox-caret-containment.md, in wrapped-row space since
+    /// UXI-AgentTile-9). Recomputed every render by `compose_first_visible_line`
+    /// from the caret's visual row, anchored on this previous value so the box
+    /// only moves when the caret would leave it; the list scrolls *to* it (never
+    /// reads it back). `Cell` so the render path can store it through `&self`.
+    pub(crate) top_vrow: std::cell::Cell<usize>,
     /// Measured INNER content size `(x, y, w, h)` of the compose box, written
     /// during paint via `CaptureBounds`, read next frame to derive
     /// `visible_cols = floor(w / CHATBOX_CHAR_W)`. The real painted width — not
@@ -2694,7 +2681,7 @@ impl Compose {
             // throws off the list's height model and strands the caret off-screen
             // on reveal — the recurring "cursor offscreen in the chatbox" bug.
             list: ScrollAnchoredList::new(gpui::ListAlignment::Top, gpui::px(18.0)),
-            window: std::cell::Cell::new(ComposeWindow::default()),
+            top_vrow: std::cell::Cell::new(0),
             bounds: std::rc::Rc::new(std::cell::Cell::new((0.0, 0.0, 0.0, 0.0))),
             pending_images: Vec::new(),
             render_cache: std::cell::RefCell::new(None),
@@ -2758,66 +2745,24 @@ impl Compose {
         self.editor.document().edit_seq()
     }
 
-    /// Recompute the caret-containment window from the CURRENT editor state and
-    /// the given visible extent, store it (authoritative), and return it
-    /// (spec-chatbox-caret-containment.md). The single integration point that
-    /// reads the cursor + the caret line's tab-expanded length and feeds
-    /// `compose_window` — kept here (not inline in the GPUI render path) so it is
-    /// headlessly testable over every edit path (Constraint 4).
-    pub(crate) fn compute_window(&self, visible_rows: usize, visible_cols: usize) -> ComposeWindow {
-        let line_count = self.editor.document().line_count().max(1);
-        let cursor = self.editor.cursor();
-        // Length of the caret's line in the SAME representation the rows render
-        // in (workspaces expanded to 4 spaces), so the horizontal clamp matches what's
-        // painted.
-        let cursor_line_len = {
-            let cl = cursor.line.min(line_count.saturating_sub(1));
-            display_line(self.editor.document(), cl).chars().count()
-        };
-        let win = compose_window(
-            cursor.line,
-            cursor.col,
-            cursor_line_len,
-            self.window.get(),
-            line_count,
-            visible_rows,
-            visible_cols,
-        );
-        self.window.set(win);
-        win
-    }
-
-    /// A fresh compose seeded with `text` (cursor at the end). Used on restore to
-    /// re-apply a persisted draft, and on the not-delivered resubmit path.
+    /// A fresh compose seeded with `text` — see [`Compose::reset_to`]. Used on
+    /// restore (persisted draft), resubmit, parked-block resume, the `r`-seeded
+    /// reply quotation, and the Diff tile's comment editor.
     pub(crate) fn seeded(text: &str) -> Self {
         let mut c = Self::new();
-        c.editor.insert_str(text);
+        c.reset_to(text);
         c
     }
 
-    /// Like [`seeded`], but the seed is the compose's **committed baseline** — it
-    /// carries NO undo history (built as the editor's initial content, not as a
-    /// sequence of edits). So `editor.undo()` on an untouched seeded compose is a
-    /// no-op, which is what lets `u` pop a `r`-seeded You-block on the first press
-    /// once the user's own typing (if any) has been undone (UXI-AgentTile-24).
-    /// Cursor rests at the end of the seed (like `seeded`).
-    pub(crate) fn seeded_committed(text: &str) -> Self {
-        let mut c = Self::new();
-        c.editor = Editor::new(text.to_string(), std::path::PathBuf::from("*compose*"));
-        c.render_cache.replace(None);
-        let last = c.editor.document().line_count().saturating_sub(1);
-        let col = c.editor.document().line_len_chars(last);
-        c.editor.cursor_mut().line = last;
-        c.editor.cursor_mut().col = col;
-        c
-    }
-
-    /// Replace the draft with a recalled history entry (UXI-AgentTile-41): a
-    /// committed baseline (no undo history) with the caret at the very end, in
-    /// Insert mode. Only the TEXT is swapped — staged image attachments and the
-    /// scroll/window state are left intact, so browsing history doesn't drop a
-    /// pasted image.
-    pub(crate) fn set_recalled(&mut self, text: &str) {
+    /// THE one "reset the editor + caret to the end" path (D14): replace the
+    /// draft with `text` as the compose's **committed baseline** — built as the
+    /// editor's initial content, NOT as an edit, so it carries no undo history
+    /// (`editor.undo()` on an untouched reset is a no-op; that is what lets `u`
+    /// pop an `r`-seeded You-block on the first press, UXI-AgentTile-24) — with
+    /// the caret at the very end, in Insert mode. Only the TEXT is swapped:
+    /// staged image attachments and the scroll/bounds state are kept, so
+    /// history recall (UXI-AgentTile-41) doesn't drop a pasted image.
+    pub(crate) fn reset_to(&mut self, text: &str) {
         self.editor = Editor::new(text.to_string(), std::path::PathBuf::from("*compose*"));
         // D6: a fresh Editor restarts `edit_seq`; drop the render snapshot so
         // it can't be served for the replaced text.
@@ -4430,7 +4375,7 @@ impl AgentState {
         replaced.extend(chars[query.end..].iter());
         let caret = query.start + accepted.chars().count();
         let compose = self.input_surface.compose_mut();
-        compose.set_recalled(&replaced);
+        compose.reset_to(&replaced);
         let line = compose.editor.document().rope().char_to_line(caret);
         let line_start = compose.editor.document().rope().line_to_char(line);
         compose.editor.cursor_mut().line = line;
@@ -5317,7 +5262,7 @@ impl AgentState {
         // out (UXI-AgentTile-24): an untouched seeded reply has nothing to undo,
         // so the first `u` pops the block rather than erasing the quotation.
         self.input_surface =
-            InputSurface::with_committed_draft(InputModeKind::Worksheet, &format!("re\n{quote}\n"));
+            InputSurface::with_draft(InputModeKind::Worksheet, &format!("re\n{quote}\n"));
         self.input_surface.compose_mut().mode = EditMode::Insert;
         self.focus = AgentFocus::Compose;
         self.pending_reveal_cursor = true;

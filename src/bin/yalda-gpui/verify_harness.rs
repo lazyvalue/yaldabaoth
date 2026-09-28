@@ -31977,7 +31977,7 @@ fn compose_idle_render_does_not_rebuild_lines(cx: &mut TestAppContext) {
     // A replaced editor (history recall) must not be served the stale snapshot.
     view.update(vcx, |v, cx| {
         let mut c = v.agent_mut(cx).expect("agent");
-        c.input_surface.compose_mut().set_recalled("recalled");
+        c.input_surface.compose_mut().reset_to("recalled");
     });
     view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();

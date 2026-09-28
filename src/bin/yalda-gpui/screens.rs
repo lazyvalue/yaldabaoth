@@ -15,13 +15,6 @@ pub(crate) fn worksheet_backdrop_alpha(mode: EditMode) -> f32 {
     }
 }
 
-/// The teal used for the worksheet backdrop wash. Brighter/more saturated than
-/// the darker `warm_accent` (which is tuned for text/border legibility) so it
-/// still reads clearly TEAL at the low wash alphas above.
-pub(crate) fn worksheet_wash_teal() -> Hsla {
-    gpui::rgb(0x2f9084).into()
-}
-
 /// The red used for the ACTIVE (live-compose) You-block backdrop wash. Sent
 /// blocks stay teal (their turn headers); only the block being typed goes red.
 /// Brighter/more saturated than the deeper `cursor`/`jump_header` red used for
@@ -1411,11 +1404,11 @@ impl YaldaGpuiView {
         let compose_panel = if !show_compose {
             None
         } else {
-            // UXI-AgentTile-11 rule 7 (bug-hunt 12): the bottom panel is now ALWAYS a pinned
+            // UXI-AgentTile-11 rule 7 (bug-hunt 12): the bottom panel is ALWAYS a pinned
             // chatbox box — it renders only in chatbox mode or as the mid-turn
             // steering box (the idle worksheet draft renders INLINE as the YouBlock,
-            // never here). So it never wears the worksheet flush/accent/"You" chrome.
-            let is_worksheet = false;
+            // never here). So it never wears the worksheet flush/accent/"You"
+            // chrome (D14: the dead `is_worksheet` branches are gone).
             let tb = c.input_surface.compose_mut();
             // Logical lines shown before the box caps height + scrolls. At/below
             // this the panel renders every line directly (grows to content,
@@ -1441,28 +1434,10 @@ impl YaldaGpuiView {
                 display_selection(tb.editor.document(), tb.editor.selection_range());
             let sep_color: Hsla = nc(at.compose_separator);
             let compose_cursor_color: Hsla = nc(at.cursor);
-            // Worksheet accent = teal (the app accent), used for the left `›`
-            // gutter bar — kept SEPARATE from the block caret (which is red), so
-            // the caret pops while the placement cue stays teal.
-            let worksheet_accent: Hsla = nc(at.warm_accent);
-            // A slight teal wash behind the worksheet draft. Fainter while
-            // TYPING (Insert) than resting (Normal), per request.
-            let worksheet_backdrop: Hsla = {
-                let mut c = worksheet_wash_teal();
-                c.a = worksheet_backdrop_alpha(compose_mode);
-                c
-            };
             // Same theme selection color the edit view paints (see
             // `build_edit_body_*` → `self.theme.agent.selection_bg`), so the
             // chatbox highlight contrast matches the rest of the app.
             let compose_selection_bg: Hsla = nc(at.selection_bg);
-            // Worksheet (inline placement) tints the box border with the accent
-            // as a placement cue; chatbox stays neutral.
-            let compose_border: Hsla = if is_worksheet {
-                worksheet_accent
-            } else {
-                dim_fg
-            };
             let compose_code_font = self.code_font.clone();
             let separator = div().w_full().h(px(1.0)).bg(dim_fg);
 
@@ -1512,7 +1487,7 @@ impl YaldaGpuiView {
                         visible_cols,
                     ));
                 }
-                let mut scroll = div()
+                div()
                     .id("compose-scroll")
                     .w_full()
                     .min_w_0()
@@ -1527,26 +1502,14 @@ impl YaldaGpuiView {
                     .py(px(8.0))
                     .font_family(compose_code_font.clone())
                     .text_size(px(13.0))
-                    .text_color(compose_fg);
-                // Placement chrome (design-c.md §1): Worksheet renders inline
-                // flush in the transcript column — no box, no margins — with an
-                // accent left bar as the `›` draft gutter, so the draft reads as a
-                // continuation of the conversation. Chatbox keeps the pinned box.
-                if is_worksheet {
-                    scroll = scroll
-                        .border_l_2()
-                        .border_color(worksheet_accent)
-                        .bg(worksheet_backdrop);
-                } else {
-                    scroll = scroll
-                        .bg(compose_panel_bg)
-                        .border_1()
-                        .border_color(dim_fg)
-                        .rounded_md()
-                        .mx_2()
-                        .mb_1();
-                }
-                scroll
+                    .text_color(compose_fg)
+                    // The pinned chatbox box (design-c.md §1).
+                    .bg(compose_panel_bg)
+                    .border_1()
+                    .border_color(dim_fg)
+                    .rounded_md()
+                    .mx_2()
+                    .mb_1()
                     // Capture the inner content width (inside px_4) so next
                     // frame's `visible_cols` reflects the real box, not the
                     // whole-window width.
@@ -1571,7 +1534,7 @@ impl YaldaGpuiView {
                 // vertical window over VISUAL rows, then map the authoritative top
                 // visual row back into the list's (item, offset) space (its items
                 // are logical lines, each a wrapped column of visual rows).
-                // Anchored on the prior window (`tb.window`) so the box only moves
+                // Anchored on the prior window (`tb.top_vrow`) so the box only moves
                 // when the caret would leave it; never read back from the list's
                 // own anchor (mis-fires on freshly-spliced unmeasured rows).
                 let per_line = compose_snap.per_line_rows.clone();
@@ -1585,14 +1548,11 @@ impl YaldaGpuiView {
                 );
                 let visual_top = compose_first_visible_line(
                     caret_vrow,
-                    tb.window.get().top_line,
+                    tb.top_vrow.get(),
                     total_vrows,
                     COMPOSE_MAX_VISIBLE_LINES,
                 );
-                tb.window.set(ComposeWindow {
-                    top_line: visual_top,
-                    left_col: 0,
-                });
+                tb.top_vrow.set(visual_top);
                 let (item_ix, offset_rows) = compose_item_for_visual_row(&per_line, visual_top);
                 tb.list.state().scroll_to(gpui::ListOffset {
                     item_ix,
@@ -1621,7 +1581,7 @@ impl YaldaGpuiView {
                             visible_cols,
                         )
                     };
-                let mut scroll = div()
+                div()
                     .id("compose-scroll")
                     .flex()
                     .flex_col()
@@ -1632,24 +1592,14 @@ impl YaldaGpuiView {
                     .py(px(8.0))
                     .font_family(compose_code_font.clone())
                     .text_size(px(13.0))
-                    .text_color(compose_fg);
-                // Same placement chrome as the small-draft path (design-c.md §1):
-                // inline-flush worksheet (accent left bar) vs pinned box.
-                if is_worksheet {
-                    scroll = scroll
-                        .border_l_2()
-                        .border_color(worksheet_accent)
-                        .bg(worksheet_backdrop);
-                } else {
-                    scroll = scroll
-                        .bg(compose_panel_bg)
-                        .border_1()
-                        .border_color(compose_border)
-                        .rounded_md()
-                        .mx_2()
-                        .mb_1();
-                }
-                scroll
+                    .text_color(compose_fg)
+                    // Same pinned-box chrome as the small-draft path.
+                    .bg(compose_panel_bg)
+                    .border_1()
+                    .border_color(dim_fg)
+                    .rounded_md()
+                    .mx_2()
+                    .mb_1()
                     .child(CaptureBounds {
                         inner: gpui::list(tb.list.state().clone(), render_fn)
                             .flex_1()
@@ -1667,29 +1617,13 @@ impl YaldaGpuiView {
                 h.a = 0.4;
                 h
             };
-            // Model C "You" boundary: in worksheet (inline) placement the panel
-            // below the read-only transcript is the user's compose area, so label
-            // it `You` in the accent. This is the presence cue the worksheet
-            // promised — under Model C the inline compose is always present in
-            // worksheet mode, so the divider is the boundary of YOUR turn. Chatbox
-            // (pinned) keeps the bare rule (its box is self-evidently the input).
+            // The pinned box keeps a bare top rule (its box is self-evidently the
+            // input; the worksheet "You" label lives on the inline You-block).
             let mut panel = div()
                 .w_full()
                 .min_w_0()
                 .border_t_1()
                 .border_color(edge_color);
-            if is_worksheet {
-                panel = panel.child(
-                    div()
-                        .px_4()
-                        .pt_1()
-                        .text_size(px(11.0))
-                        .font_family(compose_code_font.clone())
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(worksheet_accent)
-                        .child(SharedString::new_static("You")),
-                );
-            }
             // Probe the compose box's OUTER (post-margin) bounds so the harness
             // can prove the placement chrome differs (UXI-AgentTile-10): worksheet is
             // flush (full column width, no margin) vs chatbox's inset box.

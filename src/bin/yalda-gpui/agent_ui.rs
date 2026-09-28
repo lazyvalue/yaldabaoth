@@ -6392,7 +6392,7 @@ impl YaldaGpuiView {
                         claude
                             .input_surface
                             .compose_mut()
-                            .set_recalled(&format!("/{name}"));
+                            .reset_to(&format!("/{name}"));
                         claude.slash_popup_dismissed = true;
                         claude.history_reset();
                         return NormalOutcome::Handled;
@@ -6458,7 +6458,7 @@ impl YaldaGpuiView {
                     _ => None,
                 };
                 if let Some(text) = recalled {
-                    claude.input_surface.compose_mut().set_recalled(&text);
+                    claude.input_surface.compose_mut().reset_to(&text);
                     return NormalOutcome::Handled;
                 }
             }

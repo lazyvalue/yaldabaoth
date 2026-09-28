@@ -1949,29 +1949,28 @@ fn compose_wrapped_caret_never_below_the_fold() {
 
 /// THE permanent guard against the 15×-recurring "chatbox caret/text scrolls
 /// off-screen" bug (spec-chatbox-caret-containment.md Constraint 4): drive a real
-/// `Chatbox` editor through every Behavior-7 edit path and, after each, assert
-/// `compute_window` keeps the caret CELL inside the visible box on BOTH axes for
-/// a range of extents (including the degenerate 1×1). This tests the integration
-/// (cursor + tab-expanded line-length read), not just the pure window math.
+/// `Compose` editor through every Behavior-7 edit path and, after each, assert
+/// the LIVE wrapped-row window math (the render path's `compose_visual_metrics`
+/// → `compose_first_visible_line`, UXI-AgentTile-9) keeps the caret's visual row
+/// inside the visible box for a range of extents (including the degenerate
+/// 1×1). This tests the integration (cursor + tab-expanded display lines), not
+/// just the pure window math. (Was pinned on the dead horizontal-scroll
+/// `compute_window`, removed in D14.)
 #[test]
 fn chatbox_caret_cell_stays_in_window_for_every_edit_path() {
     // After a given edit, the live caret cell must be inside the window the
     // box would render at, for several visible extents.
     fn assert_contained(cb: &Compose, label: &str) {
+        let lines = crate::display_lines(cb.editor.document());
+        let cur = cb.editor.cursor();
+        let col = crate::display_col(cb.editor.document(), cur.line, cur.col);
         for &rows in &[1usize, 8] {
             for &cols in &[1usize, 4, 20, 80] {
-                let w = cb.compute_window(rows, cols);
-                let cur = cb.editor.cursor();
+                let (caret_vrow, total, _) = compose_visual_metrics(&lines, cur.line, col, cols);
+                let top = crate::compose_first_visible_line(caret_vrow, 999, total, rows);
                 assert!(
-                    cur.line >= w.top_line && cur.line < w.top_line + rows,
-                    "[{label}] caret line {} escaped vertical window {w:?} (rows={rows})",
-                    cur.line,
-                );
-                let inner = cols.saturating_sub(1).max(1);
-                assert!(
-                    cur.col >= w.left_col && cur.col <= w.left_col + inner,
-                    "[{label}] caret col {} escaped horizontal window {w:?} (cols={cols})",
-                    cur.col,
+                    caret_vrow >= top && caret_vrow < top + rows,
+                    "[{label}] caret visual row {caret_vrow} escaped window top={top} (rows={rows}, cols={cols})",
                 );
             }
         }
@@ -6198,20 +6197,9 @@ fn you_block_active_accent_is_red() {
     // Active block → red accent; parked/sent → teal.
     assert_eq!(crate::screens::you_block_accent(true, red, teal), red);
     assert_eq!(crate::screens::you_block_accent(false, red, teal), teal);
-    // The wash behind the active draft is red-dominant (r > g and r > b) and
-    // distinct from the teal wash used before.
+    // The wash behind the active draft is red-dominant (r > g and r > b).
     let wash: gpui::Rgba = crate::screens::worksheet_wash_red().into();
-    let teal_wash: gpui::Rgba = crate::screens::worksheet_wash_teal().into();
     assert!(wash.r > wash.g && wash.r > wash.b, "active wash reads red");
-    assert!(
-        teal_wash.g > teal_wash.r,
-        "teal wash reads teal (sent stays teal)"
-    );
-    assert_ne!(
-        crate::screens::worksheet_wash_red(),
-        crate::screens::worksheet_wash_teal(),
-        "active wash is no longer the teal wash"
-    );
 }
 
 #[test]
@@ -6454,7 +6442,7 @@ fn slash_query_and_popup_rows_filter() {
         },
     ];
     let set = |s: &mut AgentState, text: &str| {
-        s.input_surface.compose_mut().set_recalled(text); // Insert + cursor at end
+        s.input_surface.compose_mut().reset_to(text); // Insert + cursor at end
     };
 
     // slash_query: bare token only.
@@ -6527,7 +6515,7 @@ fn topic_query_filters_and_replaces_caret_token() {
 
     s.input_surface
         .compose_mut()
-        .set_recalled("ask %projects/co tomorrow");
+        .reset_to("ask %projects/co tomorrow");
     // Put the caret immediately after the partial Topic token, not at draft end.
     s.input_surface.compose_mut().editor.cursor_mut().col = 16;
     let query = s.topic_query().expect("percent-prefixed caret token is eligible");
@@ -6562,20 +6550,20 @@ fn topic_query_filters_and_replaces_caret_token() {
     assert_eq!(s.input_surface.compose().text(), "ask projects/cog/mail::chat tomorrow");
     assert!(s.topic_popup_dismissed, "the final segment closes the popup");
 
-    s.input_surface.compose_mut().set_recalled("ordinary prose");
+    s.input_surface.compose_mut().reset_to("ordinary prose");
     assert!(s.topic_query().is_none(), "ordinary prose stays quiet");
-    s.input_surface.compose_mut().set_recalled("projects/co");
+    s.input_surface.compose_mut().reset_to("projects/co");
     assert!(
         s.topic_query().is_none(),
         "path-shaped prose without the explicit percent trigger stays quiet",
     );
-    s.input_surface.compose_mut().set_recalled("/co");
+    s.input_surface.compose_mut().reset_to("/co");
     assert!(
         s.topic_query().is_none(),
         "a bare leading slash token belongs to slash-command completion",
     );
 
-    s.input_surface.compose_mut().set_recalled("%");
+    s.input_surface.compose_mut().reset_to("%");
     s.topic_popup_dismissed = false;
     assert_eq!(
         s.topic_popup_rows(&catalog).len(),
@@ -6591,19 +6579,19 @@ fn topic_query_refreshes_once_per_opening() {
     use crate::agent::AgentState;
 
     let mut s = AgentState::new_for_test();
-    s.input_surface.compose_mut().set_recalled("%");
+    s.input_surface.compose_mut().reset_to("%");
     assert!(s.begin_topic_query_refresh());
     assert!(!s.begin_topic_query_refresh());
 
-    s.input_surface.compose_mut().set_recalled("%projects/cog");
+    s.input_surface.compose_mut().reset_to("%projects/cog");
     assert!(
         !s.begin_topic_query_refresh(),
         "suffix edits stay in the same query generation",
     );
 
-    s.input_surface.compose_mut().set_recalled("ordinary prose");
+    s.input_surface.compose_mut().reset_to("ordinary prose");
     assert!(!s.begin_topic_query_refresh());
-    s.input_surface.compose_mut().set_recalled("%projects/cog");
+    s.input_surface.compose_mut().reset_to("%projects/cog");
     assert!(
         s.begin_topic_query_refresh(),
         "a later percent query starts a fresh catalog request",
@@ -6620,7 +6608,7 @@ fn slash_and_topic_queries_are_draft_copy_free_but_equivalent() {
     use yalda::acp_channel::AgentCommand;
 
     let mut s = AgentState::new_for_test();
-    let set = |s: &mut AgentState, text: &str| s.input_surface.compose_mut().set_recalled(text);
+    let set = |s: &mut AgentState, text: &str| s.input_surface.compose_mut().reset_to(text);
 
     // Slash: single line only; a trailing newline or second line disqualifies.
     set(&mut s, "/co\n");

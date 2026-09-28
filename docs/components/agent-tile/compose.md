@@ -585,9 +585,10 @@ compose.mode==Normal, key==u, no mods)`: it undoes the compose editor and, if th
 undo changed nothing, resets the active block (`InputSurface::new` +
 `you_block_open=false`/anchor cleared + `focus=Transcript`) **without** touching
 `parked_you_blocks`. `agent.rs` — `reply_quote_at_cursor` seeds the compose as a
-committed **baseline** (`Compose::seeded_committed` / `InputSurface::with_committed_draft`,
-built via `Editor::new(seed)` so the quotation carries no undo history) instead of
-the char-by-char `with_draft`. Builds on
+committed **baseline** (`Compose::seeded` → `Compose::reset_to` via
+`InputSurface::with_draft`, built via `Editor::new(seed)` so the quotation carries
+no undo history — D14 unified every "reset editor + caret to end" path onto
+`reset_to`). Builds on
 [UXI-AgentTile-11](#uxi-agenttile-11--the-worksheet-is-an-inline-editable-conversation-buffer-chatbox-is-mid-turn-only)
 and [UXI-AgentTile-21](#uxi-agenttile-21--nr-over-agent-text-opens-a-reply-you-block-seeded-with-a-quotation).
 
@@ -707,7 +708,7 @@ and browses it shell-style with the arrow keys, in **Insert** mode:
    (not persisted across restart).
 
 **Applies to.** `agent.rs`: `AgentState::{sent_history, history_nav}`, `HistoryNav`,
-`history_push`/`history_up`/`history_down`/`history_reset`, `Compose::set_recalled`.
+`history_push`/`history_up`/`history_down`/`history_reset`, `Compose::reset_to`.
 `agent_ui.rs`: the Up/Down recall interception in `handle_claude_key`'s compose
 dispatch (before `dispatch_insert_core`) + the browse-reset on edit, and the
 `history_push` calls at the two submit success branches (`submit_compose`,
