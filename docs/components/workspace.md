@@ -1532,4 +1532,13 @@ leaves the ownership graph unchanged);
 `verify_harness.rs::jump_palette_opens_tileless_session_into_project_workspace`
 (the real Cmd-P path opens a tile-less session as a focused visible tile in the
 project's workspace); `tests.rs::legacy_detached_tiles_are_dropped_on_restore`
-(legacy `detached_tiles` are ignored on load and not re-written).
+(legacy `detached_tiles` are ignored on load and not re-written; negative
+control: dropping the read-only legacy `Detached` solo variant fails the whole
+snapshot parse with “unknown variant `detached`”);
+`workspace::tests::open_tile_in_project_prefers_active_then_project_workspace_then_new`
+(placement order incl. the hidden-solo owner);
+`verify_harness.rs::project_menu_new_agent_session_opens_visible_tile_in_project_workspace`
+(project-menu New agent session opens a focused visible tile, creating a
+workspace for a project with none). Negative controls for the three harness
+guards were observed RED (tile placed hidden; Session rows skipped; roster
+adoption minting tiles; wrong project for a new workspace).

@@ -1588,7 +1588,7 @@ pub(crate) fn restore_layout(
 }
 
 /// Restore one persisted tile while preserving its stable id and tile-local
-/// tags. Shared by workspace layouts and the Detached collection.
+/// tags. Shared by workspace layouts and hidden tiles.
 pub(crate) fn restore_leaf(
     ws: &mut workspace::Frame<App>,
     theme: &Theme,

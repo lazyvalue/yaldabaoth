@@ -3136,8 +3136,8 @@ impl<C> Frame<C> {
         for wsp in &self.workspaces {
             wsp.layout.for_each_leaf(&mut |w| {
                 out.insert(w.id);
-                out.extend(wsp.hidden_tiles.iter().map(|tile| tile.window.id));
             });
+            out.extend(wsp.hidden_tiles.iter().map(|tile| tile.window.id));
         }
         out
     }
@@ -4088,14 +4088,15 @@ mod tests {
     }
 
     #[test]
-    fn close_focused_removes_solo_detached_tile_and_reveals_workspace() {
+    fn close_focused_removes_solo_hidden_tile_and_reveals_workspace() {
         let mut frame = Frame::with_initial(TestContent("bound"), ProjectId(0));
-        let detached = frame.push_detached(TestContent("picker"), ProjectId(0));
-        assert!(frame.present_solo(detached));
+        let hidden = frame.split_focused(SplitDir::V, TestContent("picker")).unwrap();
+        frame.hide_window(hidden).unwrap();
+        assert!(frame.present_solo(hidden));
 
         assert_eq!(frame.close_focused(), Ok(Some(1)));
-        assert!(frame.tile(detached).is_none());
-        assert_eq!(frame.presented_detached_tile_id(), None);
+        assert!(frame.tile(hidden).is_none());
+        assert_eq!(frame.presented_tile(), None);
         assert_eq!(frame.focused_window_id(), Some(1));
         assert_eq!(frame.workspaces.len(), 1);
     }
@@ -4356,129 +4357,25 @@ mod tests {
         assert_eq!(ws.workspaces[1].focused, 2);
     }
 
-    // --- Optional workspace ownership (ADR-0033 / UXI-Workspace-16) -------
+    // --- Every tile belongs to a workspace (ADR-0039 / UXI-Workspace-30) ---
 
     #[test]
-    fn attached_detached_attached_roundtrip_preserves_identity_state_project_and_tags() {
-        let layout = Layout::Split {
-            dir: SplitDir::V,
-            children: vec![(0.5, leaf(1, "a")), (0.5, leaf(2, "stateful"))],
-        };
-        let mut frame = ws_with_layout(layout, 2);
-        frame
-            .tile_mut(2)
-            .expect("bound tile")
-            .tags
-            .extend(["review".to_string(), "urgent".to_string()]);
-
-        frame.detach_window(2).expect("tile can leave split");
-        assert_eq!(frame.tile_membership(2), Some(TileMembership::Detached));
-        assert_eq!(frame.presented_detached_tile_id(), Some(2));
-        assert_eq!(frame.focused_content(), Some(&TestContent("stateful")));
-        assert_eq!(frame.tile_project(2), Some(ProjectId(0)));
-        assert_eq!(
-            frame.tile(2).expect("Detached tile").tags,
-            TagSet::from(["review".to_string(), "urgent".to_string()])
-        );
-        assert_eq!(frame.workspaces[0].layout.leaf_ids(), vec![1]);
-        assert_eq!(frame.all_window_ids(), HashSet::from([1, 2]));
-
-        frame.attach_detached(2, 0).expect("same-project bind");
-        assert_eq!(
-            frame.tile_membership(2),
-            Some(TileMembership::Attached {
-                workspace: 0,
-                visibility: AttachedVisibility::Visible
-            })
-        );
-        assert_eq!(frame.presented_detached_tile_id(), None);
-        let rebound = frame.tile(2).expect("rebound tile");
-        assert_eq!(rebound.id, 2);
-        assert_eq!(rebound.content, TestContent("stateful"));
-        assert_eq!(
-            rebound.tags,
-            TagSet::from(["review".to_string(), "urgent".to_string()])
-        );
-        assert_eq!(frame.workspaces[0].layout.leaf_ids(), vec![1, 2]);
-        assert!(frame.detached_tiles.is_empty());
-    }
-
-    #[test]
-    fn replacing_picker_leaf_with_detached_tile_preserves_slot_identity_state_and_tags() {
-        let layout = Layout::Split {
-            dir: SplitDir::V,
-            children: vec![(0.5, leaf(1, "keep")), (0.5, leaf(2, "picker"))],
-        };
-        let mut frame = ws_with_layout(layout, 2);
-        let stable = frame.push_detached(TestContent("agent-state"), ProjectId(0));
-        frame.tile_mut(stable).unwrap().tags.insert("urgent".into());
-
-        frame
-            .replace_attached_with_detached(2, stable)
-            .expect("same-project stable tile replaces picker leaf");
-
-        assert_eq!(frame.workspaces[0].layout.leaf_ids(), vec![1, stable]);
-        assert_eq!(frame.focused_window_id(), Some(stable));
-        assert_eq!(frame.tile_membership(2), None);
-        assert_eq!(
-            frame.tile_membership(stable),
-            Some(TileMembership::Attached {
-                workspace: 0,
-                visibility: AttachedVisibility::Visible
-            })
-        );
-        assert_eq!(
-            frame.tile(stable).unwrap().content,
-            TestContent("agent-state")
-        );
-        assert!(frame.tile(stable).unwrap().tags.contains("urgent"));
-        assert!(frame.detached_tiles.is_empty());
-    }
-
-    #[test]
-    fn solo_detached_presentation_never_changes_membership_and_workspace_switch_clears_it() {
-        let mut frame = Frame::with_initial(TestContent("bound"), ProjectId(0));
-        let id = frame.push_detached(TestContent("detached"), ProjectId(0));
-
-        assert!(frame.present_solo(id));
-        assert_eq!(frame.focused_window_id(), Some(id));
-        assert_eq!(frame.focused_content(), Some(&TestContent("detached")));
-        assert_eq!(frame.tile_membership(id), Some(TileMembership::Detached));
-        assert_eq!(frame.workspaces[0].layout.leaf_ids(), vec![1]);
-
-        frame.set_active_workspace(0);
-        assert_eq!(frame.presented_detached_tile_id(), None);
-        assert_eq!(frame.focused_window_id(), Some(1));
-        assert_eq!(frame.tile_membership(id), Some(TileMembership::Detached));
-    }
-
-    #[test]
-    fn attachment_is_project_local_and_failure_leaves_the_tile_detached() {
-        let mut frame = Frame::with_initial(TestContent("p0"), ProjectId(0));
-        frame.push_initial_workspace(TestContent("p1"), ProjectId(1));
-        let id = frame.push_detached(TestContent("owned-by-p0"), ProjectId(0));
-
-        assert_eq!(frame.attach_detached(id, 1), Err(()));
-        assert_eq!(frame.tile_membership(id), Some(TileMembership::Detached));
-        assert_eq!(frame.tile_project(id), Some(ProjectId(0)));
-        assert_eq!(frame.tile(id).unwrap().content, TestContent("owned-by-p0"));
-    }
-
-    #[test]
-    fn closing_workspace_detaches_its_tiles_and_keeps_the_workspace_floor() {
+    fn closing_workspace_retires_its_tiles_and_keeps_the_workspace_floor() {
         let mut frame = Frame::with_initial(TestContent("keep"), ProjectId(0));
-        let moved = frame.push_initial_workspace(TestContent("survive"), ProjectId(0));
-        frame
-            .tile_mut(moved)
-            .unwrap()
-            .tags
-            .insert("later".to_string());
+        let visible = frame.push_initial_workspace(TestContent("visible"), ProjectId(0));
+        let hidden = frame
+            .split_focused(SplitDir::V, TestContent("hidden"))
+            .unwrap();
+        frame.hide_window(hidden).unwrap();
+        assert!(frame.present_solo(hidden));
 
         frame.close_workspace(1);
         assert_eq!(frame.workspaces.len(), 1);
-        assert_eq!(frame.tile_membership(moved), Some(TileMembership::Detached));
-        assert_eq!(frame.tile(moved).unwrap().content, TestContent("survive"));
-        assert!(frame.tile(moved).unwrap().tags.contains("later"));
+        assert_eq!(frame.tile_membership(visible), None, "visible tile retired");
+        assert_eq!(frame.tile_membership(hidden), None, "hidden tile retired");
+        assert_eq!(frame.presented_tile(), None, "stale solo target cleared");
+        assert_eq!(frame.all_window_ids(), HashSet::from([1]));
+        assert_eq!(frame.validate_ownership(), Ok(()));
 
         frame.close_workspace(0);
         assert_eq!(frame.workspaces.len(), 1, "sole workspace is retained");
@@ -4486,12 +4383,45 @@ mod tests {
     }
 
     #[test]
-    fn sole_workspace_can_be_empty_after_detach() {
-        let mut frame = Frame::with_initial(TestContent("anchor"), ProjectId(0));
-        frame.detach_window(1).unwrap();
-        assert_eq!(frame.tile_membership(1), Some(TileMembership::Detached));
-        assert!(matches!(frame.workspaces[0].layout, Layout::Empty));
-        assert_eq!(frame.workspaces[0].focused, 0);
+    fn open_tile_in_project_prefers_active_then_project_workspace_then_new() {
+        let mut frame = Frame::with_initial(TestContent("p0"), ProjectId(0));
+        frame.push_initial_workspace(TestContent("p1"), ProjectId(1));
+        frame.set_active_workspace(0);
+
+        // Active workspace belongs to the project: land there, visible + focused.
+        let here = frame.open_tile_in_project(TestContent("here"), ProjectId(0));
+        assert_eq!(
+            frame.tile_membership(here),
+            Some(TileMembership::Attached {
+                workspace: 0,
+                visibility: AttachedVisibility::Visible,
+            })
+        );
+        assert_eq!(frame.focused_window_id(), Some(here));
+
+        // Active workspace is another project's: use the project's workspace.
+        let there = frame.open_tile_in_project(TestContent("there"), ProjectId(1));
+        assert_eq!(frame.workspace_index_of_window(there), Some(1));
+        assert_eq!(frame.active_workspace, 1);
+        assert_eq!(frame.focused_window_id(), Some(there));
+
+        // A project with no workspace gets a new one.
+        let fresh = frame.open_tile_in_project(TestContent("fresh"), ProjectId(2));
+        assert_eq!(frame.workspaces.len(), 3);
+        assert_eq!(frame.workspaces[2].project(), ProjectId(2));
+        assert_eq!(frame.workspace_index_of_window(fresh), Some(2));
+        assert_eq!(frame.focused_window_id(), Some(fresh));
+
+        // From a solo-presented hidden tile: land in its owning workspace.
+        frame.set_active_workspace(0);
+        frame.hide_window(here).unwrap();
+        frame.set_active_workspace(1);
+        assert!(frame.present_solo(here));
+        let beside = frame.open_tile_in_project(TestContent("beside"), ProjectId(0));
+        assert_eq!(frame.workspace_index_of_window(beside), Some(0));
+        assert_eq!(frame.presented_tile(), None);
+        assert_eq!(frame.focused_window_id(), Some(beside));
+        assert_eq!(frame.validate_ownership(), Ok(()));
     }
 
     #[test]
@@ -4562,7 +4492,7 @@ mod tests {
     }
 
     #[test]
-    fn send_tile_transition_covers_visible_hidden_and_detached_membership() {
+    fn send_tile_transition_covers_visible_and_hidden_membership() {
         let mut frame = Frame::with_initial(TestContent("source"), ProjectId(0));
         frame.push_initial_workspace(TestContent("target"), ProjectId(0));
 
@@ -4594,23 +4524,9 @@ mod tests {
         assert_eq!(frame.active_workspace, 1);
         assert_eq!(frame.presented_tile(), None);
 
-        let detached = frame.push_detached(TestContent("detached"), ProjectId(0));
-        assert!(frame.present_solo(detached));
-        frame.send_tile_to_workspace(detached, 0, true).unwrap();
-        assert_eq!(
-            frame.tile_membership(detached),
-            Some(TileMembership::Attached {
-                workspace: 0,
-                visibility: AttachedVisibility::Visible,
-            })
-        );
-
-        let foreign = frame.push_detached(TestContent("foreign"), ProjectId(1));
+        let foreign = frame.push_initial_workspace(TestContent("foreign"), ProjectId(1));
         assert_eq!(frame.send_tile_to_workspace(foreign, 0, true), Err(()));
-        assert_eq!(
-            frame.tile_membership(foreign),
-            Some(TileMembership::Detached)
-        );
+        assert_eq!(frame.workspace_index_of_window(foreign), Some(2));
         assert_eq!(frame.tile(foreign).unwrap().project(), ProjectId(1));
         assert_eq!(frame.validate_ownership(), Ok(()));
     }
@@ -4650,7 +4566,7 @@ mod tests {
     }
 
     #[test]
-    fn all_hidden_workspace_is_valid_and_detaching_hidden_clears_hidden_state() {
+    fn all_hidden_workspace_is_valid_and_solo_presentable() {
         let mut frame = Frame::with_initial(TestContent("only"), ProjectId(0));
         frame.workspaces[0].desktop.reconcile(&[1]);
         frame.hide_window(1).unwrap();
@@ -4658,11 +4574,10 @@ mod tests {
         assert_eq!(frame.workspaces[0].hidden_tiles.len(), 1);
         assert_eq!(frame.validate_ownership(), Ok(()));
         assert!(frame.present_solo(1));
-
-        frame.detach_window(1).unwrap();
-        assert!(frame.workspaces[0].hidden_tiles.is_empty());
-        assert_eq!(frame.tile_membership(1), Some(TileMembership::Detached));
-        assert_eq!(frame.presented_tile(), Some(SoloPresentation::Detached(1)));
+        assert_eq!(
+            frame.presented_tile(),
+            Some(SoloPresentation::HiddenAttached(1))
+        );
         assert_eq!(frame.validate_ownership(), Ok(()));
     }
 
@@ -4688,7 +4603,7 @@ mod tests {
     }
 
     #[test]
-    fn close_retires_tile_without_hiding_or_detaching_it() {
+    fn close_retires_tile_without_hiding_it() {
         let mut frame = Frame::with_initial(TestContent("keep"), ProjectId(0));
         let closing = frame
             .split_focused(SplitDir::V, TestContent("close"))
@@ -4696,7 +4611,7 @@ mod tests {
         assert_eq!(frame.close_focused(), Ok(Some(1)));
         assert_eq!(frame.tile_membership(closing), None);
         assert!(frame.workspaces[0].hidden_tiles.is_empty());
-        assert!(frame.detached_tiles.is_empty());
+        assert_eq!(frame.all_window_ids(), HashSet::from([1]));
         assert_eq!(frame.validate_ownership(), Ok(()));
     }
 
@@ -4715,39 +4630,31 @@ mod tests {
         frame.unhide_window(moving).unwrap();
         assert_eq!(frame.validate_ownership(), Ok(()));
 
-        frame.detach_window(moving).unwrap();
-        assert_eq!(frame.validate_ownership(), Ok(()));
-        frame.attach_detached(moving, 0).unwrap();
-        assert_eq!(frame.validate_ownership(), Ok(()));
-
         frame.push_initial_workspace(TestContent("target"), ProjectId(0));
         frame.set_active_workspace(0);
         frame.move_attached_to_workspace(moving, 1, false).unwrap();
         assert_eq!(frame.validate_ownership(), Ok(()));
+        let opened = frame.open_tile_in_project(TestContent("opened"), ProjectId(0));
+        assert_eq!(frame.workspace_index_of_window(opened), Some(0), "active workspace");
+        assert_eq!(frame.validate_ownership(), Ok(()));
         frame.close_workspace(1);
         assert_eq!(frame.validate_ownership(), Ok(()));
-        assert_eq!(
-            frame.tile_membership(moving),
-            Some(TileMembership::Detached)
-        );
-
-        frame.attach_detached(moving, 0).unwrap();
-        assert_eq!(frame.validate_ownership(), Ok(()));
+        assert_eq!(frame.tile_membership(moving), None);
+        assert_eq!(frame.workspace_index_of_window(opened), Some(0));
     }
 
     #[test]
     fn ownership_guard_rejects_each_illegal_domain_state() {
         let mut frame = Frame::with_initial(TestContent("anchor"), ProjectId(0));
-        frame.detached_tiles.push(DetachedTile::new(Window::new(
-            1,
-            ProjectId(0),
-            TestContent("duplicate"),
-        )));
+        frame.workspaces[0].hidden_tiles.push(HiddenTile::new(
+            Window::new(1, ProjectId(0), TestContent("duplicate")),
+            None,
+        ));
         assert_eq!(
             frame.validate_ownership(),
             Err(OwnershipViolation::DuplicateWindowId(1))
         );
-        frame.detached_tiles.clear();
+        frame.workspaces[0].hidden_tiles.clear();
 
         frame.workspaces[0].layout.find_leaf_mut(1).unwrap().project = ProjectId(1);
         assert!(matches!(
@@ -4756,13 +4663,6 @@ mod tests {
         ));
         frame.workspaces[0].layout.find_leaf_mut(1).unwrap().project = ProjectId(0);
 
-        frame.solo_presentation = Some(SoloPresentation::Detached(1));
-        assert_eq!(
-            frame.validate_ownership(),
-            Err(OwnershipViolation::SoloPresentationMismatch(
-                SoloPresentation::Detached(1)
-            ))
-        );
         frame.solo_presentation = Some(SoloPresentation::HiddenAttached(1));
         assert_eq!(
             frame.validate_ownership(),

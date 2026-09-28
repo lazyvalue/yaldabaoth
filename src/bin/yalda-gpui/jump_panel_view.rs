@@ -1944,7 +1944,7 @@ fn jump_tile_row_el(
     drag_font: SharedString,
     supporting_text: Hsla,
     // `Some(group)` makes this tile row drag-reorderable only within that exact
-    // workspace or Detached project/tag/untagged group (UXI-JumpPanel-28).
+    // workspace group (UXI-JumpPanel-28).
     tile_drag: Option<TileDragGroup>,
     cx: &mut Context<YaldaGpuiView>,
 ) -> AnyElement {
@@ -2051,7 +2051,7 @@ fn jump_session_row_el(
     supporting_text: Hsla,
     hidden_indicator: Option<AnyElement>,
     // `Some((tile WindowId, exact group))` makes this agent-backed tile row
-    // drag-reorderable within its workspace or Detached group
+    // drag-reorderable within its workspace group
     // (UXI-JumpPanel-28). Mutually exclusive with `allow_drag` (session-level
     // reorder), which is `false` in the tile context.
     tile_drag: Option<(workspace::WindowId, TileDragGroup)>,

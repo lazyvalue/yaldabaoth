@@ -4320,7 +4320,7 @@ impl YaldaGpuiView {
 
     /// Activate the workspace at `idx`. Mouse-click entry point from the workspace
     /// strip — no-ops if the index is out of range or already active, unless
-    /// a solo-presented Detached or hidden tile must be left.
+    /// a solo-presented hidden tile must be left.
     fn select_workspace(&mut self, idx: usize, cx: &mut Context<Self>) {
         if idx >= self.workspace.workspaces.len()
             || (idx == self.workspace.active_workspace && self.workspace.presented_tile().is_none())
@@ -6442,7 +6442,7 @@ impl YaldaGpuiView {
     }
 
     /// `UXI-Workspace-27` availability predicate: ordinary focus inside the
-    /// active workspace, never a solo-presented hidden/Detached tile.
+    /// active workspace, never a solo-presented hidden tile.
     fn focused_on_active_workspace(&self) -> bool {
         if self.workspace.presented_tile().is_some() {
             return false;
@@ -6604,8 +6604,7 @@ impl YaldaGpuiView {
         };
 
         // Selecting the active workspace is a no-op only for a tile already
-        // attached there. For a Detached tile, the active workspace is a valid
-        // destination and must attach it.
+        // visible there; a hidden tile of the active workspace is un-hidden.
         let focused_membership = self
             .workspace
             .focused_window_id()
@@ -6706,7 +6705,7 @@ impl YaldaGpuiView {
         }
         // The free-session listing lists from a cwd: use the current session's,
         // Free the current session (kept running in the store) and land the tile
-        // in the live in-tile selector — the same UI a Detached Agent tile shows
+        // in the live in-tile selector — the same UI an unbound Agent tile shows
         // (free sessions + "start new"). No bespoke overlay.
         self.release_focused_session_for_rebind();
         self.show_selector_on_focused_tile(cx);

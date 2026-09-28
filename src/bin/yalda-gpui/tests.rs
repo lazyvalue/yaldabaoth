@@ -705,13 +705,7 @@ fn preferences_round_trip_with_text_scale() {
             "Yaldabaoth\u{1f}workspace-3".into(),
             "Yaldabaoth\u{1f}workspace-1".into(),
         ]),
-        jump_tag_order: Some(std::collections::HashMap::from([(
-            "Yaldabaoth".to_string(),
-            vec!["urgent".to_string(), "frontend".to_string()],
-        )])),
-        jump_folded_tags: Some(vec!["Yaldabaoth\u{1f}frontend".into()]),
         jump_tile_order: Some(vec![30, 10, 20]),
-        jump_detached_tile_order: Some(vec![60, 40, 50]),
     };
     let json = serde_json::to_string(&prefs).unwrap();
     let back: Preferences = serde_json::from_str(&json).unwrap();
@@ -752,24 +746,8 @@ fn preferences_round_trip_with_text_scale() {
             ][..]
         )
     );
-    // UXI-JumpPanel-21: per-project tag order + folded-tag keys round-trip.
-    assert_eq!(
-        back.jump_tag_order
-            .as_ref()
-            .and_then(|m| m.get("Yaldabaoth"))
-            .map(|v| v.as_slice()),
-        Some(&["urgent".to_string(), "frontend".to_string()][..])
-    );
-    assert_eq!(
-        back.jump_folded_tags.as_deref(),
-        Some(&["Yaldabaoth\u{1f}frontend".to_string()][..])
-    );
     // UXI-JumpPanel-28: the tile drag order round-trips.
     assert_eq!(back.jump_tile_order.as_deref(), Some(&[30, 10, 20][..]));
-    assert_eq!(
-        back.jump_detached_tile_order.as_deref(),
-        Some(&[60, 40, 50][..])
-    );
 
     // Default (no zoom) is omitted from the serialized form.
     let bare = Preferences::default();
@@ -782,7 +760,11 @@ fn preferences_round_trip_with_text_scale() {
     assert_eq!(parsed.window_width_px, None);
     assert_eq!(parsed.window_height_px, None);
     assert_eq!(parsed.jump_workspace_order, None);
-    assert_eq!(parsed.jump_detached_tile_order, None);
+    assert_eq!(parsed.theme.as_deref(), Some("folio"));
+
+    // Removed Detached/tag-folder keys (ADR-0039) in an old file are ignored.
+    let removed = r#"{"theme":"folio","jump_detached_tile_order":[3],"jump_tag_order":{"p":["t"]},"jump_folded_tags":["p\u001ft"]}"#;
+    let parsed: Preferences = serde_json::from_str(removed).unwrap();
     assert_eq!(parsed.theme.as_deref(), Some("folio"));
 }
 
@@ -3569,7 +3551,6 @@ fn agent_menu_root_and_view_are_the_approved_items() {
             ("t".into(), "tag"),
             ("h".into(), "hide"),
             ("u".into(), "unhide"),
-            ("f".into(), "detach tile"),
             // agent-only session verbs
             ("r".into(), "rename session"),
             ("a".into(), "archive"),
@@ -3600,7 +3581,6 @@ fn agent_menu_root_and_view_are_the_approved_items() {
         ('t', "tile-tag"),
         ('h', "tile-hide"),
         ('u', "tile-unhide"),
-        ('f', "tile-detach"),
         ('r', "claude-rename"),
         ('a', "archive-session"),
     ] {
@@ -3625,7 +3605,6 @@ fn every_tile_menu_has_shared_tile_commands() {
         ("t", "tag", "tile-tag"),
         ("h", "hide", "tile-hide"),
         ("u", "unhide", "tile-unhide"),
-        ("f", "detach tile", "tile-detach"),
     ];
     for (name, menu) in [
         ("doc", doc_local_menu()),
@@ -4721,7 +4700,7 @@ fn agent_tile_persists_session_identity_not_index() {
 }
 
 #[test]
-fn attached_hidden_and_detached_tiles_snapshot_with_identity_tags_and_solo_focus() {
+fn attached_and_hidden_tiles_snapshot_with_identity_tags_and_solo_focus() {
     let mut projects = Projects::new();
     let cwd = std::env::temp_dir();
     let project = projects.ensure_at_cwd(cwd.clone(), "tmp");
@@ -4749,32 +4728,18 @@ fn attached_hidden_and_detached_tiles_snapshot_with_identity_tags_and_solo_focus
         .tags
         .insert("hidden-tag".into());
     assert!(frame.hide_window(hidden).is_ok());
-    let unbound = frame.push_detached(
-        App::Agent(AgentTile::Bound {
-            session: SessionId(2),
-            reopening: None,
-        }),
-        project,
-    );
-    frame
-        .tile_mut(unbound)
-        .unwrap()
-        .tags
-        .extend(["alpha".to_string(), "beta".to_string()]);
-    assert!(frame.present_solo(unbound));
+    assert!(frame.present_solo(hidden));
 
     let resolve = |id: SessionId| match id {
         SessionId(1) => Some(ServerSid::new("SID-A")),
         SessionId(3) => Some(ServerSid::new("SID-HIDDEN")),
-        SessionId(2) => Some(ServerSid::new("SID-B")),
         _ => None,
     };
     let snap = snapshot_workspace(&frame, &projects, &resolve);
     assert!(snap.tile_tags_migrated);
-    assert_eq!(snap.direct_unbound, Some(unbound));
     assert_eq!(
         snap.solo_presentation,
-        Some(PersistedSoloPresentation::Detached(unbound))
+        Some(PersistedSoloPresentation::HiddenAttached(hidden))
     );
     assert!(snap.scratchpad.is_empty());
     assert_eq!(snap.workspaces[0].hidden_tiles.len(), 1);
@@ -4784,18 +4749,10 @@ fn attached_hidden_and_detached_tiles_snapshot_with_identity_tags_and_solo_focus
             .previous_placement
             .is_some()
     );
-    assert_eq!(snap.detached_tiles.len(), 1);
-    assert_eq!(snap.detached_tiles[0].tile.id, unbound);
-    assert_eq!(
-        snap.detached_tiles[0].tile.tags,
-        workspace::TagSet::from(["alpha".to_string(), "beta".to_string()])
+    assert!(
+        !json_has_key(&serde_json::to_value(&snap).unwrap(), "detached_tiles"),
+        "no tile outside a workspace is ever written (ADR-0039)"
     );
-    match &snap.detached_tiles[0].tile.kind {
-        PersistedKind::Agent { session_id } => {
-            assert_eq!(session_id.as_ref().map(ServerSid::as_str), Some("SID-B"));
-        }
-        _ => panic!("unbound Agent kind must persist"),
-    }
     match &snap.workspaces[0].layout {
         PersistedLayout::Leaf(leaf) => {
             assert!(leaf.tags.contains("bound-tag"));
@@ -4836,27 +4793,18 @@ fn attached_hidden_and_detached_tiles_snapshot_with_identity_tags_and_solo_focus
     restored
         .insert_restored_hidden(0, hidden_window, hidden_placement)
         .unwrap();
-    let persisted_unbound = back.detached_tiles.remove(0);
-    let (window, unbound_agent) = restore_leaf(
-        &mut restored,
-        &Theme::default(),
-        persisted_unbound.tile,
-        project,
-    );
-    restored.next_window_id = restored.next_window_id.max(window.id() + 1);
-    restored.insert_restored_detached(window).unwrap();
     assert!(back.scratchpad.is_empty());
-    restored.present_solo(back.direct_unbound.unwrap());
+    let Some(PersistedSoloPresentation::HiddenAttached(solo)) = back.solo_presentation else {
+        panic!("hidden solo presentation must round-trip");
+    };
+    assert!(
+        restored.restore_solo_presentation(workspace::SoloPresentation::HiddenAttached(solo))
+    );
 
     assert_eq!(
         bound_agents,
         vec![(1, Some(ServerSid::new("SID-A")))],
         "bound Agent identity survives"
-    );
-    assert_eq!(
-        unbound_agent,
-        Some(Some(ServerSid::new("SID-B"))),
-        "unbound Agent identity survives"
     );
     assert_eq!(
         hidden_agent,
@@ -4870,14 +4818,22 @@ fn attached_hidden_and_detached_tiles_snapshot_with_identity_tags_and_solo_focus
             visibility: workspace::AttachedVisibility::Hidden,
         })
     );
-    assert_eq!(restored.presented_detached_tile_id(), Some(unbound));
+    assert_eq!(
+        restored.presented_tile(),
+        Some(workspace::SoloPresentation::HiddenAttached(hidden))
+    );
     assert!(restored.tile(1).unwrap().tags.contains("bound-tag"));
-    assert!(restored.tile(unbound).unwrap().tags.contains("beta"));
+    assert!(restored.tile(hidden).unwrap().tags.contains("hidden-tag"));
     assert!(
-        restored.alloc_window_id() > unbound,
-        "allocator advances beyond both ownership domains"
+        restored.alloc_window_id() > hidden,
+        "allocator advances beyond visible and hidden tiles"
     );
 }
+
+fn json_has_key(value: &serde_json::Value, key: &str) -> bool {
+    value.as_object().is_some_and(|map| map.contains_key(key))
+}
+
 #[test]
 fn all_hidden_workspace_persists_as_empty_without_inventing_a_tile() {
     let mut projects = Projects::new();
@@ -4912,31 +4868,36 @@ fn persisted_duplicate_agent_identity_keeps_session_cwd_project() {
     let mut projects = Projects::new();
     let correct_project = projects.ensure_at_cwd(correct_cwd.clone(), "correct");
     let wrong_project = projects.ensure_at_cwd(wrong_cwd, "wrong");
+    let sid = ServerSid::new("SID-CROSS-PROJECT");
+    // The same durable session persisted under two workspaces of different
+    // projects (corruption). The session's own cwd decides the survivor.
     let mut frame = workspace::Frame::with_initial(
-        App::Buffer(BufferApp::Picking(BrowserWindow::standalone(
-            correct_cwd.clone(),
-        ))),
+        App::Agent(AgentTile::dormant(sid.clone())),
+        wrong_project,
+    );
+    let correct = frame.push_initial_workspace(
+        App::Agent(AgentTile::dormant(sid.clone())),
         correct_project,
     );
-    let sid = ServerSid::new("SID-CROSS-PROJECT");
-    let wrong = frame.push_detached(App::Agent(AgentTile::dormant(sid.clone())), wrong_project);
-    let correct = frame.push_detached(App::Agent(AgentTile::dormant(sid.clone())), correct_project);
     let mut persisted = snapshot_workspace(&frame, &projects, &|_| None);
-    // Corruption may duplicate both the durable session and the stable tile id.
-    // Canonicalization therefore keys the concrete persisted occurrence, not id.
-    persisted.detached_tiles[0].tile.id = correct;
     let authoritative = HashMap::from([(sid.to_string(), correct_cwd.clone())]);
 
     let repair = heal_persisted_agent_ownership(&mut persisted, &authoritative, &correct_cwd);
 
-    assert_eq!(repair.removed_detached_duplicates, 1);
-    assert_eq!(persisted.detached_tiles.len(), 1);
-    assert_eq!(persisted.detached_tiles[0].tile.id, correct);
-    assert_ne!(persisted.detached_tiles[0].tile.id, wrong);
-    assert_eq!(
-        persisted.detached_tiles[0].project_cwd.as_deref(),
-        Some(correct_cwd.to_string_lossy().as_ref())
-    );
+    assert_eq!(repair.cleared_attached_duplicates, 1);
+    let session_of = |layout: &PersistedLayout| match layout {
+        PersistedLayout::Leaf(leaf) => match &leaf.kind {
+            PersistedKind::Agent { session_id } => session_id.clone(),
+            _ => None,
+        },
+        _ => None,
+    };
+    assert_eq!(session_of(&persisted.workspaces[0].layout), None, "wrong project cleared");
+    assert_eq!(session_of(&persisted.workspaces[1].layout), Some(sid));
+    match &persisted.workspaces[1].layout {
+        PersistedLayout::Leaf(leaf) => assert_eq!(leaf.id, correct),
+        _ => panic!("correct-project workspace keeps its leaf"),
+    }
 }
 
 #[test]
@@ -5278,13 +5239,7 @@ fn old_workspace_json_frame_loads_with_pre_rename_keys() {
         frame.active_workspace, 0,
         "the `active_tab` on-disk key maps to the renamed `active_workspace` field"
     );
-    assert_eq!(
-        frame.detached_tiles.len(),
-        1,
-        "legacy unbound tiles migrate to Detached"
-    );
-    assert_eq!(frame.detached_tiles[0].tile.id, 2);
-    assert_eq!(frame.direct_unbound, Some(2));
+    // Legacy `unbound_tiles` / `direct_unbound` are ignored (ADR-0039).
     assert_eq!(frame.scratchpad, vec![2]);
     assert!(frame.solo_presentation.is_none());
     assert!(frame.workspaces[0].hidden_tiles.is_empty());
@@ -5297,6 +5252,51 @@ fn old_workspace_json_frame_loads_with_pre_rename_keys() {
         vec![(1, 0, 0), (2, 1, 3)],
         "the nested workspace snapshot survives the frame rename"
     );
+}
+
+/// ADR-0039 / UXI-Workspace-30: a `workspace.json` written while Detached
+/// tiles existed (56 of them on Scott's machine) must still load — its
+/// workspaces intact, its Detached tiles and Detached solo target dropped —
+/// rather than failing to parse and losing the whole layout.
+#[test]
+fn legacy_detached_tiles_are_dropped_on_restore() {
+    let legacy = r#"{
+        "tabs": [
+            {
+                "auto_name": "workspace-1",
+                "display_name": "Main",
+                "focused_window": 1,
+                "layout": { "leaf": { "id": 1, "kind": "claude", "data": { "session_id": "SID-KEEP" } } },
+                "cwd": "/tmp"
+            }
+        ],
+        "active_tab": 0,
+        "detached_tiles": [
+            { "project_cwd": "/tmp",
+              "tile": { "id": 2, "kind": "claude", "data": { "session_id": "SID-DROP" } } }
+        ],
+        "solo_presentation": { "kind": "detached", "tile": 2 },
+        "tile_tags_migrated": true
+    }"#;
+
+    let frame: PersistedFrame =
+        serde_json::from_str(legacy).expect("a legacy frame with Detached tiles must still load");
+
+    assert_eq!(frame.workspaces.len(), 1);
+    assert_eq!(frame.workspaces[0].display_name.as_deref(), Some("Main"));
+    assert_eq!(
+        frame.solo_presentation,
+        Some(PersistedSoloPresentation::Detached(2)),
+        "the legacy target parses (and restore maps it to no presentation)"
+    );
+    let rewritten = serde_json::to_value(&frame).unwrap();
+    assert!(
+        rewritten.get("detached_tiles").is_none(),
+        "the next save writes no Detached tiles"
+    );
+    let text = rewritten.to_string();
+    assert!(text.contains("SID-KEEP"));
+    assert!(!text.contains("SID-DROP"), "the Detached tile is dropped");
 }
 
 /// A camera whose `zoom` string is unknown to this binary (a value from a NEWER
