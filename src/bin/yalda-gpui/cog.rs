@@ -176,30 +176,96 @@ struct TopicFolderBuilder {
     bindings: Vec<CogTopicBinding>,
 }
 
+/// Per-folder subfolder holding finished graphs (UXI-Cog-21). Collapsed by
+/// default; the glyph + space keep it from colliding with a real Topic path.
+pub(crate) const DONE_GRAPHS_FOLDER: &str = "✓ done";
+
 impl TopicFolderBuilder {
-    fn finish(self, parent: &str) -> Vec<CogTopicNode> {
+    /// A folder is finished when its subtree binds at least one graph and every
+    /// graph in it is done — so a project-style `name::plan` + `name::chat`
+    /// folder retires into its parent's `✓ done` along with its plan.
+    fn is_finished(&self, done: &BTreeSet<String>) -> bool {
+        fn walk(folder: &TopicFolderBuilder, done: &BTreeSet<String>, any: &mut bool) -> bool {
+            for b in folder.bindings.iter().filter(|b| b.kind == CogTopicKind::Graph) {
+                *any = true;
+                if !done.contains(&b.object) {
+                    return false;
+                }
+            }
+            folder.folders.values().all(|f| walk(f, done, any))
+        }
+        let mut any = false;
+        walk(self, done, &mut any) && any
+    }
+
+    fn finish(self, parent: &str, done: &BTreeSet<String>) -> Vec<CogTopicNode> {
+        let child_path = |label: &str| {
+            if parent.is_empty() {
+                label.to_string()
+            } else {
+                format!("{parent}/{label}")
+            }
+        };
+        // Everything under a `✓ done` folder is finished already; group no further.
+        let inside_done = parent.split('/').any(|part| part == DONE_GRAPHS_FOLDER);
         let mut nodes = Vec::new();
+        let mut finished_nodes = Vec::new();
         let mut folders: Vec<_> = self.folders.into_iter().collect();
         folders.sort_by(|(a, _), (b, _)| a.to_lowercase().cmp(&b.to_lowercase()));
         for (label, folder) in folders {
-            let path = if parent.is_empty() {
-                label.clone()
+            let finished = !inside_done && folder.is_finished(done);
+            let path = if finished {
+                // Keyed under the done folder so its own fold state is distinct.
+                format!("{}/{label}", child_path(DONE_GRAPHS_FOLDER))
             } else {
-                format!("{parent}/{label}")
+                child_path(&label)
             };
-            nodes.push(CogTopicNode::Folder {
+            let node = CogTopicNode::Folder {
                 label,
-                children: folder.finish(&path),
+                children: folder.finish(&path, done),
                 path,
-            });
+            };
+            if finished {
+                finished_nodes.push(node);
+            } else {
+                nodes.push(node);
+            }
         }
-        let mut bindings = self.bindings;
-        bindings.sort_by(|a, b| {
+        // Graphs: open ones first, newest binding first; finished ones in a
+        // collapsed-by-default `✓ done` subfolder (UXI-Cog-21). Other kinds
+        // keep their alphabetical order.
+        let (graphs, mut others): (Vec<_>, Vec<_>) = self
+            .bindings
+            .into_iter()
+            .partition(|b| b.kind == CogTopicKind::Graph);
+        let newest_first = |a: &CogTopicBinding, b: &CogTopicBinding| {
+            b.created_at.cmp(&a.created_at).then_with(|| {
+                topic_leaf_label(a)
+                    .to_lowercase()
+                    .cmp(&topic_leaf_label(b).to_lowercase())
+            })
+        };
+        let (mut finished, mut open): (Vec<_>, Vec<_>) = graphs
+            .into_iter()
+            .partition(|b| !inside_done && done.contains(&b.object));
+        open.sort_by(newest_first);
+        finished.sort_by(newest_first);
+        others.sort_by(|a, b| {
             topic_leaf_label(a)
                 .to_lowercase()
                 .cmp(&topic_leaf_label(b).to_lowercase())
         });
-        nodes.extend(bindings.into_iter().map(CogTopicNode::Binding));
+        nodes.extend(open.into_iter().map(CogTopicNode::Binding));
+        nodes.extend(others.into_iter().map(CogTopicNode::Binding));
+        if !finished.is_empty() || !finished_nodes.is_empty() {
+            let mut children = finished_nodes;
+            children.extend(finished.into_iter().map(CogTopicNode::Binding));
+            nodes.push(CogTopicNode::Folder {
+                label: DONE_GRAPHS_FOLDER.to_string(),
+                path: child_path(DONE_GRAPHS_FOLDER),
+                children,
+            });
+        }
         nodes
     }
 }
@@ -212,6 +278,15 @@ pub(crate) struct CogTopicTree {
 
 impl CogTopicTree {
     pub(crate) fn from_bindings(bindings: Vec<CogTopicBinding>) -> Self {
+        Self::from_bindings_with_done(bindings, &BTreeSet::new())
+    }
+
+    /// As [`from_bindings`](Self::from_bindings), grouping the graphs whose id
+    /// is in `done` into each folder's `✓ done` subfolder (UXI-Cog-21).
+    pub(crate) fn from_bindings_with_done(
+        bindings: Vec<CogTopicBinding>,
+        done: &BTreeSet<String>,
+    ) -> Self {
         let mut root = TopicFolderBuilder::default();
         let mut seen = BTreeSet::new();
         for binding in bindings {
@@ -228,7 +303,7 @@ impl CogTopicTree {
             folder.bindings.push(binding);
         }
         Self {
-            roots: root.finish(""),
+            roots: root.finish("", done),
         }
     }
 
@@ -906,11 +981,9 @@ fn cog_json<T: serde::de::DeserializeOwned>(args: &[&str]) -> Result<T, String> 
         .map_err(|e| format!("parsing `cog {}` output failed: {e}", args.join(" ")))
 }
 
-/// List every graph (`cog graph list`).
+/// List every graph (`cog graph list`), in the server's creation order.
 pub(crate) fn list_graphs() -> Result<Vec<CogGraph>, String> {
-    let mut graphs: Vec<CogGraph> = cog_json(&["graph", "list"])?;
-    graphs.sort_by(|a, b| a.label().to_lowercase().cmp(&b.label().to_lowercase()));
-    Ok(graphs)
+    cog_json(&["graph", "list"])
 }
 
 /// List every live hierarchical Topic binding. The empty prefix is the public
@@ -923,8 +996,78 @@ pub(crate) fn list_topic_bindings() -> Result<Vec<CogTopicBinding>, String> {
     Ok(bindings)
 }
 
+/// Topic-tree folder holding graphs that no Topic binds (UXI-Cog-20). The
+/// space keeps it from colliding with a real Topic path.
+pub(crate) const UNFILED_GRAPHS_FOLDER: &str = "unfiled graphs";
+
+/// Append one synthetic Graph binding per graph that no live Topic binds, under
+/// [`UNFILED_GRAPHS_FOLDER`], so every graph is reachable from Home. The
+/// synthetic address is stable (`unfiled graphs::<graph id>`); opening it uses
+/// `object` (the graph id) exactly like a real graph binding.
+pub(crate) fn with_unfiled_graphs(
+    mut bindings: Vec<CogTopicBinding>,
+    graphs: &[CogGraph],
+) -> Vec<CogTopicBinding> {
+    let bound: BTreeSet<&str> = bindings
+        .iter()
+        .filter(|b| b.kind == CogTopicKind::Graph)
+        .map(|b| b.object.as_str())
+        .collect();
+    let unfiled: Vec<CogTopicBinding> = graphs
+        .iter()
+        .enumerate()
+        .filter(|(_, g)| !bound.contains(g.id.as_str()))
+        .map(|(position, g)| CogTopicBinding {
+            address: format!("{UNFILED_GRAPHS_FOLDER}::{}", g.id),
+            kind: CogTopicKind::Graph,
+            object: g.id.clone(),
+            name: g.name.clone(),
+            // `cog graph list` is creation-ordered; its position stands in for
+            // a creation time so the newest unfiled graph sorts first.
+            created_at: position as i64,
+        })
+        .collect();
+    bindings.extend(unfiled);
+    bindings
+}
+
+/// Graph ids known finished. `complete` is effectively terminal, so a finished
+/// id is cached for the process lifetime and Home reloads (one per Cog event)
+/// only re-query the few graphs still open.
+static DONE_GRAPH_CACHE: std::sync::Mutex<BTreeSet<String>> =
+    std::sync::Mutex::new(BTreeSet::new());
+
+/// The ids among `graphs` that are finished: sealed, or `cog graph status`
+/// reports `complete`. A status query failure counts as open.
+fn done_graph_ids(graphs: &[CogGraph]) -> BTreeSet<String> {
+    let mut cache = DONE_GRAPH_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    for graph in graphs {
+        if cache.contains(&graph.id) {
+            continue;
+        }
+        let finished = graph.sealed
+            || cog_json::<CogGraphStatus>(&["graph", "status", &graph.id])
+                .is_ok_and(|s| s.status == "complete");
+        if finished {
+            cache.insert(graph.id.clone());
+        }
+    }
+    graphs
+        .iter()
+        .filter(|g| cache.contains(&g.id))
+        .map(|g| g.id.clone())
+        .collect()
+}
+
 pub(crate) fn list_topics() -> Result<CogTopicTree, String> {
-    Ok(CogTopicTree::from_bindings(list_topic_bindings()?))
+    let bindings = list_topic_bindings()?;
+    // A graph-list failure must not hide the Topics that did load.
+    let graphs = list_graphs().unwrap_or_default();
+    let done = done_graph_ids(&graphs);
+    Ok(CogTopicTree::from_bindings_with_done(
+        with_unfiled_graphs(bindings, &graphs),
+        &done,
+    ))
 }
 
 pub(crate) fn load_home() -> Result<CogHomeData, String> {
