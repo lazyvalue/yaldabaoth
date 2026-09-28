@@ -46,10 +46,16 @@ clip, no horizontal scroll), with the caret on the row `caret_visual_row` picks.
 The small/virtualized decision keys on TOTAL VISUAL rows so a long wrapped line
 can't overflow the un-scrolled small box. This **retired the compose's
 horizontal-scroll window** (`spec-chatbox-caret-containment.md` horizontal axis);
-the vertical caret-containment is kept.
+the vertical caret-containment is kept. **D13 (2026-09-27):** the LAST visual row
+of a line reserves the caret's column (holds ≤ width−1 columns; a tail that would
+exactly fill it wraps, leaving an empty row after a hard break), so a caret at
+end-of-line on a full row paints inside the box instead of one column past it.
+Caret-independent, so rows never jump as the caret moves.
 
 **Enforcement.** Headless: `wrap_line_cols_word_wraps_and_covers_every_char`
-(wraps, hard-breaks, covers every char, ≥1 row, makes progress) +
+(wraps, hard-breaks, covers every char, ≥1 row, makes progress, last row keeps a
+free caret column) + `compose_eol_caret_on_full_wrapped_row_paints_inside_box`
+(D13: painted EOL caret inside a whole-column narrow box) +
 `caret_visual_row_places_caret_on_a_rendered_row` (caret always on a rendered
 row). `verify_harness.rs::worksheet_r_first_paint_uses_transcript_width` drives
 the real `r` reply path and asserts from painted geometry that a newly opened,

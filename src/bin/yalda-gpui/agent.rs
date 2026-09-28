@@ -1641,6 +1641,14 @@ pub(crate) fn build_chatbox_line(
 /// (nothing dropped — the caret must be addressable at every column), always ≥1
 /// row (an empty line → one `(0, 0)` row). `width == 0` is treated as 1.
 ///
+/// D13 — the LAST row reserves the caret's column: it holds at most
+/// `width - 1` columns, so a caret at end-of-line (one past the last char)
+/// still paints inside the box. A tail that would exactly fill the last row is
+/// wrapped like any other full row, which leaves a final EMPTY `(n, n)` row for
+/// the EOL caret (after a hard break) — a non-last row never needs this: a
+/// caret at its end column belongs to the NEXT row's start. The reservation is
+/// caret-independent, so the row layout never jumps as the caret moves.
+///
 /// Computed here (not in GPUI layout) because the compose is monospace and the
 /// box width in columns is known — so the caret's visual row/col stay exactly
 /// known (view-owns-its-coordinates), and UXI-TextEditing-1 holds without measuring the
@@ -1655,8 +1663,11 @@ pub(crate) fn wrap_line_cols(line: &[char], width: usize) -> Vec<(usize, usize)>
     }
     let mut rows = Vec::new();
     let mut start = 0;
-    while start < n {
-        if n - start <= width {
+    loop {
+        // The tail fits AND leaves the reserved caret column free → last row.
+        // (`start == n` lands here too: the empty row an EOL caret sits on
+        // after a full hard-broken row.)
+        if n - start < width {
             rows.push((start, n));
             break;
         }

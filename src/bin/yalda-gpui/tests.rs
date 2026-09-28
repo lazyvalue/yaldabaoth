@@ -1844,8 +1844,15 @@ fn wrap_line_cols_word_wraps_and_covers_every_char() {
     assert_eq!(w("the quick brown", 9), vec!["the ", "quick ", "brown"]);
     // A word longer than the width is hard-broken at the column limit.
     assert_eq!(w("abcdefgh", 3), vec!["abc", "def", "gh"]);
-    // width 1 still makes progress (no infinite loop).
-    assert_eq!(w("ab", 1), vec!["a", "b"]);
+    // width 1 still makes progress (no infinite loop); the full last row
+    // leaves an empty row for the EOL caret (D13).
+    assert_eq!(w("ab", 1), vec!["a", "b", ""]);
+    // D13: the LAST row reserves the caret column — a tail that would exactly
+    // fill it wraps, so an EOL caret never paints past the box.
+    assert_eq!(w("hello", 5), vec!["hello", ""]);
+    assert_eq!(w("abcdef", 3), vec!["abc", "def", ""]);
+    assert_eq!(w("ab cd", 5), vec!["ab ", "cd"]);
+    assert_eq!(w("hell", 5), vec!["hell"], "a tail one short of full keeps one row");
 
     // Coverage: every wrapped row is contiguous and the rows tile the line.
     for (s, width) in [
@@ -1863,10 +1870,13 @@ fn wrap_line_cols_word_wraps_and_covers_every_char() {
                 "rows are contiguous (no dropped char)"
             );
         }
-        for &(a, b) in &rows {
-            assert!(b > a || chars.is_empty(), "each row makes progress");
+        let last = rows.len() - 1;
+        for (i, &(a, b)) in rows.iter().enumerate() {
+            assert!(b > a || i == last, "each non-final row makes progress");
             assert!(b - a <= width.max(1), "no row exceeds the wrap width");
         }
+        let (a, b) = rows[last];
+        assert!(b - a < width.max(1), "the last row keeps a free column for the EOL caret");
     }
 }
 
@@ -1971,6 +1981,16 @@ fn chatbox_caret_cell_stays_in_window_for_every_edit_path() {
                 assert!(
                     caret_vrow >= top && caret_vrow < top + rows,
                     "[{label}] caret visual row {caret_vrow} escaped window top={top} (rows={rows}, cols={cols})",
+                );
+                let chars: Vec<char> = lines[cur.line].chars().collect();
+                let wrapped = wrap_line_cols(&chars, cols);
+                let (rs, _) = wrapped[caret_visual_row(&wrapped, col)];
+                // The caret column must fit inside the box: the row's cells before
+                // the caret plus the caret cell itself ≤ cols (D13).
+                let cells_before = col.min(chars.len()) - rs;
+                assert!(
+                    cells_before < cols.max(1),
+                    "[{label}] caret col {col} paints at cell {cells_before} of a {cols}-col row (past the box)",
                 );
             }
         }

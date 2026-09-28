@@ -31989,3 +31989,80 @@ fn compose_idle_render_does_not_rebuild_lines(cx: &mut TestAppContext) {
     });
     assert_eq!(lines.as_deref().map(|l| l.as_slice()), Some(&["recalled".to_string()][..]));
 }
+
+// ── Q4 compose (text-editing review D11–D15, E4) ──────────────────────────────
+
+/// Paint the chatbox compose seeded with `text` (caret at `(line, col)`, mode
+/// `mode`) and return `(caret probe, compose inner bounds)`. Settles several
+/// frames first so the box's measured width feeds `visible_cols`.
+fn q4_paint_compose_caret(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+    text: &str,
+    line: usize,
+    col: usize,
+    mode: crate::EditMode,
+) -> (Option<(f32, f32, f32, f32)>, (f32, f32, f32, f32)) {
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        let tb = c.input_surface.compose_mut();
+        tb.reset_to(text);
+        tb.editor.cursor_mut().line = line;
+        tb.editor.cursor_mut().col = col;
+        tb.mode = mode;
+    });
+    for _ in 0..3 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let caret = crate::layout_probe_get("caret");
+    crate::layout_probe_end();
+    let bounds = view
+        .update(vcx, |v, cx| v.agent_read(cx, |c| c.input_surface.compose().bounds.get()))
+        .expect("agent");
+    (caret, bounds)
+}
+
+/// D13 (text-editing review): a caret at END-OF-LINE on a wrapped row that is
+/// already FULL (`visible_cols` chars) must paint INSIDE the compose box — the
+/// last row reserves the caret's column (a full last row wraps the EOL caret
+/// onto a fresh row). Drives the real chatbox render in a NARROW window (so
+/// the 8px-vs-advance slack can't hide the overflow) and reads the PAINTED
+/// caret cell against the box's measured inner right edge.
+///
+/// Negative control (observed RED): restore `wrap_line_cols`'s last-row fit
+/// test to `n - start <= width` (no reserved caret column) → the EOL caret
+/// paints one column past the box's right edge.
+#[gpui::test]
+fn compose_eol_caret_on_full_wrapped_row_paints_inside_box(cx: &mut TestAppContext) {
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
+    vcx.simulate_resize(gpui::size(px(560.0), px(600.0)));
+    vcx.run_until_parked();
+    // First paint measures the box; derive its column budget exactly as the
+    // render does.
+    let (_, b0) = q4_paint_compose_caret(&view, vcx, "x", 0, 1, crate::EditMode::Insert);
+    // Shrink the window by the box's fractional column so its width is an EXACT
+    // multiple of CHATBOX_CHAR_W — no spare pixels to absorb a spilled caret.
+    let spare = b0.2 % crate::CHATBOX_CHAR_W;
+    vcx.simulate_resize(gpui::size(px(560.0 - spare), px(600.0)));
+    vcx.run_until_parked();
+    let (_, b0) = q4_paint_compose_caret(&view, vcx, "x", 0, 1, crate::EditMode::Insert);
+    assert!(b0.2 % crate::CHATBOX_CHAR_W < 0.01, "box is a whole number of columns: {b0:?}");
+    let cols = (b0.2 / crate::CHATBOX_CHAR_W).floor() as usize;
+    assert!(cols >= 4 && cols < 60, "non-vacuous narrow box: {cols} cols ({b0:?})");
+    // Two FULL rows of an unbreakable word, caret at EOL (Insert).
+    let text: String = "a".repeat(cols * 2);
+    let (caret, b) = q4_paint_compose_caret(&view, vcx, &text, 0, cols * 2, crate::EditMode::Insert);
+    let (cx0, _, cw, _) = caret.expect("EOL caret must paint");
+    let right = b.0 + b.2;
+    assert!(
+        cx0 + cw <= right + 0.5,
+        "EOL caret cell [{cx0}, {}] paints past the compose box's right edge {right} ({cols} cols)",
+        cx0 + cw
+    );
+    assert!(cx0 >= b.0 - 0.5, "caret {cx0} left of the box {}", b.0);
+}
