@@ -1417,22 +1417,17 @@ impl TranscriptView {
                         };
                         let uses_line_hits = block_hits.is_some();
                         let ctx = RenderCtx {
-                            theme: &theme_snap,
-                            body_font: body_font_snap.clone(),
-                            code_font: code_font_snap.clone(),
-                            // UXI-TextZoom-1: markdown blocks (headings/code/tables) in
-                            // the transcript scale with zoom, like the doc view.
-                            text_scale,
-                            cursor_block: None,
-                            doc_selection: None,
-                            line_layouts: None,
-                            current_block: None,
-                            weak_view: None,
-                            doc_dir: None,
-                            block_count: 0,
                             show_heading_markers,
                             block_hits,
                             diagrams: Some(diagrams_snap.clone()),
+                            // UXI-TextZoom-1: markdown blocks (headings/code/tables) in
+                            // the transcript scale with zoom, like the doc view.
+                            ..RenderCtx::new(
+                                &theme_snap,
+                                body_font_snap.clone(),
+                                code_font_snap.clone(),
+                                text_scale,
+                            )
                         };
                         let inner = block_inner(&ctx, rendered_block);
                         // UXI-ParagraphSpacing-1: base 4px plus HALF the readability

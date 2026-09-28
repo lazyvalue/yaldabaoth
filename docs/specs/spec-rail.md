@@ -172,27 +172,18 @@ Navigating into a directory updates the rail's `FileBrowser` in place
 (same as the existing browser tile). The rail's directory state is
 independent of any `BrowserWindow` that might exist in the split tree.
 
-#### 13 · Outline rail content [DRAFT]
+#### 13 · Outline rail content
 
-Derives a flat list of `(depth, heading_text, block_index)` from the
-focused window's content:
+Behavior is specified by `UXI-Rail-1..5` in `docs/components/rail.md`.
+Entries (`workspace::OutlineEntry { level, text, line, block }`) come from
+`yalda::render::outline` over the focused buffer's text; a Doc maps each heading
+line to its block through the Doc's source spans (`DocState.spans`). A
+string-backed Doc with no source falls back to its top-level heading blocks.
+Agent/Browser tiles have no outline ("(no outline)").
 
-- `WindowContent::Doc(d)` → walk `d.blocks`, collect
-  `RenderedBlock::Heading { level, .. }` entries.
-- `WindowContent::Edit(e)` → scan the rope for ATX heading lines
-  (`^#{1,6}\s`). Cheaper than a full pulldown-cmark parse; good enough
-  for an outline.
-- `WindowContent::Agent(_)` / `WindowContent::Browser(_)` → empty
-  outline. The rail renders a "(no outline)" placeholder.
-
-Selecting a heading scrolls the focused Doc view to that block
-(`scroll_handle.scroll_to_item(block_index)`) or the Edit view to that
-line.
-
-The outline re-derives on every render frame where the focused window
-changed (new `focused: WindowId` or content mutation). Derivation is
-O(n) in block/line count — fast enough for documents up to tens of
-thousands of lines.
+The rail re-derives entries when the focused window or its content version
+changes and, every frame, tracks the section the cursor is in (`current`). The
+rows render as a virtualized `uniform_list` sized to the rail.
 
 ### Persistence
 

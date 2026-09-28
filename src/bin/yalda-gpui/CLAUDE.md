@@ -101,7 +101,8 @@ so items stay crate-visible regardless of file):
   branches on that, each screen with its own `key_context` (`YaldaView`,
   `EditView`, `BrowserView`, `AgentView`) and its own `on_action` wiring.
 - `screens.rs` — the screen render bodies: `render_doc`, `render_edit`
-  (Code + WP), `render_agent`, `render_browser`.
+  (Code + WP), `render_agent`, `render_browser` (the Doc and Edit bodies are
+  cached child views; these own the chrome around them).
 - `agent.rs` — agent-tile data layer: tool-call model, `FlatItem` view model
   + S1 cache + `rebuild_agent_view_model`, `TurnPhase`, `AgentState`,
   `AgentSession`, `AgentTile`.
@@ -121,6 +122,14 @@ so items stay crate-visible regardless of file):
   dispatch; browser nav + rail). `edit_view.rs` — `EditBodyView`, the cached
   yux body of an Editing tile (Code + WP rows, gutter, caret reveal; the
   `DiffView` root-observed shape, fingerprint `EditSeqs`).
+- `doc.rs` / `doc_ui.rs` / `doc_view.rs` — the `Viewing` (rendered markdown)
+  Doc. `doc.rs` = `DocState` + `DocSource` (blocks, block cursor, the block
+  list — reconciled at the mutation site `set_blocks`); `doc_ui.rs` = root
+  methods (block nav, `refresh_painted_docs` run from the root's
+  self-observe, mouse selection + copy, `handle_doc_key`); `doc_view.rs` =
+  `DocView`, the cached yux body (root-observed, fingerprint `DocSeqs`).
+  `screens.rs::render_doc` keeps the header/footer/action wiring and the
+  mouse-selection listeners on the uncached wrapper.
 - `render_blocks.rs` — free render helpers for the markdown doc/transcript
   path: colors/fonts, styled-line/block/table elements, wiki links.
 - `linear.rs` / `linear_ui.rs` / `linear_view.rs` — `App::Linear`: the Linear

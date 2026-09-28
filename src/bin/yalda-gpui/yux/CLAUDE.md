@@ -75,6 +75,12 @@ style bundle so a caller themes once:
   compose box). All methods take `&self` (interior-mutable), so a `&self` render
   path reconciles fine. `reconcile(items, seq)` is gated on `seq` (idle frames
   are no-ops). Consume via `.state()` (paint/reveal/scroll) + `.len()`.
+  **`land(top, focus)`** parks a scroll position for a not-yet-populated list
+  (applied by the first non-empty `reconcile`); **`settle()`** — call from render
+  after reconcile — re-reveals `focus` against the previous frame's layout and
+  returns `true` while another frame is needed (schedule it with
+  `cx.defer(move |app| app.notify(id))`, never a notify in render). Used to carry
+  the reading position across the Doc ⇄ Edit swap (UXI-Buffer-4/5).
 - **`splice_list_to_items(&ListState, old, new)`** — the bare splice primitive,
   unit-testable against a raw `ListState`. The agent transcript's
   `TranscriptScroll` reconciles by item COUNT (streaming tail + follow-output),
@@ -96,12 +102,30 @@ style bundle so a caller themes once:
   clear the cell at the top of each render. Used by the transcript's inline
   You-block (`YouBlockView`, D11).
 
+### `typography.rs` — the one type scale
+- **`TypeScale` / `TYPE_SCALE`** — the typography tokens for the markdown
+  reading/writing surfaces: body/code/label sizes, heading sizes h1–h6,
+  heading leading (`heading_leading()`, relative to the heading size) and
+  space-above, the base block gap (the `PARAGRAPH_GAP_PX` readability gap is
+  added to it), the Doc reading measure (`measure_ch` = 72ch), and the list
+  marker gutter (`list_gutter(widest_marker_chars, zoom)`). Values are at 1×;
+  multiply by `text_scale`. The Doc view (`render_blocks.rs`) and the WP editor
+  (`edit_view.rs`) both size headings from it — never hard-code a heading size.
+  Spec: `docs/components/common/typography.md`.
+
 ## Efficiency practices (non-negotiable)
 
 1. **O(changed), never O(whole tree).** An expensive surface that is usually
    stable while you interact elsewhere is its own cached view entity embedded
    with `cached_child`. The reference consumers are `transcript_view.rs`
-   (`TranscriptView`) and `linear_view.rs` (`LinearView`).
+   (`TranscriptView`, observes its session entity) and `linear_view.rs`
+   (`LinearView`); the ROOT-observed shape — for state that lives in the
+   workspace tree, not an entity — is `diff_view.rs` (`DiffView`),
+   `edit_view.rs` (`EditBodyView`, fingerprint `EditSeqs`) and `doc_view.rs`
+   (`DocView`, fingerprint `DocSeqs`). The Edit/Doc bodies are lazily created
+   by their screen render, touched every frame (`let _ = body.read(cx)`, so
+   their self-notifies reach a redraw), and their derived state (Doc blocks,
+   list reconcile) is updated on the mutation/effect path, never in render.
 2. **Never call `cx.notify()` inside a `render()`/build path.** A notify issued
    mid-draw is *parked* — no effect that frame, no scheduled redraw. Notify only
    from event handlers, `cx.observe` callbacks, timers, or `cx.defer`.

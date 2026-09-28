@@ -100,9 +100,19 @@ fn diagram_display_width(bytes: &[u8]) -> f32 {
 #[derive(Default)]
 pub(crate) struct DiagramCache {
     entries: HashMap<u64, DiagramRender>,
+    /// Bumped whenever an entry SETTLES (ready / failed) — the render input a
+    /// cached markdown surface fingerprints (`DocSeqs::diagrams`) so a
+    /// completed diagram repaints it. `Pending` doesn't bump: it paints the
+    /// same placeholder as a missing entry.
+    generation: u64,
 }
 
 impl DiagramCache {
+    /// Monotonic count of settled renders (see `generation`).
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub(crate) fn get(&self, key: u64) -> Option<&DiagramRender> {
         self.entries.get(&key)
     }
@@ -112,6 +122,9 @@ impl DiagramCache {
     }
 
     fn set(&mut self, key: u64, state: DiagramRender) {
+        if !matches!(state, DiagramRender::Pending) {
+            self.generation = self.generation.wrapping_add(1);
+        }
         self.entries.insert(key, state);
     }
 

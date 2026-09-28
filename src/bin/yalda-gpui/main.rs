@@ -85,8 +85,13 @@ mod diff_git;
 mod diff_model;
 mod diff_ui;
 mod diff_view;
+mod doc;
+mod doc_fold;
+mod doc_ui;
+mod doc_view;
 mod edit_ui;
 mod edit_view;
+mod file_sync;
 mod highlight_cache;
 mod jump_palette;
 mod jump_panel_view;
@@ -97,6 +102,7 @@ mod keymap_view;
 mod linear;
 mod linear_ui;
 mod linear_view;
+mod md_image;
 mod persist;
 mod project;
 mod render_blocks;
@@ -110,6 +116,9 @@ mod transcript_view;
 mod you_block_view;
 #[cfg(test)]
 mod verify_harness;
+/// Headless guards for the markdown view/edit experience (graph 4f1).
+#[cfg(test)]
+mod md_harness;
 /// yux — reusable UX component layer (cached-view infra + view primitives).
 /// All UX work is built from here; see `yux/CLAUDE.md`.
 mod yux;
@@ -125,7 +134,11 @@ pub(crate) use diff::*;
 pub(crate) use diff_git::*;
 pub(crate) use diff_model::*;
 pub(crate) use diff_view::*;
+pub(crate) use doc::*;
+pub(crate) use doc_fold::*;
+pub(crate) use doc_view::*;
 pub(crate) use edit_view::*;
+pub(crate) use file_sync::*;
 pub(crate) use jump_palette::*;
 pub(crate) use jump_panel_view::*;
 pub(crate) use keymap_registry::*;
@@ -133,6 +146,7 @@ pub(crate) use keymap_tile::*;
 pub(crate) use keymap_view::*;
 pub(crate) use linear::*;
 pub(crate) use linear_view::*;
+pub(crate) use md_image::*;
 pub(crate) use persist::*;
 pub(crate) use project::*;
 pub(crate) use render_blocks::*;
@@ -166,7 +180,9 @@ pub(crate) use gpui::{
 };
 
 pub(crate) use yalda::acp_channel::{AcpChannelClient, AgentProvider, ReplyEvent, YaldaFrontend};
-pub(crate) use yalda::blocks::{ColumnAlignment, ListItem, RenderedBlock, StyledLine, StyledSpan};
+pub(crate) use yalda::blocks::{
+    ColumnAlignment, ListItem, Rendered, RenderedBlock, SourceSpan, StyledLine, StyledSpan,
+};
 pub(crate) use yalda::cursor::CursorPos;
 pub(crate) use yalda::document::Document;
 pub(crate) use yalda::editor::{EditAccess, Editor, EditorCore, EditorView, LineAnchor};
@@ -227,6 +243,13 @@ actions!(
         CursorPrevBlock,
         CursorTop,
         CursorBottom,
+        // Toggle a task checkbox of the focused Doc block (UXI-Buffer-12).
+        ToggleTask,
+        NextHeading,
+        PrevHeading,
+        ToggleFold,
+        FoldAll,
+        UnfoldAll,
         OpenBrowser,
         EnterEdit,
         EnterWp,
@@ -758,176 +781,6 @@ pub(crate) fn menu_trail_crumbs(
 // Root view
 // ----------------------------------------------------------------------------
 
-/// State held while the user is viewing a rendered markdown document.
-struct DocState {
-    /// The rendered blocks, shared by pointer with the `'static` list render
-    /// closure (`blocks_rc`) — a re-parse swaps the `Rc`, never deep-clones
-    /// (C3). Replaced only via `set_blocks`.
-    blocks: Rc<Vec<RenderedBlock>>,
-    file_label: SharedString,
-    cursor_block: usize,
-    /// Variable-height virtualized list driving the doc body. Only the visible
-    /// block window is built/laid-out per frame (not one element per block), so
-    /// render is O(visible). j/k/g/G/ctrl-d/u nav reveals the focused block via
-    /// `scroll_to_reveal_item`. Reconciled by splicing the changed block range
-    /// (never `reset()`) so scroll stays anchored across a live edit-flush — see
-    /// `ScrollAnchoredList`. Gated on `blocks_seq` (the `reconcile`'s version).
-    list: ScrollAnchoredList<RenderedBlock>,
-    /// Monotonic version of `blocks`, bumped by `set_blocks` on every
-    /// reassignment. Plays the role `Document.edit_seq` plays for
-    /// `EditState.lines_cache` — the key the render snapshot is memoized on,
-    /// so no caller has to remember a manual invalidation step.
-    blocks_seq: u64,
-    /// `cursor_block` value last revealed during render. When the focused
-    /// block changes, render re-issues `scroll_to_reveal_item` with the
-    /// freshly-spliced item count — catching nav actions that fired before
-    /// the list was populated (stale count) and keeping the cursor bar
-    /// on-screen. `None` until the first render.
-    last_cursor_block: std::cell::Cell<Option<usize>>,
-    /// The pooled, shared source this Doc renders (D2 / 5c). `Some` for
-    /// file-backed Docs — the SAME `SharedCore` an Edit view of the file
-    /// binds to, so editing in Edit shows live in Doc and undo is unified.
-    /// `None` for string-backed Docs (help/welcome) and transient
-    /// placeholders. Replaces the old `edit_cache` stash: the shared core IS
-    /// the live state, so there is nothing to shuttle across a Doc↔Edit
-    /// round-trip.
-    source: Option<DocSource>,
-}
-
-/// A file-backed Doc's handle onto its pooled `SharedCore` (5c). Held so the
-/// Doc renders the file's *live* rope (shared with any Edit view) and so the
-/// pool's `Rc`-strong-count liveness keeps the buffer alive while the Doc is
-/// open.
-struct DocSource {
-    buffer_id: workspace::FileBufferId,
-    core: workspace::SharedCore,
-    /// `Document.edit_seq()` the current `blocks` were derived at. The
-    /// per-frame `refresh_blocks` re-derives only when the core has advanced
-    /// past this — O(1) when idle, one re-parse per change (the two-tile live
-    /// path; memoized exactly like `EditState.lines_cache`).
-    rendered_seq: u64,
-}
-
-impl DocSource {
-    /// Build a source from a pooled `(buffer_id, core)`, stamping
-    /// `rendered_seq` at the core's current `edit_seq` (caller renders the
-    /// matching initial `blocks`).
-    fn new(buffer_id: workspace::FileBufferId, core: workspace::SharedCore) -> Self {
-        let rendered_seq = core.borrow().document().edit_seq();
-        Self {
-            buffer_id,
-            core,
-            rendered_seq,
-        }
-    }
-    fn full_text(&self) -> String {
-        self.core.borrow().document().full_text()
-    }
-    fn edit_seq(&self) -> u64 {
-        self.core.borrow().document().edit_seq()
-    }
-    fn is_modified(&self) -> bool {
-        self.core.borrow().document().is_modified()
-    }
-}
-
-impl DocState {
-    /// Build a `Viewing` Doc from rendered blocks — the SINGLE construction path
-    /// for every Doc tile (load / reload / split / restore / theme re-render).
-    /// Centralizing it keeps the list-reconcile bookkeeping in one place instead
-    /// of re-spelling ~10 struct literals (each of which would have to stay in
-    /// lockstep with field changes — the trap that made the scroll-anchor fix
-    /// touch a dozen sites).
-    fn viewing(
-        blocks: Vec<RenderedBlock>,
-        file_label: SharedString,
-        source: Option<DocSource>,
-    ) -> Self {
-        DocState {
-            blocks: Rc::new(blocks),
-            file_label,
-            cursor_block: 0,
-            // Top-aligned: a doc reads from its first block (the agent transcript
-            // tails the bottom). 512px default item-height estimate as before.
-            list: ScrollAnchoredList::new(gpui::ListAlignment::Top, gpui::px(512.0)),
-            blocks_seq: 0,
-            last_cursor_block: std::cell::Cell::new(None),
-            source,
-        }
-    }
-
-    /// Replace `blocks` and bump `blocks_seq`. The list reconcile is keyed on
-    /// `blocks_seq`, so the next render re-splices lazily — no separate
-    /// invalidation call to remember. This is the only path that mutates
-    /// `blocks` after construction.
-    fn set_blocks(&mut self, blocks: Vec<RenderedBlock>) {
-        self.blocks = Rc::new(blocks);
-        self.blocks_seq = self.blocks_seq.wrapping_add(1);
-    }
-
-    /// Re-derive `blocks` from the shared core if it has advanced since the
-    /// last derivation (5c live path: an Edit view's keystroke bumps the
-    /// shared `edit_seq`, and the next frame re-renders this Doc). O(1) when
-    /// idle; at most one markdown parse per frame however many edits landed
-    /// since the last one (keyed on `edit_seq`, so rapid edits coalesce).
-    /// C3: called ONLY for Docs that are about to be painted
-    /// (`refresh_painted_docs` + `render_tile_content`) — a hidden /
-    /// background-workspace Doc stays stale and catches up lazily the frame it
-    /// becomes visible, before anything paints it. Uses a READ-ONLY borrow of the
-    /// core — never `borrow_mut` here — so a concurrent Edit mutation on the
-    /// same core cannot trigger a `RefCell` double-borrow panic. No-op for
-    /// string-backed Docs (`source == None`).
-    fn refresh_blocks(&mut self, theme: &Theme) {
-        let (seq, text) = match &self.source {
-            Some(src) => {
-                let seq = src.edit_seq();
-                if seq == src.rendered_seq {
-                    return;
-                }
-                (seq, src.full_text())
-            }
-            None => return,
-        };
-        #[cfg(test)]
-        DOC_REFRESH_PARSES.with(|m| {
-            *m.borrow_mut()
-                .entry(self.file_label.to_string())
-                .or_insert(0) += 1
-        });
-        let path = PathBuf::from(self.file_label.as_ref());
-        let blocks = render_with_wiki(&text, theme, Some(&path));
-        self.set_blocks(blocks);
-        if let Some(src) = self.source.as_mut() {
-            src.rendered_seq = seq;
-        }
-    }
-
-    /// O(1) pointer clone of the blocks for the `'static` list render closure.
-    /// `blocks` is itself an `Rc`, so there is no snapshot to rebuild and no
-    /// deep clone per re-parse (C3).
-    fn blocks_rc(&self) -> Rc<Vec<RenderedBlock>> {
-        self.blocks.clone()
-    }
-
-    /// Scroll the virtualized list so `idx` is on-screen. Guarded against a
-    /// stale item count (the list is spliced during render; a nav action that
-    /// fires before the first render of a freshly-loaded doc would otherwise
-    /// index past the registered count). The next render also re-reveals via
-    /// `last_cursor_block`, so an early no-op here is harmless.
-    fn reveal_block(&self, idx: usize) {
-        if idx < self.list.len() {
-            self.list.state().scroll_to_reveal_item(idx);
-        }
-    }
-
-    /// Reconcile the virtualized block list to the current `blocks`, preserving
-    /// scroll. Delegates to `ScrollAnchoredList`, gated on `blocks_seq` so an
-    /// idle frame (no edit) does zero work.
-    fn reconcile_list(&self) {
-        self.list.reconcile(&self.blocks_rc(), self.blocks_seq);
-    }
-}
-
 /// State held while the user is browsing the filesystem.
 ///
 /// `underlying`: when the browser (picker) was opened *in place* of an
@@ -1106,9 +959,6 @@ impl SharedEditor {
     #[cfg(test)]
     fn insert_char(&mut self, ch: char) {
         self.view.insert_char(&mut self.core.borrow_mut(), ch);
-    }
-    fn save(&mut self) -> std::io::Result<()> {
-        self.core.borrow_mut().save()
     }
 }
 
@@ -1324,6 +1174,29 @@ struct EditState {
     /// replacement character (vim `r{char}`) rather than a normal-mode action.
     /// Cleared after that next key (Esc / non-char cancels).
     pending_replace: bool,
+    /// Where the Doc this Edit was entered from stood (UXI-Buffer-10): restored
+    /// verbatim by `back_to_doc` when nothing was edited and the caret never
+    /// moved, so a no-op Doc→Edit→Doc round trip is exact. `None` when entered
+    /// from an unmapped Doc (or not from a Doc).
+    doc_return: Option<DocReturn>,
+    /// A Doc→Edit landing (`(list top, focus line)`) waiting for the lazily
+    /// created body entity: `render_edit` hands it to the body's list the
+    /// first time it has one (UXI-Buffer-8).
+    pending_land: Option<(gpui::ListOffset, usize)>,
+    /// The folds of the Doc this Edit was entered from (UXI-Buffer-14),
+    /// re-keyed onto the rebuilt Doc by `back_to_doc`.
+    doc_folds: DocFolds,
+}
+
+/// The Doc position a fresh Edit view was entered from (see
+/// `EditState::doc_return`), keyed on the edit state it's valid for.
+#[derive(Clone, Copy)]
+struct DocReturn {
+    /// `edit_seq` + caret at entry — any change invalidates the stash.
+    edit_seq: u64,
+    caret: (usize, usize),
+    cursor_block: usize,
+    top: gpui::ListOffset,
 }
 
 impl EditState {
@@ -1337,6 +1210,9 @@ impl EditState {
             view,
             body: None,
             pending_replace: false,
+            doc_return: None,
+            pending_land: None,
+            doc_folds: DocFolds::new(),
         }
     }
 }
@@ -1796,6 +1672,8 @@ fn doc_local_menu() -> Vec<MenuNode> {
         MenuNode::entry("e", "edit (raw markdown)", "enter-edit"),
         MenuNode::entry("w", "edit (word processor)", "enter-wp"),
         MenuNode::entry("r", "reload from disk", "reload-file"),
+        MenuNode::entry("k", "disk conflict: keep mine", "disk-keep-mine"),
+        MenuNode::entry("R", "disk conflict: reload theirs", "disk-reload-theirs"),
         MenuNode::entry("o", "outline", "rail-outline"),
         MenuNode::separator(),
         MenuNode::submenu(
@@ -1826,6 +1704,8 @@ fn edit_local_menu() -> Vec<MenuNode> {
         MenuNode::entry("v", "back to doc view", "back-to-doc"),
         MenuNode::entry("w", "toggle code/word-processor", "wp-toggle"),
         MenuNode::entry("r", "reload from disk", "reload-file"),
+        MenuNode::entry("k", "disk conflict: keep mine", "disk-keep-mine"),
+        MenuNode::entry("R", "disk conflict: reload theirs", "disk-reload-theirs"),
         // `b` file-browser dropped — Cmd-O already opens it (ADR-0032).
         MenuNode::separator(),
         MenuNode::entry("a", "select all", "select-all"),
@@ -1936,6 +1816,9 @@ struct YaldaGpuiView {
     /// completion writes it. Read-only during render; written only from the
     /// spawn callback (an event context).
     diagrams: Rc<RefCell<DiagramCache>>,
+    /// Buffer ⇄ disk sync: watcher, conflict set, autosave debounce
+    /// (`file_sync.rs`, UXI-Buffer-4..7).
+    file_sync: FileSync,
     /// Last observed outer-window restore size. Kept in the view so every
     /// settings save preserves it, and updated only by the window-bounds
     /// observer (never as a render side effect).
@@ -2013,14 +1896,9 @@ struct YaldaGpuiView {
     /// `None` when nothing is selected. Cleared on Esc, on a fresh MouseDown
     /// without modifier, and when entering edit mode.
     doc_selection: Option<DocSelection>,
-    /// Per-render scratch — populated by `render_doc` as it emits each line's
-    /// StyledText, cleared at the top of every doc render. Mouse handlers on
-    /// the doc body look up `(block_idx, line_idx)` here to hit-test against
-    /// the layout's bounds and to map pixels → char offsets.
-    /// Shared via `Rc` so the virtualized doc `gpui::list` render closure (which
-    /// must be `'static`) can hold a clone and populate it as it builds visible
-    /// lines, while `doc_pos_at` reads the same map between frames.
-    line_layouts: Rc<RefCell<HashMap<(usize, usize), TextLayout>>>,
+    /// Whether `ensure_doc_refresh_hook` has registered the root self-observe
+    /// that re-derives painted Docs on the effect path (graph 4f1 doc-view).
+    doc_refresh_hooked: bool,
     /// Session server client. When `Some`, agent sessions are created and
     /// managed through the session server (owned subprocesses survive GUI
     /// restarts). Activated by `YALDA_SESSION_SERVER=1`. When `None`, the
@@ -2080,6 +1958,11 @@ struct YaldaGpuiView {
     /// spec-jump-panel.md). The panel itself is rendered inline (it's cheap —
     /// see `render_jump_panel`), so only its scroll position is retained here.
     jump_panel_scroll: ScrollHandle,
+    /// Scroll state of the outline rail's virtualized row list, and the row it
+    /// was last asked to reveal (so reveal is issued only when the highlighted
+    /// row changes, never fighting a user wheel-scroll).
+    outline_scroll: gpui::UniformListScrollHandle,
+    outline_revealed: std::cell::Cell<Option<usize>>,
     /// Whether the jump panel is shown. Toggled by `cmd-j` / the `?` menu and
     /// persisted (`Preferences::jump_panel_visible`). Defaults to `true`.
     jump_panel_visible: bool,
@@ -2195,6 +2078,7 @@ impl YaldaGpuiView {
             window_height_px: DEFAULT_WINDOW_HEIGHT_PX,
             show_agent_heading_markers: true,
             diagrams: Default::default(),
+            file_sync: FileSync::default(),
             keymap_registry: KeymapRegistry::load(),
             desktop_grid_cols: DEFAULT_DESKTOP_GRID_COLS,
             desktop_grid_rows: DEFAULT_DESKTOP_GRID_ROWS,
@@ -2215,7 +2099,7 @@ impl YaldaGpuiView {
             workspace: workspace::Frame::with_initial(initial, seed_project),
             projects,
             doc_selection: None,
-            line_layouts: Rc::new(RefCell::new(HashMap::new())),
+            doc_refresh_hooked: false,
             session_server: connect_session_server(),
             splash_until: Some(std::time::Instant::now() + Duration::from_millis(1500)),
             syntect_hl,
@@ -2228,6 +2112,8 @@ impl YaldaGpuiView {
             topic_completions: std::rc::Rc::from([]),
             topic_completions_generation: 0,
             jump_panel_scroll: ScrollHandle::new(),
+            outline_scroll: gpui::UniformListScrollHandle::new(),
+            outline_revealed: std::cell::Cell::new(None),
             jump_panel_visible: true,
             jump_cwd_order: Vec::new(),
             jump_session_order: Vec::new(),
@@ -2271,6 +2157,7 @@ impl YaldaGpuiView {
             window_height_px: DEFAULT_WINDOW_HEIGHT_PX,
             show_agent_heading_markers: true,
             diagrams: Default::default(),
+            file_sync: FileSync::default(),
             keymap_registry: KeymapRegistry::load(),
             desktop_grid_cols: DEFAULT_DESKTOP_GRID_COLS,
             desktop_grid_rows: DEFAULT_DESKTOP_GRID_ROWS,
@@ -2291,7 +2178,7 @@ impl YaldaGpuiView {
             workspace: workspace::Frame::with_initial(initial, seed_project),
             projects,
             doc_selection: None,
-            line_layouts: Rc::new(RefCell::new(HashMap::new())),
+            doc_refresh_hooked: false,
             session_server: connect_session_server(),
             splash_until: Some(std::time::Instant::now() + Duration::from_millis(1500)),
             syntect_hl,
@@ -2304,6 +2191,8 @@ impl YaldaGpuiView {
             topic_completions: std::rc::Rc::from([]),
             topic_completions_generation: 0,
             jump_panel_scroll: ScrollHandle::new(),
+            outline_scroll: gpui::UniformListScrollHandle::new(),
+            outline_revealed: std::cell::Cell::new(None),
             jump_panel_visible: true,
             jump_cwd_order: Vec::new(),
             jump_session_order: Vec::new(),
@@ -2912,14 +2801,6 @@ impl YaldaGpuiView {
         self.workspace.focus_tile(leaf_id);
     }
 
-    /// `Some(doc)` if currently viewing a document, else `None`.
-    fn doc_mut(&mut self) -> Option<&mut DocState> {
-        match self.workspace.focused_content_mut()? {
-            App::Buffer(BufferApp::Viewing(d)) => Some(d),
-            _ => None,
-        }
-    }
-
     fn browser_mut(&mut self) -> Option<&mut BrowserWindow> {
         match self.workspace.focused_content_mut()? {
             App::Buffer(BufferApp::Picking(b)) => Some(b),
@@ -3145,7 +3026,7 @@ impl YaldaGpuiView {
                 return None;
             }
         };
-        let blocks = render_with_wiki(
+        let blocks = render_with_wiki_mapped(
             &core.borrow().document().full_text(),
             &self.theme,
             Some(path),
@@ -3243,106 +3124,6 @@ impl YaldaGpuiView {
         }
         self.workspace.close_workspace(idx);
         true
-    }
-
-    // ---- Document actions ---------------------------------------------------
-
-    fn scroll_down(&mut self, _: &ScrollDown, _w: &mut Window, cx: &mut Context<Self>) {
-        if let Some(d) = self.doc_mut()
-            && d.cursor_block + 1 < d.blocks.len()
-        {
-            d.cursor_block += 1;
-            d.reveal_block(d.cursor_block);
-            cx.notify();
-        }
-    }
-    fn scroll_up(&mut self, _: &ScrollUp, _w: &mut Window, cx: &mut Context<Self>) {
-        if let Some(d) = self.doc_mut()
-            && d.cursor_block > 0
-        {
-            d.cursor_block -= 1;
-            d.reveal_block(d.cursor_block);
-            cx.notify();
-        }
-    }
-    fn page_down(&mut self, _: &ScrollPageDown, _w: &mut Window, cx: &mut Context<Self>) {
-        if let Some(d) = self.doc_mut() {
-            d.cursor_block = (d.cursor_block + 8).min(d.blocks.len().saturating_sub(1));
-            d.reveal_block(d.cursor_block);
-            cx.notify();
-        }
-    }
-    fn page_up(&mut self, _: &ScrollPageUp, _w: &mut Window, cx: &mut Context<Self>) {
-        if let Some(d) = self.doc_mut() {
-            d.cursor_block = d.cursor_block.saturating_sub(8);
-            d.reveal_block(d.cursor_block);
-            cx.notify();
-        }
-    }
-    fn cursor_next(&mut self, _: &CursorNextBlock, _w: &mut Window, cx: &mut Context<Self>) {
-        if let Some(d) = self.doc_mut()
-            && d.cursor_block + 1 < d.blocks.len()
-        {
-            d.cursor_block += 1;
-            d.reveal_block(d.cursor_block);
-            cx.notify();
-        }
-    }
-    fn cursor_prev(&mut self, _: &CursorPrevBlock, _w: &mut Window, cx: &mut Context<Self>) {
-        if let Some(d) = self.doc_mut()
-            && d.cursor_block > 0
-        {
-            d.cursor_block -= 1;
-            d.reveal_block(d.cursor_block);
-            cx.notify();
-        }
-    }
-    fn cursor_top(&mut self, _: &CursorTop, _w: &mut Window, cx: &mut Context<Self>) {
-        if let Some(d) = self.doc_mut() {
-            d.cursor_block = 0;
-            d.reveal_block(0);
-            cx.notify();
-        }
-    }
-    fn cursor_bottom(&mut self, _: &CursorBottom, _w: &mut Window, cx: &mut Context<Self>) {
-        if let Some(d) = self.doc_mut()
-            && !d.blocks.is_empty()
-        {
-            d.cursor_block = d.blocks.len() - 1;
-            d.reveal_block(d.cursor_block);
-            cx.notify();
-        }
-    }
-    /// Move the doc cursor to the next block (wrapping past EOF) matching
-    /// `pred`. Local-menu `navigate`/`goto` commands (spec-menu-scopes.md).
-    fn doc_jump_next_matching(
-        &mut self,
-        label: &str,
-        pred: fn(&RenderedBlock) -> bool,
-        cx: &mut Context<Self>,
-    ) {
-        let target = match self.doc_mut() {
-            Some(d) if !d.blocks.is_empty() => {
-                let n = d.blocks.len();
-                let start = d.cursor_block.min(n - 1);
-                (1..=n)
-                    .map(|off| (start + off) % n)
-                    .find(|&i| pred(&d.blocks[i]))
-            }
-            _ => return,
-        };
-        match target {
-            Some(idx) => {
-                if let Some(d) = self.doc_mut() {
-                    d.cursor_block = idx;
-                    d.reveal_block(idx);
-                }
-            }
-            None => {
-                self.transient_status = Some(format!("no {label} in document").into());
-            }
-        }
-        cx.notify();
     }
 
     fn open_browser(&mut self, _: &OpenBrowser, _w: &mut Window, cx: &mut Context<Self>) {
@@ -4006,175 +3787,6 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
-    // ---- View-mode mouse selection ----------------------------------------
-
-    /// Hit-test a window-space position against the per-line `TextLayout`s
-    /// captured during the most recent render. Returns the doc position
-    /// (block_idx, line_idx, char_offset) if the point falls on a tracked
-    /// line, else `None`. For points off the right edge of a line, returns
-    /// the line's end (caller may treat as past-the-end selection).
-    fn doc_pos_at(&self, position: gpui::Point<gpui::Pixels>) -> Option<DocPos> {
-        let layouts = self.line_layouts.borrow();
-        // Choose the line whose vertical band contains `position.y`. Ties are
-        // broken by the smaller (block_idx, line_idx) — the map iteration
-        // order doesn't matter because the bounds bands don't overlap.
-        let mut hit: Option<(&(usize, usize), &TextLayout)> = None;
-        for (key, layout) in layouts.iter() {
-            let b = layout.bounds();
-            if position.y >= b.top() && position.y <= b.bottom() {
-                hit = Some((key, layout));
-                break;
-            }
-        }
-        let (key, layout) = hit?;
-        // Map pixel position → byte index. `index_for_position` returns Ok
-        // for in-line hits and Err for points past the right edge (it
-        // still gives a valid index).
-        let byte_idx = match layout.index_for_position(position) {
-            Ok(i) => i,
-            Err(i) => i,
-        };
-        let text = layout.text();
-        let char_offset = text
-            .char_indices()
-            .position(|(b, _)| b >= byte_idx)
-            .unwrap_or_else(|| text.chars().count());
-        Some(DocPos {
-            block_idx: key.0,
-            line_idx: key.1,
-            char_offset,
-        })
-    }
-
-    fn doc_mouse_down(&mut self, ev: &MouseDownEvent, cx: &mut Context<Self>) {
-        let Some(pos) = self.doc_pos_at(ev.position) else {
-            // Click on chrome / empty area: clear any existing selection.
-            if self.doc_selection.is_some() {
-                self.doc_selection = None;
-                cx.notify();
-            }
-            return;
-        };
-        self.doc_selection = Some(DocSelection {
-            anchor: pos,
-            head: pos,
-            dragging: true,
-        });
-        cx.notify();
-    }
-
-    fn doc_mouse_move(&mut self, ev: &MouseMoveEvent, cx: &mut Context<Self>) {
-        if !self.doc_selection.map(|s| s.dragging).unwrap_or(false) {
-            return;
-        }
-        let Some(pos) = self.doc_pos_at(ev.position) else {
-            return;
-        };
-        if let Some(sel) = self.doc_selection.as_mut()
-            && sel.head != pos
-        {
-            sel.head = pos;
-            cx.notify();
-        }
-    }
-
-    fn doc_mouse_up(&mut self, _ev: &MouseUpEvent, cx: &mut Context<Self>) {
-        let Some(sel) = self.doc_selection.as_mut() else {
-            return;
-        };
-        sel.dragging = false;
-        if sel.is_empty() {
-            self.doc_selection = None;
-        } else {
-            // X11-style select-to-clipboard: finalizing a non-empty drag copies
-            // the selection to the system clipboard automatically (no Cmd-C).
-            let sel = *sel;
-            if let Some(text) = self.collect_doc_selection_text(&sel)
-                && !text.is_empty()
-            {
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
-            }
-        }
-        cx.notify();
-    }
-
-    /// Read the doc-view text covered by `doc_selection` and write it to
-    /// the system clipboard. Walks blocks/lines in document order using
-    /// the focused window's DocState as the source of truth for line text.
-    fn copy_doc_selection(
-        &mut self,
-        _: &CopyDocSelection,
-        _w: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(sel) = self.doc_selection else {
-            return;
-        };
-        let Some(text) = self.collect_doc_selection_text(&sel) else {
-            return;
-        };
-        if !text.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
-        }
-    }
-
-    fn collect_doc_selection_text(&self, sel: &DocSelection) -> Option<String> {
-        let (start, end) = sel.normalized();
-        let content = self.workspace.focused_content()?;
-        let blocks = match content {
-            App::Buffer(BufferApp::Viewing(d)) => &d.blocks,
-            _ => return None,
-        };
-        let mut out = String::new();
-        for bi in start.block_idx..=end.block_idx {
-            let block = blocks.get(bi)?;
-            let lines = block_selectable_lines(block);
-            if lines.is_empty() {
-                continue;
-            }
-            let l_start = if bi == start.block_idx {
-                start.line_idx
-            } else {
-                0
-            };
-            let l_end = if bi == end.block_idx {
-                end.line_idx
-            } else {
-                lines.len().saturating_sub(1)
-            };
-            for li in l_start..=l_end {
-                let Some(line) = lines.get(li) else { continue };
-                let line_text: String = line
-                    .spans
-                    .iter()
-                    .map(|s| s.text.as_str())
-                    .collect::<Vec<_>>()
-                    .join("");
-                let chars: Vec<char> = line_text.chars().collect();
-                let s = if bi == start.block_idx && li == start.line_idx {
-                    start.char_offset.min(chars.len())
-                } else {
-                    0
-                };
-                let e = if bi == end.block_idx && li == end.line_idx {
-                    end.char_offset.min(chars.len())
-                } else {
-                    chars.len()
-                };
-                if s < e {
-                    out.extend(chars[s..e].iter());
-                }
-                if li < l_end {
-                    out.push('\n');
-                }
-            }
-            if bi < end.block_idx {
-                out.push_str("\n\n");
-            }
-        }
-        Some(out)
-    }
-
     /// The ONE resolver for "which editable text surface does a clipboard
     /// action (Cmd-V paste / Cmd-C copy) act on" (C7). A new text-input
     /// surface adds its arm here, so paste + copy can't silently skip it (the
@@ -4658,7 +4270,7 @@ impl YaldaGpuiView {
             // view of the file — the multi-home / also-show live case.
             match self.workspace.open_and_retain(&path) {
                 Ok((id, core)) => {
-                    let blocks = render_with_wiki(
+                    let blocks = render_with_wiki_mapped(
                         &core.borrow().document().full_text(),
                         &self.theme,
                         Some(&path),
@@ -4986,41 +4598,6 @@ impl YaldaGpuiView {
                 true
             }
             _ => false,
-        }
-    }
-
-    /// `on_key_down` handler for the Doc view — intercepts bare `m`/`'` to
-    /// start a mark chord.
-    fn handle_doc_key(&mut self, ev: &KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {
-        let press = keystroke_to_keypress(&ev.keystroke);
-
-        // Universal leaders: the doc view is never text entry, so `<space>`/`.`/
-        // `?` always open the menus (with top priority).
-        if self.leader_intercept(&press, cx) {
-            return;
-        }
-
-        // Ctrl-S: save the backing buffer from doc view (same as edit view).
-        if press.modifiers.contains(KMods::CONTROL)
-            && matches!(press.key, Key::Char('s') | Key::Char('S'))
-        {
-            if let Some(d) = self.doc_mut() {
-                if let Some(source) = d.source.as_ref() {
-                    let msg: SharedString = match source.core.borrow_mut().save() {
-                        Ok(()) => "saved".into(),
-                        Err(e) => format!("save failed: {}", e).into(),
-                    };
-                    self.transient_status = Some(msg);
-                } else {
-                    self.transient_status = Some("no file to save".into());
-                }
-            }
-            cx.notify();
-            return;
-        }
-
-        if self.try_start_mark_chord(&press.key, &press.modifiers, cx) {
-            cx.stop_propagation();
         }
     }
 
@@ -5946,6 +5523,8 @@ impl YaldaGpuiView {
             "keymap-reset-all" => self.keymap_menu_reset_all(cx),
             "back-to-doc" => self.back_to_doc(cx),
             "reload-file" => self.reload_focused_from_disk(cx),
+            "disk-keep-mine" => self.disk_conflict_keep_mine(cx),
+            "disk-reload-theirs" => self.disk_conflict_reload_theirs(cx),
             "rename-workspace" => self.open_rename_active_workspace_overlay(cx),
             "toggle-jump-panel" => self.toggle_jump_panel_impl(cx),
             "workspace-set-cwd" => self.open_set_workspace_cwd_overlay(cx),
@@ -6308,22 +5887,9 @@ impl YaldaGpuiView {
                 cx.notify();
             }
             // Local menus (spec-menu-scopes.md)
-            "doc-goto-top" => {
-                if let Some(d) = self.doc_mut() {
-                    d.cursor_block = 0;
-                    d.reveal_block(0);
-                    cx.notify();
-                }
-            }
-            "doc-goto-bottom" => {
-                if let Some(d) = self.doc_mut()
-                    && !d.blocks.is_empty()
-                {
-                    d.cursor_block = d.blocks.len() - 1;
-                    d.reveal_block(d.cursor_block);
-                    cx.notify();
-                }
-            }
+            "doc-goto-top" => self.doc_nav(cx, |_| Some(0)),
+            // Clamped to the last block by `move_cursor_to`.
+            "doc-goto-bottom" => self.doc_nav(cx, |_| Some(usize::MAX)),
             "wp-toggle" => self.toggle_edit_view(cx),
             "nav-headings" | "goto-heading" => self.doc_jump_next_matching(
                 "heading",
@@ -9295,37 +8861,19 @@ impl Focusable for YaldaGpuiView {
     }
 }
 
-impl YaldaGpuiView {
-    /// C3: re-derive (`DocState::refresh_blocks`) only the Doc tiles that can be
-    /// painted this frame — the solo-presented tile if any, else the ACTIVE
-    /// workspace's layout leaves. Never hidden tiles or other workspaces: a
-    /// sibling Edit keystroke must not re-parse a Doc nobody can see. A skipped
-    /// Doc is stale only while invisible; the frame that shows it lands here
-    /// (or in `render_tile_content`'s refresh) before it paints. O(1) per Doc
-    /// when its core is unchanged. Mutation-only, never notifies.
-    pub(crate) fn refresh_painted_docs(&mut self) {
-        let theme = &self.theme;
-        let mut refresh = |content: &mut App| {
-            if let App::Buffer(BufferApp::Viewing(d)) = content {
-                d.refresh_blocks(theme);
-            }
-        };
-        if let Some(presentation) = self.workspace.presented_tile() {
-            if let Some(tile) = self.workspace.tile_mut(presentation.window_id()) {
-                refresh(&mut tile.content);
-            }
-            return;
-        }
-        if let Some(wsp) = self.workspace.active_workspace_mut() {
-            wsp.layout.for_each_leaf_content_mut(&mut refresh);
-        }
-    }
-}
-
 impl Render for YaldaGpuiView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.viewport_width_px = f32::from(_window.viewport_size().width);
         self.viewport_height_px = f32::from(_window.viewport_size().height);
+
+        // 5c / C3 / 4f1 doc-view: the blocks of each Doc tile that can paint
+        // are re-derived from its shared core on the EFFECT path — the root's
+        // self-observe (`ensure_doc_refresh_hook` → `refresh_painted_docs`)
+        // runs after whatever notified and before the draw, so the diagram /
+        // outline passes below already read fresh blocks. Registering the hook
+        // (once, before the splash can return early) is the only Doc work left
+        // here; it mutates no Doc.
+        self.ensure_doc_refresh_hook(cx);
 
         // Auto-clear expired splash — but NOT while the session server is
         // missing: the splash then carries the start-the-server instruction
@@ -9341,12 +8889,6 @@ impl Render for YaldaGpuiView {
             return self.render_splash(cx);
         }
 
-        // 5c / C3: re-derive the blocks of each Doc tile that can paint this
-        // frame from its shared core when the rope has advanced (e.g. an Edit
-        // tile of the same file took a keystroke). Hidden / background-workspace
-        // Docs are skipped — they refresh lazily when they become visible. Runs
-        // before the diagram / outline passes below so they read fresh blocks.
-        self.refresh_painted_docs();
 
         // UXI-Diagram-1: ensure every mermaid Diagram block visible on either
         // markdown surface has a render in flight. Idempotent (dedups by cache
@@ -9763,32 +9305,6 @@ impl Render for YaldaGpuiView {
             .child(self.render_menu_overlay(cx))
             .into_any_element()
     }
-}
-
-// Test-only counter of how many `block_element`s the virtualized doc list
-// builds. The latency gate (verify_harness) asserts this stays O(visible) —
-// a few dozen for a 3000-block doc — proving render is no longer O(document).
-#[cfg(test)]
-thread_local! {
-    static DOC_BLOCK_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// C3: per-`file_label` count of `DocState::refresh_blocks` re-parses (the
-    /// full_text copy + markdown parse). The hidden-Doc guard asserts a Doc
-    /// that isn't painted does ZERO of these while a sibling Edit tile types.
-    static DOC_REFRESH_PARSES: std::cell::RefCell<HashMap<String, usize>> =
-        std::cell::RefCell::new(HashMap::new());
-}
-
-/// Test-only: C3 re-parse count for the Doc labelled `label` since the last
-/// [`test_reset_doc_refresh_parses`].
-#[cfg(test)]
-pub(crate) fn test_doc_refresh_parses(label: &str) -> usize {
-    DOC_REFRESH_PARSES.with(|m| m.borrow().get(label).copied().unwrap_or(0))
-}
-
-/// Test-only: zero every C3 re-parse counter.
-#[cfg(test)]
-pub(crate) fn test_reset_doc_refresh_parses() {
-    DOC_REFRESH_PARSES.with(|m| m.borrow_mut().clear());
 }
 
 /// Test-only render-decision tap (the substitute for pixel inspection — GPUI's
@@ -10289,7 +9805,11 @@ fn main() {
         }
     };
 
-    Application::new().run(move |app: &mut GpuiApp| {
+    // Markdown `http(s)` images load through gpui's HTTP client (default: a
+    // null client that fails every request).
+    Application::new()
+        .with_http_client(std::sync::Arc::new(UreqImageClient))
+        .run(move |app: &mut GpuiApp| {
         install_yaldabaoth_app_icon();
         register_keymap(app);
         // Deserialize the (extended, TypeScript-bearing) syntect syntax set
@@ -10470,6 +9990,17 @@ fn main() {
                         })
                         .detach();
                         YaldaGpuiView::observe_window_size(window, cx);
+                        // Buffer ⇄ disk sync (UXI-Buffer-4..7): watch pooled
+                        // files, reload/conflict on external change, autosave
+                        // after idle + on tile focus loss; also autosave when
+                        // the OS window deactivates.
+                        view.start_file_sync(cx);
+                        cx.observe_window_activation(window, |v, window, cx| {
+                            if !window.is_window_active() {
+                                v.autosave_dirty_buffers(cx);
+                            }
+                        })
+                        .detach();
                         view
                     })
                 },

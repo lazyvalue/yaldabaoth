@@ -1664,7 +1664,7 @@ pub(crate) fn restore_content(
             match ws.open_and_retain(&path) {
                 Ok((id, core)) => {
                     let blocks =
-                        render_with_wiki(&core.borrow().document().full_text(), theme, Some(&path));
+                        render_with_wiki_mapped(&core.borrow().document().full_text(), theme, Some(&path));
                     App::Buffer(BufferApp::Viewing(DocState::viewing(
                         blocks,
                         label,

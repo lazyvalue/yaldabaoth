@@ -19,7 +19,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use gpui::{ListAlignment, ListState, Pixels};
+use gpui::{ListAlignment, ListOffset, ListState, Pixels};
 
 /// Length of the shared PREFIX and the (non-overlapping) shared SUFFIX of two
 /// sequences — the minimal-changed-range alignment every incremental surface
@@ -110,7 +110,20 @@ pub(crate) struct ScrollAnchoredList<T> {
     /// idle frame (no edit) a no-op — no re-diff. `u64::MAX` = never synced.
     synced: RefCell<Rc<Vec<T>>>,
     synced_seq: Cell<u64>,
+    /// A parked [`Self::land`] request: `(top, focus)`, applied by the first
+    /// `reconcile` that leaves the list non-empty (a fresh list has zero items,
+    /// and `ListState::scroll_to` clamps to the item count).
+    pending_land: Cell<Option<(ListOffset, usize)>>,
+    /// Item that must end up painted inside the viewport after a landing, plus
+    /// the settle passes left. Checked against the PREVIOUS frame's layout by
+    /// [`Self::settle`] (a landing's rows are unmeasured until laid out once).
+    settle_target: Cell<Option<(usize, u8)>>,
 }
+
+/// Settle passes a landing gets before giving up (each is one extra frame). A
+/// reveal against partially-measured rows can undershoot; one or two re-checks
+/// converge in practice.
+const SETTLE_PASSES: u8 = 4;
 
 impl<T: PartialEq> ScrollAnchoredList<T> {
     pub(crate) fn new(alignment: ListAlignment, default_item_height: Pixels) -> Self {
@@ -118,7 +131,63 @@ impl<T: PartialEq> ScrollAnchoredList<T> {
             state: ListState::new(0, alignment, default_item_height),
             synced: RefCell::new(Rc::new(Vec::new())),
             synced_seq: Cell::new(u64::MAX),
+            pending_land: Cell::new(None),
+            settle_target: Cell::new(None),
         }
+    }
+
+    /// Land a (typically fresh, not-yet-populated) list at `top` with item
+    /// `focus` guaranteed on-screen: the next `reconcile` scrolls to `top`, and
+    /// subsequent [`Self::settle`] calls reveal `focus` if the first layout left
+    /// it outside the viewport. Used to carry a reading position across a
+    /// surface swap (Doc ⇄ Edit, UXI-Buffer-8/9) — the target list's row
+    /// heights are unknown until it has been laid out once.
+    pub(crate) fn land(&self, top: ListOffset, focus: usize) {
+        self.pending_land.set(Some((top, focus)));
+        self.apply_pending_land();
+    }
+
+    fn apply_pending_land(&self) {
+        let Some((top, focus)) = self.pending_land.get() else {
+            return;
+        };
+        if self.len() == 0 {
+            return;
+        }
+        self.pending_land.set(None);
+        self.state.scroll_to(top);
+        self.settle_target.set(Some((focus, SETTLE_PASSES)));
+    }
+
+    /// Post-landing check, called from render AFTER `reconcile` (it reads the
+    /// previous frame's layout). Returns `true` when another frame is needed —
+    /// the caller schedules it OUTSIDE the draw (`cx.defer(move |app| app.notify(id))`;
+    /// never a bare notify in render). `false` once `focus` painted fully inside
+    /// the viewport (or the passes ran out / there's nothing pending).
+    pub(crate) fn settle(&self) -> bool {
+        let Some((ix, passes)) = self.settle_target.get() else {
+            return false;
+        };
+        if ix >= self.len() || passes == 0 {
+            self.settle_target.set(None);
+            return false;
+        }
+        let vp = self.state.viewport_bounds();
+        if vp.size.height <= Pixels::ZERO {
+            // Not laid out yet (first frame of a fresh list): check next frame.
+            self.settle_target.set(Some((ix, passes - 1)));
+            return true;
+        }
+        let inside = self.state.bounds_for_item(ix).is_some_and(|b| {
+            b.top() >= vp.top() && (b.bottom() <= vp.bottom() || b.top() <= vp.top())
+        });
+        if inside {
+            self.settle_target.set(None);
+            return false;
+        }
+        self.state.scroll_to_reveal_item(ix);
+        self.settle_target.set(Some((ix, passes - 1)));
+        true
     }
 
     /// The underlying `ListState` — to paint (`gpui::list(list.state().clone(),
@@ -144,6 +213,7 @@ impl<T: PartialEq> ScrollAnchoredList<T> {
         let old = self.synced.borrow().clone();
         splice_list_to_items(&self.state, &old, items);
         *self.synced.borrow_mut() = items.clone();
+        self.apply_pending_land();
     }
 }
 

@@ -74,11 +74,7 @@ impl YaldaGpuiView {
         };
         let inner: AnyElement = match content {
             App::Buffer(BufferApp::Viewing(d)) => {
-                // C3: the painted set is exactly the tiles reaching here, so a
-                // Doc that `refresh_painted_docs` didn't cover still never
-                // paints stale. O(1) when already current (the common case).
-                d.refresh_blocks(&self.theme);
-                self.render_doc(leaf_root, d, cx).into_any_element()
+                self.render_doc(leaf_root, id, d, cx).into_any_element()
             }
             App::Buffer(BufferApp::Editing(e)) => {
                 self.render_edit(leaf_root, id, e, cx).into_any_element()
@@ -1754,12 +1750,9 @@ impl YaldaGpuiView {
         row.into_any_element()
     }
 
-    /// Re-derive the outline rail's heading entries from the focused window
-    /// (spec §13). No-op when the rail is closed or showing the file browser.
     /// Change-key for the outline: focused window id + that window's content
-    /// version. Re-deriving the outline is O(document) (an Edit tile allocates
-    /// the whole rope via `full_text()` and scans every line), and the render
-    /// loop runs every frame — including every keystroke. Keying on this lets
+    /// version. Re-deriving the outline is O(document), and the render loop
+    /// runs every frame — including every keystroke. Keying on this lets
     /// `refresh_outline_rail` skip the work when nothing relevant changed.
     pub(crate) fn outline_change_key(&self) -> u64 {
         use std::hash::{Hash, Hasher};
@@ -1768,79 +1761,119 @@ impl YaldaGpuiView {
             wsp.focused.hash(&mut h); // focus change → re-derive
         }
         match self.workspace.focused_content() {
-            // Edit: edit_seq is the exact monotonic content version.
-            Some(App::Buffer(BufferApp::Editing(e))) => e.editor.edit_seq().hash(&mut h),
-            // Doc: blocks only change on load/reload/edit-flush; block count is
-            // a cheap proxy (outline is cosmetic, so a same-count content change
-            // leaving it briefly stale is acceptable).
-            Some(App::Buffer(BufferApp::Viewing(d))) => d.blocks.len().hash(&mut h),
+            Some(App::Buffer(BufferApp::Editing(e))) => {
+                1u8.hash(&mut h);
+                e.editor.edit_seq().hash(&mut h);
+            }
+            // Doc: the blocks' version (bumped on every re-derive, including
+            // same-block-count edits the old `blocks.len()` key missed).
+            Some(App::Buffer(BufferApp::Viewing(d))) => {
+                2u8.hash(&mut h);
+                d.blocks_seq.hash(&mut h);
+            }
             // Agent/Browser have no outline; constant so it derives once (empty).
-            _ => 0u64.hash(&mut h),
+            _ => 0u8.hash(&mut h),
         }
         h.finish()
     }
 
+    /// Keep the outline rail in step with the focused buffer: re-derive the
+    /// entries when its content changed, and track which section its cursor is
+    /// in (UXI-Rail-1/2). No-op when the rail is closed or not an outline.
     pub(crate) fn refresh_outline_rail(&mut self) {
-        let is_outline = self
-            .workspace
-            .active_workspace()
-            .and_then(|t| t.rail.as_ref())
-            .map(|r| r.content.is_outline())
-            .unwrap_or(false);
-        if !is_outline {
-            return;
-        }
-        // Skip the O(document) re-derivation when neither the focused window nor
-        // its content changed since the last derive (the common case — cursor
-        // blink, scroll, cross-tile notify, and unrelated keystrokes).
-        let key = self.outline_change_key();
-        let unchanged = self
+        let Some((last_key, rail_focused)) = self
             .workspace
             .active_workspace()
             .and_then(|t| t.rail.as_ref())
             .and_then(|r| match &r.content {
-                workspace::RailContent::Outline(o) => o.last_key,
+                workspace::RailContent::Outline(o) => Some((o.last_key, r.focused)),
                 _ => None,
             })
-            == Some(key);
-        if unchanged {
+        else {
             return;
-        }
-        let entries = self.derive_outline();
+        };
+        let key = self.outline_change_key();
+        let entries = (last_key != Some(key)).then(|| self.derive_outline());
+        let position = self.outline_cursor_position();
         if let Some(r) = self.rail_mut()
             && let workspace::RailContent::Outline(o) = &mut r.content
         {
-            o.entries = entries;
-            o.last_key = Some(key);
-            if o.selected >= o.entries.len() {
-                o.selected = o.entries.len().saturating_sub(1);
+            if let Some(entries) = entries {
+                o.set_entries(entries);
+                o.last_key = Some(key);
             }
+            let current = match position {
+                Some(OutlinePosition::Line(l)) => o.section_at_line(l),
+                Some(OutlinePosition::Block(b)) => o.section_at_block(b),
+                None => None,
+            };
+            o.track_current(current, rail_focused);
         }
     }
 
-    /// Build `(depth, text, block_index_or_line)` heading entries from the
-    /// focused window's content (spec §13).
-    pub(crate) fn derive_outline(&self) -> Vec<(u8, String, usize)> {
+    /// Where the focused buffer's cursor is, in the outline's coordinates.
+    fn outline_cursor_position(&self) -> Option<OutlinePosition> {
         match self.workspace.focused_content() {
-            Some(App::Buffer(BufferApp::Viewing(d))) => {
-                let mut out = Vec::new();
-                for (idx, block) in d.blocks.iter().enumerate() {
-                    if let RenderedBlock::Heading { level, content } = block {
-                        out.push((*level, styled_line_plain(content), idx));
-                    }
-                }
-                out
-            }
+            Some(App::Buffer(BufferApp::Viewing(d))) => Some(match d.spans.get(d.cursor_block) {
+                Some(span) => OutlinePosition::Line(span.lines.start),
+                None => OutlinePosition::Block(d.cursor_block),
+            }),
             Some(App::Buffer(BufferApp::Editing(e))) => {
-                let text = e.editor.full_text();
-                let mut out = Vec::new();
-                for (line_no, line) in text.lines().enumerate() {
-                    if let Some((level, heading)) = atx_heading(line) {
-                        out.push((level, heading, line_no));
-                    }
-                }
-                out
+                Some(OutlinePosition::Line(e.editor.cursor().line))
             }
+            _ => None,
+        }
+    }
+
+    /// The focused buffer's headings (spec §13). Both views derive from
+    /// `yalda::render::outline` over the buffer's text, so they list the same
+    /// headings (never `#` lines inside code). A string-backed Doc with no
+    /// source falls back to its top-level heading blocks.
+    pub(crate) fn derive_outline(&self) -> Vec<workspace::OutlineEntry> {
+        match self.workspace.focused_content() {
+            Some(App::Buffer(BufferApp::Viewing(d))) => match &d.source {
+                Some(src) if !d.spans.is_empty() => {
+                    let text = src.full_text();
+                    yalda::render::outline(&text)
+                        .into_iter()
+                        .map(|h| {
+                            let block = d
+                                .spans
+                                .partition_point(|s| s.lines.start <= h.line)
+                                .saturating_sub(1);
+                            workspace::OutlineEntry {
+                                level: h.level,
+                                text: h.text,
+                                line: h.line,
+                                block: Some(block),
+                            }
+                        })
+                        .collect()
+                }
+                _ => d
+                    .blocks
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, block)| match block {
+                        RenderedBlock::Heading { level, content } => Some(workspace::OutlineEntry {
+                            level: *level,
+                            text: styled_line_plain(content),
+                            line: idx,
+                            block: Some(idx),
+                        }),
+                        _ => None,
+                    })
+                    .collect(),
+            },
+            Some(App::Buffer(BufferApp::Editing(e))) => yalda::render::outline(&e.editor.full_text())
+                .into_iter()
+                .map(|h| workspace::OutlineEntry {
+                    level: h.level,
+                    text: h.text,
+                    line: h.line,
+                    block: None,
+                })
+                .collect(),
             // Agent / Browser have no outline.
             _ => Vec::new(),
         }
@@ -2080,40 +2113,109 @@ impl YaldaGpuiView {
                     .font_weight(FontWeight::BOLD)
                     .child(SharedString::new_static("OUTLINE"));
 
-                let mut list = div().flex().flex_col().flex_1().min_h_0().overflow_hidden();
-
                 if o.entries.is_empty() {
-                    list = list.child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .text_color(muted_fg)
-                            .child(SharedString::new_static("(no outline)")),
-                    );
-                } else {
-                    let visible_rows = 40usize;
-                    let scroll = scroll_to_keep_visible(o.selected, visible_rows, o.entries.len());
-                    for (i, (level, text, _)) in
-                        o.entries.iter().enumerate().skip(scroll).take(visible_rows)
-                    {
-                        let is_sel = i == o.selected;
-                        // Indent by heading depth; depth-1 headings are
-                        // section headers (accent + bold).
-                        let indent = "  ".repeat((*level as usize).saturating_sub(1));
-                        let label_text = format!("{}{}", indent, text);
-                        let mut row = div().w_full().px_2().py_0p5().overflow_hidden();
-                        if is_sel {
-                            row = row.bg(selected_bg).text_color(selected_fg);
-                        } else if *level == 1 {
-                            row = row.text_color(accent_fg).font_weight(FontWeight::BOLD);
-                        } else {
-                            row = row.text_color(label_fg);
-                        }
-                        list = list.child(row.child(SharedString::from(label_text)));
-                    }
+                    let empty = div()
+                        .px_2()
+                        .py_1()
+                        .text_color(muted_fg)
+                        .child(SharedString::new_static("(no outline)"));
+                    return col.child(header).child(empty);
                 }
+
+                // The rail's own cursor when it has focus, else "you are here".
+                let highlighted = if focused { Some(o.selected) } else { o.current };
+                // Reveal the highlighted row only when it changes, so a manual
+                // wheel-scroll of the rail isn't yanked back every frame.
+                if self.outline_revealed.get() != highlighted {
+                    if let Some(ix) = highlighted {
+                        self.outline_scroll
+                            .scroll_to_item(ix, gpui::ScrollStrategy::Center);
+                    }
+                    self.outline_revealed.set(highlighted);
+                }
+                let entries = o.entries.clone();
+                // Headings folded in the focused Doc (UXI-Buffer-14) get a `▸`.
+                let folded_lines = self.focused_doc_fold_lines();
+                let min_level = o.min_level();
+                let active_bg: Hsla = nc(self.theme.overlay.selected_bg);
+                let here_bar = accent_fg;
+                let view = cx.entity().downgrade();
+                let list = gpui::uniform_list(
+                    "outline-rail-rows",
+                    entries.len(),
+                    move |range, _window, _cx| {
+                        range
+                            .map(|i| {
+                                let e = &entries[i];
+                                let indent = (e.level.saturating_sub(min_level)) as f32 * 12.0;
+                                let is_hl = highlighted == Some(i);
+                                let mut row = div()
+                                    .id(("outline-row", i))
+                                    .w_full()
+                                    .py_0p5()
+                                    .pl(px(8.0 + indent))
+                                    .pr_2()
+                                    .border_l_2()
+                                    .border_color(gpui::transparent_black())
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .cursor_pointer()
+                                    .text_color(label_fg);
+                                if e.level == min_level {
+                                    row = row.font_weight(FontWeight::BOLD);
+                                }
+                                if is_hl && focused {
+                                    row = row.bg(active_bg).text_color(selected_fg);
+                                } else if is_hl {
+                                    row = row.border_color(here_bar).text_color(accent_fg);
+                                }
+                                let view = view.clone();
+                                let folded = e.block.is_some() && folded_lines.contains(&e.line);
+                                let row = row
+                                    .on_mouse_down(gpui::MouseButton::Left, move |_, _w, cx| {
+                                        if let Some(v) = view.upgrade() {
+                                            v.update(cx, |v, cx| v.outline_activate(i, cx));
+                                        }
+                                    })
+                                    .child(SharedString::from(outline_row_label(&e.text, folded)));
+                                let row = probe_bounds_if(folded, "outline-folded-row", row);
+                                probe_bounds_if(is_hl, "outline-highlighted-row", row)
+                            })
+                            .collect::<Vec<_>>()
+                    },
+                )
+                .track_scroll(self.outline_scroll.clone())
+                .flex_1()
+                .min_h_0();
+                let list = probe_bounds("outline-rail-list", list.into_any_element());
                 col.child(header).child(list)
             }
         }
+    }
+}
+
+/// An outline row's text: a folded heading (UXI-Buffer-14) is prefixed `▸ `.
+pub(crate) fn outline_row_label(text: &str, folded: bool) -> String {
+    if folded {
+        format!("▸ {text}")
+    } else {
+        text.to_string()
+    }
+}
+
+/// A buffer cursor position as the outline sees it: a source line, or (for a
+/// string-backed Doc without a source map) a block index.
+#[derive(Debug, Clone, Copy)]
+enum OutlinePosition {
+    Line(usize),
+    Block(usize),
+}
+
+/// `probe_bounds` only when `cond` (a row list tags just its highlighted row).
+fn probe_bounds_if(cond: bool, label: &'static str, el: impl IntoElement) -> AnyElement {
+    if cond {
+        probe_bounds(label, el.into_any_element())
+    } else {
+        el.into_any_element()
     }
 }

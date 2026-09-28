@@ -863,6 +863,34 @@ impl EditorCore {
         self.document.delete_range_no_undo(s, e);
     }
 
+    /// Replace the single character at `char_idx` with `ch` as ONE user-undoable
+    /// step — the edit a view that owns no caret (the Doc view's task-checkbox
+    /// toggle, `UXI-Buffer-12`) makes on the shared buffer. Recorded in the
+    /// document's undo history (so `u` in any Edit view of the buffer undoes
+    /// it) and marks the buffer modified (autosave). Respects the frozen /
+    /// locked-prefix guards; a newline on either side is refused (this never
+    /// changes the line structure). If an undo group is already open (an
+    /// Edit view's insert session on the same core), the edit joins it rather
+    /// than clobbering it (B1). Returns whether the character was replaced.
+    pub fn replace_char_undoable(&mut self, char_idx: usize, ch: char) -> bool {
+        let rope = self.document.rope();
+        if ch == '\n' || char_idx >= rope.len_chars() || rope.char(char_idx) == '\n' {
+            return false;
+        }
+        let (line, col) = self.document.line_col_of_char(char_idx);
+        if !self.can_delete_range(char_idx, char_idx + 1) || !self.can_insert_char_at(line, col, ch)
+        {
+            return false;
+        }
+        let opened = self.document.begin_undo_group(line, col);
+        self.document.delete_char(line, col);
+        self.document.insert_char(line, col, ch);
+        if opened {
+            self.document.end_undo_group(line, col);
+        }
+        true
+    }
+
     /// Walk the active region and collect contiguous runs of editable lines,
     /// joined with blank-line separators. Used by `:claude-send`.
     pub fn extract_editable_inserts(&self) -> String {
@@ -4144,5 +4172,22 @@ fn f() { let x = 1; }
         assert_eq!(ed.document().line_text(1), "agent d\n");
         let a = ed.anchor_for_line_opt(2).expect("user line anchored");
         assert_eq!(ed.metadata::<TurnId>().get(a), Some(&TurnId::User(1)));
+    }
+
+    /// UXI-Buffer-12: the Doc view's checkbox toggle is one undoable step that
+    /// marks the buffer modified, and refuses a newline / frozen line.
+    #[test]
+    fn replace_char_undoable_is_one_undo_step() {
+        let mut core = EditorCore::new("- [ ] a\n".to_string(), PathBuf::from("t.md"));
+        assert!(!core.document().is_modified());
+        assert!(core.replace_char_undoable(3, 'x'));
+        assert_eq!(core.document().full_text(), "- [x] a\n");
+        assert!(core.document().is_modified());
+        assert!(!core.replace_char_undoable(7, 'x'), "the newline is never replaced");
+        let mut v = EditorView::new();
+        v.undo(&mut core);
+        assert_eq!(core.document().full_text(), "- [ ] a\n");
+        core.add_frozen_lines(0, 1);
+        assert!(!core.replace_char_undoable(3, 'x'), "frozen lines are guarded");
     }
 }

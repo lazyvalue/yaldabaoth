@@ -28,6 +28,9 @@ them by id.
 - [paragraph-spacing.md](paragraph-spacing.md) — `ParagraphSpacing`: extra vertical
   gap between blocks / paragraphs / list items on the reading surfaces (doc view,
   agent transcript, WP), scaled with zoom.
+- [typography.md](typography.md) — `Typography`: the one type scale
+  (`yux/typography.rs`), the Doc reading measure, heading rhythm, hanging list
+  markers, blockquote rule, code-block language label + copy. `UXI-Typography-1..5`.
 - [menu.md](menu.md) — `Menu`: the leader command panel (the floating "Sigil Card"),
   shared by every tile's `space` / `.` / `?` leaders. `UXI-Menu-1..4`.
 - [diagram.md](diagram.md) — `Diagram`: a `mermaid` fenced block renders inline as

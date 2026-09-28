@@ -19,6 +19,52 @@ pub struct StyledLine {
     pub spans: Vec<StyledSpan>,
 }
 
+/// Where a top-level [`RenderedBlock`] came from in its source text.
+/// `bytes` is the element's byte range; `lines` the 0-based, half-open range of
+/// source lines it occupies. Lets views map between a rendered block and the
+/// raw text (view⇄edit position, outline, checkbox toggles).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SourceSpan {
+    pub bytes: std::ops::Range<usize>,
+    pub lines: std::ops::Range<usize>,
+}
+
+/// Top-level rendered blocks plus a parallel `spans[i]` for `blocks[i]`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Rendered {
+    pub blocks: Vec<RenderedBlock>,
+    pub spans: Vec<SourceSpan>,
+}
+
+impl From<Vec<RenderedBlock>> for Rendered {
+    /// Unmapped blocks (no source text, e.g. string-backed docs): no spans.
+    fn from(blocks: Vec<RenderedBlock>) -> Self {
+        Self {
+            blocks,
+            spans: Vec::new(),
+        }
+    }
+}
+
+impl Rendered {
+    /// True when every block carries a span (the text these blocks came from
+    /// is known).
+    pub fn is_mapped(&self) -> bool {
+        !self.blocks.is_empty() && self.spans.len() == self.blocks.len()
+    }
+
+    /// Index of the block whose source lines contain `line`, else the last
+    /// block starting at or before it (blank lines between blocks map to the
+    /// preceding block). `None` when there are no blocks.
+    pub fn block_at_line(&self, line: usize) -> Option<usize> {
+        if self.spans.is_empty() {
+            return None;
+        }
+        let after = self.spans.partition_point(|s| s.lines.start <= line);
+        Some(after.saturating_sub(1))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ListItem {
     pub marker: String,
@@ -85,6 +131,13 @@ pub enum RenderedBlock {
     /// document's own prose, and it must never read as the title (bug-0014).
     Metadata {
         lines: Vec<StyledLine>,
+    },
+    /// A footnote definition (`[^label]: text`). References to it render
+    /// inline as a link-styled marker (see `render::footnote_marker`); the
+    /// definition itself is de-emphasized — it is an aside, not body prose.
+    Footnote {
+        label: String,
+        blocks: Vec<RenderedBlock>,
     },
 }
 

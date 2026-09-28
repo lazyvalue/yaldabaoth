@@ -36,6 +36,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 merman = { version = "0.6.2", features = ["raster"] }
 two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 gpui = "0.2"

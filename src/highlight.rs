@@ -4,7 +4,8 @@ use syntect::highlighting::{
     ThemeSettings,
 };
 use syntect::parsing::{SyntaxReference, SyntaxSet};
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::blocks::{StyledLine, StyledSpan};
 use crate::style::{Color, Style};
@@ -135,8 +136,31 @@ pub fn syntax_for_path(path: &std::path::Path) -> Option<&'static SyntaxReferenc
 /// A token's byte range within its line and its foreground color.
 pub type LineSpan = (std::ops::Range<usize>, Color);
 
+/// Resolve a syntect theme by name once per process; later lookups share it.
+/// (`ThemeSet::load_defaults` deserializes every bundled theme — too slow to
+/// pay per render, which is how often `render::render` builds a highlighter.)
+fn shared_theme(name: &str) -> Arc<SynTheme> {
+    static THEMES: OnceLock<Mutex<HashMap<String, Arc<SynTheme>>>> = OnceLock::new();
+    let mut map = THEMES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    map.entry(name.to_string())
+        .or_insert_with(|| {
+            Arc::new(if name == FOLIO_SYNTECT_THEME {
+                folio_theme()
+            } else {
+                static BUNDLED: OnceLock<ThemeSet> = OnceLock::new();
+                BUNDLED.get_or_init(ThemeSet::load_defaults).themes[name].clone()
+            })
+        })
+        .clone()
+}
+
+/// Cheap to construct: the syntax set and themes are process-wide caches.
+#[derive(Clone)]
 pub struct Highlighter {
-    theme: SynTheme,
+    theme: Arc<SynTheme>,
 }
 
 impl Default for Highlighter {
@@ -151,12 +175,9 @@ impl Highlighter {
     }
 
     pub fn with_syntect_theme(name: &str) -> Self {
-        let theme = if name == FOLIO_SYNTECT_THEME {
-            folio_theme()
-        } else {
-            ThemeSet::load_defaults().themes[name].clone()
-        };
-        Self { theme }
+        Self {
+            theme: shared_theme(name),
+        }
     }
 
     /// The theme's default foreground (plain, un-scoped text).
@@ -352,6 +373,21 @@ mod tests {
         let ts = syntax_for_path(std::path::Path::new("a.ts")).unwrap();
         let ts_lines = hl.highlight_file_spans(ts, "const x: number = 1;\n").unwrap();
         assert!(ts_lines[0].iter().any(|(r, c)| *r == (0..5) && *c == wine), "TS `const` keyword: {ts_lines:?}");
+    }
+
+    /// Building a highlighter must not reload syntect's bundled themes: every
+    /// markdown render builds one. Negative control: make `with_syntect_theme`
+    /// construct `Arc::new(folio_theme())` / a fresh `ThemeSet` load instead of
+    /// `shared_theme` and the pointer asserts fail.
+    #[test]
+    fn highlighters_share_cached_themes() {
+        let a = Highlighter::with_syntect_theme("base16-ocean.dark");
+        let b = Highlighter::with_syntect_theme("base16-ocean.dark");
+        let f = Highlighter::with_syntect_theme(FOLIO_SYNTECT_THEME);
+        let g = Highlighter::with_syntect_theme(FOLIO_SYNTECT_THEME);
+        assert!(Arc::ptr_eq(&a.theme, &b.theme));
+        assert!(Arc::ptr_eq(&f.theme, &g.theme));
+        assert!(!Arc::ptr_eq(&a.theme, &f.theme));
     }
 
     #[test]

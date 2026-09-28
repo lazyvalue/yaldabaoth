@@ -262,26 +262,96 @@ pub enum RailSide {
     Right,
 }
 
-/// Derived outline: heading entries from the focused window (spec-rail.md §13).
-/// `entries` is `(heading depth 1–6, display text, block index or line
-/// number)`. Re-derived on the render frames where the focused window changed.
+/// One heading in the outline rail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutlineEntry {
+    /// Heading depth 1–6.
+    pub level: u8,
+    pub text: String,
+    /// 0-based source line of the heading (for string-backed Docs with no
+    /// source map, the block index stands in).
+    pub line: usize,
+    /// The Doc block the heading lives in (`None` for an Edit view).
+    pub block: Option<usize>,
+}
+
+/// Outline rail state (spec-rail.md §13, UXI-Rail-1..5). `entries` come from
+/// `yalda::render::outline` over the focused buffer's text, so the rendered
+/// and raw views list the same headings.
+///
+/// Two highlights, never confused: `current` is the section the focused
+/// buffer's cursor is in ("you are here", tracked while the rail is not
+/// focused); `selected` is the rail's own cursor, which starts at `current`
+/// when the rail takes focus and moves with j/k.
 pub struct OutlineState {
-    pub entries: Vec<(u8, String, usize)>,
+    pub entries: Rc<Vec<OutlineEntry>>,
     pub selected: usize,
+    pub current: Option<usize>,
     /// Change-key the `entries` were derived at (focused window id + that
     /// window's content version). The render loop re-derives the outline only
     /// when this changes — otherwise re-derivation was O(document) per frame
     /// (and per keystroke, via `full_text()`, with the outline rail open).
     pub last_key: Option<u64>,
+    /// `None` until the selection has been synced to the cursor once.
+    last_synced: Option<()>,
 }
 
 impl OutlineState {
     pub fn new() -> Self {
         Self {
-            entries: Vec::new(),
+            entries: Rc::new(Vec::new()),
             selected: 0,
+            current: None,
             last_key: None,
+            last_synced: None,
         }
+    }
+
+    /// Replace the entries, keeping `selected` in range.
+    pub fn set_entries(&mut self, entries: Vec<OutlineEntry>) {
+        self.entries = Rc::new(entries);
+        self.selected = self.selected.min(self.entries.len().saturating_sub(1));
+        self.current = self.current.filter(|&c| c < self.entries.len());
+    }
+
+    /// The section containing source `line`: the last heading at or above it.
+    pub fn section_at_line(&self, line: usize) -> Option<usize> {
+        self.entries.partition_point(|e| e.line <= line).checked_sub(1)
+    }
+
+    /// The section containing Doc block `block`: the last heading whose block
+    /// is at or before it.
+    pub fn section_at_block(&self, block: usize) -> Option<usize> {
+        self.entries
+            .partition_point(|e| e.block.is_some_and(|b| b <= block))
+            .checked_sub(1)
+    }
+
+    /// Record the cursor's section. While the rail isn't focused (and when it
+    /// first opens) the rail's own selection follows it, so the rail always
+    /// starts where you are.
+    pub fn track_current(&mut self, current: Option<usize>, rail_focused: bool) {
+        let first = self.last_synced.is_none();
+        self.current = current;
+        self.last_synced = Some(());
+        if !rail_focused || first {
+            self.selected = current.unwrap_or(0);
+        }
+    }
+
+    /// Move the rail selection by `delta`, clamped (no wrap-around).
+    pub fn move_selection(&mut self, delta: isize) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let last = self.entries.len() - 1;
+        self.selected = self.selected.saturating_add_signed(delta).min(last);
+    }
+
+    /// Shallowest heading level present (indent is relative to it, so a doc
+    /// of only `##` headings isn't uniformly indented).
+    pub fn min_level(&self) -> u8 {
+        self.entries.iter().map(|e| e.level).min().unwrap_or(1)
     }
 }
 

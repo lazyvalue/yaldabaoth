@@ -618,9 +618,7 @@ pub(crate) struct RenderCtx<'a> {
     /// `None` outside the view-mode render path (e.g. edit-mode rendering
     /// and nested ctxes inside blockquotes/lists where v1 doesn't yet
     /// support selection).
-    // type alias would hurt readability here more than help
-    #[allow(clippy::type_complexity)]
-    pub(crate) line_layouts: Option<std::rc::Rc<RefCell<HashMap<(usize, usize), TextLayout>>>>,
+    pub(crate) line_layouts: Option<DocLineLayouts>,
     /// The top-level block index currently being rendered. Set by
     /// `block_element` and cleared (set to `None`) when `block_inner`
     /// recurses into nested blocks (blockquote/list content), so the v1
@@ -661,6 +659,96 @@ pub(crate) struct RenderCtx<'a> {
     /// Read-only here; populated at the two top-level render sites (doc view +
     /// transcript), `None` in nested/edit contexts (they inherit the parent's).
     pub(crate) diagrams: Option<std::rc::Rc<RefCell<DiagramCache>>>,
+    /// Structural address of the block being rendered: `[top_block, child, …]`
+    /// — each nested step is a child index (blockquote child, list item, item
+    /// content block, footnote child). Set by `block_element` in the Doc view;
+    /// `None` where no stable top-level index exists (transcript, previews).
+    /// Names per-item elements (task checkboxes: `md-task-<path>`) so later
+    /// interactions can address them.
+    pub(crate) path: Option<Vec<usize>>,
+    /// Doc view only: the tile whose `DocState` the code blocks' copy buttons
+    /// resolve against at click time (yux rule 4), and which code block (by
+    /// structural path) was just copied (the transient "Copied" label).
+    /// `None` elsewhere — the transcript and previews show no copy button.
+    pub(crate) code_copy: Option<CodeCopyCtx>,
+}
+
+/// See [`RenderCtx::code_copy`].
+#[derive(Clone, Debug)]
+pub(crate) struct CodeCopyCtx {
+    pub(crate) tile: workspace::WindowId,
+    pub(crate) copied: Option<std::rc::Rc<Vec<usize>>>,
+}
+
+impl<'a> RenderCtx<'a> {
+    /// The ONE constructor: a plain context (theme, fonts, zoom) with every
+    /// surface-specific channel off — no cursor, selection, hit sinks, wiki
+    /// navigation, diagrams or structural path. Surfaces switch on what they
+    /// use with struct-update syntax: `RenderCtx { cursor_block: …,
+    /// ..RenderCtx::new(…) }`, so a new field is added here once instead of at
+    /// every literal.
+    pub(crate) fn new(
+        theme: &'a Theme,
+        body_font: SharedString,
+        code_font: SharedString,
+        text_scale: f32,
+    ) -> Self {
+        RenderCtx {
+            theme,
+            body_font,
+            code_font,
+            text_scale,
+            cursor_block: None,
+            doc_selection: None,
+            line_layouts: None,
+            current_block: None,
+            weak_view: None,
+            doc_dir: None,
+            block_count: 0,
+            show_heading_markers: false,
+            block_hits: None,
+            diagrams: None,
+            path: None,
+            code_copy: None,
+        }
+    }
+}
+
+impl RenderCtx<'_> {
+    /// Context for a nested block at child offset `extra` below this one:
+    /// selection / cursor / line-layout plumbing is top-level only, while
+    /// fonts, zoom, wiki navigation, diagrams and the structural path carry
+    /// through.
+    pub(crate) fn nested(&self, extra: &[usize]) -> RenderCtx<'_> {
+        RenderCtx {
+            // Wiki links stay clickable inside nested blocks (blockquotes,
+            // list items) — only selection is scoped top-level.
+            weak_view: self.weak_view.clone(),
+            doc_dir: self.doc_dir.clone(),
+            show_heading_markers: self.show_heading_markers,
+            diagrams: self.diagrams.clone(),
+            code_copy: self.code_copy.clone(),
+            path: self.path.as_ref().map(|p| {
+                let mut p = p.clone();
+                p.extend_from_slice(extra);
+                p
+            }),
+            ..RenderCtx::new(
+                self.theme,
+                self.body_font.clone(),
+                self.code_font.clone(),
+                self.text_scale,
+            )
+        }
+    }
+
+    /// `md-<kind>-<path>` (path joined with `.`) when this context is
+    /// addressable, e.g. `md-task-3.1` for item 1 of the list at block 3.
+    pub(crate) fn path_id(&self, kind: &str, extra: &[usize]) -> Option<String> {
+        let p = self.path.as_ref()?;
+        let parts: Vec<String> = p.iter().chain(extra).map(|n| n.to_string()).collect();
+        Some(format!("md-{kind}-{}", parts.join(".")))
+    }
 }
 
 /// bug-0017: side channel that makes a transcript code Block's content lines
@@ -1197,7 +1285,7 @@ fn layout_probe_record(label: &'static str, b: (f32, f32, f32, f32)) {
     });
 }
 
-fn layout_probe_record_dyn(label: &str, b: (f32, f32, f32, f32)) {
+pub(crate) fn layout_probe_record_dyn(label: &str, b: (f32, f32, f32, f32)) {
     LAYOUT_PROBE_DYN.with(|p| {
         if let Some(m) = p.borrow_mut().as_mut() {
             m.insert(label.to_string(), b);
@@ -1608,10 +1696,6 @@ pub(crate) fn block_element(ctx: &RenderCtx<'_>, idx: usize, block: &RenderedBlo
         DOC_RENDER_TAP.with(|t| t.borrow_mut().cursor_bar_block = Some(idx));
     }
     let inner_ctx = RenderCtx {
-        theme: ctx.theme,
-        body_font: ctx.body_font.clone(),
-        code_font: ctx.code_font.clone(),
-        text_scale: ctx.text_scale,
         cursor_block: ctx.cursor_block,
         doc_selection: ctx.doc_selection,
         line_layouts: ctx.line_layouts.clone(),
@@ -1623,6 +1707,14 @@ pub(crate) fn block_element(ctx: &RenderCtx<'_>, idx: usize, block: &RenderedBlo
         // Nested/doc-view blocks don't use the transcript code-block hit path.
         block_hits: None,
         diagrams: ctx.diagrams.clone(),
+        path: Some(vec![idx]),
+        code_copy: ctx.code_copy.clone(),
+        ..RenderCtx::new(
+            ctx.theme,
+            ctx.body_font.clone(),
+            ctx.code_font.clone(),
+            ctx.text_scale,
+        )
     };
     let base = block_inner(&inner_ctx, block);
 
@@ -1644,7 +1736,15 @@ pub(crate) fn block_element(ctx: &RenderCtx<'_>, idx: usize, block: &RenderedBlo
         // stacks blocks in a `gpui::list`, which IGNORES item margins (the old
         // `mb_2` produced no visible gap) — padding is part of the box the list
         // measures and stacks by. Source-file lines are exempt (one block/line).
-        row = row.pb(px(8.0 * ctx.text_scale) + paragraph_gap(ctx.text_scale));
+        row = row.pb(px(TYPE_SCALE.block_gap_px * ctx.text_scale) + paragraph_gap(ctx.text_scale));
+    }
+    // Vertical rhythm: a heading gets extra space ABOVE it (the block gap
+    // below it is the normal one), so it binds to the section it opens. Not
+    // on the first block — the column's own top padding suffices there.
+    if let RenderedBlock::Heading { level, .. } = block
+        && idx > 0
+    {
+        row = row.pt(px(TYPE_SCALE.heading_space_above(*level) * ctx.text_scale));
     }
     // Source-file lines: add a full-row background tint so the focused line
     // is unmistakable (the 3px bar alone is too subtle in a wall of code).
@@ -1669,6 +1769,80 @@ pub(crate) fn block_element(ctx: &RenderCtx<'_>, idx: usize, block: &RenderedBlo
     row.child(bar).child(content_col).into_any_element()
 }
 
+/// The copy button of a fenced code block in the Doc view (`None` elsewhere).
+/// The click resolves the block by its structural path in the tile's CURRENT
+/// `DocState` at event time (yux rule 4 — a cache-hit frame replays this
+/// listener, so it must not close over the block's text), writes the block's
+/// plain text to the clipboard and shows a transient "Copied".
+fn code_copy_button(ctx: &RenderCtx<'_>) -> Option<AnyElement> {
+    let copy = ctx.code_copy.as_ref()?;
+    let path = ctx.path.clone()?;
+    let weak = ctx.weak_view.clone()?;
+    let tile = copy.tile;
+    let copied = copy.copied.as_deref() == Some(&path);
+    let id = ctx.path_id("code-copy", &[])?;
+    let btn = div()
+        .id(SharedString::from(id.clone()))
+        .px_1()
+        .rounded_sm()
+        .cursor_pointer()
+        .hover(|s| s.bg(rgba(0xffffff14)))
+        .child(if copied { "Copied" } else { "Copy" })
+        // Keep the press from starting a Doc text selection underneath.
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(move |_, _, app| {
+            let path = path.clone();
+            let _ = weak.update(app, |view, cx| view.copy_doc_code_block(tile, &path, cx));
+        })
+        .into_any_element();
+    Some(if layout_probe_active() {
+        probe_bounds_dyn(id, btn)
+    } else {
+        btn
+    })
+}
+
+/// The block at structural `path` (as built by [`RenderCtx::nested`]:
+/// `[top, …]` then a child index per blockquote / footnote step, and
+/// `[item, content_block]` per list step).
+pub(crate) fn block_at_path<'b>(
+    blocks: &'b [RenderedBlock],
+    path: &[usize],
+) -> Option<&'b RenderedBlock> {
+    let (&first, mut rest) = path.split_first()?;
+    let mut b = blocks.get(first)?;
+    while !rest.is_empty() {
+        match b {
+            RenderedBlock::BlockQuote { blocks } | RenderedBlock::Footnote { blocks, .. } => {
+                b = blocks.get(rest[0])?;
+                rest = &rest[1..];
+            }
+            RenderedBlock::List { items, .. } => {
+                let (&item, &child) = (rest.first()?, rest.get(1)?);
+                b = items.get(item)?.content.get(child)?;
+                rest = &rest[2..];
+            }
+            _ => return None,
+        }
+    }
+    Some(b)
+}
+
+/// The plain text of a code block (its lines joined with `\n`), `None` for
+/// any other block.
+pub(crate) fn code_block_text(block: &RenderedBlock) -> Option<String> {
+    match block {
+        RenderedBlock::CodeBlock { lines, .. } => Some(
+            lines
+                .iter()
+                .map(|l| l.text_content())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        _ => None,
+    }
+}
+
 /// Prepend the literal markdown heading markers (`## ` for h2, `### ` for h3,
 /// …) to a heading's already-parsed styled line. pulldown strips the markers
 /// during parse, so this re-inserts them as a leading span carrying the heading
@@ -1691,14 +1865,9 @@ pub(crate) fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElem
         RenderedBlock::Heading { level, content } => {
             let lvl = (*level as usize).clamp(1, 6) - 1;
             let style = ctx.theme.heading[lvl];
-            let size_px = match level {
-                1 => 28.0,
-                2 => 24.0,
-                3 => 20.0,
-                4 => 18.0,
-                5 => 16.0,
-                _ => 15.0,
-            };
+            // The shared type scale (`yux/typography.rs`) — the WP editor
+            // sizes its headings from the same tokens.
+            let size_px = TYPE_SCALE.heading(*level);
             // Optionally prepend the literal markdown markers (`## `, `### `)
             // ahead of the rendered heading text — pulldown strips them during
             // parse, so we re-insert a span carrying the same heading style.
@@ -1710,11 +1879,11 @@ pub(crate) fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElem
             } else {
                 content
             };
-            div()
+            let el = div()
                 .text_size(px(size_px * ctx.text_scale))
+                .line_height(TYPE_SCALE.heading_leading())
                 .font_weight(FontWeight::BOLD)
                 .text_color(fg_or(style, DEFAULT_FG))
-                .pb_1()
                 .child(doc_styled_line_element(
                     ctx,
                     content,
@@ -1723,8 +1892,11 @@ pub(crate) fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElem
                     &ctx.body_font,
                     &ctx.code_font,
                     0,
-                ))
-                .into_any_element()
+                ));
+            match ctx.path_id("heading", &[]) {
+                Some(tag) if layout_probe_active() => probe_bounds_dyn(tag, el.into_any_element()),
+                _ => el.into_any_element(),
+            }
         }
         RenderedBlock::Paragraph { lines } => {
             // GPUI flex wraps long text inside a fixed-width container — but
@@ -1768,17 +1940,30 @@ pub(crate) fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElem
                 let bg = ctx.theme.code_block_bg;
                 col = col.p_2().rounded_md().bg(bg_or(bg, BG));
             }
-            if !*source_file
-                && let Some(lang) = language
-                && !lang.is_empty()
-            {
-                col = col.child(
-                    div()
-                        .text_color(rgb(0x6272a4))
-                        .text_size(px(11.0))
+            if !*source_file {
+                // Header strip, right-aligned and muted: the language label,
+                // plus (Doc view only) a copy button.
+                let lang = language.as_deref().filter(|l| !l.is_empty());
+                let copy = code_copy_button(ctx);
+                if lang.is_some() || copy.is_some() {
+                    let mut header = div()
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .items_center()
+                        .gap_2()
                         .pb_1()
-                        .child(format!("[{}]", lang)),
-                );
+                        .font_family(ctx.body_font.clone())
+                        .text_color(rgb(0x6272a4))
+                        .text_size(px(TYPE_SCALE.label_px));
+                    if let Some(lang) = lang {
+                        header = header.child(lang.to_string());
+                    }
+                    if let Some(copy) = copy {
+                        header = header.child(copy);
+                    }
+                    col = col.child(header);
+                }
             }
             let row_style = NStyle::default();
             if *source_file {
@@ -1872,42 +2057,43 @@ pub(crate) fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElem
         RenderedBlock::BlockQuote { blocks } => {
             let bar = ctx.theme.blockquote_bar;
             let txt = ctx.theme.blockquote_text;
+            // The quoted blocks take the rest of the row (`flex_1` +
+            // `min_w_0`), so long quoted text wraps inside the column instead
+            // of sizing the row to its unwrapped width.
             let mut content = div()
                 .flex()
                 .flex_col()
+                .flex_1()
+                .min_w_0()
                 .pl_3()
                 .text_color(fg_or(txt, DEFAULT_FG))
                 .italic();
             for (i, b) in blocks.iter().enumerate() {
-                content = content.child(block_inner(
-                    &RenderCtx {
-                        theme: ctx.theme,
-                        body_font: ctx.body_font.clone(),
-                        code_font: ctx.code_font.clone(),
-                        text_scale: ctx.text_scale,
-                        cursor_block: None,
-                        doc_selection: None,
-                        line_layouts: None,
-                        current_block: None,
-                        // Wiki links should still be clickable inside
-                        // nested blocks (blockquotes, list items) — only
-                        // selection is scoped top-level.
-                        weak_view: ctx.weak_view.clone(),
-                        doc_dir: ctx.doc_dir.clone(),
-                        block_count: 0,
-                        show_heading_markers: ctx.show_heading_markers,
-                        // Nested blocks don't use the transcript code-block hit path.
-                        block_hits: None,
-                        diagrams: ctx.diagrams.clone(),
-                    },
-                    b,
-                ));
-                let _ = i;
+                content = content.child(block_inner(&ctx.nested(&[i]), b));
             }
+            // The left rule: fixed width (`flex_none`, or the row squeezes it
+            // to 0) and STRETCHED to the quote's height by the row's default
+            // cross-axis alignment (a `h_full` against the auto-height row
+            // resolved to 0 — the rule never painted).
+            let bar_el = div()
+                .w(px(3.0))
+                .flex_none()
+                .rounded_sm()
+                .bg(fg_or(bar, 0xffb86c))
+                .into_any_element();
+            let bar_el = match ctx.path_id("quote-bar", &[]) {
+                Some(tag) if layout_probe_active() => probe_bounds_dyn(tag, bar_el),
+                _ => bar_el,
+            };
+            let content = content.into_any_element();
+            let content = match ctx.path_id("quote-text", &[]) {
+                Some(tag) if layout_probe_active() => probe_bounds_dyn(tag, content),
+                _ => content,
+            };
             div()
                 .flex()
                 .flex_row()
-                .child(div().w(px(3.0)).h_full().bg(fg_or(bar, 0xffb86c)))
+                .child(bar_el)
                 .child(content)
                 .into_any_element()
         }
@@ -1925,16 +2111,35 @@ pub(crate) fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElem
                 .flex()
                 .flex_col()
                 .gap(paragraph_gap(ctx.text_scale));
-            let mut counter = start.unwrap_or(1);
-            for item in items {
+            let first = start.unwrap_or(1);
+            // Hanging markers: ONE gutter width for the whole list, sized to
+            // its widest marker (`9.` vs `10.`), so every item's text — and
+            // every wrapped continuation line — starts at the same x.
+            let widest = items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| {
+                    if !item.marker.is_empty() {
+                        item.marker.chars().count()
+                    } else if *ordered {
+                        format!("{}.", first + i as u64).chars().count()
+                    } else {
+                        1
+                    }
+                })
+                .max()
+                .unwrap_or(1);
+            let gutter = TYPE_SCALE.list_gutter(widest, ctx.text_scale);
+            for (item_idx, item) in items.iter().enumerate() {
                 col = col.child(list_item_element(
                     ctx,
                     item,
+                    item_idx,
                     *ordered,
-                    counter,
+                    first + item_idx as u64,
                     marker_style,
+                    gutter,
                 ));
-                counter += 1;
             }
             col.into_any_element()
         }
@@ -1951,14 +2156,7 @@ pub(crate) fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElem
                 .bg(fg_or(s, 0x6272a4))
                 .into_any_element()
         }
-        RenderedBlock::Image { alt, url } => {
-            let s = ctx.theme.image_label;
-            div()
-                .text_color(fg_or(s, 0xffb86c))
-                .italic()
-                .child(format!("[image: {} <{}>]", alt, url))
-                .into_any_element()
-        }
+        RenderedBlock::Image { alt, url } => image_element(ctx, alt, url),
         // Frontmatter (bug-0014): metadata ABOUT the document, so it reads
         // de-emphasized — dimmed, monospace, one row per source line, behind a
         // left rule — and never at heading scale. Before the metadata-block
@@ -1981,78 +2179,259 @@ pub(crate) fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElem
             }
             col.into_any_element()
         }
+        RenderedBlock::Footnote { label, blocks } => footnote_element(ctx, label, blocks),
+    }
+}
+
+/// An image block: the picture, fitted to the column width with its aspect
+/// kept ([`MdImage`]); the alt text (image-label styled) while it loads or when
+/// it cannot load. Relative sources resolve against the document's directory.
+fn image_element(ctx: &RenderCtx<'_>, alt: &str, url: &str) -> AnyElement {
+    let alt_el = || {
+        div()
+            .text_color(fg_or(ctx.theme.image_label, 0xffb86c))
+            .italic()
+            .child(format!("[image: {alt}]"))
+            .into_any_element()
+    };
+    let probe = |kind: &str| {
+        if layout_probe_active() {
+            ctx.path_id(kind, &[])
+        } else {
+            None
+        }
+    };
+    let alt_probed = || match probe("image-alt") {
+        Some(tag) => probe_bounds_dyn(tag, alt_el()),
+        None => alt_el(),
+    };
+    match image_resource(url, ctx.doc_dir.as_deref()) {
+        Some(resource) => div()
+            .w_full()
+            .child(MdImage::new(resource, alt_probed(), probe("image")))
+            .into_any_element(),
+        None => alt_probed(),
+    }
+}
+
+/// A footnote definition: de-emphasized (smaller, dimmed, under a hairline),
+/// its marker (the same one references show) ahead of the note's blocks.
+fn footnote_element(ctx: &RenderCtx<'_>, label: &str, blocks: &[RenderedBlock]) -> AnyElement {
+    let mut content = div().flex().flex_col().flex_1().min_w_0();
+    for (i, b) in blocks.iter().enumerate() {
+        content = content.child(block_inner(&ctx.nested(&[i]), b));
+    }
+    let el = div()
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap_2()
+        .pt_1()
+        .border_t_1()
+        .border_color(fg_or(ctx.theme.horizontal_rule, 0x6272a4))
+        .opacity(0.75)
+        .text_size(px(12.0 * ctx.text_scale))
+        .child(
+            div()
+                .flex_none()
+                .text_color(fg_or(ctx.theme.link, 0x8be9fd))
+                .child(yalda::render::footnote_marker(label)),
+        )
+        .child(content)
+        .into_any_element();
+    match ctx.path_id("footnote", &[]) {
+        Some(tag) if layout_probe_active() => probe_bounds_dyn(tag, el),
+        _ => el,
     }
 }
 
 pub(crate) fn list_item_element(
     ctx: &RenderCtx<'_>,
     item: &ListItem,
+    item_idx: usize,
     ordered: bool,
     counter: u64,
     marker_style: NStyle,
+    gutter: gpui::Pixels,
 ) -> AnyElement {
-    let marker = if !item.marker.is_empty() {
-        item.marker.clone()
-    } else if let Some(checked) = item.checked {
-        if checked { "[x]".into() } else { "[ ]".into() }
-    } else if ordered {
-        format!("{}.", counter)
-    } else {
-        "•".into()
+    let marker_fg = fg_or(marker_style, 0x50fa7b);
+    // A GFM task item (`- [ ]` / `- [x]`) shows a checkbox INSTEAD of its
+    // bullet / number (the parser still fills `marker`, so `checked` wins).
+    let marker_el = match item.checked {
+        Some(checked) => task_checkbox(ctx, item_idx, checked, marker_fg),
+        None => {
+            let marker = if !item.marker.is_empty() {
+                item.marker.clone()
+            } else if ordered {
+                format!("{}.", counter)
+            } else {
+                "•".into()
+            };
+            div()
+                .flex_none()
+                .text_color(marker_fg)
+                .font_weight(FontWeight::BOLD)
+                .child(marker)
+                .into_any_element()
+        }
     };
 
     let mut content_col = div().flex().flex_col().flex_1().min_w_0();
-    for b in &item.content {
-        content_col = content_col.child(block_inner(
-            &RenderCtx {
-                theme: ctx.theme,
-                body_font: ctx.body_font.clone(),
-                code_font: ctx.code_font.clone(),
-                text_scale: ctx.text_scale,
-                cursor_block: None,
-                doc_selection: None,
-                line_layouts: None,
-                current_block: None,
-                weak_view: ctx.weak_view.clone(),
-                doc_dir: ctx.doc_dir.clone(),
-                block_count: 0,
-                show_heading_markers: ctx.show_heading_markers,
-                // Nested blocks don't use the transcript code-block hit path.
-                block_hits: None,
-                diagrams: ctx.diagrams.clone(),
-            },
-            b,
-        ));
+    // A done task's text recedes so the open ones stand out.
+    if item.checked == Some(true) {
+        content_col = content_col.opacity(0.6);
+    }
+    for (bi, b) in item.content.iter().enumerate() {
+        content_col = content_col.child(block_inner(&ctx.nested(&[item_idx, bi]), b));
     }
 
+    // Hanging marker: the marker sits right-aligned in a fixed-width gutter
+    // (shared by the whole list), the item's blocks in their own column — so
+    // wrapped lines align with the text, never under the marker.
+    let marker_el = div()
+        .w(gutter)
+        .flex_none()
+        .flex()
+        .flex_row()
+        .justify_end()
+        .child(marker_el)
+        .into_any_element();
+    let (marker_el, content_col) = match ctx.path_id("li", &[item_idx]) {
+        Some(tag) if layout_probe_active() => (
+            probe_bounds_dyn(format!("{tag}-marker"), marker_el),
+            probe_bounds_dyn(format!("{tag}-text"), content_col.into_any_element()),
+        ),
+        _ => (marker_el, content_col.into_any_element()),
+    };
     div()
         .flex()
         .flex_row()
         .items_start()
         .w_full()
-        .gap_2()
-        .child(
-            div()
-                .min_w(px(24.0))
-                .flex_none()
-                .text_color(fg_or(marker_style, 0x50fa7b))
-                .font_weight(FontWeight::BOLD)
-                .child(marker),
-        )
+        .gap(TYPE_SCALE.list_marker_gap(ctx.text_scale))
+        .child(marker_el)
         .child(content_col)
         .into_any_element()
+}
+
+/// The checkbox square of a task-list item: a bordered box, filled with a
+/// check mark when done. Sized with the text zoom. In the Doc view it carries
+/// the element id `md-task-<block>.<item…>` (see [`RenderCtx::path_id`]) so a
+/// later click-to-toggle can address it; elsewhere it is anonymous.
+fn task_checkbox(ctx: &RenderCtx<'_>, item_idx: usize, checked: bool, color: Hsla) -> AnyElement {
+    let side = px(14.0 * ctx.text_scale);
+    let mut bx = div()
+        .size(side)
+        .flex()
+        .items_center()
+        .justify_center()
+        .border_1()
+        .border_color(color)
+        .rounded_sm()
+        .text_size(px(11.0 * ctx.text_scale))
+        .line_height(side);
+    if checked {
+        bx = bx
+            .bg(color)
+            .text_color(ncolor_to_hsla(ctx.theme.editor_bg, BG))
+            .font_weight(FontWeight::BOLD)
+            .child("✓");
+    }
+    // Slot matches the bullet column width; the box sits on the first text line.
+    let slot = div()
+        .min_w(px(24.0))
+        .flex_none()
+        .pt(px(3.0 * ctx.text_scale))
+        .child(bx);
+    match ctx.path_id("task", &[item_idx]) {
+        Some(id) => {
+            let slot = slot.id(SharedString::from(id.clone()));
+            let slot = task_checkbox_clickable(ctx, item_idx, slot).into_any_element();
+            if layout_probe_active() {
+                // A done box also reports `md-task-<path>-checked`, so a test
+                // can assert the check mark PAINTED (UXI-Buffer-12).
+                let slot = if checked {
+                    probe_bounds_dyn(format!("{id}-checked"), slot)
+                } else {
+                    slot
+                };
+                probe_bounds_dyn(id, slot)
+            } else {
+                slot
+            }
+        }
+        None => slot.into_any_element(),
+    }
+}
+
+/// UXI-Buffer-12: in the Doc view (an addressable context with a root handle)
+/// a click on the checkbox toggles that item in the source. The listener
+/// captures only the item's structural path — ids, not row data (yux rule 4):
+/// the handler resolves the Doc, its source and the marker at event time.
+fn task_checkbox_clickable(
+    ctx: &RenderCtx<'_>,
+    item_idx: usize,
+    slot: gpui::Stateful<gpui::Div>,
+) -> gpui::Stateful<gpui::Div> {
+    let (Some(weak), Some(base)) = (ctx.weak_view.clone(), ctx.path.as_ref()) else {
+        return slot;
+    };
+    let mut path = base.clone();
+    path.push(item_idx);
+    slot.cursor_pointer().on_click(move |_ev, _w, app| {
+        let _ = weak.update(app, |view, cx| view.doc_toggle_task_click(&path, cx));
+    })
 }
 
 pub(crate) fn table_element(
     ctx: &RenderCtx<'_>,
     headers: &[StyledLine],
     rows: &[Vec<StyledLine>],
-    _alignments: &[ColumnAlignment],
+    alignments: &[ColumnAlignment],
 ) -> AnyElement {
     let border = ctx.theme.table_border;
     let header_style = ctx.theme.table_header;
     let body_style = ctx.theme.paragraph;
     let border_color = fg_or(border, 0x6272a4);
+
+    // One cell: the column's alignment (`:--` / `:-:` / `--:`) places the
+    // content box inside the cell (flex justify) and aligns its wrapped lines
+    // (text align). `r` is the row (0 = header).
+    let cell = |line: &StyledLine, style: NStyle, r: usize, c: usize, last: bool| {
+        let align = alignments.get(c).cloned().unwrap_or(ColumnAlignment::Left);
+        let mut cell = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_row()
+            .px_2()
+            .py_1()
+            .text_color(fg_or(style, DEFAULT_FG));
+        cell = match align {
+            ColumnAlignment::Left => cell.justify_start().text_left(),
+            ColumnAlignment::Center => cell.justify_center().text_center(),
+            ColumnAlignment::Right => cell.justify_end().text_right(),
+        };
+        if !last {
+            cell = cell.border_r_1().border_color(border_color);
+        }
+        let text = div()
+            .min_w_0()
+            .child(styled_line_element(
+                line,
+                style,
+                DEFAULT_FG,
+                &ctx.body_font,
+                &ctx.code_font,
+                None,
+            ))
+            .into_any_element();
+        let text = match ctx.path_id("cell", &[r, c]) {
+            Some(id) if layout_probe_active() => probe_bounds_dyn(id, text),
+            _ => text,
+        };
+        cell.child(text)
+    };
 
     let mut table = div()
         .flex()
@@ -2062,26 +2441,13 @@ pub(crate) fn table_element(
         .rounded_md();
 
     // Header row
-    let mut header_row = div().flex().flex_row().bg(rgba(0x44475a40));
+    let mut header_row = div()
+        .flex()
+        .flex_row()
+        .bg(rgba(0x44475a40))
+        .font_weight(FontWeight::BOLD);
     for (i, h) in headers.iter().enumerate() {
-        let mut cell = div()
-            .flex_1()
-            .min_w_0()
-            .px_2()
-            .py_1()
-            .text_color(fg_or(header_style, DEFAULT_FG))
-            .font_weight(FontWeight::BOLD);
-        if i + 1 < headers.len() {
-            cell = cell.border_r_1().border_color(border_color);
-        }
-        header_row = header_row.child(cell.child(styled_line_element(
-            h,
-            header_style,
-            DEFAULT_FG,
-            &ctx.body_font,
-            &ctx.code_font,
-            None,
-        )));
+        header_row = header_row.child(cell(h, header_style, 0, i, i + 1 == headers.len()));
     }
     table = table.child(header_row);
 
@@ -2092,25 +2458,8 @@ pub(crate) fn table_element(
             .flex_row()
             .border_t_1()
             .border_color(border_color);
-        let _ = ri;
         for (i, c) in row.iter().enumerate() {
-            let mut cell = div()
-                .flex_1()
-                .min_w_0()
-                .px_2()
-                .py_1()
-                .text_color(fg_or(body_style, DEFAULT_FG));
-            if i + 1 < row.len() {
-                cell = cell.border_r_1().border_color(border_color);
-            }
-            row_div = row_div.child(cell.child(styled_line_element(
-                c,
-                body_style,
-                DEFAULT_FG,
-                &ctx.body_font,
-                &ctx.code_font,
-                None,
-            )));
+            row_div = row_div.child(cell(c, body_style, ri + 1, i, i + 1 == row.len()));
         }
         table = table.child(row_div);
     }
@@ -2192,7 +2541,7 @@ pub(crate) fn split_segments_at_col(
 /// is true between MouseDown and MouseUp on the doc body — during that
 /// window every MouseMove updates `head`. Once `dragging` is false the
 /// range is frozen and Cmd-C reads from it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DocSelection {
     pub(crate) anchor: DocPos,
     pub(crate) head: DocPos,
@@ -2291,7 +2640,7 @@ pub(crate) fn normalize_local_link_target(raw: &str) -> String {
     decoded
 }
 
-fn percent_decode_path(raw: &str) -> String {
+pub(crate) fn percent_decode_path(raw: &str) -> String {
     fn hex(b: u8) -> Option<u8> {
         match b {
             b'0'..=b'9' => Some(b - b'0'),
@@ -2405,20 +2754,8 @@ pub(crate) fn render_markdown_column(
     text_scale: f32,
 ) -> AnyElement {
     let ctx = RenderCtx {
-        theme,
-        body_font: body_font.clone(),
-        code_font: code_font.clone(),
-        text_scale,
-        cursor_block: None,
-        doc_selection: None,
-        line_layouts: None,
-        current_block: None,
-        weak_view: None,
-        doc_dir: None,
         block_count: blocks.len(),
-        show_heading_markers: false,
-        block_hits: None,
-        diagrams: None,
+        ..RenderCtx::new(theme, body_font.clone(), code_font.clone(), text_scale)
     };
     let cap = max_blocks.unwrap_or(blocks.len());
     let gap = paragraph_gap(text_scale);
@@ -2469,6 +2806,15 @@ pub(crate) fn render_with_wiki(
     theme: &Theme,
     path: Option<&std::path::Path>,
 ) -> Vec<RenderedBlock> {
+    render_with_wiki_mapped(text, theme, path).blocks
+}
+
+/// [`render_with_wiki`] plus each block's [`SourceSpan`] in `text`.
+pub(crate) fn render_with_wiki_mapped(
+    text: &str,
+    theme: &Theme,
+    path: Option<&std::path::Path>,
+) -> Rendered {
     if let Some(lang) = path.and_then(lang_for_path) {
         let hl = yalda::highlight::Highlighter::with_syntect_theme(theme.name.syntect_theme());
         // Use a transparent base style — source files render against the
@@ -2489,7 +2835,23 @@ pub(crate) fn render_with_wiki(
         // a whole file as one giant block can neither scroll nor virtualize.
         // Highlighting ran over the full text above, so cross-line state
         // (block comments, raw strings) is already correct in the split.
-        return lines
+        let mut spans = Vec::with_capacity(lines.len());
+        let mut at = 0;
+        for (i, raw) in text.split_inclusive('\n').enumerate().take(lines.len()) {
+            spans.push(SourceSpan {
+                bytes: at..at + raw.len(),
+                lines: i..i + 1,
+            });
+            at += raw.len();
+        }
+        while spans.len() < lines.len() {
+            let i = spans.len();
+            spans.push(SourceSpan {
+                bytes: at..at,
+                lines: i..i + 1,
+            });
+        }
+        let blocks = lines
             .into_iter()
             .enumerate()
             .map(|(i, line)| RenderedBlock::CodeBlock {
@@ -2499,10 +2861,11 @@ pub(crate) fn render_with_wiki(
                 start_line: i,
             })
             .collect();
+        return Rendered { blocks, spans };
     }
-    let mut blocks = render::render(text, theme);
-    expand_wiki_links_in_blocks(&mut blocks, theme);
-    blocks
+    let mut rendered = render::render_mapped(text, theme);
+    expand_wiki_links_in_blocks(&mut rendered.blocks, theme);
+    rendered
 }
 
 pub(crate) fn expand_wiki_links_in_blocks(blocks: &mut [RenderedBlock], theme: &Theme) {
@@ -2540,6 +2903,7 @@ pub(crate) fn expand_wiki_links_in_block(block: &mut RenderedBlock, theme: &Them
             }
         }
         // Frontmatter is metadata, not prose: no wiki-link expansion (bug-0014).
+        RenderedBlock::Footnote { blocks, .. } => expand_wiki_links_in_blocks(blocks, theme),
         RenderedBlock::HorizontalRule
         | RenderedBlock::Image { .. }
         | RenderedBlock::Metadata { .. } => {}
@@ -2624,6 +2988,7 @@ pub(crate) fn block_contains_link(block: &RenderedBlock) -> bool {
         RenderedBlock::Diagram { .. } => false,
         // An image is itself a navigable target (it carries a URL).
         RenderedBlock::Image { .. } => true,
+        RenderedBlock::Footnote { blocks, .. } => blocks.iter().any(block_contains_link),
     }
 }
 
@@ -2742,14 +3107,14 @@ pub(crate) fn re_render_one_doc(d: &mut DocState, theme: &Theme) {
         Some(src) => {
             let seq = src.edit_seq();
             let text = src.full_text();
-            d.set_blocks(render_with_wiki(&text, theme, Some(&path)));
+            d.set_blocks(render_with_wiki_mapped(&text, theme, Some(&path)));
             if let Some(src) = d.source.as_mut() {
                 src.rendered_seq = seq;
             }
         }
         None => {
             let text = std::fs::read_to_string(&path).unwrap_or_default();
-            d.set_blocks(render_with_wiki(&text, theme, Some(&path)));
+            d.set_blocks(render_with_wiki_mapped(&text, theme, Some(&path)));
         }
     }
 }

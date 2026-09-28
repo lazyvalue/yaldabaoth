@@ -151,142 +151,62 @@ impl YaldaGpuiView {
     pub(crate) fn render_doc(
         &self,
         root: gpui::Div,
-        d: &DocState,
+        id: workspace::WindowId,
+        d: &mut DocState,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        // Clear the per-render layout sink before re-emitting lines. Mouse
-        // hit-testing reads this map between renders, so stale entries from
-        // a now-removed block would otherwise leak through.
-        self.line_layouts.borrow_mut().clear();
-        // Resolve the focused doc's directory for wiki link targets.
-        // `file_label` is the canonicalized path of the file backing this
-        // Doc — its parent dir is where `[[name]]` lookups start. `None`
-        // if the doc has no parent (e.g., root-level untitled buffer).
-        let doc_dir = {
-            let path = PathBuf::from(d.file_label.as_ref());
-            path.parent().map(|p| p.to_path_buf())
-        };
-        // ---- Virtualized doc body (audit #1) ----
-        //
-        // The body is a `gpui::list`: only the visible block window is built
-        // and laid out per frame, not one element per block. This makes a
-        // `cx.notify()` (j/k move, scroll, theme/zoom, and especially every
-        // mouse-move during a selection drag) O(visible) instead of
-        // O(blocks+spans). Audit #2 falls out of this — `line_layouts` only
-        // holds the visible lines, so `doc_pos_at`'s scan collapses to
-        // O(visible) too.
-
-        // Reconcile the list to the current `blocks` by splicing ONLY the
-        // changed range — never `reset()` (that drops scroll + measurements and
-        // snaps the viewport to the top whenever the block count changes, e.g. a
-        // live edit-flush from a sibling Edit tile). Scroll stays anchored; the
-        // reveal below keeps the focused block on-screen. Must run EVERY frame
-        // (the `blocks_seq` gate makes an idle frame a no-op).
-        d.reconcile_list();
-        let new_count = d.list.len();
-        // Keep the focused block on-screen when it changed (this also catches
-        // nav actions whose `reveal_block` ran against a stale count before the
-        // list was first populated).
-        if d.last_cursor_block.get() != Some(d.cursor_block) {
-            d.last_cursor_block.set(Some(d.cursor_block));
-            if d.cursor_block < new_count {
-                d.list.state().scroll_to_reveal_item(d.cursor_block);
+        // Graph 4f1 doc-view: the block list is a cached child entity
+        // (`DocView`) that re-renders only when its own inputs move
+        // (`DocSeqs`), so a root notify from another tile / agent streaming is
+        // a cache hit. Created lazily here (`DocState` constructors have no
+        // `cx`); no notify. The blocks were already re-derived and the list
+        // reconciled on the effect path (`refresh_painted_docs`,
+        // `DocState::set_blocks`) — nothing here mutates the Doc.
+        // A body is bound to the tile id it looks its `DocState` up by; if this
+        // state now lives in a different tile (content moved), rebind.
+        let body_view = match &d.body {
+            Some(v) if v.read(cx).window_id() == id => v.clone(),
+            _ => {
+                let root_ent = cx.entity();
+                let v = cx.new(|vcx| DocView::new(root_ent, id, vcx));
+                d.body = Some(v.clone());
+                v
             }
-        }
-
-        // Owned snapshots for the `'static` per-row render closure — all cheap
-        // (Theme clone once per frame, Rc pointer clones, SharedString refcount
-        // bumps, Copy values). The closure rebuilds a `RenderCtx` borrowing
-        // these owned locals for each visible block it constructs.
-        let theme = self.theme.clone();
-        let body_font = self.body_font.clone();
-        let code_font = self.code_font.clone();
-        let text_scale = self.text_scale;
-        let cursor_block = d.cursor_block;
-        let doc_selection = self.doc_selection;
-        let line_layouts = self.line_layouts.clone();
-        let weak_view = cx.entity().downgrade();
-        let blocks_rc = d.blocks_rc();
-        let diagrams = self.diagrams.clone();
-
-        let render_fn = move |idx: usize, _w: &mut Window, _app: &mut GpuiApp| -> AnyElement {
-            let Some(block) = blocks_rc.get(idx) else {
-                return div().into_any_element();
-            };
-            #[cfg(test)]
-            DOC_BLOCK_BUILDS.with(|c| c.set(c.get() + 1));
-            let ctx = RenderCtx {
-                theme: &theme,
-                body_font: body_font.clone(),
-                code_font: code_font.clone(),
-                text_scale,
-                cursor_block: Some(cursor_block),
-                doc_selection,
-                line_layouts: Some(line_layouts.clone()),
-                current_block: None,
-                weak_view: Some(weak_view.clone()),
-                doc_dir: doc_dir.clone(),
-                block_count: blocks_rc.len(),
-                // Doc view never shows raw markdown markers — agent chat only.
-                show_heading_markers: false,
-                // Doc view uses `doc_selection`/`line_layouts`, not the
-                // transcript code-block hit path.
-                block_hits: None,
-                diagrams: Some(diagrams.clone()),
-            };
-            let el = block_element(&ctx, idx, block);
-            // UXI-ParagraphSpacing-1 test seam: expose each doc block's painted
-            // bounds so `verify_harness` can measure the inter-block gap.
-            #[cfg(test)]
-            let el = probe_bounds_dyn(format!("doc-block-{idx}"), el);
-            el
         };
+        let d: &DocState = d;
+        // Touch the entity every frame: gpui only routes a child's own
+        // `cx.notify()` to a redraw if the entity was ACCESSED during the last
+        // draw (`window_invalidators_by_entity`). A cache-hit frame whose
+        // parent merely clones the handle drops the body from that set, and
+        // its observe-driven self-notify would then never repaint it.
+        let _ = body_view.read(cx);
 
         // View-mode mouse selection: anchor on left MouseDown, update head on
         // every MouseMove while a button is held, release on MouseUp. The
-        // wrapping doc body is the listener for all three; hit-testing falls
-        // through to the registered per-line TextLayouts in `self.line_layouts`
-        // (now populated only for the visible window — audit #2).
+        // listeners sit on this UNCACHED wrapper (re-registered every frame)
+        // and capture only the tile id; the handlers hit-test against the
+        // Doc's own sink (`DocState::line_layouts`, filled by the body's paint)
+        // at event time.
         let body = div()
-            .id("doc-body")
-            .flex()
-            .flex_col()
             .flex_1()
             .min_h_0()
-            .px_8()
-            .py_4()
-            .text_size(px(14.0 * self.text_scale))
-            .font_family(self.body_font.clone())
-            .text_color(self.editor_fg())
+            .w_full()
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|view, ev: &MouseDownEvent, _w, cx| {
-                    view.doc_mouse_down(ev, cx);
+                cx.listener(move |view, ev: &MouseDownEvent, _w, cx| {
+                    view.doc_mouse_down(id, ev, cx);
                 }),
             )
-            .on_mouse_move(cx.listener(|view, ev: &MouseMoveEvent, _w, cx| {
-                view.doc_mouse_move(ev, cx);
+            .on_mouse_move(cx.listener(move |view, ev: &MouseMoveEvent, _w, cx| {
+                view.doc_mouse_move(id, ev, cx);
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|view, ev: &MouseUpEvent, _w, cx| {
-                    view.doc_mouse_up(ev, cx);
+                cx.listener(move |view, ev: &MouseUpEvent, _w, cx| {
+                    view.doc_mouse_up(id, ev, cx);
                 }),
             )
-            .child(
-                // Default (visible-only) measuring — NOT `Auto`. `Auto` means
-                // "measure all items" (gpui list.rs), which builds every line to
-                // measure it and registers its `TextLayout` into `line_layouts`,
-                // but only the visible lines get prepainted (bounds set). Then
-                // `doc_pos_at` iterating all of them calls `.bounds()` on an
-                // un-prepainted layout → panic across the input callback. The
-                // agent + Edit lists already use the default; the doc body's
-                // parent is `flex_1().min_h_0()`, so the list fills the viewport
-                // and scrolls without needing to size to content.
-                gpui::list(d.list.state().clone(), render_fn)
-                    .flex_1()
-                    .w_full(),
-            );
+            .child(cached_child(body_view));
 
         let top = self.theme.top_bar;
         let bot = self.theme.bottom_bar;
@@ -304,6 +224,9 @@ impl YaldaGpuiView {
             .child(format!("yalda-gpui — {}", d.file_label))
             .child(self.multi_home_dot(d.file_label.as_ref()));
 
+        let doc_conflict = d.source.as_ref().is_some_and(|s| {
+            self.buffer_has_disk_conflict(&s.core.borrow().document().file_path)
+        });
         let footer = div()
             .flex()
             .flex_row()
@@ -315,17 +238,24 @@ impl YaldaGpuiView {
             .bg(bg_or(bot, STATUS_BG))
             .text_color(fg_or(bot, 0x666666))
             .text_size(px(11.0))
-            .child({
-                // The workspace interior is always a Plane (infinite-plane,
-                // Stage D) — no layout-mode sigil. Just the block counter.
-                format!(
-                    "block {} / {}",
-                    d.cursor_block.saturating_add(1),
-                    d.blocks.len()
-                )
-            })
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .child({
+                        // The workspace interior is always a Plane (infinite-plane,
+                        // Stage D) — no layout-mode sigil. Just the block counter.
+                        format!(
+                            "block {} / {}",
+                            d.cursor_block.saturating_add(1),
+                            d.blocks.len()
+                        )
+                    })
+                    .children(doc_conflict.then(disk_conflict_badge)),
+            )
             .child(SharedString::new_static(
-                "j/k scroll · h/l block · g/G top/bot · Ctrl-O browse · Space tile menu · . workspace menu",
+                "j/k scroll · h/l block · g/G top/bot · ]] [[ heading · za fold · Ctrl-O browse · Space tile menu · . workspace menu",
             ));
 
         root.key_context("YaldaView")
@@ -338,6 +268,12 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::cursor_prev))
             .on_action(cx.listener(Self::cursor_top))
             .on_action(cx.listener(Self::cursor_bottom))
+            .on_action(cx.listener(Self::doc_toggle_task))
+            .on_action(cx.listener(Self::next_heading))
+            .on_action(cx.listener(Self::prev_heading))
+            .on_action(cx.listener(Self::toggle_fold))
+            .on_action(cx.listener(Self::fold_all))
+            .on_action(cx.listener(Self::unfold_all))
             .on_action(cx.listener(Self::open_browser))
             .on_action(cx.listener(Self::enter_edit))
             .on_action(cx.listener(Self::enter_wp))
@@ -407,6 +343,11 @@ impl YaldaGpuiView {
                 v
             }
         };
+        // A Doc→Edit landing (UXI-Buffer-8) goes to the body's list before
+        // its first render (the body settles it itself; no notify here).
+        if let Some((top, focus)) = e.pending_land.take() {
+            body_view.update(cx, |b, _| b.list.land(top, focus));
+        }
         // Touch the entity every frame: gpui only routes a child's own
         // `cx.notify()` to a redraw if the entity was ACCESSED during the last
         // draw (`window_invalidators_by_entity`). A cache-hit frame whose
@@ -442,6 +383,10 @@ impl YaldaGpuiView {
             ))
             .child(self.multi_home_dot(e.file_label.as_ref()));
 
+        let edit_conflict = {
+            let core = e.editor.core.borrow();
+            self.buffer_has_disk_conflict(&core.document().file_path)
+        };
         let dirty_mark = if e.editor.is_modified() { "•" } else { " " };
         let extend_mark = if e.editor.extend_mode() { " EXT" } else { "" };
         let sel_size: Option<usize> = e.editor.selection_range().map(|((sl, sc), (el, ec))| {
@@ -491,7 +436,14 @@ impl YaldaGpuiView {
             .bg(bg_or(bot, STATUS_BG))
             .text_color(fg_or(bot, 0x666666))
             .text_size(px(11.0))
-            .child(left_status)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .child(left_status)
+                    .children(edit_conflict.then(disk_conflict_badge)),
+            )
             .child(SharedString::new_static(
                 "Space menu for wp/raw · Ctrl-S save · Ctrl-V view · v ext · d del · y yank",
             ));
@@ -3332,4 +3284,20 @@ impl YaldaGpuiView {
             .child(list)
             .child(hint)
     }
+}
+
+/// Status-bar badge for a Buffer whose dirty text diverged from an external
+/// change on disk (UXI-Buffer-5). Wrapped in a layout probe so the harness can
+/// assert it actually PAINTS, not just that the flag is set.
+fn disk_conflict_badge() -> AnyElement {
+    probe_bounds(
+        "buffer-disk-conflict",
+        div()
+            .text_color(rgb(0xE0A030))
+            .font_weight(FontWeight::BOLD)
+            .child(SharedString::new_static(
+                "changed on disk — space k keep mine · space R reload theirs",
+            ))
+            .into_any_element(),
+    )
 }
