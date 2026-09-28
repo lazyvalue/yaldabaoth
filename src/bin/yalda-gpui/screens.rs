@@ -268,6 +268,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::cursor_prev))
             .on_action(cx.listener(Self::cursor_top))
             .on_action(cx.listener(Self::cursor_bottom))
+            .on_action(cx.listener(Self::doc_toggle_task))
             .on_action(cx.listener(Self::open_browser))
             .on_action(cx.listener(Self::enter_edit))
             .on_action(cx.listener(Self::enter_wp))

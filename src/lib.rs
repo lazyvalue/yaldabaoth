@@ -26,6 +26,7 @@ pub mod session_client;
 pub mod session_proto;
 pub mod session_wal;
 pub mod style;
+pub mod task_list;
 pub mod theme;
 pub mod tree;
 pub mod worktree;

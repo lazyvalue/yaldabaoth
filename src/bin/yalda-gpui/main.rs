@@ -241,6 +241,8 @@ actions!(
         CursorPrevBlock,
         CursorTop,
         CursorBottom,
+        // Toggle a task checkbox of the focused Doc block (UXI-Buffer-12).
+        ToggleTask,
         OpenBrowser,
         EnterEdit,
         EnterWp,

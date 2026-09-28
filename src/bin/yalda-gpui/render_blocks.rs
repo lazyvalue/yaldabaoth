@@ -2176,8 +2176,16 @@ fn task_checkbox(ctx: &RenderCtx<'_>, item_idx: usize, checked: bool, color: Hsl
         .child(bx);
     match ctx.path_id("task", &[item_idx]) {
         Some(id) => {
-            let slot = slot.id(SharedString::from(id.clone())).into_any_element();
+            let slot = slot.id(SharedString::from(id.clone()));
+            let slot = task_checkbox_clickable(ctx, item_idx, slot).into_any_element();
             if layout_probe_active() {
+                // A done box also reports `md-task-<path>-checked`, so a test
+                // can assert the check mark PAINTED (UXI-Buffer-12).
+                let slot = if checked {
+                    probe_bounds_dyn(format!("{id}-checked"), slot)
+                } else {
+                    slot
+                };
                 probe_bounds_dyn(id, slot)
             } else {
                 slot
@@ -2185,6 +2193,25 @@ fn task_checkbox(ctx: &RenderCtx<'_>, item_idx: usize, checked: bool, color: Hsl
         }
         None => slot.into_any_element(),
     }
+}
+
+/// UXI-Buffer-12: in the Doc view (an addressable context with a root handle)
+/// a click on the checkbox toggles that item in the source. The listener
+/// captures only the item's structural path — ids, not row data (yux rule 4):
+/// the handler resolves the Doc, its source and the marker at event time.
+fn task_checkbox_clickable(
+    ctx: &RenderCtx<'_>,
+    item_idx: usize,
+    slot: gpui::Stateful<gpui::Div>,
+) -> gpui::Stateful<gpui::Div> {
+    let (Some(weak), Some(base)) = (ctx.weak_view.clone(), ctx.path.as_ref()) else {
+        return slot;
+    };
+    let mut path = base.clone();
+    path.push(item_idx);
+    slot.cursor_pointer().on_click(move |_ev, _w, app| {
+        let _ = weak.update(app, |view, cx| view.doc_toggle_task_click(&path, cx));
+    })
 }
 
 pub(crate) fn table_element(

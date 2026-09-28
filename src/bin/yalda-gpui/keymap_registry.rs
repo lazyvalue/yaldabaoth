@@ -78,6 +78,7 @@ const DEFAULT_BINDINGS: &[DefaultBinding] = &[
     b!("left",         "CursorPrevBlock",  YV, "Navigation", "Previous block"),
     b!("g",            "CursorTop",        YV, "Navigation", "Go to top"),
     b!("shift-g",      "CursorBottom",     YV, "Navigation", "Go to bottom"),
+    b!("x",            "ToggleTask",       YV, "Editing", "Toggle task checkbox"),
     b!("ctrl-o",       "OpenBrowser",      YV, "Apps & files", "Open file browser"),
     b!("ctrl-e",       "EnterEdit",        YV, "Editing", "Edit — raw markdown"),
     b!("ctrl-shift-e", "EnterWp",          YV, "Editing", "Edit — word processor"),

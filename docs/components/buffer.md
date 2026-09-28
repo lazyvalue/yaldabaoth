@@ -144,7 +144,7 @@ cached body `DocView`), `edit_ui.rs` / `edit_view.rs`, `browser_ui.rs`,
   residue).** In `Viewing` (and wherever `block_inner` renders markdown, e.g. the
   agent transcript): a task item (`- [ ]` / `- [x]`) shows a checkbox in place of
   its bullet (done items dimmed; in the Doc view the box is addressable as
-  `md-task-<block>.<item…>` for a later click-to-toggle); an image alone in its
+  `md-task-<block>.<item…>` and toggles — UXI-Buffer-12); an image alone in its
   paragraph paints the picture — relative paths from the document's directory,
   `http(s)` via the app HTTP client — never wider than the column, aspect kept,
   alt text while loading or on failure (an image inside prose is its alt text as
@@ -156,3 +156,25 @@ cached body `DocView`), `edit_ui.rs` / `edit_view.rs`, `browser_ui.rs`,
   `images_paint_fitted_to_the_column`, `hard_breaks_paint_separate_lines`,
   `table_columns_honor_alignment`, `footnote_definitions_paint_as_blocks`;
   `render.rs` `render_fixes_tests::*`.
+- **`UXI-Buffer-12` (task checkboxes toggle from the Doc view).** In `Viewing`
+  on a file-backed Doc, a task item's state flips `[ ]` → `[x]`, `[x]`/`[X]` →
+  `[ ]` in the **source** by: (a) a left **click on its painted checkbox** —
+  exactly that item, at any nesting depth; or (b) **`x`** (`ToggleTask`,
+  YaldaView) on the focused block — the block's **first open** task (document
+  order, nested items included), or, when every task in it is done, its **last**
+  task (so repeated `x` checks a list off top-down and one more `x` walks it
+  back; `x` on a block with no task does nothing). Space is NOT the gesture —
+  it is the App leader (ADR-0032). The edit goes through the shared pooled
+  buffer as **one undo step** (`u` in any Edit view of the file undoes it), marks
+  the buffer dirty (autosave, UXI-Buffer-6), leaves every other byte untouched,
+  moves the Doc cursor to the toggled block, and the Doc repaints the new state.
+  A `[ ]` inside code / a table / non-task text is never a target (markers come
+  from the same parser the renderer uses). String-backed Docs (help/welcome)
+  are read-only: a status line says so. Mechanism: `yalda::task_list`
+  (`task_markers_in` over the block's `SourceSpan`, `task_item_paths`,
+  `key_toggle_target`) + `EditorCore::replace_char_undoable`; the checkbox
+  listener captures only its structural path and resolves the Doc and marker at
+  event time. Status: implemented (graph 4f1 `checkbox-toggle`). Guards:
+  `md_harness.rs` `x_toggles_the_focused_blocks_first_open_task`,
+  `clicking_a_checkbox_toggles_that_item`; `task_list.rs` tests;
+  `editor.rs` `replace_char_undoable_is_one_undo_step`.

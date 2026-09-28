@@ -742,3 +742,132 @@ fn doc_body_repaints_a_same_file_sibling_edit(cx: &mut TestAppContext) {
         "the Doc must PAINT the sibling Edit tile's text, not stale content: {painted:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// checkbox-toggle (graph 4f1): UXI-Buffer-12 — toggling a task from the Doc.
+// ---------------------------------------------------------------------------
+
+/// The focused Doc's pooled source text (what autosave writes).
+fn doc_source(view: &Entity<YaldaGpuiView>, vcx: &mut VisualTestContext) -> (String, bool) {
+    view.read_with(vcx, |v, _| match v.workspace.focused_content() {
+        Some(App::Buffer(BufferApp::Viewing(d))) => {
+            let src = d.source.as_ref().expect("file-backed Doc");
+            (src.full_text(), src.is_modified())
+        }
+        _ => panic!("expected a Doc"),
+    })
+}
+
+/// Run `act` with a FRESH probe map, then ROOT-only frames (no forced body
+/// notify): a probe recorded now proves the cached Doc body re-rendered on its
+/// own inputs as a result of `act` — a cache-hit replay records none.
+fn probed_after(
+    view: &Entity<YaldaGpuiView>,
+    vcx: &mut VisualTestContext,
+    act: impl FnOnce(&mut VisualTestContext),
+) {
+    crate::layout_probe_begin();
+    act(vcx);
+    paint(view, vcx);
+}
+
+/// UXI-Buffer-12 (key): `x` on a focused task-list block checks its FIRST open
+/// task through the shared buffer (dirty → autosaved to disk), the Doc PAINTS
+/// the check, repeated `x` works down the list, and once every task is done
+/// `x` unchecks the LAST one. The edit is one undo step in an Edit view.
+///
+/// Negative control (observed RED): drop the `ToggleTask` `on_action` in
+/// `render_doc` (screens.rs) → the source is unchanged after `x`.
+#[gpui::test]
+fn x_toggles_the_focused_blocks_first_open_task(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let md = "Intro.\n\n- [x] one\n- [ ] two\n- [ ] three\n";
+    let (view, vcx, file) = boot_probed(cx, "task-key", md);
+    view.update(vcx, |v, cx| v.start_file_sync(cx));
+    assert!(probe_get("md-task-1.1").is_some(), "the open box painted");
+    assert!(probe_get("md-task-1.1-checked").is_none(), "non-vacuous: item 1 starts open");
+
+    // `x` on a block with no task is a no-op on the text.
+    vcx.simulate_keystrokes("x");
+    vcx.run_until_parked();
+    assert_eq!(doc_source(&view, vcx), (md.to_string(), false));
+
+    vcx.simulate_keystrokes("j");
+    paint(&view, vcx);
+    probed_after(&view, vcx, |vcx| vcx.simulate_keystrokes("x"));
+    let (text, dirty) = doc_source(&view, vcx);
+    assert_eq!(text, "Intro.\n\n- [x] one\n- [x] two\n- [ ] three\n");
+    assert!(dirty, "the toggle marks the buffer modified");
+    assert!(
+        probe_get("md-task-1.1-checked").is_some(),
+        "the Doc body re-rendered and PAINTED item 1 checked"
+    );
+    assert!(probe_get("md-task-1.2-checked").is_none());
+
+    // Autosave (UXI-Buffer-6) persists it.
+    vcx.executor().advance_clock(std::time::Duration::from_millis(1500));
+    vcx.run_until_parked();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), text, "autosaved");
+
+    vcx.simulate_keystrokes("x");
+    vcx.run_until_parked();
+    assert_eq!(doc_source(&view, vcx).0, "Intro.\n\n- [x] one\n- [x] two\n- [x] three\n");
+    probed_after(&view, vcx, |vcx| vcx.simulate_keystrokes("x"));
+    assert_eq!(
+        doc_source(&view, vcx).0,
+        "Intro.\n\n- [x] one\n- [x] two\n- [ ] three\n",
+        "all done → x unchecks the last task"
+    );
+    assert!(probe_get("md-task-1.2-checked").is_none(), "item 2 painted open again");
+    assert!(probe_get("md-task-1.2").is_some());
+
+    // One undo step per toggle, in an Edit view of the same buffer.
+    vcx.simulate_keystrokes("ctrl-e");
+    vcx.run_until_parked();
+    let normal =
+        view.update(vcx, |v, _| v.edit_mut().expect("edit").mode == crate::EditMode::Normal);
+    assert!(normal, "Edit opens in Normal");
+    vcx.simulate_keystrokes("u");
+    vcx.run_until_parked();
+    let text = view.update(vcx, |v, _| v.edit_mut().expect("edit").editor.full_text());
+    assert_eq!(text, "Intro.\n\n- [x] one\n- [x] two\n- [x] three\n", "u undid the last toggle");
+    crate::layout_probe_end();
+}
+
+/// UXI-Buffer-12 (click): a real click on a painted checkbox toggles exactly
+/// THAT item — nested items and `*` bullets included — both ways, and the Doc
+/// PAINTS the new state. Nothing else in the source changes.
+///
+/// Negative control (observed RED): drop the `on_click` in
+/// `task_checkbox_clickable` (render_blocks.rs) → the source is unchanged.
+#[gpui::test]
+fn clicking_a_checkbox_toggles_that_item(cx: &mut TestAppContext) {
+    let md = "* [ ] parent\n  * [ ] child\n* [X] done\n";
+    let (view, vcx, _file) = boot_probed(cx, "task-click", md);
+    let click = |view: &Entity<YaldaGpuiView>, vcx: &mut VisualTestContext, tag: &str| {
+        let (x, y, w, h) = probe_get(tag).unwrap_or_else(|| panic!("{tag} painted"));
+        let at = gpui::point(gpui::px(x + w / 2.0), gpui::px(y + h / 2.0));
+        // A real click, split so the probe map is cleared between press and
+        // release: the press anchors a (then empty) view selection, which
+        // itself repaints the body with the PRE-toggle blocks.
+        let (left, none) = (gpui::MouseButton::Left, gpui::Modifiers::default());
+        vcx.simulate_mouse_down(at, left, none);
+        vcx.run_until_parked();
+        probed_after(view, vcx, |vcx| vcx.simulate_mouse_up(at, left, none));
+    };
+
+    click(&view, vcx, "md-task-0.0.1.0");
+    assert_eq!(doc_source(&view, vcx).0, "* [ ] parent\n  * [x] child\n* [X] done\n");
+    assert!(probe_get("md-task-0.0.1.0-checked").is_some(), "the child painted checked");
+    assert!(probe_get("md-task-0.0-checked").is_none(), "the parent is untouched");
+
+    click(&view, vcx, "md-task-0.1");
+    assert_eq!(
+        doc_source(&view, vcx).0,
+        "* [ ] parent\n  * [x] child\n* [ ] done\n",
+        "`[X]` unchecks to `[ ]`"
+    );
+    assert!(probe_get("md-task-0.1-checked").is_none(), "painted open");
+    assert!(probe_get("md-task-0.1").is_some());
+    crate::layout_probe_end();
+}

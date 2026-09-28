@@ -444,3 +444,89 @@ fn doc_selection_text(d: &DocState, sel: &DocSelection) -> Option<String> {
     }
     Some(out)
 }
+
+// ---- Task checkboxes (UXI-Buffer-12) ---------------------------------------
+
+impl YaldaGpuiView {
+    /// `x` (the `ToggleTask` action) on a Doc: toggle a task item of the
+    /// focused block — the first open one, or the last when all are done
+    /// (`task_list::key_toggle_target`).
+    pub(crate) fn doc_toggle_task(&mut self, _: &ToggleTask, _w: &mut Window, cx: &mut Context<Self>) {
+        let Some(block) = self.doc_mut().map(|d| d.cursor_block) else {
+            return;
+        };
+        self.doc_toggle_task_in(block, None, cx);
+    }
+
+    /// A click on the painted checkbox `md-task-<path>`: toggle exactly that
+    /// item. `path` = `[top block, item path…]`, the only thing the listener
+    /// captured; the Doc, its source and the marker are resolved here. The
+    /// click reaches this only in the FOCUSED tile (UXI-Workspace-9 consumes a
+    /// click on an unfocused one), so the focused Doc is the clicked one.
+    pub(crate) fn doc_toggle_task_click(&mut self, path: &[usize], cx: &mut Context<Self>) {
+        let Some((&block, item)) = path.split_first() else {
+            return;
+        };
+        self.doc_toggle_task_in(block, Some(item), cx);
+    }
+
+    /// The one body behind the key and the click: flip the marker through the
+    /// shared buffer (one undo step, marks it dirty → autosave), re-derive the
+    /// blocks, and repaint. Failures surface as a transient status.
+    fn doc_toggle_task_in(&mut self, block: usize, item: Option<&[usize]>, cx: &mut Context<Self>) {
+        let theme = self.theme.clone();
+        let Some(d) = self.doc_mut() else {
+            return;
+        };
+        if let Err(msg) = toggle_task(d, block, item, &theme) {
+            self.transient_status = Some(msg.into());
+        }
+        cx.notify();
+    }
+}
+
+/// Toggle one task marker of top-level `block` in `d`'s shared source: the
+/// item at `item` (a structural path, from a click) or, for the key, the
+/// [`yalda::task_list::key_toggle_target`]. Moves the block cursor onto
+/// `block`. Returns the item's new checked state.
+fn toggle_task(
+    d: &mut DocState,
+    block: usize,
+    item: Option<&[usize]>,
+    theme: &Theme,
+) -> Result<bool, &'static str> {
+    use yalda::task_list::{key_toggle_target, task_item_paths, task_markers_in};
+    if d.source.is_none() {
+        return Err("read-only document: no source to toggle");
+    }
+    // Spans and blocks must describe the CURRENT text (a sibling Edit may have
+    // typed since the last paint-side re-derive).
+    d.refresh_blocks(theme);
+    let span = d.spans.get(block).ok_or("no source for this block")?.bytes.clone();
+    let rendered = d.blocks.get(block).ok_or("no such block")?;
+    let core = d.source.as_ref().ok_or("read-only document")?.core.clone();
+    let text = core.borrow().document().full_text();
+    let markers = task_markers_in(&text, &span);
+    let idx = match item {
+        None => key_toggle_target(&markers).ok_or("no task in this block")?,
+        Some(item) => {
+            let paths = task_item_paths(rendered);
+            if paths.len() != markers.len() {
+                return Err("task list out of sync with its source");
+            }
+            paths.iter().position(|p| p == item).ok_or("no such task")?
+        }
+    };
+    let m = &markers[idx];
+    let replaced = {
+        let mut c = core.borrow_mut();
+        let char_idx = c.document().rope().byte_to_char(m.state_byte());
+        c.replace_char_undoable(char_idx, m.toggled_char())
+    };
+    if !replaced {
+        return Err("task is read-only here");
+    }
+    d.refresh_blocks(theme);
+    d.cursor_block = block.min(d.blocks.len().saturating_sub(1));
+    Ok(!m.checked)
+}
