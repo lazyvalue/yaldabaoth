@@ -1,4 +1,5 @@
 use crate::highlight::Highlighter;
+use crate::md_line::{self, list_marker_len};
 use crate::style::{Modifier, Style};
 use crate::theme::Theme;
 
@@ -311,47 +312,9 @@ fn is_horizontal_rule(line: &str) -> bool {
     matches!(first, '-' | '*' | '_') && t.chars().all(|c| c == first || c == ' ')
 }
 
+/// Accept `>`, `> `, `>>`, `> >`, etc. at the very start (C9: shared parser).
 fn split_quote_prefix(s: &str) -> (&str, &str) {
-    // Accept `>`, `> `, `>>`, `> >`, etc. at the very start.
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    let mut any = false;
-    while i < bytes.len() {
-        if bytes[i] == b'>' {
-            any = true;
-            i += 1;
-            if i < bytes.len() && bytes[i] == b' ' {
-                i += 1;
-            }
-        } else {
-            break;
-        }
-    }
-    if any { (&s[..i], &s[i..]) } else { ("", s) }
-}
-
-fn list_marker_len(s: &str) -> Option<usize> {
-    let bytes = s.as_bytes();
-    if bytes.is_empty() {
-        return None;
-    }
-    // Unordered.
-    if matches!(bytes[0], b'-' | b'*' | b'+') && bytes.get(1) == Some(&b' ') {
-        return Some(2);
-    }
-    // Ordered: one or more digits + `.` or `)` + space.
-    let mut i = 0;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i > 0
-        && i < bytes.len()
-        && (bytes[i] == b'.' || bytes[i] == b')')
-        && bytes.get(i + 1) == Some(&b' ')
-    {
-        return Some(i + 2);
-    }
-    None
+    s.split_at(md_line::quote_prefix_len(s))
 }
 
 /// Tokenize inline markdown into styled segments. Recognizes:

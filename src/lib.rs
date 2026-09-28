@@ -16,6 +16,7 @@ pub mod keybind;
 pub mod keys;
 pub mod line_input;
 pub mod md_highlight;
+pub mod md_line;
 pub mod menu;
 pub mod parse;
 pub mod paths;

@@ -2800,26 +2800,20 @@ pub(crate) fn classify_wp_line(text: &str, in_fence: bool) -> WpLineKind {
         }
     }
 
+    // C9: marker detection is the shared lib parser (`yalda::md_line`), the
+    // same one list continuation + the source highlighter use.
     // Unordered list: -, *, + followed by a space.
-    let mut chars = trimmed.chars();
-    if let Some(c) = chars.next()
-        && matches!(c, '-' | '*' | '+')
-        && chars.next() == Some(' ')
-    {
+    if yalda::md_line::bullet_marker(trimmed).is_some() {
         return WpLineKind::BulletItem;
     }
 
     // Ordered list: digits + (`.` | `)`) + space.
-    let digit_count = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
-    if digit_count > 0 {
-        let after = &trimmed[digit_count..];
-        let mut after_chars = after.chars();
-        if matches!(after_chars.next(), Some('.') | Some(')')) && after_chars.next() == Some(' ') {
-            return WpLineKind::OrderedItem;
-        }
+    if yalda::md_line::ordered_marker(trimmed).is_some() {
+        return WpLineKind::OrderedItem;
     }
 
-    if trimmed.starts_with('>') {
+    // Blockquote: any leading `>` run (space optional, like the highlighter).
+    if yalda::md_line::quote_prefix_len(trimmed) > 0 {
         return WpLineKind::Blockquote;
     }
 
@@ -2951,4 +2945,90 @@ pub(crate) fn apply_selection_style(
         }
     }
     result
+}
+
+/// Visit every string over `alpha` up to `max_len` chars (depth-first, one
+/// reused buffer) — the C9 behavior-pin corpus for the marker-parser oracles.
+#[cfg(test)]
+pub(crate) fn c9_for_each_corpus(max_len: usize, alpha: &[char], f: &mut dyn FnMut(&str)) {
+    fn go(buf: &mut String, depth: usize, alpha: &[char], f: &mut dyn FnMut(&str)) {
+        f(buf);
+        if depth == 0 {
+            return;
+        }
+        for &c in alpha {
+            buf.push(c);
+            go(buf, depth - 1, alpha, f);
+            buf.pop();
+        }
+    }
+    go(&mut String::new(), max_len, alpha, f);
+}
+
+/// The marker-heavy alphabet the C9 pins enumerate.
+#[cfg(test)]
+pub(crate) const C9_ALPHA: [char; 13] = ['-', '+', '>', ' ', '1', '.', ')', '[', ']', 'x', 'a', '\t', '#'];
+
+#[cfg(test)]
+mod c9_classify_pin {
+    use super::*;
+
+    /// C9 behavior pin: the pre-refactor `classify_wp_line`, verbatim, as an
+    /// oracle — the shared-parser version must agree on every corpus input.
+    #[test]
+    fn classify_wp_line_matches_legacy() {
+        fn old(text: &str, in_fence: bool) -> WpLineKind {
+            let trimmed = text.trim_start();
+            if in_fence {
+                if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+                    return WpLineKind::CodeFence;
+                }
+                return WpLineKind::CodeContent;
+            }
+            if trimmed.is_empty() {
+                return WpLineKind::Empty;
+            }
+            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+                return WpLineKind::CodeFence;
+            }
+            let hash_count = trimmed.chars().take_while(|&c| c == '#').count();
+            if (1..=6).contains(&hash_count) {
+                let after = &trimmed[hash_count..];
+                if after.is_empty() || after.starts_with(' ') {
+                    return WpLineKind::Heading(hash_count as u8);
+                }
+            }
+            let mut chars = trimmed.chars();
+            if let Some(c) = chars.next()
+                && matches!(c, '-' | '*' | '+')
+                && chars.next() == Some(' ')
+            {
+                return WpLineKind::BulletItem;
+            }
+            let digit_count = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
+            if digit_count > 0 {
+                let after = &trimmed[digit_count..];
+                let mut after_chars = after.chars();
+                if matches!(after_chars.next(), Some('.') | Some(')'))
+                    && after_chars.next() == Some(' ')
+                {
+                    return WpLineKind::OrderedItem;
+                }
+            }
+            if trimmed.starts_with('>') {
+                return WpLineKind::Blockquote;
+            }
+            if text.matches('|').count() >= 2 {
+                return WpLineKind::TableRow;
+            }
+            WpLineKind::Paragraph
+        }
+        c9_for_each_corpus(5, &C9_ALPHA, &mut |s| {
+            assert_eq!(classify_wp_line(s, false), old(s, false), "classify({s:?})");
+            assert_eq!(classify_wp_line(s, true), old(s, true), "classify fenced({s:?})");
+        });
+        for s in ["\u{a0}- x", "* é", "1. ü", "> é", "a | b | c", "\u{3000}>q"] {
+            assert_eq!(classify_wp_line(s, false), old(s, false), "classify({s:?})");
+        }
+    }
 }
