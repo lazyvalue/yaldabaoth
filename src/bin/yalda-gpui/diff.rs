@@ -171,9 +171,21 @@ impl Folds {
 /// fold overrides (module docs), with each comment's card rows placed inline
 /// (spec B5): a live comment right after the line its snippet ends on (the
 /// match nearest its stored line numbers), an outdated / unplaceable one right
-/// after its file header. Folded files show no cards. Pure; O(visible lines ×
-/// comments of that file).
+/// after its file header. Folded files show no cards. Pure.
+///
+/// E3: comments are grouped by path ONCE (not re-filtered per file), and each
+/// file's per-side `(row, number, text)` vector is built at most once per side
+/// (not per comment) — O(comments + visible lines), not O(files × comments).
 pub(crate) fn visible_rows(model: &DiffModel, review: Option<&Review>, folds: &Folds) -> Vec<RowRef> {
+    // Comment indices by path, in `Review::comments` order.
+    let mut by_path: HashMap<&std::path::Path, Vec<usize>> = HashMap::new();
+    if let Some(r) = review {
+        for (ci, c) in r.comments.iter().enumerate() {
+            #[cfg(test)]
+            row_build_counters::bump_comment_visit();
+            by_path.entry(c.path.as_path()).or_default().push(ci);
+        }
+    }
     let mut rows = Vec::new();
     for (fi, f) in model.files.iter().enumerate() {
         let viewed = review.is_some_and(|r| r.is_viewed(f));
@@ -203,9 +215,22 @@ pub(crate) fn visible_rows(model: &DiffModel, review: Option<&Review>, folds: &F
         // right after body row k.
         let mut top: Vec<usize> = Vec::new();
         let mut after: HashMap<usize, Vec<usize>> = HashMap::new();
-        if let Some(r) = review {
-            for (ci, c) in r.comments.iter().enumerate().filter(|(_, c)| c.path == f.path) {
-                match (!c.outdated).then(|| place_comment(f, &body, c)).flatten() {
+        if let (Some(r), Some(cis)) = (review, by_path.get(f.path.as_path())) {
+            let mut new_side: Option<Vec<SideLine<'_>>> = None;
+            let mut old_side: Option<Vec<SideLine<'_>>> = None;
+            for &ci in cis {
+                let c = &r.comments[ci];
+                let placed = if c.outdated {
+                    None
+                } else {
+                    let slot = match c.side {
+                        CommentSide::New => &mut new_side,
+                        CommentSide::Old => &mut old_side,
+                    };
+                    let side = slot.get_or_insert_with(|| side_lines(f, &body, c.side));
+                    place_in_side(side, c)
+                };
+                match placed {
                     Some(k) => after.entry(k).or_default().push(ci),
                     None => top.push(ci),
                 }
@@ -240,6 +265,27 @@ pub(crate) fn visible_rows(model: &DiffModel, review: Option<&Review>, folds: &F
     rows
 }
 
+/// Test-only counters pinning E3's complexity (comment visits, side-vector
+/// builds). Thread-local so parallel tests don't race.
+#[cfg(test)]
+pub(crate) mod row_build_counters {
+    use std::cell::Cell;
+    thread_local! {
+        static COMMENT_VISITS: Cell<usize> = const { Cell::new(0) };
+        static SIDE_BUILDS: Cell<usize> = const { Cell::new(0) };
+    }
+    pub(crate) fn bump_comment_visit() {
+        COMMENT_VISITS.with(|c| c.set(c.get() + 1));
+    }
+    pub(crate) fn bump_side_build() {
+        SIDE_BUILDS.with(|c| c.set(c.get() + 1));
+    }
+    /// `(comment visits, side-vector builds)` since the last reset.
+    pub(crate) fn take() -> (usize, usize) {
+        (COMMENT_VISITS.with(|c| c.replace(0)), SIDE_BUILDS.with(|c| c.replace(0)))
+    }
+}
+
 /// The text of diff line `row` (a `Line` row) in `file`.
 fn line_text(file: &FileDiff, row: RowRef) -> Option<&str> {
     let RowRef::Line { hunk, line, .. } = row else {
@@ -259,18 +305,33 @@ fn side_number(row: RowRef, side: CommentSide) -> Option<u32> {
     }
 }
 
+/// One `side` line of a file's body: `(body index, line number, trimmed text)`.
+type SideLine<'a> = (usize, u32, &'a str);
+
+/// The `side` lines of one file's `body` rows, in order (trailing whitespace
+/// trimmed) — what comment placement matches snippets against.
+fn side_lines<'a>(file: &'a FileDiff, body: &[RowRef], side: CommentSide) -> Vec<SideLine<'a>> {
+    #[cfg(test)]
+    row_build_counters::bump_side_build();
+    body.iter()
+        .enumerate()
+        .filter_map(|(k, r)| Some((k, side_number(*r, side)?, line_text(file, *r)?.trim_end())))
+        .collect()
+}
+
 /// Where comment `c`'s card goes among one file's `body` rows (hunk + line
 /// rows, no cards): the index of the LAST line of the run of `c.side` lines
 /// matching `c.snippet` (trailing whitespace ignored, the same rule as
 /// `Review::recompute_outdated`), choosing the match whose last line number
 /// is nearest `c.lines[1]` so a comment follows its code when lines drift.
 /// An empty snippet falls back to the exact line number. `None` ⇒ unplaceable.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn place_comment(file: &FileDiff, body: &[RowRef], c: &ReviewComment) -> Option<usize> {
-    let side: Vec<(usize, u32, &str)> = body
-        .iter()
-        .enumerate()
-        .filter_map(|(k, r)| Some((k, side_number(*r, c.side)?, line_text(file, *r)?.trim_end())))
-        .collect();
+    place_in_side(&side_lines(file, body, c.side), c)
+}
+
+/// [`place_comment`] against a prebuilt `c.side` vector ([`side_lines`]).
+fn place_in_side(side: &[SideLine<'_>], c: &ReviewComment) -> Option<usize> {
     let mut needle: Vec<&str> = c.snippet.split('\n').map(str::trim_end).collect();
     if needle.len() > 1 && needle.last() == Some(&"") {
         needle.pop();
@@ -1434,6 +1495,138 @@ index 3..4 100644
 
     fn file_rows(rows: &[RowRef]) -> Vec<usize> {
         rows.iter().enumerate().filter(|(_, r)| r.is_file()).map(|(i, _)| i).collect()
+    }
+
+    /// The pre-E3 algorithm, verbatim in shape: per file, filter ALL comments
+    /// by path and place each with `place_comment` (which rebuilds the side
+    /// vector per comment). The reference the optimized `visible_rows` must
+    /// match row-for-row.
+    fn reference_visible_rows(model: &DiffModel, review: Option<&Review>, folds: &Folds) -> Vec<RowRef> {
+        let mut rows = Vec::new();
+        for (fi, f) in model.files.iter().enumerate() {
+            let viewed = review.is_some_and(|r| r.is_viewed(f));
+            let collapsed = folds.is_collapsed(&f.path, viewed);
+            rows.push(RowRef::File { file: fi, viewed, collapsed });
+            if collapsed {
+                continue;
+            }
+            let mut body = Vec::new();
+            for (hi, h) in f.hunks.iter().enumerate() {
+                body.push(RowRef::Hunk { file: fi, hunk: hi });
+                for (li, (old, new)) in h.line_numbers().into_iter().enumerate() {
+                    body.push(RowRef::Line {
+                        file: fi,
+                        hunk: hi,
+                        line: li,
+                        old: old.map(|n| n as u32),
+                        new: new.map(|n| n as u32),
+                    });
+                }
+            }
+            let mut top = Vec::new();
+            let mut after: HashMap<usize, Vec<usize>> = HashMap::new();
+            if let Some(r) = review {
+                for (ci, c) in r.comments.iter().enumerate().filter(|(_, c)| c.path == f.path) {
+                    match (!c.outdated).then(|| place_comment(f, &body, c)).flatten() {
+                        Some(k) => after.entry(k).or_default().push(ci),
+                        None => top.push(ci),
+                    }
+                }
+            }
+            let push_card = |rows: &mut Vec<RowRef>, ci: usize| {
+                let c = &review.unwrap().comments[ci];
+                let parts = comment_card_lines(c).len().clamp(1, u8::MAX as usize) as u8;
+                for part in 0..parts {
+                    rows.push(RowRef::Comment { file: fi, comment: ci, part, parts });
+                }
+            };
+            for ci in top {
+                push_card(&mut rows, ci);
+            }
+            for (k, row) in body.into_iter().enumerate() {
+                rows.push(row);
+                if let Some(cards) = after.get(&k) {
+                    for &ci in cards {
+                        push_card(&mut rows, ci);
+                    }
+                }
+            }
+        }
+        rows
+    }
+
+    /// E3: many files × many comments (both sides, empty snippets, multi-line
+    /// snippets, outdated, unplaceable, and comments on paths not in the diff)
+    /// produce rows IDENTICAL to the pre-E3 algorithm, while visiting each
+    /// comment once and building each file's side vector at most once per side.
+    ///
+    /// Negative control (observed RED): build the side vector per comment
+    /// (drop the `get_or_insert_with` memo) → `side builds` exceeds the bound.
+    #[test]
+    fn visible_rows_many_files_and_comments_match_reference_in_linear_work() {
+        const FILES: usize = 40;
+        let mut raw = String::new();
+        for i in 0..FILES {
+            raw.push_str(&format!(
+                "diff --git a/f{i}.rs b/f{i}.rs\nindex 1..2 100644\n--- a/f{i}.rs\n+++ b/f{i}.rs\n\
+                 @@ -1,4 +1,4 @@\n ctx\n-old{i}\n+new{i}\n same\n dup\n\
+                 @@ -30,3 +30,4 @@\n dup\n+added{i}\n same\n tail\n"
+            ));
+        }
+        let m = parse_diff(&raw, PathBuf::from("/wt"), "feature", "main", "deadbeef");
+        assert_eq!(m.files.len(), FILES);
+        let mut review = Review::new("feature", "main", std::path::Path::new("/wt"));
+        let now = chrono::Utc::now();
+        let mut n = 0usize;
+        for i in 0..FILES {
+            let path = PathBuf::from(format!("f{i}.rs"));
+            let specs: Vec<(CommentSide, [usize; 2], String)> = vec![
+                (CommentSide::New, [2, 2], format!("new{i}")),
+                (CommentSide::Old, [2, 2], format!("old{i}")),
+                (CommentSide::New, [31, 31], "same".into()), // two matches: nearest wins
+                (CommentSide::New, [4, 4], "same".into()),
+                (CommentSide::New, [30, 31], format!("dup\nadded{i}")),
+                (CommentSide::New, [32, 32], String::new()), // exact-line fallback
+                (CommentSide::Old, [99, 99], "nowhere".into()), // unplaceable → top
+            ];
+            for (side, lines, snippet) in specs {
+                review.add_comment(path.clone(), side, lines, snippet, format!("body {n}"), now);
+                n += 1;
+            }
+            if i % 5 == 0 {
+                review.comments.last_mut().unwrap().outdated = true;
+                let c = &mut review.comments[n - 3];
+                c.outdated = true;
+            }
+        }
+        // Comments on files the diff doesn't contain are never shown.
+        for j in 0..10 {
+            review.add_comment(
+                PathBuf::from(format!("gone{j}.rs")),
+                CommentSide::New,
+                [1, 1],
+                "x".into(),
+                "orphan".into(),
+                now,
+            );
+        }
+        let mut folds = Folds::default();
+        folds.toggle(&m.files[3].path, false); // one folded file shows no cards
+
+        let _ = row_build_counters::take();
+        let rows = visible_rows(&m, Some(&review), &folds);
+        let (visits, side_builds) = row_build_counters::take();
+        let expected = reference_visible_rows(&m, Some(&review), &folds);
+        assert_eq!(rows, expected, "optimized rows must equal the reference rows");
+        assert!(
+            rows.iter().filter(|r| r.is_inline_insert()).count() > FILES * 5,
+            "non-vacuous: most comments placed as cards"
+        );
+        assert_eq!(visits, review.comments.len(), "each comment visited exactly once");
+        assert!(
+            side_builds <= 2 * FILES,
+            "side vectors built at most once per side per file: got {side_builds}"
+        );
     }
 
     #[test]
