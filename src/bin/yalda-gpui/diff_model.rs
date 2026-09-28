@@ -88,6 +88,12 @@ pub struct FileDiff {
     pub added: usize,
     /// Total removed lines across all hunks in this file.
     pub removed: usize,
+    /// The file's review identity (spec rev 2 § Data Model, B4): a stable hash
+    /// of the repo-relative path plus every hunk's content lines (kind + text),
+    /// EXCLUDING `@@` positions. A position-only shift keeps it; any content
+    /// change to the file's diff changes it, which is what clears Viewed.
+    /// See [`compute_file_hash`].
+    pub file_hash: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -206,6 +212,22 @@ fn compute_hunk_hash(path: &Path, occurrence_index: usize, lines: &[DiffLine]) -
     hasher.finish()
 }
 
+/// Compute a file's `file_hash` (spec rev 2 B4): the repo-relative `path`
+/// plus, for each hunk in order, its content lines (`DiffLine` hashes both the
+/// Context/Added/Removed kind and the text; a slice hash is length-prefixed, so
+/// hunk boundaries are part of the identity). The `@@` header is never fed in,
+/// so a position-only shift leaves the hash unchanged — mirrors
+/// [`compute_hunk_hash`].
+pub fn compute_file_hash(path: &Path, hunks: &[Hunk]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    hunks.len().hash(&mut hasher);
+    for hunk in hunks {
+        hunk.lines.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 /// Strip a git diff `--- `/`+++ ` path operand down to a repo-relative
 /// `PathBuf`: drops the `a/`/`b/` prefix, passes `/dev/null` through as-is,
 /// and drops any trailing tab-separated timestamp (`git diff --no-index`
@@ -304,6 +326,7 @@ fn parse_file_section(section: &[&str]) -> FileDiff {
         .flat_map(|h| h.lines.iter())
         .filter(|l| matches!(l, DiffLine::Removed(_)))
         .count();
+    let file_hash = compute_file_hash(&path, &hunks);
 
     FileDiff {
         path,
@@ -311,6 +334,7 @@ fn parse_file_section(section: &[&str]) -> FileDiff {
         hunks,
         added,
         removed,
+        file_hash,
     }
 }
 
@@ -698,6 +722,50 @@ index 1111111..2222222 100644
         assert_eq!(
             m.files[0].hunks[0].patch_text(),
             "@@ -1,3 +1,3 @@\n fn foo() {\n-    old_line();\n+    new_line();\n }\n"
+        );
+    }
+
+    // ── Cog graph 8g7 node `review-store`: `FileDiff::file_hash` (spec rev 2
+    // B4 — Viewed is keyed by path + file_hash) ─────────────────────────────
+
+    fn one_file(path: &str, header: &str, body: &str) -> String {
+        format!(
+            "diff --git a/{path} b/{path}\nindex 1111111..2222222 100644\n--- a/{path}\n+++ b/{path}\n{header}\n{body}"
+        )
+    }
+
+    /// A position-only shift (only the `@@` numbers move) keeps `file_hash`.
+    #[test]
+    fn file_hash_is_position_independent() {
+        let before = model(&one_file("src/pos.rs", "@@ -5,3 +5,3 @@", " context\n-old\n+new\n"));
+        let after = model(&one_file("src/pos.rs", "@@ -50,3 +52,3 @@ fn x()", " context\n-old\n+new\n"));
+        assert_ne!(before.files[0].hunks[0].header, after.files[0].hunks[0].header);
+        assert_eq!(before.files[0].file_hash, after.files[0].file_hash);
+    }
+
+    /// Any content change (text or kind) to the file's diff changes `file_hash`.
+    #[test]
+    fn file_hash_changes_with_content() {
+        let base = model(&one_file("src/a.rs", "@@ -1,3 +1,3 @@", " context\n-old\n+new\n"));
+        let text = model(&one_file("src/a.rs", "@@ -1,3 +1,3 @@", " context\n-old\n+newer\n"));
+        let kind = model(&one_file("src/a.rs", "@@ -1,3 +1,3 @@", " context\n-old\n new\n"));
+        assert_ne!(base.files[0].file_hash, text.files[0].file_hash);
+        assert_ne!(base.files[0].file_hash, kind.files[0].file_hash);
+    }
+
+    /// Identical diff content in two different files hashes differently (path
+    /// is part of the identity), and the hash is deterministic.
+    #[test]
+    fn file_hash_differs_across_paths() {
+        let body = " context\n-old\n+new\n";
+        let a = model(&one_file("src/a.rs", "@@ -1,3 +1,3 @@", body));
+        let b = model(&one_file("src/b.rs", "@@ -1,3 +1,3 @@", body));
+        let a2 = model(&one_file("src/a.rs", "@@ -1,3 +1,3 @@", body));
+        assert_ne!(a.files[0].file_hash, b.files[0].file_hash);
+        assert_eq!(a.files[0].file_hash, a2.files[0].file_hash);
+        assert_eq!(
+            a.files[0].file_hash,
+            compute_file_hash(&a.files[0].path, &a.files[0].hunks)
         );
     }
 }
