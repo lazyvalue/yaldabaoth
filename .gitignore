@@ -2,6 +2,9 @@
 
 # Claude Code worktrees (per CLAUDE.md worktree workflow)
 /.claude/worktrees/
+
+# Claude Code scheduled-tasks lock (transient runtime state, rewritten each session)
+.claude/scheduled_tasks.lock
 /tmp
 .DS_Store
 
